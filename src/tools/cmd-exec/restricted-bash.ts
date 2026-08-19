@@ -393,7 +393,6 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const env: Record<string, string> = {
         ...sanitizeEnv(process.env as Record<string, string>),
         SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         // KUBECONFIG from the resolved `cluster` param (see above): the cluster's
         // kubeconfig when set, else /dev/null. Inline --kubeconfig is rejected by
         // validation, so the `cluster` param is the only way to select a cluster.

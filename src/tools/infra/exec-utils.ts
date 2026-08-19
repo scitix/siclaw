@@ -86,9 +86,8 @@ export function prepareExecEnv(kubeconfigRef?: KubeconfigRef, resolvedKubeconfig
   return {
     childEnv: {
       ...sanitizeEnv(process.env as Record<string, string>),
-      ...(kubeconfigRef?.credentialsDir
-        ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir }
-        : {}),
+      // SICLAW_CREDENTIALS_DIR is not passed to children: see the note on SICLAW_SAFE in
+      // sanitize-env.ts. Nothing in a child reads it, and it hands an expansion payload the layout.
       KUBECONFIG: "/dev/null",
     },
     kubeconfigPath,

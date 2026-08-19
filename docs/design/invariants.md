@@ -164,7 +164,8 @@ draft → (request review) → pending → (AI + static analysis) → approved/r
 - Timeout: default 180s, max 300s
 - Args passed as array to `spawn()` — no shell interpolation (injection-safe)
 - Max output: 10 MB combined stdout+stderr
-- Env injected: `SICLAW_DEBUG_IMAGE`, `KUBECONFIG`, `SICLAW_CREDENTIALS_DIR`
+- Env injected: `SICLAW_DEBUG_IMAGE`, `KUBECONFIG`. NOT `SICLAW_CREDENTIALS_DIR` — it points at the
+  credential tree and no child reads it; see the note on `SICLAW_SAFE` in `sanitize-env.ts`.
 
 **Source**: `src/tools/shell/local-script.ts`
 

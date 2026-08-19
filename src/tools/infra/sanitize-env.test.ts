@@ -24,13 +24,18 @@ describe("sanitizeEnv", () => {
     expect(result).not.toHaveProperty("SICLAW_SSO_CLIENT_SECRET");
   });
 
-  it("allows SICLAW_DEBUG_IMAGE and SICLAW_CREDENTIALS_DIR", () => {
+  it("allows SICLAW_DEBUG_IMAGE but NOT SICLAW_CREDENTIALS_DIR", () => {
+    // The credentials dir holds no secret, but it POINTS at the credential tree, and it was classified
+    // as harmless on the premise that a child cannot read what it points at — a premise that does not
+    // hold in the current image (security.md §4.6). Handing it over is what makes an expansion payload
+    // trivial: `"$SICLAW_CREDENTIALS_DIR"/clusters/*` needs no knowledge of the layout. The only reader
+    // is the main process reading its own environment, which this does not touch.
     const result = sanitizeEnv({
       SICLAW_DEBUG_IMAGE: "debug:latest",
       SICLAW_CREDENTIALS_DIR: "/app/.siclaw/credentials",
     });
     expect(result).toHaveProperty("SICLAW_DEBUG_IMAGE", "debug:latest");
-    expect(result).toHaveProperty("SICLAW_CREDENTIALS_DIR", "/app/.siclaw/credentials");
+    expect(result).not.toHaveProperty("SICLAW_CREDENTIALS_DIR");
   });
 
   it("blocks common sensitive env vars", () => {

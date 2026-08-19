@@ -176,7 +176,6 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       const childEnv: Record<string, string> = {
         ...sanitizeEnv(process.env as Record<string, string>),
         SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: kubeResult.path || "/dev/null",
       };
 

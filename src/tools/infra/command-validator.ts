@@ -320,12 +320,6 @@ export function getContextCommands(context: ExecContext): ReadonlySet<string> {
 
 // ── Sensitive path patterns (secondary defense) ──────────────────────
 
-const FILE_READING_CMDS = new Set([
-  "cat", "head", "tail", "less", "more",
-  "grep", "egrep", "fgrep", "awk", "gawk",
-  "cut", "sort", "wc", "uniq", "column",
-  "jq", "yq", "strings", "diff",
-]);
 
 // ── Unified validation entry point ──────────────────────────────────
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { filterPodNoise, stdinExecCmd } from "./exec-utils.js";
+import { filterPodNoise, stdinExecCmd, prepareExecEnv } from "./exec-utils.js";
 
 describe("filterPodNoise", () => {
   it("removes kubectl exec SPDY stream diagnostics but preserves the real error", () => {
@@ -40,5 +40,17 @@ describe("stdinExecCmd", () => {
   it("python3 command does NOT contain -s flag", () => {
     const cmd = stdinExecCmd("python3", "arg1");
     expect(cmd).not.toContain("-s");
+  });
+});
+
+describe("the child environment does not point at the credential tree", () => {
+  // Regression guard for a pointer, not a secret: `SICLAW_CREDENTIALS_DIR` used to be injected into
+  // every child env AND allowed through sanitizeEnv, so an expansion payload needed no knowledge of
+  // the layout. Nothing in a child ever read it; the only reader is core/config.ts in the main process.
+  it("omits SICLAW_CREDENTIALS_DIR even when a credentials dir is configured", () => {
+    const env = prepareExecEnv({ credentialsDir: "/app/.siclaw/credentials" } as never, null);
+    expect(env.childEnv).not.toHaveProperty("SICLAW_CREDENTIALS_DIR");
+    // The things a child legitimately needs are still there.
+    expect(env.childEnv).toHaveProperty("KUBECONFIG");
   });
 });
