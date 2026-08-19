@@ -628,26 +628,39 @@ const NVIDIA_SMI_SAFE_PREFIXES = [
  * their own writes, so each gets its own allowlist (the shape validateDcgmi already uses).
  */
 /**
- * Read-only option sets for the nvidia-smi subcommands that have their own, taken from NVIDIA's
- * documented option lists rather than from what happened to be needed:
- * https://docs.nvidia.com/deploy/nvidia-smi/index.html
+ * Read-only option sets for the nvidia-smi subcommands that have their own.
  *
- * Every documented `topo` option is a query, so the set is complete rather than minimal. For
- * `nvlink` the documented queries are listed and the counter-control and counter-reset options are
- * left out — `-sc/--setcontrol` and `-r/--resetcounters` WRITE counter state.
+ * Transcribed from a REAL `nvidia-smi topo --help` / `nvlink --help` on a GPU node, not from the
+ * online documentation: the docs list `topo -nvme / -gpu / -nic / -all`, which that driver does not
+ * have, and they give long forms (`--path`, `--nvlink`, `--list`) that do not exist either. Only what
+ * a real binary confirms is listed here — an allowlist that names options nothing accepts is a claim
+ * we cannot back, and the cost of omitting a genuine option is a refusal, not a leak.
  *
- * These are allowlists, so an option the docs do not show (NVIDIA's page truncates the `nvlink`
- * list) fails closed: the command is refused, never silently widened.
+ * Every WRITE and RESET option is excluded, and the help text is what identifies them:
+ *   nvlink -sc/--setcontrol, -r/--resetcounters, -re/--reseterrorcounters,
+ *          -sLowPwrThres/--setLowPowerThreshold, -sBwMode/--setBandwidthMode
+ * `-re` is the reason this is an allow-list rather than a deny-list: it resets every error counter,
+ * and it was refused before anyone noticed it existed, simply by not being named.
+ *
+ * The deprecated getters (`-gc/--getcontrol`, `-g/--getcounters`) are also left out — nvidia-smi
+ * itself directs callers to `-gt/--getthroughput`.
  */
 const NVIDIA_SMI_SUBCMD_FLAGS = new Map<string, Set<string>>(Object.entries({
   topo: new Set([
-    "-m", "--matrix", "-mp", "-p", "--path", "-i", "-c", "-n", "--nvlink",
-    "-p2p", "-C", "-M", "-gnid", "-nvme", "-cpu", "--cpu", "-gpu", "-nic", "-all", "-h",
+    "-m", "--matrix", "-mp", "--matrix_pci",
+    "-i", "--id", "-c", "--cpu", "-n", "--nearest_gpus", "-p", "--gpu_path",
+    "-p2p", "--p2pstatus",
+    "-C", "--get-numa-id-of-nearby-cpu", "-M", "--get-numa-id-of-nearby-mem",
+    "-gnid", "--gpu-numa-id", "-h", "--help",
   ]),
   nvlink: new Set([
-    "-s", "--status", "-c", "--capabilities", "-i", "--id", "-l", "--list",
-    "-e", "--errorcounters", "-p", "-pcibusid", "-R", "-remotelinkinfo",
-    "-gt", "--getthroughput", "-h",
+    "-h", "--help", "-i", "--id", "-l", "--link",
+    "-s", "--status", "-c", "--capabilities",
+    "-p", "--pcibusid", "-R", "--remotelinkinfo",
+    "-e", "--errorcounters", "-ec", "--crcerrorcounters",
+    "-gt", "--getthroughput",
+    "-gLowPwrInfo", "--getLowPowerInfo", "-gBwMode", "--getBandwidthMode",
+    "-cBridge", "--checkBridge",
   ]),
 }));
 

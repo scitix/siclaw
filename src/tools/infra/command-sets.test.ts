@@ -1777,15 +1777,40 @@ describe("stdin-only text commands: file operands and flag values", () => {
 });
 
 describe("nvidia-smi topo/nvlink read-only option sets", () => {
-  it("allows the documented topo queries that used to be refused", () => {
-    for (const flag of ["-p2p r", "-C -i 0", "-M -i 0", "-nvme", "-gnid -i 0", "-cpu", "-gpu", "-nic", "-all"]) {
-      expect(validateCommandRestrictions(`nvidia-smi topo ${flag}`)).toBeNull();
+  it("allows the topo queries a real nvidia-smi documents", () => {
+    // Transcribed from `nvidia-smi topo --help` on a GPU node. NOT from the online docs, which list
+    // -nvme / -gpu / -nic / -all — that driver has none of them, so the allowlist does not claim them.
+    for (const flag of [
+      "-m", "-mp", "--matrix_pci", "-p2p r", "--p2pstatus r",
+      "-C -i 0", "--get-numa-id-of-nearby-cpu -i 0", "-M -i 0", "-gnid -i 0", "--gpu-numa-id -i 0",
+      "-c 0", "--cpu 0", "-n 2 -i 0", "--nearest_gpus 2 -i 0", "-p -i 0,1", "--gpu_path -i 0,1", "-h",
+    ]) {
+      expect(validateCommandRestrictions(`nvidia-smi topo ${flag}`), flag).toBeNull();
     }
   });
 
-  it("allows the documented nvlink queries that used to be refused", () => {
-    for (const flag of ["--id 0", "-l 0", "-p", "-pcibusid", "-R", "-remotelinkinfo", "-gt", "--getthroughput"]) {
-      expect(validateCommandRestrictions(`nvidia-smi nvlink ${flag}`)).toBeNull();
+  it("does not claim topo options no real binary accepted", () => {
+    // These came from the docs page and are not in the driver's help. An allowlist naming options
+    // nothing accepts is a claim we cannot back; omitting a genuine one costs a refusal, not a leak.
+    for (const flag of ["-nvme", "-gpu", "-nic", "-all", "-cpu", "--path", "--nvlink"]) {
+      expect(validateCommandRestrictions(`nvidia-smi topo ${flag}`), flag).not.toBeNull();
+    }
+  });
+
+  it("allows the nvlink queries a real nvidia-smi documents", () => {
+    for (const flag of [
+      "-i 0", "--id 0", "-l 0", "--link 0", "-s", "--status", "-c", "--capabilities",
+      "-p", "--pcibusid", "-R", "--remotelinkinfo", "-e", "--errorcounters",
+      "-ec", "--crcerrorcounters", "-gt d", "--getthroughput d",
+      "-gLowPwrInfo", "--getLowPowerInfo", "-gBwMode", "--getBandwidthMode", "-cBridge", "--checkBridge", "-h",
+    ]) {
+      expect(validateCommandRestrictions(`nvidia-smi nvlink ${flag}`), flag).toBeNull();
+    }
+  });
+
+  it("refuses the single-dash long forms that do not exist", () => {
+    for (const flag of ["-pcibusid", "-remotelinkinfo", "--list"]) {
+      expect(validateCommandRestrictions(`nvidia-smi nvlink ${flag}`), flag).not.toBeNull();
     }
   });
 
@@ -1807,11 +1832,18 @@ describe("nvidia-smi topo/nvlink read-only option sets", () => {
     expect(validateCommandRestrictions("nvidia-smi nvlink -s")).toBeNull();
   });
 
-  it("still refuses nvlink counter writes and resets", () => {
-    expect(validateCommandRestrictions("nvidia-smi nvlink -r")).not.toBeNull();
-    expect(validateCommandRestrictions("nvidia-smi nvlink --resetcounters")).not.toBeNull();
-    expect(validateCommandRestrictions("nvidia-smi nvlink -sc 0")).not.toBeNull();
-    expect(validateCommandRestrictions("nvidia-smi nvlink --setcontrol 0")).not.toBeNull();
+  it("still refuses every write and reset the real help documents", () => {
+    // Read off `nvidia-smi nvlink --help`, so the list is what the binary actually offers rather than
+    // what I remembered. `-re` resets ALL error counters and was refused before anyone noticed it
+    // existed — which is the argument for an allow-list: what is not named is not permitted.
+    for (const flag of [
+      "-r", "--resetcounters", "-sc 0", "--setcontrol 0",
+      "-re", "--reseterrorcounters",
+      "-sLowPwrThres 5", "--setLowPowerThreshold 5", "-sBwMode 1", "--setBandwidthMode 1",
+      "-gc", "--getcontrol", "-g",            // deprecated getters; nvidia-smi points at -gt
+    ]) {
+      expect(validateCommandRestrictions(`nvidia-smi nvlink ${flag}`), flag).not.toBeNull();
+    }
   });
 });
 
