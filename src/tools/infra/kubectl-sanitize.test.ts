@@ -6,6 +6,8 @@ import {
   SENSITIVE_ENV_NAME_PATTERNS,
   SENSITIVE_KEY_PATTERNS,
   SENSITIVE_VALUE_PATTERNS,
+  redactLines,
+  redactSensitiveContent,
 } from "./kubectl-sanitize.js";
 
 // ── detectSensitiveResource ──────────────────────────────────────────
@@ -709,4 +711,46 @@ describe("SENSITIVE_VALUE_PATTERNS", () => {
       expect(SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value))).toBe(false);
     });
   }
+});
+
+describe("a ConfigMap entry whose value is JSON on one line", () => {
+  // The `-o json` path walks such a payload (redactByPattern). The yaml / describe / pipeline-fallback
+  // path reaches the same text through the line redactors, where the key on the line is a FILENAME and
+  // the blob matches no value pattern — so every secret inside it used to survive.
+  const leaks = (s: string) => /hunter2|plain-secret-value/.test(s);
+
+  it("redacts secrets inside a compact JSON value on the yaml path", () => {
+    const yaml = [
+      "data:",
+      `  app.json: '{"token":"plain-secret-value","password":"hunter2"}'`,
+      `  compact: {"password":"hunter2"}`,
+      "  plain.conf: |",
+      "    listen 8080",
+    ].join("\n");
+    const out = redactSensitiveContent(yaml);
+    expect(leaks(out)).toBe(false);
+    expect(out).toContain("**REDACTED**");
+    // Non-secret configuration is still readable — the point is per-entry granularity.
+    expect(out).toContain("listen 8080");
+  });
+
+  it("stays on one line, so it cannot corrupt the surrounding document", () => {
+    const line = `  app.json: '{"password":"hunter2"}'`;
+    const { text } = redactLines(line);
+    expect(text.split("\n")).toHaveLength(1);
+    expect(leaks(text)).toBe(false);
+  });
+
+  it("redacts a bare JSON object occupying the whole line", () => {
+    const { text, redacted } = redactLines('{"token":"plain-secret-value"}');
+    expect(redacted).toBe(true);
+    expect(leaks(text)).toBe(false);
+  });
+
+  it("leaves a JSON value with no sensitive key alone", () => {
+    const line = `  app.json: '{"listen":8080,"name":"web"}'`;
+    const { text, redacted } = redactLines(line);
+    expect(redacted).toBe(false);
+    expect(text).toBe(line);
+  });
 });

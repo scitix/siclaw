@@ -249,3 +249,30 @@ describe("postExecSecurity — a failed run survives a structural sanitizer", ()
     expect(result).not.toContain("(no output)");
   });
 });
+
+describe("stderr is redacted too", () => {
+  // stderr used to be appended verbatim, on the rationale that sanitizing it would break the JSON
+  // validity of a combined blob — which stopped applying once stdout is sanitized in isolation. A
+  // command that echoes a token in its error message was leaking it through the one channel nothing
+  // looked at.
+  it("redacts a secret a command echoed into its own error message", () => {
+    const out = postExecSecurity("", null, {
+      stderr: 'curl: failed with header "Authorization: Bearer ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\npassword: hunter2',
+      exitCode: 22,
+    });
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("ghp_AAAA");
+    expect(out).toContain("STDERR:");
+    // What survives: which command failed, and the exit code. What does NOT: the rest of that line.
+    // Redaction is value-level, so a `key: value` line carrying a secret loses the whole value —
+    // there is no way to know where the secret ends inside free prose. The trade is deliberate; a
+    // narrower substring pass would have to change the redactor stdout shares, for a smaller gain.
+    expect(out).toContain("curl: **REDACTED**");
+    expect(out).toContain("[exit code: 22]");
+  });
+
+  it("leaves ordinary stderr untouched", () => {
+    const out = postExecSecurity("body", null, { stderr: "Warning: v1beta1 is deprecated" });
+    expect(out).toContain("Warning: v1beta1 is deprecated");
+  });
+});

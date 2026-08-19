@@ -16,7 +16,7 @@ import {
 } from "./output-sanitizer.js";
 import { processToolOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
-import { detectSensitiveResource } from "./kubectl-sanitize.js";
+import { detectSensitiveResource, redactLines } from "./kubectl-sanitize.js";
 
 // ── Pre-exec ────────────────────────────────────────────────────────
 
@@ -141,7 +141,15 @@ export function postExecSecurity(
     const sig = opts.signal ? ` (signal: ${opts.signal})` : "";
     combined += `\n[exit code: ${opts.exitCode}${sig}]`;
   }
-  if (opts?.stderr) combined += `\n\nSTDERR:\n${opts.stderr}`;
+  // stderr is redacted too, line by line. It used to be appended verbatim, on the rationale that
+  // sanitizing it would break the JSON validity of a stdout+stderr blob — a rationale that stopped
+  // applying once stdout is sanitized in isolation above. A command that echoes a token in its error
+  // message was leaking it through the one channel nothing looked at. Line-level (not structural),
+  // because stderr is prose: the error text survives, only a value that looks like a secret goes.
+  if (opts?.stderr) {
+    const { text: safeStderr } = redactLines(opts.stderr);
+    combined += `\n\nSTDERR:\n${safeStderr}`;
+  }
   return processToolOutput(combined);
 }
 

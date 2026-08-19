@@ -144,6 +144,20 @@ function redactOneLine(line: string): string | null {
   if (split && (isSensitiveKeyName(split.key) || looksLikeSensitiveValue(split.value))) {
     return `${split.prefix}${REDACTED}`;
   }
+
+  // A ConfigMap entry whose value is JSON on ONE line — `app.json: '{"password":"…"}'` — names its
+  // secrets by the keys INSIDE the blob, which no line-oriented test can see: the key on this line is
+  // a filename, and the blob as a whole matches no value pattern. The `-o json` path already walks
+  // such a payload (redactByPattern); the yaml / describe / pipeline-fallback path reaches the same
+  // text through here, so it has to walk it too. Serialized compact to stay one line.
+  if (split) {
+    const asJson = redactJsonPayload(split.value, { compact: true });
+    if (asJson?.redacted) return `${split.prefix}${asJson.text}`;
+  }
+
+  const wholeLine = redactJsonPayload(line.trim(), { compact: true });
+  if (wholeLine?.redacted) return wholeLine.text;
+
   return looksLikeSensitiveValue(line.trim()) ? REDACTED : null;
 }
 
@@ -547,7 +561,10 @@ function redactByPattern(obj: any, field: string): boolean {
  * puts several pairs on one line, and a line-oriented pass over something we
  * could not parse gives no confidence that it rewrote all of them.
  */
-function redactJsonPayload(value: string): { text: string; redacted: boolean } | null {
+function redactJsonPayload(
+  value: string,
+  opts?: { compact?: boolean },
+): { text: string; redacted: boolean } | null {
   const trimmed = value.trim();
   if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
 
@@ -561,7 +578,12 @@ function redactJsonPayload(value: string): { text: string; redacted: boolean } |
   }
 
   const redacted = redactJsonTree(parsed);
-  return { text: redacted ? JSON.stringify(parsed, null, 2) : value, redacted };
+  // A line-level caller must not turn one line into several: it would corrupt the surrounding
+  // document's shape, and the streaming sanitizer works a line at a time.
+  const text = redacted
+    ? (opts?.compact ? JSON.stringify(parsed) : JSON.stringify(parsed, null, 2))
+    : value;
+  return { text, redacted };
 }
 
 /** Redact values under sensitive keys anywhere in a parsed JSON tree, in place. */
