@@ -7,6 +7,7 @@ import { renderTextResult } from "../infra/tool-render.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit } from "../infra/exit-classification.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { validateNodeName, validatePodName } from "../infra/exec-utils.js";
@@ -272,7 +273,7 @@ Examples (pass the id from host_list; names shown here for readability):
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
-          details: { error: true, reason: "ssh_exec_failed", host: params.host },
+          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", host: params.host },
         };
       } finally {
         signal?.removeEventListener("abort", onAbort);
@@ -285,19 +286,27 @@ Examples (pass the id from host_list; names shown here for readability):
         };
       }
 
-      // Mirror node_exec's error judgment: signal-killed with stdout = OK; otherwise non-zero exit = error.
-      const isError = result.exitCode !== 0 &&
-        !(result.exitCode === null && result.stdout.trim());
-      // Exit code renders as a trailing annotation rather than a header prefix —
-      // same shape as bash/node_exec/pod_exec, and it keeps our own literals out
-      // of the body that gets sanitized (see PostExecOptions.exitCode).
+      // WHAT the exit code means, from the same helper the other tools use. The code itself is
+      // rendered by postExecSecurity so our literals stay out of the sanitized body; `notes` carries
+      // the truncation notice and the class beside it.
+      const judgment = classifyExit({
+        command: params.command,
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        signal: result.signal,
+        context: "host",
+      });
+      const notes = (result.truncated ? "\n...[output truncated at 10 MB]" : "")
+        + (judgment.annotation ? `\n${judgment.annotation}` : "");
       return {
         content: [{
           type: "text",
           text: postExecSecurity(result.stdout.trim(), pre.action, {
             stderr: result.stderr.trim() || undefined,
-            ...(result.truncated ? { notes: "\n...[output truncated at 10 MB]" } : {}),
-            ...(isError
+            ...(notes ? { notes } : {}),
+            // Whenever the run did not exit 0: the code is a FACT, `error` below is the judgment.
+            ...(judgment.exitClass !== "success"
               ? {
                   exitCode: result.exitCode ?? "unknown",
                   ...(result.signal ? { signal: result.signal } : {}),
@@ -307,9 +316,10 @@ Examples (pass the id from host_list; names shown here for readability):
         }],
         details: {
           exitCode: result.exitCode,
+          exit_class: judgment.exitClass,
           host: params.host,
           host_label: hostLabel,
-          ...(isError && { error: true }),
+          ...(judgment.isError && { error: true }),
           ...(result.signal ? { signal: result.signal } : {}),
         },
       };

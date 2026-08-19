@@ -10,6 +10,7 @@ import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit } from "../infra/exit-classification.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import {
   validateNodeName,
@@ -438,15 +439,33 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
 
       // Assemble output, then sanitize + truncate via unified facade
       const filteredStderr = filterPodNoise(execResult.stderr);
-      const isError = execResult.exitCode !== 0 &&
-        !(execResult.exitCode === null && execResult.stdout.trim());
-      // Show the output as a shell would, with the exit code as a trailing annotation
-      // (not a prefix that replaces the body), so a non-zero exit with no output —
-      // e.g. `grep` with no match — reads as an empty result, not a failure.
-      const out = execResult.stdout.trim();
+      // WHAT the exit code means, not just that it was non-zero. The exit code itself is rendered by
+      // postExecSecurity (`exitCode`), which keeps our literals out of the sanitized body; the class
+      // rides in `notes` beside it, because `details` is stripped before the model sees the result.
+      const judgment = classifyExit({
+        command: params.command,
+        exitCode: execResult.exitCode,
+        stdout: execResult.stdout,
+        // Unfiltered: filterPodNoise drops kubectl's own chatter, which is exactly where a channel
+        // failure announces itself.
+        stderr: execResult.stderr,
+        context: "node",
+      });
       return {
-        content: [{ type: "text", text: postExecSecurity(out, pre.action, { stderr: filteredStderr || undefined, ...(isError && { exitCode: execResult.exitCode ?? "unknown" }) }) }],
-        details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
+        content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
+          stderr: filteredStderr || undefined,
+          ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),
+          // Rendered whenever the run did not exit 0 — the code is a FACT, while `error` below is a
+          // judgment about it, and conflating them hid the code on a no-match.
+          ...(judgment.exitClass !== "success"
+            ? { exitCode: execResult.exitCode ?? "unknown" }
+            : {}),
+        }) }],
+        details: {
+          exitCode: execResult.exitCode ?? 0,
+          exit_class: judgment.exitClass,
+          ...(judgment.isError && { error: true }),
+        },
       };
     },
   };

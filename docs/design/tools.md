@@ -250,6 +250,39 @@ The context system has two layers:
 
 **Source**: `COMMANDS` and `CONTEXT_POLICIES` in `src/tools/infra/command-sets.ts`
 
+### 6.1b What a Non-Zero Exit Means (`exit-classification.ts`)
+
+Every exec tool reports a non-zero exit through `classifyExit`, which answers a different question
+from "did it exit 0": **whose failure was it?**
+
+| class | meaning | `details.error` |
+|---|---|---|
+| `channel_error` | The exec path failed — the target never ran the command, so the status is not its answer. Includes a spawn failure (`ENOENT`) and a `kubectl exec` transport error. | yes |
+| `dependency_missing` | The command is not on the target (127, or the runtime's "executable file not found"). Retrying cannot help. | yes |
+| `not_executable` | Found but not runnable (126). | yes |
+| `no_match` | The command ran and matched nothing (`grep`/`pgrep`/`test` exiting 1). **Not a failure.** | no |
+| `target_reported_failure` | The command ran and reported this status. The target's own answer. | yes |
+| `interrupted` | Signalled (timeout, abort). Partial output is still a result. | only with no output |
+
+Two contracts hold this together, and neither is derivable from the other:
+
+- **The class must appear in the TEXT.** `details` is stripped from a tool result before the model
+  sees it, so a distinction that lives only there cannot be acted on.
+- **`details.error` must stay accurate**, because it drives the Trace outcome. This is why `no_match`
+  does not set it: a `grep` that matched nothing used to paint a failed tool call.
+
+The annotation is appended by `appendAnnotation` **after** sanitizing and truncating, never folded
+into the body. It is our own statement about the result, not target output — and a structural (JSON)
+sanitizer replaces everything it cannot parse with a suppression notice, which is exactly what a
+failed command's output produces. Folding it in silently ate the classification.
+
+Telling a dead channel from a command that failed needs **stderr**, since `kubectl exec` reports both
+through the exit status. Call sites therefore pass stderr UNFILTERED (`filterPodNoise` removes the
+kubectl lines a channel failure announces itself in). The markers are anchored at line start and only
+consulted when stdout is empty, so a command whose own output contains `error:` is not mistaken for a
+broken channel; `command terminated with exit code N` is deliberately NOT a marker, because it means
+the command did run.
+
 ### 6.2 Security Strategy: Pre-Execution vs Post-Execution
 
 The security pipeline uses two complementary strategies — understanding which

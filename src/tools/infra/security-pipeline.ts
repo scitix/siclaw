@@ -82,6 +82,18 @@ export interface PostExecOptions {
   signal?: string;
   /** Literal trailer (e.g. a truncation notice). Appended after sanitization. */
   notes?: string;
+  /**
+   * Optional projection of the SANITIZED stdout (json_path). Its position is a security and a
+   * correctness requirement, not a preference:
+   *
+   *   - AFTER sanitization, because projecting first would strip the shape a structural sanitizer
+   *     matches on (crictl's `info.config.envs`) and could surface a value it would have redacted;
+   *   - BEFORE truncation, because truncated JSON does not parse — the feature would fail on exactly
+   *     the large documents it exists for;
+   *   - BEFORE the literal trailers below, because it must see the command's document, not our
+   *     `[exit code: N]` line.
+   */
+  project?: (sanitizedStdout: string) => string;
 }
 
 /**
@@ -112,6 +124,12 @@ export function postExecSecurity(
     if (opts?.hasSensitiveKubectl) {
       sanitized = redactSensitiveContent(sanitized);
     }
+  }
+
+  // Projection sits between sanitization and our own literals: it must see the command's document
+  // and nothing we appended to it.
+  if (opts?.project) {
+    sanitized = opts.project(sanitized);
   }
 
   // Everything below is literal text we generate, so it is appended after
