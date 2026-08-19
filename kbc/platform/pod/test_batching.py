@@ -83,7 +83,7 @@ def test_partial_slices_are_still_rejected_for_ordinary_documents(tmp_path):
     stops short of the last line is incomplete, and there is no longer any
     exemption from that — nothing in this planner may decide the model has
     seen enough."""
-    body = "".join(f"operational note line {i:05d}\n" for i in range(40_000))
+    body = "".join(f"operational note line {i:05d}\n" for i in range(60_000))
     raw = _mk_text(tmp_path, {"ops/manual.md": body})
     inv = bt.scan_sources(raw)
     item = next(i for i in inv if i["path"] == "ops/manual.md")
@@ -101,9 +101,9 @@ def test_partial_slices_are_still_rejected_for_ordinary_documents(tmp_path):
 def test_context_budget_defaults_leave_room_for_the_working_set(tmp_path):
     """The numbers themselves, in one place. A batch spends its slice PLUS a
     working set (system prompt, BRIEF, INTENT, index, the pages it appends to,
-    every accumulated tool result). The agreed SAFE ceiling for one session is
-    750K of a 1M window, so at ~3 bytes/token for this corpus the slice should
-    sit near a third of the window — leaving the rest for the working set.
+    every accumulated tool result). The owner target is at most 500K of a 1M
+    window. At ~3 bytes/token the configured source slice plus the measured
+    fixed overhead must remain below that target.
 
     The band moved up from 120-220K when the old 512KB budget was found to be
     costly rather than cautious: a smaller budget pushes more families into the
@@ -111,15 +111,46 @@ def test_context_budget_defaults_leave_room_for_the_working_set(tmp_path):
     Context is the cheap resource; stability is the expensive one."""
     slice_tokens = bt.DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES / 3
     assert 280_000 <= slice_tokens <= 450_000, slice_tokens
-    assert slice_tokens < 750_000, "must stay under the agreed safe ceiling"
+    assert (slice_tokens + bt.ESTIMATED_FIXED_CONTEXT_TOKENS
+            <= bt.DEFAULT_CONTEXT_TARGET_TOKENS)
     # Same question, same answer: a file is sliced only when it truly does not
-    # fit one session.
+    # fit one session. These are compiler facts, not environment configuration.
     assert (bt.DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES
             == bt.DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES)
+    plan = bt.build_plan([], [], planner="hierarchical-code")
+    assert plan["context_window_tokens"] == 1_000_000
+    assert plan["context_target_tokens"] == 500_000
+    assert plan["estimated_context_tokens"] <= plan["context_target_tokens"]
     # An image is ~1.5-2.5K vision tokens. Pricing it like a document is what
     # produced batches of nothing but screenshots.
     assert bt._image_cost() <= 12 * 1024
     assert bt._image_cost() <= bt._hierarchical_image_cost() <= 4 * bt._image_cost()
+
+
+def test_checkpoint_digest_covers_progress_and_detects_tampering(tmp_path):
+    plan = bt.build_plan([], [], planner="hierarchical-code")
+    plan["batches"] = [{"id": "b01", "sources": ["one.md"], "status": "pending"}]
+    bt.seal_checkpoint(plan)
+    first = plan["checkpoint_digest"]
+    assert bt.checkpoint_is_valid(plan)
+    plan["batches"][0]["status"] = "done"
+    assert not bt.checkpoint_is_valid(plan)
+    bt.seal_checkpoint(plan)
+    assert bt.checkpoint_is_valid(plan)
+    assert plan["checkpoint_digest"] != first
+
+
+def test_checkpoint_state_machine_rejects_late_phases_with_pending_work(tmp_path):
+    plan = {"phase": "complete", "batches": [
+        {"id": "b01", "sources": ["one.md"], "status": "pending"}
+    ]}
+    assert "unfinished map" in " ".join(bt.checkpoint_state_errors(plan))
+    plan["phase"] = "map"
+    assert bt.checkpoint_state_errors(plan) == []
+    plan["batches"][0]["status"] = "done"
+    plan["phase"] = "final"
+    plan["reductions"] = [{"id": "r001", "status": "pending"}]
+    assert "unfinished reductions" in " ".join(bt.checkpoint_state_errors(plan))
 
 
 def test_a_section_placeholder_never_costs_its_own_session(tmp_path):
@@ -199,14 +230,26 @@ def test_pack_groups_by_top_dir_and_budget(tmp_path):
     )
     inv = bt.scan_sources(raw)
     batches = bt.pack_batches(inv, budget=200)
-    # ops/, root(""), sdk/ in sorted path order; sdk splits at the budget.
     by_sources = [b["sources"] for b in batches]
-    assert ["ops/d.md"] in by_sources
-    assert ["root.md"] in by_sources
-    sdk_batches = [b for b in by_sources if b and b[0].startswith("sdk/")]
-    assert len(sdk_batches) == 2  # 90+90 then 90
+    assert len(by_sources) == 2, by_sources
+    assert all(b["bytes"] <= 200 for b in batches)
     flat = [p for b in by_sources for p in b]
     assert sorted(flat) == sorted(i["path"] for i in inv)  # exactly once
+
+
+def test_many_small_sections_fill_the_context_budget_instead_of_spawning_one_session_each(tmp_path):
+    raw = _mk(tmp_path, {
+        f"section-{i:03d}/page.md": 200 for i in range(125)
+    })
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_hierarchical_batches(inv, budget=1_000, text_budget=1_000)
+    # The old section-boundary flush emitted 125 sessions here. Filling to half
+    # the existing budget reduces the same shape to roughly the requested 50
+    # without enlarging any deployment-configured budget.
+    assert len(batches) == 42, batches
+    assert all(500 <= b["bytes"] <= 1_000 for b in batches[:-1]), batches
+    assert batches[-1]["bytes"] <= 1_000
+    assert sorted(p for b in batches for p in b["sources"]) == sorted(i["path"] for i in inv)
 
 
 def test_pack_oversized_single_file_gets_own_batch(tmp_path):
@@ -906,11 +949,14 @@ def main():
         test_every_text_format_can_be_sliced_not_only_markdown,
         test_partial_slices_are_still_rejected_for_ordinary_documents,
         test_context_budget_defaults_leave_room_for_the_working_set,
+        test_checkpoint_digest_covers_progress_and_detects_tampering,
+        test_checkpoint_state_machine_rejects_late_phases_with_pending_work,
         test_a_section_placeholder_never_costs_its_own_session,
         test_scan_skips_hidden_and_empty,
         test_threshold_gate_small_kb_never_batches,
         test_tiered_gate_keeps_small_and_medium_routes_stable,
         test_pack_groups_by_top_dir_and_budget,
+        test_many_small_sections_fill_the_context_budget_instead_of_spawning_one_session_each,
         test_pack_oversized_single_file_gets_own_batch,
         test_hierarchical_pack_keeps_document_assets_together,
         test_hierarchical_family_links_exact_original_attachment_and_sidecar,

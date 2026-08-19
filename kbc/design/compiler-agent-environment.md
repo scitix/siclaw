@@ -40,6 +40,22 @@ It is not a page per file and not a line-by-line code reference.
 7. **Gates produce actionable truth.** Deterministic checks protect confinement,
    provenance, coverage, and output shape. They do not reward deleting citations
    or bulk-excluding ordinary code merely to make a score green.
+8. **Handoff is durable and globally scoped.** Each stateless batch starts from
+   `authoring/COMPILATION_STATE.json`, which names the phase, full Candidate page
+   set, source-to-page map, tree hash, full Raw inventory, and Candidate index.
+   The assigned batch limits responsibility, not what the agent may discover.
+9. **Delivery is its own resumable phase.** After final review the compiler
+   checkpoints `phase=commit` before emitting provenance commit input. A relay
+   failure at this point replays only delivery; it never repeats map, reduce, or
+   final semantic work.
+10. **Checkpoints prove their identity.** Every persisted `BATCH_PLAN.json`
+    carries a monotonically advancing revision, update time, and SHA-256 digest.
+    Corruption pauses with `plan_integrity`; it never looks like an absent plan.
+11. **A batch boundary is a durability barrier.** Candidate bytes,
+    `BATCH_PLAN.json`, and `COMPILATION_STATE.json` enter the consumer in one
+    transaction. The orchestrator starts the next batch only after the consumer
+    acknowledges that transaction; browser, WebSocket, Runtime, and Box states
+    are not permission to continue or evidence that a batch landed.
 
 ## Phase access matrix
 
@@ -67,3 +83,10 @@ It is not a page per file and not a line-by-line code reference.
   is explicitly prohibited from starting a second full compilation.
 - All access remains read-only, path-confined, bounded, and covered by regression
   tests.
+- The compiler keeps the selected model's 1M context window and uses an internal
+  500K planning target per turn; neither number is a Helm value or environment
+  variable. Actual per-batch usage and high-water context are stamped in the
+  checkpoint for later tuning.
+- A persisted commit-phase checkpoint can finish with no new model session.
+- Killing the Runtime or Box after an acknowledged batch rehydrates the same
+  Candidate/task checkpoint and starts at the first unsealed batch.

@@ -46,6 +46,8 @@ interface BoxEvent {
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
   /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
   commit_input?: boolean;
+  /** KBC durability barrier identity; ACK only after consumer commit succeeds. */
+  sync_id?: string;
   code?: string;
   stage?: string;
   attempts?: number;
@@ -178,9 +180,37 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
                 `[capability] run=${runId} persistArtifacts failed; retrying in ${delayMs}ms:`,
                 err instanceof Error ? err.message : String(err),
               );
-              manager.touchHeartbeat(runId);
               await new Promise((resolve) => setTimeout(resolve, delayMs));
               delayMs = Math.min(delayMs * 2, 5000);
+            }
+          }
+          if (evt.sync_id !== undefined) {
+            if (typeof evt.sync_id !== "string" || !evt.sync_id || evt.sync_id.length > 128) {
+              throw new Error(`invalid artifact sync id for run ${runId}`);
+            }
+            // Persistence acknowledgement is a second, idempotent hop back to
+            // KBC. Until it lands, the box must not start the next batch. A WS
+            // reconnect may replay the same sync_id; Sicore upserts atomically
+            // and this endpoint accepts duplicate ACKs.
+            let ackDelayMs = 250;
+            for (;;) {
+              try {
+                await client.postJson(`/artifacts/ack/${runId}`, { sync_id: evt.sync_id }, 10_000);
+                break;
+              } catch (err) {
+                const rec = manager.get(runId);
+                if (!rec || isTerminalCapabilityStatus(rec.status)) {
+                  throw new Error(
+                    `artifact acknowledgement aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                }
+                console.error(
+                  `[capability] run=${runId} artifact ACK failed; retrying in ${ackDelayMs}ms:`,
+                  err instanceof Error ? err.message : String(err),
+                );
+                await new Promise((resolve) => setTimeout(resolve, ackDelayMs));
+                ackDelayMs = Math.min(ackDelayMs * 2, 5000);
+              }
             }
           }
         }

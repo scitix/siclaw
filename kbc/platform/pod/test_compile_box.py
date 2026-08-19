@@ -3879,7 +3879,8 @@ async def test_batch_orchestrator_routing_and_resume():
         # resume: mark one batch pending again → next trigger routes to batch even
         # under a huge threshold, and only the pending batch (+终审) re-runs
         plan["batches"][1]["status"] = "pending"
-        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        plan["phase"] = "map"
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
         assert compile_box._should_route_to_batch(run, "直接开始编译")
         driven.clear()
@@ -3898,6 +3899,29 @@ async def test_batch_orchestrator_routing_and_resume():
         note = compile_box._drain_batch_notes(run)
         assert "注意保密条款" in note and compile_box._drain_batch_notes(run) == ""
         run._batch_active = False
+
+        # Explicit control reset: a corrupt plan is revoked, but Candidate and
+        # Raw remain. The trusted resume command rebuilds a plan in-place and
+        # consumes the reset marker instead of requiring a fresh generation.
+        (wd / batching.BATCH_PLAN_PATH).unlink()
+        reset_marker = wd / compile_box.RECOVERY_RESET_PATH
+        reset_marker.write_text(
+            '{"version":1,"reason":"explicit_control_reset","candidate_preserved":true}',
+            "utf-8",
+        )
+        compile_box._prepare_command(
+            run, {"action": "compile.resume", "parameters": {}})
+        driven.clear()
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "ignored localized text")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+        assert len(driven) == 3, driven
+        assert not reset_marker.exists(), "reset marker survived replacement-plan seal"
+        assert (wd / batching.BATCH_PLAN_PATH).is_file()
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
@@ -4818,6 +4842,10 @@ def test_batch_relay_brief_hands_off_progress_and_prior_pages():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         (base / "raw" / "ops").mkdir(parents=True)
+        (base / "raw" / "other").mkdir(parents=True)
+        (base / "raw" / "ops" / "big.md").write_text("# big", encoding="utf-8")
+        (base / "raw" / "ops" / "sibling.md").write_text("# sibling", encoding="utf-8")
+        (base / "raw" / "other" / "far.md").write_text("# far", encoding="utf-8")
         (base / "candidate").mkdir()
         (base / "authoring").mkdir()
         (base / "candidate" / "tickets.md").write_text(
@@ -4850,12 +4878,50 @@ def test_batch_relay_brief_hands_off_progress_and_prior_pages():
         assert "candidate/tickets.md" in directive, directive
         assert "not your field of view" in directive, directive
 
+        # The durable hand-off names the ENTIRE Candidate tree and source map;
+        # responsibility is bounded, visibility is not.
+        compile_box._write_compilation_state(run, plan)
+        state = json.loads((base / "authoring" / "COMPILATION_STATE.json").read_text())
+        assert state["visibility"] == "complete_frozen_raw_and_candidate_tree", state
+        assert state["candidate_pages"] == [
+            "elsewhere.md", "neighbour.md", "tickets.md"
+        ], state
+        assert state["source_to_pages"]["ops/big.md"] == ["tickets.md"], state
+        assert len(state["candidate_tree_hash"]) == 64, state
+
         # No prior work \u2192 a hand-off that is still honest, never fabricated.
         fresh = compile_box._batch_relay_brief(
             run, plan, {"id": "h003", "sources": ["new/area.md"]}, 1, 2, locale="en")
         assert "Candidate pages so far: 3" in fresh, fresh
         assert "candidate/tickets.md" not in fresh, fresh
     print("\u2713 batch relay brief: machine-computed hand-off between sessions")
+
+
+def test_batch_checkpoint_digest_is_verified_before_resume():
+    """A damaged checkpoint must pause for explicit reset/restore, never look
+    like no checkpoint and silently restart an expensive semantic compile."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        run = compile_box.CompileRun("checkpoint-integrity", str(wd), 1)
+        plan = {"phase": "map", "batches": [
+            {"id": "b01", "sources": ["one.md"], "status": "pending"}
+        ]}
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        assert compile_box._load_batch_plan(run)["checkpoint_digest"]
+
+        stored = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        stored["batches"][0]["status"] = "done"
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(stored))
+        try:
+            compile_box._load_batch_plan(run)
+        except compile_box.PlanIntegrityError as error:
+            assert "digest" in str(error)
+            assert compile_box._batch_error_code(error) == "plan_integrity"
+        else:
+            raise AssertionError("tampered checkpoint was accepted")
+    print("\u2713 batch checkpoint: digest mismatch pauses instead of replanning")
 
 
 def test_hierarchical_resume_state_contract():
@@ -4875,7 +4941,7 @@ def test_hierarchical_resume_state_contract():
             "reductions": [],
         }
 
-        for phase in ("map", "reduce", "final"):
+        for phase in ("map", "reduce", "final", "commit"):
             plan["phase"] = phase
             (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
             assert compile_box._batch_plan_resumable(plan), phase
@@ -4894,7 +4960,7 @@ def test_hierarchical_resume_state_contract():
             assert "no interrupted batch plan" in str(error)
         else:
             raise AssertionError("complete batch plan must not be resumable")
-    print("\u2713 hierarchical resume: typed command covers map/reduce/final only")
+    print("\u2713 hierarchical resume: typed command covers map/reduce/final/commit only")
 
 
 def test_hierarchical_pdf_page_directive():
@@ -5154,12 +5220,22 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             # replay the expensive map or reduce train, even if raw has since
             # shrunk below the ordinary batch threshold.
             saved["phase"] = "final"
-            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(saved))
+            compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, saved)
             os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
             assert compile_box._should_route_to_batch(run, "直接开始编译")
             driven.clear()
             await compile_box._run_batch_compile(run, "直接开始编译")
             assert len(driven) == 1 and driven[0].startswith("final review"), driven
+
+            # A crash after semantic finalization but before the durable commit
+            # retries delivery only. No model session is replayed.
+            committed = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            committed["phase"] = "commit"
+            compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, committed)
+            driven.clear()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert driven == [], driven
+            assert json.loads((wd / batching.BATCH_PLAN_PATH).read_text())["phase"] == "complete"
     finally:
         compile_box._drive_batch_session = real_drive
         compile_box._run_ledger_repairs = real_repairs
@@ -6202,6 +6278,57 @@ async def test_workspace_sync_invalidates_verification_before_cross_process_resu
     print("✓ workspace sync invalidates old verified before cross-process resume")
 
 
+async def test_durable_workspace_sync_waits_for_consumer_ack():
+    """A sealed batch is not complete until Sicore commits and ACKs it."""
+    compile_box.RUNS.clear()
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        authoring = Path(td) / "authoring"
+        candidate.mkdir()
+        authoring.mkdir()
+        (candidate / "index.md").write_text("# Index\n", "utf-8")
+        (candidate / "topic.md").write_text("# Topic\n", "utf-8")
+        (authoring / "BATCH_PLAN.json").write_text(
+            json.dumps({"phase": "map", "batches": [{"id": "b01", "status": "done"}]}),
+            "utf-8",
+        )
+        run = compile_box.CompileRun("ack-run", td, 1)
+        run._artifact_ack_required = True
+        compile_box.RUNS[run.run_id] = run
+        sent = {}
+
+        pending = asyncio.create_task(
+            compile_box._sync_workspace(run, sent, durable_barrier=True))
+        event = await asyncio.wait_for(run.events.get(), timeout=1)
+        run.events.task_done()
+        assert event["type"] == "syncArtifacts", event
+        sync_id = event.get("sync_id")
+        assert sync_id and not pending.done(), "batch advanced before durable ACK"
+        assert run._pending_sync_events[sync_id] == event
+
+        client = TestClient(TestServer(compile_box.build_app()))
+        await client.start_server()
+        try:
+            response = await client.post(
+                f"/artifacts/ack/{run.run_id}", json={"sync_id": sync_id})
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["accepted"] is True, body
+            changed = await asyncio.wait_for(pending, timeout=1)
+            assert changed >= 3, changed
+            assert sent, "dedupe cursor advances only after ACK"
+
+            # Lost ACK responses are harmless: runtime retries idempotently.
+            response = await client.post(
+                f"/artifacts/ack/{run.run_id}", json={"sync_id": sync_id})
+            body = await response.json()
+            assert response.status == 200 and body["accepted"] is False, body
+        finally:
+            await client.close()
+            compile_box.RUNS.clear()
+    print("✓ durable workspace sync waits for atomic consumer ACK")
+
+
 async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
     """Unsafe YAML is a repair finding, not a retry poison or trust leak."""
     class ResultMessage:
@@ -6813,6 +6940,7 @@ async def main():
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_batch_relay_brief_hands_off_progress_and_prior_pages()
+    test_batch_checkpoint_digest_is_verified_before_resume()
     test_hierarchical_resume_state_contract()
     test_hierarchical_pdf_page_directive()
     await test_codex_batch_scope_and_pdf_page_tool()
@@ -6833,6 +6961,7 @@ async def main():
     await test_batch_rebuild_exhaustion_raises_resumable()
     test_batch_retry_preserves_first_attempt_page_baseline()
     await test_workspace_sync_invalidates_verification_before_cross_process_resume()
+    await test_durable_workspace_sync_waits_for_consumer_ack()
     await test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust()
     await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()

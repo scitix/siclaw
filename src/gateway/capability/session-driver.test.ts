@@ -96,6 +96,39 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     });
   });
 
+  it("ACKs a sealed checkpoint only after the consumer transaction commits", async () => {
+    const order: string[] = [];
+    const fe = fakeFrontend();
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) order.push("persist");
+      return { ok: true };
+    });
+    const client = {
+      async *streamPath() {
+        yield {
+          type: "syncArtifacts",
+          sync_id: "sync-1",
+          artifacts: [{ path: "candidate/a.md", content: "# A" }],
+        };
+      },
+      postJson: vi.fn().mockImplementation(async () => {
+        order.push("ack");
+        return { ok: true };
+      }),
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running", inputRevision: "manifest-1" });
+
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager: mgr });
+
+    expect(order).toEqual(["persist", "ack"]);
+    expect(client.postJson).toHaveBeenCalledWith(
+      "/artifacts/ack/r1",
+      { sync_id: "sync-1" },
+      10_000,
+    );
+  });
+
   it("persists an explicit input commit even when no files changed", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();
@@ -272,6 +305,10 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS);
     expect(artifactCalls).toHaveLength(3);
     expect(artifactCalls[0][1]).toEqual(artifactCalls[2][1]);
+    // A consumer persistence retry is not evidence that the Box is alive. If it
+    // refreshes the Box heartbeat, a dead Box can stay "running" for the full
+    // data-stale window while only this local retry loop is making progress.
+    expect(mgr.touchHeartbeat).not.toHaveBeenCalled();
   }, 10_000);
 
   it("stops retrying when the run is cancelled or reaped", async () => {

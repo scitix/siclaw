@@ -411,8 +411,13 @@ def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> 
     source paths or provider response fragments, and pod stdout is
     operator-visible. The full message belongs on the OWNER-facing SSE events
     (run.emit error/summary), which the owner owns."""
+    context = ""
+    command_context = getattr(run, "_command_context", None)
+    if command_context is not None:
+        operation_id, generation = command_context
+        context = f" operation={operation_id} generation={generation}"
     tail = f" {extra}" if extra else ""
-    print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
+    print(f"[compile_box] {label} run={run.run_id} round={run.round}{context}{tail}", flush=True)
 
 
 def _error_event(
@@ -789,6 +794,14 @@ class CompileRun:
         # machine; Sicore's operation and the runtime run remain authoritative.
         self._accepted_commands: dict[str, str] = {}
         self._command_context: tuple[str, int] | None = None
+        # A sealed batch checkpoint is not durable when it merely entered this
+        # process's SSE queue. New runtimes advertise artifact ACK support and
+        # acknowledge only after Sicore commits the whole syncArtifacts batch.
+        # The orchestrator waits on that ACK before starting the next batch.
+        self._artifact_ack_required = False
+        self._sync_lock = asyncio.Lock()
+        self._pending_sync_acks: dict[str, asyncio.Future] = {}
+        self._pending_sync_events: dict[str, dict] = {}
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -945,6 +958,8 @@ _pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 WORKSPACE_SYNC_DIRS = ("authoring", "candidate", "eval", "release")
 SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
 MAX_SYNC_FILE_BYTES = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1024)))
+ARTIFACT_ACK_TIMEOUT_SECS = 10 * 60
+RECOVERY_RESET_PATH = "authoring/RECOVERY_RESET.json"
 # SDK stdio JSON reader buffer. The SDK default is 1MB, and one oversized tool
 # result (a Read of a big source file) kills the whole session with a fatal
 # "exceeded maximum buffer size" — seen live on a 139-source compile (2026-07-06).
@@ -1029,58 +1044,92 @@ def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
     }
 
 
-async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = False) -> int:
+async def _sync_workspace(
+    run: CompileRun,
+    sent: dict,
+    *,
+    commit_input: bool = False,
+    durable_barrier: bool = False,
+) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
     previously-synced files that no longer exist on disk. Updates `sent` after
     enqueue and retains tombstone markers for reconnect replay;
     returns the number of changed entries."""
-    if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
-        raise FileNotFoundError("cannot commit compile input without candidate/index.md")
-    blocked_paths = _blocked_provenance_paths(run)
-    if commit_input and blocked_paths:
-        raise selfcheck.ProvenanceStampError(
-            "cannot commit compile input while candidate provenance stamping is blocked")
-    changed = []
-    next_sent = dict(sent)
-    # Blocked pages still exist. Treat them as collected so durability sync
-    # preserves the last good consumer copy instead of emitting a tombstone.
-    collected = set(blocked_paths)
-    for art in _collect_workspace_artifacts_for_sync(run):
-        collected.add(art["path"])
-        sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
-        if sent.get(art["path"]) == sha:
-            continue
-        next_sent[art["path"]] = sha
-        changed.append(art)
-    # Tombstones: a previously-synced file the agent deleted (page merge, rename,
-    # restructure) must be deleted from the consumer's store too — otherwise the
-    # orphan row gets published and the next respawn's workspace rehydration puts
-    # the file back on disk, silently undoing the deletion. Judged by is_file(),
-    # NOT by absence from the collection: a file that merely became oversized or
-    # binary is skipped by the collector but still exists, and must keep its
-    # last-synced row. `sent` scopes the sweep to paths this box life actually
-    # synced, so a store row that never materialized here can't be tombstoned.
-    wd = Path(run.workdir)
-    for path in [p for p in sent if p not in collected]:
-        if (wd / path).is_file():
-            continue  # still on disk, just not collectable — keep the row
-        if sent.get(path) != _SYNC_TOMBSTONE:
-            next_sent[path] = _SYNC_TOMBSTONE
-            changed.append({"path": path, "deleted": True})
-    if changed or commit_input:
-        event = {"type": "syncArtifacts", "artifacts": changed}
-        if commit_input:
-            event["commit_input"] = True
-        await run.emit(event)
-        # Advance the dedup cursor only after the event is queued. Tombstone
-        # markers are retained so an SSE re-attach can replay deletions too.
-        if changed:
-            sent.clear()
-            sent.update(next_sent)
-        if commit_input:
-            run._commit_input_replay = True
-    return len(changed)
+    async with run._sync_lock:
+        if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
+            raise FileNotFoundError("cannot commit compile input without candidate/index.md")
+        blocked_paths = _blocked_provenance_paths(run)
+        if commit_input and blocked_paths:
+            raise selfcheck.ProvenanceStampError(
+                "cannot commit compile input while candidate provenance stamping is blocked")
+        changed = []
+        next_sent = dict(sent)
+        # Blocked pages still exist. Treat them as collected so durability sync
+        # preserves the last good consumer copy instead of emitting a tombstone.
+        collected = set(blocked_paths)
+        for art in _collect_workspace_artifacts_for_sync(run):
+            collected.add(art["path"])
+            sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
+            if sent.get(art["path"]) == sha:
+                continue
+            next_sent[art["path"]] = sha
+            changed.append(art)
+        # Tombstones: a previously-synced file the agent deleted (page merge, rename,
+        # restructure) must be deleted from the consumer's store too — otherwise the
+        # orphan row gets published and the next respawn's workspace rehydration puts
+        # the file back on disk, silently undoing the deletion. Judged by is_file(),
+        # NOT by absence from the collection: a file that merely became oversized or
+        # binary is skipped by the collector but still exists, and must keep its
+        # last-synced row. `sent` scopes the sweep to paths this box life actually
+        # synced, so a store row that never materialized here can't be tombstoned.
+        wd = Path(run.workdir)
+        for path in [p for p in sent if p not in collected]:
+            if (wd / path).is_file():
+                continue  # still on disk, just not collectable — keep the row
+            if sent.get(path) != _SYNC_TOMBSTONE:
+                next_sent[path] = _SYNC_TOMBSTONE
+                changed.append({"path": path, "deleted": True})
+        if changed or commit_input:
+            event = {"type": "syncArtifacts", "artifacts": changed}
+            if commit_input:
+                event["commit_input"] = True
+            ack = None
+            sync_id = ""
+            if durable_barrier and run._artifact_ack_required:
+                sync_id = str(uuid.uuid4())
+                event["sync_id"] = sync_id
+                ack = asyncio.get_running_loop().create_future()
+                run._pending_sync_acks[sync_id] = ack
+                run._pending_sync_events[sync_id] = event
+            await run.emit(event)
+            if ack is not None:
+                _print_compile_lifecycle(
+                    "checkpoint.await_ack", run,
+                    extra=f"sync={sync_id} artifacts={len(changed)} commit={str(commit_input).lower()}",
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(ack), timeout=ARTIFACT_ACK_TIMEOUT_SECS)
+                except asyncio.TimeoutError as error:
+                    _print_compile_lifecycle(
+                        "checkpoint.ack_timeout", run, extra=f"sync={sync_id}")
+                    raise TimeoutError(
+                        f"consumer did not acknowledge artifact checkpoint {sync_id}"
+                    ) from error
+                _print_compile_lifecycle(
+                    "checkpoint.acked", run,
+                    extra=f"sync={sync_id} artifacts={len(changed)} commit={str(commit_input).lower()}",
+                )
+            # ACK-capable barriers advance only after the consumer transaction
+            # committed. Legacy/non-barrier sync keeps its established enqueue
+            # cursor and remains replayable on relay re-attach.
+            if changed:
+                sent.clear()
+                sent.update(next_sent)
+            if commit_input:
+                run._commit_input_replay = True
+        return len(changed)
 
 
 def _workspace_replay_artifacts(run: CompileRun, sent: dict) -> list[dict]:
@@ -1119,6 +1168,11 @@ async def _sync_loop(run: CompileRun, sent: dict):
     while True:
         try:
             await asyncio.sleep(SYNC_INTERVAL_SECS)
+            # Batch Candidate bytes and their task ledger form one sealed fact.
+            # Never leak a half-written current batch through the periodic path;
+            # the orchestrator persists the whole tree at its batch boundary.
+            if getattr(run, "_batch_active", False):
+                continue
             await _sync_workspace(run, sent)
         except asyncio.CancelledError:
             return
@@ -1691,7 +1745,8 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         raise CommandRejected("no structured source changes are available for incremental compile", 409)
     if action == "compile.resume":
         plan = _load_batch_plan(run)
-        if not _batch_plan_resumable(plan):
+        reset_marker = (Path(run.workdir) / RECOVERY_RESET_PATH).is_file()
+        if not _batch_plan_resumable(plan) and not reset_marker:
             raise CommandRejected("no interrupted batch plan is available to resume", 409)
     if action == "compile.refresh_domain":
         index = Path(run.workdir) / "candidate" / "index.md"
@@ -3011,12 +3066,9 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 ]
                 _record_provenance_stamp_result(run, resolved, failures)
             run._turn_page_hashes = None
-            sent = getattr(run, "_sync_sent", None)
-            if sent is not None:
-                try:
-                    await _sync_workspace(run, sent)
-                except Exception:
-                    pass
+            # Do not persist an internal batch session independently. Candidate
+            # bytes and the orchestrator's done stamp must enter the consumer in
+            # one atomic syncArtifacts transaction at the batch boundary.
             return
         # Layer-1 self-check BEFORE the sync so SELFCHECK.json rides the same
         # pre-turn_done sync. Fail-open: a self-check crash must not kill the
@@ -3741,9 +3793,16 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         return None
     try:
         plan = json.loads(p.read_text())
-        return plan if isinstance(plan, dict) and isinstance(plan.get("batches"), list) else None
-    except Exception:
-        return None
+    except Exception as error:
+        raise PlanIntegrityError("the durable batch checkpoint is unreadable; reset or restore it") from error
+    if not isinstance(plan, dict) or not isinstance(plan.get("batches"), list):
+        raise PlanIntegrityError("the durable batch checkpoint has an invalid shape; reset or restore it")
+    if not batching.checkpoint_is_valid(plan):
+        raise PlanIntegrityError("the durable batch checkpoint digest does not match; reset or restore it")
+    state_errors = batching.checkpoint_state_errors(plan)
+    if state_errors:
+        raise PlanIntegrityError("the durable batch checkpoint state is inconsistent; reset or restore it")
+    return plan
 
 
 def _batch_resume_point(plan: dict | None) -> tuple[int, int] | None:
@@ -3770,13 +3829,15 @@ def _batch_plan_resumable(plan: dict | None) -> bool:
     """
     return plan is not None and (
         len(batching.pending_batches(plan)) > 0
-        or plan.get("phase") in {"map", "reduce", "final"}
+        or plan.get("phase") in {"map", "reduce", "final", "commit"}
     )
 
 
 def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p = Path(run.workdir) / rel
     p.parent.mkdir(parents=True, exist_ok=True)
+    if rel == batching.BATCH_PLAN_PATH and isinstance(value, dict):
+        batching.seal_checkpoint(value)
     p.write_text(batching.dump_json(value))
 
 
@@ -4311,7 +4372,9 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
             f"(see the batching discipline in the system prompt):\n{listing}\n"
-            "First read authoring/BRIEF.json, authoring/INTENT.md and candidate/index.md to stay consistent "
+            "First read authoring/BRIEF.json, authoring/INTENT.md, authoring/COMPILATION_STATE.json and "
+            "candidate/index.md to inherit the complete task, Raw inventory, completed-batch ownership, "
+            "and current Wiki shape; the entire frozen Raw snapshot and Candidate tree remain readable/searchable. "
             "in voice and structure; then read every source in this batch closely and fold its content fully "
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
             "sources[].resource must list the sources it was actually compiled from); update the matching "
@@ -4324,7 +4387,8 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
-        "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
+        "先读 authoring/BRIEF.json、authoring/INTENT.md、authoring/COMPILATION_STATE.json 和 candidate/index.md,"
+        "继承完整任务、Raw 总清单、已完成批次归属和当前 Wiki 结构;冻结 Raw 全量与 Candidate 全树始终可读可搜索;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "sources[].resource 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "清单是你的**交付责任面**,不是你的视野边界:需要交叉印证时(某个附件被谁引用、邻近文档同一件事怎么表述、"
@@ -4664,6 +4728,98 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
         run._ledger_forced = False
 
 
+def _candidate_checkpoint_hash(workdir: str) -> str:
+    pages = incremental.page_hashes(workdir)
+    return hashlib.sha256(json.dumps(
+        pages, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _write_compilation_state(run: "CompileRun", plan: dict) -> None:
+    """Persist the complete machine hand-off between stateless batch sessions.
+
+    Responsibility remains per batch, but global visibility does not: every
+    successor gets the full Raw inventory, every Candidate page name, the full
+    source-to-page ownership map, and the current tree hash. Content remains in
+    Raw/Candidate and is available through read/search tools instead of being
+    duplicated into this bounded control artifact.
+    """
+    try:
+        pages = selfcheck.candidate_pages(run.workdir)
+    except Exception:
+        pages = {}
+    source_to_pages: dict[str, list[str]] = {}
+    for page, info in sorted(pages.items()):
+        for entry in info.get("sources") or []:
+            source = selfcheck._strip_source_prefix(str(entry))
+            source_to_pages.setdefault(source, []).append(page)
+    batches = plan.get("batches") or []
+    state = {
+        "version": 1,
+        "phase": plan.get("phase") or "map",
+        "planner": plan.get("planner") or "",
+        "checkpoint_revision": plan.get("checkpoint_revision") or 0,
+        "checkpoint_digest": plan.get("checkpoint_digest") or "",
+        "checkpoint_updated_at": plan.get("checkpoint_updated_at") or "",
+        "batches_done": sum(1 for batch in batches if batch.get("status") in {"done", "skipped"}),
+        "batches_total": len(batches),
+        "candidate_tree_hash": _candidate_checkpoint_hash(run.workdir),
+        "candidate_pages": sorted(pages),
+        "source_to_pages": source_to_pages,
+        "raw_inventory": batching.SOURCES_INVENTORY_PATH,
+        "candidate_index": "candidate/index.md",
+        "visibility": "complete_frozen_raw_and_candidate_tree",
+    }
+    _write_batch_file(run, "authoring/COMPILATION_STATE.json", state)
+
+
+async def _commit_batch_compile(run: "CompileRun", plan: dict, replies: list[str]) -> None:
+    """Commit an already-reviewed Candidate without replaying model work.
+
+    The content-only `commit` checkpoint is emitted before the provenance commit.
+    If the relay persists only the first event, a successor resumes here and
+    emits `commit_input` again; map/reduce/final are never repeated.
+    """
+    sent = getattr(run, "_sync_sent", None)
+    already_commit = plan.get("phase") == "commit"
+    plan["phase"] = "commit"
+    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+    _write_compilation_state(run, plan)
+    _print_compile_lifecycle(
+        "batch.phase", run,
+        extra=(f"phase=commit done={len(plan.get('batches') or [])}/{len(plan.get('batches') or [])} "
+               f"checkpoint={str(plan.get('checkpoint_digest') or '')[:12]} "
+               f"revision={plan.get('checkpoint_revision', 0)}"))
+    if sent is not None:
+        try:
+            if not already_commit:
+                await _sync_workspace(run, sent, durable_barrier=True)
+                _print_compile_lifecycle("batch.commit.checkpoint", run)
+            await _sync_workspace(run, sent, commit_input=True, durable_barrier=True)
+            _print_compile_lifecycle("batch.commit.emit", run)
+        except Exception as error:
+            _print_compile_lifecycle(
+                "batch.commit.failed", run, extra=f"class={type(error).__name__}")
+            # Keep the local/replay state at commit. Never demote to final: the
+            # expensive semantic work is complete and only delivery is pending.
+            plan["phase"] = "commit"
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            raise
+    plan["phase"] = "complete"
+    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+    _print_compile_lifecycle(
+        "batch.complete", run, extra=f"peak_context={run._peak_context_tokens}")
+    if run._peak_context_tokens > 0:
+        peak_k = run._peak_context_tokens // 1000
+        await run.emit({"type": "summary", "text": _loc(run,
+            f"Heaviest batch held about {peak_k}K tokens of context "
+            f"(per-batch detail in authoring/BATCH_PLAN.json).",
+            f"最重的一批约占用 {peak_k}K tokens 上下文"
+            f"(逐批明细见 authoring/BATCH_PLAN.json)。")})
+    await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
+                    or _loc(run, "Batch compile complete.", "分批编译完成。")})
+
+
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
     the end), many bounded sessions inside. Crash-resumable across map, optional
@@ -4711,6 +4867,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。")})
             plan = await _plan_batches(run, [i for i in inventory if i["path"] in plannable])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            # An explicit plan-integrity reset preserves Candidate but revokes
+            # the corrupt controller checkpoint. Seal the replacement plan and
+            # the reset-marker tombstone in the same batch-zero transaction.
+            (Path(run.workdir) / RECOVERY_RESET_PATH).unlink(missing_ok=True)
         else:
             # The pinned plan predates this run; a source deleted from raw/ in
             # between would leave a batch directive pointing at a missing file,
@@ -4726,6 +4886,14 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                              f"断点续批:{len(dropped)} 个源已不在 raw/ 中或已被豁免,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
+        entry_phase = str(plan.get("phase") or "map")
+        _write_compilation_state(run, plan)
+        # Seal the task/handoff before batch 1. A provider/Box failure with zero
+        # completed pages is still an autonomously recoverable compile when the
+        # exact plan and input identity are durable.
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            await _sync_workspace(run, sent, durable_barrier=True)
         slice_failures = _materialize_batch_slices(run, plan)
         if slice_failures:
             n_all = len(plan["batches"])
@@ -4757,7 +4925,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 f"{len(slice_failures)} 个批次的读界视图无法构建,已跳过;未记账的源已自动豁免并写明理由,"
                 f"列车继续。")})
         n = len(plan["batches"])
-        pending = batching.pending_batches(plan)
+        pending = batching.pending_batches(plan) if entry_phase == "map" else []
         if plan.get("mode") == "hierarchical":
             run._model_idle_timeout_s = max(
                 _MODEL_IDLE_TIMEOUT_S, _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S)
@@ -4782,6 +4950,18 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                           f"继续分批编译:剩余 {len(pending)}/{n} 批。") if resuming
                      else _loc(run, plan_summary_en, plan_summary_zh)),
         })
+        _print_compile_lifecycle(
+            "batch.plan", run,
+            extra=(f"planner={plan.get('planner')} mode={plan.get('mode')} phase={entry_phase} "
+                   f"sources={plan.get('source_count', len(inventory))} batches={n} pending={len(pending)} "
+                   f"budget={plan.get('budget', 0)} text_budget={plan.get('text_budget', 0) or 0} "
+                   f"target_context={plan.get('context_target_tokens', 0)} "
+                   f"estimated_context={plan.get('estimated_context_tokens', 0)} "
+                   f"checkpoint={str(plan.get('checkpoint_digest') or '')[:12]} "
+                   f"revision={plan.get('checkpoint_revision', 0)}"))
+        if entry_phase == "commit":
+            await _commit_batch_compile(run, plan, replies)
+            return
         bounded = plan_bounded_sources(plan)
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
@@ -4908,27 +5088,28 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     f"Batch {k}/{n} could not complete ({e}); its unaccounted sources were auto-excluded "
                     f"with a reason and the train continues.",
                     f"批 {k}/{n} 无法完成({e});未记账的源已自动豁免并写明理由,列车继续。")})
-            batching.stamp_done(plan, batch["id"], usage=run._turn_usage)
+            batching.stamp_done(
+                plan, batch["id"], usage=run._turn_usage,
+                tree_hash=_candidate_checkpoint_hash(run.workdir))
             run._turn_usage = None
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            _write_compilation_state(run, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
             # NOW: if it only rode the next periodic sync, a crash in that window
             # would re-run an already-done batch on resume.
             sent = getattr(run, "_sync_sent", None)
             if sent is not None:
-                try:
-                    await _sync_workspace(run, sent)
-                except Exception:
-                    pass  # periodic sync will retry; the local stamp is already on disk
+                await _sync_workspace(run, sent, durable_barrier=True)
             _print_compile_lifecycle("batch.done", run, extra=_lifecycle_batch_ref(batch, k, n))
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
-        if plan.get("mode") == "hierarchical":
+        if plan.get("mode") == "hierarchical" and entry_phase in {"map", "reduce"}:
             if "reductions" not in plan:
                 plan["reductions"] = batching.pack_section_reductions(
                     selfcheck.candidate_pages(run.workdir))
             plan["phase"] = "reduce"
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            _write_compilation_state(run, plan)
             reductions = plan.get("reductions", [])
             reduction_count = len(reductions)
             pending_reductions = batching.pending_reductions(plan)
@@ -4951,6 +5132,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 if len(reduction["pages"]) < 2:
                     batching.stamp_reduction_done(plan, reduction["id"])
                     _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                    _write_compilation_state(run, plan)
                     continue
                 k = next(
                     i + 1 for i, item in enumerate(reductions)
@@ -4971,14 +5153,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         f"【分区归并 {k}/{reduction_count}】{reply}"))
                 batching.stamp_reduction_done(plan, reduction["id"])
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                _write_compilation_state(run, plan)
                 sent = getattr(run, "_sync_sent", None)
                 if sent is not None:
-                    try:
-                        await _sync_workspace(run, sent)
-                    except Exception:
-                        pass
+                    await _sync_workspace(run, sent, durable_barrier=True)
         plan["phase"] = "final"
         _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        _write_compilation_state(run, plan)
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
             _loc(run, "final review", "终审"),
@@ -5084,33 +5265,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             if notes_reply:
                 replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
             await _run_ledger_repairs(run, replies)  # the digest may have touched pages
-        sent = getattr(run, "_sync_sent", None)
-        plan["phase"] = "complete"
-        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
-        if sent is not None:
-            # Successful batch completion is one full-compile provenance commit.
-            # Content and input revision must land atomically before turn_done.
-            try:
-                await _sync_workspace(run, sent, commit_input=True)
-            except Exception:
-                # The durable commit did not happen. Keep the plan resumable at
-                # final close-out rather than falsely claiming completion.
-                plan["phase"] = "final"
-                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
-                raise
-        _print_compile_lifecycle(
-            "batch.complete", run, extra=f"peak_context={run._peak_context_tokens}")
-        if run._peak_context_tokens > 0:
-            # The owner tuning a budget should not have to read pod logs for the
-            # one number that says whether it was right.
-            peak_k = run._peak_context_tokens // 1000
-            await run.emit({"type": "summary", "text": _loc(run,
-                f"Heaviest batch held about {peak_k}K tokens of context "
-                f"(per-batch detail in authoring/BATCH_PLAN.json).",
-                f"最重的一批约占用 {peak_k}K tokens 上下文"
-                f"(逐批明细见 authoring/BATCH_PLAN.json)。")})
-        await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
-                        or _loc(run, "Batch compile complete.", "分批编译完成。")})
+        await _commit_batch_compile(run, plan, replies)
     except Exception as e:
         # stdout stays whitelisted: exception class + a machine-routable code.
         # The MESSAGE (which can carry raw source paths / provider response
@@ -7003,6 +7158,7 @@ async def handle_session(request: web.Request):
     # persistent session, batch sessions, PK and media-verify all inherit them.
     _apply_session_config(body)
     run = CompileRun(run_id, body.get("workdir", "/work"), int(body.get("round", 1)), body.get("instruction", ""))
+    run._artifact_ack_required = body.get("artifact_ack") is True
     # Tool whitelist from the runtime BoxProfile (None/absent → driver default).
     run.allowed_tools = body.get("allowed_tools")
     run.locale = body.get("locale")
@@ -7365,6 +7521,30 @@ async def handle_command(request: web.Request):
         return web.json_response({"error": str(exc)}, status=exc.status)
 
 
+async def handle_artifacts_ack(request: web.Request):
+    """Acknowledge one syncArtifacts transaction after consumer commit.
+
+    The endpoint is idempotent: a retried ACK for an already-released barrier is
+    still successful. Unknown runs remain a 404 so a runtime never mistakes a
+    different/reaped box for the owner of the checkpoint.
+    """
+    run = RUNS.get(request.match_info["run_id"])
+    if not run:
+        return web.json_response({"error": "unknown run"}, status=404)
+    try:
+        body = await request.json() if request.body_exists else {}
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return web.json_response({"error": "request body must be valid JSON"}, status=400)
+    sync_id = str(body.get("sync_id") or "").strip()
+    if not sync_id or len(sync_id) > 128:
+        return web.json_response({"error": "sync_id is required"}, status=400)
+    future = run._pending_sync_acks.pop(sync_id, None)
+    run._pending_sync_events.pop(sync_id, None)
+    if future is not None and not future.done():
+        future.set_result(True)
+    return web.json_response({"ok": True, "sync_id": sync_id, "accepted": future is not None})
+
+
 async def handle_events(request: web.Request):
     run = RUNS.get(request.match_info["run_id"])
     if not run:
@@ -7381,8 +7561,12 @@ async def handle_events(request: web.Request):
         # a previous runtime dequeued a sync event but died before persisting it;
         # it also works when the run already queued its terminal `end` frame.
         wants_replay = request.query.get("replay") == "1"
+        pending_syncs = (list(getattr(run, "_pending_sync_events", {}).values())
+                         if wants_replay else [])
+        for ev in pending_syncs:
+            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
         replay = (_workspace_replay_artifacts(run, getattr(run, "_sync_sent", {}))
-                  if wants_replay else [])
+                  if wants_replay and not pending_syncs else [])
         replay_commit = wants_replay and getattr(run, "_commit_input_replay", False)
         if replay or replay_commit:
             ev = {"type": "syncArtifacts", "artifacts": replay}
@@ -7782,6 +7966,11 @@ async def _flush_on_shutdown(_app) -> None:
     Best-effort — a store that never acks still loses it; F1 is the durable fix."""
     runs = [r for r in RUNS.values() if getattr(r, "_sync_sent", None) is not None]
     for run in runs:
+        # A durability barrier already owns the sync lock and its exact event is
+        # queued/replayable. Waiting up to the ACK timeout inside aiohttp shutdown
+        # would consume the pod's termination grace without adding evidence.
+        if getattr(run, "_sync_lock", None) is not None and run._sync_lock.locked():
+            continue
         try:
             n = await _sync_workspace(run, run._sync_sent)
             if n:
@@ -7832,6 +8021,7 @@ def build_app() -> web.Application:
         web.post("/session/{run_id}", handle_session),
         web.post("/message/{run_id}", handle_message),
         web.post("/command/{run_id}", handle_command),
+        web.post("/artifacts/ack/{run_id}", handle_artifacts_ack),
         web.get("/events/{run_id}", handle_events),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),
