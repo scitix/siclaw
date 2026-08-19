@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { gzipSync } from "node:zlib";
-import { validateKnowledgePackage } from "./knowledge-package.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import {
+  extractKnowledgePackageToDir,
+  OKF_CITATION_SIDECAR,
+  validateKnowledgePackage,
+} from "./knowledge-package.js";
 
 describe("validateKnowledgePackage", () => {
   it("accepts a minimal markdown wiki package", () => {
@@ -54,6 +61,21 @@ describe("validateKnowledgePackage", () => {
     ]);
 
     expect(() => validateKnowledgePackage(buf)).toThrow("Path traversal");
+  });
+
+  it("does not materialize uploader-supplied citation metadata", async () => {
+    const buf = makeTarGz([
+      { name: "index.md", content: "# Index\n" },
+      { name: OKF_CITATION_SIDECAR, content: JSON.stringify({ sources: [{ url: "https://docs.feishu.cn/wiki/input" }] }) },
+    ]);
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-knowledge-test-"));
+    try {
+      await extractKnowledgePackageToDir(buf, target);
+      await expect(fs.readFile(path.join(target, "index.md"), "utf8")).resolves.toContain("# Index");
+      await expect(fs.stat(path.join(target, OKF_CITATION_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(target, { recursive: true, force: true });
+    }
   });
 });
 

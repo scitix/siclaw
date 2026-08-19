@@ -11,6 +11,7 @@ const MAX_ARCHIVE_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_UNPACKED_BYTES = 100 * 1024 * 1024;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_FILES = 1000;
+export const OKF_CITATION_SIDECAR = ".okf-citations.json";
 
 export interface KnowledgePackageInfo {
   sha256: string;
@@ -98,7 +99,10 @@ export async function extractKnowledgePackageToDir(buf: Buffer, targetDir: strin
   const archivePath = path.join(tmpDir, "knowledge.tar.gz");
   try {
     await fs.writeFile(archivePath, buf, { mode: 0o600 });
-    await execFileAsync("tar", ["-xzf", archivePath, "-C", targetDir]);
+    // Package citation metadata is uploader-supplied input. Sicore validates
+    // and freezes it, then sends the canonical citationSources separately.
+    // Never expose the uploaded copy to the model-visible knowledge tree.
+    await execFileAsync("tar", ["-xzf", archivePath, "-C", targetDir, `--exclude=${OKF_CITATION_SIDECAR}`]);
     return info;
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
