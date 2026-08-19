@@ -14,7 +14,7 @@ export interface AdapterConfig {
   pollIntervalMs: number;
 }
 
-/** Per-key config handed to one SicoreA2aClient after its agent is resolved. */
+/** Per-key config handed to one A2aClient after its agent is resolved. */
 export interface ResolvedAdapterConfig {
   baseUrl: string;
   agentId: string;
@@ -65,16 +65,16 @@ function normalizeBaseUrl(raw: string): string {
   try {
     url = new URL(raw);
   } catch {
-    throw new ConfigError("SICORE_URL must be an absolute URL");
+    throw new ConfigError("A2A_URL must be an absolute URL");
   }
   if (url.username || url.password) {
-    throw new ConfigError("SICORE_URL must not contain credentials");
+    throw new ConfigError("A2A_URL must not contain credentials");
   }
   if (url.search || url.hash) {
-    throw new ConfigError("SICORE_URL must not contain a query string or fragment");
+    throw new ConfigError("A2A_URL must not contain a query string or fragment");
   }
   if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) {
-    throw new ConfigError("SICORE_URL must use HTTPS (HTTP is allowed only for loopback testing)");
+    throw new ConfigError("A2A_URL must use HTTPS (HTTP is allowed only for loopback testing)");
   }
   return url.toString().replace(/\/$/, "");
 }
@@ -185,7 +185,7 @@ function loadKeys(env: NodeJS.ProcessEnv): NamedKey[] {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig {
   return {
-    baseUrl: normalizeBaseUrl(required(env, "SICORE_URL")),
+    baseUrl: normalizeBaseUrl(required(env, "A2A_URL")),
     keys: loadKeys(env),
     requestTimeoutMs: parseBoundedInteger(env, "SICLAW_A2A_TIMEOUT_MS", 30_000, 1_000, 120_000),
     pollIntervalMs: parseBoundedInteger(env, "SICLAW_A2A_POLL_INTERVAL_MS", 3_000, 500, 5_000),

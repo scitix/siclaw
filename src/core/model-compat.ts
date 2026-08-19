@@ -43,7 +43,7 @@ export function isValidMaxTokensField(value: unknown): value is MaxTokensField {
  * Whether `modelId` names an OpenAI reasoning family, which rejects the legacy
  * `max_tokens` field and requires `max_completion_tokens`.
  *
- * Same shape as sicore's `isReasoningModel` (sicore/pkg/llm/openai.go), which
+ * Same shape as control-plane's `isReasoningModel` (control-plane/pkg/llm/openai.go), which
  * was added after the identical 400 from the same gateway. This is a NAMING
  * CONVENTION, so it is only the fallback: an explicit `max_tokens_field` on the
  * model row always wins, which is what covers renamed ids on aggregator

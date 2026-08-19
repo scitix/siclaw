@@ -2,8 +2,8 @@ import type { ClusterMetaEntry } from "../../shared/credential-types.js";
 
 /**
  * Reserved system metadata keys that must never reach the model — mirrors
- * sicore's `metadata.IsReservedSystemKey`. `registry` is debug-image plumbing
- * (already surfaced via `debug_image`), not an infrastructure fact. sicore
+ * control-plane's `metadata.IsReservedSystemKey`. `registry` is debug-image plumbing
+ * (already surfaced via `debug_image`), not an infrastructure fact. control-plane
  * filters these upstream; we enforce it here too because this helper is the
  * final model-visible boundary (defense in depth, no drift-free guarantee).
  */
@@ -11,7 +11,7 @@ const RESERVED_SYSTEM_KEYS = new Set(["registry"]);
 
 /**
  * Flatten filled cluster metadata into a compact `key → value` record for LLM
- * consumption. Keyed by the stable `key` (sicore guarantees `(org_id, key)`
+ * consumption. Keyed by the stable `key` (control-plane guarantees `(org_id, key)`
  * uniqueness) — NOT `display_name`, which is editable display text that can
  * collide and would silently clobber entries under `Object.fromEntries`.
  *

@@ -490,7 +490,7 @@ export function registerChatRoutes(
       promptText = await appendOcrEvidence(body.text ?? "", normalized.filter((a) => a.kind !== "image"));
       // Image-only message with no text and no OCR evidence: a bare images
       // payload with empty text leaves runtime prompt behavior undefined, so
-      // fall back to a default instruction (aligns with sicore).
+      // fall back to a default instruction (aligns with control-plane).
       if (promptText.trim() === "" && images.length > 0) {
         promptText = ATTACHMENT_ONLY_PROMPT;
       }

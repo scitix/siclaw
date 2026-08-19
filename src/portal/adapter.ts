@@ -105,7 +105,7 @@ async function resolveChannelBinding(
   const row = await selectChannelBinding(db, channelId, routeKey);
   if (!row) {
     // No explicit binding. A per-agent open bot auto-serves any group it joins
-    // (standalone supports open only — authorized requires Sicore's im_bindings).
+    // (standalone supports open only — authorized requires ControlPlane's im_bindings).
     if (conversationExistingOnly && conversationKey) return null;
     return resolveOpenGroupBinding(db, channelId, routeKey, conversationKey);
   }
@@ -449,10 +449,10 @@ interface PersonalChannelConfig {
   personal_bot?: {
     agent_id?: string;
     // Legacy spellings kept alongside the current tiers; `isOpenAccessTier` normalizes both.
-    access_mode?: "open" | "public" | "identified" | "granted" | "sicore_authorized" | (string & {});
+    access_mode?: "open" | "public" | "identified" | "granted" | "platform_authorized" | (string & {});
     owner_user_id?: string;
     // When not explicitly false, an open per-agent bot also auto-serves any
-    // group it is added to (no PAIR). Mirrors Sicore's group_auto_bind.
+    // group it is added to (no PAIR). Mirrors ControlPlane's group_auto_bind.
     group_auto_bind?: boolean;
   };
 }
@@ -530,7 +530,7 @@ async function ensureOpenGroupBindingRow(
  * Open-mode group fallback: a per-agent open bot answers in any group it joins
  * without a PAIR. All senders in one group share a single session (keyed by
  * chat id, distinct from the DM `open_id:` keys), and every turn runs as the
- * fixed owner. Authorized mode is punted here (Sicore-only).
+ * fixed owner. Authorized mode is punted here (remote-control-plane-only).
  */
 async function resolveOpenGroupBinding(
   db: Db,
@@ -2837,7 +2837,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
     // Standalone Portal has one portal-secret-authenticated Runtime trust
     // domain and no runtime_id relation. Scope ownership to the exact
-    // message/session pair here; SiCore additionally enforces per-Runtime
+    // message/session pair here; ControlPlane additionally enforces per-Runtime
     // ownership in its own implementation of this RPC.
     const db = getDb();
     const [result] = await db.query(

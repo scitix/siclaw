@@ -2787,7 +2787,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // `personal_bot: { agent_id, access_mode: "open", ... }` — the adapter's
   // channel.list / resolvePersonalChannelBinding already understand that
   // shape, so the gateway serves the bot with zero extra plumbing.
-  // Standalone supports OPEN access only (authorized mode is Sicore-only).
+  // Standalone supports OPEN access only (authorized mode is remote-control-plane-only).
   // Reads are open to any authenticated user; writes are ADMIN ONLY.
   // ================================================================
 
@@ -4021,7 +4021,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (query.userId) { conds.push(`${actorUserColumn("s")} = ?`); params.push(query.userId); }
     if (channelId) { conds.push("s.channel_id = ?"); params.push(channelId); }
     // Exact channel sender id (Lark open_id / DingTalk staffId) — lets an admin
-    // pin one sender even when they are NOT linked to a SiCore account.
+    // pin one sender even when they are NOT linked to a ControlPlane account.
     if (query.senderExternalId) { conds.push("s.sender_external_id = ?"); params.push(query.senderExternalId); }
     if (query.agentId) { conds.push("s.agent_id = ?"); params.push(query.agentId); }
     if (query.cursorTs && query.cursorId) {

@@ -2,7 +2,7 @@
 
 > Status: draft · 2026-06-15
 > Scope: `portal-web` Metrics dashboard + `src/portal/siclaw-api.ts` `/api/v1/siclaw/metrics/*`
-> Ports the Grafana-style time picker already shipped in the downstream sicore web dashboard.
+> Ports the Grafana-style time picker already shipped in the downstream control-plane web dashboard.
 
 ## Background & goal
 
@@ -20,9 +20,9 @@ on a single `from`/`to` timestamp contract, matching what audit already half-did
 ## What stays untouched (contract boundary)
 
 `src/portal/adapter.ts` `/api/internal/siclaw/metrics/*` is a **separate, parallel**
-implementation (independent SQL, `period` enum) consumed by the downstream sicore Portal over
+implementation (independent SQL, `period` enum) consumed by the downstream control-plane Portal over
 the internal-auth channel. It is a cross-system wire contract and is **out of scope** — exactly
-mirroring how the sicore port left its own `adapter/rpc.go` alone. Only `/api/v1/*` (siclaw's
+mirroring how the control-plane port left its own `adapter/rpc.go` alone. Only `/api/v1/*` (siclaw's
 own portal-web) migrates.
 
 ```
@@ -31,14 +31,14 @@ own portal-web) migrates.
 │  (this change)  │      from / to (ms|ISO)        │  /api/v1 handlers    │
 └─────────────────┘                                └──────────────────────┘
 ┌─────────────────┐   /api/internal/.../metrics    ┌──────────────────────┐
-│  sicore Portal  │ ────────────────────────────▶ │  adapter.ts          │  ◀── DO NOT TOUCH
+│  control-plane Portal  │ ────────────────────────────▶ │  adapter.ts          │  ◀── DO NOT TOUCH
 │  (downstream)   │      period / startDate        │  /api/internal       │
 └─────────────────┘                                └──────────────────────┘
 ```
 
 ## Overall approach
 
-Same shape as the sicore port, adapted to siclaw's stack (Vite SPA, no i18n, no UI lib,
+Same shape as the control-plane port, adapted to siclaw's stack (Vite SPA, no i18n, no UI lib,
 TypeScript backend):
 
 1. **Time model in `useMetrics.ts`** — a `TimeRange { from, to }` where each side is either a
@@ -184,9 +184,9 @@ absolute-positioned panel + a `mousedown` outside-click listener):
 
 | # | Question | Decision | Rationale |
 |---|----------|----------|-----------|
-| 1 | Absolute From/To entry widget | **Hand-rolled mini calendar + text inputs** | Zero new deps, fits siclaw's dependency-free Tailwind style, closest parity to sicore/Grafana. From/To text accept `now-30m`/ISO; an inline month grid sets the date; `Apply` commits. Native `<input type="datetime-local">` was rejected — it can't express relative expressions (`now-30m`), the core of the Grafana model, so it'd force running text + native pickers in parallel. Both peer reviewers flagged the calendar as the highest-effort/bug-density piece and suggested text-only; honored the user's explicit choice for the calendar, mitigated by keeping it date-only, self-contained, and unit-tested. |
-| 2 | Audit tab time source | **Unify under the header picker** (drop Audit's own `rangeMs` select) | Matches sicore's end state; removes the duplicate, drift-prone path. Audit freezes the resolved window per filter change for pagination stability. |
-| 3 | Quick-range set | **Match sicore's 10** (30m / 1h / 3h / 6h / 12h / 24h / 2d / 7d / 30d / 90d) | Cross-product consistency with the downstream sicore dashboard. |
+| 1 | Absolute From/To entry widget | **Hand-rolled mini calendar + text inputs** | Zero new deps, fits siclaw's dependency-free Tailwind style, closest parity to control-plane/Grafana. From/To text accept `now-30m`/ISO; an inline month grid sets the date; `Apply` commits. Native `<input type="datetime-local">` was rejected — it can't express relative expressions (`now-30m`), the core of the Grafana model, so it'd force running text + native pickers in parallel. Both peer reviewers flagged the calendar as the highest-effort/bug-density piece and suggested text-only; honored the user's explicit choice for the calendar, mitigated by keeping it date-only, self-contained, and unit-tested. |
+| 2 | Audit tab time source | **Unify under the header picker** (drop Audit's own `rangeMs` select) | Matches control-plane's end state; removes the duplicate, drift-prone path. Audit freezes the resolved window per filter change for pagination stability. |
+| 3 | Quick-range set | **Match control-plane's 10** (30m / 1h / 3h / 6h / 12h / 24h / 2d / 7d / 30d / 90d) | Cross-product consistency with the downstream control-plane dashboard. |
 
 ### Mini-calendar scope (decision #1)
 

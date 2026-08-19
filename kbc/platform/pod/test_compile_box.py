@@ -1994,7 +1994,7 @@ async def test_test_session_idle_ttl_reaper():
 
 
 async def test_list_test_sessions_endpoint():
-    """Defect 2 (list): GET /test-sessions returns the agreed sicore wire contract
+    """Defect 2 (list): GET /test-sessions returns the agreed control-plane wire contract
     exactly — tid / parent_run_id / created_at / last_activity_at / done — one row
     per live session."""
     compile_box.TEST_SESSIONS.clear()
@@ -2976,13 +2976,13 @@ def test_apply_session_config():
         os.environ.pop("KBC_COMPILE_MODEL", None)
         compile_box._PK_KILL_AT_BOOT = False
         compile_box._apply_session_config({
-            "llm": {"base_url": "https://massapi.example/model-api",
+            "llm": {"base_url": "https://model-gateway.example.com/model-api",
                     "auth_token": "tok-1", "model": "claude-sonnet-4-6"},
             "settings": {"KBC_COMPILE_MODEL": "claude-opus-4-8",
                          "KBC_PK_MODE": "auto",
                          "EVIL_KEY": "nope", "PATH": "/pwn"},
         })
-        assert os.environ["ANTHROPIC_BASE_URL"] == "https://massapi.example/model-api"
+        assert os.environ["ANTHROPIC_BASE_URL"] == "https://model-gateway.example.com/model-api"
         assert os.environ["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
         assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-1"
         assert "ANTHROPIC_API_KEY" not in os.environ           # stale key cleared
@@ -3018,14 +3018,14 @@ def test_apply_session_config():
             "llm": {
                 "engine": "codex_sdk",
                 "protocol": "openai_responses",
-                "base_url": "https://massapi.example/model-api",
+                "base_url": "https://model-gateway.example.com/model-api",
                 "api_key": "mass-key",
                 "model": "gpt-5.6-luna",
             },
             "settings": {"KBC_ENGINE": "claude_agent_sdk"},
         })
         assert os.environ["KBC_ENGINE"] == "codex_sdk"
-        assert os.environ["OPENAI_BASE_URL"] == "https://massapi.example/model-api"
+        assert os.environ["OPENAI_BASE_URL"] == "https://model-gateway.example.com/model-api"
         assert os.environ["OPENAI_API_KEY"] == "mass-key"
         assert os.environ["OPENAI_MODEL"] == "gpt-5.6-luna"
         assert not any(key in os.environ for key in (
@@ -4247,7 +4247,7 @@ async def test_batch_content_fault_skips_batch_but_stall_interrupts():
 
 async def test_batch_zero_progress_second_run_auto_excludes():
     """Finding 2 (07-24 review): a healthy model that simply never writes
-    sources[].resource would loop provider-fault → sicore auto-resume → provider-fault
+    sources[].resource would loop provider-fault → control-plane auto-resume → provider-fault
     until the breaker suspends it for a human. The FIRST zero-progress run stays a
     provider blip (batch pending, no exclusion — a blip must not drop good
     content); a SECOND independent zero-progress run for the SAME batch reclassifies
@@ -6279,7 +6279,7 @@ async def test_workspace_sync_invalidates_verification_before_cross_process_resu
 
 
 async def test_durable_workspace_sync_waits_for_consumer_ack():
-    """A sealed batch is not complete until Sicore commits and ACKs it."""
+    """A sealed batch is not complete until the control plane commits and ACKs it."""
     compile_box.RUNS.clear()
     with tempfile.TemporaryDirectory() as td:
         candidate = Path(td) / "candidate"

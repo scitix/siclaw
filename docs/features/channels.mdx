@@ -107,7 +107,7 @@ Use these application-identity scopes for a complete Siclaw Agent test bot:
 | Read bot metadata (recommended) | `application:bot.basic_info:read` | Keeps the bot name and identity lookup explicit in the app configuration |
 
 Do not add contacts, Drive, Docs, Calendar, or tenant-admin scopes for this
-channel. The optional Sicore identity-binding flow only calls
+channel. The optional ControlPlane identity-binding flow only calls
 `authen/v1/user_info`, which requires no additional API scope for `open_id`,
 display name, and avatar.
 
@@ -117,7 +117,7 @@ The matching platform configuration is:
 2. Select **Long connection** for events and callbacks.
 3. Subscribe to the `im.message.receive_v1` event.
 4. Subscribe to the `card.action.trigger` callback.
-5. Add the Sicore callback URL
+5. Add the ControlPlane callback URL
    `/api/v1/siclaw/personal-bot/oauth/feishu/callback` as an exact redirect URL
    when identity binding is tested.
 6. Publish the app version after changing capabilities, events, callbacks,

@@ -5,7 +5,7 @@
  * model, but it must NEVER be shown or persisted as the user's message.
  *
  * The runtime's own gateway persists the original (pre-injection) text, so siclaw's
- * Web UI is clean. But other portals on the runtime↔portal protocol (e.g. sicore)
+ * Web UI is clean. But other portals on the runtime↔portal protocol (e.g. control-plane)
  * receive the user turn via the agentbox→portal append channel, where the brain's
  * recorded turn carries the injected directive — leaking it into their chat UI.
  * This strips it at the persistence boundary so every consumer sees the clean text.

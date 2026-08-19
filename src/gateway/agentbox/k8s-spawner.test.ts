@@ -261,7 +261,7 @@ describe("K8sSpawner — spawn branches", () => {
     process.env.KBC_PK_MODE = "off";
     process.env.KBC_MEDIA_VERIFY = "on";
     process.env.KBC_SMOKE = ""; // empty ⇒ not forwarded
-    process.env.ANTHROPIC_BASE_URL = "https://massapi.example/model-api";
+    process.env.ANTHROPIC_BASE_URL = "https://model-gateway.example.com/model-api";
 
     const cm = new FakeCertManager();
     const s = new K8sSpawner({ namespace: "siclaw-debug" });
@@ -406,7 +406,7 @@ describe("K8sSpawner — spawn branches", () => {
 
   it("refuses to forward secret-shaped names through the prefix glob (ops knobs only)", async () => {
     process.env.KBC_PK_MODE = "off";                       // knob → forwarded
-    process.env.KBC_MASSAPI_TOKEN = "sk-parked";           // secret-shaped → refused
+    process.env.KBC_MODEL_PROXY_TOKEN = "sk-parked";       // secret-shaped → refused
     process.env.KBC_WEBHOOK_SECRET = "hush";               // secret-shaped → refused
     process.env.KBC_SIGNING_API_KEY = "k";                 // secret-shaped → refused
 
@@ -426,12 +426,12 @@ describe("K8sSpawner — spawn branches", () => {
       await s.spawn({ agentId: "kbrun2", profile: "kb-compile" });
       const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
       expect(env).toContainEqual({ name: "KBC_PK_MODE", value: "off" });
-      for (const leaked of ["KBC_MASSAPI_TOKEN", "KBC_WEBHOOK_SECRET", "KBC_SIGNING_API_KEY"]) {
+      for (const leaked of ["KBC_MODEL_PROXY_TOKEN", "KBC_WEBHOOK_SECRET", "KBC_SIGNING_API_KEY"]) {
         expect(env.some((e: any) => e.name === leaked)).toBe(false);
       }
     } finally {
       delete process.env.KBC_PK_MODE;
-      delete process.env.KBC_MASSAPI_TOKEN;
+      delete process.env.KBC_MODEL_PROXY_TOKEN;
       delete process.env.KBC_WEBHOOK_SECRET;
       delete process.env.KBC_SIGNING_API_KEY;
     }
@@ -1432,4 +1432,3 @@ describe("K8sSpawner — every listing carries what staleness is judged on", () 
     expect(withoutClock(forAgent)).toEqual(withoutClock(fromList));
   });
 });
-

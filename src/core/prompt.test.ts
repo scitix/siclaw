@@ -49,7 +49,7 @@ describe("buildSreSystemPrompt memory flag", () => {
 });
 
 describe("buildSreSystemPrompt visual output guidance", () => {
-  it("authorizes every Mermaid family supported by Sicore Web", () => {
+  it("authorizes every Mermaid family supported by ControlPlane Web", () => {
     const prompt = buildSreSystemPrompt("web");
 
     expect(prompt).toContain("flowchart");

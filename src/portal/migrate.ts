@@ -635,7 +635,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");
   // The wire protocol a model speaks. A PER-MODEL attribute, not a provider one:
   // one endpoint can serve OpenAI-protocol and Claude-protocol models side by
-  // side (api.scitix.ai does exactly that), so there is no meaningful
+  // side (a model gateway can do exactly that), so there is no meaningful
   // provider-wide answer. model_providers.api_type survives only as the value
   // pre-filled when adding a model.
   //

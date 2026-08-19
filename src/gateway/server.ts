@@ -726,7 +726,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // the worker gates its toolset read-only and stamps the result artifact.
     const delegation = params.delegation as PromptOptions["delegation"];
     // A cross-Runtime delegation session is created by the coordinator Runtime
-    // before Sicore routes this chat.send to the target Runtime. Re-inserting the
+    // before ControlPlane routes this chat.send to the target Runtime. Re-inserting the
     // session/user row here would overwrite ownership/lineage and duplicate the
     // delegated task. Only honor the flag on an authenticated delegation turn.
     // promptMessageId intentionally stays undefined on this path: the source
@@ -892,7 +892,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Agent-prompt precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
         // agent's model binding) wins as-is. When the caller does NOT forward one
-        // — e.g. sicore's web-chat proxy, which never sends systemPrompt — fall
+        // — e.g. control-plane's web-chat proxy, which never sends systemPrompt — fall
         // back to the agent's persisted instruction (agents.system_prompt via
         // config.getAgent). Every agent type uses the same precedence.
         //

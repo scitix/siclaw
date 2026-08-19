@@ -447,7 +447,7 @@ describe("handleDelegate — admission fence", () => {
 });
 
 describe("handleDelegate — cross-Runtime routing", () => {
-  it("routes a remote peer through Sicore and never creates it in the coordinator AgentBoxManager", async () => {
+  it("routes a remote peer through ControlPlane and never creates it in the coordinator AgentBoxManager", async () => {
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
     deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
       if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };

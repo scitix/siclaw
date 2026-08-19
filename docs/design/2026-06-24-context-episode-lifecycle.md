@@ -330,7 +330,7 @@ config + normalizer pattern.
 ## 11. Out of scope
 
 The Audit dashboard's **entry-surface breakdown** (splitting metrics by
-web / api / a2a / channels, and aligning with sicore's monitoring system) is a
+web / api / a2a / channels, and aligning with control-plane's monitoring system) is a
 **separate observability concern**, orthogonal to context compaction. It is
 intentionally NOT covered here and should be designed on its own if pursued.
 The episode-observability touch-points in §6.1–§6.4 (episode counts,

@@ -301,13 +301,13 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
 
     const result = await brain.ensureContextForModelPrompt(
-      { id: "gpt-5.5", name: "GPT-5.5", provider: "sicore-custom-model", contextWindow: 0, maxTokens: 100, reasoning: false },
+      { id: "gpt-5.5", name: "GPT-5.5", provider: "custom-model", contextWindow: 0, maxTokens: 100, reasoning: false },
       "hello",
     );
 
     expect(result).toMatchObject({ ok: false, compacted: false, contextWindow: 0 });
     expect(result.errorMessage).toBe(
-      "Context preflight failed for sicore-custom-model/gpt-5.5: context window must be greater than 0 tokens (received 0). Configure a positive context window for this model.",
+      "Context preflight failed for custom-model/gpt-5.5: context window must be greater than 0 tokens (received 0). Configure a positive context window for this model.",
     );
     expect(session.compact).not.toHaveBeenCalled();
   });
@@ -321,13 +321,13 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
 
     const result = await brain.ensureContextForModelPrompt(
-      { id: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro", provider: "sicore-custom-model", contextWindow: 10_000, maxTokens: 8172, reasoning: true },
+      { id: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro", provider: "custom-model", contextWindow: 10_000, maxTokens: 8172, reasoning: true },
       "hello",
     );
 
     expect(result).toMatchObject({ ok: false, compacted: false, contextWindow: 10_000 });
     expect(result.errorMessage).toBe(
-      "Context preflight failed for sicore-custom-model/DeepSeek-V4-Pro: context window 10000 tokens must exceed compaction reserve 16384 tokens. Increase the model context window or lower compaction.reserveTokens.",
+      "Context preflight failed for custom-model/DeepSeek-V4-Pro: context window 10000 tokens must exceed compaction reserve 16384 tokens. Increase the model context window or lower compaction.reserveTokens.",
     );
     expect(session.compact).not.toHaveBeenCalled();
   });

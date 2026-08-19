@@ -1,6 +1,6 @@
 """In-pod de-streaming shim for the Anthropic Messages route (charset fix).
 
-massapi's Anthropic-compatible STREAMING route corrupts multibyte characters
+An Anthropic-compatible proxy's STREAMING route corrupts multibyte characters
 whose bytes straddle an SSE chunk boundary (the gateway decodes each chunk
 independently with errors=replace → U+FFFD); its NON-streaming route returns
 the same bytes intact (gateway bug report, 2026-07). The compile box is
@@ -20,7 +20,7 @@ CLI env, TEST sessions always keep true streaming for interactive UX, the
 codex/OpenAI route is untouched, and KBC_DESTREAM=0/off is the operator
 escape hatch (e.g. once the gateway ships cross-chunk incremental decoding).
 Blast radius is this container image only: the shim binds 127.0.0.1 inside
-the siclaw-kbc-box pod; runtime/agentbox/sicore LLM callers never see it.
+the siclaw-kbc-box pod; runtime/agentbox/control-plane LLM callers never see it.
 """
 
 from __future__ import annotations

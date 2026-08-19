@@ -30,8 +30,8 @@ export type EntryMode = "all" | "web" | "api" | "a2a" | "channel" | "scheduled";
  * For **channel** sessions the audit actor is the channel sender (the raw
  * sender id — Lark open_id / DingTalk staffId — which is the "same person" key),
  * NOT the binding owner. For every other origin it is the session's `user_id`
- * (web=logged-in, api/a2a=API-key owner). siclaw has no SiCore-user concept, so
- * no SiCore identity appears here.
+ * (web=logged-in, api/a2a=API-key owner). siclaw has no remote-user concept, so
+ * no ControlPlane identity appears here.
  *
  * Use this ONLY for the actor-based FILTER and the distinct-actor COUNT — it is
  * the canonical "who acted" expression. Do NOT project it as the response

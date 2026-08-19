@@ -38,7 +38,7 @@ function completedTask() {
 }
 
 describe("stdio process", () => {
-  it("bridges a real MCP subprocess call to the Sicore A2A HTTP contract", async () => {
+  it("bridges a real MCP subprocess call to the ControlPlane A2A HTTP contract", async () => {
     let observedAuth = "";
     let observedBody: unknown;
     const mock = createServer(async (request, response) => {
@@ -57,7 +57,7 @@ describe("stdio process", () => {
       command: process.execPath,
       args: ["--import", "tsx", adapterEntrypoint],
       env: {
-        SICORE_URL: `http://127.0.0.1:${port}`,
+        A2A_URL: `http://127.0.0.1:${port}`,
         SICLAW_AGENT_ID: "agent-e2e",
         SICLAW_A2A_KEY: "e2e-key",
       },
@@ -104,7 +104,7 @@ describe("stdio process", () => {
       command: process.execPath,
       args: ["--import", "tsx", adapterEntrypoint],
       env: {
-        SICORE_URL: `http://127.0.0.1:${port}`,
+        A2A_URL: `http://127.0.0.1:${port}`,
         SICLAW_A2A_KEY: "e2e-key",
       },
       stderr: "pipe",
@@ -147,7 +147,7 @@ describe("stdio process", () => {
       command: process.execPath,
       args: ["--import", "tsx", adapterEntrypoint],
       env: {
-        SICORE_URL: `http://127.0.0.1:${port}`,
+        A2A_URL: `http://127.0.0.1:${port}`,
         SICLAW_A2A_KEYS: JSON.stringify({ sre: "secret-key-sre", kb: "secret-key-kb" }),
       },
       stderr: "pipe",

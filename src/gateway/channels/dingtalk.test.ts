@@ -323,7 +323,7 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     expect(ecArgs[2]).toBe("owner-1");     // user_id = binding owner (ownership)
     expect(ecArgs[5]).toBe("channel");     // origin
     // The channel sender is the raw staff id, the channel is "ch", stamped on the
-    // session. NEVER the owner. siclaw has no SiCore-user concept.
+    // session. NEVER the owner. siclaw has no remote-user concept.
     expect(ecArgs[7]).toMatchObject({ senderExternalId: "staff-1", channelId: "ch" });
 
     const rows = appendMessageMock.mock.calls.map((c) => c[0] as any);
@@ -414,7 +414,7 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     // Method-aware mock: config.getModelBinding → full binding; config.getAgent → system prompt.
     const frontend = { request: vi.fn(async (method: string) => {
       if (method === "config.getModelBinding") {
-        return { binding: { modelProvider: "sicore-custom-x", modelId: "deepseek-ai/DeepSeek-V4-Pro", modelConfig, modelRouting, systemPrompt: "p" } };
+        return { binding: { modelProvider: "custom-x", modelId: "deepseek-ai/DeepSeek-V4-Pro", modelConfig, modelRouting, systemPrompt: "p" } };
       }
       return { system_prompt: "p" };
     }) };
@@ -423,7 +423,7 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
 
     expect(frontend.request).toHaveBeenCalledWith("config.getModelBinding", { agentId: "agent-mb" });
     const promptArg = promptMock.mock.calls[0][0] as any;
-    expect(promptArg.modelProvider).toBe("sicore-custom-x");
+    expect(promptArg.modelProvider).toBe("custom-x");
     expect(promptArg.modelId).toBe("deepseek-ai/DeepSeek-V4-Pro");
     expect(promptArg.modelConfig).toEqual(modelConfig);
     expect(promptArg.modelRouting).toEqual(modelRouting);

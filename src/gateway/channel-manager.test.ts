@@ -177,7 +177,7 @@ describe("personal binding RPC wrappers", () => {
     expect("denied" in result).toBe(false);
   });
 
-  it("pairs a personal Sicore user binding", async () => {
+  it("pairs a personal ControlPlane user binding", async () => {
     frontend.responses.set("channel.pairPersonal", { success: true, agentName: "Agent" });
     const result = await handlePersonalPairingCode("ABC123", "pb1", "ou_1", frontend as unknown as FrontendWsClient);
     expect(result).toEqual({ success: true, agentName: "Agent" });
@@ -189,11 +189,11 @@ describe("personal binding RPC wrappers", () => {
 
   it("resets a personal session by session_key", async () => {
     frontend.responses.set("channel.resetPersonalSession", { success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
-    const result = await resetPersonalSession("pb1", "sicore_user:u1", frontend as unknown as FrontendWsClient);
+    const result = await resetPersonalSession("pb1", "platform_user:u1", frontend as unknown as FrontendWsClient);
     expect(result).toEqual({ success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
     expect(frontend.calls[0]).toEqual({
       method: "channel.resetPersonalSession",
-      params: { channel_id: "pb1", session_key: "sicore_user:u1" },
+      params: { channel_id: "pb1", session_key: "platform_user:u1" },
     });
   });
 

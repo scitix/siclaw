@@ -61,7 +61,7 @@ function extractModelEntrySelects(src: string): string[] {
  * Column-list SELECTs that legitimately do NOT need api_type, because they feed
  * something other than a model descriptor. Keyed by the projected columns.
  *
- * - `model_id` alone: default-model lookups (adapter's sicore endpoints,
+ * - `model_id` alone: default-model lookups (adapter's control-plane endpoints,
  *   ai-security-reviewer's bare chat/completions fetch) — no descriptor built.
  * - `me.id`: ownership checks in the admin CRUD.
  * - `*`: admin CRUD echoes the whole row back to the Portal UI.

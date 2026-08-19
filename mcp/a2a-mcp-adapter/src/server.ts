@@ -24,7 +24,7 @@ export function buildInstructions(router: AgentRouter): string {
 
 export function createMcpServer(router: AgentRouter): Server {
   const server = new Server(
-    { name: "sicore-a2a-mcp-adapter", version: "0.1.0" },
+    { name: "a2a-mcp-adapter", version: "0.1.0" },
     { capabilities: { tools: {} }, instructions: buildInstructions(router) },
   );
   const handleTool = createToolHandler(router);

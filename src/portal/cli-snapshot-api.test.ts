@@ -189,7 +189,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     const db = getDb();
     await db.query(
       "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ["p-gw", "default", "gateway", "https://api.scitix.ai/model-api", "sk-test", "openai-completions", 0],
+      ["p-gw", "default", "gateway", "https://model-gateway.example.com/model-api", "sk-test", "openai-completions", 0],
     );
     const insertModel = (id: string, modelId: string, apiType: string | null, sort: number) =>
       db.query(
@@ -248,7 +248,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     const db = getDb();
     await db.query(
       "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ["p-mixed", "default", "mixed", "https://api.scitix.ai/model-api", "sk-test", "openai-completions", 0],
+      ["p-mixed", "default", "mixed", "https://model-gateway.example.com/model-api", "sk-test", "openai-completions", 0],
     );
     const insert =
       "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, max_tokens_field, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";

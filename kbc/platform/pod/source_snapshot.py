@@ -23,7 +23,7 @@ from typing import Callable
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PART_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-# Sicore admits individual Feishu/Drive source files up to 200 MiB. A tar+gzip
+# ControlPlane admits individual Feishu/Drive source files up to 200 MiB. A tar+gzip
 # transport object for an incompressible file can be slightly larger than the
 # source itself, so keep a bounded 256 MiB envelope on both the compressed and
 # declared-unpacked sides. The compile-box HTTP request ceiling remains 768 MiB,
@@ -78,7 +78,7 @@ def canonical_file_manifest(files: list[dict]) -> bytes:
         ({"path": item["path"], "sha256": item["sha256"], "size_bytes": item["size_bytes"]} for item in files),
         key=lambda item: item["path"],
     )
-    # Sicore computes this digest with Go's encoding/json.  Its otherwise
+    # ControlPlane computes this digest with Go's encoding/json.  Its otherwise
     # compact UTF-8 output escapes the HTML-sensitive code points and the two
     # JavaScript line separators even inside filenames.  Mirror that wire
     # contract explicitly; Python's json encoder leaves these characters raw
@@ -293,7 +293,7 @@ def _extract_part(bundle: bytes, destination: Path, part: dict) -> None:
             except ValueError as exc:
                 raise ValueError(f"unsafe source path {member.name!r}: escapes part directory") from exc
             if not member.isfile():
-                # The Sicore writer emits file entries only; parent directories
+                # The ControlPlane writer emits file entries only; parent directories
                 # are created from each declared path. Reject every extra tar
                 # member so a small descriptor cannot hide a directory-entry
                 # amplification payload.

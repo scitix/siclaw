@@ -6,7 +6,7 @@
 
 LLM 鉴权走 SDK 默认:
   - 本地:复用订阅(SDK 自带的 claude 二进制读 ~/.claude 鉴权)。
-  - 生产 pod:设 ANTHROPIC_BASE_URL → 公司 massapi(key 容器外注入)。
+  - 生产 pod:设 ANTHROPIC_BASE_URL → 模型代理(key 容器外注入)。
 
 用法:python compile_agent.py --workdir /path/to/workdir
 """

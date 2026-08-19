@@ -171,7 +171,7 @@ export interface AuditResponse {
 // absolute ms at fetch time, so the backend only ever sees absolute windows.
 // Relative ranges therefore "slide" (re-resolve to the current now on each
 // fetch); absolute ranges are fixed. This mirrors Grafana's model and the
-// downstream sicore dashboard.
+// downstream control-plane dashboard.
 
 export interface TimeRange {
   from: string
@@ -560,7 +560,7 @@ export function useChannels(): { channels: ChannelListEntry[]; loading: boolean 
 
 // ── Channel senders (distinct open_ids / staffIds seen in a window) ──
 // Feeds the Metrics open_id filter combobox so an admin can pin one sender even
-// when they are not linked to a SiCore account.
+// when they are not linked to a ControlPlane account.
 
 export interface ChannelSender { senderId: string; sessionCount: number; messageCount: number; lastSeen: string }
 

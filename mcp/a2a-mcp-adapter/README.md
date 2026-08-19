@@ -1,20 +1,24 @@
-# Sicore A2A MCP Adapter
+# ControlPlane A2A MCP Adapter
 
 A minimal local stdio MCP server that lets Codex or Claude Code drive one or more
-existing Siclaw agents through Sicore's A2A API.
+existing Siclaw agents through ControlPlane's A2A API.
 
 The adapter is intentionally thin:
 
 ```text
-Codex / Claude Code --stdio MCP--> this adapter --HTTPS A2A--> Sicore --> Siclaw Runtime --> the agent's existing AgentBox
+Codex / Claude Code --stdio MCP--> this adapter --HTTPS A2A--> ControlPlane --> Siclaw Runtime --> the agent's existing AgentBox
 ```
 
 It does not hold cluster credentials, choose what a Siclaw agent does, or execute
 infrastructure tools.
 
+The package uses public-neutral names throughout. Deployments must provide the
+new endpoint and visual-export environment variables described below; legacy
+private naming aliases are intentionally not retained.
+
 ## Multiple agents, one adapter
 
-Each Sicore A2A key is bound to exactly one Siclaw agent. Historically one adapter
+Each ControlPlane A2A key is bound to exactly one Siclaw agent. Historically one adapter
 process meant one key meant one agent, so switching agents meant editing config and
 restarting.
 
@@ -59,7 +63,7 @@ The original single-key environment variables keep working unchanged and map to
 the reserved alias `default`:
 
 - `SICLAW_A2A_KEY` / `SICLAW_A2A_KEY_FILE` alone → one agent named `default`.
-- `SICLAW_AGENT_ID` still pins the `default` agent (for an older Sicore without
+- `SICLAW_AGENT_ID` still pins the `default` agent (for an older ControlPlane without
   `/self`, or as a cross-check). It applies only to the single-key form; combining
   it with `SICLAW_A2A_KEYS` is a configuration error, because each named key
   resolves its own agent.
@@ -106,7 +110,7 @@ Requires Node.js 22.19 or newer.
 
 Required:
 
-- `SICORE_URL`: Sicore base URL, for example `https://sicore.example.com`.
+- `A2A_URL`: ControlPlane base URL, for example `https://control-plane.example.com`.
 - at least one key, from any combination of:
   - `SICLAW_A2A_KEYS`: JSON object of named keys, e.g. `{"sre":"sk-a","kb":"sk-b"}`.
     Alias must match `^[a-z0-9][a-z0-9_-]{0,31}$`.
@@ -119,7 +123,7 @@ Optional:
 
 - `SICLAW_AGENT_ID`: the agent UUID bound to the single `default` key. By default
   the adapter resolves the agent from each key at startup (`GET /api/v1/a2a/self`).
-  Set it to pin the `default` agent as a cross-check or for an older Sicore without
+  Set it to pin the `default` agent as a cross-check or for an older ControlPlane without
   `/self`. It cannot be combined with `SICLAW_A2A_KEYS`.
 - `SICLAW_A2A_TIMEOUT_MS`: network-operation timeout, default `30000`. Bounded GET
   retries share this same budget.
@@ -145,7 +149,7 @@ not in a shared/committed config.
 Single key:
 
 ```bash
-SICORE_URL=https://sicore.example.com \
+A2A_URL=https://control-plane.example.com \
 SICLAW_A2A_KEY_FILE=~/.config/siclaw/test-a2a-key \
 node dist/index.js
 ```
@@ -153,7 +157,7 @@ node dist/index.js
 Multiple named keys:
 
 ```bash
-SICORE_URL=https://sicore.example.com \
+A2A_URL=https://control-plane.example.com \
 SICLAW_A2A_KEYS='{"sre":"sk-a","kb":"sk-b"}' \
 node dist/index.js
 ```
@@ -168,18 +172,18 @@ directory:
 
 ```bash
 codex mcp add \
-  --env SICORE_URL=https://sicore.example.com \
+  --env A2A_URL=https://control-plane.example.com \
   --env SICLAW_A2A_KEYS='{"sre":"sk-a","kb":"sk-b"}' \
-  siclaw -- node /absolute/path/to/sicore-a2a-adapter/dist/index.js
+  siclaw -- node /absolute/path/to/a2a-mcp-adapter/dist/index.js
 ```
 
 ## Claude Code
 
 ```bash
 claude mcp add -s user \
-  -e SICORE_URL=https://sicore.example.com \
+  -e A2A_URL=https://control-plane.example.com \
   -e SICLAW_A2A_KEYS='{"sre":"sk-a","kb":"sk-b"}' \
-  siclaw -- node /absolute/path/to/sicore-a2a-adapter/dist/index.js
+  siclaw -- node /absolute/path/to/a2a-mcp-adapter/dist/index.js
 ```
 
 The model-visible tool schemas contain no key parameter and no `agent_id`
@@ -188,7 +192,7 @@ single-key form and omit `agent`; with several, the model passes the alias.
 
 ## Watchdog behavior
 
-Sicore owns the durable background task. The local adapter stays stateless across
+ControlPlane owns the durable background task. The local adapter stays stateless across
 restarts (the only in-memory state is the `task_id -> alias` map, which
 `siclaw_list_tasks` rebuilds). When `siclaw_investigate` returns a working task,
 the MCP client should keep the current turn open and call `siclaw_wait_task` with
@@ -220,9 +224,9 @@ previous conversation.
 - Adapter restarts do not lose server-side tasks; recover them with
   `siclaw_list_tasks` using the same keys.
 
-## Relation to the remote Sicore MCP endpoint
+## Relation to the remote ControlPlane MCP endpoint
 
-Sicore also exposes a first-party remote MCP endpoint (`/api/v1/mcp`, stateless
+ControlPlane also exposes a first-party remote MCP endpoint (`/api/v1/mcp`, stateless
 streamable HTTP). That endpoint is out of scope for this adapter: each remote MCP
 client configuration carries its own `Authorization` header, so multi-agent use
 there is just multiple client configurations, one per agent — no alias multiplexing

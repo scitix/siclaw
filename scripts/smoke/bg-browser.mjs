@@ -13,7 +13,7 @@ import WebSocket from "ws";
 const baseUrl = process.env.SICLAW_PORTAL_URL ?? "http://127.0.0.1:18080";
 const apiBase = `${baseUrl}/api/v1`;
 const chromeBin = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
-const HOST = process.env.HOST_NAME ?? "172.16.73.22";
+const HOST = process.env.HOST_NAME ?? "192.0.2.22";
 const MARKER = process.env.MARKER ?? `SMOKE_UI_${Date.now() % 100000}`;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 

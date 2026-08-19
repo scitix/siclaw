@@ -290,10 +290,10 @@ export interface LarkChannelConfig {
     agent_id: string;
     // Admission tier, decided ENTIRELY by the frontend — the runtime never interprets it to
     // allow or refuse, it only picks fallback copy when a refusal arrives without a reason.
-    // `open`/`sicore_authorized` are the legacy spellings of `public`/`granted`. Typed as a
+    // `open`/`platform_authorized` are the legacy spellings of `public`/`granted`. Typed as a
     // union plus `string` on purpose: a frontend may introduce a tier this build has never
     // heard of, and the branch below must treat that as "gated", never as "let everyone in".
-    access_mode: "open" | "public" | "identified" | "granted" | "sicore_authorized" | (string & {});
+    access_mode: "open" | "public" | "identified" | "granted" | "platform_authorized" | (string & {});
     owner_user_id?: string;
     authorize_url?: string;
     group_auto_bind?: boolean;
@@ -610,7 +610,7 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
  * The return value is the card-callback response Feishu shows as a toast.
  * Feishu enforces a hard ~3s budget on that response measured END-TO-END
  * (its edge → this pod → back). We MUST NOT block it on the persist RPC:
- * persistence hops to Portal/sicore over WS, and that latency plus the two
+ * persistence hops to Portal/control-plane over WS, and that latency plus the two
  * network legs intermittently blew the 3s budget — Feishu then rejected an
  * otherwise-valid response with business error 200671, even though the vote
  * had already been written. So respond OPTIMISTICALLY and immediately, and
@@ -1489,7 +1489,7 @@ export async function handleLarkMessage(
   // Use the SERVER-authoritative session key (not the local open_id default) for
   // both the queue and the queued context, so the two-path contract holds:
   //   - open group     → open_id:<sender>  (per-sender: concurrent + isolated)
-  //   - authorized group → sicore_user:<id> (per-user)
+  //   - authorized group → platform_user:<id> (per-user)
   //   - personal topic → <participant-key>:lark_thread:<root message>
   //   - shared group → chat:<route-key> (topic candidates are ignored)
   //   - legacy single binding session → "" (binding-level queue + /new reset)

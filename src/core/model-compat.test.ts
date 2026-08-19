@@ -120,7 +120,7 @@ describe("buildProviderModelDescriptor — per-model protocol", () => {
 
   // The production case: one aggregator gateway, mixed protocols.
   it("lets models on one gateway speak different protocols", () => {
-    const gateway = { api: "openai-completions", baseUrl: "https://api.scitix.ai/model-api" };
+    const gateway = { api: "openai-completions", baseUrl: "https://model-gateway.example.com/model-api" };
     expect(buildProviderModelDescriptor(
       { ...row("anthropic-messages"), model_id: "claude-sonnet-5" }, gateway,
     ).api).toBe("anthropic-messages");
@@ -191,7 +191,7 @@ describe("looksLikeOpenAiReasoningModel", () => {
 });
 
 describe("resolveMaxTokensField", () => {
-  const gateway = { api: "openai-completions", baseUrl: "https://api.scitix.ai/model-api" };
+  const gateway = { api: "openai-completions", baseUrl: "https://model-gateway.example.com/model-api" };
   const anthropic = { api: "anthropic", baseUrl: "https://api.anthropic.com/v1" };
 
   it("uses an explicit override", () => {
@@ -228,7 +228,7 @@ describe("resolveMaxTokensField", () => {
 });
 
 describe("buildProviderModelDescriptor — per-model max-tokens field", () => {
-  const gateway = { api: "openai-completions", baseUrl: "https://api.scitix.ai/model-api" };
+  const gateway = { api: "openai-completions", baseUrl: "https://model-gateway.example.com/model-api" };
   const row = (model_id: string, max_tokens_field?: string | null) => ({
     model_id, context_window: 128000, max_tokens: 4096, max_tokens_field,
   });

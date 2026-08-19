@@ -7,8 +7,8 @@ describe("formatToolInput — host_exec / host_script", () => {
   const ID = "d456a827-8dca-4e0c-954c-0bfdf9e78450"
 
   it("host_exec shows '<resolved name> $ <command>' when metadata.host_label is present", () => {
-    const s = formatToolInput("host_exec", { host: ID, command: "ping -c 100 10.155.55.254" }, { host_label: "061" })
-    expect(s).toBe("061 $ ping -c 100 10.155.55.254")
+    const s = formatToolInput("host_exec", { host: ID, command: "ping -c 100 192.0.2.254" }, { host_label: "061" })
+    expect(s).toBe("061 $ ping -c 100 192.0.2.254")
     expect(s).not.toContain(ID)
   })
 

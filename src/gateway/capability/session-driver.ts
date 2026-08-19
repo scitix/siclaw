@@ -190,7 +190,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
             }
             // Persistence acknowledgement is a second, idempotent hop back to
             // KBC. Until it lands, the box must not start the next batch. A WS
-            // reconnect may replay the same sync_id; Sicore upserts atomically
+            // reconnect may replay the same sync_id; the control plane upserts atomically
             // and this endpoint accepts duplicate ACKs.
             let ackDelayMs = 250;
             for (;;) {
