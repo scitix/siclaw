@@ -99,8 +99,8 @@ export async function extractKnowledgePackageToDir(buf: Buffer, targetDir: strin
   const archivePath = path.join(tmpDir, "knowledge.tar.gz");
   try {
     await fs.writeFile(archivePath, buf, { mode: 0o600 });
-    // Package citation metadata is uploader-supplied input. Sicore validates
-    // and freezes it, then sends the canonical citationSources separately.
+    // Package citation metadata is uploader-supplied input. The import service
+    // validates and freezes it, then sends canonical citationSources separately.
     // Never expose the uploaded copy to the model-visible knowledge tree.
     await execFileAsync("tar", ["-xzf", archivePath, "-C", targetDir, `--exclude=${OKF_CITATION_SIDECAR}`]);
     return info;
