@@ -283,6 +283,34 @@ consulted when stdout is empty, so a command whose own output contains `error:` 
 broken channel; `command terminated with exit code N` is deliberately NOT a marker, because it means
 the command did run.
 
+### 6.1c Projecting JSON Output (`json_path`)
+
+`node_exec`, `pod_exec` and `host_exec` accept an optional `json_path` that projects a field out of
+the command's JSON output. It is evaluated **in the AgentBox**, which is the point: the JSON-emitting
+diagnostics that matter (`crictl inspect`, `nvidia-smi -q -x`, `ip -j`) run on targets that usually do
+not have `jq`, so the alternative was pulling the whole document back.
+
+Grammar, in full: `.a.b`, `.a[0]` (negative counts from the end), `.a[]` / `.a[*]` to map over an
+array, `.["quoted name"]`, `.` for the document. **There is no expression language** — no filters,
+conditions, functions or arithmetic. A filter is rejected rather than ignored, so a path that looks
+like jq cannot silently project something else.
+
+Not implemented with jq, deliberately: that would hand agent-authored program text to a process
+running as `agentbox` — the user that owns the credentials — and jq's `$ENV` reads the environment. A
+projection needs none of that, and this evaluator cannot reach outside the parsed document at all.
+
+Its position in the pipeline is a requirement, not a preference (`PostExecOptions.project`):
+
+- **after** sanitization — projecting first would strip the shape a structural sanitizer matches on
+  (crictl's `info.config.envs`) and could hand back a value it would have redacted;
+- **before** truncation — truncated JSON does not parse, so a projection running later would fail
+  exactly on the large documents it exists for.
+
+Two consequences worth knowing: a structural sanitizer appends a redaction notice, which makes its own
+output un-parseable, so the projector parses the JSON span and ignores trailing prose; and it
+re-appends that notice to the projection, because a projected answer must not read as verbatim when it
+is edited.
+
 ### 6.2 Security Strategy: Pre-Execution vs Post-Execution
 
 The security pipeline uses two complementary strategies — understanding which

@@ -65,6 +65,17 @@ export interface PostExecOptions {
   stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
   hasSensitiveKubectl?: boolean;
+  /**
+   * Optional projection of the SANITIZED stdout (json_path). Its position in the pipeline is a
+   * security and a correctness requirement, not a preference:
+   *
+   *   - it runs AFTER sanitization, because projecting first would strip the shape a structural
+   *     sanitizer matches on (crictl's `info.config.envs`) and could surface a value it would have
+   *     redacted;
+   *   - it runs BEFORE truncation, because truncated JSON does not parse — which would make the
+   *     feature fail exactly on the large documents it exists for.
+   */
+  project?: (sanitizedStdout: string) => string;
 }
 
 /**
@@ -88,6 +99,9 @@ export function postExecSecurity(
   let sanitized = applySanitizer(stdout, action);
   if (opts?.hasSensitiveKubectl) {
     sanitized = redactSensitiveContent(sanitized);
+  }
+  if (opts?.project) {
+    sanitized = opts.project(sanitized);
   }
   const combined = opts?.stderr
     ? sanitized + `\n\nSTDERR:\n${opts.stderr}`

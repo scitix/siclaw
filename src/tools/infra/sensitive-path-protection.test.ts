@@ -110,7 +110,9 @@ describe("validateCommand blocks sensitive paths in all contexts", () => {
           sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
         });
         expect(err).not.toBeNull();
-        expect(err).toContain("sensitive paths");
+        // The discriminator, not the prose — the refusal now names the matched text and an
+        // alternative, and a phrase assertion would break on any rewording of it.
+        expect(JSON.parse(err as string).rejected_by).toBe("sensitive_path");
       });
     }
   }

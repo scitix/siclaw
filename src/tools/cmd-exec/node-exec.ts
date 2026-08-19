@@ -11,7 +11,8 @@ import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
-import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
+import { jsonPathProjector } from "../infra/json-projection.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import {
   validateNodeName,
   validatePodName,
@@ -67,6 +68,7 @@ export { validateCommand } from "../infra/command-validator.js";
 interface NodeExecParams {
   node?: string;
   command: string;
+  json_path?: string;
   netns?: string;
   pod?: string;
   namespace?: string;
@@ -76,6 +78,7 @@ interface NodeExecParams {
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
+
 
 export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
@@ -98,9 +101,9 @@ The pod is automatically cleaned up after execution (--rm).
 Commands run on the HOST — they have access to the host's tools, filesystem, devices, /proc, /sys, and /dev.
 The list below is what POLICY permits, not what the node has installed: binaries resolve from the
 node's own PATH, so a permitted command can still fail with exit 127 on a node that lacks it. That
-is a property of the node, not of this tool. jq and yq in particular are usually absent — for JSON,
-prefer a command's own output flags (crictl inspectp -o go-template, --format=) over piping to a
-JSON processor.
+is a property of the node, not of this tool. jq and yq in particular are usually absent, so do NOT
+pipe to a JSON processor — ask the command for JSON (crictl inspectp -o json, ip -j, nvidia-smi -q -x)
+and pass json_path to project the field you want. That is evaluated here, not on the node.
 
 Use this tool for host-level diagnostics that cannot be done from within a pod, such as:
 - Inspecting host network interfaces, routes, and RDMA devices
@@ -196,6 +199,16 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
         })
       ),
+      json_path: Type.Optional(
+        Type.String({
+          description:
+            "Project a field out of the command's JSON output instead of returning the whole document. " +
+            "Evaluated HERE, not on the target — so it works on a target without jq, which most nodes are. " +
+            "Grammar: .a.b, .a[0] (negative counts from the end), .a[] to map over an array, " +
+            '.["odd key"]. Projection only — there are no filters, conditions or functions. ' +
+            "Applied to the sanitized output before truncation, so it is the way to read a large document.",
+        }),
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 30, max: 120; ignored when run_in_background — see that param)",
@@ -234,6 +247,12 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
+
+      // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
+      // would answer with a kubeconfig error and hide the actual mistake.
+      if (backgroundEnabled && params.run_in_background === true && params.json_path) {
+        return backgroundJsonPathError();
+      }
 
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_exec");
@@ -459,7 +478,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       // structural (JSON) sanitizer that cannot parse a failed command's output replaces the whole
       // body with a suppression notice — which silently ate the classification.
       return {
-        content: [{ type: "text", text: appendAnnotation(postExecSecurity(body, pre.action, { stderr: filteredStderr || undefined }), judgment.annotation) }],
+        content: [{ type: "text", text: appendAnnotation(postExecSecurity(body, pre.action, { stderr: filteredStderr || undefined, project: jsonPathProjector(params.json_path) }), judgment.annotation) }],
         details: {
           exitCode: execResult.exitCode ?? 0,
           exit_class: judgment.exitClass,

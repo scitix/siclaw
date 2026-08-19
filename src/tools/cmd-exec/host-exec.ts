@@ -8,8 +8,9 @@ import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
+import { jsonPathProjector } from "../infra/json-projection.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
-import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import { validateNodeName, validatePodName } from "../infra/exec-utils.js";
 import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
@@ -17,6 +18,7 @@ import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js
 interface HostExecParams {
   host: string;
   command: string;
+  json_path?: string;
   pod?: string;
   namespace?: string;
   container?: string;
@@ -40,6 +42,7 @@ const HOST_BG_MAX_TTL = 3600;
  * the COMMANDS registry has no ssh / scp / sftp / sshpass entries — those are
  * blocked at the local context whitelist (DESIGN risk #1).
  */
+
 export function createHostExecTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
@@ -103,6 +106,16 @@ Examples (pass the id from host_list; names shown here for readability):
       container: Type.Optional(
         Type.String({ description: "Container name (multi-container pods). Only used with `pod`." }),
       ),
+      json_path: Type.Optional(
+        Type.String({
+          description:
+            "Project a field out of the command's JSON output instead of returning the whole document. " +
+            "Evaluated HERE, not on the target — so it works on a target without jq, which most nodes are. " +
+            "Grammar: .a.b, .a[0] (negative counts from the end), .a[] to map over an array, " +
+            '.["odd key"]. Projection only — there are no filters, conditions or functions. ' +
+            "Applied to the sanitized output before truncation, so it is the way to read a large document.",
+        }),
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 30, max: 120; in background: default 600, max 3600)",
@@ -141,6 +154,12 @@ Examples (pass the id from host_list; names shown here for readability):
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as HostExecParams;
+
+      // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
+      // would answer with a kubeconfig error and hide the actual mistake.
+      if (backgroundEnabled && params.run_in_background === true && params.json_path) {
+        return backgroundJsonPathError();
+      }
 
       // Validate host name format (reuse node naming rules — RFC 1123)
       const hostErr = validateNodeName(params.host);
@@ -306,7 +325,7 @@ Examples (pass the id from host_list; names shown here for readability):
         content: [{
           type: "text",
           text: appendAnnotation(
-            postExecSecurity(stdout, pre.action, { stderr: result.stderr.trim() || undefined }),
+            postExecSecurity(stdout, pre.action, { stderr: result.stderr.trim() || undefined, project: jsonPathProjector(params.json_path) }),
             judgment.annotation,
           ),
         }],

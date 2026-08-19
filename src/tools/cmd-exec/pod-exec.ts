@@ -12,7 +12,8 @@ import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
-import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
+import { jsonPathProjector } from "../infra/json-projection.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import { validatePodName, prepareExecEnv, filterPodNoise } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
@@ -27,10 +28,12 @@ interface PodExecParams {
   namespace?: string;
   container?: string;
   command: string;
+  json_path?: string;
   cluster?: string;
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
+
 
 export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
@@ -90,6 +93,16 @@ Examples:
           description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         }),
       ),
+      json_path: Type.Optional(
+        Type.String({
+          description:
+            "Project a field out of the command's JSON output instead of returning the whole document. " +
+            "Evaluated HERE, not on the target — so it works on a target without jq, which most nodes are. " +
+            "Grammar: .a.b, .a[0] (negative counts from the end), .a[] to map over an array, " +
+            '.["odd key"]. Projection only — there are no filters, conditions or functions. ' +
+            "Applied to the sanitized output before truncation, so it is the way to read a large document.",
+        }),
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 30, max: 120; ignored when run_in_background)",
@@ -128,6 +141,12 @@ Examples:
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as PodExecParams;
+
+      // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
+      // would answer with a kubeconfig error and hide the actual mistake.
+      if (backgroundEnabled && params.run_in_background === true && params.json_path) {
+        return backgroundJsonPathError();
+      }
 
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_exec");
@@ -239,8 +258,8 @@ Examples:
         );
 
         return {
-          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: filterPodNoise(stderr.trim()) || undefined }) }],
-          details: { exitCode: 0 },
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: filterPodNoise(stderr.trim()) || undefined, project: jsonPathProjector(params.json_path) }) }],
+          details: { exitCode: 0, exit_class: "success" },
         };
       } catch (err: any) {
         // User Stop → execFile rejects with an AbortError; surface a clean "Aborted." rather than
@@ -263,7 +282,7 @@ Examples:
           context: "pod",
         });
         return {
-          content: [{ type: "text", text: appendAnnotation(postExecSecurity(stdout || "(no output)", pre.action, { stderr: stderr || undefined }), judgment.annotation) }],
+          content: [{ type: "text", text: appendAnnotation(postExecSecurity(stdout || "(no output)", pre.action, { stderr: stderr || undefined, project: jsonPathProjector(params.json_path) }), judgment.annotation) }],
           details: {
             exitCode: err.code ?? "unknown",
             exit_class: judgment.exitClass,

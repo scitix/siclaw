@@ -471,7 +471,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
         return {
           content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: stderr.trim() || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
-          details: { exitCode: 0 },
+          details: { exitCode: 0, exit_class: "success" },
         };
       } catch (err: any) {
         const errStderr = err.stderr?.trim() ?? err.message;

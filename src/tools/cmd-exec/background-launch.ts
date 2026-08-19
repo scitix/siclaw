@@ -27,6 +27,27 @@ export function backgroundNotLineSafeError(): BackgroundToolResult {
 }
 
 /**
+ * `json_path` with `run_in_background` is refused rather than ignored.
+ *
+ * A background command's output is streamed to a file as it arrives; there is no complete document to
+ * project, and `task_output` reads that file rather than passing back through this pipeline. Accepting
+ * both would silently drop the projection — the agent would ask for one field, get the whole stream,
+ * and have no way to tell that its parameter did nothing.
+ */
+export function backgroundJsonPathError(): BackgroundToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify({
+      error: true,
+      message: "json_path cannot be combined with run_in_background: background output is streamed to a "
+        + "file as it arrives, so there is no complete JSON document to project.",
+      hint: "Either drop run_in_background and project the result, or keep the background run and read "
+        + "the file with task_output(task_id) when it completes.",
+    }) }],
+    details: { blocked: true, reason: "background_json_path_unsupported" },
+  };
+}
+
+/**
  * The "launched" success result. `runningWhere` is the short human lead-in (e.g.
  * "Running on the node in the background."); everything after it — the END-YOUR-TURN
  * guidance and the "these are internal handles, don't show the user" instruction — is

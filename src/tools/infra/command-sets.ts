@@ -176,6 +176,11 @@ interface InternalRule {
   command: string;
   pipeOnly?: boolean;
   noFilePaths?: boolean;
+  /**
+   * Flags whose value may begin with "-" (a negative number). Only consulted to stop the value being
+   * validated as a flag — see the note in validateByRule.
+   */
+  valueFlags?: readonly string[];
   blockedFlags?: string[];
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
@@ -231,6 +236,20 @@ function validateByRule(
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
+
+    // A flag's VALUE that begins with "-" is not a flag. `journalctl -b -1` (the previous boot) was
+    // refused with `"-1" is not allowed`, which names the value rather than the parse — an agent
+    // reading that drops the -1 and loses the intent, and never discovers that `-b-1` works.
+    //
+    // Narrow on purpose: only a value matching a NEGATIVE NUMBER is consumed, and only directly after
+    // a flag the command declares as value-taking. Anything else keeps being validated as a flag, so
+    // this cannot become a hole through which an arbitrary token slips past the whitelist.
+    if (
+      rule.valueFlags?.includes(args[i - 1]) &&
+      /^-\d+$/.test(arg)
+    ) {
+      continue;
+    }
 
     if (!arg.startsWith("-")) {
       positionalCount++;
@@ -1107,7 +1126,7 @@ function applyCommandConstraints(
   def: CommandDef,
 ): string | null {
   const hasDeclarative = def.blockedFlags || def.allowedFlags ||
-    def.allowedSubcommands || def.positionals || def.requiredFlags;
+    def.allowedSubcommands || def.positionals || def.requiredFlags || def.valueFlags;
 
   // Custom validator takes priority (escape hatch for complex commands)
   if (def.validate) {
@@ -1132,6 +1151,7 @@ function applyCommandConstraints(
     allowedSubcommands: def.allowedSubcommands,
     positionals: def.positionals,
     requiredFlags: def.requiredFlags,
+    valueFlags: def.valueFlags,
   });
 }
 
@@ -1297,6 +1317,8 @@ export interface CommandDef {
   requiredFlags?: string[];
   /** Custom validator — mutually exclusive with declarative constraint fields above. */
   validate?: (args: string[]) => string | null;
+  /** Flags whose value may begin with "-" (e.g. journalctl -b -1). */
+  valueFlags?: readonly string[];
 }
 
 /**
@@ -1472,7 +1494,8 @@ export const COMMANDS: Record<string, CommandDef> = {
   tree:      { category: "file", allowedFlags: TREE_FLAGS }, // default-deny: -o (write output to file) rejected; positional dirs are read targets
 
   // ── system logs & services ──
-  journalctl:  { category: "services", allowedFlags: [
+  // valueFlags: `-b -1` / `-n -100` pass a NEGATIVE value; without this the value is read as a flag.
+  journalctl:  { category: "services", valueFlags: ["-b", "--boot", "-n", "--lines", "-p", "--priority"], allowedFlags: [
     "-u", "--unit", "-n", "--lines", "--since", "--until",
     "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
     "--no-pager", "-o", "--output", "-r", "--reverse",

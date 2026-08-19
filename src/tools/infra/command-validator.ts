@@ -342,6 +342,41 @@ const FILE_READING_CMDS = new Set([
  *
  * Returns an error message string if blocked, or null if allowed.
  */
+
+/**
+ * What to do INSTEAD, per kind of secret. A refusal that names no alternative gets retried with a
+ * different command and refused again — which is the loop this exists to break.
+ *
+ * The advice is about the diagnostic goal behind the read, not about getting the file: nothing here
+ * offers a way to obtain the material.
+ */
+function sensitivePathHint(matched: string): string {
+  if (/\.ssh|id_rsa|id_ed25519|id_ecdsa/.test(matched)) {
+    return "To reach a host, use host_exec — it acquires the key through the broker. Private keys are never readable.";
+  }
+  if (/secrets\//.test(matched)) {
+    return "For a mounted secret, check that it is mounted and non-empty (ls -l on the directory, stat on the file) "
+      + "rather than reading its contents; for a Secret's keys use kubectl get secret -o jsonpath over the key NAMES.";
+  }
+  if (/\.key$|\.p12$|\.pfx$|\.jks$/.test(matched)) {
+    return "To check a certificate, read its public half instead (the .crt/.pem) — expiry, subject and issuer are all "
+      + "there. A private key is never needed to diagnose TLS.";
+  }
+  if (/\/proc\//.test(matched)) {
+    return "This process file exposes another process's memory, environment or descriptors. For diagnostics use ps, "
+      + "lsof or /proc/<pid>/status, which are permitted.";
+  }
+  if (/shadow|passwd/.test(matched)) {
+    return "For account questions use getent with a name-resolution database, or id <user>.";
+  }
+  if (/\.aws|\.gcp|\.azure|\.docker/.test(matched)) {
+    return "Cloud and registry credentials are not readable. For an image-pull problem, read the pod's events and the "
+      + "kubelet log — they name the failure without the credential.";
+  }
+  return "Read the artefact that answers the question rather than the secret itself; if the credential is genuinely "
+    + "the subject, that is a Portal operation, not a diagnostic one.";
+}
+
 export function validateCommand(command: string, options?: ValidateCommandOptions): string | null {
   if (!command || !command.trim()) {
     return "Command must not be empty.";
@@ -417,9 +452,18 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   // arguments is a potential leak vector.
   if (options?.sensitivePathPatterns) {
     for (const cmd of commands) {
-      if (options.sensitivePathPatterns.some((re) => re.test(cmd))) {
+      for (const re of options.sensitivePathPatterns) {
+        const hit = re.exec(cmd);
+        if (!hit) continue;
+        // Name WHAT matched and what to do instead. "Accessing sensitive paths is not allowed" told
+        // the agent nothing: not which argument was the problem, not whether the command itself was
+        // rejected — so the usual response was to try a different command and be refused again.
+        // The matched text is the caller's own input, so echoing it leaks nothing.
         return JSON.stringify({
-          error: "Accessing sensitive paths is not allowed.",
+          error: `"${hit[0]}" is credential or secret material, which is not readable through this tool.`,
+          matched: hit[0],
+          rejected_by: "sensitive_path",
+          hint: sensitivePathHint(hit[0]),
         }, null, 2);
       }
     }
