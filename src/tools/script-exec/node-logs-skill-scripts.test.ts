@@ -338,6 +338,23 @@ describe("get-node-logs.sh — filtering", () => {
     expect(statusLines(r.stdout)).toHaveLength(1);
   });
 
+  it("still blames the pattern when the dying filter takes the source down with it", () => {
+    // On a real node this is the normal shape of an invalid pattern: grep exits
+    // immediately, the pipe closes, and journalctl — still streaming megabytes —
+    // dies of SIGPIPE (141). Judging the source first reported "the log source
+    // failed, see stderr", i.e. blamed the node for the caller's regex. A few
+    // lines of fake output never reproduce it (they fit in the pipe buffer), so
+    // this fake writes more than the buffer can hold.
+    const { bin } = makeCase({
+      journalctl: `awk 'BEGIN{for(i=0;i<200000;i++) print "Aug 18 14:20:01 node kubelet[1]: filler line", i}'`,
+      systemctl: SYSTEMCTL_KNOWN,
+    });
+    const r = run(NODE_LOGS, ["--unit", "kubelet", "--grep", "kube(let"], bin);
+    expect(header(r.stdout, "status")).toContain("filter_error");
+    expect(r.stdout).not.toContain("source_error");
+    expect(r.code).toBe(2);
+  });
+
   it("keeps only the last --tail lines but counts every match", () => {
     const { bin } = makeCase({
       journalctl: `for i in $(awk 'BEGIN{for(i=1;i<=500;i++) print i}'); do echo "line $i match"; done`,

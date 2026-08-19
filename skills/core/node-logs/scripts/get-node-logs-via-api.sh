@@ -519,17 +519,20 @@ REPORT_RC="${STAGES[3]}"
 
 # One `status:` line, always the last one, with the explanation above it.
 echo "---"
-if [[ "$SRC_RC" -ne 0 ]]; then
-  echo "Output above is partial: it is what arrived before the transfer failed."
-  echo "Anything missing from it is unknown, not absent. See stderr for the cause."
-  echo "status:      source_error (kubectl exited $SRC_RC)"
-  exit 5
-fi
+# FILTER before SOURCE: a rejected pattern kills grep at once, the pipe closes and
+# kubectl dies of SIGPIPE mid-transfer, so judging the source first would report a
+# failed fetch for what is really a bad regex.
 if [[ "$FILTER_RC" -gt 1 ]]; then
   echo "The pattern was rejected, so NOTHING was searched — the transfer was wasted."
   echo "Fix the ERE syntax, or pass the string via --grep-fixed."
   echo "status:      filter_error (grep exited $FILTER_RC)"
   exit 2
+fi
+if [[ "$SRC_RC" -ne 0 ]]; then
+  echo "Output above is partial: it is what arrived before the transfer failed."
+  echo "Anything missing from it is unknown, not absent. See stderr for the cause."
+  echo "status:      source_error (kubectl exited $SRC_RC)"
+  exit 5
 fi
 if [[ "$REPORT_RC" -eq 10 ]]; then
   echo "The source was read and produced no matching line. Bounded non-evidence for"

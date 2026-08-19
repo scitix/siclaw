@@ -459,6 +459,20 @@ REPORT_RC="${STAGES[3]}"
 # The verdict is ALWAYS the last line, with any explanation above it, so that one
 # rule — read the last line — holds for every outcome of every invocation.
 echo "---"
+# FILTER before SOURCE, deliberately: an invalid pattern kills grep instantly, the
+# pipe closes, and journalctl — mid-stream on a real node — dies of SIGPIPE with
+# 141. Judging the source first therefore reported "the log source failed, see
+# stderr" for a rejected pattern, blaming the node for the caller's regex. (A
+# fixture never showed this: a few lines of fake output fit in the pipe buffer and
+# the source exits before it can be signalled.) grep exits 1 for "no match" —
+# impossible here, the line-count marker always matches — and >=2 for a real
+# failure, so >1 is the pattern being rejected.
+if [[ "$FILTER_RC" -gt 1 ]]; then
+  echo "The pattern was rejected, so NOTHING was searched. Check the ERE syntax"
+  echo "(unbalanced parenthesis or bracket), or pass the string via --grep-fixed."
+  echo "status:      filter_error (grep exited $FILTER_RC)"
+  exit 2
+fi
 if [[ "$SRC_RC" -ne 0 ]]; then
   # The source itself failed. Its stderr went straight to the caller, so the
   # cause is visible instead of being folded into an empty "no logs" report.
@@ -466,14 +480,6 @@ if [[ "$SRC_RC" -ne 0 ]]; then
   echo "What is missing from it is unknown, not absent. See stderr for the cause."
   echo "status:      source_error (log source exited $SRC_RC)"
   exit 5
-fi
-# grep exits 1 for "no match" (impossible here: the line-count marker always
-# matches) and >=2 for a real failure, which is nearly always an invalid ERE.
-if [[ "$FILTER_RC" -gt 1 ]]; then
-  echo "The pattern was rejected, so NOTHING was searched. Check the ERE syntax"
-  echo "(unbalanced parenthesis or bracket), or pass the string via --grep-fixed."
-  echo "status:      filter_error (grep exited $FILTER_RC)"
-  exit 2
 fi
 if [[ "$REPORT_RC" -eq 10 ]]; then
   echo "The source was read successfully and produced no matching line. That is"
