@@ -339,11 +339,36 @@ describe("Anthropic thinking compat", () => {
     }
   });
 
-  // "I cannot tell" must not be answered with the shape being retired.
-  it("defaults an unrecognisable id to the latest generation", () => {
-    expect(resolveAnthropicCompat("our-internal-proxy-model")).toEqual({
+  // "I cannot tell WHICH Claude" must not be answered with the shape being
+  // retired — but that only applies to a Claude id.
+  it("defaults an unrecognised CLAUDE id to the latest generation", () => {
+    expect(resolveAnthropicCompat("claude-neo-preview")).toEqual({
       forceAdaptiveThinking: true, supportsTemperature: false,
     });
+  });
+
+  // anthropic-messages is a PROTOCOL other vendors implement. Handing a MiniMax
+  // model the newest Claude shape is not a cautious guess, it is a guess about a
+  // different product — and adaptive thinking is exactly what such an endpoint
+  // would reject. Resolving to nothing leaves pi's own defaults in place.
+  it("says nothing about a model that is not Claude", () => {
+    for (const id of ["minimax-m2.1", "glm-4.6", "our-internal-proxy-model", "deepseek-v3"]) {
+      expect(resolveAnthropicCompat(id)).toEqual({});
+    }
+    const cfg = withResolvedModelCompat({
+      api: "anthropic-messages",
+      models: [{ id: "minimax-m2.1", reasoning: true }],
+    });
+    expect((cfg.models[0] as any).compat).toBeUndefined();
+    expect(compatOf("minimax-m2.1").forceAdaptiveThinking).toBeUndefined();
+  });
+
+  // The cost of the rule above, stated: a Claude model renamed past recognition
+  // is indistinguishable from a MiniMax id, so it needs the override rather than
+  // a guess.
+  it("still lets an override speak for an unrecognisable id", () => {
+    expect(resolveAnthropicCompat("opus-5-fast", '{"forceAdaptiveThinking":true}'))
+      .toEqual({ forceAdaptiveThinking: true });
   });
 
   it("lets a per-model override win, one key at a time", () => {

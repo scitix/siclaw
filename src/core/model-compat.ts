@@ -283,22 +283,46 @@ export function parseAnthropicCompatOverrides(raw: unknown): AnthropicCompat {
 }
 
 /**
+ * Whether an id names a CLAUDE model at all.
+ *
+ * The generation defaults below describe Claude's API contract and nothing else,
+ * but `anthropic-messages` is a protocol other vendors implement — MiniMax,
+ * Z.ai, and any Anthropic-compatible gateway serve their own models over it.
+ * Handing one of those the newest Claude shape is not a cautious guess, it is a
+ * guess about a different product, and `thinking:{type:"adaptive"}` is exactly
+ * the kind of thing such an endpoint would reject.
+ *
+ * So "unknown id" splits in two: an unrecognised CLAUDE id gets the
+ * latest-generation default (the reasoning in LATEST_ANTHROPIC_COMPAT holds), an
+ * id that is not Claude at all gets NOTHING and keeps pi's defaults. A Claude
+ * model renamed past recognition therefore needs an explicit override — the
+ * honest answer, since at that point it is indistinguishable from a MiniMax id.
+ */
+function looksLikeClaudeModel(modelId: string): boolean {
+  return bareModelId(modelId).includes("claude");
+}
+
+/**
  * Resolve the Anthropic-protocol compat for one model, in priority order:
  *
  *   1. the operator's per-model override — always wins, and is the documented
  *      way to opt out (pi's own docstring: "Set to `false` to opt out");
  *   2. pi's bundled table — authoritative where it has an answer;
- *   3. a generation rule, then the latest-generation default.
+ *   3. for a Claude id only: a generation rule, then the latest generation.
  *
- * Only keys not answered by a higher priority fall through, so an override of
- * one key does not discard pi's answer for the other.
+ * Returns a PARTIAL: an id that is not Claude and not in pi's table resolves to
+ * nothing at all, which leaves pi's own defaults in place. Only keys not
+ * answered by a higher priority fall through, so an override of one key does not
+ * discard pi's answer for the other.
  */
-export function resolveAnthropicCompat(modelId: string, overrides?: unknown): Required<AnthropicCompat> {
+export function resolveAnthropicCompat(modelId: string, overrides?: unknown): AnthropicCompat {
   const explicit = parseAnthropicCompatOverrides(overrides);
   const builtin = builtinAnthropicCompat(modelId);
-  const base = builtin
-    ? { ...LEGACY_ANTHROPIC_COMPAT, ...builtin }
-    : looksLikeLegacyAnthropicThinking(modelId) ? LEGACY_ANTHROPIC_COMPAT : LATEST_ANTHROPIC_COMPAT;
+  if (builtin) return { ...LEGACY_ANTHROPIC_COMPAT, ...builtin, ...explicit };
+  if (!looksLikeClaudeModel(modelId)) return explicit;
+  const base = looksLikeLegacyAnthropicThinking(modelId)
+    ? LEGACY_ANTHROPIC_COMPAT
+    : LATEST_ANTHROPIC_COMPAT;
   return { ...base, ...explicit };
 }
 
@@ -347,6 +371,11 @@ export function withResolvedModelCompat<T>(config: T): T {
     let touched = false;
     for (const key of ANTHROPIC_COMPAT_KEYS) {
       if (typeof stated[key] === "boolean") continue;
+      // Only keys the resolver actually ANSWERED. It returns nothing for a model
+      // that is not Claude, and writing `undefined` there would still add the
+      // key — enough for `modelNeedsRebind` to see a change and, worse, to look
+      // like a decision we never made.
+      if (resolved[key] === undefined) continue;
       merged[key] = resolved[key];
       touched = true;
     }

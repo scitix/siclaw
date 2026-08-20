@@ -1083,6 +1083,16 @@ export function createHttpServer(
       // otherwise the frontend misses events.
       if (managed.isAgentActive || managed.isCompacting || managed.isRetrying) {
         console.log(`[agentbox-http] Prompt resolved but agent still busy for session ${managed.id} (active=${managed.isAgentActive} compacting=${managed.isCompacting} retrying=${managed.isRetrying}), deferring SSE close`);
+        // Re-open the live path for THIS window. Brain events are diverted to the
+        // routing runner only while an attempt could still be discarded by a
+        // fallback; the prompt has resolved, so no further attempt can run and
+        // there is nothing left to discard. Leaving the diversion in place makes
+        // the work this branch waits for invisible: `runAttempt` unsubscribes
+        // when `brain.prompt()` returns, so events after that reach the runner
+        // either — and `auto_compaction_end` in particular is the ONLY thing that
+        // clears the frontend's compacting state (`setIsCompacting(false)` has no
+        // other caller), so losing it pins the UI in "compacting" for good.
+        managed._routeBrainEventsThroughExtra = false;
         const unsub = managed.brain.subscribe((event: any) => {
           if (event.type === "agent_end" || event.type === "auto_compaction_end" || event.type === "auto_retry_end") {
             // Use setTimeout to let synchronous follow-up events (e.g.

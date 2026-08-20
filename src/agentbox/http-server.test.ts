@@ -668,6 +668,39 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(session.brain.prompt).toHaveBeenCalled();
   });
 
+  it("POST /api/prompt keeps forwarding brain events while a deferred compaction finishes", async () => {
+    // Brain events are diverted to the routing runner only while a fallback could
+    // still discard the attempt. Once the prompt resolves nothing can be
+    // discarded — but runAttempt has also unsubscribed by then, so leaving the
+    // diversion on drops everything in the window this branch exists to wait for.
+    // auto_compaction_end is the sharp case: it is the ONLY thing that clears the
+    // frontend's compacting state, so losing it pins the UI there for good.
+    const session = await sm.getOrCreate("compact-window");
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+      // Compaction kicked off during the turn and is still running as it resolves.
+      session.isCompacting = true;
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "compact-window" });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // Close is deferred, so the consumer is still attached and must still be fed.
+    expect(session._promptDone).toBe(false);
+    expect(session._routeBrainEventsThroughExtra).toBe(false);
+
+    session._eventBuffer.length = 0;
+    session.isCompacting = false;
+    session.brain.emitter.emit("event", { type: "auto_compaction_end" });
+    // The live subscription and this buffer share the same gate, so landing here
+    // is what proves the event is no longer dropped on the floor.
+    expect(session._eventBuffer.some((e: any) => e?.type === "auto_compaction_end")).toBe(true);
+  });
+
   it("POST /api/prompt rejects missing text", async () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);
