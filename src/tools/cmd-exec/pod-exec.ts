@@ -12,7 +12,6 @@ import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
-import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import { validatePodName, prepareExecEnv, filterPodNoise } from "../infra/exec-utils.js";
@@ -263,8 +262,6 @@ Examples:
           content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
             stderr: filterPodNoise(stderr.trim()) || undefined,
             project: jsonPathProjector(params.json_path),
-            // Success can still be a truncated window: exactly --tail=N lines back looks complete.
-            ...(tailTruncationNote(params.command, stdout) ? { notes: `\n${tailTruncationNote(params.command, stdout)}` } : {}),
           }) }],
           details: { exitCode: 0, exit_class: "success" },
         };

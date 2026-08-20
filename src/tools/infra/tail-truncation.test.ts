@@ -58,3 +58,34 @@ describe("tailTruncationNote", () => {
     expect(tailTruncationNote("kubectl logs mypod --tail=3", lines(3) + "\n")).not.toBe("");
   });
 });
+
+describe("the note is only wired where the command it applies to can run", () => {
+  it("is called only by tools whose whitelist admits kubectl", async () => {
+    // The note fires for `kubectl logs --tail=N` and nothing else. `kubectl` is not in any context's
+    // whitelist — restricted_bash adds it explicitly via `extraAllowed`. So a tool that does not pass
+    // that set refuses the command before it runs, and the note there is unreachable.
+    //
+    // It was wired into node_exec, pod_exec and host_exec, where all three were dead. Nothing failed
+    // when they were removed, which is why this test exists: the next person to add the call needs to
+    // be told why it would do nothing.
+    const { readFileSync, globSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const root = resolve(import.meta.dirname, "../../..");
+
+    const callers: string[] = [];
+    for (const f of globSync("src/tools/**/*.ts", { cwd: root })) {
+      if (f.endsWith(".test.ts") || f.endsWith("tail-truncation.ts")) continue;
+      const src = readFileSync(resolve(root, f), "utf8");
+      const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      if (/\btailTruncationNote\s*\(/.test(code)) callers.push(f);
+    }
+    expect(callers.length, "expected at least restricted_bash to use it").toBeGreaterThan(0);
+
+    for (const f of callers) {
+      const code = readFileSync(resolve(root, f), "utf8");
+      expect(code, `${f} appends a --tail note but never whitelists kubectl, so the only command the `
+        + `note applies to is refused before it runs — the note is dead there`)
+        .toMatch(/extraAllowed[\s\S]{0,120}kubectl/);
+    }
+  });
+});

@@ -8,7 +8,6 @@ import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
-import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
@@ -317,10 +316,10 @@ Examples (pass the id from host_list; names shown here for readability):
         signal: result.signal,
         context: "host",
       });
-      const tailNote = tailTruncationNote(params.command, result.stdout);
+      // No tail-window note here — see the note in node-exec.ts: `kubectl` is not in this tool's
+      // whitelist, so the only command the note applies to cannot run.
       const notes = (result.truncated ? "\n...[output truncated at 10 MB]" : "")
-        + (judgment.annotation ? `\n${judgment.annotation}` : "")
-        + (tailNote ? `\n${tailNote}` : "");
+        + (judgment.annotation ? `\n${judgment.annotation}` : "");
       return {
         content: [{
           type: "text",

@@ -11,7 +11,6 @@ import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
-import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import {
@@ -471,8 +470,10 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         stderr: execResult.stderr,
         context: "node",
       });
-      const notes = (judgment.annotation ? `\n${judgment.annotation}` : "")
-        + (tailTruncationNote(params.command, execResult.stdout) ? `\n${tailTruncationNote(params.command, execResult.stdout)}` : "");
+      // No tail-window note here: it fires only for `kubectl logs --tail=N`, and `kubectl` is
+      // whitelisted for restricted_bash alone (this tool passes no extraAllowed), so the command is
+      // refused before it can run. See tail-truncation.test.ts, which pins that reachability.
+      const notes = judgment.annotation ? `\n${judgment.annotation}` : "";
       return {
         content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
           stderr: filteredStderr || undefined,
