@@ -15,7 +15,7 @@ import {
   MIN_CHUNK_RATIO,
   SAFETY_MARGIN,
 } from "../compaction.js";
-import compactionSafeguardExtension from "./compaction-safeguard.js";
+import compactionSafeguardExtension, { formatToolFailureMeta } from "./compaction-safeguard.js";
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -570,5 +570,29 @@ describe("compactionSafeguardExtension", () => {
 
       expect(result).toEqual({ cancel: true });
     });
+  });
+});
+
+describe("formatToolFailureMeta", () => {
+  // The summary this feeds is what the agent reads AFTER a compaction, so anything missing here is
+  // forgotten. It carried only status and exitCode, which is the raw number and none of the judgment:
+  // an agent that had just been told "the channel failed, the target never ran this" was left with
+  // `exitCode=1` and every reason to go on treating it as the target's answer.
+  it("carries the exit judgment, not just the raw code", () => {
+    const meta = formatToolFailureMeta({
+      error: true, exitCode: 1, exit_class: "channel_error", channel_leg: "namespace_entry",
+    });
+    expect(meta).toContain("exitCode=1");
+    expect(meta).toContain("exit_class=channel_error");
+    expect(meta).toContain("channel_leg=namespace_entry");
+  });
+
+  it("omits what is absent rather than inventing it", () => {
+    expect(formatToolFailureMeta({ exitCode: 2 })).toBe("exitCode=2");
+    expect(formatToolFailureMeta({ exit_class: "no_match" })).toBe("exit_class=no_match");
+    expect(formatToolFailureMeta({})).toBeUndefined();
+    expect(formatToolFailureMeta(undefined)).toBeUndefined();
+    // A non-string class is untrusted input, not something to interpolate as [object Object].
+    expect(formatToolFailureMeta({ exit_class: { nope: 1 } })).toBeUndefined();
   });
 });

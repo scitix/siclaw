@@ -131,7 +131,12 @@ function truncateFailureText(text: string, maxChars: number): string {
   return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
-function formatToolFailureMeta(details: unknown): string | undefined {
+/**
+ * Exported for its test: the fields it carries are a contract with exit-classification, and dropping one
+ * is invisible from either file alone (it shows up only as an agent that forgets, after a compaction,
+ * that a failure was the channel's rather than the target's).
+ */
+export function formatToolFailureMeta(details: unknown): string | undefined {
   if (!details || typeof details !== "object") return undefined;
   const record = details as Record<string, unknown>;
   const status = typeof record.status === "string" ? record.status : undefined;
@@ -139,9 +144,17 @@ function formatToolFailureMeta(details: unknown): string | undefined {
     typeof record.exitCode === "number" && Number.isFinite(record.exitCode)
       ? record.exitCode
       : undefined;
+  // `exit_class` and `channel_leg` are the whole point of the exit classification — whose failure it
+  // was, and where it broke — and carrying only the raw exit code across a compaction throws both away.
+  // An agent that just learned "the exec channel failed, the target never ran this" would be left with
+  // `exitCode=1` after the summary and go on treating it as the target's answer.
+  const exitClass = typeof record.exit_class === "string" ? record.exit_class : undefined;
+  const channelLeg = typeof record.channel_leg === "string" ? record.channel_leg : undefined;
   const parts: string[] = [];
   if (status) parts.push(`status=${status}`);
   if (exitCode !== undefined) parts.push(`exitCode=${exitCode}`);
+  if (exitClass) parts.push(`exit_class=${exitClass}`);
+  if (channelLeg) parts.push(`channel_leg=${channelLeg}`);
   return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
