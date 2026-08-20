@@ -128,3 +128,32 @@ describe("classifyClusterFailure", () => {
     expect(result.reason).toBe("cluster_unavailable");
   });
 });
+
+describe("every tool that ensures a cluster also classifies the failure", () => {
+  it("has no caller that lets a raw ensure error through", async () => {
+    // Sibling of the json_path wiring invariant, and the same failure mode: a helper wired at six call
+    // sites with behavioural tests at two of them. A seventh tool added later that calls
+    // `ensureClusterForTool` without classifying reports "cluster unavailable" for a cluster that is
+    // simply not bound — the misdiagnosis this pair of functions exists to prevent.
+    const { readFileSync, globSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const files = globSync("src/tools/**/*.ts", { cwd: resolve(import.meta.dirname, "../../..") })
+      .filter((f) => !f.endsWith(".test.ts") && !f.endsWith("ensure-kubeconfigs.ts"));
+
+    const callers: string[] = [];
+    for (const f of files) {
+      const src = readFileSync(resolve(import.meta.dirname, "../../..", f), "utf8");
+      // Strip block and line comments: kubeconfig-resolver.ts names the function in its header only,
+      // and counting that would demand classification from a file that never calls it.
+      const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      if (/\bensureClusterForTool\s*\(/.test(code)) callers.push(f);
+    }
+    expect(callers.length, "expected the exec tools to be found").toBeGreaterThanOrEqual(6);
+
+    for (const f of callers) {
+      const src = readFileSync(resolve(import.meta.dirname, "../../..", f), "utf8");
+      expect(src, `${f} ensures a cluster but never calls classifyClusterFailure — an unbound cluster `
+        + `would be reported as unavailable`).toMatch(/\bclassifyClusterFailure\s*\(/);
+    }
+  });
+});

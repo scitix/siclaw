@@ -68,3 +68,27 @@ describe("sanitizeEnv", () => {
     expect(Object.keys(result)).toHaveLength(5);
   });
 });
+
+describe("no tool re-injects the credentials pointer after sanitizing", () => {
+  it("has no object literal setting SICLAW_CREDENTIALS_DIR anywhere under src/tools", async () => {
+    // `sanitizeEnv` strips the variable, and two tools used to add it straight back on the next line —
+    // which is why stripping it from the allow-list was not enough on its own. `local-script.ts` built
+    // its child env inline rather than through exec-utils, so the guard on exec-utils' builder never
+    // covered it: reverting that line failed nothing in the whole suite.
+    //
+    // A pointer, not a secret. It holds no credential, but it makes an expansion payload trivial to
+    // write — `"$SICLAW_CREDENTIALS_DIR"/clusters/*` needs no knowledge of the layout, and the
+    // command validator screens text before the shell expands it.
+    const { readFileSync, globSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const root = resolve(import.meta.dirname, "../../..");
+    const offenders: string[] = [];
+    for (const f of globSync("src/tools/**/*.ts", { cwd: root })) {
+      if (f.endsWith(".test.ts")) continue;
+      const code = readFileSync(resolve(root, f), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");   // the design notes name it
+      if (/SICLAW_CREDENTIALS_DIR\s*:/.test(code)) offenders.push(f);
+    }
+    expect(offenders, "these files hand a child a pointer to the credential tree").toEqual([]);
+  });
+});

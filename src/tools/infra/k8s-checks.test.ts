@@ -42,6 +42,21 @@ describe("checkNodeReady", () => {
     expect(err).toContain("status: False");
   });
 
+  it("does not send the reader to a field that cannot produce this condition", async () => {
+    // The old message offered "down, cordoned, or experiencing issues". Cordoning sets
+    // spec.unschedulable and leaves Ready=True, so it can never be the cause of a non-True Ready —
+    // naming it costs a wasted `kubectl get node -o yaml` on the wrong field. A non-True Ready comes
+    // from the kubelet: not reporting, or reporting a problem.
+    //
+    // Reverting this message failed nothing in the whole suite, which is why the guard is here.
+    mockExecFile.mockResolvedValueOnce({ stdout: "False" });
+    const err = (await checkNodeReady("node-1")) ?? "";
+    expect(err).not.toMatch(/cordon/i);
+    expect(err).toMatch(/kubelet/i);
+    // and it names the command that actually shows the cause
+    expect(err).toContain("kubectl describe node node-1");
+  });
+
   it("returns 'unknown' when status empty", async () => {
     mockExecFile.mockResolvedValueOnce({ stdout: "" });
     const err = await checkNodeReady("node-1");
