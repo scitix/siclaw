@@ -40,13 +40,20 @@ import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-ku
  * stage/reason/cached go in the TEXT as well as in `details`, because `details` is stripped before
  * the model sees the result — a distinction only present there cannot be acted on.
  */
-function debugPodFailureResult(err: unknown) {
+export function debugPodFailureResult(err: unknown) {
   const startup = err instanceof DebugPodStartupError ? err : undefined;
   const message = err instanceof Error ? err.message : String(err);
   return {
     content: [{ type: "text" as const, text: JSON.stringify({
       error: true,
       message: `Debug pod failed to start: ${message}`,
+      // `err.message` is "exit null" when the underlying kubectl was signalled, which says nothing —
+      // three reviews report exactly that string as the whole diagnosis. The transport's own stderr is
+      // what names the scheduling, admission or image problem.
+      ...(typeof (err as { stderr?: unknown })?.stderr === "string"
+        && (err as { stderr: string }).stderr.trim()
+        ? { transport_stderr: (err as { stderr: string }).stderr.trim().slice(0, 2000) }
+        : {}),
       ...(startup && {
         stage: startup.stage,
         reason: startup.reason,

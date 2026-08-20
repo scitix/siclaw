@@ -25,6 +25,7 @@ import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } 
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaKubectl } from "../infra/bg-session.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
+import { debugPodFailureResult } from "../cmd-exec/node-exec.js";
 
 interface NodeScriptParams {
   node?: string;
@@ -247,8 +248,10 @@ Examples:
           cachedPod = await ensureDebugPodReady(spec, env, { signal });
         } catch (err: any) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-            details: { error: true, reason: "debug_pod_failed" },
+            // Same payload node_exec returns: stage, reason, node, whether it is a memo replay, and the
+            // transport's stderr. "Debug pod failed to start" on its own was the entire diagnosis here,
+            // and a review reported two identical undiagnosable failures because of it.
+            ...debugPodFailureResult(err),
           };
         }
         const pinnedPodName = acquireDebugPod(spec);
@@ -303,8 +306,7 @@ Examples:
         fgPod = await ensureDebugPodReady(fgSpec, env, { signal });
       } catch (err: any) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-          details: { error: true, reason: "debug_pod_failed" },
+          ...debugPodFailureResult(err),
         };
       }
       const fgPinnedPodName = acquireDebugPod(fgSpec); // null if the pod vanished; proceed best-effort

@@ -32,6 +32,7 @@ export type ExitClass =
   | "interrupted"
   | "output_truncated"
   | "pipeline_upstream_failed"
+  | "invalid_arguments"
   | "channel_error";
 
 /**
@@ -275,6 +276,23 @@ export function classifyExit(opts: {
   // is still the answer to the question that was asked, so it is not reported as a failure; that
   // matches the pre-existing judgment and is why the signal is named instead.
   if (exitCode === null || exitCode === undefined) {
+    // SIGKILL with no exit code is what our own timeout looks like — we set it, so we can say so
+    // instead of reporting "exit code: unknown". What we still cannot tell apart is WHERE the time
+    // went (the API proxy, an unresponsive kubelet, a stalled log stream), so the annotation names
+    // those as the things to check rather than pretending to know.
+    if (signal === "SIGKILL") {
+      return {
+        exitClass: "interrupted",
+        isError: true,
+        annotation:
+          "[interrupted: the command was killed at the tool's timeout, so it produced "
+          + (stdout.trim() ? "only the partial output above" : "nothing")
+          + ". The tool cannot tell WHERE the time went — the apiserver proxy, an unresponsive kubelet, or "
+          + "a log stream that never closed all look the same from here. Narrow the request (a shorter "
+          + "--since, one pod instead of a label, a smaller --tail) or raise timeout_seconds; a node that "
+          + "is genuinely unreachable will keep timing out at every layer.]",
+      };
+    }
     const detail = signal ? ` (signal: ${signal})` : "";
     return stdout.trim()
       ? { exitClass: "interrupted", isError: false, annotation: `[interrupted${detail}; output above is partial]` }
@@ -366,6 +384,41 @@ export function classifyExit(opts: {
         + "never ran the command, so this status is NOT its answer. See STDERR for the transport error. "
         + "Retrying the same command may work if the cause was transient; a missing pod or container "
         + "will not fix itself.]",
+    };
+  }
+
+  // The client rejected the command before it reached the server. Not the target's answer, and — the
+  // part that costs real time — not worth retrying unchanged: a review shows `--until-time` failing
+  // twice in a row because the outcome looked like an ordinary error.
+  //
+  // Deliberately NOT a pre-exec blocklist of flags: kubectl versions differ per image and per cluster,
+  // so a curated "these do not exist" list would start refusing commands that work the moment the client
+  // is upgraded. Reading the client's own answer is version-proof.
+  if (/^error: unknown (flag|shorthand flag)/m.test(stderr) || /^Error: unknown flag/m.test(stderr)) {
+    return {
+      exitClass: "invalid_arguments",
+      isError: true,
+      annotation:
+        "[invalid_arguments: the CLIENT rejected this command — the flag does not exist in the kubectl "
+        + "build available here, so the request never reached the cluster. This is not the target's "
+        + "answer, and retrying it unchanged will fail identically. Check `--help` for the subcommand, or "
+        + "use an equivalent that does exist (e.g. `kubectl get events --sort-by` instead of "
+        + "`kubectl events --sort-by`, `--since-time` instead of `--until-time`).]",
+    };
+  }
+
+  // An API NotFound on a named object is an ANSWER: the query succeeded and the object is not there.
+  // Same semantics as grep finding nothing. A review captured the cost of calling it a failure — the
+  // identical existence check ran three times, at 18:00, 18:02 and 18:04.
+  if (context === "local" && !stdout.trim()
+      && /^Error from server \(NotFound\)/m.test(stderr)) {
+    return {
+      exitClass: "no_match",
+      isError: false,
+      annotation:
+        "[no_match: the API answered that this object does not exist. The query SUCCEEDED — this is the "
+        + "result, not a failure, and re-running it will return the same answer. If you expected the "
+        + "object, check the namespace and the name rather than repeating the call.]",
     };
   }
 

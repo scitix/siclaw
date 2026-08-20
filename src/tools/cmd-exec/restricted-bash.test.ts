@@ -1691,3 +1691,34 @@ describe("a Secret may only be printed in a form that cannot show its values", (
     expect(err).not.toContain("custom-columns");
   });
 });
+
+describe("rollout is allowed by VERB, not by subcommand", () => {
+  // Trace 3f73a70e: `kubectl rollout history` was refused as a write, and the agent spent five calls
+  // rebuilding the same revision list out of Deployment annotations, ReplicaSet creation times and
+  // images. `history` prints revisions and changes nothing; the other verbs mutate — so the allowance
+  // belongs on the verb.
+  const check = (cmd: string) => validateKubectlInPipeline([cmd]);
+
+  it("permits rollout history", () => {
+    for (const cmd of [
+      "kubectl rollout history deployment/model-api -n simaas",
+      "kubectl rollout history deployment model-api",
+      "kubectl rollout history -n simaas deployment/model-api --revision=138",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("still refuses every verb that changes state", () => {
+    for (const verb of ["undo", "restart", "pause", "resume", "status"]) {
+      const err = check(`kubectl rollout ${verb} deployment/model-api`);
+      expect(err, verb).not.toBeNull();
+      // and the refusal says which verb IS available rather than only what is forbidden
+      expect(err, verb).toContain("history");
+    }
+  });
+
+  it("refuses a bare rollout with no verb", () => {
+    expect(check("kubectl rollout")).not.toBeNull();
+  });
+});

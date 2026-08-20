@@ -251,7 +251,10 @@ describe("an API answer is not a transport failure", () => {
   const err = (reason: string) => `Error from server (${reason}): the thing was not agreeable`;
 
   it("treats a decision by the server as the target's answer", () => {
-    for (const reason of ["NotFound", "Forbidden", "AlreadyExists", "Conflict", "Invalid", "BadRequest"]) {
+    // NotFound is asserted separately: it is an existence ANSWER and now classifies as `no_match`
+    // (isError false), which is a later, deliberate change — see "treats a NotFound on a named object as
+    // the result". The rest are refusals or rejections, so they stay the target's reported failure.
+    for (const reason of ["Forbidden", "AlreadyExists", "Conflict", "Invalid", "BadRequest"]) {
       const j = classifyExit({ command: "kubectl get pvc x", exitCode: 1, stdout: "", stderr: err(reason), context: "local" });
       expect(j.exitClass, reason).toBe("target_reported_failure");
       expect(j.channelLeg, reason).toBeUndefined();
@@ -324,5 +327,59 @@ describe("the negative half of an existence check", () => {
       expect(j.exitClass, command).toBe("target_reported_failure");
       expect(j.isError, command).toBe(true);
     }
+  });
+});
+
+describe("answers the API gave, and commands the client refused", () => {
+  // Read from the traces behind the findings, not from the finding text.
+  it("treats a NotFound on a named object as the result", () => {
+    // Trace baf4b39b: the identical `kubectl get pvc … -o wide` ran at 18:00:58, 18:02:20 and 18:04:09.
+    // Reporting the answer as a tool failure is what paid for the two extra calls.
+    const j = classifyExit({
+      command: "kubectl get pvc ai-infra-lliao-1 -n t-ai-infra-xyjiang02 -o wide",
+      exitCode: 1, stdout: "",
+      stderr: 'Error from server (NotFound): persistentvolumeclaims "ai-infra-lliao-1" not found',
+      context: "local",
+    });
+    expect(j.exitClass).toBe("no_match");
+    expect(j.isError).toBe(false);
+    expect(j.annotation, "and says re-running will not change it").toMatch(/same answer|SUCCEEDED/);
+  });
+
+  it("still reads the same string as a dead channel when kubectl is the transport", () => {
+    // The context split matters more now that `local` NotFound is a success: for pod_exec the same text
+    // means the pod we tried to enter is gone, and the command never ran.
+    for (const context of ["pod", "node", "host"]) {
+      const j = classifyExit({ command: "uptime", exitCode: 1, stdout: "",
+        stderr: 'Error from server (NotFound): pods "gone" not found', context });
+      expect(j.exitClass, context).toBe("channel_error");
+    }
+  });
+
+  it("does not call a Forbidden a no-match", () => {
+    // Only NotFound is an existence answer. Forbidden means the question was refused, not answered.
+    const j = classifyExit({ command: "kubectl get secret x", exitCode: 1, stdout: "",
+      stderr: "Error from server (Forbidden): secrets is forbidden", context: "local" });
+    expect(j.exitClass).toBe("target_reported_failure");
+  });
+
+  it("separates a client-side flag rejection from the target's answer", () => {
+    // Traces f5375aa8 / 10a4e8e8: `--sort-by` on `kubectl events` and `--until-time` on `kubectl logs`
+    // were rejected by the CLIENT, reported as ordinary errors, and retried identically.
+    for (const stderr of ["error: unknown flag: --sort-by\nSee 'kubectl events --help' for usage.",
+                          "error: unknown flag: --until-time"]) {
+      const j = classifyExit({ command: "kubectl events --sort-by=x", exitCode: 1, stdout: "", stderr, context: "local" });
+      expect(j.exitClass).toBe("invalid_arguments");
+      expect(j.annotation, "must say not to retry unchanged").toMatch(/retrying it unchanged|never reached/);
+    }
+  });
+
+  it("says the timeout was ours, and what it cannot tell apart", () => {
+    // Trace d95259e5: two node-proxy/logs timeouts reported only `(no output) [exit code: unknown]`.
+    const j = classifyExit({ command: "kubectl logs x --tail=500000", exitCode: null, stdout: "",
+      stderr: "", signal: "SIGKILL", context: "local" });
+    expect(j.exitClass).toBe("interrupted");
+    expect(j.annotation).toMatch(/tool's timeout/);
+    expect(j.annotation, "and does not pretend to know which layer was slow").toMatch(/cannot tell/);
   });
 });

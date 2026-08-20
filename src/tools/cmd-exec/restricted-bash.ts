@@ -79,6 +79,20 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       }, null, 2);
     }
 
+    // `rollout history` is a read: it prints revisions and nothing else. The other rollout verbs
+    // (undo, restart, pause, resume) mutate, so the allowance is on the VERB, not the subcommand — a
+    // review shows the blanket refusal costing five calls to rebuild the same information out of
+    // Deployment annotations and ReplicaSets.
+    if (subcommand === "rollout") {
+      const verb = args.find((a, i) => i > args.indexOf("rollout") && !a.startsWith("-"));
+      if (verb === "history") return null;
+      return JSON.stringify({
+        error: `kubectl rollout "${verb ?? "(no verb)"}" is not allowed in read-only mode.`,
+        hint: "Only `kubectl rollout history` is permitted — the other verbs (undo, restart, pause, "
+          + "resume) change cluster state.",
+      }, null, 2);
+    }
+
     if (!subcommand || !SAFE_SUBCOMMANDS.has(subcommand)) {
       return JSON.stringify({
         error: `kubectl subcommand "${subcommand || "(empty)"}" is not allowed in read-only mode.`,

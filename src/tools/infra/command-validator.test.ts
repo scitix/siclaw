@@ -451,3 +451,28 @@ describe("a sensitive-path refusal says what matched and what to do instead", ()
     }
   });
 });
+
+describe("refusals name what does work", () => {
+  it("tells a rejected shell loop that semicolons are supported", () => {
+    // Trace 026ab91c: `for … done` was refused with the whole allow-list, which reads as "we have never
+    // heard of `for`"; the very next call used `cmd; cmd; cmd` successfully. The capability was there,
+    // the guidance was not.
+    const err = validateCommand("for p in a b c; do kubectl logs $p; done", {
+      context: "local", sensitivePathPatterns: [], extraAllowed: new Set(["kubectl"]),
+    }) ?? "";
+    const parsed = JSON.parse(err);
+    expect(parsed.shell_constructs_rejected, "keywords are separated from missing binaries").toContain("for");
+    expect(parsed.hint).toMatch(/Semicolon-separated/);
+  });
+
+  it("names ps as the substitute for a blocked cmdline", () => {
+    // node_exec b4d9c4b9: status and stack were permitted for the same PID while cmdline was refused,
+    // with no alternative given. The asymmetry is deliberate — a command line carries credentials in its
+    // arguments — so the refusal has to point somewhere.
+    const err = validateCommand("cat /proc/1627110/cmdline", {
+      context: "node", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
+    }) ?? "";
+    expect(err).toContain("ps -p");
+    expect(err).toContain("/proc/<pid>/status");
+  });
+});

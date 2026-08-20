@@ -437,8 +437,13 @@ function sensitivePathHint(matched: string): string {
       + "there. A private key is never needed to diagnose TLS.";
   }
   if (/\/proc\//.test(matched)) {
-    return "This process file exposes another process's memory, environment or descriptors. For diagnostics use ps, "
-      + "lsof or /proc/<pid>/status, which are permitted.";
+    // The asymmetry is deliberate and was reported as confusing: status and stack are permitted for the
+    // same PID while cmdline is not, because a command line routinely carries credentials in its
+    // arguments. Naming the exact substitute is what the refusal was missing.
+    return "This process file exposes another process's memory, environment or descriptors — a command "
+      + "line in particular often carries credentials in its arguments. For the same information use "
+      + "`ps -p <pid> -o args=` (the command line, argument-safe), `/proc/<pid>/status` (state, UIDs, "
+      + "memory) or `/proc/<pid>/stack`, all of which are permitted.";
   }
   if (/shadow|passwd/.test(matched)) {
     return "For account questions use getent with a name-resolution database, or id <user>.";
@@ -496,8 +501,27 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   }
 
   if (violations.length > 0) {
+    const names = [...new Set(violations)];
+    // Shell KEYWORDS land here as if they were missing binaries, and the allow-list then reads as "we
+    // have never heard of `for`" — which is why three reviews describe the interface as implying full
+    // shell support. The refusal now separates the two and, for the loop case, names the shape that
+    // actually works: a review shows `cmd1; cmd2; cmd3` running fine right after `for … done` was
+    // refused, so the capability is not missing, only the guidance was.
+    const KEYWORDS = new Set(["for", "do", "done", "while", "until", "if", "then", "fi", "case", "esac",
+                              "function", "select", "time", "coproc"]);
+    const keywords = names.filter((n) => KEYWORDS.has(n));
+    const binaries = names.filter((n) => !KEYWORDS.has(n));
     return JSON.stringify({
-      error: `Blocked: disallowed command(s) — "${[...new Set(violations)].join(", ")}" is not in the allowed command list`,
+      error: `Blocked: disallowed command(s) — "${names.join(", ")}" is not in the allowed command list`,
+      ...(keywords.length > 0 && {
+        shell_constructs_rejected: keywords,
+        hint: "Shell loops, conditionals and command substitution are not available — every command is "
+          + "checked against the allow-list, and a construct that builds commands at runtime cannot be. "
+          + "Semicolon-separated commands ARE supported, so expand the loop yourself: "
+          + "`cmd pod-a; cmd pod-b; cmd pod-c`. For a list you do not know in advance, read it with one "
+          + "call first, then issue the expanded commands.",
+      }),
+      ...(binaries.length > 0 && { binaries_not_allowed: binaries }),
       allowed: [...contextCmds, ...(options?.extraAllowed ?? [])].sort(),
     }, null, 2);
   }
