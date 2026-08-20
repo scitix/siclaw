@@ -1622,6 +1622,51 @@ describe("a Secret may only be printed in a form that cannot show its values", (
     }
   });
 
+  it("covers the spellings a live cluster actually accepts, not the ones that read plausibly", () => {
+    // Third round of holes in this same control. Every payload here was run against a real cluster
+    // first, and the run changed what needed fixing:
+    //
+    //   --template={{.data.password}}   returned the bare base64  → real; `--template` is the alias for
+    //                                                               -o go-template and the format check
+    //                                                               only inspected -o/--output
+    //   get --raw /…/secrets/<name>    returned the whole object  → real, and worse than a format hole:
+    //                                                               a raw API passthrough has no printer
+    //                                                               and no resource token, so the output
+    //                                                               sanitizer attached nothing either
+    //   secrets.v1.  secret.v1.  secrets.   returned the base64   → real, WITH the trailing dot (empty
+    //                                                               group for a core resource)
+    //   secrets.v1   secrets.core                                 → rejected by kubectl itself, so not
+    //                                                               holes; the review's spelling was one
+    //                                                               of these
+    for (const cmd of [
+      "kubectl get secret demo --template={{.data.password}}",
+      "kubectl get secret demo --template='{{.data.password}}'",
+      "kubectl get secret demo --template",
+      "kubectl get secrets.v1. demo -o yaml",
+      "kubectl get secret.v1. demo -o jsonpath={.data.password}",
+      "kubectl get secrets. demo -o yaml",
+      "kubectl get secret.v1./demo -o yaml",
+      "kubectl get --raw /api/v1/namespaces/default/secrets/demo",
+      "kubectl get --raw=/api/v1/namespaces/default/secrets/demo",
+      "kubectl get --raw /api/v1/namespaces/default/secrets",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("leaves the raw endpoints an SRE actually needs", () => {
+    // `--raw` is refused for a Secret path, not banned: /metrics, /healthz and /version are ordinary
+    // diagnostics and name no resource.
+    for (const cmd of [
+      "kubectl get --raw /metrics", "kubectl get --raw /healthz", "kubectl get --raw /version",
+      "kubectl get --raw /api/v1/namespaces/default/pods", "kubectl get --raw /apis",
+      // and a typed name for a resource that is not a Secret
+      "kubectl get configmaps.v1. demo -o yaml", "kubectl get pods.v1. -o yaml",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
   it("does not chase abbreviations kubectl itself rejects", () => {
     // `kubectl get sec` fails at the server ("the server doesn't have a resource type"), and Secrets have
     // no registered short name — checked against a live cluster, so these are not holes. Matching them

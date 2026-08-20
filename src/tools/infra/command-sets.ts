@@ -1284,11 +1284,30 @@ const ALL_NS_ALWAYS_NEED_SELECTOR = new Set(["describe", "events", "top"]);
  * refusal, so this is the trade taken on purpose.
  */
 export function argsNameSecrets(args: string[], subcommand: string): boolean {
+  // `get --raw /api/v1/namespaces/x/secrets/y` names a Secret in a PATH, not a resource token: the
+  // loop below takes `split("/")[0]` and gets "" for an absolute path, so it saw nothing. Any
+  // `/secrets` segment counts.
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    const rawPath = a === "--raw" ? args[i + 1] : a.startsWith("--raw=") ? a.slice("--raw=".length) : undefined;
+    if (rawPath && rawPath.split("?")[0].split("/").some((seg) => seg === "secrets" || seg === "secret")) {
+      return true;
+    }
+  }
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith("-") || a === subcommand) continue;
     for (const part of a.split(",")) {
-      const type = part.split("/")[0].trim().toLowerCase();
+      // `type/name`, then `type.version[.group]` — kubectl accepts both, and the second needs the
+      // TRAILING dot for a core-group resource. Checked against a live cluster rather than assumed:
+      //
+      //   secrets.v1.   leaks      secrets.v1     rejected by kubectl ("no resource type")
+      //   secret.v1.    leaks      secrets.core   rejected
+      //   secrets.      leaks
+      //
+      // So the review's spelling (`secrets.v1`) is not itself reachable, but the family is — taking the
+      // segment before the first dot covers every form kubectl actually accepts.
+      const type = part.split("/")[0].split(".")[0].trim().toLowerCase();
       if (type === "secret" || type === "secrets") return true;
     }
   }
@@ -1384,6 +1403,14 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
 function getKubectlOutputFormat(args: string[]): string | null {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    // `--template=X` is the long-standing alias for `-o go-template=X`, and it prints a value with no
+    // key beside it. Verified against a live cluster: `kubectl get secret x --template={{.data.password}}`
+    // returns the bare base64. Inspecting only -o/--output treated it as plain table output.
+    if (a === "--template" || a.startsWith("--template=")) return "go-template";
+    // `--raw` is not a format at all — it is a raw API passthrough, which is worse: it returns the API
+    // object with NO printer and no resource for `detectSensitiveResource` to match, so the output
+    // sanitizer attaches nothing. Measured: the Secret comes back verbatim.
+    if (a === "--raw" || a.startsWith("--raw=")) return "raw";
     if ((a === "-o" || a === "--output") && args[i + 1] && !args[i + 1].startsWith("-")) {
       return extractKubectlFormatName(args[i + 1]);
     }

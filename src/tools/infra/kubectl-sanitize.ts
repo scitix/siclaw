@@ -501,20 +501,70 @@ function getItems(obj: any, depth = 0): any[] {
   return [obj];
 }
 
+/**
+ * `kubectl apply` stores a JSON copy of the whole object — INCLUDING `data` — in this annotation, so a
+ * Secret managed that way carries its own values a second time, outside the field the sanitizer redacts.
+ *
+ * Measured: `kubectl get secret x -o json` on an applied Secret redacted `data.password`, appended the
+ * "redacted" notice, and returned the base64 verbatim inside the annotation. `-o json` is the ONE format
+ * the Secret control permits precisely because the structural sanitizer was believed to cover it, so
+ * this defeated that control for every Secret created or updated with `apply` — which is how most are.
+ *
+ * Missed originally because the verification Secret was built with `kubectl create secret generic`,
+ * which writes no such annotation. A blind spot in the fixture, not in the reasoning.
+ */
+const LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration";
+
+/** Redact an annotation that carries a copy of the object. Returns whether anything changed. */
+function redactAppliedConfigAnnotation(obj: any): boolean {
+  const ann = obj?.metadata?.annotations;
+  if (!ann || typeof ann !== "object") return false;
+  let redacted = false;
+  for (const key of Object.keys(ann)) {
+    // Keyed on the well-known name, but not ONLY on it: any annotation holding a serialized object with
+    // a data/stringData member is the same disclosure under a different key (a controller's own
+    // last-applied copy, an operator's snapshot).
+    const value = ann[key];
+    if (typeof value !== "string") continue;
+    const carriesData = key === LAST_APPLIED_ANNOTATION
+      || /"(?:data|stringData)"\s*:\s*\{/.test(value);
+    if (!carriesData) continue;
+    ann[key] = REDACTED;
+    redacted = true;
+  }
+  return redacted;
+}
+
+/** ConfigMap variant: the annotation copy is judged by the same patterns as the entries themselves. */
+function redactAppliedConfigInPlace(obj: any): boolean {
+  const ann = obj?.metadata?.annotations;
+  if (!ann || typeof ann !== "object") return false;
+  const value = ann[LAST_APPLIED_ANNOTATION];
+  if (typeof value !== "string") return false;
+  const cleaned = redactSensitiveContent(value);
+  if (cleaned === value) return false;
+  ann[LAST_APPLIED_ANNOTATION] = cleaned;
+  return true;
+}
+
 /** Sanitize a single Kubernetes object in place; returns whether anything was redacted. */
 function sanitizeObject(obj: any, resourceType: SensitiveResourceType): boolean {
   switch (resourceType) {
     case "secret": {
-      // Both calls must run — `||` would short-circuit and leave stringData raw.
+      // All three must run — `||` would short-circuit and leave the later ones raw.
       const data = redactAllValues(obj, "data");
       const stringData = redactAllValues(obj, "stringData");
-      return data || stringData;
+      const applied = redactAppliedConfigAnnotation(obj);
+      return data || stringData || applied;
     }
 
     case "configmap": {
       const data = redactByPattern(obj, "data");
       const binaryData = redactByPattern(obj, "binaryData");
-      return data || binaryData;
+      // Same annotation, same copy of `data` — a ConfigMap's entries are judged by pattern rather than
+      // redacted wholesale, so run the annotation through the text redactor instead of blanking it.
+      const applied = redactAppliedConfigInPlace(obj);
+      return data || binaryData || applied;
     }
 
     case "pod":

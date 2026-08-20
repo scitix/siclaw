@@ -790,3 +790,69 @@ describe("a mixed-resource response is judged per item", () => {
     expect(leaks(sanitizeJSON(noKind, "secret"), "c2VjcmV0")).toBe(false);
   });
 });
+
+describe("a Secret managed with kubectl apply carries its values twice", () => {
+  // `kubectl apply` writes a JSON copy of the whole object — including `data` — into
+  // kubectl.kubernetes.io/last-applied-configuration. The sanitizer redacted `data`, appended its
+  // "redacted" notice, and returned the base64 verbatim inside the annotation.
+  //
+  // That defeated the Secret control at its foundation: `-o json` is the one format permitted, and it is
+  // permitted BECAUSE the structural sanitizer was believed to cover it. Most Secrets are applied rather
+  // than created, so most Secrets were affected.
+  //
+  // Missed originally because the verification fixture used `kubectl create secret generic`, which writes
+  // no such annotation — a blind spot in the fixture, not in the reasoning. Reproduced on a real applied
+  // Secret before fixing.
+  const CANARY = "UDAtQ0FOQVJZLUJBU0U2NA==";
+  const applied = (extra: Record<string, string> = {}) => JSON.stringify({
+    apiVersion: "v1", kind: "Secret", type: "Opaque",
+    metadata: {
+      name: "demo", namespace: "default",
+      annotations: {
+        "kubectl.kubernetes.io/last-applied-configuration":
+          `{"apiVersion":"v1","data":{"password":"${CANARY}"},"kind":"Secret","metadata":{"name":"demo"}}`,
+        ...extra,
+      },
+    },
+    data: { password: CANARY },
+  });
+
+  it("redacts the annotation copy, not just the data field", () => {
+    const out = sanitizeJSON(applied(), "secret");
+    expect(out).not.toContain(CANARY);
+    expect(out).toContain("REDACTED");
+    // the key names stay readable — the structure is still useful
+    expect(out).toContain("password");
+  });
+
+  it("catches the same disclosure under a different annotation key", () => {
+    // Keyed on the well-known name would be enough for kubectl, but a controller or operator writing its
+    // own last-applied copy is the same disclosure. Any annotation holding a serialized data/stringData
+    // object is redacted.
+    const out = sanitizeJSON(applied({
+      "some-operator.example.com/snapshot": `{"kind":"Secret","data":{"token":"${CANARY}"}}`,
+    }), "secret");
+    expect(out).not.toContain(CANARY);
+  });
+
+  it("leaves an ordinary annotation alone", () => {
+    const out = sanitizeJSON(applied({ "meta.helm.sh/release-name": "my-release" }), "secret");
+    expect(out).toContain("my-release");
+  });
+
+  it("judges a ConfigMap's annotation copy by pattern, not wholesale", () => {
+    // A ConfigMap's entries are judged by pattern rather than blanked, so its annotation copy is too —
+    // blanking it would throw away a whole config file the agent legitimately needs to read.
+    const cm = JSON.stringify({
+      apiVersion: "v1", kind: "ConfigMap",
+      metadata: { name: "c", annotations: {
+        "kubectl.kubernetes.io/last-applied-configuration":
+          '{"kind":"ConfigMap","data":{"app.conf":"listen 8080\npassword=hunter2"}}',
+      } },
+      data: { "app.conf": "listen 8080\npassword=hunter2" },
+    });
+    const out = sanitizeJSON(cm, "configmap");
+    expect(out).not.toContain("hunter2");
+    expect(out, "the non-secret part of the file survives").toContain("listen 8080");
+  });
+});
