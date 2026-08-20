@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initDb, closeDb, getDb } from "../gateway/db.js";
 import { runPortalMigrations } from "./migrate.js";
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 
 describe("runPortalMigrations on SQLite :memory:", () => {
   beforeEach(() => {
@@ -222,6 +223,25 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       expect(col!.notnull).toBe(1);
       expect(col!.dflt_value).toBe("'openai-completions'");
     });
+  });
+
+  it("model_entries token defaults match the constants writers use", async () => {
+    // The column default is the backstop for an INSERT that omits the column. It
+    // used to say 65536 while every writer said DEFAULT_MAX_TOKENS — two answers
+    // to one question, and the column's was above the real ceiling of the Claude
+    // models in use (64000), which the Claude protocol rejects rather than clamps.
+    const db = getDb();
+    await runPortalMigrations();
+    const [rows] = await db.query<Array<{ name: string; dflt_value: string | null }>>(
+      "PRAGMA table_info(model_entries)",
+    );
+    const defaultOf = (name: string) => rows.find((r) => r.name === name)?.dflt_value;
+    expect(defaultOf("max_tokens")).toBe(String(DEFAULT_MAX_TOKENS));
+    expect(defaultOf("context_window")).toBe(String(DEFAULT_CONTEXT_WINDOW));
+    // Independent of the constants: whatever they become, the stored default must
+    // stay under the smallest ceiling among models in use, or an omitted column
+    // hands out a value that fails every turn.
+    expect(DEFAULT_MAX_TOKENS).toBeLessThan(64000);
   });
 
   // Reproduces exactly what happened on siclaw-inner: a table created by an

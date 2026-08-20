@@ -299,7 +299,7 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
 
   const bindingApi = normalizeProviderApi(provider.api_type);
   const [entryRows] = await db.query(
-    "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
+    "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, compat_overrides FROM model_entries WHERE provider_id = ?",
     [provider.id],
   ) as any;
   const models = (entryRows as any[]).map((m: any) =>

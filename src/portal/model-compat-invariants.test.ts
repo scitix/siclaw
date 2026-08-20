@@ -30,7 +30,9 @@ const SRC_DIR = path.resolve(__dirname, "..");
  * when absent. `context_window` doubles as the marker that identifies such a
  * SELECT (see `isDescriptorSelect`), so it is not itself checked here.
  */
-const REQUIRED_DESCRIPTOR_COLUMNS = ["max_tokens", "max_tokens_field", "reasoning", "vision"];
+const REQUIRED_DESCRIPTOR_COLUMNS = [
+  "max_tokens", "max_tokens_field", "reasoning", "vision", "compat_overrides",
+];
 
 /** Number of production call sites of buildProviderModelDescriptor. */
 const EXPECTED_DESCRIPTOR_CALL_SITES = 7;

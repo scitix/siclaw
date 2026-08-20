@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest"
 import {
   applyProtocolToHinted,
+  buildAddModelBody,
   buildImportPayload,
   describeListedModel,
+  emptyModelForm,
   importableModels,
   modelApiLabel,
   normalizeApiType,
@@ -10,6 +12,34 @@ import {
   type FetchSelection,
   type ListedModel,
 } from "./Models"
+
+describe("add-model form defaults", () => {
+  // The form used to pre-fill 65536 and always send it. Because the API keeps any
+  // positive value it receives, that made the backend default unreachable on the
+  // primary user path: adding a Claude model whose real ceiling is 64000, without
+  // touching the field, stored a value that fails every turn. The fix is for the
+  // form to send nothing when the operator did not fill it in.
+  it("starts with max_tokens blank so the backend default applies", () => {
+    expect(emptyModelForm().max_tokens).toBe("")
+  })
+
+  it("omits max_tokens from the request body when left blank", () => {
+    const body = buildAddModelBody(emptyModelForm())
+    expect("max_tokens" in body).toBe(false)
+    // Absent, not NaN/null — parseInt("") on the wire is a different request.
+    expect(body.context_window).toBe(128000)
+  })
+
+  it("sends an operator-supplied max_tokens as a number", () => {
+    const body = buildAddModelBody({ ...emptyModelForm(), max_tokens: " 64000 " })
+    expect(body.max_tokens).toBe(64000)
+  })
+
+  it("never pre-fills a value above a live Claude model's ceiling", () => {
+    const prefilled = emptyModelForm().max_tokens
+    if (prefilled !== "") expect(parseInt(prefilled)).toBeLessThan(64000)
+  })
+})
 
 describe("normalizeApiType", () => {
   it("maps legacy stored api_type values to pi's canonical api ids", () => {
@@ -127,7 +157,7 @@ describe("describeListedModel", () => {
   // the 128K the import falls back to, because a too-low value makes siclaw
   // reject long turns in preflight.
   it("marks fallen-back values as defaults", () => {
-    expect(describeListedModel(listed({ id: "m" }))).toBe("128K ctx (default) · 66K out (default)")
+    expect(describeListedModel(listed({ id: "m" }))).toBe("128K ctx (default) · 16K out (default)")
   })
 
   it("shows real values without the default marker", () => {
@@ -137,7 +167,7 @@ describe("describeListedModel", () => {
 
   it("mixes real and defaulted fields", () => {
     expect(describeListedModel(listed({ id: "m", context_window: 200000 })))
-      .toBe("200K ctx · 66K out (default)")
+      .toBe("200K ctx · 16K out (default)")
   })
 
   it("appends capability flags only when present", () => {

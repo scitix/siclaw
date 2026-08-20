@@ -65,7 +65,7 @@ import {
   tracingTestSsrfGuard,
   type ExporterAuth,
 } from "./tracing-exporters.js";
-import { normalizeProviderApi, isValidMaxTokensField } from "../core/model-compat.js";
+import { normalizeProviderApi, isValidMaxTokensField, ANTHROPIC_COMPAT_KEYS, DEFAULT_MAX_TOKENS, DEFAULT_CONTEXT_WINDOW } from "../core/model-compat.js";
 import { readBodyWithCap } from "../lib/portal-snapshot-client.js";
 import {
   buildModelListUrl,
@@ -147,6 +147,40 @@ function normalizeMaxTokensFieldInput(
 
 const INVALID_MAX_TOKENS_FIELD_MESSAGE =
   'max_tokens_field must be "max_tokens", "max_completion_tokens", or empty for auto';
+
+/**
+ * Normalise a client-supplied `compat_overrides` for `model_entries`.
+ *
+ * Unlike the read path — which drops what it does not recognise so a value from
+ * a newer build cannot take a model out of service — a WRITE is rejected. An
+ * unknown key or a non-boolean here is an operator typo, and this is the one
+ * moment it can still be reported to the person who made it. Stored as JSON
+ * text; `{}` and `""` fold to NULL, i.e. back to automatic resolution.
+ */
+function normalizeCompatOverridesInput(
+  value: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (value === null || value === undefined) return { ok: true, value: null };
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return { ok: true, value: null };
+    try { parsed = JSON.parse(trimmed); } catch { return { ok: false }; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false };
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  const out: Record<string, boolean> = {};
+  for (const [key, v] of entries) {
+    if (!(ANTHROPIC_COMPAT_KEYS as readonly string[]).includes(key)) return { ok: false };
+    if (typeof v !== "boolean") return { ok: false };
+    out[key] = v;
+  }
+  if (Object.keys(out).length === 0) return { ok: true, value: null };
+  return { ok: true, value: JSON.stringify(out) };
+}
+
+const INVALID_COMPAT_OVERRIDES_MESSAGE =
+  `compat_overrides must be a JSON object of booleans limited to: ${ANTHROPIC_COMPAT_KEYS.join(", ")}`;
 
 // ── MCP config import / export ────────────────────────────────
 
@@ -3160,18 +3194,23 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const modelId = trim(body.model_id);
     const maxTokensField = normalizeMaxTokensFieldInput(body.max_tokens_field);
     if (!maxTokensField.ok) { sendJson(res, 400, { error: INVALID_MAX_TOKENS_FIELD_MESSAGE }); return; }
+    const compatOverrides = normalizeCompatOverridesInput(body.compat_overrides);
+    if (!compatOverrides.ok) { sendJson(res, 400, { error: INVALID_COMPAT_OVERRIDES_MESSAGE }); return; }
     await db.query(
-      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, is_default, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, compat_overrides, is_default, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, modelId, trim(body.name) || modelId,
         body.reasoning ? 1 : 0, body.vision ? 1 : 0,
-        clampTokenCount(body.context_window, 128000),
-        clampTokenCount(body.max_tokens, 65536),
+        clampTokenCount(body.context_window, DEFAULT_CONTEXT_WINDOW),
+        // Absent is not "unlimited": the Claude protocol rejects a request with no
+        // max_tokens. Same defaults pi applies on its own config path.
+        clampTokenCount(body.max_tokens, DEFAULT_MAX_TOKENS),
         // Required column: fall back to the provider's default when unspecified.
         apiType.value ?? providerApiType,
         // Nullable: NULL is the live "infer it" state, not a missing answer.
         maxTokensField.value,
+        compatOverrides.value,
         body.is_default ? 1 : 0,
         body.sort_order ?? 0,
       ],
@@ -3205,8 +3244,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // NOT NULL columns whose form inputs can arrive as null: the frontend sends
     // parseInt("") = NaN for a cleared box, which serialises to null, and the
     // generic loop below would push it straight into `context_window INT NOT
-    // NULL`. Fall back to the column default instead of 500-ing.
-    const NUMERIC_DEFAULTS: Record<string, number> = { context_window: 128000, max_tokens: 65536 };
+    // NULL`. Fall back to the same defaults the create path uses.
+    const NUMERIC_DEFAULTS: Record<string, number> = {
+      context_window: DEFAULT_CONTEXT_WINDOW,
+      max_tokens: DEFAULT_MAX_TOKENS,
+    };
     for (const f of fields) {
       if (!(f in body)) continue;
       sets.push(`${f} = ?`);
@@ -3237,6 +3279,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       const normalized = normalizeMaxTokensFieldInput(body.max_tokens_field);
       if (!normalized.ok) { sendJson(res, 400, { error: INVALID_MAX_TOKENS_FIELD_MESSAGE }); return; }
       sets.push("max_tokens_field = ?");
+      values.push(normalized.value);
+    }
+    // Same reasoning as max_tokens_field: kept out of the generic loop so `{}` /
+    // "" fold to NULL (back to automatic resolution) instead of being stored
+    // verbatim, and ahead of the guard so a PUT carrying only this field works.
+    if ("compat_overrides" in body) {
+      const normalized = normalizeCompatOverridesInput(body.compat_overrides);
+      if (!normalized.ok) { sendJson(res, 400, { error: INVALID_COMPAT_OVERRIDES_MESSAGE }); return; }
+      sets.push("compat_overrides = ?");
       values.push(normalized.value);
     }
     if (sets.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
@@ -3396,8 +3447,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         name: trim(m.name) || modelId,
         reasoning: m.reasoning ? 1 : 0,
         vision: m.vision ? 1 : 0,
-        contextWindow: clampTokenCount(m.context_window, 128000),
-        maxTokens: clampTokenCount(m.max_tokens, 65536),
+        contextWindow: clampTokenCount(m.context_window, DEFAULT_CONTEXT_WINDOW),
+        maxTokens: clampTokenCount(m.max_tokens, DEFAULT_MAX_TOKENS),
         apiType: apiType.value ?? providerApiType,
       });
     }

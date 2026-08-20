@@ -60,6 +60,16 @@ export interface BrainModelInfo {
    * only on the chat-completions variant.
    */
   maxTokensField?: string;
+  /**
+   * `compat.forceAdaptiveThinking` — the Anthropic thinking request shape.
+   *
+   * The same failure as `api` and `maxTokensField`, and the sharpest of the
+   * three: correcting a model from the legacy `thinking:{type:"enabled"}` to
+   * `{type:"adaptive"}` changes nothing about its id, provider or sizes, so a
+   * rebind check omitting it keeps issuing the shape Claude 4.6+ and the 5
+   * family reject with a 400.
+   */
+  forceAdaptiveThinking?: boolean;
 }
 
 /**
@@ -90,7 +100,8 @@ export function modelNeedsRebind(
     || current.reasoning !== next.reasoning
     || current.contextWindow !== next.contextWindow
     || current.maxTokens !== next.maxTokens
-    || current.maxTokensField !== next.maxTokensField;
+    || current.maxTokensField !== next.maxTokensField
+    || current.forceAdaptiveThinking !== next.forceAdaptiveThinking;
 }
 
 /**

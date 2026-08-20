@@ -100,7 +100,7 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
     if (!provider) continue;
 
     const [modelRows] = await db.query<ModelRow[]>(
-      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, compat_overrides FROM model_entries WHERE provider_id = ?",
       [provider.id],
     );
     const providerApi = normalizeProviderApi(provider.api_type);

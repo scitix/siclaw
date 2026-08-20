@@ -157,6 +157,21 @@ export interface RunPromptWithModelRoutingOptions {
    * attempt would leak into the persisted turn, and buffering costs nothing.
    */
   optimisticPrimaryStream?: boolean;
+  /**
+   * Apply the candidate's runtime tunables (`modelConfig.params` — currently
+   * `reasoning_effort`). Called for every attempt AFTER its `setModel`, which is
+   * the order `BrainSession.applyModelParams` documents and which pi requires:
+   * `setThinkingLevel` CLAMPS to the current model's capabilities, and on a
+   * non-reasoning model it clamps `high` to `off` without persisting it — the
+   * following `setModel` then restores the persisted default, so params applied
+   * BEFORE the switch are silently dropped on the first turn of a
+   * non-reasoning → reasoning binding.
+   *
+   * Per attempt, not per turn: each candidate may be a different model, and a
+   * fallback that inherited nothing would run at whatever level the previous
+   * candidate left behind.
+   */
+  applyCandidateModelParams?: (candidate: ModelRouteCandidate) => void;
   now?: () => number;
 }
 
@@ -296,31 +311,79 @@ export function shouldUseModelRouteRunner(policy: unknown, state: ModelRouteStat
  * - Real multi-candidate routing (`shouldUseModelRouteRunner`) → the configured
  *   policy, unchanged.
  * - Otherwise (routing off, single candidate, or a user-pinned model) → a
- *   single-candidate policy built from the CURRENT model. The runner then streams
- *   that one candidate live (optimistic primary), never falls back, and still
- *   emits `model_route_start` + `model_route_success(isFallback:false)` — so every
- *   turn carries its model identity on one event channel for downstream
- *   collection, while the UX is identical to a bare prompt.
+ *   single-candidate policy. The runner then streams that one candidate live
+ *   (optimistic primary), never falls back, and still emits `model_route_start` +
+ *   `model_route_success(isFallback:false)` — so every turn carries its model
+ *   identity on one event channel for downstream collection, while the UX is
+ *   identical to a bare prompt.
  *
- * The single candidate intentionally omits `modelConfig`: the model is already
- * pinned by the caller's setup, so `runAttempt`'s `modelNeedsUpdate` guard skips
- * a redundant `setModel` (which would otherwise drop applied runtime params).
+ * `requestBinding` — the model the CALLER asked this turn to run on, carrying its
+ * own `modelConfig` — wins over `currentModel` when supplied, and is the whole
+ * reason provider registration belongs to `runAttempt` rather than to the caller.
+ * A caller that registers the provider itself can only ever register the primary's
+ * one config, while a fallback candidate may live on a different provider
+ * entirely; and having registered it, the caller must then decide what a refusal
+ * or a missing model MEANS — which is precisely the judgement the routing policy
+ * already encodes (`model_not_found` is a default fallback condition). Passing the
+ * binding through instead keeps that judgement in one place: the config is
+ * registered per candidate, a refusal becomes that candidate's classified setup
+ * failure carrying pi's own message, and a fallback target still gets its turn.
  *
- * Returns `undefined` only when there is no current model — the runner's own
- * guard then falls back to a bare `brain.prompt`.
+ * When the binding is absent the candidate is built from the current model and
+ * omits `modelConfig`: nothing needs registering, and `runAttempt`'s
+ * `modelNeedsRebind` guard then skips a redundant `setModel` (which would
+ * otherwise drop applied runtime params).
+ *
+ * Returns `undefined` only when there is neither a binding nor a current model —
+ * the runner's own guard then falls back to a bare `brain.prompt`.
  */
 export function resolveEffectivePolicy(
   configured: ModelRoutePolicy | undefined,
   state: ModelRouteState,
   currentModel: { provider: string; id: string } | undefined,
+  requestBinding?: ModelRouteCandidate,
 ): ModelRoutePolicy | undefined {
-  if (shouldUseModelRouteRunner(configured, state)) return configured;
-  if (!currentModel) return undefined;
+  if (shouldUseModelRouteRunner(configured, state)) {
+    return withBindingConfig(configured!, requestBinding);
+  }
+  const candidate = requestBinding
+    ?? (currentModel ? { provider: currentModel.provider, modelId: currentModel.id } : undefined);
+  if (!candidate) return undefined;
   return {
     enabled: true,
     strategy: "ordered_fallback",
-    candidates: [{ provider: currentModel.provider, modelId: currentModel.id }],
+    candidates: [candidate],
   };
+}
+
+/**
+ * Give the configured candidate that names the request's bound model that
+ * binding's `modelConfig`, when it has none of its own.
+ *
+ * The top-level `modelConfig` is the documented registration config for the turn,
+ * while `ModelRouteCandidate.modelConfig` is optional — so a policy carrying only
+ * provider/model identities is valid at this boundary, and dropping the binding
+ * would leave the primary's provider unregistered and the candidate skipped as
+ * `model_not_found`. The control planes in tree hydrate every candidate, which is
+ * exactly why this gap is invisible from their side and must be closed here.
+ *
+ * A candidate's OWN config always wins: it is the more specific statement, and a
+ * fallback candidate on another provider must not be handed the primary's config.
+ */
+function withBindingConfig(
+  policy: ModelRoutePolicy,
+  binding: ModelRouteCandidate | undefined,
+): ModelRoutePolicy {
+  if (!binding?.modelConfig) return policy;
+  const candidates = normalizeCandidates(policy.candidates);
+  let changed = false;
+  const merged = candidates.map((candidate) => {
+    if (candidate.modelConfig) return candidate;
+    if (candidate.provider !== binding.provider || candidate.modelId !== binding.modelId) return candidate;
+    changed = true;
+    return { ...candidate, modelConfig: binding.modelConfig };
+  });
+  return changed ? { ...policy, candidates: merged } : policy;
 }
 
 export function normalizeModelRoutePolicy(policy: unknown): ModelRoutePolicy | undefined {
@@ -725,7 +788,9 @@ export async function runPromptWithModelRouting(
     // buffer every attempt, since a live failed attempt would leak into the
     // turn they persist from collected events.
     const streamFromStart = optimisticPrimaryStream && i === 0;
-    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart, media);
+    const attemptResult = await runAttempt(
+      brain, text, candidate, emitBrainEvent, streamFromStart, media, options.applyCandidateModelParams,
+    );
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
 
@@ -908,6 +973,7 @@ async function runAttempt(
   emitBrainEvent: (event: unknown) => void,
   streamFromStart: boolean,
   media?: PromptMedia,
+  applyCandidateModelParams?: (candidate: ModelRouteCandidate) => void,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -940,6 +1006,23 @@ async function runAttempt(
     if (modelNeedsRebind(brain.getModel(), model)) {
       await brain.setModel(model);
     }
+    // AFTER setModel, unconditionally — see applyCandidateModelParams. Also runs
+    // when the rebind was skipped: the level is session state a previous
+    // candidate or turn may have moved, so "no model change" does not mean "no
+    // params change".
+    applyCandidateModelParams?.(candidate);
+    // Which model this attempt actually runs on, and the wire settings that
+    // decide the request's SHAPE. Model identity used to be logged by the prompt
+    // path's own setModel call; that call moved in here, and for a while nothing
+    // logged it at all — leaving "which model was this turn on?" unanswerable
+    // from a box's stdout, which is the first question every provider-4xx triage
+    // asks. Attempt-scoped rather than turn-scoped: a fallback runs on a
+    // different model than the one the turn started with.
+    console.log(
+      `[model-route] attempt on ${model.provider}/${model.id} `
+      + `(api=${model.api ?? "-"}, maxTokensField=${model.maxTokensField ?? "-"}, `
+      + `adaptiveThinking=${model.forceAdaptiveThinking ?? "-"}, reasoning=${model.reasoning})`,
+    );
   } catch (err) {
     const message = errorMessage(err);
     unsubscribeProviderResponse?.();

@@ -151,4 +151,20 @@ describe("modelNeedsRebind", () => {
     expect(modelNeedsRebind({ ...base, maxTokensField: undefined }, base)).toBe(true);
     expect(modelNeedsRebind(base, { ...base, maxTokensField: undefined })).toBe(true);
   });
+
+  // The third instance of the same shape, and the loudest: correcting a model to
+  // adaptive thinking changes nothing else about it, so skipping the rebind keeps
+  // sending the legacy thinking shape that Claude 4.6+ rejects with a 400.
+  it("rebinds when only the thinking shape changed", () => {
+    expect(modelNeedsRebind(base, { ...base, forceAdaptiveThinking: true })).toBe(true);
+    expect(modelNeedsRebind({ ...base, forceAdaptiveThinking: true }, { ...base, forceAdaptiveThinking: false }))
+      .toBe(true);
+  });
+
+  it("does not rebind when the thinking shape is unset on both sides", () => {
+    // Absent means "pi's own default", so an unset key must compare EQUAL to
+    // itself — mapping absent to false would force a rebind on every turn for
+    // every OpenAI-protocol model, which never carries this key at all.
+    expect(modelNeedsRebind(base, { ...base })).toBe(false);
+  });
 });

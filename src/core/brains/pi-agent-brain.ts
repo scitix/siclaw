@@ -36,6 +36,18 @@ function readMaxTokensField(compat: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/**
+ * Same narrowing for a boolean compat key. Undefined when absent — and that is
+ * load-bearing rather than incidental: absent means "pi's own default", so
+ * mapping it to `false` here would make an unset key compare unequal to a model
+ * explicitly set to false and force a pointless rebind on every turn.
+ */
+function readCompatBoolean(compat: unknown, key: string): boolean | undefined {
+  if (!compat || typeof compat !== "object" || !(key in compat)) return undefined;
+  const value = (compat as Record<string, unknown>)[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
 
@@ -256,6 +268,7 @@ export class PiAgentBrain implements BrainSession {
       reasoning: model.reasoning,
       api: model.api,
       maxTokensField: readMaxTokensField(model.compat),
+      forceAdaptiveThinking: readCompatBoolean(model.compat, "forceAdaptiveThinking"),
     };
   }
 
@@ -292,6 +305,7 @@ export class PiAgentBrain implements BrainSession {
       reasoning: model.reasoning,
       api: model.api,
       maxTokensField: readMaxTokensField(model.compat),
+      forceAdaptiveThinking: readCompatBoolean(model.compat, "forceAdaptiveThinking"),
     };
   }
 

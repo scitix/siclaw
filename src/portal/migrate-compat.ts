@@ -89,6 +89,42 @@ export async function tightenColumnNotNull(
 }
 
 /**
+ * Idempotently change a column's DEFAULT (MySQL only).
+ *
+ * Distinct from {@link widenColumn}, which compares COLUMN_TYPE: an INT staying an
+ * INT reads as "no change" however the default differs, so a default correction
+ * would silently skip. `CREATE TABLE IF NOT EXISTS` cannot reach an existing table
+ * either, and {@link safeAlterTable} only ADDs missing columns — so a wrong default
+ * on an upgraded database has no other way out.
+ *
+ * A default-only MODIFY is a metadata change in MySQL 8 (no table copy), and this
+ * is guarded on the current COLUMN_DEFAULT so it runs at most once. SQLite has no
+ * cheap MODIFY COLUMN — changing a default there means rebuilding the table — so it
+ * is a no-op, and an existing SQLite file keeps whatever default it was created
+ * with. Callers must therefore treat a column default as a backstop, never as the
+ * value writers rely on.
+ */
+export async function setColumnDefault(
+  db: Db,
+  table: string,
+  column: string,
+  definition: string,
+  expectedDefault: string,
+): Promise<void> {
+  if (db.driver !== "mysql") return;
+  if (!(await columnExists(db, table, column))) return; // fresh install already has it
+  const [rows] = await db.query<Array<{ COLUMN_DEFAULT: string | null }>>(
+    `SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column],
+  );
+  const current = (rows[0]?.COLUMN_DEFAULT ?? "").trim();
+  if (current === expectedDefault) return; // already correct — skip the MODIFY
+  await db.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
+  console.log(`[portal-migrate] default for ${table}.${column}: ${current || "(none)"} → ${expectedDefault}`);
+}
+
+/**
  * Idempotently widen a column's TYPE (MySQL only). CHAR→VARCHAR is a type change that
  * {@link safeAlterTable} (add-if-missing) never applies to an existing column, so widening an
  * existing deployment needs an explicit MODIFY. Guarded on the current COLUMN_TYPE so a large

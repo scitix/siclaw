@@ -49,7 +49,7 @@ import {
   type ModelRouteEvent,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
-import { modelNeedsRebind } from "../core/brain-session.js";
+import { withResolvedModelCompat } from "../core/model-compat.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 
 type RequestHandler = (
@@ -327,17 +327,102 @@ function defaultPromptTextForMedia(media?: PromptMedia): string {
   return "";
 }
 
+/**
+ * Same resolution as `withResolvedModelCompat`, applied to every candidate's own
+ * config. A fallback candidate is registered from its OWN modelConfig, so
+ * resolving only the turn's binding would leave the chain's later models on
+ * whatever shape the control plane happened to state — the failure would simply
+ * move one candidate down.
+ */
+function withResolvedCandidateCompat(
+  policy: ModelRoutePolicy | undefined,
+): ModelRoutePolicy | undefined {
+  if (!policy?.candidates?.length) return policy;
+  let changed = false;
+  const candidates = policy.candidates.map((candidate) => {
+    if (!candidate.modelConfig) return candidate;
+    const resolved = withResolvedModelCompat(candidate.modelConfig);
+    if (resolved === candidate.modelConfig) return candidate;
+    changed = true;
+    return { ...candidate, modelConfig: resolved };
+  });
+  return changed ? { ...policy, candidates } : policy;
+}
+
+/**
+ * The model this turn's caller asked to run on, shaped as a routing candidate so
+ * that registering its config and looking it up stay inside `runAttempt`.
+ */
+function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate | undefined {
+  if (!body.modelProvider || !body.modelId) return undefined;
+  return {
+    provider: body.modelProvider,
+    modelId: body.modelId,
+    modelConfig: body.modelConfig,
+  };
+}
+
+/**
+ * Apply one candidate's runtime tunables. Snake_case on the wire → camelCase
+ * `BrainModelParams`.
+ *
+ * The candidate's own `params` win; the turn's top-level `modelConfig.params` are
+ * the fallback. That order matters in both directions: a control plane hydrates
+ * each candidate with its PROVIDER config, which carries no `params`, so reading
+ * only the candidate would drop the effort the caller asked for on every routed
+ * turn — while reading only the top level would ignore a per-candidate override.
+ */
+function applyModelParamsForCandidate(
+  brain: BrainSession,
+  candidate: ModelRouteCandidate,
+  turnModelConfig: Record<string, unknown> | undefined,
+): void {
+  if (!brain.applyModelParams) return;
+  const raw = readParams(candidate.modelConfig) ?? readParams(turnModelConfig);
+  if (!raw) return;
+  const effort = raw.reasoning_effort;
+  brain.applyModelParams({
+    reasoningEffort: typeof effort === "string" ? effort : undefined,
+  });
+}
+
+function readParams(config: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const params = config?.params;
+  return params && typeof params === "object" ? params as Record<string, unknown> : undefined;
+}
+
+/**
+ * The binding to actually route this turn on.
+ *
+ * A binding WITH a `modelConfig` is always handed through: registering it is
+ * `runAttempt`'s job, and if the model is still absent afterwards that is a real
+ * `model_not_found` — a fallback candidate gets its turn, and with no fallback the
+ * run exhausts and reports it, rather than silently answering on whichever model
+ * the session happened to be on.
+ *
+ * A binding WITHOUT one is different in kind: there is nothing to register, so the
+ * caller is naming a model it expects to already exist. If it does not, the
+ * session stays on its current model — a tolerance that predates routing and that
+ * callers of the plain `modelProvider`/`modelId` form rely on. Only that case is
+ * tolerated, and only here; it is deliberately not extended to a binding whose
+ * config was supposed to create the model.
+ */
+function bindingCandidateForRun(
+  body: PromptRequestBody,
+  brain: { findModel: (provider: string, modelId: string) => unknown },
+): ModelRouteCandidate | undefined {
+  const binding = requestBindingCandidate(body);
+  if (!binding) return undefined;
+  if (binding.modelConfig) return binding;
+  return brain.findModel(binding.provider, binding.modelId) ? binding : undefined;
+}
+
 function singleCandidateForMediaPreflight(
   body: PromptRequestBody,
   policy: ModelRoutePolicy | undefined,
 ): ModelRouteCandidate | undefined {
-  if (body.modelProvider && body.modelId) {
-    return {
-      provider: body.modelProvider,
-      modelId: body.modelId,
-      modelConfig: body.modelConfig,
-    };
-  }
+  const binding = requestBindingCandidate(body);
+  if (binding) return binding;
   const candidates = normalizeCandidates(policy?.candidates);
   return candidates.length === 1 ? candidates[0] : undefined;
 }
@@ -754,9 +839,18 @@ export function createHttpServer(
       return;
     }
 
-    const configuredModelRouting = normalizeModelRoutePolicy(
+    // Fill in wire-compat keys the caller left unstated, for THIS turn's binding
+    // and for every routing candidate, before any of them reaches
+    // registerProvider. A control plane that answers config.getModelBinding
+    // itself supplies the whole modelConfig and the runtime forwards it verbatim,
+    // so the descriptor-side resolution never runs on that path — which is how
+    // the adaptive-thinking 400 survived being fixed there. Mutating our own
+    // parsed body is deliberate: every later use (the binding candidate,
+    // setDelegationModel, the params lookup) then sees the same resolved config.
+    if (body.modelConfig) body.modelConfig = withResolvedModelCompat(body.modelConfig);
+    const configuredModelRouting = withResolvedCandidateCompat(normalizeModelRoutePolicy(
       body.modelRouting !== undefined ? body.modelRouting : loadConfig().modelRouting,
-    );
+    ));
     if (body.modelProvider && body.modelId) {
       const clearedUserSelection = clearModelRouteUserSelectionIfDifferent(managed.modelRouteState, {
         provider: body.modelProvider,
@@ -846,41 +940,15 @@ export function createHttpServer(
         });
       }
 
-      // Dynamically register provider config from gateway DB (before findModel)
-      if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
-        try {
-          managed.brain.registerProvider(body.modelProvider, body.modelConfig);
-          console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
-        } catch (err) {
-          console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
-        }
-      }
+      // Provider registration and model lookup for this turn's binding are NOT
+      // done here — they belong to `runAttempt`, per candidate. See
+      // `resolveEffectivePolicy` for why, and `requestBindingCandidate` below for
+      // how the binding reaches it.
 
-      // Set model if specified in prompt request (ensures model is applied before first prompt)
-      // Always call setModel when the registry model differs from the session model
-      // (covers field changes like reasoning/contextWindow without id/provider change)
-      if (body.modelProvider && body.modelId) {
-        const found = managed.brain.findModel(body.modelProvider, body.modelId);
-        if (found) {
-          const currentModel = managed.brain.getModel();
-          if (modelNeedsRebind(currentModel, found)) {
-            console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
-            await managed.brain.setModel(found);
-          }
-        }
-      }
-
-      // Apply per-model runtime tunables delivered on modelConfig.params
-      // (reasoning_effort). Re-applied every prompt so a model switch or a config
-      // change takes effect on the next turn. Snake_case on the wire → camelCase
-      // BrainModelParams.
-      if (body.modelConfig && managed.brain.applyModelParams) {
-        const rawParams = (body.modelConfig as Record<string, unknown>).params;
-        const p = (rawParams && typeof rawParams === "object" ? rawParams : {}) as Record<string, unknown>;
-        managed.brain.applyModelParams({
-          reasoningEffort: typeof p.reasoning_effort === "string" ? p.reasoning_effort : undefined,
-        });
-      }
+      // Runtime tunables (modelConfig.params) are applied per candidate, AFTER
+      // that candidate's setModel — see applyCandidateModelParams at the runner
+      // call below. Applying them here would be before the model switch, which
+      // pi silently discards.
 
       if (requiredInputsForPromptMedia(promptMedia).length > 0) {
         if (shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState)) {
@@ -1071,14 +1139,15 @@ export function createHttpServer(
     }
 
     // Single entry: every prompt goes through the routing runner. With no real
-    // fallback target it runs one candidate (the current model) live — identical
-    // UX to a bare prompt, but still emitting model_route_* so every turn carries
-    // its model identity on one channel. effectivePolicy is read AFTER model setup
-    // so the single candidate reflects the model just pinned for this turn.
+    // fallback target it runs one candidate live — identical UX to a bare prompt,
+    // but still emitting model_route_* so every turn carries its model identity on
+    // one channel. That candidate is this turn's BINDING when the request carried
+    // one (the runner registers its config and looks it up), else the current model.
     const effectivePolicy = resolveEffectivePolicy(
       configuredModelRouting,
       managed.modelRouteState,
       managed.brain.getModel?.(),
+      bindingCandidateForRun(body, managed.brain),
     );
     // Only the no-current-model edge falls back to a bare brain.prompt (runner
     // guard) whose events flow through the live _eventBuffer subscription.
@@ -1096,6 +1165,9 @@ export function createHttpServer(
         emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
         onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
         shouldAbort: () => managed._aborted,
+        applyCandidateModelParams: (candidate) => {
+          applyModelParamsForCandidate(managed.brain, candidate, body.modelConfig);
+        },
       },
       promptMedia,
     );
