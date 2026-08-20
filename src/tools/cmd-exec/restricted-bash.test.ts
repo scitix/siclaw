@@ -1759,3 +1759,35 @@ describe("a Secret read cannot be piped", () => {
     }
   });
 });
+
+describe("the subcommand and the rollout verb come from one reader", () => {
+  const check = (cmd: string) => validateKubectlInPipeline([cmd]);
+  it("is not fooled by a global flag's value", () => {
+    // A local copy of the value-flag list was missing `--as` and others, so `kubectl --as get delete pod
+    // victim` took `get` as the subcommand and the mutating `delete` was never examined. The table now
+    // lives with the sanitizer, because both sides have to agree about where the verb is.
+    for (const cmd of ["kubectl --as get delete pod victim", "kubectl --request-timeout get delete pod v",
+                       "kubectl --as-group get delete pod v", "kubectl --as-uid get delete pod v",
+                       "kubectl --cache-dir get delete pod v", "kubectl --username get delete pod v",
+                       "kubectl --token get apply -f x.yaml"]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("extracts the rollout verb the same way — it was wrong in BOTH directions", () => {
+    // `rollout -n history restart …` read the namespace as the verb and permitted a restart;
+    // `rollout -n x history …` was refused for naming `x`.
+    expect(check("kubectl rollout -n history restart deployment/foo"), "a restart must not pass").not.toBeNull();
+    expect(check("kubectl rollout --as history undo deployment/foo")).not.toBeNull();
+    expect(check("kubectl rollout -n x history deployment/foo"), "a namespaced history must pass").toBeNull();
+    expect(check("kubectl rollout history deployment/foo")).toBeNull();
+  });
+
+  it("leaves ordinary namespaced and impersonated reads alone", () => {
+    for (const cmd of ["kubectl get pods", "kubectl -n kube-system get pods",
+                       "kubectl --as user get pods", "kubectl --request-timeout 30s get pods",
+                       "kubectl --context prod -n x get pods -o json"]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+});

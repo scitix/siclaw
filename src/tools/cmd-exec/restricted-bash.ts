@@ -93,25 +93,11 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     // Extract the kubectl arguments from the command string
     const stripped = cmd.trim().replace(/^\S+\s+/, ""); // remove "kubectl" prefix
     const args = parseArgs(stripped);
-    // Skip flags and their values to find the actual subcommand.
-    // Flags like -n, --namespace, --kubeconfig consume the next arg as a value,
-    // so "kubectl -n kube-system get pods" must not treat "kube-system" as subcommand.
-    const KUBECTL_VALUE_FLAGS = new Set([
-      "-n", "--namespace", "--kubeconfig", "--context", "--cluster",
-      "--user", "--server", "-s", "--token", "--certificate-authority",
-      "--client-certificate", "--client-key", "--tls-server-name",
-    ]);
-    let subcommand: string | undefined;
-    for (let i = 0; i < args.length; i++) {
-      const a = args[i];
-      if (a.startsWith("-")) {
-        // Skip flag + its value if it's a known value-taking flag (without =)
-        if (KUBECTL_VALUE_FLAGS.has(a) && !a.includes("=")) i++;
-        continue;
-      }
-      subcommand = a.toLowerCase();
-      break;
-    }
+    // ONE reader, with the shared flag-arity table. A local copy of the value-flag list is how
+    // `kubectl --as get delete pod victim` got through: `--as` was missing from it, so `get` was taken
+    // as the subcommand and the mutating `delete` was never examined. The table lives with the
+    // sanitizer because both sides must agree about where the verb is.
+    const subcommand = kubectlSubcommand(args);
 
     if (subcommand === "exec") {
       return JSON.stringify({
@@ -125,7 +111,11 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     // review shows the blanket refusal costing five calls to rebuild the same information out of
     // Deployment annotations and ReplicaSets.
     if (subcommand === "rollout") {
-      const verb = args.find((a, i) => i > args.indexOf("rollout") && !a.startsWith("-"));
+      // The verb needs the same treatment as the subcommand: `kubectl rollout -n history restart …`
+      // otherwise reads `history` (the namespace) as the verb and permits a restart, while
+      // `kubectl rollout -n x history …` is refused for naming `x`. Wrong in both directions.
+      const afterRollout = args.slice(args.indexOf("rollout") + 1);
+      const verb = kubectlSubcommand(afterRollout);
       if (verb === "history") return null;
       return JSON.stringify({
         error: `kubectl rollout "${verb ?? "(no verb)"}" is not allowed in read-only mode.`,

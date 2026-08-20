@@ -115,10 +115,83 @@ function globReachesSensitivePath(arg: string, examples: readonly string[]): str
  * Extract individual commands from a shell pipeline.
  * Splits on |, &&, ;, || while respecting quotes and subshells.
  */
+/**
+ * Does the quote character at `at` actually CLOSE the string?
+ *
+ * bash: inside `'...'` a backslash has no special meaning at all, so the next `'` always closes. Three
+ * tokenizers in this file counted preceding backslashes regardless of quote type, so
+ *
+ *   echo 'x\'; kubectl delete pod victim
+ *
+ * read as ONE `echo` command — while bash runs two, which a shell confirms. Every check downstream then
+ * examined only the `echo`: the disallowed-command list, the kubectl verb rules, the redirection ban.
+ * It applies to restricted_bash, node_exec and host_exec, all of which hand the string to a shell.
+ *
+ * `"..."` and `$'...'` DO honour escapes, so the backslash count still decides there.
+ */
+function quoteCloses(input: string, at: number, quote: string, ansiC: boolean): boolean {
+  if (quote === "'" && !ansiC) return true;
+  let backslashes = 0;
+  for (let j = at - 1; j >= 0 && input[j] === "\\"; j--) backslashes++;
+  return backslashes % 2 === 0;
+}
+
+/**
+ * OUTSIDE any quote, does the character at `at` escape the one after it?
+ *
+ * The companion to `quoteCloses`, and the other half of the same mistake. bash escapes ANY next character
+ * here, quotes included, so `\'` is a literal apostrophe that does not open a string. Two of these
+ * tokenizers escaped only `; | & \`, and the third did not escape anything — and in all three the quote
+ * branch ran FIRST, so the `'` was consumed as an opening quote before the escape was ever considered.
+ * Everything after it then read as quoted:
+ *
+ *   echo \' > /tmp/pwn        the redirection ban never saw a `>` — measured in a container, the file
+ *                             really was created
+ *   echo \' ; rm x            the separator never split, so `rm` was never checked
+ *   echo 'x'\''y'; rm x       the same, via the ordinary idiom for an apostrophe inside single quotes
+ *
+ * Found by differentially testing the tokenizer against a real bash rather than by reading it: the
+ * construct that exposed it is one nobody would write by hand as an attack, and it is what `'` becomes
+ * when a shell-quoting helper emits it.
+ *
+ * The character set is deliberately unbounded. A list here is a list that will be missing something.
+ */
+function escapesNext(input: string, at: number): boolean {
+  return input[at] === "\\" && at + 1 < input.length;
+}
+
+/**
+ * Is the `'` at `quoteAt` the start of an ANSI-C string, `$'…'`?
+ *
+ * It matters because the two kinds of single quote follow OPPOSITE rules: in `'…'` a backslash escapes
+ * nothing so the next `'` always closes, while in `$'…'` it escapes and can therefore extend the string
+ * past a separator. Deciding this on `input[quoteAt - 1] === "$"` alone was wrong in both of the ways a
+ * `$` can fail to introduce one:
+ *
+ *   echo \$'x\'; rm x      the `$` is escaped — a literal dollar, then a PLAIN single quote
+ *   echo $$'x\'; rm x      `$$` is the pid, and the `'` after it is a PLAIN single quote
+ *
+ * bash runs two commands in both cases; we read one, and the tail was never checked. Measured, not
+ * inferred.
+ *
+ * The rule here is deliberately narrower than bash's: only a lone `$`, itself not preceded by `$` or `\`,
+ * introduces an ANSI-C string. Anything more tangled (`$$$'…'`, `\\$'…'`) falls back to the PLAIN rule,
+ * which closes at the next `'` — more splits, more checks, never fewer. Getting this direction right is
+ * the whole point: a wrong "plain" reading over-refuses, a wrong "ANSI-C" reading lets a command through.
+ * Chasing bash's exact lexer here would mean re-deriving `$$`/`${}`/`$(` interaction, and every attempt
+ * at that in this file so far has produced a new hole.
+ */
+function opensAnsiC(input: string, quoteAt: number): boolean {
+  if (input[quoteAt - 1] !== "$") return false;
+  const before = input[quoteAt - 2];
+  return before !== "$" && before !== "\\";
+}
+
 export function extractCommands(input: string): string[] {
   const commands: string[] = [];
   let current = "";
   let inQuote: string | null = null;
+  let ansiC = false;
   let parenDepth = 0;
 
   for (let i = 0; i < input.length; i++) {
@@ -126,32 +199,27 @@ export function extractCommands(input: string): string[] {
 
     if (inQuote) {
       current += ch;
-      if (ch === inQuote) {
-        // Count consecutive preceding backslashes — char is escaped only if count is odd
-        let backslashes = 0;
-        for (let j = i - 1; j >= 0 && input[j] === "\\"; j--) backslashes++;
-        if (backslashes % 2 === 0) {
-          inQuote = null;
-        }
+      if (ch === inQuote && quoteCloses(input, i, inQuote, ansiC)) {
+        inQuote = null;
+        ansiC = false;
       }
+      continue;
+    }
+
+    // Escapes are resolved BEFORE quotes: `\'` is a literal apostrophe, not an opening quote. Reversing
+    // these two branches is what let a `>` and a `;` hide inside a string that bash never started.
+    if (escapesNext(input, i)) {
+      current += ch + input[i + 1];
+      i++;
       continue;
     }
 
     if (ch === '"' || ch === "'" || ch === "`") {
+      // `$'…'` honours escapes; a plain `'…'` does not.
+      ansiC = ch === "'" && opensAnsiC(input, i);
       inQuote = ch;
       current += ch;
       continue;
-    }
-
-    // Handle backslash escape outside quotes (e.g., \; in find -exec ... \;)
-    // Prevents escaped metacharacters from being treated as command separators.
-    if (ch === "\\" && i + 1 < input.length) {
-      const next = input[i + 1];
-      if (next === ";" || next === "|" || next === "&" || next === "\\") {
-        current += ch + next;
-        i++;
-        continue;
-      }
     }
 
     if (ch === "(") {
@@ -214,6 +282,7 @@ export function extractPipeline(input: string): PipelineSegment[] {
   const segments: PipelineSegment[] = [];
   let current = "";
   let inQuote: string | null = null;
+  let ansiC = false;
   let parenDepth = 0;
   let nextIsPiped = false;
 
@@ -222,31 +291,26 @@ export function extractPipeline(input: string): PipelineSegment[] {
 
     if (inQuote) {
       current += ch;
-      if (ch === inQuote) {
-        // Count consecutive preceding backslashes — char is escaped only if count is odd
-        let backslashes = 0;
-        for (let j = i - 1; j >= 0 && input[j] === "\\"; j--) backslashes++;
-        if (backslashes % 2 === 0) {
-          inQuote = null;
-        }
+      if (ch === inQuote && quoteCloses(input, i, inQuote, ansiC)) {
+        inQuote = null;
+        ansiC = false;
       }
+      continue;
+    }
+
+    // Escapes before quotes — see `escapesNext`.
+    if (escapesNext(input, i)) {
+      current += ch + input[i + 1];
+      i++;
       continue;
     }
 
     if (ch === '"' || ch === "'" || ch === "`") {
+      // `$'…'` honours escapes; a plain `'…'` does not.
+      ansiC = ch === "'" && opensAnsiC(input, i);
       inQuote = ch;
       current += ch;
       continue;
-    }
-
-    // Handle backslash escape outside quotes (e.g., \; in find -exec ... \;)
-    if (ch === "\\" && i + 1 < input.length) {
-      const next = input[i + 1];
-      if (next === ";" || next === "|" || next === "&" || next === "\\") {
-        current += ch + next;
-        i++;
-        continue;
-      }
     }
 
     if (ch === "(") { parenDepth++; current += ch; continue; }
@@ -303,6 +367,7 @@ export function extractPipeline(input: string): PipelineSegment[] {
  */
 export function validateShellOperators(command: string): string | null {
   let inQuote: string | null = null;
+  let ansiC3 = false;
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
@@ -332,13 +397,24 @@ export function validateShellOperators(command: string): string | null {
 
     // Track quote state for redirection checks only
     if (inQuote) {
-      if (ch === inQuote && command[i - 1] !== "\\") {
+      if (ch === inQuote && quoteCloses(command, i, inQuote, ansiC3)) {
         inQuote = null;
+        ansiC3 = false;
       }
       continue;
     }
 
+    // Escapes before quotes — see `escapesNext`. This function had no escape handling at all, which is
+    // why `echo \' > /tmp/pwn` passed the redirection ban: the `'` opened a string bash never opened, and
+    // the `>` was read as its content. Placed after the substitution checks above deliberately, so `\$(`
+    // and `` \` `` keep being refused — over-refusing a substitution is not the failure mode here.
+    if (escapesNext(command, i)) {
+      i++;
+      continue;
+    }
+
     if (ch === "'" || ch === '"') {
+      ansiC3 = ch === "'" && opensAnsiC(command, i);
       inQuote = ch;
       continue;
     }
@@ -367,18 +443,49 @@ export function validateShellOperators(command: string): string | null {
         }, null, 2);
       }
 
-      // Allow fd duplication: >&N (e.g. 2>&1, >&2)
-      if (command[i + 1] === "&") continue;
+      // fd duplication — `2>&1`, `>&2`, `2>&-` — is allowed. A FILE after `>&` is not.
+      //
+      // `[n]>&word` only duplicates a descriptor when `word` is a number or `-`. Otherwise bash treats it
+      // as an ordinary output redirection, so `echo HI >& /tmp/out` writes the file — measured in a
+      // container, where the file appeared with `HI` in it while this returned ALLOW. It reads as fd
+      // syntax, which is why one `continue` covered it for the whole history of this check.
+      //
+      // Only `>&` and `1>&` actually reach a file; `2>&/tmp/x` and `3>&/tmp/x` make bash say `ambiguous
+      // redirect` and write nothing. The rule here does not encode that asymmetry — refusing a form bash
+      // rejects anyway costs nothing, and the reason `1` behaves like an absent fd is not a detail worth
+      // depending on.
+      if (command[i + 1] === "&") {
+        let j = i + 2;
+        while (j < command.length && (command[j] === " " || command[j] === "\t")) j++;
+        // A descriptor number, or `-` to close. Anything else — a path, a variable, a glob — is a file.
+        const word = command.slice(j).match(/^(\d+|-)(?=[\s;|&)]|$)/);
+        if (word) continue;
+        return JSON.stringify({
+          error: "Output redirection (>&) to a file is not allowed.",
+          hint: "`>&` duplicates a file descriptor only when followed by a number or `-` (e.g. `2>&1`, `>&2`). Followed by anything else it writes a file, which is refused like `>`.",
+        }, null, 2);
+      }
 
       // Determine the redirect target (skip optional second > for >>)
       let j = i + 1;
       if (command[j] === ">") j++; // >>
-      // Skip whitespace
-      while (j < command.length && command[j] === " ") j++;
+      // A tab separates a redirection from its target exactly as a space does, so skipping only spaces
+      // refused `> \t/dev/null` — over-refusal, but a pointless one, and the `>&` branch above already
+      // skips both. Two whitespace rules in one function is how they end up disagreeing.
+      while (j < command.length && (command[j] === " " || command[j] === "\t")) j++;
 
-      // Allow redirect to /dev/null
+      // Allow redirect to /dev/null — and ONLY to /dev/null.
+      //
+      // `\b` here matched any path whose next character is not a word character, so `> /dev/null.bak`,
+      // `/dev/null-x`, `/dev/null~`, `/dev/null,x` and `/dev/null:x` were all read as the discard target
+      // and permitted. Measured in a container: each one wrote a real file with the payload in it. The
+      // blast radius is small — the write lands under `/dev`, which only root can write, and neither
+      // `sandbox` (restricted_bash) nor `agentbox` (node_exec) can — so this was a hole in the check, not
+      // a reachable escalation. It is still the redirection ban failing to mean what it says.
+      //
+      // The target must therefore END here: whitespace, a shell separator, or end of string.
       const target = command.substring(j);
-      if (/^\/dev\/null\b/.test(target)) continue;
+      if (/^\/dev\/null(?=[\s;|&)]|$)/.test(target)) continue;
 
       return JSON.stringify({
         error: "Output redirection (> or >>) to files is not allowed.",

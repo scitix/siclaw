@@ -370,7 +370,41 @@ const FLAGS_WITH_VALUE = new Set([
   "--cluster",
   "--as",
   "--as-group",
+  "--as-uid",
   "--timeout",
+  // kubectl's remaining global value flags. This table decides where the SUBCOMMAND is, and BOTH kinds of
+  // error are real:
+  //
+  //   a missing entry     hands back the flag's value as the verb — `kubectl --as get delete pod victim`
+  //                       read as subcommand `get`, and the mutating `delete` went through
+  //   a wrong entry       swallows the verb — `--warnings-as-errors` is a BOOLEAN, so listing it here
+  //                       made `kubectl --warnings-as-errors delete get pod victim` read as `get` while
+  //                       real kubectl runs the delete. It also broke ordinary reads: plain
+  //                       `--warnings-as-errors get pods` was refused for naming subcommand `pods`.
+  //
+  // So this table is not a memory exercise. It is checked against `kubectl options` — a snapshot lives in
+  // `testdata/kubectl-options.txt` and `kubectl-flag-table.test.ts` compares the two. Refresh the
+  // snapshot by running `kubectl options` when kubectl is upgraded; anything ending `=false` or `=true`
+  // there is a boolean and must NOT be listed here.
+  "--request-timeout",
+  "--cache-dir",
+  "--username",
+  "--password",
+  "--token",
+  "--server", "-s",
+  "--user",
+  "--as-user-extra",
+  "--kuberc",
+  "--v", "-v",
+  "--certificate-authority",
+  "--client-certificate",
+  "--client-key",
+  "--tls-server-name",
+  "--profile",
+  "--profile-output",
+  "--log-file",
+  "--log-flush-frequency",
+  "--vmodule",
 ]);
 
 // ── Detection functions ──────────────────────────────────────────────

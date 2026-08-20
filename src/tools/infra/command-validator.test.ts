@@ -502,3 +502,28 @@ describe("a sensitive-output source cannot feed a pipe", () => {
     }
   });
 });
+
+describe("a single quote is not escapable", () => {
+  const nd = { context: "node" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  it("closes on the next quote, so the second command is seen", () => {
+    // bash gives a backslash NO special meaning inside `'…'`, so `echo 'x\'; cmd` is TWO commands —
+    // confirmed by running a shell, which printed both. Three tokenizers here counted preceding
+    // backslashes regardless of quote type and read it as one `echo`, so every downstream check saw only
+    // that: the disallowed-command list, the kubectl verb rules, the redirection ban. It applies to
+    // restricted_bash, node_exec and host_exec, which all hand the string to a shell.
+    for (const cmd of ["echo 'x\\'; kubectl delete pod victim", "true 'x\\'; rm harmless",
+                       "echo 'x\\'; echo hi > /tmp/out", "echo 'x\\'; ip link set eth0 down"]) {
+      expect(extractCommands(cmd).length, cmd).toBe(2);
+      expect(validateCommand(cmd, nd), cmd).not.toBeNull();
+    }
+  });
+
+  it("still honours escapes where bash does", () => {
+    // `"…"` and `$'…'` DO process a backslash, so the count still decides there — and a `;` inside any
+    // quote is data, not a separator.
+    expect(extractCommands('echo "a\\"; b"').length, "escaped quote inside double quotes").toBe(1);
+    expect(extractCommands("grep 'a;b' /var/log/x").length).toBe(1);
+    expect(extractCommands('grep "a;b" /var/log/x').length).toBe(1);
+    expect(validateCommand("grep 'a;b' /var/log/x", nd)).toBeNull();
+  });
+});
