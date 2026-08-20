@@ -70,6 +70,20 @@ find /app/.siclaw/credentials -type f -exec chmod 0640 {} \; 2>/dev/null || true
 # The realistic way to get here is a spec change, not a bug: `runAsNonRoot: true`, a restricted Pod
 # Security Standard on the namespace, or CHOWN dropped from the capability list. The pod would come up
 # looking healthy.
+# Each type directory as well as the parent: the chowns are independent, so a partial failure can leave
+# one of them root-owned and readable while the parent looks correct.
+for spec in "clusters:agentbox:kubecred:2750" "hosts:agentbox:hostcred:2750"; do
+  d="${spec%%:*}"; rest="${spec#*:}"; want_own="${rest%:*}"; want_mode="${rest##*:}"
+  [ -d "/app/.siclaw/credentials/$d" ] || continue
+  got_own="$(stat -c '%U:%G' "/app/.siclaw/credentials/$d" 2>/dev/null || echo '?:?')"
+  got_mode="$(stat -c '%a' "/app/.siclaw/credentials/$d" 2>/dev/null || echo '?')"
+  if [ "$got_own" != "$want_own" ] || [ "$got_mode" != "$want_mode" ]; then
+    echo "FATAL: /app/.siclaw/credentials/$d is $got_own mode $got_mode, expected $want_own mode $want_mode." >&2
+    echo "       One credential type is not isolated even though the parent looks correct." >&2
+    exit 1
+  fi
+done
+
 cred_owner="$(stat -c '%U:%G' /app/.siclaw/credentials 2>/dev/null || echo '?:?')"
 cred_mode="$(stat -c '%a' /app/.siclaw/credentials 2>/dev/null || echo '?')"
 if [ "$cred_owner" != "agentbox:kubecred" ] || [ "$cred_mode" != "750" ]; then

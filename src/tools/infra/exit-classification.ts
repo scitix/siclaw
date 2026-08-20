@@ -137,7 +137,11 @@ const EXIT_1_MEANS_NOTHING_FOUND = new Set([
  * falls through to the generic class, which is the behaviour this replaces.
  */
 function lastPipelineCommand(command: string): string {
-  const segments = command.split(/\|\|?/).map((s) => s.trim()).filter(Boolean);
+  // A single `|` only. `/\|\|?/` also split on `||`, so `grep foo || false` became two segments and the
+  // grep — which is what the exit code came from — stopped being the last one. Harmless in the common
+  // case (when the right-hand side succeeds the exit is 0 and classification never runs) but it turned a
+  // no_match into a generic failure whenever both sides exited 1. The lookarounds keep `||` intact.
+  const segments = command.split(/(?<!\|)\|(?!\|)/).map((s) => s.trim()).filter(Boolean);
   const last = segments[segments.length - 1] ?? command;
   return getCommandBinary(last).toLowerCase();
 }

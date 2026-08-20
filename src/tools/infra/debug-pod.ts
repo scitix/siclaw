@@ -672,14 +672,16 @@ export async function ensureDebugPodReady(
   }
 
   if (!result.pod) {
-    const failure = new DebugPodStartupError(
+    // Unreachable today — createFn either sets a pod or throws — and kept only as a defensive throw.
+    // It deliberately does NOT write the memo: this runs OUTSIDE the creation lock, so a waiter that
+    // has already created a pod could have its success overwritten by a failure recorded here. Every
+    // memo write belongs inside createFn, where the lock is held.
+    throw new DebugPodStartupError(
       `Debug pod failed to start on node "${spec.nodeName}" (no pod was created and no error was reported).`,
       "unknown",
       "no_pod_created",
       spec.nodeName,
     );
-    rememberStartupFailure(key, failure);
-    throw failure;
   }
   // Started: whatever this node failed with before no longer describes it.
   forgetStartupFailure(key);

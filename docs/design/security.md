@@ -39,14 +39,27 @@ will attempt — intentionally or via prompt injection — to:
 │   │                       │   │                         │ │
 │   │ • Node.js runtime     │   │ • kubectl (setgid)      │ │
 │   │ • LLM API client      │   │ • grep, jq, sort, ...   │ │
-│   │ • Tool validation     │   │ • skill scripts          │ │
+│   │ • Tool validation     │   │   (via restricted_bash) │ │
 │   │ • Reads kubeconfig    │   │ • NO credential access   │ │
+│   │ • Skill scripts       │   │                         │ │
+│   │   (local_script)      │   │                         │ │
 │   └──────────────────────┘   └────────────────────────┘ │
 │                                                          │
 │   Trust boundary: sandbox user cannot read agentbox's    │
 │   files (kubeconfig, mTLS certs, .siclaw/config/)        │
 └──────────────────────────────────────────────────────────┘
 ```
+
+**Skill scripts are NOT in the sandbox.** `restricted_bash` is the only tool that drops privileges
+(`sudo -E -u sandbox`); `local_script` spawns the interpreter directly, so a skill runs as `agentbox` —
+the credential owner. This diagram claimed otherwise, which mattered once "sandbox is in no credential
+group" became the foundation of the isolation: it made Layer 1 look like it covered skills.
+
+That placement is deliberate, not an oversight to fix by wrapping skills in `sudo -u sandbox`: skills
+legitimately run `kubectl` against a bound cluster and read their own files, and a skill is repository
+content reviewed before it ships, not model-authored text. The control on skills is review plus the
+command whitelist their `restricted_bash` calls still go through — not OS-level user separation. Moving
+them into the sandbox would be a separate change with its own migration.
 
 ### 1.3 What We Protect
 
