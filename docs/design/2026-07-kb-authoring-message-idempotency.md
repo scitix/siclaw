@@ -32,7 +32,7 @@ turning the run checkpoint into an unbounded transcript.
 
 ## Deployment
 
-The field is additive and optional, so Sicore, the runtime, and the compile-box
+The field is additive and optional, so ControlPlane, the runtime, and the compile-box
 image may roll independently. Full protection is active after all three pieces
 are deployed; changing `compile_box.py` requires rebuilding the
 `siclaw-kbc-box` image.

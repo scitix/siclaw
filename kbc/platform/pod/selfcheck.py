@@ -54,7 +54,7 @@ from source_kinds import (
 # (see is_media_asset / asset_attribution_edges / coverage), so cf no longer needs
 # a token per image and the exclusion ledger no longer needs a row per image.
 # Superset of IMAGE_SOURCE_EXTS by .tiff; kept EXACT and byte-for-byte in sync
-# with the sicore ledger mirror via the shared fixture.
+# with the control-plane ledger mirror via the shared fixture.
 MEDIA_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".tiff"}
 
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
@@ -160,7 +160,7 @@ def is_media_asset(rel: str) -> bool:
     ext = posixpath.splitext(rel)[1].lower()
     if ext not in MEDIA_ASSET_EXTS:
         return False
-    # Segment match is case-INSENSITIVE, matching the sicore ledger mirror (an
+    # Segment match is case-INSENSITIVE, matching the control-plane ledger mirror (an
     # `Assets/` dir counts too); the platform always writes lowercase `assets/`,
     # so this only matters for hand-authored trees, but the two repos must agree.
     return has_assets_segment(rel)
@@ -1150,9 +1150,9 @@ def okf_import_violations(pages: dict[str, dict]) -> list[dict]:
     This is deliberately narrower than the producer profile: imported pages
     may contain legitimate human verification records, wikilinks, or
     bundle-root links. It is also narrower than the authoring lint's body-style
-    checks. The import boundary requires the frontmatter contract Sicore can
+    checks. The import boundary requires the frontmatter contract ControlPlane can
     persist and inspect, plus an explicit root ``okf_version: "0.2"`` marker.
-    Keep this selection aligned with Sicore's ``validateAdoptionOKFStructure``.
+    Keep this selection aligned with ControlPlane's ``validateAdoptionOKFStructure``.
     """
     violations = [
         violation for violation in okf_v02_violations(pages)
@@ -1240,7 +1240,7 @@ def _unwrap_angle_destination(destination: str) -> str:
     ``>``, so an anchored angle link kept its brackets and lost its edge — a
     good compile was wrongly failed (review finding). Runs AFTER the title
     strip (a quoted title is not a fragment) and BEFORE #/? truncation. Mirrors
-    the sicore ledger's unwrapAngleDestination; change only in lockstep."""
+    the control-plane ledger's unwrapAngleDestination; change only in lockstep."""
     if destination.startswith("<"):
         close = destination.find(">")
         if close != -1:
@@ -1252,7 +1252,7 @@ def _strip_fragment_query(target: str) -> str:
     """Drop a URL ``#fragment`` / ``?query`` from the STILL-ENCODED target, before
     percent-decoding — so an encoded ``%23``/``%3F`` that is part of a real
     filename survives while an actual fragment/query delimiter is removed. Order
-    matches the sicore ledger's parser (strip angle → truncate #/? → unescape) so
+    matches the control-plane ledger's parser (strip angle → truncate #/? → unescape) so
     the two repos derive byte-identical edges."""
     return target.split("#", 1)[0].split("?", 1)[0]
 
@@ -2091,7 +2091,7 @@ def detect_over_broad_exclusions(workdir: str, exclusions: list[dict]) -> list[d
     DETECTION ONLY (stability-first mandate: never prevention): the caller surfaces
     it loudly in the self-check narration/repair prompt so a human narrows it; it is
     never auto-removed and never blocks the train. Kept OUT of coverage() on purpose
-    — coverage is the accounting contract mirrored byte-for-byte by sicore's
+    — coverage is the accounting contract mirrored byte-for-byte by control-plane's
     adoption ledger; this is a box-side compile heuristic, not part of that ledger.
 
     Counts DISTINCT sources per pattern, never row hits: the ledger legitimately
@@ -2353,7 +2353,7 @@ def run_layer1(workdir: str) -> dict:
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
         # Box-side compile heuristic (NOT part of the coverage accounting
         # contract): over-broad exclusion patterns flagged for a human, never
-        # blocking. Report-level so coverage() stays byte-identical to sicore's.
+        # blocking. Report-level so coverage() stays byte-identical to control-plane's.
         "over_broad_exclusions": over_broad,
         "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks

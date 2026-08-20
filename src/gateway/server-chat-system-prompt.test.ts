@@ -1,7 +1,7 @@
 /**
  * Regression test for the custom-system-prompt fallback in chat.send.
  *
- * Bug: sicore's web-chat proxy sends chat.send WITHOUT a systemPrompt param, so
+ * Bug: control-plane's web-chat proxy sends chat.send WITHOUT a systemPrompt param, so
  * the runtime's handler (which only read params.systemPrompt) handed the box
  * `undefined` and a custom-prompt agent silently got AgentBox's built-in default
  * SRE persona. Channel paths (dingtalk/lark) already resolved the agent's own
@@ -161,7 +161,7 @@ describe("startRuntime — chat.send custom system prompt", () => {
     expect(getAgentCalls).toEqual([]);
   });
 
-  it("falls back to the agent's custom prompt when the caller omits systemPrompt (sicore web path)", async () => {
+  it("falls back to the agent's custom prompt when the caller omits systemPrompt (control-plane web path)", async () => {
     getAgentResult = { system_prompt: "custom agent persona" };
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;

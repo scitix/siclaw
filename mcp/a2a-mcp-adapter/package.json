@@ -1,11 +1,11 @@
 {
-  "name": "@scitix/sicore-a2a-mcp-adapter",
+  "name": "@scitix/a2a-mcp-adapter",
   "version": "0.1.0",
-  "description": "Local stdio MCP adapter for one Sicore-hosted Siclaw A2A agent",
+  "description": "Local stdio MCP adapter for one remote-control-plane-hosted Siclaw A2A agent",
   "type": "module",
   "private": true,
   "bin": {
-    "sicore-a2a-mcp": "./dist/index.js"
+    "a2a-mcp": "./dist/index.js"
   },
   "main": "./dist/index.js",
   "files": [

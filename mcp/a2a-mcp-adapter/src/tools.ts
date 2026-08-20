@@ -41,7 +41,7 @@ export function buildToolDefinitions(router: AgentRouter) {
     {
       name: "siclaw_investigate",
       description:
-        "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous Sicore A2A task. Reuse context_id to continue the same investigation. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The A2A key selected by \"agent\" fixes which Siclaw agent is used."
+        "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous ControlPlane A2A task. Reuse context_id to continue the same investigation. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The A2A key selected by \"agent\" fixes which Siclaw agent is used."
         + ` ${hint}${requireAgent}`,
       inputSchema: {
         type: "object",

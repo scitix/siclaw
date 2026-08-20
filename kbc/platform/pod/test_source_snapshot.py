@@ -122,7 +122,7 @@ class SourceSnapshotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unpacks too large"):
             source_snapshot.validate_snapshot(snapshot)
 
-    def test_canonical_manifest_matches_sicore_contract(self):
+    def test_canonical_manifest_matches_control_plane_contract(self):
         files = [
             {"path": "b.md", "sha256": "2" * 64, "size_bytes": 4},
             {"path": "a.md", "sha256": "1" * 64, "size_bytes": 3},
@@ -138,7 +138,7 @@ class SourceSnapshotTest(unittest.TestCase):
             "03893ac5d1c473dd02f41eb12245120037acfa71357ac1fbf20b9ac82bc388b0",
         )
 
-    def test_canonical_manifest_matches_sicore_json_escaping(self):
+    def test_canonical_manifest_matches_control_plane_json_escaping(self):
         files = [{
             "path": "R&D<plan>\u2028.md",
             "sha256": "a" * 64,

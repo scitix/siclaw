@@ -17,12 +17,12 @@ sessions and tool calls that came from this one person." Operators need to
 
 ## Dependency direction (the rule that shapes this design)
 
-**SiCore depends on siclaw; siclaw must never depend on SiCore.**
+**ControlPlane depends on siclaw; siclaw must never depend on ControlPlane.**
 
-Therefore siclaw has **no concept of a "SiCore user."** Mapping a Lark/DingTalk
-account to a SiCore identity is solved entirely inside SiCore's own layer and is
-out of scope here. Any field that exists only to carry a SiCore identity through
-siclaw (`sicore_user_id`, `ResolvedChannelBinding.senderUserId`) is a reverse
+Therefore siclaw has **no concept of a "ControlPlane user."** Mapping a Lark/DingTalk
+account to a ControlPlane identity is solved entirely inside ControlPlane's own layer and is
+out of scope here. Any field that exists only to carry a ControlPlane identity through
+siclaw (`platform_user_id`, `ResolvedChannelBinding.senderUserId`) is a reverse
 dependency and is **removed** by this design.
 
 We attribute channel audit using only identifiers siclaw already owns natively.
@@ -71,19 +71,19 @@ audit/tools query already joins `chat_sessions` and filters on
 redundancy and a drift risk (a message's sender disagreeing with its session's).
 Tool-level attribution is obtained by joining a message back to its session.
 
-### Removed (SiCore coupling)
+### Removed (ControlPlane coupling)
 
-- `chat_sessions.sicore_user_id`, `chat_messages.sicore_user_id` — schema,
+- `chat_sessions.platform_user_id`, `chat_messages.platform_user_id` — schema,
   `adapter.ts` (`chat.ensureSession` / `chat.appendMessage`), `chat-repo.ts`.
 - `ResolvedChannelBinding.senderUserId` — `channel-manager.ts`.
-- `actorSicoreUserId` pass-through — `channels/lark.ts`, `channels/dingtalk.ts`.
-- The `sicore_user_id` arm of the Metrics user axis and the `sicoreUserId`
+- `actorPlatformUserId` pass-through — `channels/lark.ts`, `channels/dingtalk.ts`.
+- The `platform_user_id` arm of the Metrics user axis and the `platformUserId`
   pairing returned by the channel-senders endpoint — `metrics-entry.ts`,
   `siclaw-api.ts`, `portal-web` hooks/components.
 
 ## Metrics behavior
 
-The "by user" axis is origin-aware and contains no SiCore concept:
+The "by user" axis is origin-aware and contains no ControlPlane concept:
 
 ```
 actorUserColumn ≡ CASE WHEN origin = 'channel'
@@ -111,7 +111,7 @@ The sender picker is fed by the channel-senders endpoint, which returns the
 **distinct senders seen in the window with an occurrence count and last-seen
 timestamp, ordered by recency**. Raw `open_id`s are opaque; the count and
 last-seen are what make the list usable ("the one active 5 minutes ago with 30
-messages"). The endpoint returns sender ids only — no SiCore pairing, no name.
+messages"). The endpoint returns sender ids only — no ControlPlane pairing, no name.
 
 In the Sessions / Tools tables, a channel row's actor column shows the
 `sender_external_id` (truncated, full value on hover), so an operator can spot
@@ -145,7 +145,7 @@ rows, senders for channel rows. Two consequences, both intentional:
 
 `migrate.ts` is additive (CREATE TABLE IF NOT EXISTS + idempotent
 `safeAlterTable`); it does not drop columns. The removed columns
-(`sicore_user_id`, message-level `sender_external_id`) were introduced on the
+(`platform_user_id`, message-level `sender_external_id`) were introduced on the
 current unmerged branch, so removing them from the branch means fresh databases
 never receive them. The only database that already has them is a manually-migrated
 test deployment (siclaw-inner), which is disposable and can be recreated. **No
@@ -154,12 +154,12 @@ destructive migration is written**; the mainline schema is simply clean.
 ## Testing
 
 - `chat-repo`: `sender_external_id` write mapping on sessions; no owner fallback;
-  removal of `sicore_user_id` / message-level `sender_external_id` reflected in
+  removal of `platform_user_id` / message-level `sender_external_id` reflected in
   assertions.
 - `lark` / `dingtalk`: open mode → `sender_external_id` set (NULL when absent),
   never owner; `channel_id` stamped on the session.
 - Metrics: filtering sessions and tools by `sender_external_id` + `channel_id`;
-  `actorUserColumn` no longer references any SiCore column; channel-senders
+  `actorUserColumn` no longer references any ControlPlane column; channel-senders
   endpoint returns count + last-seen ordered by recency.
 
 ## Future (deferred, not in this change)
@@ -168,5 +168,5 @@ If `open_id` proves too hard to recognize in practice, capture the sender's
 display name **only if it already arrives in the Lark/DingTalk event payload**
 (no extra contact-API call, no external dependency) and denormalize it as
 `chat_sessions.sender_display_name` — a single point-in-time column, no join
-table. This is native channel data, not a SiCore concept, so it does not violate
+table. This is native channel data, not a ControlPlane concept, so it does not violate
 the dependency-direction rule. Deferred to keep this change minimal.

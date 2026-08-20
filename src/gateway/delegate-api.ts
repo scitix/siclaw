@@ -374,7 +374,7 @@ export async function handleDelegate(
     return;
   }
 
-  // Direct chat already routes agent_id → runtime_id in Sicore. Delegation must
+  // Direct chat already routes agent_id → runtime_id in ControlPlane. Delegation must
   // make the same placement decision before touching the local AgentBoxManager;
   // otherwise a coordinator Runtime can create a correctly configured peer in
   // the wrong network environment. Fail closed if the control plane cannot
@@ -519,7 +519,7 @@ export async function handleDelegate(
     writeFrame({ type: "peer_event", event: evt });
     // Local execution consumes AgentBox SSE directly, so publish a mirror for an
     // opened PeerSessionView. A remote target Runtime already published this
-    // exact chat.event to Sicore; mirroring again would duplicate the transcript.
+    // exact chat.event to ControlPlane; mirroring again would duplicate the transcript.
     if (mirrorToPeerChannel) {
       try { deps.frontendClient.emitEvent("chat.event", { sessionId: peerSessionId, event: evt }); } catch { /* best-effort live mirror */ }
     }

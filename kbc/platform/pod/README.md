@@ -53,7 +53,7 @@ platform/pod/.venv/bin/python platform/pod/test_compile_box.py
 ```bash
 docker build -f platform/pod/Dockerfile -t siclaw-kbc-box .
 docker run --rm -p 3000:3000 \
-  -e ANTHROPIC_BASE_URL=https://<massapi>/ \   # model goes through the company massapi (key injected on the proxy side)
+  -e ANTHROPIC_BASE_URL=https://<model-proxy>/ \   # key is injected on the proxy side
   -v /tmp/wd:/work \
   siclaw-kbc-box
 # then:

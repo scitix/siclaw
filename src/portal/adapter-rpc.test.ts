@@ -145,7 +145,7 @@ describe("config.getSettings", () => {
     // speaks the Claude protocol.
     mockQuery(
       [{ model_provider: "gateway", model_id: "claude-sonnet-5" }],
-      [{ id: "p1", name: "gateway", base_url: "https://api.scitix.ai/model-api", api_key: "sk-key", api_type: "openai-completions" }],
+      [{ id: "p1", name: "gateway", base_url: "https://model-gateway.example.com/model-api", api_key: "sk-key", api_type: "openai-completions" }],
       [
         { model_id: "claude-sonnet-5", name: "Claude", reasoning: 0, context_window: 128000, max_tokens: 8192, api_type: "anthropic-messages" },
         { model_id: "DeepSeek-V4-Pro", name: "DeepSeek", reasoning: 0, context_window: 128000, max_tokens: 8192, api_type: null },
@@ -337,7 +337,7 @@ describe("config.getModelBinding", () => {
   it("carries each model's own protocol through the model-binding mirror", async () => {
     mockQuery(
       [{ model_provider: "gateway", model_id: "claude-sonnet-5" }],
-      [{ id: "p1", name: "gateway", base_url: "https://api.scitix.ai/model-api", api_key: "sk-key", api_type: "openai-completions" }],
+      [{ id: "p1", name: "gateway", base_url: "https://model-gateway.example.com/model-api", api_key: "sk-key", api_type: "openai-completions" }],
       [{ model_id: "claude-sonnet-5", name: "Claude", reasoning: 0, context_window: 128000, max_tokens: 8192, api_type: "anthropic-messages" }],
     );
 
@@ -1964,10 +1964,10 @@ describe("channel.resolveBinding", () => {
     });
   });
 
-  it("punts (null) on a sicore_authorized personal bot in standalone", async () => {
+  it("punts (null) on a platform_authorized personal bot in standalone", async () => {
     mockQuery(
       [],                                                                  // selectChannelBinding → none
-      [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "sicore_authorized" } }) }],
+      [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "platform_authorized" } }) }],
     );
 
     const result = await getHandler("channel.resolveBinding")(

@@ -12,7 +12,7 @@ afterEach(() => {
 
 function baseEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
-    SICORE_URL: "https://sicore.example.com/",
+    A2A_URL: "https://control-plane.example.com/",
     SICLAW_AGENT_ID: "agent-1",
     SICLAW_A2A_KEY: "test-key",
     ...extra,
@@ -22,7 +22,7 @@ function baseEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 describe("loadConfig", () => {
   it("loads and normalizes the single-key form as the default alias", () => {
     expect(loadConfig(baseEnv())).toEqual({
-      baseUrl: "https://sicore.example.com",
+      baseUrl: "https://control-plane.example.com",
       keys: [{ alias: "default", apiKey: "test-key", agentId: "agent-1" }],
       requestTimeoutMs: 30_000,
       pollIntervalMs: 3_000,
@@ -114,14 +114,14 @@ describe("loadConfig", () => {
   });
 
   it("allows HTTP only for loopback testing", () => {
-    expect(loadConfig(baseEnv({ SICORE_URL: "http://127.0.0.1:3000" })).baseUrl)
+    expect(loadConfig(baseEnv({ A2A_URL: "http://127.0.0.1:3000" })).baseUrl)
       .toBe("http://127.0.0.1:3000");
-    expect(() => loadConfig(baseEnv({ SICORE_URL: "http://sicore.example.com" })))
+    expect(() => loadConfig(baseEnv({ A2A_URL: "http://control-plane.example.com" })))
       .toThrow(/must use HTTPS/);
   });
 
   it("reads a private key file without persisting it in config", () => {
-    const dir = mkdtempSync(join(tmpdir(), "sicore-a2a-config-"));
+    const dir = mkdtempSync(join(tmpdir(), "a2a-config-"));
     tempDirs.push(dir);
     const keyFile = join(dir, "key");
     writeFileSync(keyFile, "file-key\n", { mode: 0o600 });
@@ -131,7 +131,7 @@ describe("loadConfig", () => {
   });
 
   it.runIf(process.platform !== "win32")("rejects a group-readable key file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "sicore-a2a-config-"));
+    const dir = mkdtempSync(join(tmpdir(), "a2a-config-"));
     tempDirs.push(dir);
     const keyFile = join(dir, "key");
     writeFileSync(keyFile, "file-key\n", { mode: 0o644 });

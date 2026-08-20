@@ -509,7 +509,7 @@ export class K8sSpawner implements BoxSpawner {
 
     // Profile-declared extra env forwarding, ON TOP of the base allowlist. A lean
     // capability box (e.g. kb-compile) does NOT phone home for settings, so its LLM
-    // endpoint (company massapi, Anthropic-compatible) must be injected as env
+    // Anthropic-compatible model proxy endpoint must be injected as env
     // ("credentials don't enter the sandbox" → the base URL is a proxy, key
     // injected proxy-side). Which names to forward is the profile's declaration.
     // A trailing "*" forwards every var with that prefix (e.g. "KBC_*" — the KB

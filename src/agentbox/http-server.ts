@@ -656,7 +656,7 @@ export function createHttpServer(
    *
    * Kept next to box-status because both expose box-observed state. This list
    * is what a developer console can show after a test deploy: which knowledge
-   * libraries, skills, and MCP servers are actually on disk, not what Sicore
+   * libraries, skills, and MCP servers are actually on disk, not what ControlPlane
    * intended to send.
    */
   addRoute("GET", "/api/sync-status", async (_req, res) => {

@@ -38,7 +38,7 @@ import {
 const MAX_JUMP_DEPTH = 3;
 
 /**
- * SSH connect/handshake fail-fast deadline (sicore parity: connector default 10s).
+ * SSH connect/handshake fail-fast deadline (control-plane parity: connector default 10s).
  * Deliberately separate from the per-command timeout — an unreachable host fails
  * in ~10s so the caller can fall back (e.g. to node_exec) instead of waiting out
  * the full 30–120s command timeout.

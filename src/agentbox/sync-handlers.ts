@@ -271,7 +271,7 @@ interface KnowledgeBundlePayload {
     id: string;
     name: string;
     /** One sentence naming the field this library covers, written by the compile
-     *  box (kbc `report_domain`). Wire key from sicore
+     *  box (kbc `report_domain`). Wire key from control-plane
      *  `KnowledgeRepoBundle.consumerDomain` (JSON camelCase on
      *  `versions.consumer_domain` / active-version snapshot). Absent when the
      *  library predates report_domain, the version has no domain, or an older
@@ -551,7 +551,7 @@ export function createKnowledgeHandler(
             // has reported one yet" when debugging silent name-only catalogs.
             console.debug(
               `[sync-handlers.knowledge] multi-library bundle: ${repos.length} repos, ` +
-                `0 with consumerDomain (JSON key must be consumerDomain from sicore; ` +
+                `0 with consumerDomain (JSON key must be consumerDomain from control-plane; ` +
                 `empty is also normal before any library has report_domain)`,
             );
           }

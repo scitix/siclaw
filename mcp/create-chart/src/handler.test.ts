@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
+import { exportMarkdownVisualsWithVisualExportWeb } from "./visual-export.js";
 import {
   RENDER_CHART_INPUT_SCHEMA,
   RENDER_CHART_DESCRIPTION,
@@ -13,11 +13,11 @@ import {
   handleRenderChart,
 } from "./handler.js";
 
-vi.mock("./sicore-export.js", () => {
+vi.mock("./visual-export.js", () => {
   const png =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
   return {
-    exportMarkdownVisualsWithSicoreWeb: vi.fn(async (markdown: string) => {
+    exportMarkdownVisualsWithVisualExportWeb: vi.fn(async (markdown: string) => {
       const kind = markdown.startsWith("```mermaid")
         ? "mermaid"
         : markdown.startsWith("```visual-card")
@@ -47,7 +47,7 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/PNG image artifact/);
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/Sicore Web's own chart renderer\/export path/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/ControlPlane Web's own chart renderer\/export path/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
@@ -65,20 +65,20 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
 });
 
 describe("visual image tool schemas", () => {
-  it("registers Mermaid export as a Sicore Web image artifact tool", () => {
+  it("registers Mermaid export as a ControlPlane Web image artifact tool", () => {
     expect(RENDER_MERMAID_INPUT_SCHEMA.required).toEqual(["source"]);
     expect(RENDER_MERMAID_INPUT_SCHEMA.additionalProperties).toBe(false);
-    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/Sicore Web's own Mermaid renderer\/export path/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/ControlPlane Web's own Mermaid renderer\/export path/);
     expect(RENDER_MERMAID_DESCRIPTION).toMatch(/image\/png/);
     expect(RENDER_MERMAID_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_MERMAID_DESCRIPTION).toMatch(/```mermaid/);
   });
 
-  it("registers visual-card export as a Sicore Web image artifact tool", () => {
+  it("registers visual-card export as a ControlPlane Web image artifact tool", () => {
     expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.required).toEqual(["type", "title"]);
     expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("report");
     expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("root_cause_chain");
-    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/Sicore Web's own visual-card renderer\/export path/);
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/ControlPlane Web's own visual-card renderer\/export path/);
     expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/image\/png/);
     expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/```visual-card/);
   });
@@ -234,7 +234,7 @@ describe("validateMermaid", () => {
 });
 
 describe("validateVisualCard", () => {
-  it("keeps Sicore visual-card specs and strips unknown keys", () => {
+  it("keeps ControlPlane visual-card specs and strips unknown keys", () => {
     const out = validateVisualCard({
       type: "report",
       title: "诊断结论",
@@ -260,7 +260,7 @@ describe("validateVisualCard", () => {
 
 describe("handleRenderChart", () => {
   beforeEach(() => {
-    vi.mocked(exportMarkdownVisualsWithSicoreWeb).mockClear();
+    vi.mocked(exportMarkdownVisualsWithVisualExportWeb).mockClear();
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -297,11 +297,11 @@ describe("handleRenderChart", () => {
     expect((meta.chart_id as string).startsWith("pie-")).toBe(true);
     expect(typeof meta.bytes).toBe("number");
     expect(meta.bytes as number).toBeGreaterThan(0);
-    expect(meta.renderer).toBe("sicore-web");
+    expect(meta.renderer).toBe("visual-export-web");
     expect(meta).not.toHaveProperty("markdown_embed");
     expect(meta).not.toHaveProperty("markdown_embed_raw");
     expect(meta.embed_instructions).toMatch(/READY_TO_PASTE/);
-    expect(exportMarkdownVisualsWithSicoreWeb).toHaveBeenCalledWith(ready);
+    expect(exportMarkdownVisualsWithVisualExportWeb).toHaveBeenCalledWith(ready);
   });
 
   it("embeds the validated spec (not the raw input) inside the chart fence", async () => {

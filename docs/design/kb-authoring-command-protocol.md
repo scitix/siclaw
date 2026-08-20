@@ -7,7 +7,7 @@ envelope. Free-form conversation continues to use `capability.message`.
 Human-language text is never used to select an execution path.
 
 This protocol is owned by Siclaw because it is part of the reusable capability
-execution surface. Sicore is one consumer and owns the knowledge-domain
+execution surface. ControlPlane is one consumer and owns the knowledge-domain
 operation, generation fence, product authorization, and UI.
 
 ## Language
@@ -94,7 +94,7 @@ parameters. Unknown versions and unknown actions fail closed.
    labels and connective prose, but ticket IDs, affected pages, nonces,
    reference answers, and verdicts are transported without interpretation.
 9. A command is an intent/receipt, not another lifecycle state machine. Run
-   status remains the execution truth and Sicore's authoring operation remains
+   status remains the execution truth and ControlPlane's authoring operation remains
    the domain mutation truth.
 10. A consumer that has already selected an immutable source revision supplies
     `input_revision` on `capability.start`. Runtime persists that revision in the
@@ -124,7 +124,7 @@ routing or lifecycle state.
 
 ## Layer responsibilities
 
-### Sicore
+### ControlPlane
 
 - authorizes the user and repository;
 - validates the product action payload;
@@ -163,16 +163,16 @@ routing or lifecycle state.
 
 The command path is at-least-once delivery with idempotent acceptance, not a
 distributed exactly-once transaction. A process may die after the box accepts a
-turn but before Runtime or Sicore persists its receipt. Retrying the same id is
+turn but before Runtime or ControlPlane persists its receipt. Retrying the same id is
 therefore required: the surviving layer acknowledges the duplicate and the
 missing durable receipt is repaired. If both Runtime and the ephemeral box die
-inside that window, Sicore's operation/generation and artifact-write fences
+inside that window, ControlPlane's operation/generation and artifact-write fences
 remain the safety boundary; the same command may be redelivered to a rehydrated
 box, but stale generations cannot commit.
 
 ## Rolling migration
 
 Existing message-prefix detection remains a temporary compatibility adapter for
-older Sicore deployments. New Sicore buttons use `capability.command`. Legacy
+older ControlPlane deployments. New ControlPlane buttons use `capability.command`. Legacy
 hits must be observable and can be removed after the paired deployment has been
 stable for one release window.

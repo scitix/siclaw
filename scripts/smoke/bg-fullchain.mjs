@@ -8,7 +8,7 @@
 //                    exec_job_event status=stopped.
 const baseUrl = process.env.SICLAW_PORTAL_URL ?? "http://127.0.0.1:18080";
 const apiBase = `${baseUrl}/api/v1`;
-const HOST = process.env.HOST_NAME ?? "172.16.73.22";
+const HOST = process.env.HOST_NAME ?? "192.0.2.22";
 const MODE = process.env.MODE ?? "completed";
 const MARKER = process.env.MARKER ?? "SMOKE_FC";
 const timeoutMs = Number(process.env.BG_TIMEOUT_MS ?? 180_000);

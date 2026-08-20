@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolveAgentId, SicoreA2aClient } from "./a2a-client.js";
+import { resolveAgentId, A2aClient } from "./a2a-client.js";
 import { loadConfig, type AdapterConfig, type NamedKey } from "./config.js";
 import { AgentRouter, type AgentEntry } from "./router.js";
 import { serveStdio } from "./server.js";
@@ -18,7 +18,7 @@ async function buildEntry(config: AdapterConfig, key: NamedKey): Promise<AgentEn
     // Prefix with the alias (never the key) so the operator knows which entry failed.
     throw new Error(`agent "${key.alias}": ${error instanceof Error ? error.message : String(error)}`);
   }
-  const client = new SicoreA2aClient({ ...shared, agentId });
+  const client = new A2aClient({ ...shared, agentId });
   return { alias: key.alias, agentId, api: client };
 }
 
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   const agentList = entries.map((entry) => `${entry.alias}=${entry.agentId}`).join(", ");
   const resolvedFromKey = config.keys.some((key) => !key.agentId);
   process.stderr.write(
-    `[sicore-a2a-mcp] ready endpoint=${new URL(config.baseUrl).origin} agents=[${agentList}]`
+    `[a2a-mcp] ready endpoint=${new URL(config.baseUrl).origin} agents=[${agentList}]`
     + `${resolvedFromKey ? " (some agents resolved from key)" : ""}\n`,
   );
 
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   process.stderr.write(
-    `[sicore-a2a-mcp] fatal: ${error instanceof Error ? error.message : String(error)}\n`,
+    `[a2a-mcp] fatal: ${error instanceof Error ? error.message : String(error)}\n`,
   );
   process.exit(1);
 });

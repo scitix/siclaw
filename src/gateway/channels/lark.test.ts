@@ -177,7 +177,7 @@ function makeBinding(overrides: Record<string, unknown> = {}) {
 }
 
 function makePersonalConfig(
-  accessMode: "open" | "sicore_authorized" = "open",
+  accessMode: "open" | "platform_authorized" = "open",
   overrides: Record<string, unknown> = {},
 ) {
   return {
@@ -493,7 +493,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
       undefined,
       {} as any,
       "zh-CN",
-      makePersonalConfig("sicore_authorized", { authorize_url: "https://sicore.example/siclaw/a1?tab=channels" }),
+      makePersonalConfig("platform_authorized", { authorize_url: "https://control-plane.example/siclaw/a1?tab=channels" }),
     );
 
     expect(promptMock).not.toHaveBeenCalled();
@@ -516,7 +516,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
       undefined,
       {} as any,
       "zh-CN",
-      makePersonalConfig("sicore_authorized"),
+      makePersonalConfig("platform_authorized"),
     );
 
     expect(handlePersonalPairingCodeMock).toHaveBeenCalledWith("ABC123", "personal-bot-1", "ou_user_1", expect.anything());
@@ -525,7 +525,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
   });
 
   it("forwards PAIR on any gated tier, not just the legacy spelling", async () => {
-    // Keying this branch on `sicore_authorized` alone told a gated bot's users "this bot is open,
+    // Keying this branch on `platform_authorized` alone told a gated bot's users "this bot is open,
     // no PAIR needed" and discarded their code — a gated bot described as public.
     for (const tier of ["identified", "granted", "some_future_tier"]) {
       handlePersonalPairingCodeMock.mockResolvedValue({ success: true, agentName: "Secure Agent" });
@@ -556,7 +556,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
     resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
       bindingId: "personal-bot-1",
       sessionId: "old-personal",
-      sessionKey: "sicore_user:user-1",
+      sessionKey: "platform_user:user-1",
       routeType: "user",
       createdBy: "user-1",
     })));
@@ -577,10 +577,10 @@ describe("handleLarkMessage — personal bot p2p", () => {
       undefined,
       {} as any,
       "zh-CN",
-      makePersonalConfig("sicore_authorized"),
+      makePersonalConfig("platform_authorized"),
     );
 
-    expect(resetPersonalSessionMock).toHaveBeenCalledWith("personal-bot-1", "sicore_user:user-1", expect.anything());
+    expect(resetPersonalSessionMock).toHaveBeenCalledWith("personal-bot-1", "platform_user:user-1", expect.anything());
     expect(resetBindingSessionMock).not.toHaveBeenCalled();
     expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
@@ -660,7 +660,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
   });
 
   it("authorized group: a walled sender gets a hint and no agent runs", async () => {
-    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", authorizeUrl: "https://sicore.example/auth" });
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", authorizeUrl: "https://control-plane.example/auth" });
     const lark = makeLarkClient();
     const mgr = makeAgentBoxManager();
     await handleLarkMessage(
@@ -675,7 +675,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
         app_id: "cli_x",
         app_secret: "secret",
         group_channel_id: "lark:personal:pb-1",
-        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "sicore_authorized", owner_user_id: "owner-1" },
+        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "platform_authorized", owner_user_id: "owner-1" },
       },
     );
 
@@ -898,7 +898,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     };
     resolveBindingMock.mockResolvedValue(makeBinding());
     resolveAgentModelBindingMock.mockResolvedValue({
-      modelProvider: "sicore-custom-254e68c4",
+      modelProvider: "control-plane-custom-254e68c4",
       modelId: "deepseek-ai/DeepSeek-V4-Pro",
       modelConfig,
       modelRouting,
@@ -918,7 +918,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
     expect(resolveAgentModelBindingMock).toHaveBeenCalledWith("a1", expect.anything());
     expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
-      modelProvider: "sicore-custom-254e68c4",
+      modelProvider: "control-plane-custom-254e68c4",
       modelId: "deepseek-ai/DeepSeek-V4-Pro",
       modelConfig,
       modelRouting,
@@ -984,11 +984,11 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     );
   });
 
-  it("records the raw open_id as the channel sender even for a sicore_user session key", async () => {
-    // siclaw has no SiCore-user concept: regardless of the server-issued session
+  it("records the raw open_id as the channel sender even for a platform_user session key", async () => {
+    // siclaw has no remote-user concept: regardless of the server-issued session
     // key, the audit sender is always the raw open_id, stamped on the session.
     resolveBindingMock.mockResolvedValue(makeBinding({
-      sessionKey: "sicore_user:sender-99",
+      sessionKey: "platform_user:sender-99",
       createdBy: "owner-1",
     }));
     promptMock.mockResolvedValue({ sessionId: "session-fixed" });
@@ -1088,11 +1088,11 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 
-  it("/new resets the SERVER session key (authorized group → sicore_user:<id>), not the local open_id", async () => {
+  it("/new resets the SERVER session key (authorized group → platform_user:<id>), not the local open_id", async () => {
     // Contract: the Runtime must reset whatever session key the resolver
-    // returned, so an authorized group resets the sender's sicore_user session
+    // returned, so an authorized group resets the sender's platform_user session
     // and an open group resets open_id:<sender> — never the local default.
-    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "old-session", sessionKey: "sicore_user:u42" }));
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "old-session", sessionKey: "platform_user:u42" }));
     resetBindingSessionMock.mockResolvedValue({ success: true, agentId: "a1", oldSessionId: "old-session", sessionId: "new-session" });
     const mgr = makeAgentBoxManager("a1");
 
@@ -1105,7 +1105,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       {} as any,
     );
 
-    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "sicore_user:u42");
+    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "platform_user:u42");
   });
 
   it("/new in a SHARED group is rejected, not reset (one member can't wipe the group)", async () => {
@@ -2674,7 +2674,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps Sicore visual-card source as markdown when no PNG artifact is available", async () => {
+  it("keeps ControlPlane visual-card source as markdown when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-visual-card" });
     streamEventsMock.mockImplementation(async function* () {
@@ -4609,7 +4609,7 @@ describe("handleLarkMessage — /apikey", () => {
 // ── /webchat — self-service browser chat link (personal chat only) ──
 
 describe("handleLarkMessage — /webchat", () => {
-  const ACTION_URL = "https://sicore.example/siclaw/webchat/claim/token-1";
+  const ACTION_URL = "https://control-plane.example/siclaw/webchat/claim/token-1";
 
   function sendPersonal(text: string, lark: ReturnType<typeof makeLarkClient>) {
     return handleLarkMessage(
@@ -4620,7 +4620,7 @@ describe("handleLarkMessage — /webchat", () => {
       undefined,
       {} as any,
       "zh-CN",
-      makePersonalConfig("sicore_authorized"),
+      makePersonalConfig("platform_authorized"),
     );
   }
 
@@ -4655,7 +4655,7 @@ describe("handleLarkMessage — /webchat", () => {
     await handleLarkMessage(
       makeTextEvent("/webchat", { chat_type: "p2p" }),
       lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
-      "zh-CN", makePersonalConfig("sicore_authorized"),
+      "zh-CN", makePersonalConfig("platform_authorized"),
     );
 
     const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
@@ -4735,7 +4735,7 @@ describe("handleLarkMessage — /webchat", () => {
     await handleLarkMessage(
       makeTextEvent("/webchat", { chat_type: "p2p" }),
       lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
-      "zh-CN", makePersonalConfig("sicore_authorized"),
+      "zh-CN", makePersonalConfig("platform_authorized"),
     );
 
     const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));

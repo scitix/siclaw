@@ -4,9 +4,9 @@
 # one engine for a run (claude_agent_sdk or codex_sdk).
 #
 # build:  docker build -f platform/pod/Dockerfile -t kbc-compile-pod .   (run from kbc/ = build ctx)
-# run (production; LLM via the company massapi):
+# run (production; LLM via an Anthropic-compatible model proxy):
 #   docker run --rm \
-#     -e ANTHROPIC_BASE_URL=https://<massapi>/   \   # model goes through the proxy; key injected proxy-side
+#     -e ANTHROPIC_BASE_URL=https://<model-proxy>/   \   # model goes through the proxy; key injected proxy-side
 #     -e ANTHROPIC_API_KEY=<token>               \   # or pass a key directly
 #     -v /path/to/workdir:/work                  \   # workdir with raw sources
 #     kbc-compile-pod
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 
 # Pin the SDK: an unpinned install drifts on every rebuild, and the bundled
 # Claude Code CLI drifts with it (API request-shape changes can break the
-# massapi/Bedrock path). 0.2.110 is production-proven on the KB compile path.
+# proxy/Bedrock path). 0.2.110 is production-proven on the KB compile path.
 # PyYAML backs deterministic OKF frontmatter validation. python-pptx/openpyxl/
 # python-docx let office_ingest pre-render .pptx/.xlsx/.docx sources to markdown
 # (PDFs are rendered by the agent's Read tool through poppler-utils; text and
@@ -40,7 +40,7 @@ COPY tools/ /app/tools/
 
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-# massapi/Bedrock rejects the `context_management` request field (HTTP 400).
+# The proxy/Bedrock path rejects the `context_management` request field (HTTP 400).
 # Root cause (2026-07-06, see compile_box.py header): the thinking-clear
 # context edit rides the experimental context-management beta — DISABLE_
 # EXPERIMENTAL_BETAS is the real kill switch; autocompact-off stays as

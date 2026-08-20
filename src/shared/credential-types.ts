@@ -24,10 +24,10 @@ export interface Identity {
 export type ResourceKind = "cluster" | "host";
 
 /**
- * One filled structured-metadata entry for a cluster, mirroring sicore's
+ * One filled structured-metadata entry for a cluster, mirroring control-plane's
  * `metadata.MetadataEntry` wire shape (resource_metadata × metadata_keys).
  * Admin-maintained facts the LLM can't discover via kubectl — RDMA type,
- * scheduler, node model, etc. See sicore
+ * scheduler, node model, etc. See control-plane
  * docs/design/siclaw-cluster-metadata-passthrough.md.
  */
 export interface ClusterMetaEntry {

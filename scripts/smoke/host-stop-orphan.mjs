@@ -4,7 +4,7 @@
 // sentinel. 0 survivors = the remote group was reaped.
 import { setTimeout as wait } from "node:timers/promises";
 const b = (process.env.SICLAW_PORTAL_URL ?? "http://127.0.0.1:18080") + "/api/v1";
-const HOST = process.env.HOST_NAME ?? "172.16.73.22";
+const HOST = process.env.HOST_NAME ?? "192.0.2.22";
 const SENT = "SENTINEL_" + Math.floor(Date.now() % 1e7);
 const pj = (v) => { if (!v) return {}; if (typeof v === "object") return v; try { return JSON.parse(v) ?? {}; } catch { return {}; } };
 async function jf(u, o = {}) { const r = await fetch(u, { ...o, headers: { "Content-Type": "application/json", ...(o.headers ?? {}) } }); const t = await r.text(); let x; try { x = t ? JSON.parse(t) : {}; } catch { x = t; } if (!r.ok) throw new Error(`${u} ${r.status}: ${t.slice(0,200)}`); return x; }

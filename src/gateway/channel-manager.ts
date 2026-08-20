@@ -56,7 +56,7 @@ export interface ResolvedChannelBinding {
 
 /**
  * Non-binding result from `channel.resolveBinding`: the Portal recognised the
- * channel but turned the sender away (sicore_authorized group, sender unbound or
+ * channel but turned the sender away (platform_authorized group, sender unbound or
  * without read access to the agent). The Runtime should reply a short hint
  * rather than silently ignore. Distinct from `null` (ignore: no binding at all).
  */

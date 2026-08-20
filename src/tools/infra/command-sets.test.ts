@@ -1462,7 +1462,7 @@ describe("tcpdump restrictions (read-only live capture)", () => {
 
 describe("perftest tuning flags are allowed (no skill needed)", () => {
   it("accepts device / gid / size / sweep / duration / bidirectional flags", () => {
-    expect(validateCommandRestrictions("ib_write_bw -d mlx5_1 -x 3 -F 22.253.212.1")).toBeNull();
+    expect(validateCommandRestrictions("ib_write_bw -d mlx5_1 -x 3 -F 192.0.2.1")).toBeNull();
     expect(validateCommandRestrictions("ib_send_bw -s 65536 -n 1000 --report_gbits")).toBeNull();
     expect(validateCommandRestrictions("ib_send_bw -a -b 192.168.1.1")).toBeNull();
     expect(validateCommandRestrictions("ib_write_bw -D 20 -m 4096 -c RC")).toBeNull();

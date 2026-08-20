@@ -8,7 +8,7 @@ describe("flattenClusterMeta", () => {
   });
 
   it("flattens to key→value (stable key, not editable display_name)", () => {
-    // key is what sicore guarantees unique per (org_id, key); display_name is
+    // key is what control-plane guarantees unique per (org_id, key); display_name is
     // editable display text that can collide — so it must NOT be the map key.
     expect(flattenClusterMeta([
       { key: "rdma_type", display_name: "RDMA Type", value: "SR-IOV" },
@@ -26,7 +26,7 @@ describe("flattenClusterMeta", () => {
   });
 
   it("drops reserved system keys (registry) at the model-visible boundary", () => {
-    // `registry` is sicore's internal debug-image plumbing (IsReservedSystemKey),
+    // `registry` is control-plane's internal debug-image plumbing (IsReservedSystemKey),
     // surfaced via debug_image — never an infra fact for the model.
     expect(flattenClusterMeta([
       { key: "registry", value: "registry.example.com/busybox:1.36" },

@@ -23,7 +23,7 @@ import weakref
 from pathlib import Path
 from typing import Protocol
 
-# massapi proxies to Bedrock, which rejects the `context_management` request
+# The configured proxy may route to Bedrock, which rejects the `context_management` request
 # field ("Extra inputs are not permitted", HTTP 400). Root cause (2026-07-06,
 # see compile_box.py header): the thinking-clear context edit rides the
 # experimental context-management beta — CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS

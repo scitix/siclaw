@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * create-chart MCP server — stdio transport, exposes Sicore Web-backed visual
+ * create-chart MCP server — stdio transport, exposes ControlPlane Web-backed visual
  * tools. Each tool returns a READY_TO_PASTE source block plus a structured PNG
  * image content block; channel adapters own platform-specific delivery.
  *

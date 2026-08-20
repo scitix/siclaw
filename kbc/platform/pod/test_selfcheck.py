@@ -2047,7 +2047,7 @@ def test_over_broad_exclusion_flagged_not_blocking():
     the narration warn line, and the repair prompt — but is NEVER blocking (it is
     a report-level heuristic, kept OUT of coverage()/`closed`) and NEVER
     auto-removed. A normal dir-prefix under the threshold is not flagged. It stays
-    out of the coverage() accounting dict (sicore mirrors that byte-for-byte)."""
+    out of the coverage() accounting dict (control-plane mirrors that byte-for-byte)."""
     import selfcheck
     with tempfile.TemporaryDirectory() as td:
         raw = Path(td) / "raw"
@@ -2379,7 +2379,7 @@ def test_media_citing_pages_via_attribution_edge():
 
 def test_asset_provenance_fixture():
     """The shared two-repo fixture: edges + coverage v2 must equal expected.json
-    byte-for-byte (sicore's adoption ledger asserts the SAME expected.json)."""
+    byte-for-byte (control-plane's adoption ledger asserts the SAME expected.json)."""
     fx = Path(__file__).resolve().parent / "fixtures" / "asset-provenance"
     expected = json.loads((fx / "expected.json").read_text(encoding="utf-8"))
     edges = selfcheck.asset_attribution_edges(str(fx))

@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { A2aClientError, normalizeTask, resolveAgentId, SicoreA2aClient } from "./a2a-client.js";
+import { A2aClientError, normalizeTask, resolveAgentId, A2aClient } from "./a2a-client.js";
 import type { ResolvedAdapterConfig } from "./config.js";
 
 function config(extra: Partial<ResolvedAdapterConfig> = {}): ResolvedAdapterConfig {
   return {
-    baseUrl: "https://sicore.example.com",
+    baseUrl: "https://control-plane.example.com",
     agentId: "agent/one",
     apiKey: "super-secret-key",
     requestTimeoutMs: 5_000,
@@ -57,10 +57,10 @@ describe("resolveAgentId", () => {
   it("resolves the bound agent from the key via /self", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ agentId: "agent-9" }));
     await expect(resolveAgentId(config(), fetchImpl as typeof fetch)).resolves.toBe("agent-9");
-    expect(String(fetchImpl.mock.calls[0][0])).toBe("https://sicore.example.com/api/v1/a2a/self");
+    expect(String(fetchImpl.mock.calls[0][0])).toBe("https://control-plane.example.com/api/v1/a2a/self");
   });
 
-  it("tells the operator to pin SICLAW_AGENT_ID on an older Sicore", async () => {
+  it("tells the operator to pin SICLAW_AGENT_ID on an older ControlPlane", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ error: { message: "A2A route not found" } }, 404));
     await expect(resolveAgentId(config(), fetchImpl as typeof fetch))
       .rejects.toThrow(/set SICLAW_AGENT_ID/);
@@ -70,7 +70,7 @@ describe("resolveAgentId", () => {
     const fetchImpl = vi.fn(async () => jsonResponse({
       error: {
         status: "UNAUTHENTICATED",
-        message: "A valid SiCore agent API key is required",
+        message: "A valid ControlPlane agent API key is required",
         details: [{ reason: "AUTHENTICATION_REQUIRED" }],
       },
     }, 401));
@@ -81,15 +81,15 @@ describe("resolveAgentId", () => {
   });
 });
 
-describe("SicoreA2aClient", () => {
+describe("A2aClient", () => {
   it("sends the canonical text message without exposing the agent as tool input", async () => {
     const fetchImpl = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ task: task() }));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
     await client.sendMessage("check node", "context-1");
 
     expect(fetchImpl).toHaveBeenCalledOnce();
     const [url, init] = fetchImpl.mock.calls[0];
-    expect(String(url)).toBe("https://sicore.example.com/api/v1/a2a/agents/agent%2Fone/message:send");
+    expect(String(url)).toBe("https://control-plane.example.com/api/v1/a2a/agents/agent%2Fone/message:send");
     expect(init?.headers).toMatchObject({ authorization: "Bearer super-secret-key" });
     expect(JSON.parse(String(init?.body))).toEqual({
       message: {
@@ -104,11 +104,11 @@ describe("SicoreA2aClient", () => {
     const fetchImpl = vi.fn(async () => jsonResponse({
       error: {
         status: "UNAUTHENTICATED",
-        message: "A valid SiCore agent API key is required",
+        message: "A valid ControlPlane agent API key is required",
         details: [{ reason: "AUTHENTICATION_REQUIRED" }],
       },
     }, 401));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
 
     const error = await client.getTask("task-1").catch((value) => value as A2aClientError);
     expect(error).toBeInstanceOf(A2aClientError);
@@ -123,7 +123,7 @@ describe("SicoreA2aClient", () => {
       .mockResolvedValueOnce(jsonResponse({ error: { message: "temporary" } }, 500))
       .mockResolvedValueOnce(new Response("not-json", { status: 200 }))
       .mockResolvedValueOnce(jsonResponse({ task: task("TASK_STATE_COMPLETED", "recovered") }));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
 
     await expect(client.getTask("task-1")).resolves.toMatchObject({ state: "completed", result: "recovered" });
     expect(fetchImpl).toHaveBeenCalledTimes(3);
@@ -131,7 +131,7 @@ describe("SicoreA2aClient", () => {
 
   it("bounds transient GET retries", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ error: { message: "temporary" } }, 503));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
 
     await expect(client.getTask("task-1")).rejects.toBeInstanceOf(A2aClientError);
     expect(fetchImpl).toHaveBeenCalledTimes(3);
@@ -139,7 +139,7 @@ describe("SicoreA2aClient", () => {
 
   it("never retries task submission or cancellation", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ error: { message: "temporary" } }, 503));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
 
     await expect(client.sendMessage("check node")).rejects.toBeInstanceOf(A2aClientError);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -153,7 +153,7 @@ describe("SicoreA2aClient", () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse({ task: task() }))
       .mockResolvedValueOnce(jsonResponse({ task: task("TASK_STATE_COMPLETED", "done") }));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
     const result = await client.waitForTask("task-1", 1);
     expect(result.state).toBe("completed");
     expect(result.result).toBe("done");
@@ -169,7 +169,7 @@ describe("SicoreA2aClient", () => {
           init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
         })
       ));
-    const client = new SicoreA2aClient(
+    const client = new A2aClient(
       config({ requestTimeoutMs: 5_000, pollIntervalMs: 10 }),
       fetchImpl as typeof fetch,
     );
@@ -186,7 +186,7 @@ describe("SicoreA2aClient", () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse({ tasks: [task()], totalSize: 1, pageSize: 10, nextPageToken: "10" }))
       .mockResolvedValueOnce(jsonResponse({ task: task("TASK_STATE_CANCELED") }));
-    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+    const client = new A2aClient(config(), fetchImpl as typeof fetch);
 
     const list = await client.listTasks({ contextId: "context-1", status: "TASK_STATE_WORKING", pageSize: 10, pageToken: 0 });
     expect(list.total_size).toBe(1);

@@ -1,4 +1,4 @@
-import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
+import { exportMarkdownVisualsWithVisualExportWeb } from "./visual-export.js";
 import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
 
 const CHART_SPEC_VERSION = 1;
@@ -33,7 +33,7 @@ export const RENDER_CHART_DESCRIPTION =
     "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
     "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
     "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
-    "The tool renders through Sicore Web's own chart renderer/export path and returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
+    "The tool renders through ControlPlane Web's own chart renderer/export path and returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
   ].join(" ");
 
 export const RENDER_MERMAID_INPUT_SCHEMA = {
@@ -43,7 +43,7 @@ export const RENDER_MERMAID_INPUT_SCHEMA = {
     source: {
       type: "string",
       description:
-        "The Mermaid source only, without ```mermaid fences. Sicore Web supports flowchart/graph, sequenceDiagram, timeline, and xychart-beta.",
+        "The Mermaid source only, without ```mermaid fences. ControlPlane Web supports flowchart/graph, sequenceDiagram, timeline, and xychart-beta.",
     },
     title: {
       type: "string",
@@ -54,7 +54,7 @@ export const RENDER_MERMAID_INPUT_SCHEMA = {
 } as const;
 
 export const RENDER_MERMAID_DESCRIPTION = [
-  "Render a Mermaid diagram through Sicore Web's own Mermaid renderer/export path and return a PNG image artifact.",
+  "Render a Mermaid diagram through ControlPlane Web's own Mermaid renderer/export path and return a PNG image artifact.",
   "Use this in Feishu/Lark channel replies whenever the user asks for a flowchart, sequence diagram, timeline, topology, remediation flow, or Mermaid diagram image.",
   "Arguments must contain Mermaid source only, not fenced markdown. The tool returns READY_TO_PASTE ```mermaid markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
 ].join(" ");
@@ -75,13 +75,13 @@ export const RENDER_VISUAL_CARD_INPUT_SCHEMA = {
         "status_distribution",
         "action_plan",
       ],
-      description: "Sicore Web visual-card type.",
+      description: "ControlPlane Web visual-card type.",
     },
     title: { type: "string" },
     label: { type: "string" },
     subtitle: { type: "string" },
     conclusion: { type: "string" },
-    summary: { type: "string", description: "Alias accepted by Sicore Web as conclusion." },
+    summary: { type: "string", description: "Alias accepted by ControlPlane Web as conclusion." },
     tone: { type: "string" },
     status: { type: "string" },
     footer: { type: "string" },
@@ -100,7 +100,7 @@ export const RENDER_VISUAL_CARD_INPUT_SCHEMA = {
 } as const;
 
 export const RENDER_VISUAL_CARD_DESCRIPTION = [
-  "Render a Sicore Web visual-card conclusion card through Sicore Web's own visual-card renderer/export path and return a PNG image artifact.",
+  "Render a ControlPlane Web visual-card conclusion card through ControlPlane Web's own visual-card renderer/export path and return a PNG image artifact.",
   "Use this for Feishu/Lark final diagnosis cards, health checks, root-cause summaries, incident timelines, metric snapshots, status distributions, and action plans when the group needs a conclusion-card image.",
   "Arguments must be one visual-card JSON object, not Markdown and not a JSON string. The tool returns READY_TO_PASTE ```visual-card markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
 ].join(" ");
@@ -115,9 +115,9 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
 
   const spec = JSON.stringify(args);
   const markdownEmbed = "```chart\n" + spec + "\n```";
-  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
   const visual = exported.find((item) => item.kind === "chart") ?? exported[0];
-  if (!visual?.image) throw new Error("render_chart: Sicore Web export returned no chart image");
+  if (!visual?.image) throw new Error("render_chart: ControlPlane Web export returned no chart image");
   const png = visual.image;
 
   const result: RenderChartResult = {
@@ -131,7 +131,7 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
     bytes: Buffer.byteLength(spec, "utf8"),
     image_bytes: png.byteLength,
     image_mime: "image/png",
-    renderer: "sicore-web",
+    renderer: "visual-export-web",
     embed_instructions:
       "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear, and preserve the returned image artifact. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
   };
@@ -161,9 +161,9 @@ export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChart
   const args = validateMermaid(rawArgs);
   const id = newChartId("mermaid");
   const markdownEmbed = "```mermaid\n" + args.source + "\n```";
-  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
   const visual = exported.find((item) => item.kind === "mermaid") ?? exported[0];
-  if (!visual?.image) throw new Error("render_mermaid: Sicore Web export returned no Mermaid image");
+  if (!visual?.image) throw new Error("render_mermaid: ControlPlane Web export returned no Mermaid image");
 
   const meta = visualMetadata(id, "mermaid", markdownEmbed, visual.image);
 
@@ -193,9 +193,9 @@ export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderCh
   const id = newChartId("visual-card");
   const specJson = JSON.stringify(spec);
   const markdownEmbed = "```visual-card\n" + specJson + "\n```";
-  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
   const visual = exported.find((item) => item.kind === "visual-card") ?? exported[0];
-  if (!visual?.image) throw new Error("render_visual_card: Sicore Web export returned no visual-card image");
+  if (!visual?.image) throw new Error("render_visual_card: ControlPlane Web export returned no visual-card image");
 
   const meta = visualMetadata(id, "visual-card", markdownEmbed, visual.image);
 
@@ -236,7 +236,7 @@ function visualMetadata(
     bytes: Buffer.byteLength(markdownEmbed, "utf8"),
     image_bytes: image.byteLength,
     image_mime: "image/png",
-    renderer: "sicore-web",
+    renderer: "visual-export-web",
     embed_instructions:
       "Paste the READY_TO_PASTE block above verbatim into your reply and preserve the returned image artifact. Do not expose escaped JSON or describe Feishu upload mechanics.",
   };
@@ -359,7 +359,7 @@ export function validateVisualCard(raw: unknown): Record<string, unknown> {
   const obj = raw as Record<string, unknown>;
   const type = typeof obj.type === "string" ? obj.type : "";
   if (!RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum.includes(type as any)) {
-    throw new Error("render_visual_card: type is required and must be a supported Sicore visual-card type");
+    throw new Error("render_visual_card: type is required and must be a supported ControlPlane visual-card type");
   }
   if (typeof obj.title !== "string" || !obj.title.trim()) {
     throw new Error("render_visual_card: title is required");

@@ -66,7 +66,7 @@ installs `chromium`) to rasterize LLM-generated markdown — chart JSON, Mermaid
 source, and visual-card JSON — into PNGs for IM channel replies.
 
 Chromium runs with `--no-sandbox --disable-setuid-sandbox`
-(`mcp/create-chart/src/sicore-export.ts`). This is the standard workaround for
+(`mcp/create-chart/src/visual-export.ts`). This is the standard workaround for
 running Chromium in a container without `CAP_SYS_ADMIN` or a custom seccomp
 profile, but it disables Chromium's own process sandbox — so a Chromium 0-day
 reached via crafted render input would get **process-level access at sandbox-user

@@ -125,7 +125,7 @@ function artifactText(task: Record<string, unknown>): string | null {
 export function normalizeTask(value: unknown): SiclawTask {
   const task = asRecord(value);
   if (!task || typeof task.id !== "string" || !task.id) {
-    throw new A2aClientError("Sicore returned an invalid A2A task", { reason: "INVALID_A2A_RESPONSE" });
+    throw new A2aClientError("ControlPlane returned an invalid A2A task", { reason: "INVALID_A2A_RESPONSE" });
   }
   const status = asRecord(task.status);
   const rawState = typeof status?.state === "string" ? status.state : "TASK_STATE_UNSPECIFIED";
@@ -147,7 +147,7 @@ export function normalizeTask(value: unknown): SiclawTask {
 
 function errorFromResponse(status: number, payload: unknown): A2aClientError {
   const envelope = payload as A2aErrorEnvelope;
-  const message = envelope?.error?.message || `Sicore A2A request failed with HTTP ${status}`;
+  const message = envelope?.error?.message || `ControlPlane A2A request failed with HTTP ${status}`;
   const reason = envelope?.error?.details?.[0]?.reason || envelope?.error?.status || "A2A_REQUEST_FAILED";
   return new A2aClientError(message, {
     httpStatus: status,
@@ -167,7 +167,7 @@ function normalizeNextPageToken(value: unknown): number | null {
     ? value
     : typeof value === "string" ? Number(value) : Number.NaN;
   if (!Number.isSafeInteger(token) || token < 0) {
-    throw new A2aClientError("Sicore returned an invalid A2A page token", {
+    throw new A2aClientError("ControlPlane returned an invalid A2A page token", {
       reason: "INVALID_A2A_RESPONSE",
     });
   }
@@ -200,13 +200,13 @@ async function a2aRequest<T>(
       });
     } catch (error) {
       if (controller.signal.aborted) {
-        throw new A2aClientError("Sicore A2A request timed out", {
+        throw new A2aClientError("ControlPlane A2A request timed out", {
           reason: "A2A_TIMEOUT",
           retriable: true,
         });
       }
       throw new A2aClientError(
-        `Could not reach Sicore A2A endpoint: ${error instanceof Error ? error.message : String(error)}`,
+        `Could not reach ControlPlane A2A endpoint: ${error instanceof Error ? error.message : String(error)}`,
         { reason: "A2A_UNREACHABLE", retriable: true },
       );
     }
@@ -216,7 +216,7 @@ async function a2aRequest<T>(
       raw = await response.text();
     } catch (error) {
       throw new A2aClientError(
-        `Could not read Sicore A2A response: ${error instanceof Error ? error.message : String(error)}`,
+        `Could not read ControlPlane A2A response: ${error instanceof Error ? error.message : String(error)}`,
         {
           httpStatus: response.status,
           reason: "A2A_RESPONSE_READ_FAILED",
@@ -229,7 +229,7 @@ async function a2aRequest<T>(
       try {
         payload = JSON.parse(raw);
       } catch {
-        throw new A2aClientError("Sicore returned a non-JSON A2A response", {
+        throw new A2aClientError("ControlPlane returned a non-JSON A2A response", {
           httpStatus: response.status,
           reason: "INVALID_A2A_RESPONSE",
           retriable: method === "GET" && (response.ok || isRetriableHttpStatus(response.status)),
@@ -257,7 +257,7 @@ async function retryIdempotentRead<T>(
   for (let attempt = 0; attempt <= READ_RETRY_DELAYS_MS.length; attempt += 1) {
     const remaining = operationDeadline - Date.now();
     if (remaining <= 0) {
-      throw lastError ?? new A2aClientError("Sicore A2A request timed out", {
+      throw lastError ?? new A2aClientError("ControlPlane A2A request timed out", {
         reason: "A2A_TIMEOUT",
         retriable: true,
       });
@@ -273,12 +273,12 @@ async function retryIdempotentRead<T>(
     }
   }
 
-  throw lastError ?? new A2aClientError("Sicore A2A read failed");
+  throw lastError ?? new A2aClientError("ControlPlane A2A read failed");
 }
 
-// resolveAgentId asks Sicore which agent the configured key is bound to
+// resolveAgentId asks ControlPlane which agent the configured key is bound to
 // (GET /api/v1/a2a/self). Keys are per-agent, so this spares the operator
-// from copying the agent UUID into client config. Older Sicore deployments
+// from copying the agent UUID into client config. Older ControlPlane deployments
 // without the endpoint require SICLAW_AGENT_ID to be set explicitly.
 export async function resolveAgentId(
   config: AgentResolveInput,
@@ -291,7 +291,7 @@ export async function resolveAgentId(
   } catch (error) {
     if (error instanceof A2aClientError && error.httpStatus === 404) {
       throw new A2aClientError(
-        "This Sicore does not support key self-resolution (GET /api/v1/a2a/self); set SICLAW_AGENT_ID explicitly",
+        "This ControlPlane does not support key self-resolution (GET /api/v1/a2a/self); set SICLAW_AGENT_ID explicitly",
         { httpStatus: 404, reason: "SELF_RESOLUTION_UNSUPPORTED" },
       );
     }
@@ -299,12 +299,12 @@ export async function resolveAgentId(
   }
   const agentId = typeof payload?.agentId === "string" ? payload.agentId.trim() : "";
   if (!agentId) {
-    throw new A2aClientError("Sicore /self returned no agentId", { reason: "INVALID_A2A_RESPONSE" });
+    throw new A2aClientError("ControlPlane /self returned no agentId", { reason: "INVALID_A2A_RESPONSE" });
   }
   return agentId;
 }
 
-export class SicoreA2aClient implements SiclawA2aApi {
+export class A2aClient implements SiclawA2aApi {
   private readonly agentBaseUrl: string;
 
   constructor(
@@ -406,7 +406,7 @@ export class SicoreA2aClient implements SiclawA2aApi {
       await delay(Math.min(this.config.pollIntervalMs, remaining));
     }
     if (current) return current;
-    throw lastError ?? new A2aClientError("Sicore A2A wait timed out before receiving a task snapshot", {
+    throw lastError ?? new A2aClientError("ControlPlane A2A wait timed out before receiving a task snapshot", {
       reason: "A2A_TIMEOUT",
       retriable: true,
     });

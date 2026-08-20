@@ -1,6 +1,6 @@
 # asset-provenance fixture (coverage v2)
 
-Shared, byte-for-byte contract between siclaw `selfcheck.py` and the sicore
+Shared, byte-for-byte contract between siclaw `selfcheck.py` and the control-plane
 adoption ledger (DESIGN-kb-asset-provenance-2026-07-22 §六). Both repos run
 their edge extraction + coverage math over this same `raw/` + `candidate/` +
 `authoring/EXCLUSIONS.json` and assert the result equals `expected.json`.

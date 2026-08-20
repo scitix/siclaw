@@ -83,12 +83,12 @@ from codex_engine import CodexSDKClient, EngineTool, isolated_readonly_workspace
 import source_snapshot
 from source_inspector import SourceInspector
 
-# massapi/Bedrock rejects the `context_management` field Claude Code attaches
+# The proxy/Bedrock path rejects the `context_management` field Claude Code attaches
 # (HTTP 400 "context_management: Extra inputs are not permitted").
 # ROOT CAUSE (settled 2026-07-06 by reading bundled CLI 2.1.191): the field is
 # NOT autocompact — it is the thinking-clear context edit, attached whenever a
 # turn has thinking enabled AND the context-management beta is in the betas
-# list. massapi masquerades as a first-party endpoint, so the CLI auto-enables
+# list. The proxy presents itself as a first-party endpoint, so the CLI auto-enables
 # that beta for modern models; adaptive thinking then decides per-turn → the
 # 400 is intermittent (respawn-rehydrate first turns, image-heavy turns).
 # The gate: `if (o1(provider) && !E2e() && enabled) push(contextManagementBeta)`
@@ -97,7 +97,7 @@ from source_inspector import SourceInspector
 # experimental beta that changes the request shape is a 400 hazard here.
 os.environ.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
 # Autocompact stays off too (kept from the earlier mitigation): a compile is a
-# long multi-turn session and massapi has no compaction affordances. BOTH
+# long multi-turn session and the proxy has no compaction affordances. BOTH
 # spellings: CLI 0.2.110 read DISABLE_AUTO_COMPACT (underscored).
 # setdefault → an explicit deployment override still wins.
 os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
@@ -219,7 +219,7 @@ _TEST_SESSION_IMPL = None
 
 
 # ── Model-stall watchdog (L1) ────────────────────────────────────────────────
-# A compile turn can wedge on a black-holed model request (massapi/upstream
+# A compile turn can wedge on a black-holed model request (proxy/upstream
 # accepts the connection but never responds). The bundled `claude` CLI's own
 # request timeout is ~60min and not tunable from here, so a routine upstream
 # hiccup froze a run for an hour. We own the recovery: a turn-scoped watchdog
@@ -505,10 +505,10 @@ def _arm_test_turn(run: "TestRun") -> None:
 
 
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
-# massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
+# The model proxy under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
 # The bundled CLI retries internally a few times; past that the turn ends with
 # is_error=True and api_error_status set (CLI >= 2.1.110). We back off and re-issue
-# rather than failing the run — massapi's limits are not ours to fix (out of
+# rather than failing the run — the proxy's limits are not ours to fix (out of
 # scope), so this is graceful handling, not a fix. Exhaustion ends the turn with a
 # clear owner-facing note instead of a crash.
 # DOMAIN_MAX_CHARS is an admission ceiling for the ONE piece of library metadata
@@ -791,12 +791,12 @@ class CompileRun:
         # Typed machine-control receipts. A command id is accepted at most once
         # for this live run, and the first command pins the run to the consumer's
         # operation/generation context. This is intentionally NOT another status
-        # machine; Sicore's operation and the runtime run remain authoritative.
+        # machine; ControlPlane's operation and the runtime run remain authoritative.
         self._accepted_commands: dict[str, str] = {}
         self._command_context: tuple[str, int] | None = None
         # A sealed batch checkpoint is not durable when it merely entered this
         # process's SSE queue. New runtimes advertise artifact ACK support and
-        # acknowledge only after Sicore commits the whole syncArtifacts batch.
+        # acknowledge only after the control plane commits the whole syncArtifacts batch.
         # The orchestrator waits on that ACK before starting the next batch.
         self._artifact_ack_required = False
         self._sync_lock = asyncio.Lock()
@@ -892,7 +892,7 @@ class TestRun:
         self.consumer_max_turns: int | None = None
         self.consumer_fingerprint: str = ""
         # Lifecycle timestamps for the idle-TTL reaper and GET /test-sessions.
-        # created_at/last_activity_at are wire (iso8601, agreed with sicore);
+        # created_at/last_activity_at are wire (iso8601, agreed with control-plane);
         # _last_activity_monotonic drives the TTL comparison (clock-skew safe).
         now = time.monotonic()
         self.created_at: str = _now_iso()
@@ -3202,7 +3202,7 @@ def _engine_kind() -> str:
 def _reference_assist_model() -> str:
     """Use the consumer's LIGHT tier for short answer-authoring work.
 
-    Sicore materializes the administrator-selected LIGHT model as the blue-team
+    ControlPlane materializes the administrator-selected LIGHT model as the blue-team
     role. Keep an explicit override for operators, then fall back to the compile
     tier only when an older consumer has not supplied the LIGHT role yet.
     """
@@ -3263,7 +3263,7 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         mcp_servers={"compile": _make_compile_tools(run, raw_scope=raw_scope)},
         permission_mode="bypassPermissions",  # the pod itself is the sandbox
         setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
-        # Pin the compile model explicitly: the box talks to massapi (Bedrock),
+        # Pin the compile model explicitly: the box talks to an Anthropic-compatible proxy (backed by Bedrock),
         # which serves specific ids — the SDK default may not be one, and the KB
         # compile default is opus by product decision. Overridable per-deploy.
         model=_long_context_model(_compile_model()),
@@ -3555,7 +3555,7 @@ def _compile_system_prompt(run: "CompileRun") -> str:
 
 
 # ── batch mode (DESIGN-kb-batch-compile-2026-07-05) ──────────────────────────
-# Large corpora never fit one session (autocompact is off — massapi rejects the
+# Large corpora never fit one session (autocompact is off — the proxy rejects the
 # context_management field), so the box splits the compile into code-budgeted
 # batches, each a FRESH session over the same workspace. State handoff is the
 # workspace itself (exact files, code-verifiable), never a prose summary. Small
@@ -5041,7 +5041,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     # remain, OR a SECOND independent run again made zero progress
                     # (counter already ≥1). A healthy model that simply never
                     # writes sources[].resource would otherwise loop provider-fault →
-                    # resume → provider-fault until the sicore breaker suspends it
+                    # resume → provider-fault until the control-plane breaker suspends it
                     # for a human. Two independent runs of zero progress is content
                     # the train cannot digest: account it. Content shape must never
                     # wedge the train (2026-07-24 mandate) — auto-exclude with a
@@ -5289,7 +5289,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             _print_compile_lifecycle(
                 "batch.interrupted.frame", run,
                 extra=f"{frame.filename}:{frame.lineno} in {frame.name}")
-        # Route with _batch_error_code so Sicore auto-resume can distinguish
+        # Route with _batch_error_code so ControlPlane auto-resume can distinguish
         # deterministic failures (plan_integrity, quota_exhausted) from
         # transient ones (model_stall, provider_fault). Never hardcode batch_failed.
         batch_code = _batch_error_code(e)
@@ -5681,7 +5681,7 @@ async def run_session(run: CompileRun):
     """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
     for this KB. BOX_ROLE (+ the playbook + the attempt instruction) is the standing
     system prompt; the session then takes turns via POST /message — continuous
-    prepare + compile in one session, on massapi, with the compile tools.
+    prepare + compile in one session, through the model proxy, with the compile tools.
     Conversational by construction: connect, then wait for the first /message.
     (Durable cross-restart resume + a file-backed session store land in P4; v1
     uses an in-process store.)"""
@@ -5829,7 +5829,7 @@ READONLY_CONSUMER_DISALLOWED_TOOLS = [
 
 def _test_model() -> str:
     # The interactive kb-test consumer is the same production-consumer tier as
-    # PK's blue team. Sicore resolves that role to the selected provider model
+    # PK's blue team. ControlPlane resolves that role to the selected provider model
     # and sends it as KBC_PK_BLUE_MODEL. Keep KBC_TEST_MODEL as an explicit
     # override, but never fall back to a Claude model after a Codex session has
     # already supplied the blue-tier GPT model.
@@ -6428,7 +6428,7 @@ def _build_test_client(run: "TestRun", sid: str):
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
         setting_sources=[],                        # tenant isolation
         # The test session mimics the REAL consumer → the gate/consumer tier
-        # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
+        # (sonnet), not the compile tier. Proxy-served id; overridable per-deploy.
         model=run.consumer_model or _test_model(),
         max_turns=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
         session_id=sid,
@@ -7922,7 +7922,7 @@ async def handle_close_test(request: web.Request):
 async def handle_list_test_sessions(request: web.Request):
     """List the box's live test sessions so the consumer can reconcile orphans
     against its own records and drive the idle-reap view. Wire contract agreed
-    with sicore — the field names (tid/parent_run_id/created_at/last_activity_at/
+    with control-plane — the field names (tid/parent_run_id/created_at/last_activity_at/
     done) are load-bearing, do not rename."""
     return web.json_response({"sessions": [
         {

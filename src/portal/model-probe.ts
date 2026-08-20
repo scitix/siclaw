@@ -10,7 +10,7 @@
  * So the probe tries the resolved field and, on failure, tries the other one.
  * It deliberately does NOT parse the error message to decide: gateways word
  * protocol rejections differently and inconsistently, whereas "the other one
- * works" is unambiguous. (Same conclusion sicore reached for the same gateway.)
+ * works" is unambiguous. (Same conclusion control-plane reached for the same gateway.)
  */
 
 import {
@@ -189,7 +189,7 @@ export async function probeModelOnce(
  * body shape, so a protocol mismatch makes the field name moot. Deliberately no
  * error-message parsing at any step — gateways word these rejections
  * differently and inconsistently, whereas "the other one works" is unambiguous.
- * (Same conclusion sicore reached against this same gateway.)
+ * (Same conclusion control-plane reached against this same gateway.)
  *
  * Pure with respect to storage: it reports which attribute was corrected and
  * leaves persistence to the caller.

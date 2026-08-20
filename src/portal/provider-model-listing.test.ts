@@ -137,7 +137,7 @@ describe("parseAnthropicModelList", () => {
 
 describe("providerFetchSsrfGuard", () => {
   it("allows public and RFC1918 hosts", () => {
-    expect(providerFetchSsrfGuard("https://api.scitix.ai/model-api").ok).toBe(true);
+    expect(providerFetchSsrfGuard("https://model-gateway.example.com/model-api").ok).toBe(true);
     expect(providerFetchSsrfGuard("http://10.0.1.5:8000/v1").ok).toBe(true);
     expect(providerFetchSsrfGuard("http://192.168.1.20:11434/v1").ok).toBe(true);
   });
@@ -164,7 +164,7 @@ describe("providerFetchSsrfGuard", () => {
 
 describe("buildModelListUrl", () => {
   it("appends /models the same way the runtime appends /chat/completions", () => {
-    expect(buildModelListUrl("https://api.scitix.ai/model-api")).toBe("https://api.scitix.ai/model-api/models");
+    expect(buildModelListUrl("https://model-gateway.example.com/model-api")).toBe("https://model-gateway.example.com/model-api/models");
     expect(buildModelListUrl("https://api.anthropic.com/v1")).toBe("https://api.anthropic.com/v1/models");
   });
 
@@ -262,9 +262,9 @@ describe("buildModelListUrl — pagination", () => {
   });
 
   it("leaves the OpenAI branch unparameterised", () => {
-    expect(buildModelListUrl("https://api.scitix.ai/model-api", "openai-completions"))
-      .toBe("https://api.scitix.ai/model-api/models");
-    expect(buildModelListUrl("https://api.scitix.ai/model-api")).toBe("https://api.scitix.ai/model-api/models");
+    expect(buildModelListUrl("https://model-gateway.example.com/model-api", "openai-completions"))
+      .toBe("https://model-gateway.example.com/model-api/models");
+    expect(buildModelListUrl("https://model-gateway.example.com/model-api")).toBe("https://model-gateway.example.com/model-api/models");
   });
 });
 

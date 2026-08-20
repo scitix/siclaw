@@ -126,7 +126,7 @@ describe("tool contract", () => {
 
   it("keeps the submitted task_id when the bounded wait fails after submission", async () => {
     const api = fakeApi();
-    vi.mocked(api.waitForTask).mockRejectedValue(new Error("Sicore A2A request timed out"));
+    vi.mocked(api.waitForTask).mockRejectedValue(new Error("ControlPlane A2A request timed out"));
     const result = await createToolHandler(singleRouter(api))("siclaw_investigate", { question: "check node" });
 
     expect(api.sendMessage).toHaveBeenCalledOnce();
@@ -134,10 +134,10 @@ describe("tool contract", () => {
     expect(result.structuredContent).toMatchObject({
       task_id: "task-1",
       state: "working",
-      wait_error: "Sicore A2A request timed out",
+      wait_error: "ControlPlane A2A request timed out",
     });
     expect(result.content[0].text).toContain("task-1");
-    expect(result.content[0].text).toContain("wait_error: Sicore A2A request timed out");
+    expect(result.content[0].text).toContain("wait_error: ControlPlane A2A request timed out");
     expect(result.content[0].text).toContain("do not submit the same investigation again");
   });
 
