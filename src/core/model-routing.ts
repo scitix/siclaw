@@ -172,6 +172,22 @@ export interface RunPromptWithModelRoutingOptions {
    * candidate left behind.
    */
   applyCandidateModelParams?: (candidate: ModelRouteCandidate) => void;
+  /**
+   * Whether the runner is currently CAPTURING brain events, i.e. whether the
+   * caller's own live subscription must stand aside.
+   *
+   * The caller cannot derive this from the promise: `runAttempt` drops its
+   * subscription the moment `brain.prompt()` returns, while the caller only
+   * regains control a microtask later, in `.then`. Anything the brain emits in
+   * between — `auto_compaction_end` above all, which is the only thing that
+   * clears a frontend's compacting state — reaches nobody. So the handoff is
+   * signalled from INSIDE the attempt, in the same synchronous block as the
+   * unsubscribe, which is the only way to leave no gap at all.
+   *
+   * Paired, not one-shot: the next candidate must capture again, or a buffering
+   * fallback would stream live and defeat the point of buffering it.
+   */
+  onEventCaptureChange?: (capturing: boolean) => void;
   now?: () => number;
 }
 
@@ -790,6 +806,7 @@ export async function runPromptWithModelRouting(
     const streamFromStart = optimisticPrimaryStream && i === 0;
     const attemptResult = await runAttempt(
       brain, text, candidate, emitBrainEvent, streamFromStart, media, options.applyCandidateModelParams,
+      options.onEventCaptureChange,
     );
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
@@ -974,6 +991,7 @@ async function runAttempt(
   streamFromStart: boolean,
   media?: PromptMedia,
   applyCandidateModelParams?: (candidate: ModelRouteCandidate) => void,
+  onEventCaptureChange?: (capturing: boolean) => void,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -1061,6 +1079,10 @@ async function runAttempt(
   let streaming = streamFromStart;
   let emittedLive = false;
   let hadToolExecution = false;
+  // Take over event delivery, and hand it back in the finally below — both in the
+  // same synchronous block as the subscribe/unsubscribe they pair with, so no
+  // event can fall between the two owners.
+  onEventCaptureChange?.(true);
   const unsubscribe = brain.subscribe((event: unknown) => {
     if (streaming) {
       emitBrainEvent(event);
@@ -1123,6 +1145,11 @@ async function runAttempt(
       },
     };
   } finally {
+    // Hand delivery back BEFORE dropping the subscription, not after: these two
+    // statements have no await between them, so on a single-threaded runtime
+    // there is no instant in which neither owner is listening. Reversing them
+    // reintroduces exactly that instant.
+    onEventCaptureChange?.(false);
     unsubscribe();
     unsubscribeProviderResponse?.();
   }

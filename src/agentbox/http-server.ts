@@ -1178,6 +1178,15 @@ export function createHttpServer(
         applyCandidateModelParams: (candidate) => {
           applyModelParamsForCandidate(managed.brain, candidate, body.modelConfig);
         },
+        // The runner owns this flag for the duration of the run, because only it
+        // can flip it in the same synchronous block as its own subscribe /
+        // unsubscribe. Doing it here off the promise instead left a microtask in
+        // which neither the runner nor the live subscription below was
+        // listening — long enough to lose an `auto_compaction_end`, which is the
+        // only thing that clears the frontend's compacting state.
+        onEventCaptureChange: (capturing) => {
+          managed._routeBrainEventsThroughExtra = capturing;
+        },
       },
       promptMedia,
     );

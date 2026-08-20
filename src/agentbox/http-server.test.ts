@@ -701,6 +701,42 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(session._eventBuffer.some((e: any) => e?.type === "auto_compaction_end")).toBe(true);
   });
 
+  it("POST /api/prompt has the live path open the moment the runner lets go", async () => {
+    // The window is not observable from a prompt-scoped mock: an event queued
+    // from inside brain.prompt still fires while the runner is subscribed (so it
+    // travels the runner's own channel), and anything scheduled as a macrotask
+    // lands after .then, which the old code also survived. What is observable —
+    // and what the gap consisted of — is WHEN the gate opens: with the handoff
+    // driven from inside the attempt it is already open when brain.prompt
+    // returns, so nothing can fall between the two owners. The ordering itself is
+    // pinned in model-routing.test.ts ("gives delivery back before unsubscribing").
+    const session = await sm.getOrCreate("compact-race");
+    let gateWhenPromptReturned: boolean | undefined;
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+      session.isCompacting = true;
+      queueMicrotask(() => { gateWhenPromptReturned = session._routeBrainEventsThroughExtra; });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "compact-race" });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // Still deferred (compaction was in flight), so the consumer is attached…
+    expect(session._promptDone).toBe(false);
+    // …and an event arriving now reaches it rather than being dropped.
+    session._eventBuffer.length = 0;
+    session.isCompacting = false;
+    session.brain.emitter.emit("event", { type: "auto_compaction_end" });
+    expect(session._eventBuffer.some((e: any) => e?.type === "auto_compaction_end")).toBe(true);
+    // Recorded for the record: the runner's own channel covered the earlier
+    // instant, which is why that timing was never the lossy one.
+    expect(gateWhenPromptReturned).toBe(true);
+  });
+
   it("POST /api/prompt rejects missing text", async () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);

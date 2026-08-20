@@ -392,6 +392,52 @@ describe("model-routing policy", () => {
   });
 });
 
+describe("event-capture handoff", () => {
+  /**
+   * The invariant, rather than a timing accident: the runner must hand delivery
+   * back BEFORE it drops its subscription. Reversed, there is a window in which
+   * neither the runner nor the caller's live subscription is listening — and the
+   * caller cannot close it from the outside, because it only regains control a
+   * microtask later, in `.then`. What falls in is `auto_compaction_end`, the only
+   * event that clears a frontend's compacting state.
+   */
+  function brainRecordingOrder(order: string[]) {
+    const emitter = new EventEmitter();
+    return {
+      emitter,
+      subscribe: (listener: (event: unknown) => void) => {
+        emitter.on("event", listener);
+        return () => { order.push("unsubscribe"); emitter.off("event", listener); };
+      },
+      prompt: vi.fn(async () => {
+        emitter.emit("event", {
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+        });
+      }),
+      getModel: () => ({ provider: "openai", id: "gpt-4", name: "GPT-4", contextWindow: 1000, maxTokens: 100, reasoning: false }),
+      findModel: () => ({ provider: "openai", id: "gpt-4", name: "GPT-4", contextWindow: 1000, maxTokens: 100, reasoning: false }),
+      setModel: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
+    } as any;
+  }
+
+  it("gives delivery back before unsubscribing, on every attempt", async () => {
+    const order: string[] = [];
+    const brain = brainRecordingOrder(order);
+    await runPromptWithModelRouting(
+      brain,
+      "hi",
+      { enabled: true, strategy: "ordered_fallback", candidates: [{ provider: "openai", modelId: "gpt-4" }] },
+      createModelRouteState(),
+      { onEventCaptureChange: (capturing) => order.push(capturing ? "capture:on" : "capture:off") },
+    );
+    // capture:on must precede the subscription's life, and capture:off must come
+    // BEFORE unsubscribe — adjacent statements, so nothing can land between them.
+    expect(order).toEqual(["capture:on", "capture:off", "unsubscribe"]);
+  });
+});
+
 describe("resolveEffectivePolicy (single routing entry)", () => {
   const multi: ModelRoutePolicy = {
     enabled: true,
