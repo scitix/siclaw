@@ -336,9 +336,32 @@ diagnostic. A bare relative filename (`cat "id_rsa"`) therefore still passes thi
 it needs per-command operand knowledge, not a broader text rule.
 
 The pass is deliberately **command-agnostic** — it screens any command carrying the path, not a list of
-readers — so whitelisting a new tool cannot open a hole here. A GLOB that expands onto a sensitive path
-(`cat /etc/*`) is *not* caught: pre-dates this design, and closing it needs a rule that does not also
-refuse `cat /etc/*release*`.
+readers — so whitelisting a new tool cannot open a hole here.
+
+**Globs.** An argument containing `*`, `?`, `[` or `{` is compiled to the regex of the paths it can
+expand to and tested against `SENSITIVE_PATH_EXAMPLES`. `cat /etc/*` is refused because that regex
+matches `/etc/shadow`; `cat /etc/*release*` is not, because it matches no example. Screening the glob's
+literal prefix instead would refuse the second, which names no secret — so the intersection is computed,
+not approximated.
+
+Two shell semantics are load-bearing, and both were confirmed by running a shell rather than recalled:
+
+- `*` and `?` do not cross `/`, so `/etc/*` cannot reach `/etc/kubernetes/admin.conf`;
+- `*` and `?` do not match a leading `.`, so `ls /root/*` must stay permitted even though
+  `/root/.bash_history` is on the example list — the shell can never expand it there.
+
+`**` is read as crossing separators. That is the permissive direction: it can only make the compiled
+regex match more examples, so a shell without globstar is refused slightly more often, never less.
+
+The examples exist because the patterns are regexes and a glob cannot be intersected with a regex at
+validation time. They are pinned in both directions — every pattern must match an example, every example
+must be matched by a pattern — so adding a pattern without an example fails a test instead of silently
+leaving globs unscreened for it. The patterns remain authoritative for literal paths; the examples are
+only what globs are compared against.
+
+Residual, stated rather than implied: a suffix-only pattern (`\.key$`) is not reachable through a glob
+in an arbitrary directory — `cat /app/certs/*` is permitted even if a key lives there, because no example
+is under that path. Covering it would mean refusing every `dir/*`.
 
 ### 4.3 Context-Based Whitelisting
 

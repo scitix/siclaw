@@ -1889,3 +1889,55 @@ export const CONTAINER_SENSITIVE_PATHS: RegExp[] = [
   /\.psql_history/,
   /\.node_repl_history/,
 ];
+
+/**
+ * One concrete path per pattern above.
+ *
+ * The patterns are regexes, so nothing can be intersected with them directly — deciding whether a glob
+ * and a regex can match a common string is not something to attempt at validation time. A glob is
+ * therefore tested against these literals instead: `cat /etc/*` compiles to `^/etc/(?!\.)[^/]*$`, which
+ * matches `/etc/shadow`, so it is refused; `cat /etc/*release*` compiles to a regex that matches none of
+ * them, so it runs.
+ *
+ * The list can drift from the patterns, so it is pinned in both directions: every pattern must match at
+ * least one example, and every example must be matched by some pattern. Adding a pattern without an
+ * example fails the test rather than silently leaving globs unscreened for it.
+ *
+ * These are EXAMPLES, not the protected set — the patterns remain authoritative for literal paths.
+ */
+export const SENSITIVE_PATH_EXAMPLES: readonly string[] = [
+  "/run/secrets/kubernetes.io/serviceaccount/token",
+  "/var/run/secrets/kubernetes.io/serviceaccount/token",
+  "/proc/1/environ",
+  "/proc/1/cmdline",
+  "/proc/1/fd/3",
+  "/proc/1/mem",
+  "/proc/1/maps",
+  "/proc/1/smaps",
+  "/proc/kcore",
+  "/etc/shadow",
+  "/etc/gshadow",
+  "/etc/master.passwd",
+  "/root/.ssh/config",
+  "/root/.ssh/id_rsa",
+  "/root/.ssh/id_ed25519",
+  "/root/.ssh/id_ecdsa",
+  "/etc/ssl/private/server.key",
+  "/etc/ssl/private/keystore.p12",
+  "/etc/ssl/private/keystore.pfx",
+  "/etc/ssl/private/keystore.jks",
+  "/root/.aws/credentials",
+  "/root/.gcp/application_default_credentials.json",
+  "/root/.azure/accessTokens.json",
+  "/root/.docker/config.json",
+  "/etc/kubernetes/pki/apiserver.crt",
+  "/etc/kubernetes/admin.conf",
+  "/var/lib/kubelet/pki/kubelet-client-current.pem",
+  "/var/lib/kubelet/pods/2b1f/volumes/kubernetes.io~secret/default-token/token",
+  "/var/lib/etcd/member/snap/db",
+  "/root/.bash_history",
+  "/root/.zsh_history",
+  "/root/.mysql_history",
+  "/root/.psql_history",
+  "/root/.node_repl_history",
+];

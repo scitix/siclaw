@@ -7,6 +7,7 @@ import {
   getContextAllowedSet,
   getCommandBinary,
   parseArgs,
+  SENSITIVE_PATH_EXAMPLES,
   validateCommandRestrictions,
 } from "./command-sets.js";
 
@@ -27,6 +28,84 @@ export interface ValidateCommandOptions {
   sensitivePathPatterns?: RegExp[];
   /** Reject pipes (|), chaining (&&, ;) — for contexts where commands are passed as argv, not through a shell. */
   blockPipeline?: boolean;
+}
+
+
+const GLOB_METACHARS = /[*?[{]/;
+
+/** Regex-escape a literal run. */
+function escapeLiteral(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Compile a shell glob to the regex of the paths it can expand to.
+ *
+ * Two semantics are load-bearing and were confirmed by running a shell rather than recalled:
+ *
+ *   - `*` and `?` do NOT cross `/`. `/etc/*` cannot reach `/etc/kubernetes/admin.conf`.
+ *   - `*` and `?` do NOT match a leading `.`. Without that, `ls /root/*` would be refused because
+ *     `/root/.bash_history` is on the example list, while the shell can never expand it there.
+ *
+ * `**` is treated as crossing separators (globstar), which is the permissive reading: it can only make
+ * the compiled regex match MORE examples, so a shell without globstar is refused slightly more often
+ * rather than less.
+ */
+export function globToPathRegExp(glob: string): RegExp | null {
+  let out = "^";
+  let atSegmentStart = true;
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") {
+      const globstar = glob[i + 1] === "*";
+      if (globstar) i++;
+      // A leading dot is only protected when the wildcard opens the segment.
+      out += globstar ? (atSegmentStart ? "(?!\\.)(?:.*)" : ".*")
+                      : (atSegmentStart ? "(?!\\.)[^/]*" : "[^/]*");
+      atSegmentStart = false;
+    } else if (ch === "?") {
+      out += atSegmentStart ? "[^/.]" : "[^/]";
+      atSegmentStart = false;
+    } else if (ch === "[") {
+      const close = glob.indexOf("]", i + 1);
+      if (close === -1) { out += "\\["; atSegmentStart = false; continue; }
+      // Character classes carry over as-is; `!` is the shell's negation, `^` the regex's.
+      const body = glob.slice(i + 1, close).replace(/^!/, "^");
+      out += `[${body}]`;
+      i = close;
+      atSegmentStart = false;
+    } else if (ch === "{") {
+      const close = glob.indexOf("}", i + 1);
+      if (close === -1) { out += "\\{"; atSegmentStart = false; continue; }
+      const alts = glob.slice(i + 1, close).split(",").map(escapeLiteral);
+      out += `(?:${alts.join("|")})`;
+      i = close;
+      atSegmentStart = false;
+    } else {
+      out += escapeLiteral(ch);
+      atSegmentStart = ch === "/";
+    }
+  }
+  try {
+    return new RegExp(out + "$");
+  } catch {
+    return null;   // a class the shell accepts and JS does not: fall through to the literal checks
+  }
+}
+
+/**
+ * Could this glob expand onto a sensitive path?
+ *
+ * The gap this closes: `cat /etc/shadow` was refused while `cat /etc/*` was not, and the shell expands
+ * the second onto the first. Screening the glob's literal prefix instead would refuse
+ * `cat /etc/*release*`, which names no secret and is an ordinary diagnostic — hence the compile-and-test
+ * approach rather than a prefix rule.
+ */
+function globReachesSensitivePath(arg: string, examples: readonly string[]): string | null {
+  if (!GLOB_METACHARS.test(arg)) return null;
+  const rx = globToPathRegExp(arg);
+  if (!rx) return null;
+  return examples.find((example) => rx.test(example)) ?? null;
 }
 
 // ── extractCommands (moved from restricted-bash.ts) ──────────────────
@@ -461,6 +540,23 @@ export function validateCommand(command: string, options?: ValidateCommandOption
       // still slips through this pass; the owner-side controls remain, and widening it needs per-command
       // operand knowledge rather than a text rule.
       const pathish = parseArgs(cmd).filter((a) => a.includes("/"));
+
+      // A glob the shell expands ONTO a sensitive path: `cat /etc/shadow` was refused and `cat /etc/*`
+      // was not. Compiled and tested against representative literals rather than screened by prefix,
+      // so `cat /etc/*release*` — which names no secret — still runs.
+      for (const arg of pathish) {
+        const reached = globReachesSensitivePath(arg, SENSITIVE_PATH_EXAMPLES);
+        if (!reached) continue;
+        return JSON.stringify({
+          error: `"${arg}" expands onto credential or secret material (for example "${reached}"), `
+            + `which is not readable through this tool.`,
+          matched: arg,
+          expands_onto: reached,
+          rejected_by: "sensitive_path",
+          hint: sensitivePathHint(reached),
+        }, null, 2);
+      }
+
       for (const re of options.sensitivePathPatterns) {
         const hit = re.exec(cmd) ?? pathish.map((a) => re.exec(a)).find((m) => m !== null) ?? null;
         if (!hit) continue;
