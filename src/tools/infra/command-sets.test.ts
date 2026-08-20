@@ -2073,3 +2073,22 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
     expect(err, "and says why a label selector is not equivalent").toMatch(/label selector|phase filter/);
   });
 });
+
+describe("a refused subcommand names what is permitted", () => {
+  it("lists the allowed set and points crictl exec at pod_exec", () => {
+    // A review shows `crictl exec` refused clearly, and the caller then guessing at kubelet volume paths
+    // because the refusal named nothing to do instead.
+    const err = validateCommandRestrictions("crictl exec -i abc123 sh", { context: "node" }) ?? "";
+    const parsed = JSON.parse(err);
+    expect(parsed.allowed).toContain("inspect");
+    expect(parsed.hint).toMatch(/pod_exec/);
+  });
+
+  it("still refuses, and does not invent an alternative where none exists", () => {
+    const err = validateCommandRestrictions("crictl attach abc", { context: "node" }) ?? "";
+    const parsed = JSON.parse(err);
+    expect(parsed.error).toMatch(/not allowed/);
+    expect(parsed.allowed, "the permitted set is always shown").toContain("logs");
+    expect(parsed.hint, "no fabricated advice").toBeUndefined();
+  });
+});

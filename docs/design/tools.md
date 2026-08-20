@@ -306,6 +306,37 @@ The leg must reach `details` from every tool that classifies an exit; a field th
 is invisible to the UI and to metrics, which is the only place it can be read (`details` never reaches the
 model, so the distinction is also stated in the annotation text).
 
+**The classes, and what each one answers.** Every one exists because the exit code alone was reported as
+something untrue, and each was written or corrected against a real trace:
+
+| class | `isError` | the question it answers |
+|-------|-----------|-------------------------|
+| `no_match` | false | The query ran and found nothing — grep, `ps -p`, `findmnt`, and an API NotFound on a named object in the `local` context |
+| `output_truncated` | true | The command RAN; this is a PREFIX. A search over it proves nothing |
+| `pipeline_upstream_failed` | true | An earlier stage failed while the last exited 0 — an empty result means the query failed |
+| `invalid_arguments` | true | The CLIENT refused the flag or printer; the request never reached the cluster |
+| `dependency_missing` | true | The channel worked; the binary is not on the target |
+| `not_executable` | true | Found, could not be run |
+| `interrupted` | varies | Signalled. A SIGKILL with no exit code is OUR timeout, and the annotation says which layers it cannot tell apart |
+| `channel_error` | true | The target never ran it. `channelLeg` says whether the transport or the namespace entry broke |
+| `target_reported_failure` | true | The target ran it and reported this status — its own answer |
+
+Two of these were corrected by reading traces rather than reasoning, and both corrections went from "this
+is fine" to "this is a failure":
+
+- A 141 on the **final** pipeline stage was first treated as a benign SIGPIPE. Nothing is downstream of
+  the last stage, so no consumer could have closed the pipe — it was killed. A trace shows
+  `kubectl logs --tail=-1 | grep -c '…'` returning 141 with **no output** after 83 seconds, while the same
+  shape that completed took 11 seconds and printed `0`; a `grep -c` that finishes always prints a number.
+- `Error from server` was matched as a prefix, so an API NotFound was classified as a dead channel whose
+  annotation said the target never ran the command. The server answered.
+
+The reverse also happened: two reviews asked for `nvidia-smi` and `curl` non-zero exits to be treated as
+success. They are not — those exit non-zero because the target FOUND something (an ECC fault, a failed TLS
+verification), and `target_reported_failure` already says it is the target's own answer rather than a
+transport fault, which is the distinction those reviews wanted. Calling a GPU fault "no match" would be the
+new untruth.
+
 ### 6.1c Projecting JSON Output (`json_path`)
 
 `node_exec`, `pod_exec` and `host_exec` accept an optional `json_path` that projects a field out of

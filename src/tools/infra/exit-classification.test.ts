@@ -383,3 +383,23 @@ describe("answers the API gave, and commands the client refused", () => {
     expect(j.annotation, "and does not pretend to know which layer was slow").toMatch(/cannot tell/);
   });
 });
+
+describe("a printer the client does not have is a client rejection", () => {
+  it("classifies it with the flag rejections, not as the target's failure", () => {
+    // Four findings are `kubectl events -o wide` / `-o custom-columns`: `events` supports neither, the
+    // client says so before contacting the server, and it was reported as the target's own failure.
+    const j = classifyExit({
+      command: "kubectl events --for node/x -o custom-columns=A:.a", exitCode: 1, stdout: "",
+      stderr: 'error: unable to match a printer suitable for the output format "custom-columns"',
+      context: "local",
+    });
+    expect(j.exitClass).toBe("invalid_arguments");
+    expect(j.annotation, "and names the subcommand that does support it").toMatch(/kubectl get events/);
+  });
+
+  it("leaves a real target failure alone", () => {
+    const j = classifyExit({ command: "kubectl get pods", exitCode: 1, stdout: "",
+      stderr: "Error from server (Forbidden): pods is forbidden", context: "local" });
+    expect(j.exitClass).toBe("target_reported_failure");
+  });
+});

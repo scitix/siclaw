@@ -229,6 +229,13 @@ function validateByRule(
         if (!allowed.includes(arg)) {
           return JSON.stringify({
             error: `${cmd} ${position === 0 ? "subcommand" : "action"} "${arg}" is not allowed.`,
+            // Listing what IS permitted turns a dead end into a next step. A review reports `crictl exec`
+            // being refused clearly and the caller then guessing at kubelet volume paths, because the
+            // refusal named nothing.
+            allowed: [...allowed],
+            ...(SUBCOMMAND_ALTERNATIVES[`${cmd} ${arg}`]
+              ? { hint: SUBCOMMAND_ALTERNATIVES[`${cmd} ${arg}`] }
+              : {}),
           }, null, 2);
         }
         return null;
@@ -1208,6 +1215,23 @@ function applyCommandConstraints(
  * (for pipe-only enforcement).
  * Returns an error message string if blocked, or null if allowed.
  */
+/**
+ * What to do instead, for the refusals a review saw someone work around by guessing.
+ *
+ * Keyed on `command subcommand`. Only entries where a real substitute exists — an empty hint is worse
+ * than none, and the `allowed` list beside it already covers the general case.
+ */
+const SUBCOMMAND_ALTERNATIVES: Record<string, string> = {
+  "crictl exec": "Entering a container is not available here. Use `pod_exec` (which enters through the "
+    + "Kubernetes API with the same read-only validation), or read what you need from outside with "
+    + "`crictl inspect` / `crictl logs`.",
+  "crictl run": "This tool does not start containers. `crictl inspect`, `crictl ps` and `crictl logs` "
+    + "cover inspection of what is already running.",
+  "crictl rm": "This tool is read-only; container lifecycle changes are out of scope.",
+  "crictl rmi": "This tool is read-only; image removal is out of scope.",
+  "crictl stop": "This tool is read-only; stopping a container is out of scope.",
+};
+
 export function validateCommandRestrictions(
   cmd: string,
   options?: { context?: string; piped?: boolean },

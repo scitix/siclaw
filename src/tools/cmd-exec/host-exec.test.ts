@@ -169,3 +169,41 @@ describe("host_exec", () => {
     expect((result.details as any).signal).toBe("SIGTERM");
   });
 });
+
+describe("an SSH failure says WHICH layer failed", () => {
+  // "SSH connection failed" was the whole answer, and the three cases call for different next steps.
+  // Two are readable straight out of the client's text — a review captured
+  // `forwardOut from … failed: (SSH) Channel open failure: No route to host`, where `forwardOut` means
+  // the bastion was reached and could not reach the target.
+  const run = async (message: string, host = "h1") => {
+    vi.mocked(acquireSshTarget).mockResolvedValue({ host: "10.0.0.9", port: 22, username: "u",
+      auth: { type: "password", password: "p" } } as never);
+    vi.mocked(sshExec).mockRejectedValue(new Error(message));
+    const res = await createHostExecTool({ credentialBroker: fakeBroker } as any)
+      .execute("id", { host, command: "uptime" }, undefined, {} as any);
+    return { text: res.content[0].text as string, details: res.details as Record<string, unknown> };
+  };
+
+  it("names the jump hop rather than blaming the bastion", async () => {
+    const r = await run("forwardOut from 214.31.43.1 to 214.31.40.77:22 failed: (SSH) Channel open failure: No route to host");
+    expect(r.details.ssh_stage).toBe("jump_hop");
+    expect(r.text).toMatch(/bastion was reached/);
+  });
+
+  it("separates a rejected credential from an unreachable host", async () => {
+    expect((await run("All configured authentication methods failed")).details.ssh_stage).toBe("authentication");
+    expect((await run("SSH chain connect timeout after 10000ms")).details.ssh_stage).toBe("network");
+  });
+
+  it("says the same host just failed, without refusing to try again", async () => {
+    // Deliberately not a negative cache: the attempt still happens, because a cache would keep a host
+    // that has just recovered locked out. A review reports two ten-second waits — worth reporting, not
+    // worth a state machine that can be wrong.
+    const host = `repeat-${Date.now()}`;
+    const first = await run("SSH chain connect timeout after 10000ms", host);
+    expect(first.text, "nothing to report on the first failure").not.toMatch(/also failed/);
+    const second = await run("SSH chain connect timeout after 10000ms", host);
+    expect(second.text).toMatch(/also failed to connect/);
+    expect(vi.mocked(sshExec).mock.calls.length, "the second attempt was still made").toBeGreaterThan(1);
+  });
+});

@@ -43,6 +43,62 @@ const HOST_BG_MAX_TTL = 3600;
  * blocked at the local context whitelist (DESIGN risk #1).
  */
 
+/**
+ * Which layer of the SSH path failed, from the client's own error text.
+ *
+ * "SSH connection failed" was the whole answer, and the three cases call for completely different next
+ * steps. Two of them are visible in the text with no extra work — a review captured
+ * `forwardOut from 214.31.43.1 to 214.31.40.77:22 failed: (SSH) Channel open failure: No route to host`,
+ * where `forwardOut` names the JUMP HOP: the bastion was reached and it could not reach the target, which
+ * is a different investigation from the bastion being unreachable.
+ */
+function classifySshFailure(message: string): { stage: string; hint: string } {
+  if (/forwardOut|Channel open failure/i.test(message)) {
+    return {
+      stage: "jump_hop",
+      hint: "The bastion was reached; the hop from it to the target failed. Check the target's own "
+        + "reachability and the bastion's route to it — the bastion itself is fine.",
+    };
+  }
+  if (/All configured authentication methods failed|Permission denied|publickey|Authentication failure/i.test(message)) {
+    return {
+      stage: "authentication",
+      hint: "The host answered and rejected the credential. Retrying will not help; the binding's key or "
+        + "password needs checking.",
+    };
+  }
+  if (/connect timeout|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|No route to host|ENETUNREACH/i.test(message)) {
+    return {
+      stage: "network",
+      hint: "Nothing answered at the transport layer. If the host is up, this is a network or firewall "
+        + "path problem rather than a credential one.",
+    };
+  }
+  return { stage: "unknown", hint: "The client gave no recognisable stage; see the message above." };
+}
+
+/**
+ * Recent connect-level failures per host, so a second call can SAY the first one just failed.
+ *
+ * Deliberately NOT a negative cache: the attempt is still made. A cache would keep a host that has just
+ * recovered locked out, and the evidence for skipping is thin — a review reports two ten-second waits,
+ * which is not worth a state machine that can be wrong. Reporting costs nothing and is never wrong.
+ */
+const recentSshFailures = new Map<string, { at: number; stage: string }>();
+const SSH_FAILURE_MEMORY_MS = 60_000;
+
+function noteSshFailure(host: string, stage: string): string {
+  const now = Date.now();
+  const prev = recentSshFailures.get(host);
+  recentSshFailures.set(host, { at: now, stage });
+  if (prev && now - prev.at < SSH_FAILURE_MEMORY_MS) {
+    const secs = Math.floor((now - prev.at) / 1000);
+    return ` This host also failed to connect ${secs}s ago (${prev.stage}); the two are almost certainly `
+      + "the same cause, so a third attempt is unlikely to differ.";
+  }
+  return "";
+}
+
 export function createHostExecTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
@@ -293,9 +349,12 @@ Examples (pass the id from host_list; names shown here for readability):
           return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
         }
         const msg = err instanceof Error ? err.message : String(err);
+        const ssh = classifySshFailure(msg);
+        const repeat = noteSshFailure(params.host, ssh.stage);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node in a cluster this agent is BOUND to, node_exec reaches it without SSH — check with cluster_list first, because that fallback does not exist for an unbound cluster and two reviews reported being sent to it anyway.` }],
-          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", channel_leg: "transport", host: params.host },
+          content: [{ type: "text", text: `Error: ${msg}\n\n[ssh_${ssh.stage}: ${ssh.hint}]${repeat}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node in a cluster this agent is BOUND to, node_exec reaches it without SSH — check with cluster_list first, because that fallback does not exist for an unbound cluster and two reviews reported being sent to it anyway.` }],
+          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", channel_leg: "transport",
+                     ssh_stage: ssh.stage, host: params.host },
         };
       } finally {
         signal?.removeEventListener("abort", onAbort);

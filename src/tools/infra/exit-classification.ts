@@ -394,6 +394,23 @@ export function classifyExit(opts: {
   // Deliberately NOT a pre-exec blocklist of flags: kubectl versions differ per image and per cluster,
   // so a curated "these do not exist" list would start refusing commands that work the moment the client
   // is upgraded. Reading the client's own answer is version-proof.
+  // `unable to match a printer` belongs here for the same reason: the client refused the OUTPUT FORMAT
+  // before contacting the server. Four findings are `kubectl events -o wide` / `-o custom-columns`,
+  // where `events` supports neither — and `kubectl get events` supports both, which is what the
+  // annotation needs to say. Reported as the target's failure until now.
+  const printerRejected = /^error: unable to match a printer/m.test(stderr);
+  if (printerRejected) {
+    return {
+      exitClass: "invalid_arguments",
+      isError: true,
+      annotation:
+        "[invalid_arguments: the CLIENT refused this output format for this subcommand — the request never "
+        + "reached the cluster, so this is not the target's answer and retrying it unchanged will fail "
+        + "identically. `kubectl events` supports neither `-o wide` nor `-o custom-columns`; "
+        + "`kubectl get events` supports both, and `-o json` works for either.]",
+    };
+  }
+
   if (/^error: unknown (flag|shorthand flag)/m.test(stderr) || /^Error: unknown flag/m.test(stderr)) {
     return {
       exitClass: "invalid_arguments",
