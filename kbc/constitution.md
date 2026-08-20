@@ -18,6 +18,6 @@
 
 ## Knobs (optional, turn on as needed)
 
-- **Sensitive**: if the documents contain credentials / privacy / customer data, declare the red lines here (what must not enter the output). Machine IDs, SKU catalogs, and encoding tables are not credentials; do not hide them under this knob.
+- **Sensitive**: if the documents contain credentials / privacy / customer data, declare the red lines here (what must not enter the output). Catalog IDs, lookup tables, and encoding tables are not credentials; do not hide them under this knob.
 - **Evidence level**: if the same assertion has multi-tier sources (measured / vendor-stated / hearsay), set the priority here.
 - **Leave-blank**: for blocks that are "not to be compiled for now", declare it here; the compiler marks them "not covered" rather than hard-coding. Do not use leave-blank for a canonical inventory the consumer will filter as a complete set — that needs a data page, not a pointer.

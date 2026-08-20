@@ -73,8 +73,8 @@ The owner is a domain expert who knows the content — and knows nothing about c
 Some sources are not documents that explain something — they are **collections
 of records**: ticket exports, on-call logs, inspection runs, structured data
 tables, and **canonical inventories that a reader or Q&A agent will treat as a
-complete set** (approved/in-production catalogs, encoding↔config maps, machine
-ID overviews, status ledgers). They belong in the knowledge base as much as
+complete set** (published catalogs, encoding↔config maps, entity ID overviews,
+status ledgers). They belong in the knowledge base as much as
 anything else, but forcing one into a single narrative page fails both ways:
 summarising loses the detail, transcribing answers no question.
 
@@ -103,13 +103,14 @@ are still yours to judge. These two are **not**:
 
 1. Cutting a complete inventory down to a summary-plus-pointer because it is
    long, because transcription might drift, because the rows are "not the
-   current GPU decision set", or because they are CPU/storage/management SKUs;
+   current decision set", or because they belong to a category the current
+   brief did not highlight;
 2. Excluding a source because it cannot be transcribed — exclusion means "this
    does not belong in the base", not "I could not handle it".
 
 This is especially true for an internal knowledge base (`audience=internal-eng`
-or `redaction=none`): machine IDs, configuration lists, and internal codes are
-**not redaction targets**. Credentials (passwords / BMC / keys) still stay off
+or `redaction=none`): catalog IDs, lookup tables, and internal codes are
+**not redaction targets**. Credentials (passwords / keys) still stay off
 the page. Do not stretch "avoid copying large tables" into hiding the shelf the
 user needs to filter.
 
