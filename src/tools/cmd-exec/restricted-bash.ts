@@ -27,6 +27,7 @@ import {
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { tailTruncationNote } from "../infra/tail-truncation.js";
+import { hasPipeline, instrumentPipeline, extractPipelineStatus } from "../infra/pipeline-status.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 
 const execAsync = promisify(exec);
@@ -409,9 +410,13 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       // In production (K8s pods), run child processes as the sandbox user.
       // sudo's SUID elevates to root, then drops to sandbox; -E preserves our
       // sanitized env (allowed by SETENV in sudoers).
-      let execCommand = command;
+      // Instrument a PIPELINE so bash reports each stage's status. Only for restricted_bash, and only
+      // when there is a pipeline — see pipeline-status.ts for why nowhere else and what it does not cover.
+      // Applied BEFORE the sudo wrapping so it runs in the inner bash, whose PIPESTATUS we want.
+      const instrumented = hasPipeline(command);
+      let execCommand = instrumented ? instrumentPipeline(command) : command;
       if (isProd) {
-        const escaped = command.replace(/'/g, "'\\''");
+        const escaped = execCommand.replace(/'/g, "'\\''");
         execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
       }
 
@@ -480,18 +485,38 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
         signal?.removeEventListener("abort", onAbort);
 
+        // Strip the sentinel BEFORE anything reads the output: a structural sanitizer parses the whole
+        // payload, so a trailing marker would make every instrumented `-o json` pipeline "not JSON".
+        const okStages = instrumented ? extractPipelineStatus(stdout) : { stdout, statuses: [] };
+        const okStdout = okStages.stdout;
+
+        // Exit 0 does not mean every stage succeeded — it means the LAST one did. This is where
+        // `kubectl get x | jq .` stops being reported as a successful empty result.
+        const okJudgment = classifyExit({
+          command: params.command, exitCode: 0, stdout: okStdout, stderr,
+          context: "local", pipeStatuses: okStages.statuses,
+        });
+        const okNotes = (okJudgment.annotation ? `\n${okJudgment.annotation}` : "")
+          + (tailTruncationNote(params.command, okStdout) ? `\n${tailTruncationNote(params.command, okStdout)}` : "");
         return {
-          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
+          content: [{ type: "text", text: postExecSecurity(okStdout.trim(), pre.action, {
             stderr: stderr.trim() || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
-            // Success can still be a truncated window: exactly --tail=N lines back looks complete.
-            ...(tailTruncationNote(params.command, stdout) ? { notes: `\n${tailTruncationNote(params.command, stdout)}` } : {}),
+            ...(okNotes ? { notes: okNotes } : {}),
           }) }],
-          details: { exitCode: 0, exit_class: "success" },
+          details: {
+            exitCode: 0,
+            exit_class: okJudgment.exitClass,
+            ...(okStages.statuses.length > 1 ? { pipe_statuses: okStages.statuses } : {}),
+            ...(okJudgment.isError && { error: true }),
+          },
         };
       } catch (err: any) {
         const errStderr = err.stderr?.trim() ?? err.message;
-        const errStdout = (err.stdout?.trim() ?? "") as string;
+        const errStages = instrumented
+          ? extractPipelineStatus((err.stdout ?? "") as string)
+          : { stdout: (err.stdout ?? "") as string, statuses: [] };
+        const errStdout = errStages.stdout.trim();
         // In this context the image is ours, so a 127 means the whitelist advertises something the
         // AgentBox does not ship — classifyExit says that instead of advising a workaround.
         const judgment = classifyExit({
@@ -501,6 +526,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           stderr: errStderr,
           signal: err.signal,
           context: "local",
+          pipeStatuses: errStages.statuses,
         });
         return {
           content: [{ type: "text", text: postExecSecurity(errStdout, pre.action, {
@@ -513,6 +539,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           details: {
             exitCode: err.code,
             exit_class: judgment.exitClass,
+            ...(errStages.statuses.length > 1 ? { pipe_statuses: errStages.statuses } : {}),
             ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
             ...(judgment.isError && { error: true }),
           },

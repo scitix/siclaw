@@ -161,3 +161,44 @@ describe("waitForPodDone", () => {
     await expect(promise).rejects.toThrow(/Aborted|Timed out/);
   });
 });
+
+describe("a Pod that is not Running may still hold a running container", () => {
+  // pod_exec-4 (high): the Pod sat at Pending while the named startup-delay init container was already
+  // Running, and exec into it was refused on the POD-level phase. The investigation fell back to
+  // node_exec + CRI + host PIDs for a check that would have worked.
+  const pod = (phase: string, running: string[], init: string[] = []) => JSON.stringify({
+    status: {
+      phase,
+      initContainerStatuses: init.map((name) => ({ name, state: { running: {} } })),
+      containerStatuses: running.map((name) => ({ name, state: { running: {} } })),
+    },
+  });
+
+  it("admits the container the caller named", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", [], ["startup-delay"]) });
+    expect(await checkPodRunning("p", "ns", undefined, undefined, "startup-delay")).toBeNull();
+  });
+
+  it("refuses a container that is not running, and says which are", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", [], ["startup-delay"]) });
+    const err = await checkPodRunning("p", "ns", undefined, undefined, "app");
+    expect(err).toContain("startup-delay");
+    expect(err, "a refusal that names the runnable option").toMatch(/container parameter/);
+  });
+
+  it("still refuses when nothing at all is running", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", []) });
+    const err = await checkPodRunning("p", "ns", undefined, undefined, "app");
+    expect(err).toMatch(/No container/);
+  });
+
+  it("costs nothing on the happy path", async () => {
+    mockExecFile.mockReset();
+    mockExecFile.mockResolvedValueOnce({ stdout: "Running" });
+    expect(await checkPodRunning("p", "ns")).toBeNull();
+    expect(mockExecFile, "one call, not two").toHaveBeenCalledTimes(1);
+  });
+});

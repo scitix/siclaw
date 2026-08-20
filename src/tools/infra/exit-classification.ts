@@ -21,6 +21,7 @@
  */
 
 import { getCommandBinary } from "./command-sets.js";
+import { isExpectedSigpipe, pipelineStages } from "./pipeline-status.js";
 
 export type ExitClass =
   | "success"
@@ -30,6 +31,7 @@ export type ExitClass =
   | "target_reported_failure"
   | "interrupted"
   | "output_truncated"
+  | "pipeline_upstream_failed"
   | "channel_error";
 
 /**
@@ -187,8 +189,85 @@ export function classifyExit(opts: {
    * our image — advice to "use a different command" would send the agent chasing its own tail.
    */
   context?: string;
+  /**
+   * Per-stage statuses from PIPESTATUS, in pipeline order, when the caller could obtain them
+   * (restricted_bash only — see pipeline-status.ts for why nowhere else). Absent means "not known",
+   * never "all fine": the judgment below must degrade to the exit-code-only reading, not assume success.
+   */
+  pipeStatuses?: number[];
 }): ExitJudgment {
-  const { command, exitCode, stdout, stderr = "", signal, context } = opts;
+  const { command, exitCode, stdout, stderr = "", signal, context, pipeStatuses } = opts;
+
+  // ── Per-stage reading, when we have it ───────────────────────────────────
+  // Placed FIRST because it can overturn the exit code in both directions, which is the whole point:
+  // the exit code is the last stage's, and the last stage is often not the one that matters.
+  if (pipeStatuses && pipeStatuses.length > 1) {
+    const stages = pipelineStages(command);
+    const last = pipeStatuses[pipeStatuses.length - 1];
+    const label = (i: number) => `stage ${i + 1}/${pipeStatuses.length}`
+      + (stages[i] ? ` (${stages[i].split(/\s+/)[0]})` : "");
+
+    // (1) An upstream stage failed while the pipeline as a whole reported success. Seven high-severity
+    //     findings are this: `kubectl get x | jq .` where kubectl exits 1 and jq exits 0, reported
+    //     success on an empty result — so the agent reads "nothing found" rather than "the query failed".
+    const upstreamFailures = pipeStatuses
+      .map((code, i) => ({ code, i }))
+      .filter(({ code, i }) => i < pipeStatuses.length - 1 && code !== 0
+        && !isExpectedSigpipe(pipeStatuses, i, stages));
+    if (last === 0 && upstreamFailures.length > 0) {
+      const who = upstreamFailures.map(({ code, i }) => `${label(i)} exited ${code}`).join(", ");
+      return {
+        exitClass: "pipeline_upstream_failed",
+        isError: true,
+        annotation:
+          `[pipeline_upstream_failed: ${who}, while the last stage exited 0 — so the pipeline's exit code `
+          + "says success and the output above is NOT a complete answer. An empty result here means the "
+          + "EARLIER stage failed, not that nothing matched. Fix the failing stage; see STDERR for its "
+          + "error.]",
+      };
+    }
+
+    // (2) SIGPIPE is benign ONLY when it happened UPSTREAM of a stage that stopped reading on purpose.
+    //     `seq … | head -3` is that case: stage 1 gets 141, `head` exits 0, and under `pipefail` the
+    //     shell reports 141 for a command that did exactly what was asked.
+    //
+    //     A 141 on the LAST stage is the opposite and must never be called benign: nothing is downstream
+    //     of it, so no consumer could have closed the pipe — it was killed. Read from a real trace
+    //     (ce1bd949): `kubectl logs --tail=-1 | grep -c '…'` returned exit 141 with `(no output)` after
+    //     83 seconds, while the same shape that completed took 11 seconds and printed `0`. A `grep -c`
+    //     that ran to the end always prints a number, so no output means it never got there. Classifying
+    //     that as success would have told the agent an empty result was the answer — the exact false
+    //     success this whole change set exists to remove. My first version of this rule did that.
+    const expectedSigpipes = pipeStatuses
+      .map((code, i) => ({ code, i }))
+      .filter(({ i }) => i < pipeStatuses.length - 1 && isExpectedSigpipe(pipeStatuses, i, stages));
+    if (last === 0 && expectedSigpipes.length > 0) {
+      const at = label(expectedSigpipes[0].i);
+      return {
+        exitClass: "success",
+        isError: false,
+        annotation:
+          `[pipeline_sigpipe: ${at} was ended by SIGPIPE because a later stage stopped reading — which is `
+          + "how `head` and `grep -q` finish a pipeline normally, not a failure. The output above is what "
+          + "was asked for. (The command's own exit code is 141 only when `pipefail` is set.)]",
+      };
+    }
+
+    // (3) The final stage died on SIGPIPE, or was killed. Nothing downstream of it could have closed the
+    //     pipe, so the read is INCOMPLETE and an empty result proves nothing.
+    if (last === 141) {
+      return {
+        exitClass: "output_truncated",
+        isError: true,
+        annotation:
+          `[output_truncated: ${label(pipeStatuses.length - 1)} was killed by SIGPIPE, and nothing `
+          + "downstream of it could have closed the pipe — so the pipeline was cut short (a timeout, or "
+          + "the writer going away), NOT finished. Output above is incomplete: a count of zero or an empty "
+          + "result here is not evidence of absence. Narrow the read (a shorter --since, one pod instead "
+          + "of a label, a tighter filter) rather than retrying it unchanged.]",
+      };
+    }
+  }
 
   if (exitCode === 0) return { exitClass: "success", isError: false, annotation: "" };
 

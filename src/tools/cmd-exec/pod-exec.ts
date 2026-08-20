@@ -194,6 +194,9 @@ Examples:
       // Check pod exists and is Running
       const podCheckErr = await checkPodRunning(
         pod, namespace, env.childEnv, env.kubeconfigPath ?? undefined,
+        // The container the caller named: a Pod that is not Running may still hold a running one, and
+        // that container is often exactly what the call is for.
+        params.container,
       );
       if (podCheckErr) {
         return {

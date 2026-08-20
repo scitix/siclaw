@@ -2035,3 +2035,41 @@ describe("short-option clusters and empty patterns cannot smuggle a credential o
     allow("grep -ie.");
   });
 });
+
+describe("a bounded server-side selector satisfies the bulk-output rule", () => {
+  // Seven review findings: node-scoped triage needs `-A -o json` narrowed to one node, was refused, and
+  // had to fall back to custom-columns — losing initContainers and extended resources, the fields it
+  // was after. An exact server-side `spec.nodeName` bounds the response to one node's pods, the same
+  // order as `-n <namespace> -o json`, which is already permitted. The rule's own concern is met.
+  const check = (cmd: string) =>
+    checkAllNamespacesRestriction(cmd.split(/\s+/).slice(1), "get");
+
+  it("accepts a selector pinning one node or one object", () => {
+    for (const cmd of [
+      "kubectl get pods -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get pods -A --field-selector=spec.nodeName=node-1 -o json",
+      "kubectl get pods -A --field-selector spec.nodeName=n1,status.phase=Running -o json",
+      "kubectl get pods -A --field-selector metadata.name=mypod -o yaml",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("still refuses anything that can match the whole cluster", () => {
+    for (const cmd of [
+      "kubectl get pods -A -o json",
+      "kubectl get pods -A --field-selector status.phase=Running -o json",
+      "kubectl get pods -A -l app=x -o json",
+      "kubectl get pods -A --field-selector spec.nodeName!=node-1 -o json",   // a negation is not a pin
+      "kubectl get pods -A --field-selector spec.nodeName= -o json",          // empty value pins nothing
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("names the accepted form instead of repeating advice that does not work", () => {
+    const err = check("kubectl get pods -A -o json") ?? "";
+    expect(err).toContain("spec.nodeName");
+    expect(err, "and says why a label selector is not equivalent").toMatch(/label selector|phase filter/);
+  });
+});

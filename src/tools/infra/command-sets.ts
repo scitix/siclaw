@@ -1350,6 +1350,35 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
     + `  kubectl describe secret <name>         (key names and byte counts, no values)`;
 }
 
+/**
+ * Does a field selector pin the result to ONE node or ONE object by name?
+ *
+ * `-A -o json` is refused because serializing every object of a kind is the concern. A server-side
+ * `--field-selector spec.nodeName=<exact>` removes that concern rather than papering over it: the
+ * apiserver returns one node's pods, which is the same order of magnitude as `-n <namespace> -o json`
+ * — already permitted. Seven separate review findings hit this, all of them node-scoped triage that
+ * then had to fall back to custom-columns and lose the nested fields it needed.
+ *
+ * Narrow on purpose. `status.phase=Running` across all namespaces is NOT bounded and stays refused, and
+ * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
+ * selector names a single node or a single object", nothing looser.
+ */
+function hasBoundingFieldSelector(args: string[]): boolean {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--field-selector" && args[i + 1]) values.push(args[i + 1]);
+    else if (a.startsWith("--field-selector=")) values.push(a.slice("--field-selector=".length));
+  }
+  for (const raw of values) {
+    for (const term of raw.split(",")) {
+      const m = /^\s*(spec\.nodeName|metadata\.name)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
+      if (m && m[2].trim().length > 0) return true;
+    }
+  }
+  return false;
+}
+
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
   const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
   if (!hasAllNs) return null;
@@ -1376,6 +1405,9 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
   if (subcommand === "get") {
     const format = getKubectlOutputFormat(args);
     if (format === "yaml" || format === "json") {
+      // An exact server-side node or name selector bounds the response, which is the concern this rule
+      // exists for — so the rule is satisfied rather than waived.
+      if (hasBoundingFieldSelector(args)) return null;
       // A refusal that names no runnable alternative gets retried in another shape and refused again.
       // The resource is echoed back so the suggestion is copy-pasteable rather than a template.
       const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";
@@ -1389,8 +1421,10 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
         + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
-        + `server-side --field-selector DOES narrow what the apiserver serializes, but this check does `
-        + `not yet distinguish the two — stated plainly rather than claiming no selector can help. Instead:\n`
+        + `server-side --field-selector that pins spec.nodeName or metadata.name to ONE exact value IS `
+        + `accepted, because it bounds what the apiserver serializes. A label selector or a phase filter `
+        + `is not — those can still match the whole cluster. Instead:\n`
+        + `  kubectl get ${resource} -A --field-selector spec.nodeName=<node> -o json   (accepted)\n`
         + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`
         + `   (add the fields you need — these two exist on every resource)\n`
         + `  kubectl get ${resource} -A -o wide                     (a fixed, bounded set of columns)\n`

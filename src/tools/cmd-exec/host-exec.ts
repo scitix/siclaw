@@ -190,7 +190,7 @@ Examples (pass the id from host_list; names shown here for readability):
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node in a cluster this agent is BOUND to, node_exec reaches it without SSH — check with cluster_list first, because that fallback does not exist for an unbound cluster and two reviews reported being sent to it anyway.` }],
           // Same class as the sshExec failure below: the channel never opened, so this is not the
           // host's answer. The text already said so; details did not, which left the UI and the
           // channel outcome unable to tell it from a command that failed.
@@ -294,7 +294,7 @@ Examples (pass the id from host_list; names shown here for readability):
         }
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node in a cluster this agent is BOUND to, node_exec reaches it without SSH — check with cluster_list first, because that fallback does not exist for an unbound cluster and two reviews reported being sent to it anyway.` }],
           details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", channel_leg: "transport", host: params.host },
         };
       } finally {
