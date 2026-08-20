@@ -15,6 +15,7 @@ import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { signToken } from "./auth.js";
 import { registerSiclawRoutes, sqlDayKey } from "./siclaw-api.js";
+import { DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 const JWT_SECRET = "test-siclaw-misc";
@@ -377,6 +378,139 @@ describe("siclaw-api misc routes", () => {
         body: { name: "openai" },
       }));
       expect(status).toBe(401);
+    });
+  });
+
+  // ── max_tokens default, at the route level ───────────────
+  //
+  // The Portal helper test proves the FORM omits a blank max_tokens and the
+  // migration test proves the COLUMN default; neither shows what a write path
+  // actually persists when the field is absent. That gap is how 65536 survived:
+  // the constant was correct in three writers while the value reaching the DB
+  // came from elsewhere. These assert the bound parameter itself.
+  describe("model write paths default max_tokens", () => {
+    const providerRow = [[{ id: "p1", api_type: "anthropic-messages" }], []];
+    // Column order of the create INSERT — the assertion has to name the position
+    // it means, or it silently follows a column being added ahead of it.
+    const CREATE_MAX_TOKENS_IDX = 7;
+
+    it("POST .../models persists the constant when max_tokens is absent", async () => {
+      query.mockResolvedValueOnce(providerRow);              // provider lookup
+      query.mockResolvedValueOnce([[], []]);                 // INSERT
+      query.mockResolvedValueOnce([[{ id: "new" }], []]);    // read-back of the row
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models",
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { model_id: "claude-haiku-4-5", api_type: "anthropic-messages" },
+      }));
+      expect(status).toBe(201);
+      const insert = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO model_entries"));
+      expect(insert).toBeDefined();
+      expect(insert![1][CREATE_MAX_TOKENS_IDX]).toBe(DEFAULT_MAX_TOKENS);
+      expect(DEFAULT_MAX_TOKENS).toBeLessThan(64000);
+    });
+
+    it("POST .../models keeps an explicit max_tokens", async () => {
+      query.mockResolvedValueOnce(providerRow);
+      query.mockResolvedValueOnce([[], []]);
+      query.mockResolvedValueOnce([[{ id: "new" }], []]);
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models",
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { model_id: "m", api_type: "anthropic-messages", max_tokens: 64000 },
+      }));
+      expect(status).toBe(201);
+      const insert = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO model_entries"));
+      expect(insert![1][CREATE_MAX_TOKENS_IDX]).toBe(64000);
+    });
+
+    // The form sends parseInt("") = NaN for a cleared box, which arrives as null.
+    // On a NOT NULL column that has to become the default, not the null.
+    it("PUT .../models/:mid turns a cleared max_tokens into the constant", async () => {
+      query.mockResolvedValueOnce([[{ id: "m1" }], []]);  // existing entry lookup
+      query.mockResolvedValueOnce([[], []]);              // UPDATE
+      query.mockResolvedValueOnce([[{ id: "m1" }], []]);  // read-back of the row
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models/m1",
+        method: "PUT",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { max_tokens: null },
+      }));
+      expect(status).toBe(200);
+      const update = query.mock.calls.find((c) => String(c[0]).includes("UPDATE model_entries"));
+      expect(update).toBeDefined();
+      expect(String(update![0])).toContain("max_tokens = ?");
+      expect(update![1][0]).toBe(DEFAULT_MAX_TOKENS);
+    });
+
+    // The write path is the one moment an operator typo can still be reported to
+    // the person who made it — the read path deliberately ignores what it does
+    // not recognise, so an unknown key stored here would just be silently inert.
+    it("rejects a compat_overrides key that is not in the whitelist", async () => {
+      query.mockResolvedValueOnce(providerRow);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models",
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { model_id: "m", api_type: "anthropic-messages", compat_overrides: { somethingNew: true } },
+      }));
+      expect(status).toBe(400);
+      expect(String(body.error)).toContain("forceAdaptiveThinking");
+      expect(query.mock.calls.some((c) => String(c[0]).includes("INSERT INTO model_entries"))).toBe(false);
+    });
+
+    it("stores a whitelisted compat override and folds an empty one to NULL", async () => {
+      query.mockResolvedValueOnce(providerRow);
+      query.mockResolvedValueOnce([[], []]);
+      query.mockResolvedValueOnce([[{ id: "new" }], []]);
+      await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models",
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { model_id: "m", api_type: "anthropic-messages", compat_overrides: { forceAdaptiveThinking: false } },
+      }));
+      const insert = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO model_entries"));
+      expect(insert![1][10]).toBe('{"forceAdaptiveThinking":false}');
+
+      query.mockClear();
+      query.mockResolvedValueOnce(providerRow);
+      query.mockResolvedValueOnce([[], []]);
+      query.mockResolvedValueOnce([[{ id: "new2" }], []]);
+      await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models",
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { model_id: "m2", api_type: "anthropic-messages", compat_overrides: {} },
+      }));
+      const insert2 = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO model_entries"));
+      // NULL, not "{}" — back to automatic resolution.
+      expect(insert2![1][10]).toBeNull();
+    });
+
+    it("batch import persists the constant for a listing that carried no max_tokens", async () => {
+      const connQuery = vi.fn().mockResolvedValue([{ affectedRows: 1 }, []]);
+      (getDb as any).mockReturnValue({
+        query,
+        getConnection: vi.fn().mockResolvedValue({
+          query: connQuery,
+          beginTransaction: vi.fn(), commit: vi.fn(), rollback: vi.fn(), release: vi.fn(),
+        }),
+      });
+      query.mockResolvedValueOnce(providerRow);
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/admin/models/providers/p1/models/batch",
+        method: "POST",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: { models: [{ model_id: "claude-opus-4-5" }] },
+      }));
+      expect(status).toBe(200);
+      const insert = connQuery.mock.calls.find((c) => String(c[0]).includes("INTO model_entries"));
+      expect(insert).toBeDefined();
+      // Batch INSERT has no max_tokens_field column, so the position differs from
+      // the create path — another reason to assert an index, not a value anywhere.
+      expect(insert![1][7]).toBe(DEFAULT_MAX_TOKENS);
     });
   });
 

@@ -302,7 +302,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE api_key IS NOT NULL AND api_key != '' ORDER BY sort_order, name",
     );
     const [models] = await db.query<ModelRow[]>(
-      "SELECT provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",
+      "SELECT provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, compat_overrides, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",
     );
     // MCP: scoped to agent via agent_mcp_servers when active, else all enabled.
     const [mcps] = activeAgentId

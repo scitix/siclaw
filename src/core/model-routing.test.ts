@@ -392,6 +392,72 @@ describe("model-routing policy", () => {
   });
 });
 
+describe("event-capture handoff", () => {
+  /**
+   * The invariant, rather than a timing accident: the runner must hand delivery
+   * back BEFORE it drops its subscription. Reversed, there is a window in which
+   * neither the runner nor the caller's live subscription is listening — and the
+   * caller cannot close it from the outside, because it only regains control a
+   * microtask later, in `.then`. What falls in is `auto_compaction_end`, the only
+   * event that clears a frontend's compacting state.
+   */
+  function brainRecordingOrder(order: string[]) {
+    const emitter = new EventEmitter();
+    return {
+      emitter,
+      subscribe: (listener: (event: unknown) => void) => {
+        emitter.on("event", listener);
+        return () => { order.push("unsubscribe"); emitter.off("event", listener); };
+      },
+      prompt: vi.fn(async () => {
+        emitter.emit("event", {
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+        });
+      }),
+      getModel: () => ({ provider: "openai", id: "gpt-4", name: "GPT-4", contextWindow: 1000, maxTokens: 100, reasoning: false }),
+      findModel: () => ({ provider: "openai", id: "gpt-4", name: "GPT-4", contextWindow: 1000, maxTokens: 100, reasoning: false }),
+      setModel: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
+    } as any;
+  }
+
+  it("gives delivery back before unsubscribing, on every attempt", async () => {
+    const order: string[] = [];
+    const brain = brainRecordingOrder(order);
+    await runPromptWithModelRouting(
+      brain,
+      "hi",
+      { enabled: true, strategy: "ordered_fallback", candidates: [{ provider: "openai", modelId: "gpt-4" }] },
+      createModelRouteState(),
+      { onEventCaptureChange: (capturing) => order.push(capturing ? "capture:on" : "capture:off") },
+    );
+    // capture:on must precede the subscription's life, and capture:off must come
+    // BEFORE unsubscribe — adjacent statements, so nothing can land between them.
+    expect(order).toEqual(["capture:on", "capture:off", "unsubscribe"]);
+  });
+
+  // A setup failure never captured, so there is nothing for the attempt to give
+  // back — but the CALLER diverted delivery before the run started, so an exit
+  // that stays quiet leaves it diverted across the next microtask. Narrow and
+  // real: a primary that ran a prompt can still be compacting while a fallback
+  // candidate fails setup.
+  it("hands delivery back even when the attempt fails before it captures", async () => {
+    const order: string[] = [];
+    const brain = brainRecordingOrder(order);
+    brain.findModel = () => undefined;
+    const result = await runPromptWithModelRouting(
+      brain,
+      "hi",
+      { enabled: true, strategy: "ordered_fallback", candidates: [{ provider: "openai", modelId: "gone" }] },
+      createModelRouteState(),
+      { onEventCaptureChange: (capturing) => order.push(capturing ? "capture:on" : "capture:off") },
+    );
+    expect(result.exhausted).toBe(true);
+    expect(order).toEqual(["capture:off"]);
+  });
+});
+
 describe("resolveEffectivePolicy (single routing entry)", () => {
   const multi: ModelRoutePolicy = {
     enabled: true,
@@ -423,6 +489,68 @@ describe("resolveEffectivePolicy (single routing entry)", () => {
 
   it("returns undefined when there is no current model (runner falls back to a bare prompt)", () => {
     expect(resolveEffectivePolicy(undefined, createModelRouteState(), undefined)).toBeUndefined();
+  });
+
+  // The binding carries its own modelConfig so that registering it — and deciding
+  // what a refusal or a missing model means — happens per candidate inside
+  // runAttempt. A caller that resolves the binding itself can only ever register
+  // the primary's config, and has to invent that decision above the policy.
+  it("prefers this turn's binding over the current model, config included", () => {
+    const binding = {
+      provider: "sicore-custom-x",
+      modelId: "claude-fable-5",
+      modelConfig: { baseUrl: "https://x/v1", apiKey: "sk", api: "anthropic-messages" },
+    };
+    expect(resolveEffectivePolicy(undefined, createModelRouteState(), currentModel, binding)).toEqual({
+      enabled: true,
+      strategy: "ordered_fallback",
+      candidates: [binding],
+    });
+  });
+
+  it("routes on the binding even with no current model to fall back to", () => {
+    const binding = { provider: "p", modelId: "m", modelConfig: { baseUrl: "u" } };
+    expect(resolveEffectivePolicy(undefined, createModelRouteState(), undefined, binding)?.candidates)
+      .toEqual([binding]);
+  });
+
+  // The fallback chain must survive — but candidate.modelConfig is OPTIONAL while
+  // the top-level modelConfig is the documented registration config for the turn,
+  // so a policy naming identities only is valid here. Returning it untouched left
+  // the primary's provider unregistered and the candidate skipped as
+  // model_not_found. Both control planes in tree hydrate every candidate, which is
+  // why this is invisible from their side.
+  it("gives the bound candidate the binding's config without disturbing the chain", () => {
+    const binding = { provider: "openai", modelId: "gpt-4", modelConfig: { baseUrl: "u", apiKey: "sk" } };
+    const eff = resolveEffectivePolicy(multi, createModelRouteState(), currentModel, binding);
+    expect(eff?.candidates).toEqual([
+      { provider: "openai", modelId: "gpt-4", label: undefined, modelConfig: binding.modelConfig },
+      { provider: "anthropic", modelId: "claude", label: undefined, modelConfig: undefined },
+    ]);
+  });
+
+  it("never overwrites a candidate's own config, and never lends it to another provider", () => {
+    const hydrated: ModelRoutePolicy = {
+      enabled: true,
+      strategy: "ordered_fallback",
+      candidates: [
+        { provider: "openai", modelId: "gpt-4", modelConfig: { baseUrl: "own" } },
+        { provider: "anthropic", modelId: "claude" },
+      ],
+    };
+    const binding = { provider: "openai", modelId: "gpt-4", modelConfig: { baseUrl: "from-binding" } };
+    const eff = resolveEffectivePolicy(hydrated, createModelRouteState(), currentModel, binding);
+    // Own config wins (more specific), and the anthropic candidate stays bare —
+    // handing it the primary's config would register the wrong provider.
+    expect(eff?.candidates?.[0].modelConfig).toEqual({ baseUrl: "own" });
+    expect(eff?.candidates?.[1].modelConfig).toBeUndefined();
+    // Nothing changed, so the policy object itself is passed straight through.
+    expect(eff).toBe(hydrated);
+  });
+
+  it("passes a policy through untouched when the binding carries no config", () => {
+    const binding = { provider: "openai", modelId: "gpt-4" };
+    expect(resolveEffectivePolicy(multi, createModelRouteState(), currentModel, binding)).toBe(multi);
   });
 });
 

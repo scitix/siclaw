@@ -21,6 +21,15 @@ export interface ProviderModelCompat {
   supportsToolUse?: boolean;
   maxTokensField?: string;
   thinkingFormat?: string;
+  /**
+   * Anthropic protocol only. Send `thinking: {type:"adaptive"}` +
+   * `output_config.effort` instead of the legacy `{type:"enabled",
+   * budget_tokens}`. Claude 4.6+ and the 5 family REJECT the legacy shape with a
+   * 400, so this is a property of the model's API contract, not of the endpoint.
+   */
+  forceAdaptiveThinking?: boolean;
+  /** Anthropic protocol only. Claude Opus 4.7+ rejects a non-default temperature. */
+  supportsTemperature?: boolean;
 }
 
 export interface ProviderModelConfig {

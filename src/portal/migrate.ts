@@ -15,7 +15,8 @@
  */
 
 import { getDb } from "../gateway/db.js";
-import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull } from "./migrate-compat.js";
+import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull, setColumnDefault } from "./migrate-compat.js";
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 import type { Db } from "../gateway/db.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
@@ -405,6 +406,18 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
 
+  // context_window / max_tokens: the column defaults are INTERPOLATED from
+  // DEFAULT_CONTEXT_WINDOW / DEFAULT_MAX_TOKENS (core/model-compat.ts), which
+  // mirror what pi applies to a model definition of its own. Interpolated rather
+  // than written out, because a hand-copied number here is a second answer to the
+  // same question and the one it gave (65536) was above the ceiling of the Claude
+  // models in use. Fresh installs get it from this DDL; existing databases are
+  // corrected by the setColumnDefault call below (MySQL).
+  //
+  // A default only governs an INSERT that omits the column; rows already storing
+  // 65536 keep it, so an affected model needs its max_tokens corrected rather
+  // than a redeploy. No migration is attempted here: a stored value can be a
+  // deliberate operator choice, and this cannot tell the two apart.
   `CREATE TABLE IF NOT EXISTS model_entries (
     id CHAR(36) PRIMARY KEY,
     provider_id CHAR(36) NOT NULL,
@@ -412,10 +425,11 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     name VARCHAR(255),
     reasoning TINYINT(1) NOT NULL DEFAULT 0,
     vision TINYINT(1) NOT NULL DEFAULT 0,
-    context_window INT NOT NULL DEFAULT 128000,
-    max_tokens INT NOT NULL DEFAULT 65536,
+    context_window INT NOT NULL DEFAULT ${DEFAULT_CONTEXT_WINDOW},
+    max_tokens INT NOT NULL DEFAULT ${DEFAULT_MAX_TOKENS},
     api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
     max_tokens_field VARCHAR(32) DEFAULT NULL,
+    compat_overrides TEXT DEFAULT NULL,
     is_default TINYINT(1) NOT NULL DEFAULT 0,
     sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -662,6 +676,26 @@ export async function runPortalMigrations(): Promise<void> {
   // on purpose: unlike the wire protocol, there is a sane automatic answer, so
   // "unanswered" is a meaningful state rather than a hole to backfill.
   await safeAlterTable(db, "model_entries", "max_tokens_field", "VARCHAR(32) DEFAULT NULL");
+  // Per-model wire-compat overrides (JSON text, whitelisted keys). Nullable and
+  // normally NULL: the resolver answers from pi's own table or a generation rule,
+  // and this exists for the id neither reads correctly. TEXT rather than a column
+  // per key — this boundary has already grown `api_type`, `max_tokens_field` and
+  // now two thinking keys, each time as a separate schema change.
+  await safeAlterTable(db, "model_entries", "compat_overrides", "TEXT DEFAULT NULL");
+  // An upgraded database still carries the old 65536 column default — CREATE TABLE
+  // IF NOT EXISTS skips an existing table, and the value was above the ceiling of
+  // Claude models in use. Unlike the stored ROWS (left alone: 65536 can be a
+  // deliberate choice for a model whose ceiling really is that high, and nothing
+  // here can tell that from an unlucky default), the column default is
+  // unambiguous — nobody chose it per model — so it is corrected on its own.
+  // The same helper covers context_window if that constant ever moves.
+  await setColumnDefault(
+    db,
+    "model_entries",
+    "max_tokens",
+    `INT NOT NULL DEFAULT ${DEFAULT_MAX_TOKENS}`,
+    String(DEFAULT_MAX_TOKENS),
+  );
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");

@@ -1,3 +1,4 @@
+import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import type { ProviderModelCompat } from "./config.js";
 
 export interface ProviderCompatInput {
@@ -17,6 +18,12 @@ export interface ProviderModelRow {
   api_type?: string | null;
   /** Explicit `maxTokensField` override; NULL/empty = infer. */
   max_tokens_field?: string | null;
+  /**
+   * Per-model compat overrides as JSON text; NULL = resolve automatically.
+   * The escape hatch for a model whose id neither pi's table nor the generation
+   * rule reads correctly — see `resolveAnthropicCompat`.
+   */
+  compat_overrides?: string | null;
 }
 
 /**
@@ -30,6 +37,8 @@ export interface ProviderModelRow {
 export interface ModelCompatInput {
   id: string;
   maxTokensField?: string | null;
+  /** Persisted per-model compat overrides (JSON text or object); highest priority. */
+  compatOverrides?: unknown;
 }
 
 /** The two field names pi can emit — see MaxTokensField below. */
@@ -83,7 +92,11 @@ export function resolveMaxTokensField(
 
 /** Build the model half of a compat input from a raw `model_entries` row. */
 export function modelCompatInputFromRow(row: ProviderModelRow): ModelCompatInput {
-  return { id: row.model_id, maxTokensField: row.max_tokens_field };
+  return {
+    id: row.model_id,
+    maxTokensField: row.max_tokens_field,
+    compatOverrides: row.compat_overrides,
+  };
 }
 
 /**
@@ -113,6 +126,265 @@ export function normalizeProviderApi(api: string | null | undefined): string {
   const raw = (api ?? "").trim();
   if (!raw) return "openai-completions";
   return LEGACY_API_ALIASES[raw.toLowerCase()] ?? raw;
+}
+
+/**
+ * What to store in `model_entries.max_tokens` when nobody supplied a real value
+ * — neither the operator nor the provider's own `/models` listing.
+ *
+ * The previous default, 65536, is above the real ceiling of models that are in
+ * use: pi's own Anthropic table puts claude-haiku-4-5, claude-opus-4-5 and
+ * claude-sonnet-4-5 at 64000. On the Claude protocol pi sends this value
+ * verbatim as `max_tokens`, and Anthropic rejects a request that exceeds the
+ * model's ceiling rather than clamping it — so the default that is meant to keep
+ * a request valid was what made it invalid.
+ *
+ * This is pi's own number, deliberately: when pi builds a model from a config
+ * file it applies `modelDef.maxTokens ?? 16384` (and `contextWindow ?? 128000`,
+ * which is where this table's context_window default already comes from). Its
+ * dynamic `registerProvider` path — the one every Portal-managed provider takes
+ * — passes the field through without that default, which is separately how an
+ * absent value reaches the Claude protocol as no `max_tokens` at all.
+ *
+ * Matching the number rather than picking our own means an unset field behaves
+ * exactly as it would have on pi's other path, and there is one value to keep in
+ * sync instead of a per-protocol table of our own invention. The cost is real
+ * and accepted: a model whose true ceiling is 128000 is held to 16384 until
+ * someone fills the field in — a truncated answer, not a failed turn.
+ *
+ * A real value always beats this, so writers should read the provider listing
+ * first (see `provider-model-listing.ts`) and reach for this only as the floor.
+ */
+export const DEFAULT_MAX_TOKENS = 16384;
+export const DEFAULT_CONTEXT_WINDOW = 128000;
+
+// ── Anthropic-protocol compat ────────────────────────────────────────────────
+
+/**
+ * The compat keys we resolve for the Anthropic protocol.
+ *
+ * A WHITELIST at both ends. Reading: an override naming anything else is
+ * ignored, so a typo cannot reach pi. Writing: only these are emitted, so this
+ * never becomes a passthrough for whatever a control plane invents.
+ */
+export const ANTHROPIC_COMPAT_KEYS = ["forceAdaptiveThinking", "supportsTemperature"] as const;
+export type AnthropicCompatKey = (typeof ANTHROPIC_COMPAT_KEYS)[number];
+export type AnthropicCompat = Partial<Record<AnthropicCompatKey, boolean>>;
+
+/**
+ * What to assume for a model id pi's bundled table does not know.
+ *
+ * **Deliberately the opposite of pi's own defaults** (`forceAdaptiveThinking`
+ * false, `supportsTemperature` true). pi's defaults are the backward-compatible
+ * choice for a hand-written config file that may predate any of this; what
+ * arrives here is a LIVE model id a control plane just bound, and the two
+ * populations fail in opposite directions:
+ *
+ *   - pi's table is a release snapshot, so it necessarily lags the API. The lag
+ *     window is exactly when a model is newly launched — the moment an operator
+ *     is most likely to add it. Defaulting to the legacy shape there fails on
+ *     day one, which is what produced the `claude-opus-5` 400: pi 0.80.7 knows
+ *     14 claude ids and that is not one of them.
+ *   - the set of models REQUIRING adaptive is open and growing; the set that
+ *     only accepts the legacy shape is closed and shrinking.
+ *
+ * The residual risk is the inverse: a pre-4.6 model renamed by an aggregator so
+ * neither the table nor the generation rule below recognises it would be sent
+ * adaptive and 400 the other way. That is what `compat_overrides` is for — and
+ * why this is a default, not a hardcoded answer.
+ */
+const LATEST_ANTHROPIC_COMPAT: Required<AnthropicCompat> = {
+  forceAdaptiveThinking: true,
+  supportsTemperature: false,
+};
+
+/** Explicit legacy shape, for an id whose generation is known to predate 4.6. */
+const LEGACY_ANTHROPIC_COMPAT: Required<AnthropicCompat> = {
+  forceAdaptiveThinking: false,
+  supportsTemperature: true,
+};
+
+/** First Claude generation whose API requires adaptive thinking. */
+const ADAPTIVE_THINKING_SINCE = { major: 4, minor: 6 };
+
+/** Strip an aggregator's `vendor/` namespace, as `looksLikeOpenAiReasoningModel` does. */
+function bareModelId(modelId: string): string {
+  const id = modelId.trim().toLowerCase();
+  const slash = id.lastIndexOf("/");
+  return slash >= 0 ? id.slice(slash + 1) : id;
+}
+
+/**
+ * pi's own answer for this model, if its bundled table has one — the authority,
+ * and the reason this is a lookup rather than a table of ours. Also covers the
+ * legacy models whose entry has NO compat at all: absent means pi's defaults,
+ * which for them are correct, so a miss here is not the same as "unknown".
+ */
+export function builtinAnthropicCompat(modelId: string): AnthropicCompat | undefined {
+  const table = ANTHROPIC_MODELS as Record<string, { compat?: Record<string, unknown> } | undefined>;
+  const entry = table[modelId.trim()] ?? table[bareModelId(modelId)];
+  if (!entry) return undefined;
+  return pickAnthropicCompat(entry.compat ?? {});
+}
+
+/**
+ * Whether an id names a Claude generation older than adaptive thinking.
+ *
+ * A generation RULE, not a model list: `claude-sonnet-4-5` and
+ * `claude-3-7-sonnet` are legacy, `claude-opus-4-6` and `claude-opus-5` are not,
+ * and nothing has to be added here when a new model ships. That is the whole
+ * point — mirroring pi's per-model table is what we are avoiding.
+ *
+ * Only a CONFIDENT read counts. An id with no recognisable generation returns
+ * false and takes the latest-generation default, because "I cannot tell" must
+ * not be answered with "then assume the shape that is being retired".
+ */
+export function looksLikeLegacyAnthropicThinking(modelId: string): boolean {
+  const id = bareModelId(modelId);
+  if (!id.includes("claude")) return false;
+  // claude-2, claude-instant-*: unambiguously pre-adaptive.
+  if (/(^|[^0-9])claude-(2|instant)([^0-9]|$)/.test(id)) return true;
+  // Generation digits, either order: claude-3-7-sonnet / claude-sonnet-4-5.
+  const match = /claude-(?:[a-z]+-)?(\d+)(?:-(\d+))?/.exec(id);
+  if (!match) return false;
+  const major = Number(match[1]);
+  if (!Number.isFinite(major)) return false;
+  if (major !== ADAPTIVE_THINKING_SINCE.major) return major < ADAPTIVE_THINKING_SINCE.major;
+  // Same major: a MISSING minor means .0, not "unknown". `claude-opus-4` and
+  // `claude-sonnet-4` are real ids, are pre-adaptive, and are absent from pi's
+  // 0.80.7 table — reading them as the current generation would force adaptive
+  // and 400 them in the opposite direction.
+  const minor = match[2] === undefined ? 0 : Number(match[2]);
+  if (!Number.isFinite(minor)) return false;
+  return minor < ADAPTIVE_THINKING_SINCE.minor;
+}
+
+function pickAnthropicCompat(source: Record<string, unknown>): AnthropicCompat {
+  const out: AnthropicCompat = {};
+  for (const key of ANTHROPIC_COMPAT_KEYS) {
+    if (typeof source[key] === "boolean") out[key] = source[key] as boolean;
+  }
+  return out;
+}
+
+/**
+ * Parse a persisted `compat_overrides` value. Unknown keys and non-booleans are
+ * dropped rather than rejected: this is a read path, and a value written by a
+ * newer build must not take a model out of service here.
+ */
+export function parseAnthropicCompatOverrides(raw: unknown): AnthropicCompat {
+  if (raw === null || raw === undefined || raw === "") return {};
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try { value = JSON.parse(raw); } catch { return {}; }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return pickAnthropicCompat(value as Record<string, unknown>);
+}
+
+/**
+ * Whether an id names a CLAUDE model at all.
+ *
+ * The generation defaults below describe Claude's API contract and nothing else,
+ * but `anthropic-messages` is a protocol other vendors implement — MiniMax,
+ * Z.ai, and any Anthropic-compatible gateway serve their own models over it.
+ * Handing one of those the newest Claude shape is not a cautious guess, it is a
+ * guess about a different product, and `thinking:{type:"adaptive"}` is exactly
+ * the kind of thing such an endpoint would reject.
+ *
+ * So "unknown id" splits in two: an unrecognised CLAUDE id gets the
+ * latest-generation default (the reasoning in LATEST_ANTHROPIC_COMPAT holds), an
+ * id that is not Claude at all gets NOTHING and keeps pi's defaults. A Claude
+ * model renamed past recognition therefore needs an explicit override — the
+ * honest answer, since at that point it is indistinguishable from a MiniMax id.
+ */
+function looksLikeClaudeModel(modelId: string): boolean {
+  return bareModelId(modelId).includes("claude");
+}
+
+/**
+ * Resolve the Anthropic-protocol compat for one model, in priority order:
+ *
+ *   1. the operator's per-model override — always wins, and is the documented
+ *      way to opt out (pi's own docstring: "Set to `false` to opt out");
+ *   2. pi's bundled table — authoritative where it has an answer;
+ *   3. for a Claude id only: a generation rule, then the latest generation.
+ *
+ * Returns a PARTIAL: an id that is not Claude and not in pi's table resolves to
+ * nothing at all, which leaves pi's own defaults in place. Only keys not
+ * answered by a higher priority fall through, so an override of one key does not
+ * discard pi's answer for the other.
+ */
+export function resolveAnthropicCompat(modelId: string, overrides?: unknown): AnthropicCompat {
+  const explicit = parseAnthropicCompatOverrides(overrides);
+  const builtin = builtinAnthropicCompat(modelId);
+  if (builtin) return { ...LEGACY_ANTHROPIC_COMPAT, ...builtin, ...explicit };
+  if (!looksLikeClaudeModel(modelId)) return explicit;
+  const base = looksLikeLegacyAnthropicThinking(modelId)
+    ? LEGACY_ANTHROPIC_COMPAT
+    : LATEST_ANTHROPIC_COMPAT;
+  return { ...base, ...explicit };
+}
+
+function usesAnthropicMessages(provider: ProviderCompatInput): boolean {
+  return normalizeProviderApi(provider.api) === "anthropic-messages";
+}
+
+/**
+ * Fill in the Anthropic compat keys a provider CONFIG left unstated, per model.
+ *
+ * `buildProviderModelDescriptor` only covers configs this repo assembles from
+ * `model_entries`. A control plane that answers `config.getModelBinding` itself
+ * supplies the whole `modelConfig` — compat included — and the runtime forwards
+ * it verbatim, so none of that function runs on the path most production traffic
+ * takes. That is not a hypothetical split: it is why the same
+ * `"thinking.type.enabled" is not supported` 400 survived being "fixed" in the
+ * descriptor, and why `maxTokensField` had to be fixed twice, once on each side.
+ *
+ * So the resolution happens again HERE, at the last point both paths share
+ * before pi is handed the config. Only keys the config does not state are
+ * filled: an explicit value — including `false` — is the caller's decision and
+ * always wins, which is exactly what pi's own docstring documents `false` for.
+ *
+ * Returns a copy; the caller's object belongs to the control plane and is not
+ * ours to mutate.
+ */
+export function withResolvedModelCompat<T>(config: T): T {
+  if (!config || typeof config !== "object") return config;
+  const cfg = config as unknown as Record<string, unknown>;
+  const models = cfg.models;
+  if (!Array.isArray(models)) return config;
+  const providerApi = typeof cfg.api === "string" ? cfg.api : undefined;
+  let changed = false;
+  const nextModels = models.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+    const model = entry as Record<string, unknown>;
+    const id = typeof model.id === "string" ? model.id : "";
+    if (!id) return entry;
+    const api = normalizeProviderApi(typeof model.api === "string" ? model.api : providerApi);
+    if (api !== "anthropic-messages") return entry;
+    const stated = (model.compat && typeof model.compat === "object" && !Array.isArray(model.compat)
+      ? model.compat
+      : {}) as Record<string, unknown>;
+    const resolved = resolveAnthropicCompat(id);
+    const merged: Record<string, unknown> = { ...stated };
+    let touched = false;
+    for (const key of ANTHROPIC_COMPAT_KEYS) {
+      if (typeof stated[key] === "boolean") continue;
+      // Only keys the resolver actually ANSWERED. It returns nothing for a model
+      // that is not Claude, and writing `undefined` there would still add the
+      // key — enough for `modelNeedsRebind` to see a change and, worse, to look
+      // like a decision we never made.
+      if (resolved[key] === undefined) continue;
+      merged[key] = resolved[key];
+      touched = true;
+    }
+    if (!touched) return entry;
+    changed = true;
+    return { ...model, compat: merged };
+  });
+  if (!changed) return config;
+  return { ...cfg, models: nextModels } as unknown as T;
 }
 
 /**
@@ -153,7 +425,7 @@ export function defaultProviderModelCompat(
   model: ModelCompatInput,
 ): Required<
   Pick<ProviderModelCompat, "supportsDeveloperRole" | "supportsUsageInStreaming" | "maxTokensField">
-> {
+> & AnthropicCompat {
   return {
     supportsDeveloperRole: usesChatCompletions(provider) && isOfficialOpenAIBaseUrl(provider.baseUrl),
     supportsUsageInStreaming: true,
@@ -161,6 +433,10 @@ export function defaultProviderModelCompat(
     // own base-URL heuristic, and this value is precisely what we mean to state
     // explicitly.
     maxTokensField: resolveMaxTokensField(model, provider),
+    // Protocol-scoped: pi reads both of these ONLY on the anthropic-messages
+    // path, so emitting them elsewhere is noise that also invites the wrong
+    // question of them ("does this OpenAI model support temperature?").
+    ...(usesAnthropicMessages(provider) ? resolveAnthropicCompat(model.id, model.compatOverrides) : {}),
   };
 }
 

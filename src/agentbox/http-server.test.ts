@@ -118,8 +118,29 @@ function makeFakeBrain() {
     { id: "deepseek-chat", provider: "deepseek", name: "DeepSeek", contextWindow: 64000, maxTokens: 4096, reasoning: false },
   ];
   let currentModel = models[0];
+  // Thinking-level state modelled on pi 0.80.7 (agent-session.js: setThinkingLevel
+  // ~1253, setModel ~1176, _getThinkingLevelForModelSwitch ~1302), because the
+  // ORDER of setModel vs applyModelParams only matters through these semantics:
+  //  - setThinkingLevel CLAMPS to the current model (non-reasoning → "off");
+  //  - a clamp to "off" on a non-reasoning model is NOT persisted as the default;
+  //  - setModel restores from that persisted default when the OLD model could not
+  //    think, then re-clamps against the new one.
+  // Together they mean an effort applied BEFORE a non-reasoning → reasoning switch
+  // is discarded. A fake that just records the last call cannot see that, which is
+  // why this models the behaviour instead. If pi changes these, this fake is what
+  // has to be revisited.
+  let thinkingLevel = "medium";
+  let persistedDefaultLevel = "medium";
+  const supportsThinking = () => !!currentModel.reasoning;
+  const setThinkingLevel = (level: string) => {
+    const effective = supportsThinking() ? level : "off";
+    const changed = effective !== thinkingLevel;
+    thinkingLevel = effective;
+    if (changed && (supportsThinking() || effective !== "off")) persistedDefaultLevel = effective;
+  };
   return {
     emitter,
+    getThinkingLevel: () => thinkingLevel,
     subscribe: (cb: (e: any) => void) => {
       emitter.on("event", cb);
       return () => emitter.off("event", cb);
@@ -130,7 +151,15 @@ function makeFakeBrain() {
     steer: vi.fn(async () => {}),
     clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
     getModel: vi.fn(() => currentModel),
-    setModel: vi.fn(async (model: typeof currentModel) => { currentModel = model; }),
+    setModel: vi.fn(async (model: typeof currentModel) => {
+      // Level chosen against the OLD model, then re-clamped against the new one.
+      const carried = supportsThinking() ? thinkingLevel : persistedDefaultLevel;
+      currentModel = model;
+      setThinkingLevel(carried);
+    }),
+    applyModelParams: vi.fn((params: { reasoningEffort?: string }) => {
+      if (params.reasoningEffort) setThinkingLevel(params.reasoningEffort);
+    }),
     findModel: vi.fn((provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id)),
     getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, cost: 0.01 })),
@@ -395,6 +424,317 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(session.brain.prompt).toHaveBeenCalledWith(text, undefined);
     const seen = (session.brain.prompt as any).mock.calls[0][0] as string;
     expect(seen).not.toContain("�");
+  });
+
+  it("POST /api/prompt falls back to a healthy secondary when the bound primary is missing", async () => {
+    // The binding is handed to the routing runner as the primary candidate rather
+    // than resolved before it, so a primary that cannot be found is an ordinary
+    // model_not_found — a default fallback condition — and the secondary still
+    // gets its turn. Resolving it beforehand and failing the request outright is
+    // what took this away.
+    const session = await sm.getOrCreate("bound-missing-fallback");
+    const seenModels: string[] = [];
+    session.brain.prompt.mockImplementation(async () => {
+      const model = session.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "bound-missing-fallback",
+      modelProvider: "sicore-custom-x",
+      modelId: "claude-fable-5",
+      modelConfig: modelConfigWithInput(["text"]),
+      modelRouting: {
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "sicore-custom-x", modelId: "claude-fable-5", modelConfig: modelConfigWithInput(["text"]) },
+          { provider: "anthropic", modelId: "claude" },
+        ],
+      },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // The missing primary never ran; the healthy secondary answered.
+    expect(seenModels).toEqual(["anthropic/claude"]);
+    expect(session._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+  });
+
+  it("POST /api/prompt does not answer on the previous model when the bound model is missing and there is no fallback", async () => {
+    // With one candidate there is nothing to fall back to, so the run exhausts and
+    // reports it. What must NOT happen is the old silent behaviour: skipping the
+    // binding and answering on whichever model the session was already on.
+    const session = await sm.getOrCreate("bound-missing-exhaust");
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "bound-missing-exhaust",
+      modelProvider: "sicore-custom-x",
+      modelId: "claude-fable-5",
+      modelConfig: modelConfigWithInput(["text"]),
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+    const exhausted = session._extraEventBuffer.find((event) => event.type === "model_route_exhausted");
+    expect(exhausted).toBeDefined();
+    expect(JSON.stringify(exhausted)).toContain("sicore-custom-x/claude-fable-5");
+  });
+
+  it("POST /api/prompt surfaces a provider config pi refused, and does not fall back on it by default", async () => {
+    // pi's validateProviderConfig throws BEFORE registering anything, so the
+    // provider does not exist afterwards. Registration now happens per candidate
+    // inside the runner, so the throw becomes that candidate's setup failure with
+    // pi's own message attached — where it used to be a console.warn and the turn
+    // carried on, failing later as an upstream 4xx two layers from the cause.
+    //
+    // It classifies as `unknown`, which is deliberately NOT a default fallback
+    // kind: a refused config is a misconfiguration, not a transient condition, and
+    // silently answering from a second provider would hide it. An operator who
+    // wants that behaviour adds the kind to the policy's `fallbackOn` — the
+    // decision stays in the policy rather than being hardcoded upstream of it.
+    const session = await sm.getOrCreate("reg-fail");
+    session.brain.registerProvider = vi.fn(() => {
+      throw new Error('Provider p: "apiKey" or "oauth" is required when defining models.');
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "reg-fail",
+      modelProvider: "sicore-custom-x",
+      modelId: "claude-fable-5",
+      modelConfig: modelConfigWithInput(["text"]),
+      modelRouting: {
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "sicore-custom-x", modelId: "claude-fable-5", modelConfig: modelConfigWithInput(["text"]) },
+          { provider: "anthropic", modelId: "claude" },
+        ],
+      },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+    expect(session._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
+    const exhausted = session._extraEventBuffer.find((event) => event.type === "model_route_exhausted");
+    expect(exhausted).toBeDefined();
+    // pi's own reason has to reach the failure, or the operator is told only that
+    // "a model was not found" for what is actually a missing apiKey.
+    expect(JSON.stringify(exhausted)).toContain("apiKey");
+  });
+
+  it("POST /api/prompt registers the bound primary when the policy carries identities only", async () => {
+    // ModelRouteCandidate.modelConfig is OPTIONAL, and the top-level modelConfig is
+    // the documented registration config for the turn — so a policy naming only
+    // provider/model is valid at this boundary. Both control planes in tree hydrate
+    // every candidate, which is exactly why dropping the binding here would be
+    // invisible from their side: the primary's provider would go unregistered and
+    // the candidate skipped as model_not_found.
+    const session = await sm.getOrCreate("unhydrated-policy");
+    const config = modelConfigWithInput(["text"]);
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "unhydrated-policy",
+      modelProvider: "anthropic",
+      modelId: "claude",
+      modelConfig: config,
+      modelRouting: {
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "anthropic", modelId: "claude" },
+          { provider: "deepseek", modelId: "deepseek-chat" },
+        ],
+      },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(session.brain.registerProvider).toHaveBeenCalledWith("anthropic", config);
+    // The fallback candidate is NOT handed the primary's config — it may be a
+    // different provider entirely.
+    expect(session.brain.registerProvider).toHaveBeenCalledTimes(1);
+    expect(session.brain.getModel().id).toBe("claude");
+  });
+
+  it("POST /api/prompt keeps the requested reasoning effort across a non-reasoning → reasoning switch", async () => {
+    // The session is on a NON-reasoning model and the turn binds a reasoning one
+    // with reasoning_effort=high. Applied before the switch, pi clamps high to off
+    // on the current model, does not persist it, and setModel then restores the
+    // previous default — so the effort the caller asked for is silently lost on the
+    // first turn. Params must be applied after the candidate's setModel.
+    const session = await sm.getOrCreate("effort-switch");
+    expect(session.brain.getModel().reasoning).toBe(false);
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "think hard",
+      sessionId: "effort-switch",
+      modelProvider: "anthropic",
+      modelId: "claude",
+      modelConfig: { ...modelConfigWithInput(["text"]), params: { reasoning_effort: "high" } },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(session.brain.getModel().id).toBe("claude");
+    expect(session.brain.getThinkingLevel()).toBe("high");
+  });
+
+  it("POST /api/prompt applies the turn's reasoning effort to a fallback candidate too", async () => {
+    // Candidates are hydrated with their PROVIDER config, which carries no params,
+    // so a fallback that read only its own config would run at whatever level the
+    // failed primary left behind rather than the effort the caller asked for.
+    const session = await sm.getOrCreate("effort-fallback");
+    const levels: string[] = [];
+    session.brain.prompt.mockImplementation(async () => {
+      const model = session.brain.getModel();
+      levels.push(`${model.id}:${session.brain.getThinkingLevel()}`);
+      if (model.provider === "openai") {
+        session.brain.emitter.emit("event", {
+          type: "message_end",
+          message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit exceeded" },
+        });
+        return;
+      }
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "think hard",
+      sessionId: "effort-fallback",
+      modelConfig: { params: { reasoning_effort: "high" } },
+      modelRouting: {
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "openai", modelId: "gpt-4" },
+          { provider: "anthropic", modelId: "claude" },
+        ],
+      },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // gpt-4 cannot think, so "off" there is correct — the point is claude gets high.
+    expect(levels).toEqual(["gpt-4:off", "claude:high"]);
+  });
+
+  it("POST /api/prompt still tolerates an unknown model when no modelConfig was sent", async () => {
+    // Without a modelConfig there is nothing to register, so the caller is naming
+    // a model it expects to already exist. If it does not, the session stays on its
+    // current model — a tolerance that predates routing and is deliberately kept,
+    // which is why the binding is dropped rather than routed on.
+    const session = await sm.getOrCreate("no-config");
+    // Only the named model is missing. Stubbing findModel to return nothing for
+    // EVERY id (as this test used to) also breaks resolution of the model the
+    // session falls back to, so the turn exhausted and the assertions below could
+    // not tell that apart from the tolerance working.
+    const realFindModel = session.brain.findModel;
+    session.brain.findModel = vi.fn((provider: string, id: string) =>
+      id === "gpt-4-does-not-exist" ? undefined : realFindModel(provider, id),
+    );
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "no-config",
+      modelProvider: "openai",
+      modelId: "gpt-4-does-not-exist",
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(r.data.ok).toBe(true);
+    expect(r.data.error).toBeUndefined();
+    expect(session.brain.setModel).not.toHaveBeenCalled();
+    expect(session.brain.prompt).toHaveBeenCalled();
+  });
+
+  it("POST /api/prompt keeps forwarding brain events while a deferred compaction finishes", async () => {
+    // Brain events are diverted to the routing runner only while a fallback could
+    // still discard the attempt. Once the prompt resolves nothing can be
+    // discarded — but runAttempt has also unsubscribed by then, so leaving the
+    // diversion on drops everything in the window this branch exists to wait for.
+    // auto_compaction_end is the sharp case: it is the ONLY thing that clears the
+    // frontend's compacting state, so losing it pins the UI there for good.
+    const session = await sm.getOrCreate("compact-window");
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+      // Compaction kicked off during the turn and is still running as it resolves.
+      session.isCompacting = true;
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "compact-window" });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // Close is deferred, so the consumer is still attached and must still be fed.
+    expect(session._promptDone).toBe(false);
+    expect(session._routeBrainEventsThroughExtra).toBe(false);
+
+    session._eventBuffer.length = 0;
+    session.isCompacting = false;
+    session.brain.emitter.emit("event", { type: "auto_compaction_end" });
+    // The live subscription and this buffer share the same gate, so landing here
+    // is what proves the event is no longer dropped on the floor.
+    expect(session._eventBuffer.some((e: any) => e?.type === "auto_compaction_end")).toBe(true);
+  });
+
+  it("POST /api/prompt has the live path open the moment the runner lets go", async () => {
+    // The window is not observable from a prompt-scoped mock: an event queued
+    // from inside brain.prompt still fires while the runner is subscribed (so it
+    // travels the runner's own channel), and anything scheduled as a macrotask
+    // lands after .then, which the old code also survived. What is observable —
+    // and what the gap consisted of — is WHEN the gate opens: with the handoff
+    // driven from inside the attempt it is already open when brain.prompt
+    // returns, so nothing can fall between the two owners. The ordering itself is
+    // pinned in model-routing.test.ts ("gives delivery back before unsubscribing").
+    const session = await sm.getOrCreate("compact-race");
+    let gateWhenPromptReturned: boolean | undefined;
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+      session.isCompacting = true;
+      queueMicrotask(() => { gateWhenPromptReturned = session._routeBrainEventsThroughExtra; });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "compact-race" });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // Still deferred (compaction was in flight), so the consumer is attached…
+    expect(session._promptDone).toBe(false);
+    // …and an event arriving now reaches it rather than being dropped.
+    session._eventBuffer.length = 0;
+    session.isCompacting = false;
+    session.brain.emitter.emit("event", { type: "auto_compaction_end" });
+    expect(session._eventBuffer.some((e: any) => e?.type === "auto_compaction_end")).toBe(true);
+    // Recorded for the record: the runner's own channel covered the earlier
+    // instant, which is why that timing was never the lossy one.
+    expect(gateWhenPromptReturned).toBe(true);
   });
 
   it("POST /api/prompt rejects missing text", async () => {
@@ -1258,7 +1598,13 @@ describe("http-server — steer / abort / clear-queue", () => {
       modelProvider: "anthropic",
       modelId: "claude",
     });
-    expect(fail.status).toBe(500);
+    // 200, not 500: setModel now runs inside the routing runner (per candidate),
+    // so a throw there is that candidate's setup failure and is reported through
+    // the route events, not as a rejected HTTP request. What this test is about is
+    // unchanged — the locks below must still be free, or the session 409s forever.
+    expect(fail.status).toBe(200);
+    await flushAsync();
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_exhausted")).toBe(true);
     expect(s._promptDone).toBe(true);
     // Both locks must be released — _promptInflight was set synchronously
     // before setModel and the setup-failure path must clear it too.

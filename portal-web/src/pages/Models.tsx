@@ -84,9 +84,69 @@ export function modelApiLabel(apiType: string | null | undefined): string {
   return raw ? normalizeApiType(raw) : ""
 }
 
-/** Defaults the batch endpoint applies when the listing carried no value. */
+/**
+ * Defaults the batch endpoint applies when the listing carried no value. Keep in
+ * step with DEFAULT_CONTEXT_WINDOW / DEFAULT_MAX_TOKENS in core/model-compat.ts —
+ * these only LABEL what the backend will store, so a stale number here describes
+ * the import wrongly rather than changing it.
+ */
 const IMPORT_DEFAULT_CONTEXT_WINDOW = 128000
-const IMPORT_DEFAULT_MAX_TOKENS = 65536
+const IMPORT_DEFAULT_MAX_TOKENS = 16384
+
+export interface AddModelForm {
+  model_id: string
+  name: string
+  context_window: string
+  max_tokens: string
+  api_type: string
+  max_tokens_field: string
+  reasoning: boolean
+  vision: boolean
+  is_default: boolean
+}
+
+/**
+ * `max_tokens` starts EMPTY, and that is the whole point.
+ *
+ * It used to be pre-filled with 65536, above the real ceiling of the Claude models
+ * in use (64000) — and since the API keeps any positive value it is sent, adding
+ * one of those models without touching the field stored a value that makes every
+ * turn fail. A pre-filled number is a claim about a model the form has never seen;
+ * leaving it blank sends nothing and lets the backend's own default stand, which is
+ * the one place that tracks what pi does.
+ *
+ * `context_window` is pre-filled on purpose: it already matches the backend default
+ * and being too LOW there only costs preflight headroom, not a failed turn.
+ */
+export function emptyModelForm(): AddModelForm {
+  return {
+    model_id: "",
+    name: "",
+    context_window: "128000",
+    max_tokens: "",
+    api_type: "openai-completions",
+    max_tokens_field: "",
+    reasoning: false,
+    vision: false,
+    is_default: false,
+  }
+}
+
+/**
+ * Build the create-model request body, omitting a blank `max_tokens` entirely so
+ * the backend default applies. Sending `parseInt("")` would put NaN on the wire,
+ * which serialises to null and is not the same thing as absent.
+ */
+export function buildAddModelBody(form: AddModelForm): Record<string, unknown> {
+  const { max_tokens, ...rest } = form
+  const body: Record<string, unknown> = {
+    ...rest,
+    context_window: parseInt(form.context_window),
+  }
+  const trimmed = max_tokens.trim()
+  if (trimmed !== "") body.max_tokens = parseInt(trimmed)
+  return body
+}
 
 /**
  * What a listed model will actually be imported as. The OpenAI listing spec
@@ -193,7 +253,7 @@ export function Models() {
 
   // Add model
   const [showAddModel, setShowAddModel] = useState<string | null>(null)
-  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", max_tokens_field: "", reasoning: false, vision: false, is_default: false })
+  const [modelForm, setModelForm] = useState(emptyModelForm())
   const [addingModel, setAddingModel] = useState(false)
 
   // Fetch models from the provider's own /models endpoint
@@ -278,10 +338,10 @@ export function Models() {
     try {
       await api(`/siclaw/admin/models/providers/${providerId}/models`, {
         method: "POST",
-        body: { ...modelForm, context_window: parseInt(modelForm.context_window), max_tokens: parseInt(modelForm.max_tokens) },
+        body: buildAddModelBody(modelForm),
       })
       setShowAddModel(null)
-      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", max_tokens_field: "", reasoning: false, vision: false, is_default: false })
+      setModelForm(emptyModelForm())
       await fetchProviders()
       toast.success("Model added")
     } catch (err: any) { toast.error(err.message) } finally { setAddingModel(false) }
@@ -600,7 +660,7 @@ export function Models() {
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Model ID</label><input placeholder="e.g. gpt-4o" value={modelForm.model_id} onChange={(e) => setModelForm({ ...modelForm, model_id: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input placeholder="e.g. GPT-4o" value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={modelForm.context_window} onChange={(e) => setModelForm({ ...modelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
-                          <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                          <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} placeholder={`${IMPORT_DEFAULT_MAX_TOKENS} (default)`} title="Leave blank to use the default. Set this to the model's real output ceiling — a value ABOVE it makes every turn fail on the Claude protocol." className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— the wire protocol this model speaks</span></label><select value={modelForm.api_type} onChange={(e) => setModelForm({ ...modelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
                           <div className="col-span-2">
                             <label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max-Tokens Field <span className="font-normal opacity-70">— which request field carries the output cap</span></label>
