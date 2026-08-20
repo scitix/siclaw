@@ -931,3 +931,65 @@ describe("a payload the agent reshaped in the pipeline is still redacted", () =>
     expect(sanitizeJSON(cm, "configmap")).toContain("not-a-secret");
   });
 });
+
+describe("a registry credential travels under names the key patterns do not cover", () => {
+  // `.dockerconfigjson` was matched by name. The same credential also arrives as `config.json`, as a bare
+  // `auth`, and inside a ConfigMap entry holding a whole file — all three returned the value verbatim, in
+  // JSON and in YAML.
+  const CRED = "dXNlcjpwYXNz";                 // base64("user:pass")
+
+  it("redacts it in a ConfigMap, whatever the entry is called", () => {
+    const cm = JSON.stringify({ kind: "ConfigMap", metadata: { name: "c" }, data: {
+      "config.json": JSON.stringify({ auths: { "registry.example": { auth: CRED } } }),
+      auth: CRED,
+      "safe.conf": "listen 8080",
+    }});
+    const out = sanitizeJSON(cm, "configmap");
+    expect(out).not.toContain(CRED);
+    expect(out, "the rest of the ConfigMap still reads").toContain("listen 8080");
+  });
+
+  it("redacts the whole auths block in YAML", () => {
+    // `auths` is a credential map by definition, so the block is sensitive as a KEY — which is what makes
+    // the nested mapping collapse without needing to know the registry names inside it.
+    expect(redactSensitiveContent(`auths:\n  registry:\n    auth: ${CRED}\n`)).not.toContain(CRED);
+    expect(redactSensitiveContent(`auth: ${CRED}\n`), "and a bare line too").not.toContain(CRED);
+  });
+
+  it("does NOT treat `auth` as a sensitive name", () => {
+    // This is the whole reason the rule is two signals rather than a key pattern: these are ordinary
+    // configuration, and a redactor that eats them is one people work around.
+    for (const line of ["auth: none", "auth: ldap", "auth: rbac", "auth: Bearer",
+                        "auth_mode: rbac", "authorization-mode: RBAC", "auths_enabled: true"]) {
+      expect(redactSensitiveContent(`${line}\n`).trim(), line).toBe(line);
+    }
+  });
+
+  it("keys on the docker encoding, not on base64-looking text", () => {
+    // The value signal is "decodes to X:Y with printable halves", which is what the encoding IS.
+    const notCredential = Buffer.from("just some plain text").toString("base64");
+    expect(redactSensitiveContent(`auth: ${notCredential}\n`)).toContain(notCredential);
+    const isCredential = Buffer.from("robot$acct:AbCd1234").toString("base64");
+    expect(redactSensitiveContent(`auth: ${isCredential}\n`)).not.toContain(isCredential);
+  });
+
+  it("redacts every credential field inside an auths subtree", () => {
+    // Two paths, both safe, with different fidelity — worth pinning because the difference is not
+    // obvious and a future reader could "fix" the wrong one:
+    //
+    //   as a real object   the structural pass redacts field by field, so the field NAMES survive and
+    //                      the reader can still see what was configured
+    //   as a string (a whole file inside a ConfigMap entry) the text path collapses the `auths` block,
+    //                      because it cannot know which of the nested names are values
+    const asObject = sanitizeJSON(JSON.stringify({ kind: "ConfigMap",
+      auths: { r: { username: "u", password: "p", identitytoken: "t", auth: CRED } } }), "configmap");
+    for (const secret of ["\"p\"", "\"t\"", CRED]) expect(asObject).not.toContain(secret);
+    expect(asObject, "field names survive on the structural path").toContain("identitytoken");
+    expect(asObject, "and so does a non-credential field").toContain("\"u\"");
+
+    const asString = sanitizeJSON(JSON.stringify({ kind: "ConfigMap",
+      data: { "cfg.json": JSON.stringify({ auths: { r: { password: "p", auth: CRED } } }) } }), "configmap");
+    expect(asString).not.toContain(CRED);
+    expect(asString, "the whole block goes, names included").not.toContain("password");
+  });
+});

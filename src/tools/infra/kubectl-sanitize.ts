@@ -117,11 +117,33 @@ function unquote(value: string): string {
   return m ? m[2] : noComma;
 }
 
+/** Is this the base64 of `user:password`? */
+function looksLikeDockerAuth(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]{8,}={0,2}$/.test(value)) return false;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(value, "base64").toString("utf8");
+  } catch {
+    return false;
+  }
+  // `user:password` — a colon with printable text on both sides, and no control characters, which is
+  // what separates a real encoding from base64-looking noise.
+  return /^[\x20-\x7e]+:[\x20-\x7e]+$/.test(decoded);
+}
+
 function isSensitiveKeyName(key: string): boolean {
+  // `auths` is a registry credential map by definition — its children are the credentials, whatever they
+  // are named — so it is sensitive as a KEY even though `auth` alone is not. Matching it here means the
+  // existing nested-mapping logic collapses the whole block, which is what the YAML form needs.
+  if (key.trim().toLowerCase() === "auths") return true;
   return SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key));
 }
 
 function looksLikeSensitiveValue(value: string): boolean {
+  // Docker encodes `user:password` as base64, so a value that decodes to `X:Y` IS a credential wherever
+  // it sits. This is what covers a bare `auth:` line without making `auth` a sensitive key name — `auth:
+  // none`, `auth: ldap` and `auth: rbac` are ordinary configuration and stay readable.
+  if (looksLikeDockerAuth(value.trim().replace(/^["']|["']$/g, ""))) return true;
   return SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value));
 }
 
@@ -552,6 +574,9 @@ export function sanitizeJSON(
   // Shape-agnostic sweep over the WHOLE document, after the structural pass. This is what covers a
   // payload the agent reshaped in the pipeline, where the structural walk has no path to follow.
   if (redactSensitiveNameValuePairs(obj)) redacted = true;
+  // Registry credentials, which travel under names the key patterns do not cover (`config.json`, a bare
+  // `auth`) and inside ConfigMap entries that hold a whole file.
+  if (redactRegistryAuth(obj)) redacted = true;
 
   const sanitized = JSON.stringify(obj, null, 2);
   return redacted ? sanitized + REDACTION_NOTICE : sanitized;
@@ -667,6 +692,70 @@ function redactSensitiveNameValuePairs(node: unknown, depth = 0): boolean {
   }
   for (const key of Object.keys(obj)) {
     if (redactSensitiveNameValuePairs(obj[key], depth + 1)) redacted = true;
+  }
+  return redacted;
+}
+
+/**
+ * A docker registry credential, wherever it is stored.
+ *
+ * `.dockerconfigjson` was covered by key name, but the same credential travels under `config.json`, or a
+ * bare `auth`, or inside a ConfigMap entry that holds a whole file — a review found all three returning
+ * `dXNlcjpwYXNz` verbatim, in JSON and in YAML.
+ *
+ * Two signals, both unambiguous, because `auth` on its own is NOT one: `auth: none`, `auth: ldap`,
+ * `auth: rbac` are ordinary configuration and must stay readable.
+ *
+ *   1. CONTEXT — an `auths` object maps a registry to its credentials by definition, so everything
+ *      credential-shaped inside it is a credential. No false positives available.
+ *   2. VALUE SHAPE — docker encodes `user:password` as base64. A value that decodes to `X:Y` with
+ *      printable halves is that encoding; `none`, `ldap` and `rbac` do not decode that way.
+ */
+const REGISTRY_CRED_FIELDS = new Set(["auth", "password", "identitytoken", "registrytoken"]);
+
+
+/** Redact registry credentials anywhere in a parsed document. Returns whether anything changed. */
+function redactRegistryAuth(node: unknown, insideAuths = false, depth = 0): boolean {
+  if (depth > 64 || node === null || typeof node !== "object") return false;
+  let redacted = false;
+  if (Array.isArray(node)) {
+    for (const child of node) if (redactRegistryAuth(child, insideAuths, depth + 1)) redacted = true;
+    return redacted;
+  }
+  const obj = node as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    const lower = key.toLowerCase();
+    const value = obj[key];
+
+    // (1) inside an `auths` subtree, every credential field is a credential
+    if (insideAuths && REGISTRY_CRED_FIELDS.has(lower) && typeof value === "string" && value !== REDACTED) {
+      obj[key] = REDACTED;
+      redacted = true;
+      continue;
+    }
+
+    // (2) outside it, only the docker encoding itself
+    if (lower === "auth" && typeof value === "string" && value !== REDACTED && looksLikeDockerAuth(value)) {
+      obj[key] = REDACTED;
+      redacted = true;
+      continue;
+    }
+
+    // A ConfigMap entry is often a whole FILE: parse it and look inside.
+    if (typeof value === "string" && /"auths"\s*:/.test(value)) {
+      try {
+        const inner = JSON.parse(value);
+        if (redactRegistryAuth(inner, insideAuths, depth + 1)) {
+          obj[key] = JSON.stringify(inner);
+          redacted = true;
+          continue;
+        }
+      } catch {
+        // not JSON after all — the text redactor still sees it
+      }
+    }
+
+    if (redactRegistryAuth(value, insideAuths || lower === "auths", depth + 1)) redacted = true;
   }
   return redacted;
 }
