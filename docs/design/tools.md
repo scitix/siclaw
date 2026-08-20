@@ -283,6 +283,29 @@ consulted when stdout is empty, so a command whose own output contains `error:` 
 broken channel; `command terminated with exit code N` is deliberately NOT a marker, because it means
 the command did run.
 
+**Which leg broke is a second, independent field.** `exitClass` answers "was this the target's own
+answer"; `channelLeg` answers "where did it break". They are separate because they vary independently —
+merging them would need a class per combination — and because the second one had a hole:
+
+| leg | named by | example |
+|-----|----------|---------|
+| `transport` | kubectl's / the SSH client's own diagnostics | `error dialing backend: EOF` |
+| `namespace_entry` | the wrapper node_exec and host_exec put around the command | `nsenter: cannot open /proc/1/ns/mnt: Permission denied` |
+
+Every channel marker was originally a kubectl string, so the leg *between* the channel and the target had
+none: `nsenter` failing, or a netns that disappeared between resolution and exec, was classified
+`target_reported_failure` — whose annotation tells the agent "that is the target's own answer" — for a
+command the target never received. A `pod=` target dying mid-call is the ordinary way to reach it.
+
+Both markers are unambiguous only because neither wrapper is reachable as a user command: `nsenter` is in
+no context's whitelist and `ip netns exec` is refused by the validator. That is a load-bearing property,
+not a coincidence — if either becomes reachable, a user command's own failure starts being reported as our
+leg breaking, and a test asserts it stays that way.
+
+The leg must reach `details` from every tool that classifies an exit; a field that stops at the judgment
+is invisible to the UI and to metrics, which is the only place it can be read (`details` never reaches the
+model, so the distinction is also stated in the annotation text).
+
 ### 6.1c Projecting JSON Output (`json_path`)
 
 `node_exec`, `pod_exec` and `host_exec` accept an optional `json_path` that projects a field out of

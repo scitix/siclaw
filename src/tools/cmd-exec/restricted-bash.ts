@@ -513,6 +513,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           details: {
             exitCode: err.code,
             exit_class: judgment.exitClass,
+            ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
             ...(judgment.isError && { error: true }),
           },
         };

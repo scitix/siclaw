@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { classifyExit } from "./exit-classification.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { validateCommand } from "./command-validator.js";
 
 describe("classifyExit", () => {
   it("treats exit 0 as success with nothing appended", () => {
@@ -160,6 +163,82 @@ describe("classifyExit", () => {
     for (const j of cases) {
       expect(j.annotation).not.toBe("");
       expect(j.annotation).toContain(j.exitClass === "interrupted" ? "interrupted" : j.exitClass);
+    }
+  });
+});
+
+describe("which leg broke is a separate question from whose failure it was", () => {
+  // The channel markers were all kubectl's, so the leg BETWEEN the channel and the target — `nsenter`
+  // for node_exec, `ip netns exec` for host_exec — had none. All three strings below were classified
+  // `target_reported_failure`, whose annotation tells the agent "that is the target's own answer", for
+  // a command the target never saw.
+  //
+  // Captured from a real privileged pod on the test cluster, not written from memory.
+  const REAL = {
+    nsMissing: "nsenter: cannot open /proc/999999/ns/ipc: No such file or directory\ncommand terminated with exit code 1",
+    nsDenied: "nsenter: cannot open /proc/1/ns/mnt: Permission denied\ncommand terminated with exit code 1",
+    netnsGone: 'Cannot open network namespace "no-such-netns": No such file or directory',
+    transport: "error dialing backend: EOF",
+    realFailure: "command terminated with exit code 3",
+    notFound: "sh: 1: definitely-not-a-binary: not found\ncommand terminated with exit code 127",
+  };
+
+  it("separates the namespace-entry leg from the transport", () => {
+    for (const [label, stderr, exitCode] of [
+      ["nsenter: target ns gone", REAL.nsMissing, 1],
+      ["nsenter: permission denied", REAL.nsDenied, 1],
+      ["ip netns exec: netns gone", REAL.netnsGone, 255],
+    ] as const) {
+      const j = classifyExit({ command: "uptime", exitCode, stdout: "", stderr, context: "node" });
+      expect(j.exitClass, label).toBe("channel_error");
+      expect(j.channelLeg, label).toBe("namespace_entry");
+      // The agent never sees details, so the distinction has to be in the text.
+      expect(j.annotation, label).toMatch(/namespace/i);
+      expect(j.annotation, label).not.toMatch(/target's own answer/);
+    }
+
+    const t = classifyExit({ command: "uptime", exitCode: 1, stdout: "", stderr: REAL.transport, context: "pod" });
+    expect(t.exitClass).toBe("channel_error");
+    expect(t.channelLeg).toBe("transport");
+  });
+
+  it("still lets the target's own answer through as the target's", () => {
+    // The point of the leg is to stop over-claiming, not to reclassify real failures.
+    const j = classifyExit({ command: "sh -c 'exit 3'", exitCode: 3, stdout: "", stderr: REAL.realFailure, context: "node" });
+    expect(j.exitClass).toBe("target_reported_failure");
+    expect(j.channelLeg).toBeUndefined();
+
+    // A binary missing INSIDE a successfully entered namespace is the target's environment, not a leg.
+    const dep = classifyExit({ command: "definitely-not-a-binary", exitCode: 127, stdout: "", stderr: REAL.notFound, context: "node" });
+    expect(dep.exitClass).toBe("dependency_missing");
+    expect(dep.channelLeg).toBeUndefined();
+  });
+
+  it("does not fire when the command produced output", () => {
+    // Same guard the transport markers have: with stdout present the command ran, whatever stderr says.
+    const j = classifyExit({ command: "uptime", exitCode: 1, stdout: "load average: 0.1", stderr: REAL.nsMissing, context: "node" });
+    expect(j.exitClass).not.toBe("channel_error");
+  });
+
+  it("cannot be triggered by a command the agent asked for", () => {
+    // Both markers are unambiguous only because neither wrapper is reachable as a user command:
+    // `nsenter` is in no whitelist, and `ip netns exec` is refused by the validator. If either becomes
+    // reachable, a user command failing would be reported as our own leg breaking.
+    const sets = readFileSync(resolve(import.meta.dirname, "command-sets.ts"), "utf8");
+    expect(sets).not.toMatch(/^\s+nsenter:\s*\{/m);
+    const opts = { context: "node" as const, sensitivePathPatterns: [] as RegExp[] };
+    expect(validateCommand("ip netns exec myns sh -c 'echo hi'", opts)).not.toBeNull();
+  });
+
+  it("is surfaced by every tool that classifies an exit", () => {
+    // The leg is only useful if it reaches details. Four tools call classifyExit; each must pass it on,
+    // and a fifth added later must too.
+    const root = resolve(import.meta.dirname, "../..");
+    for (const f of ["tools/cmd-exec/pod-exec.ts", "tools/cmd-exec/node-exec.ts",
+                     "tools/cmd-exec/host-exec.ts", "tools/cmd-exec/restricted-bash.ts"]) {
+      const src = readFileSync(resolve(root, f), "utf8");
+      if (!/\bclassifyExit\s*\(/.test(src)) continue;
+      expect(src, `${f} classifies an exit but drops channelLeg`).toMatch(/channel_leg:\s*judgment\.channelLeg/);
     }
   });
 });

@@ -60,6 +60,27 @@ const CHANNEL_ERROR_MARKERS: readonly RegExp[] = [
 ];
 
 /**
+ * The namespace-entry leg failing, as opposed to the transport.
+ *
+ * Both are unambiguous: `nsenter` is in NO context's whitelist and `ip netns exec` is refused by the
+ * validator, so neither string can come from a command the agent asked for — only from the wrapper
+ * node_exec and host_exec put around it. Captured from a real privileged pod rather than written from
+ * memory:
+ *
+ *   nsenter: cannot open /proc/999999/ns/ipc: No such file or directory
+ *   nsenter: cannot open /proc/1/ns/mnt: Permission denied
+ *   Cannot open network namespace "no-such-netns": No such file or directory
+ *
+ * Before this, all three were classified `target_reported_failure` — "the target's own answer" — for a
+ * command the target never saw. A vanished `pod=` netns is the common case and read as the pod
+ * answering.
+ */
+const NAMESPACE_ENTRY_MARKERS: readonly RegExp[] = [
+  /^nsenter: /m,
+  /^Cannot open network namespace /m,
+];
+
+/**
  * A missing binary, as reported by the CONTAINER RUNTIME rather than by a shell.
  *
  * `sh -c` gives 127, but `kubectl exec` without a shell surfaces it as
@@ -69,9 +90,25 @@ const CHANNEL_ERROR_MARKERS: readonly RegExp[] = [
  */
 const MISSING_BINARY_MARKER = /executable file not found|: not found$|: command not found/im;
 
+/**
+ * WHICH leg of the path to the target broke. Separate from `exitClass` on purpose: "was this the
+ * target's own answer" and "where did it break" are independent questions, and folding the second into
+ * the first would need a class per combination.
+ *
+ *   transport        — the exec channel: kubectl exec / the SSH connection. Named by kubectl's own
+ *                      diagnostics, which is why classification needs UNFILTERED stderr.
+ *   namespace_entry  — the channel opened, then `nsenter` / `ip netns exec` failed. The target never
+ *                      ran the command either, but the cause is on our side (debug-pod privileges, or
+ *                      a netns that disappeared between resolution and exec — the ordinary outcome of
+ *                      a `pod=` target dying mid-call), not the transport's.
+ */
+export type ChannelLeg = "transport" | "namespace_entry";
+
 export interface ExitJudgment {
   /** What the exit code means. */
   exitClass: ExitClass;
+  /** For `channel_error` only: which leg broke. Absent for every other class. */
+  channelLeg?: ChannelLeg;
   /** Whether this should count as a failed tool call (drives `details.error` → Trace outcome). */
   isError: boolean;
   /** Text appended to the tool output, since `details` never reaches the model. Empty for success. */
@@ -167,9 +204,24 @@ export function classifyExit(opts: {
   // A channel that failed produced no command output, so stdout must be empty for this to be
   // considered at all — otherwise a command of the agent's own that prints "error:" would be
   // misreported as a dead channel.
+  if (!stdout.trim() && NAMESPACE_ENTRY_MARKERS.some((re) => re.test(stderr))) {
+    return {
+      exitClass: "channel_error",
+      channelLeg: "namespace_entry",
+      isError: true,
+      annotation:
+        "[channel_error: the exec channel opened, then entering the target namespace failed — so the "
+        + "target never ran the command and this status is NOT its answer. See STDERR. A namespace that "
+        + "no longer exists usually means the pod behind a `pod=` target has gone: re-resolve it rather "
+        + "than retrying this command. A permission failure is a setup problem on the debug-pod side and "
+        + "will not fix itself.]",
+    };
+  }
+
   if (!stdout.trim() && CHANNEL_ERROR_MARKERS.some((re) => re.test(stderr))) {
     return {
       exitClass: "channel_error",
+      channelLeg: "transport",
       isError: true,
       annotation:
         "[channel_error: the exec channel itself failed — the target "

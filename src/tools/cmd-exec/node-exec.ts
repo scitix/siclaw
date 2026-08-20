@@ -490,6 +490,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         details: {
           exitCode: execResult.exitCode ?? 0,
           exit_class: judgment.exitClass,
+          ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
           ...(judgment.isError && { error: true }),
         },
       };

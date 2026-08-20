@@ -191,7 +191,10 @@ Examples (pass the id from host_list; names shown here for readability):
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
-          details: { error: true, reason: "host_acquire_failed" },
+          // Same class as the sshExec failure below: the channel never opened, so this is not the
+          // host's answer. The text already said so; details did not, which left the UI and the
+          // channel outcome unable to tell it from a command that failed.
+          details: { error: true, reason: "host_acquire_failed", exit_class: "channel_error", channel_leg: "transport" },
         };
       }
       // The model often passes an opaque host id; surface the resolved friendly name so the tool
@@ -292,7 +295,7 @@ Examples (pass the id from host_list; names shown here for readability):
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
-          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", host: params.host },
+          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", channel_leg: "transport", host: params.host },
         };
       } finally {
         signal?.removeEventListener("abort", onAbort);
@@ -339,6 +342,7 @@ Examples (pass the id from host_list; names shown here for readability):
         details: {
           exitCode: result.exitCode,
           exit_class: judgment.exitClass,
+          ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
           host: params.host,
           host_label: hostLabel,
           ...(judgment.isError && { error: true }),

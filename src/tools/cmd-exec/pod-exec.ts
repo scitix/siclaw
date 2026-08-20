@@ -296,6 +296,7 @@ Examples:
           details: {
             exitCode: err.code ?? "unknown",
             exit_class: judgment.exitClass,
+            ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
             ...(judgment.isError && { error: true }),
           },
         };
