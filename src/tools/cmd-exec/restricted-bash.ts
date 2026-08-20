@@ -9,7 +9,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
-import { SAFE_SUBCOMMANDS, checkAllNamespacesRestriction, checkSecretOutputFormat } from "../infra/command-sets.js";
+import { SAFE_SUBCOMMANDS, checkAllNamespacesRestriction, checkSecretOutputFormat, argsNameSecrets } from "../infra/command-sets.js";
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -44,7 +44,43 @@ export { getCommandBinary } from "../infra/command-sets.js";
  * Checks that subcommands are in the safe whitelist.
  * Returns an error message if blocked, or null if all kubectl commands are safe.
  */
+/**
+ * A Secret read that feeds a PIPE has no structural guarantee left.
+ *
+ * `-o json` is the one permitted format precisely because the structural sanitizer redacts every
+ * `data`/`stringData` value. That holds for the tool's own output — and the tool's output is the LAST
+ * stage's. `kubectl get secret demo -o json | jq -r .data.password` hands back a bare base64 string: not
+ * JSON, so nothing structural applies, and unrecognisable to any text redactor, which is the same reason
+ * `-o jsonpath` is refused outright.
+ *
+ * So the pipe is refused when a stage reads a Secret. Scoped to Secrets: for a ConfigMap or Pod the
+ * redaction is pattern-based and survives reshaping far better, and refusing every filtered read would
+ * cost far more than it protects.
+ */
+function checkSecretIntoPipe(commands: string[]): string | null {
+  if (commands.length < 2) return null;
+  for (let i = 0; i < commands.length - 1; i++) {
+    const args = parseArgs(commands[i]);
+    if (getCommandBinary(commands[i]).toLowerCase() !== "kubectl") continue;
+    const sub = args.find((a, idx) => idx > 0 && !a.startsWith("-"));
+    if (sub !== "get" && sub !== "describe") continue;
+    if (!argsNameSecrets(args, sub)) continue;
+    return JSON.stringify({
+      error: "Piping a Secret read into another command is not allowed. `-o json` is permitted only because the "
+        + "structural sanitizer redacts its values, and that applies to what the LAST stage prints — a "
+        + "filter can turn the object into a bare value the redactor cannot recognise.",
+      hint: "Run the read on its own (`kubectl get secret <name> -o json`) and work from the redacted "
+        + "output, or use `kubectl describe secret <name>` for key names and byte counts.",
+    }, null, 2);
+  }
+  return null;
+}
+
 export function validateKubectlInPipeline(commands: string[]): string | null {
+  // Before the per-command checks: this one is about the pipeline SHAPE, not any single command.
+  const piped = checkSecretIntoPipe(commands);
+  if (piped) return piped;
+
   for (const cmd of commands) {
     const binary = getCommandBinary(cmd);
     if (binary !== "kubectl") continue;
@@ -145,7 +181,11 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     if (subcommand === "config") {
       const configSub = args.filter((a) => !a.startsWith("-"));
       const hasView = configSub.includes("view");
-      const hasRaw = args.includes("--raw");
+      // `--raw` is a BOOLEAN flag, so kubectl accepts `--raw`, `--raw=true` and `--raw=1` alike — an
+      // exact-match check caught only the first, and the other two print the full kubeconfig with its
+      // client certificates and tokens. Any `--raw` spelling is refused: a `--raw=false` that someone
+      // meant literally loses nothing by being rejected here.
+      const hasRaw = args.some((a) => a === "--raw" || a.startsWith("--raw="));
       if (hasView && hasRaw) {
         return JSON.stringify({
           error: "kubectl config view --raw is not allowed — it exposes credentials.",

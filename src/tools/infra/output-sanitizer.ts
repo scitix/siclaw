@@ -13,6 +13,7 @@
 
 import {
   detectSensitiveResource,
+  kubectlSubcommand,
   getOutputFormat,
   sanitizeJSON,
   redactSensitiveContent,
@@ -91,7 +92,8 @@ function makeKubectlJsonSanitizer(
 // ── kubectl rules ────────────────────────────────────────────────────
 
 OUTPUT_RULES["kubectl"] = (args) => {
-  const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+  // Shared with detectSensitiveResource so the two cannot disagree about what a command says.
+  const sub = kubectlSubcommand(args);
 
   // describe: sanitize configmap/pod output; secret describe is safe (shows byte counts only)
   if (sub === "describe") {
@@ -155,45 +157,94 @@ for (const cmd of [
  * Redact sensitive values from env/printenv output (KEY=VALUE per line).
  * Matches key names against SENSITIVE_ENV_NAME_PATTERNS.
  */
-function redactEnvOutput(output: string): string {
-  const lines = output.split("\n");
+function redactEnvOutput(output: string, opts?: { separator?: string }): string {
+  // `env -0` / `printenv -0` separate entries with NUL, not newline. Splitting on newlines left the whole
+  // record as one "line" whose first KEY= decided everything, so `SAFE=x<NUL>API_KEY=secret` kept the
+  // secret. The separator is passed in by the rule, the only place that can see the flag.
+  const sep = opts?.separator ?? "\n";
+  const entries = output.split(sep);
   let redacted = false;
 
-  const result = lines.map((line) => {
-    const eqIdx = line.indexOf("=");
-    if (eqIdx <= 0) return line;
+  // An env VALUE may span lines. Per-line splitting masked only the first line of a multi-line secret
+  // and let the remainder through, so a continuation line belongs to the record above it until the next
+  // `KEY=`.
+  const KEY_START = /^[A-Za-z_][A-Za-z0-9_]*=/;
+  const records: string[] = [];
+  for (const entry of entries) {
+    if (sep === "\n" && records.length > 0 && !KEY_START.test(entry)) {
+      records[records.length - 1] += "\n" + entry;
+    } else {
+      records.push(entry);
+    }
+  }
 
-    const key = line.slice(0, eqIdx);
+  const result = records.map((record) => {
+    const eqIdx = record.indexOf("=");
+    if (eqIdx <= 0) return record;
+
+    const key = record.slice(0, eqIdx);
     if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
       redacted = true;
       return `${key}=${REDACTED}`;
     }
 
-    // Also check value patterns (JWT, PEM, etc.)
-    const value = line.slice(eqIdx + 1);
+    // Value patterns (JWT, PEM, …) over the WHOLE value, continuation lines included.
+    const value = record.slice(eqIdx + 1);
     if (SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value))) {
       redacted = true;
       return `${key}=${REDACTED}`;
     }
 
-    return line;
+    return record;
   });
 
-  const sanitized = result.join("\n");
+  const sanitized = result.join(sep);
   return redacted ? sanitized + REDACTION_NOTICE : sanitized;
 }
 
-OUTPUT_RULES["env"] = (_args) => ({
-  type: "sanitize",
-  sanitize: redactEnvOutput,
-  lineSafe: true,
-});
+/**
+ * `printenv NAME` prints the VALUE ALONE — no `KEY=` for the redactor to key on, so a sensitive variable
+ * came back verbatim. The name is only in the argv, and the entire output is that one value: redact all
+ * of it or none of it.
+ */
+function redactBareEnvValue(names: string[]): (output: string) => string {
+  const sensitive = names.some((n) => SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(n)));
+  return (output: string) => {
+    if (!sensitive) return redactEnvOutput(output);
+    return output.trim() ? REDACTED + REDACTION_NOTICE : output;
+  };
+}
 
-OUTPUT_RULES["printenv"] = (_args) => ({
-  type: "sanitize",
-  sanitize: redactEnvOutput,
-  lineSafe: true,
-});
+/** `-0`/`--null` switches the record separator to NUL, which also removes any line structure. */
+function envNulSeparated(args: string[]): boolean {
+  return args.some((a) => a === "-0" || a === "--null");
+}
+
+const NUL_SEPARATOR = String.fromCharCode(0);
+
+OUTPUT_RULES["env"] = (args) => {
+  const nul = envNulSeparated(args);
+  return {
+    type: "sanitize",
+    sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
+    // NUL-separated output has no lines, so it cannot be redacted incrementally per line.
+    lineSafe: !nul,
+  };
+};
+
+OUTPUT_RULES["printenv"] = (args) => {
+  // `printenv NAME…` prints bare values; `printenv` alone prints KEY=VALUE records.
+  const names = args.filter((a) => !a.startsWith("-"));
+  const nul = envNulSeparated(args);
+  if (names.length > 0) {
+    return { type: "sanitize", sanitize: redactBareEnvValue(names), lineSafe: false };
+  }
+  return {
+    type: "sanitize",
+    sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
+    lineSafe: !nul,
+  };
+};
 
 // ── crictl inspect rules ────────────────────────────────────────────
 

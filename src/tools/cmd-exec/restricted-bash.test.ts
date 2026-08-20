@@ -1722,3 +1722,40 @@ describe("rollout is allowed by VERB, not by subcommand", () => {
     expect(check("kubectl rollout")).not.toBeNull();
   });
 });
+
+describe("a Secret read cannot be piped", () => {
+  // `-o json` is the ONE permitted Secret format, and it is permitted because the structural sanitizer
+  // redacts every data value. That applies to what the LAST stage prints — so
+  // `kubectl get secret demo -o json | jq -r .data.password` hands back a bare base64 string: not JSON,
+  // nothing structural applies, and unrecognisable to a text redactor for exactly the reason
+  // `-o jsonpath` is refused outright. The premise does not survive a pipe.
+  const check = (cmd: string) => validateKubectlInPipeline(cmd.split(" | "));
+
+  it("refuses a Secret feeding any downstream stage", () => {
+    for (const cmd of ["kubectl get secret demo -o json | jq -r .data.password",
+                       "kubectl get secret demo -o json | jq '.data'",
+                       "kubectl get secrets. demo -o json | jq -r .data.password",
+                       "kubectl get secret/demo -o json | grep password",
+                       "kubectl get secret demo -o json | base64 -d",
+                       "kubectl describe secret demo | grep -i token"]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("names what to do instead", () => {
+    const err = check("kubectl get secret demo -o json | jq .data") ?? "";
+    expect(err).toContain("describe secret");
+    expect(err, "and explains why the format alone is not the guarantee").toMatch(/last stage|redact/i);
+  });
+
+  it("leaves unpiped reads and other resources alone", () => {
+    // Scoped to Secrets: a ConfigMap or Pod is pattern-redacted, which survives reshaping far better,
+    // and refusing every filtered read would cost more than it protects.
+    for (const cmd of ["kubectl get secret demo -o json", "kubectl describe secret demo",
+                       "kubectl get secret demo -o name",
+                       "kubectl get pods -o json | jq '.items[].metadata.name'",
+                       "kubectl get cm x -o json | jq .data"]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+});

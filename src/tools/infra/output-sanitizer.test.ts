@@ -1,3 +1,5 @@
+import { argsNameSecrets } from "./command-sets.js";
+import { detectSensitiveResource } from "./kubectl-sanitize.js";
 import { describe, it, expect } from "vitest";
 import { analyzeOutput, applySanitizer, type OutputAction, redactSensitiveContent } from "./output-sanitizer.js";
 
@@ -420,5 +422,88 @@ describe("a cross-line redactor is not line-safe", () => {
 
     const perBatch = pem.map((line) => redactSensitiveContent(line)).join("\n");
     expect(perBatch).toContain("MIIEowIBAAKCAQEA");   // ← what streaming would have written
+  });
+});
+
+describe("one reading of a kubectl command, for the validator and the sanitizer alike", () => {
+  const CANARY = "c3VwZXItc2VjcmV0";
+  const secretJson = JSON.stringify({ kind: "Secret", metadata: { name: "demo" }, data: { password: CANARY } });
+  const sanitized = (args: string[]) => {
+    const action = analyzeOutput("kubectl", args);
+    return action ? applySanitizer(secretJson, action) : secretJson;
+  };
+
+  it("sees past a global flag placed before the verb", () => {
+    // The rule took the first non-dash argument as the subcommand, so `kubectl -n default get secret …`
+    // read as subcommand "default", no rule matched, and the Secret came back verbatim. A global flag
+    // before the verb is ordinary kubectl usage, and the flag-arity table needed to see past it already
+    // existed in this file — used by detectSensitiveResource and not by this.
+    for (const args of [["-n", "default", "get", "secret", "demo", "-o", "json"],
+                        ["--context", "prod", "get", "secret", "demo", "-o", "json"],
+                        ["--kubeconfig", "/tmp/kc", "get", "secret", "demo", "-o", "json"],
+                        ["get", "secret", "demo", "-o", "json"]]) {
+      expect(sanitized(args), args.join(" ")).not.toContain(CANARY);
+    }
+  });
+
+  it("normalises a typed resource name the way the validator does", () => {
+    // kubectl accepts `type.version[.group]`, with a TRAILING dot for a core resource. The validator
+    // learned that and permitted `-o json` for it — which is permitted BECAUSE the structural sanitizer
+    // redacts `data` — while this side still split only on `/`, so no sanitizer attached at all. Both now
+    // call the same normaliser, and a test below pins that they agree.
+    for (const resource of ["secret", "secrets", "secret.v1.", "secrets.", "secrets.v1.", "secret/demo"]) {
+      expect(sanitized(["get", resource, "demo", "-o", "json"]), resource).not.toContain(CANARY);
+    }
+  });
+
+  it("the validator and the sanitizer agree about what names a Secret", () => {
+    // The guard against this pair drifting again. Anything the validator treats as a Secret read must
+    // also attach a sanitizer, or `-o json` is permitted on the strength of redaction that never runs.
+    for (const resource of ["secret", "secrets", "secret.v1.", "secrets.", "secret/demo", "pod,secret",
+                            "secret,pod", "pod,secret/demo"]) {
+      const args = ["get", resource, "demo", "-o", "json"];
+      const namedByValidator = argsNameSecrets(args, "get");
+      const seenBySanitizer = detectSensitiveResource(args) === "secret"
+        || analyzeOutput("kubectl", args) !== null;
+      expect(seenBySanitizer, `${resource}: validator=${namedByValidator}`).toBe(namedByValidator);
+    }
+  });
+});
+
+describe("env and printenv output the redactor could not key on", () => {
+  const NUL = String.fromCharCode(0);
+  const out = (bin: string, args: string[], payload: string) => {
+    const action = analyzeOutput(bin, args);
+    return action ? applySanitizer(payload, action) : payload;
+  };
+
+  it("redacts a bare value when the NAME was in the argv", () => {
+    // `printenv PASSWORD` prints the value ALONE — no `KEY=` for a line redactor to match, so it came
+    // back verbatim. The name is only in the arguments, and the whole output is that one value.
+    expect(out("printenv", ["PASSWORD"], "super-secret")).not.toContain("super-secret");
+    expect(out("printenv", ["API_KEY"], "abc123")).not.toContain("abc123");
+    // A harmless name is untouched.
+    expect(out("printenv", ["HOME"], "/root")).toContain("/root");
+  });
+
+  it("splits on NUL when the caller asked for NUL", () => {
+    // `-0` separates records with NUL. Splitting on newlines left the whole thing as one record whose
+    // first KEY= decided everything, so the second half kept its secret.
+    const payload = `SAFE=x${NUL}API_KEY=zzz`;
+    for (const bin of ["env", "printenv"]) {
+      const r = out(bin, ["-0"], payload);
+      expect(r, bin).not.toContain("zzz");
+      expect(r, bin).toContain("SAFE=x");
+    }
+    // And it is no longer claimed to be streamable per line, because it has no lines.
+    expect(analyzeOutput("env", ["-0"])?.lineSafe).toBe(false);
+    expect(analyzeOutput("env", [])?.lineSafe).toBe(true);
+  });
+
+  it("redacts a multi-line value to its end", () => {
+    // A value may span lines. Per-line redaction masked the first line and let the rest through.
+    const r = out("env", [], "PASSWORD=first-line\nSECOND-LINE-SECRET\nSAFE=ok");
+    expect(r).not.toContain("SECOND-LINE-SECRET");
+    expect(r, "and the next record survives").toContain("SAFE=ok");
   });
 });

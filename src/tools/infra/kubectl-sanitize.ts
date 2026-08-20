@@ -360,6 +360,37 @@ const FLAGS_WITH_VALUE = new Set([
  *          cm/<name>, pod, pods, po, po/<name>, comma-separated (pod,secret)
  * Skips flag values (-n, -l, --namespace, etc.)
  */
+/**
+ * One reading of a kubectl resource token, for the validator AND the sanitizer.
+ *
+ * They had two: the validator learned `secret.v1.` and `secrets.` (kubectl accepts a
+ * `type.version[.group]` form, with a TRAILING dot for a core resource) while the sanitizer still split
+ * only on `/`. So `kubectl get secret.v1. demo -o json` passed the format check — which permits `-o json`
+ * BECAUSE the structural sanitizer redacts `data` — and then got no sanitizer at all, returning the
+ * Secret verbatim. Exactly the drift a comment in this file warned about, on the same pair of functions.
+ */
+export function normalizeResourceToken(token: string): string {
+  return token.split("/")[0].split(".")[0].trim().toLowerCase();
+}
+
+/**
+ * The subcommand, skipping flag VALUES.
+ *
+ * `args.find(a => !a.startsWith("-"))` reads `kubectl -n default get secret …` as subcommand "default",
+ * so the rule below never fired and a Secret came back unredacted. A global flag before the verb is
+ * ordinary kubectl usage, and the flag-arity table needed to see past it already existed here.
+ */
+export function kubectlSubcommand(args: string[]): string | undefined {
+  let skipNext = false;
+  for (const arg of args) {
+    if (skipNext) { skipNext = false; continue; }
+    if (FLAGS_WITH_VALUE.has(arg)) { skipNext = true; continue; }
+    if (arg.startsWith("-")) continue;
+    return arg.toLowerCase();
+  }
+  return undefined;
+}
+
 export function detectSensitiveResource(
   args: string[],
 ): SensitiveResourceType | null {
@@ -384,7 +415,7 @@ export function detectSensitiveResource(
     const parts = arg.split(",");
     for (const part of parts) {
       // Handle type/name form: secret/my-secret
-      const resourceType = part.split("/")[0].toLowerCase();
+      const resourceType = normalizeResourceToken(part);
       if (resourceType in RESOURCE_ALIAS_MAP) {
         return RESOURCE_ALIAS_MAP[resourceType];
       }

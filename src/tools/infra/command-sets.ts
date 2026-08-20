@@ -1,3 +1,4 @@
+import { normalizeResourceToken } from "./kubectl-sanitize.js";
 /**
  * Shared command whitelist and command-level validators used by
  * restricted-bash, pod-exec, and node-exec tools.
@@ -35,13 +36,34 @@ export function parseArgs(command: string): string[] {
     current = "";
     quotedEmpty = false;
   };
-  for (const ch of command) {
+  const chars = [...command];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     if (inQuote) {
-      if (ch === inQuote) {
+      // ANSI-C quoting ($'…') decodes escapes; a single-quoted string does not, and inside double
+      // quotes a backslash escapes only a few characters. Handled where the quote was opened.
+      if (ch === "\\" && (inQuote === '"' || inQuote === "\u0001")) {
+        const next = chars[i + 1];
+        if (next !== undefined) { current += decodeShellEscape(chars, i + 1, (n) => { i = n; }); continue; }
+      }
+      if (ch === inQuote || (inQuote === "\u0001" && ch === "'")) {
         inQuote = null;
       } else {
         current += ch;
       }
+    } else if (ch === "$" && chars[i + 1] === "'") {
+      // $'…' — the shell DECODES \057 and \x2f here, so `$'\057etc\057shadow'` reaches the process as
+      // /etc/shadow. Treating it as literal text let the sensitive-path check miss the real path
+      // entirely. A sentinel marks the mode so the closing quote is still `'`.
+      inQuote = "\u0001";
+      quotedEmpty = true;
+      i++;
+    } else if (ch === "\\") {
+      // An UNQUOTED backslash escapes the next character and disappears: `cat /etc/shado\w` opens
+      // /etc/shadow. Screening the text as written saw `shado\w` and matched nothing.
+      const next = chars[i + 1];
+      if (next !== undefined) { current += next; i++; }
+      continue;
     } else if (ch === '"' || ch === "'") {
       inQuote = ch;
       quotedEmpty = true;
@@ -53,6 +75,32 @@ export function parseArgs(command: string): string[] {
   }
   flush();
   return args;
+}
+
+/**
+ * Decode one backslash escape at `chars[at]`, advancing the caller's index past what it consumed.
+ *
+ * Only the forms that can rewrite a PATH: octal, hex, and the common control letters. Anything else
+ * yields the character itself, which is what bash does for an unrecognised escape.
+ */
+function decodeShellEscape(chars: string[], at: number, advance: (to: number) => void): string {
+  const c = chars[at];
+  if (c === "x" || c === "X") {
+    let hex = "";
+    let j = at + 1;
+    while (j < chars.length && hex.length < 2 && /[0-9a-fA-F]/.test(chars[j])) hex += chars[j++];
+    if (hex) { advance(j - 1); return String.fromCharCode(parseInt(hex, 16)); }
+  }
+  if (/[0-7]/.test(c)) {
+    let oct = "";
+    let j = at;
+    while (j < chars.length && oct.length < 3 && /[0-7]/.test(chars[j])) oct += chars[j++];
+    advance(j - 1);
+    return String.fromCharCode(parseInt(oct, 8));
+  }
+  const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", "0": "\0", "\\": "\\", "'": "'", '"': '"' };
+  advance(at);
+  return simple[c] ?? c;
 }
 
 /**
@@ -233,8 +281,8 @@ function validateByRule(
             // being refused clearly and the caller then guessing at kubelet volume paths, because the
             // refusal named nothing.
             allowed: [...allowed],
-            ...(SUBCOMMAND_ALTERNATIVES[`${cmd} ${arg}`]
-              ? { hint: SUBCOMMAND_ALTERNATIVES[`${cmd} ${arg}`] }
+            ...(SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`)
+              ? { hint: SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`) }
               : {}),
           }, null, 2);
         }
@@ -453,6 +501,35 @@ function checkCurlMethod(method: string | undefined): string | null {
 }
 
 function validateCurl(args: string[]): string | null {
+  // A leading `@` on ANY curl value means "read this local file" — `-w @fmt`, `-H @hdrs`, `-d @body`,
+  // `-F f=@path`, `--config @file`. The flag allow-list only decided WHICH flags were permitted, so `-w`
+  // and `-H` passed and their values read a kubeconfig — printing it, or POSTing it to whatever host the
+  // same command named. Checked first, and for every argument shape, because the flag it rides on is not
+  // what makes it dangerous.
+  //
+  // Refused rather than path-screened: `@` has exactly this one meaning in curl, the file forms have no
+  // read-only use through this tool, and screening the path would still leave `-H @<passing path>
+  // https://attacker` available.
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    const eq = arg.indexOf("=");
+    const candidates = [
+      arg.startsWith("@") ? arg : undefined,                                  // bare @file
+      eq > 0 ? arg.slice(eq + 1) : undefined,                                 // --data=@file, -F n=@file
+      /^-[A-Za-z]@/.test(arg) ? arg.slice(2) : undefined,                     // -d@file
+      /^-{1,2}[A-Za-z][A-Za-z-]*$/.test(arg) ? args[i + 1] : undefined,       // -H @file
+    ];
+    for (const candidate of candidates) {
+      if (candidate?.startsWith("@")) {
+        return JSON.stringify({
+          error: `curl "${candidate}" is not allowed — a leading @ tells curl to read that local file, `
+            + "which can print a credential or send it to a remote host.",
+          hint: "Pass the value inline instead of @file. To read a file, use the dedicated file tools.",
+        }, null, 2);
+      }
+    }
+  }
+
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (!arg.startsWith("-")) {
@@ -877,8 +954,16 @@ function validateMount(args: string[]): string | null {
     const arg = args[i];
     if (!arg.startsWith("-")) {
       nonFlagCount++;
-      if (nonFlagCount >= 2) {
-        return "mount with device and mountpoint arguments is not allowed. Only listing mounts (mount without arguments or with -l) is permitted.";
+      // ONE operand is already an action, not a listing: `mount /mnt` looks the target up in fstab and
+      // mounts it. The threshold was two — device AND mountpoint — which let the fstab form through.
+      // There is no read-only use for `mount <target>`; listing is the bare command or `-l`.
+      if (nonFlagCount >= 1) {
+        return JSON.stringify({
+          error: `mount with an operand ("${arg}") is not allowed — it mounts a filesystem, and this `
+            + "tool is read-only.",
+          hint: "A bare `mount` (or `mount -l`) lists mounted filesystems; `findmnt` gives the same "
+            + "information with structure.",
+        }, null, 2);
       }
       continue;
     }
@@ -1221,7 +1306,8 @@ function applyCommandConstraints(
  * Keyed on `command subcommand`. Only entries where a real substitute exists — an empty hint is worse
  * than none, and the `allowed` list beside it already covers the general case.
  */
-const SUBCOMMAND_ALTERNATIVES: Record<string, string> = {
+// Also a Map, for the same reason.
+const SUBCOMMAND_ALTERNATIVES = new Map<string, string>(Object.entries({
   "crictl exec": "Entering a container is not available here. Use `pod_exec` (which enters through the "
     + "Kubernetes API with the same read-only validation), or read what you need from outside with "
     + "`crictl inspect` / `crictl logs`.",
@@ -1230,7 +1316,41 @@ const SUBCOMMAND_ALTERNATIVES: Record<string, string> = {
   "crictl rm": "This tool is read-only; container lifecycle changes are out of scope.",
   "crictl rmi": "This tool is read-only; image removal is out of scope.",
   "crictl stop": "This tool is read-only; stopping a container is out of scope.",
-};
+}));
+
+/**
+ * Flags that turn a read-only tool into a command RUNNER, and other write switches that survive an
+ * `allowedSubcommands` match.
+ *
+ * `allowedSubcommands` returns as soon as the subcommand is in the set, so nothing after it is examined.
+ * That is how `ip -batch /tmp/commands` passed: `-batch` reads a FILE OF COMMANDS and executes them, so
+ * the whole read-only argument collapses. `bridge`, `tc` and `rdma` share the switch. `conntrack -z`
+ * zeroes counters, and `nvme`'s `--output-file` writes to disk.
+ */
+// A Map, not an object literal: a command named `constructor` or `toString` reads a Function off
+// Object.prototype, and the `.flags.test()` below then throws. This PR already fixed that class of bug
+// in the rule lookups and an existing test caught me reintroducing it here.
+const WRITE_FLAGS_BY_COMMAND = new Map<string, { flags: RegExp; why: string }>(Object.entries({
+  ip:        { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  bridge:    { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  tc:        { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  rdma:      { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  conntrack: { flags: /^(-z|--zero|-D|--delete|-F|--flush|-U|--update|-I|--create)$/,
+               why: "it modifies or clears connection tracking state" },
+  nvme:      { flags: /^(--output-file|-o|--fw-file)(=.*)?$/, why: "it writes to a file on the target" },
+}));
+
+/** A write switch present on an otherwise read-only command. */
+function checkWriteFlags(cmd: string, args: string[]): string | null {
+  const rule = WRITE_FLAGS_BY_COMMAND.get(cmd);
+  if (!rule) return null;
+  const hit = args.slice(1).find((a) => rule.flags.test(a));
+  if (!hit) return null;
+  return JSON.stringify({
+    error: `${cmd} "${hit}" is not allowed — ${rule.why}.`,
+    hint: "This tool is read-only. Issue the individual read commands instead of a batch or a write.",
+  }, null, 2);
+}
 
 export function validateCommandRestrictions(
   cmd: string,
@@ -1247,7 +1367,15 @@ export function validateCommandRestrictions(
   const ctxErr = applyContextPolicy(baseName, args, options?.context, options?.piped);
   if (ctxErr) return ctxErr;
 
-  // 2. Command-intrinsic constraints (validate function or declarative rules)
+  // 2. Write switches, BEFORE any per-command validator or allowedSubcommands match. Both of those
+  //    return as soon as the subcommand/action looks read-only and never examine the rest of the
+  //    argument list — which is how `ip -batch <file>` passed: validateIp skips leading flags to find
+  //    the object, so it never saw that `-batch` makes the whole thing a command runner. A permitted
+  //    verb does not make its flags safe.
+  const writeFlag = checkWriteFlags(baseName, args);
+  if (writeFlag) return writeFlag;
+
+  // 3. Command-intrinsic constraints (validate function or declarative rules)
   return applyCommandConstraints(baseName, args, def);
 }
 
@@ -1331,7 +1459,7 @@ export function argsNameSecrets(args: string[], subcommand: string): boolean {
       //
       // So the review's spelling (`secrets.v1`) is not itself reachable, but the family is — taking the
       // segment before the first dot covers every form kubectl actually accepts.
-      const type = part.split("/")[0].split(".")[0].trim().toLowerCase();
+      const type = normalizeResourceToken(part);
       if (type === "secret" || type === "secrets") return true;
     }
   }
