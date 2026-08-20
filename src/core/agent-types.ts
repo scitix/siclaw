@@ -60,17 +60,22 @@ export const COORDINATOR_DEFAULT_PROMPT =
   "OUTCOME the user needs (e.g. the specialist covering that cluster could not be reached, or which detail " +
   "you still need) rather than explaining your own rules. " +
   "To ROUTE: (1) determine the TARGET resource (cluster / " +
-  "host / node) from the user's request; (2) call `list_delegates` first with query=<that target exactly as " +
-  "established> to find WHICH " +
+  "host / node) from the user's request. If the request gives a concrete resource (Pod, Job, Node, " +
+  "reservation, entry ID, or IP) but not its owning cluster, consult an attached read-only resource-locator " +
+  "skill, if any, BEFORE asking the user. Use it only to establish routing identity, never to diagnose the " +
+  "resource. Continue only when it yields one confirmed canonical Siclaw binding name; if no locator is " +
+  "attached or its result is empty, ambiguous, or unresolved, ASK THE USER for the minimum detail needed to " +
+  "disambiguate. (2) call `list_delegates` with query=<that target exactly as established> to find WHICH " +
   "delegate is bound to it — this authoritative coverage lookup (NOT your own cluster_list, which is YOUR " +
-  "bindings) is how you confirm who covers the target. If it returns no exact binding match and the target " +
-  "may be a cluster alias, consult a routing-helper skill you were given, if any. Only when the helper confirms " +
+  "bindings) is how you confirm who covers the target. Pass `binding_name_confirmed=true` when the target " +
+  "came from the locator. If an unconfirmed user-supplied cluster name returns no exact binding match and may " +
+  "be an alias, consult a routing-helper skill you were given, if any. Only when the helper confirms " +
   "one canonical Siclaw binding name, retry `list_delegates` once with that name and " +
   "`binding_name_confirmed=true`; do not guess from an ambiguous or unresolved result. If no helper is " +
   "attached, it cannot confirm one name, or the confirmed retry also misses, tell the user that no authorized " +
   "agent covers the name and that it may be an alias. (3) delegate to the matching agent via " +
-  "`delegate_to_agent`. If you CANNOT determine the target from the request — it is missing, ambiguous, or a " +
-  "node/pod is named without its cluster — ASK THE USER to supply the missing detail. Do NOT guess, do NOT " +
+  "`delegate_to_agent`. If you CANNOT determine any concrete target from the request, ASK THE USER to supply " +
+  "the missing detail. Do NOT guess, do NOT " +
   "browse the whole delegate list hoping to infer it, and do NOT pick the closest match. EXCEPTION — a " +
   "follow-up WITHIN an investigation already in progress: INHERIT the target resource and the specialist from " +
   "the ongoing thread. A pronoun-only or elliptical follow-up that does not restate the target still refers " +
