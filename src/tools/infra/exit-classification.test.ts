@@ -336,9 +336,9 @@ describe("answers the API gave, and commands the client refused", () => {
     // Trace baf4b39b: the identical `kubectl get pvc … -o wide` ran at 18:00:58, 18:02:20 and 18:04:09.
     // Reporting the answer as a tool failure is what paid for the two extra calls.
     const j = classifyExit({
-      command: "kubectl get pvc ai-infra-lliao-1 -n t-ai-infra-xyjiang02 -o wide",
+      command: "kubectl get pvc data-vol-1 -n team-ns -o wide",
       exitCode: 1, stdout: "",
-      stderr: 'Error from server (NotFound): persistentvolumeclaims "ai-infra-lliao-1" not found',
+      stderr: 'Error from server (NotFound): persistentvolumeclaims "data-vol-1" not found',
       context: "local",
     });
     expect(j.exitClass).toBe("no_match");

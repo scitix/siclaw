@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { filterPodNoise, stdinExecCmd, prepareExecEnv } from "./exec-utils.js";
+import { filterPodNoise, stdinExecCmd, prepareExecEnv, spawnAsync } from "./exec-utils.js";
 
 describe("filterPodNoise", () => {
   it("removes kubectl exec SPDY stream diagnostics but preserves the real error", () => {
@@ -52,5 +52,29 @@ describe("the child environment does not point at the credential tree", () => {
     expect(env.childEnv).not.toHaveProperty("SICLAW_CREDENTIALS_DIR");
     // The things a child legitimately needs are still there.
     expect(env.childEnv).toHaveProperty("KUBECONFIG");
+  });
+});
+
+describe("the output cap and the UTF-8 decode fix have to coexist", () => {
+  // These arrived from opposite directions and conflicted in a rebase: main added
+  // `setEncoding("utf8")` so a multi-byte character split across two data events stops becoming two
+  // U+FFFD, and this branch added a ceiling so an unbounded read stops reading as a complete answer.
+  //
+  // Combining them naively reintroduces the first bug at the cut instead of at a chunk boundary: with
+  // decoding on the stream the chunks are STRINGS, so slicing at the cap can end on a lone surrogate —
+  // half an emoji. Hence the explicit trim, and hence this test.
+  it("keeps multi-byte output intact below the cap", async () => {
+    const text = "中".repeat(200_000) + "🎉";
+    const r = await spawnAsync("/bin/bash", ["-c", `printf '%s' '${text}'`], 30_000);
+    expect((r.stdout.match(/中/g) ?? []).length).toBe(200_000);
+    expect(r.stdout, "no replacement characters at any chunk boundary").not.toContain("�");
+    expect(r.truncated).toBeFalsy();
+  });
+
+  it("reports truncation and never cuts a character in half", async () => {
+    const r = await spawnAsync("/bin/bash", ["-c", "yes ABCDEFGHIJ | head -c 20000000"], 60_000);
+    expect(r.truncated, "the caller must be told this is a prefix").toBe(true);
+    expect(r.stdout.length).toBeLessThanOrEqual(1024 * 1024 * 10);
+    expect(/[\uD800-\uDBFF]$/.test(r.stdout), "the cut is not half a character").toBe(false);
   });
 });
