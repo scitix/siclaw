@@ -453,11 +453,18 @@ describe("sanitizeJSON", () => {
   });
 
   describe("error handling", () => {
-    it("returns error for invalid JSON", () => {
-      const result = sanitizeJSON("not json at all", "secret");
-      expect(result).toContain("error");
-      expect(result).toContain("Failed to parse");
-      expect(result).not.toContain("not json at all");
+    it("keeps non-JSON output instead of suppressing it, and says the structural pass did not run", () => {
+      // Was: replace everything with "Failed to parse … Raw output suppressed". The usual reason
+      // `-o json` returns non-JSON is that kubectl wrote an API error to stderr, so suppression deleted
+      // the `Error from server (NotFound)` the caller needed and made it look like a sanitizer fault.
+      // Four separate reviews reported that misdiagnosis.
+      const apiError = 'Error from server (NotFound): pods "gone" not found';
+      const out = sanitizeJSON(apiError, "pod");
+      expect(out, "the API error must survive").toContain("NotFound");
+      expect(out, "and the caller must be told the structural pass did not run").toMatch(/not JSON/i);
+      // Still redacted as TEXT, since the structural sanitizer genuinely did not apply.
+      const withSecret = "token=AKIAIOSFODNN7EXAMPLE not json";
+      expect(sanitizeJSON(withSecret, "pod")).not.toContain("AKIAIOSFODNN7EXAMPLE");
     });
   });
 
@@ -854,5 +861,73 @@ describe("a Secret managed with kubectl apply carries its values twice", () => {
     const out = sanitizeJSON(cm, "configmap");
     expect(out).not.toContain("hunter2");
     expect(out, "the non-secret part of the file survives").toContain("listen 8080");
+  });
+});
+
+describe("a payload the agent reshaped in the pipeline is still redacted", () => {
+  // From a real trace (9d088e8e, E018), reported as a high-severity finding: "sensitive env vars in
+  // kubectl JSON were not structurally redacted — access keys and API keys reached the tool result and
+  // the persisted trace in plaintext. This is an actual data exposure, not a theoretical risk."
+  //
+  // The command was
+  //   kubectl get pod X -n ns -o json | jq '{podIP:…,containers:[.spec.containers[]|{name,ports,env,…}]}'
+  // so what the sanitizer saw was jq's object: `containers` at the TOP level, no `kind`, no `items`.
+  // detectSensitiveResource still said "pod" from the args, the missing kind fell back to it, and
+  // sanitizePodEnv looked for `spec.containers` and found nothing. Four credential env vars went out
+  // verbatim, with outcome:success and no redaction notice.
+  //
+  // The text redactor is not a fallback here either — measured: it misses the JSON `{name, value}` env
+  // shape in compact AND pretty form.
+  const CANARY = "CANARY-CREDENTIAL-VALUE";
+  const reshaped = JSON.stringify({
+    podIP: "10.45.173.235",
+    containers: [{
+      name: "head",
+      ports: [{ containerPort: 6379 }],
+      env: [
+        { name: "LOG_SYNC_ACCESS_KEY_SECRET", value: CANARY },
+        { name: "SWANLAB_API_KEY", value: CANARY },
+        { name: "AI4SLAB_RUN_ROOT", value: "/volume/data/run04" },
+        // The real trace also carried LOG_SYNC_ACCESS_KEY_ID. It is deliberately NOT redacted and is
+        // asserted separately below: an access key ID is an identifier, not a credential — it cannot
+        // authenticate on its own, its paired *_SECRET is redacted, and masking it would make "which key
+        // is this pod configured with" unanswerable. Chasing identifiers is how a redactor becomes noise.
+        { name: "LOG_SYNC_ACCESS_KEY_ID", value: "AKIA-IDENTIFIER-NOT-A-SECRET" },
+      ],
+    }],
+    annotations: {},
+  }, null, 2);
+
+  it("redacts credentials with no kind, no items and no spec to walk", () => {
+    const out = sanitizeJSON(reshaped, "pod");
+    expect(out).not.toContain(CANARY);
+    expect(out).toContain("REDACTED");
+    // Names and non-secret values stay — the projection is still useful.
+    expect(out).toContain("SWANLAB_API_KEY");
+    expect(out).toContain("/volume/data/run04");
+    expect(out, "an access key ID is an identifier, not a credential").toContain("AKIA-IDENTIFIER-NOT-A-SECRET");
+  });
+
+  it("does not go silent when the shape is unrecognised", () => {
+    // The failure mode was not "redacted the wrong thing", it was redacting NOTHING and saying nothing.
+    const out = sanitizeJSON(reshaped, "pod");
+    expect(out, "a redaction must be announced").toMatch(/REDACTED|redacted/);
+  });
+
+  it("still redacts the native shape, and a Secret's data unconditionally", () => {
+    // The shape-agnostic sweep runs IN ADDITION to the structural pass, never instead of it: no name
+    // heuristic can decide that a Secret's `data` values are secret — the structural pass just knows.
+    const native = JSON.stringify({ kind: "Pod", spec: { containers: [{ env: [
+      { name: "MYSQL_PASSWORD", value: CANARY }] }] } });
+    expect(sanitizeJSON(native, "pod")).not.toContain(CANARY);
+    const secret = JSON.stringify({ kind: "Secret", data: { blandkey: "Ym9yaW5n" } });
+    const out = sanitizeJSON(secret, "secret");
+    expect(out, "a bland key name gives the heuristic nothing to match").not.toContain("Ym9yaW5n");
+  });
+
+  it("leaves an ordinary name/value pair alone", () => {
+    const cm = JSON.stringify({ items: [{ kind: "ConfigMap", data: { a: "b" },
+      metadata: { name: "c", labels: { name: "not-a-secret" } } }] });
+    expect(sanitizeJSON(cm, "configmap")).toContain("not-a-secret");
   });
 });

@@ -255,7 +255,9 @@ Examples:
         const { stdout, stderr } = await execFileAsync(
           "kubectl",
           kubectlArgs,
-          { timeout, env: env.childEnv, signal },
+          // Same ceiling restricted_bash uses. Without it Node's 1 MB default applied, and a large
+          // read was killed at that limit — the captured prefix then read as a complete answer.
+          { timeout, env: env.childEnv, signal, maxBuffer: 1024 * 1024 * 10 },
         );
 
         return {

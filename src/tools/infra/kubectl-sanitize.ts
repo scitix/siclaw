@@ -171,6 +171,17 @@ function redactOneLine(line: string): string | null {
  */
 export const REDACTION_NOTICE = "\n\n⚠️ Sensitive values have been redacted for security.";
 
+/**
+ * Appended when `-o json` output did not parse as JSON.
+ *
+ * Says what happened rather than hiding it: the structural sanitizer could not run, so the text got the
+ * line redactor instead. The caller needs to know which of the two it received — a Secret's `data` is
+ * redacted unconditionally by the structural pass, and only by that pass.
+ */
+export const NON_JSON_NOTICE =
+  "\n\n⚠️ This output is not JSON, so the structural sanitizer did not run — the text redactor was "
+  + "applied instead. If a value should have been masked structurally, treat this output as unverified.";
+
 // ── Line-level redaction ─────────────────────────────────────────────
 
 /**
@@ -447,10 +458,17 @@ export function sanitizeJSON(
   try {
     obj = JSON.parse(output);
   } catch {
-    // JSON parse failed — don't leak raw output, return error
-    return JSON.stringify({
-      error: "Failed to parse kubectl JSON output for sanitization. Raw output suppressed to prevent potential data leak.",
-    }, null, 2);
+    // NOT JSON. Suppressing it wholesale was worse than the leak it guarded against: the usual reason
+    // `-o json` returns non-JSON is that kubectl wrote an API error to stderr, and
+    // "Failed to parse … Raw output suppressed" replaced `Error from server (NotFound)` with what reads
+    // like a sanitizer malfunction. Four separate reviews reported that misdiagnosis; the actual
+    // NotFound was gone from the record entirely.
+    //
+    // So the text is kept, run through the line redactor first. That is strictly better than
+    // suppression in both directions: an API error survives, and a recognisable secret is still masked
+    // — the structural sanitizer never applied to this text anyway, since it does not parse.
+    const text = redactSensitiveContent(output);
+    return text + NON_JSON_NOTICE;
   }
 
   let redacted = false;
@@ -467,6 +485,10 @@ export function sanitizeJSON(
     // Not `redacted ||=` — that short-circuits and skips the remaining items.
     if (sanitizeObject(item, perItem)) redacted = true;
   }
+
+  // Shape-agnostic sweep over the WHOLE document, after the structural pass. This is what covers a
+  // payload the agent reshaped in the pipeline, where the structural walk has no path to follow.
+  if (redactSensitiveNameValuePairs(obj)) redacted = true;
 
   const sanitized = JSON.stringify(obj, null, 2);
   return redacted ? sanitized + REDACTION_NOTICE : sanitized;
@@ -545,6 +567,45 @@ function redactAppliedConfigInPlace(obj: any): boolean {
   if (cleaned === value) return false;
   ann[LAST_APPLIED_ANNOTATION] = cleaned;
   return true;
+}
+
+/**
+ * Redact `{name, value}` pairs with a sensitive name, ANYWHERE in the document.
+ *
+ * The structural sanitizers walk known paths — `spec.containers[].env` for a Pod, `data` for a Secret —
+ * which holds only while the payload keeps the shape kubectl produced. It routinely does not: the agent
+ * pipes through jq. A real trace shows
+ *
+ *   kubectl get pod X -o json | jq '{podIP:…,containers:[.spec.containers[]|{name,ports,env,…}]}'
+ *
+ * whose output has `containers` at the TOP level and no `kind` at all. `getItems` returned it as one
+ * item, the missing `kind` fell back to the command's "pod", and `sanitizePodEnv` looked for
+ * `spec.containers` and found nothing — so four credential env vars went to the model and into a
+ * persisted trace verbatim, with `outcome: success` and no notice. The text redactor does not cover it
+ * either: it does not recognise the JSON `{name, value}` env shape, in compact OR pretty form (measured).
+ *
+ * This pass is shape-agnostic on purpose: it asks only "is this an object with a string `name` and a
+ * string `value`", which is what an env entry looks like however the document was reshaped. It runs in
+ * ADDITION to the structural pass, never instead of it — the structural pass redacts a Secret's `data`
+ * unconditionally, which no name heuristic could do.
+ */
+function redactSensitiveNameValuePairs(node: unknown, depth = 0): boolean {
+  if (depth > 64 || node === null || typeof node !== "object") return false;
+  let redacted = false;
+  if (Array.isArray(node)) {
+    for (const child of node) if (redactSensitiveNameValuePairs(child, depth + 1)) redacted = true;
+    return redacted;
+  }
+  const obj = node as Record<string, unknown>;
+  if (typeof obj.name === "string" && typeof obj.value === "string" && obj.value !== REDACTED
+      && SENSITIVE_ENV_NAME_PATTERNS.some((re) => re.test(obj.name as string))) {
+    obj.value = REDACTED;
+    redacted = true;
+  }
+  for (const key of Object.keys(obj)) {
+    if (redactSensitiveNameValuePairs(obj[key], depth + 1)) redacted = true;
+  }
+  return redacted;
 }
 
 /** Sanitize a single Kubernetes object in place; returns whether anything was redacted. */

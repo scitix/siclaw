@@ -101,6 +101,16 @@ export function prepareExecEnv(kubeconfigRef?: KubeconfigRef, resolvedKubeconfig
  * Spawn a child process and collect stdout/stderr.
  * Supports timeout and AbortSignal for cancellation.
  */
+/**
+ * Ceiling on captured output, matching the one restricted_bash passes to execFile.
+ *
+ * This function accumulated without any limit. That is not merely a memory risk: a review reported a
+ * ~200k-line read whose captured prefix then read as a complete answer, and a search over it that found
+ * nothing was taken as proof of absence. A cap the caller can SEE is better than either an unbounded
+ * string or a silent cut.
+ */
+const SPAWN_OUTPUT_CAP_UNITS = 1024 * 1024 * 10;
+
 export function spawnAsync(
   cmd: string,
   args: string[],
@@ -109,10 +119,11 @@ export function spawnAsync(
   signal?: AbortSignal,
   /** Optional data to write to the child's stdin (pipe mode). */
   stdinData?: string,
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ stdout: string; stderr: string; truncated?: boolean }> {
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
+    let truncated = false;
     const child = spawn(cmd, args, {
       stdio: [stdinData !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
       env,
@@ -129,11 +140,28 @@ export function spawnAsync(
     // otherwise arrive as two U+FFFD — see background-bash-runner.ts.
     child.stdout!.setEncoding("utf8");
     child.stderr!.setEncoding("utf8");
+    // Both halves are load-bearing and they interact. Decoding on the stream means chunks arrive as
+    // STRINGS, so the cap counts UTF-16 code units rather than bytes — close enough for a memory
+    // ceiling, and it must not slice through a surrogate pair, or truncation would reintroduce exactly
+    // the mojibake `setEncoding` is here to prevent, just at the cut instead of at a chunk boundary.
+    const appendCapped = (buf: string, chunk: string): { text: string; hitCap: boolean } => {
+      if (buf.length >= SPAWN_OUTPUT_CAP_UNITS) return { text: buf, hitCap: true };
+      const next = buf + chunk;
+      if (next.length <= SPAWN_OUTPUT_CAP_UNITS) return { text: next, hitCap: false };
+      let cut = next.slice(0, SPAWN_OUTPUT_CAP_UNITS);
+      // A lone high surrogate at the cut is half a character; drop it.
+      if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+      return { text: cut, hitCap: true };
+    };
     child.stdout!.on("data", (chunk: string) => {
-      stdout += chunk;
+      const r = appendCapped(stdout, chunk);
+      stdout = r.text;
+      if (r.hitCap) truncated = true;
     });
     child.stderr!.on("data", (chunk: string) => {
-      stderr += chunk;
+      const r = appendCapped(stderr, chunk);
+      stderr = r.text;
+      if (r.hitCap) truncated = true;
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -141,10 +169,12 @@ export function spawnAsync(
     child.on("close", (code) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      if (code === 0) resolve({ stdout, stderr });
+      // `truncated` travels on BOTH paths. A capped read that then exits non-zero is the case where a
+      // partial prefix is most likely to be mistaken for a complete answer.
+      if (code === 0) resolve({ stdout, stderr, truncated });
       else
         reject(
-          Object.assign(new Error(`exit ${code}`), { code, stdout, stderr }),
+          Object.assign(new Error(`exit ${code}`), { code, stdout, stderr, truncated }),
         );
     });
     child.on("error", (err) => {
@@ -193,6 +223,8 @@ export interface ExecResult {
   stderr: string;
   exitCode: number | null;
   timedOut?: boolean;
+  /** Output hit the capture ceiling: what is here is a PREFIX, and a search over it proves nothing. */
+  truncated?: boolean;
 }
 
 // ── Container netns resolution ───────────────────────────────────────

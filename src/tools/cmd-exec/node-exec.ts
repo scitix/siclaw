@@ -473,7 +473,12 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       // No tail-window note here: it fires only for `kubectl logs --tail=N`, and `kubectl` is
       // whitelisted for restricted_bash alone (this tool passes no extraAllowed), so the command is
       // refused before it can run. See tail-truncation.test.ts, which pins that reachability.
-      const notes = judgment.annotation ? `\n${judgment.annotation}` : "";
+      // A capped read is a PREFIX. Saying so is the difference between "nothing matched" and "nothing
+      // matched in the part we kept" — a review reported the second being read as the first.
+      const notes = (judgment.annotation ? `\n${judgment.annotation}` : "")
+        + (execResult.truncated ? "\n[output_truncated: output hit the capture ceiling, so the text above "
+          + "is only the beginning — a search over it that finds nothing proves nothing. Narrow the "
+          + "command rather than retrying it unchanged.]" : "");
       return {
         content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
           stderr: filteredStderr || undefined,

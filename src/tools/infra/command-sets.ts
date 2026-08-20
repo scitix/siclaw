@@ -1388,7 +1388,9 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
           + `  kubectl get secrets -n <namespace>`;
       }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
-        + `${resource} in the cluster is the concern, so a selector does not lift it. Instead:\n`
+        + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
+        + `server-side --field-selector DOES narrow what the apiserver serializes, but this check does `
+        + `not yet distinguish the two — stated plainly rather than claiming no selector can help. Instead:\n`
         + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`
         + `   (add the fields you need — these two exist on every resource)\n`
         + `  kubectl get ${resource} -A -o wide                     (a fixed, bounded set of columns)\n`

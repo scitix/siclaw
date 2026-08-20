@@ -125,7 +125,7 @@ export function kubectlExec(
   namespace?: string,
   /** Optional data to pipe to kubectl's stdin. */
   stdinData?: string,
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ stdout: string; stderr: string; truncated?: boolean }> {
   const nsArgs = namespace ? ["-n", namespace] : [];
   return spawnAsync(
     "kubectl",

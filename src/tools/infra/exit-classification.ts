@@ -29,6 +29,7 @@ export type ExitClass =
   | "not_executable"
   | "target_reported_failure"
   | "interrupted"
+  | "output_truncated"
   | "channel_error";
 
 /**
@@ -49,7 +50,17 @@ export type ExitClass =
 const CHANNEL_ERROR_MARKERS: readonly RegExp[] = [
   /^error: unable to upgrade connection/m,
   /^error dialing backend/m,
-  /^Error from server/m,
+  // NOT a bare `/^Error from server/`. That matched every API answer, so `kubectl get pvc missing`
+  // returning NotFound was classified `channel_error` — whose annotation says "the target never ran the
+  // command". The API server answered; that is the most informative reply a kubectl call can get, and
+  // calling it a transport failure is a worse misdiagnosis than the generic error it replaced.
+  //
+  // Only the reasons that really mean "the request did not reach a decision" stay here. NotFound,
+  // Forbidden, AlreadyExists, Conflict, Invalid and BadRequest are the server's ANSWER and fall through
+  // to target_reported_failure.
+  /^Error from server \((?:Timeout|InternalError|ServiceUnavailable|ServerTimeout|GatewayTimeout)\)/m,
+  /^Error from server: etcdserver: request timed out/m,
+  /^Error from server: dial tcp/m,
   /^error: unable to use a TTY/m,
   /^error: Internal error occurred: error executing command in container/m,
   /^The connection to the server .* was refused/m,
@@ -126,6 +137,15 @@ const EXIT_1_MEANS_NOTHING_FOUND = new Set([
   "grep", "egrep", "fgrep", "zgrep", "bzgrep", "xzgrep",
   "pgrep", "pidof",
   "test", "[",
+  // `ps -p <pid>` exits 1 when no such process, `findmnt <path>` when nothing is mounted there. Both are
+  // the negative half of an existence check, which is what the caller asked.
+  //
+  // Deliberately NOT extended to `nvidia-smi` or `curl`, which two reviews also asked for: those exit
+  // non-zero because the TARGET reported a problem — an ECC error, a failed TLS verification — and that
+  // is a finding, not an empty result. `target_reported_failure` already tells the agent it is the
+  // target's own answer rather than a transport fault, which is the distinction those reviews wanted;
+  // calling a GPU fault "no match" would be the new untruth.
+  "ps", "findmnt",
 ]);
 
 /**
@@ -182,6 +202,24 @@ export function classifyExit(opts: {
       : { exitClass: "interrupted", isError: true, annotation: `[interrupted before producing output${detail}]` };
   }
 
+  // maxBuffer is NOT a channel failure, though a string `code` made it look like one: the command RAN,
+  // produced more than the capture limit, and was killed — and `err.stdout` holds the prefix that was
+  // captured. Classifying it `channel_error` told the agent "the command could not be started, so the
+  // target never ran it", which is the opposite of what happened, and left a truncated prefix looking
+  // like a complete result: a review reported exactly that false negative ("No matches found" over
+  // output that had been cut at the limit).
+  if (exitCode === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /maxBuffer length exceeded/i.test(stderr)) {
+    return {
+      exitClass: "output_truncated",
+      isError: true,
+      annotation:
+        "[output_truncated: the command RAN and produced more output than the capture limit, so it was "
+        + "stopped and the text above is only the beginning. It is NOT a complete result — a search over "
+        + "it that finds nothing proves nothing. Narrow the command (a tighter filter, fewer objects, a "
+        + "smaller window) rather than retrying it unchanged.]",
+    };
+  }
+
   if (typeof exitCode !== "number" || !Number.isInteger(exitCode)) {
     return {
       exitClass: "channel_error",
@@ -208,6 +246,23 @@ export function classifyExit(opts: {
   // A channel that failed produced no command output, so stdout must be empty for this to be
   // considered at all — otherwise a command of the agent's own that prints "error:" would be
   // misreported as a dead channel.
+  // Context matters for an API NotFound. Running kubectl AS the command (`local`), a NotFound is the
+  // server's answer about a resource. Running kubectl as the TRANSPORT (pod/node/host exec), the same
+  // string means the pod we tried to enter is gone — the command never ran, which is a channel failure.
+  // One string, two meanings, and only the context separates them.
+  if (context !== "local" && !stdout.trim()
+      && /^Error from server \((?:NotFound|Forbidden)\)/m.test(stderr)) {
+    return {
+      exitClass: "channel_error",
+      channelLeg: "transport",
+      isError: true,
+      annotation:
+        "[channel_error: the exec target could not be reached — the API refused or could not find it, so "
+        + "the command never ran and this status is NOT its answer. Re-resolve the target rather than "
+        + "retrying the same command.]",
+    };
+  }
+
   if (!stdout.trim() && NAMESPACE_ENTRY_MARKERS.some((re) => re.test(stderr))) {
     return {
       exitClass: "channel_error",

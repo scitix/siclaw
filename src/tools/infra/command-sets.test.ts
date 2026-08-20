@@ -1922,7 +1922,10 @@ describe("a kubectl -A refusal names a runnable alternative", () => {
     expect(err).toContain("kubectl get pods -A -o custom-columns=");
     expect(err).toContain("kubectl get pods -n <namespace> -o json");
     // And it says why a selector does not help, since that is the natural next thing to try.
-    expect(err).toContain("a selector does not lift it");
+    expect(err).toContain("client-side selector does not lift it");
+    // A server-side --field-selector DOES narrow what the apiserver serializes, so the refusal must
+    // not claim that no selector can help — a review reported being sent in a circle by that.
+    expect(err).toContain("--field-selector");
   });
 
   it("suggests only fields that exist on every resource", () => {

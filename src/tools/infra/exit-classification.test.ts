@@ -92,7 +92,7 @@ describe("classifyExit", () => {
         const j = classifyExit({ command: "cat /etc/hosts", exitCode: 1, stdout: "", stderr });
         expect(j.exitClass).toBe("channel_error");
         expect(j.isError).toBe(true);
-        expect(j.annotation).toContain("never ran the command");
+        expect(j.annotation).toMatch(/never ran|could not be reached/);
       });
     }
 
@@ -239,6 +239,90 @@ describe("which leg broke is a separate question from whose failure it was", () 
       const src = readFileSync(resolve(root, f), "utf8");
       if (!/\bclassifyExit\s*\(/.test(src)) continue;
       expect(src, `${f} classifies an exit but drops channelLeg`).toMatch(/channel_leg:\s*judgment\.channelLeg/);
+    }
+  });
+});
+
+describe("an API answer is not a transport failure", () => {
+  // `/^Error from server/` matched every API reply, so `kubectl get pvc missing` returning NotFound was
+  // classified channel_error — whose annotation says the target never ran the command. The API server
+  // answered; that is the most informative reply a kubectl call can get. Three reviews reported the
+  // NotFound being counted as a tool failure; the class made it worse by naming the wrong cause.
+  const err = (reason: string) => `Error from server (${reason}): the thing was not agreeable`;
+
+  it("treats a decision by the server as the target's answer", () => {
+    for (const reason of ["NotFound", "Forbidden", "AlreadyExists", "Conflict", "Invalid", "BadRequest"]) {
+      const j = classifyExit({ command: "kubectl get pvc x", exitCode: 1, stdout: "", stderr: err(reason), context: "local" });
+      expect(j.exitClass, reason).toBe("target_reported_failure");
+      expect(j.channelLeg, reason).toBeUndefined();
+    }
+  });
+
+  it("keeps the reasons that mean the request reached no decision", () => {
+    for (const reason of ["Timeout", "InternalError", "ServiceUnavailable"]) {
+      const j = classifyExit({ command: "kubectl get pods", exitCode: 1, stdout: "", stderr: err(reason), context: "local" });
+      expect(j.exitClass, reason).toBe("channel_error");
+    }
+    for (const stderr of ["Error from server: etcdserver: request timed out",
+                          "Error from server: dial tcp 10.0.0.1:6443: i/o timeout"]) {
+      expect(classifyExit({ command: "kubectl get pods", exitCode: 1, stdout: "", stderr, context: "local" }).exitClass).toBe("channel_error");
+    }
+  });
+
+  it("reads the SAME string as a channel failure when kubectl is the transport", () => {
+    // One string, two meanings, separated only by context: running kubectl AS the command, NotFound is
+    // an answer about a resource; running it as the transport for pod_exec, it means the pod we tried to
+    // enter is gone, so the command never ran.
+    for (const context of ["pod", "node", "host"]) {
+      const j = classifyExit({ command: "uptime", exitCode: 1, stdout: "", stderr: err("NotFound"), context });
+      expect(j.exitClass, context).toBe("channel_error");
+      expect(j.channelLeg, context).toBe("transport");
+    }
+  });
+});
+
+describe("a capture ceiling is not a failure to start", () => {
+  it("says the command RAN and its output is a prefix", () => {
+    // `err.code` is the string ERR_CHILD_PROCESS_STDIO_MAXBUFFER, which the string-code branch read as
+    // "the command could not be started, so the target never ran it" — the opposite of what happened,
+    // over a partial prefix that then read as a complete answer. A review reported exactly that false
+    // negative: a search over truncated output returning "No matches found".
+    for (const opts of [
+      { exitCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" as never, stderr: "" },
+      { exitCode: 1, stderr: "stdout maxBuffer length exceeded" },
+    ]) {
+      const j = classifyExit({ command: "strings /opt/app/bin", stdout: "prefix", ...opts, context: "pod" });
+      expect(j.exitClass).toBe("output_truncated");
+      expect(j.isError, "it IS a failed call — the answer is incomplete").toBe(true);
+      expect(j.annotation).toMatch(/RAN|proves nothing/);
+      expect(j.annotation, "must not claim the command never started").not.toMatch(/never ran|could not be started/);
+    }
+  });
+
+  it("leaves a real spawn failure alone", () => {
+    const j = classifyExit({ command: "x", exitCode: "ENOENT" as never, stdout: "", stderr: "", context: "pod" });
+    expect(j.exitClass).toBe("channel_error");
+  });
+});
+
+describe("the negative half of an existence check", () => {
+  it("treats ps and findmnt exit 1 as no match", () => {
+    for (const command of ["ps -p 12345", "findmnt /nope", "ps -p 1 | grep x"]) {
+      const j = classifyExit({ command, exitCode: 1, stdout: "", stderr: "", context: "node" });
+      expect(j.exitClass, command).toBe("no_match");
+      expect(j.isError, command).toBe(false);
+    }
+  });
+
+  it("does NOT extend that to a target reporting a problem", () => {
+    // Two reviews asked for nvidia-smi and curl to be included. They are the opposite case: those exit
+    // non-zero because the target found something — an ECC fault, a failed TLS verification — and that is
+    // a finding, not an empty result. `target_reported_failure` already says it is the target's own
+    // answer rather than a transport fault, which is the distinction those reviews actually wanted.
+    for (const [command, code] of [["nvidia-smi -q", 1], ["curl --fail https://x", 60]] as const) {
+      const j = classifyExit({ command, exitCode: code, stdout: "", stderr: "", context: "node" });
+      expect(j.exitClass, command).toBe("target_reported_failure");
+      expect(j.isError, command).toBe(true);
     }
   });
 });
