@@ -59,6 +59,28 @@ chmod 2750 /app/.siclaw/credentials/hosts 2>/dev/null || true
 # Group-readable files, for the setgid reader (kubectl) — not for sandbox, which is in no such group.
 find /app/.siclaw/credentials -type f -exec chmod 0640 {} \; 2>/dev/null || true
 
+# Verify the chowns above actually took effect, rather than trusting that they did.
+#
+# Every one of them ends in `|| true`, which is right — a standalone Docker run without CAP_CHOWN should
+# not be bricked by it — but it means the isolation can fail to apply in complete silence. The volume is
+# an emptyDir, mounted root-owned, so if the chown does not land the credential tree stays world-readable
+# and every child process can read it. The group guard above does NOT catch this: it checks sandbox's
+# group membership, which is a property of the image, not of the directory.
+#
+# The realistic way to get here is a spec change, not a bug: `runAsNonRoot: true`, a restricted Pod
+# Security Standard on the namespace, or CHOWN dropped from the capability list. The pod would come up
+# looking healthy.
+cred_owner="$(stat -c '%U:%G' /app/.siclaw/credentials 2>/dev/null || echo '?:?')"
+cred_mode="$(stat -c '%a' /app/.siclaw/credentials 2>/dev/null || echo '?')"
+if [ "$cred_owner" != "agentbox:kubecred" ] || [ "$cred_mode" != "750" ]; then
+  echo "FATAL: /app/.siclaw/credentials is $cred_owner mode $cred_mode, expected agentbox:kubecred mode 750." >&2
+  echo "       The permission fix did not take effect, so the credential tree is not isolated from" >&2
+  echo "       child processes. The container must start as root with CAP_CHOWN/CAP_FOWNER — check for" >&2
+  echo "       runAsNonRoot, a restricted PodSecurity policy, or a dropped capability." >&2
+  echo "       See docs/design/security.md §3 and ADR-010." >&2
+  exit 1
+fi
+
 chown -R agentbox:agentbox /app/.siclaw/skills 2>/dev/null || true
 chmod 0755 /app/.siclaw/skills 2>/dev/null || true
 

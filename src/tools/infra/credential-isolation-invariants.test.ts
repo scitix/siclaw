@@ -80,6 +80,35 @@ describe("credential isolation: the entrypoint does not re-open what the image c
     expect(entrypoint).toMatch(/chmod 2750 \/app\/\.siclaw\/credentials\/hosts/);
   });
 
+  it("refuses to start when the permission fix did not take effect", () => {
+    // Every chown ends in `|| true` — correct, so a standalone Docker run without CAP_CHOWN is not
+    // bricked — but it means the isolation can fail to apply in silence. The volume is an emptyDir,
+    // mounted root-owned, so a chown that does not land leaves the tree readable by every child. The
+    // group guard does not cover this: it checks sandbox's group membership, an image property, not the
+    // directory's owner.
+    //
+    // The realistic path here is a spec change, not a bug — `runAsNonRoot: true`, a restricted Pod
+    // Security Standard, or CHOWN dropped from the capability list — and the pod would look healthy.
+    // Verified against the spawner: the pod has no runAsUser and explicitly adds CHOWN/FOWNER, so root
+    // + the capability is the contract this depends on.
+    expect(entrypoint).toMatch(/stat -c '%U:%G' \/app\/\.siclaw\/credentials/);
+    expect(entrypoint).toMatch(/agentbox:kubecred.*expected|expected agentbox:kubecred/);
+    expect(entrypoint).toMatch(/FATAL: \/app\/\.siclaw\/credentials is/);
+    // and it must EXIT, not warn — a warning in a container log is not a control
+    const block = entrypoint.slice(entrypoint.indexOf("cred_owner="));
+    expect(block.slice(0, block.indexOf("\nfi")), "the check must exit non-zero").toContain("exit 1");
+  });
+
+  it("depends on a pod that starts as root with CAP_CHOWN, and says so", () => {
+    // The entrypoint cannot fix permissions without it, and the spawner is where that is decided. If
+    // this ever changes, the guard above turns a silent loss of isolation into a refusal to start —
+    // which is the point, but the pairing should be visible from here.
+    const spawner = readFileSync(resolve(repoRoot, "src/gateway/agentbox/k8s-spawner.ts"), "utf8");
+    expect(spawner).not.toMatch(/runAsNonRoot:\s*true/);
+    expect(spawner).toMatch(/"CHOWN"/);
+    expect(spawner).toMatch(/"FOWNER"/);
+  });
+
   it("keeps credential files group-readable for the setgid reader", () => {
     // 0640 is what lets setgid kubectl read a kubeconfig. It is only safe because no low-privilege user
     // is in that group — which is the assertion in the block above.

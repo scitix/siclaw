@@ -173,6 +173,23 @@ traversal means "kubectl and the owner" rather than "every child process". Each 
 then keeps its own group, setgid, so material written into it inherits the right one — `hosts/` stays
 `hostcred` instead of being flattened into `kubecred` by a recursive chown.
 
+**The permission fix is verified, not assumed.** Every chown in the entrypoint ends in `|| true`, so a
+standalone Docker run without `CAP_CHOWN` is not bricked — but that also means the isolation can fail to
+apply in silence. `/app/.siclaw/credentials` is an emptyDir, mounted root-owned, so a chown that does not
+land leaves the tree readable by every child process. The group guard does not cover this case: it checks
+`sandbox`'s group membership, a property of the image, not the directory's owner — so the tree could be
+world-readable with that guard passing.
+
+The entrypoint therefore re-reads owner and mode afterwards and refuses to start unless they are
+`agentbox:kubecred` mode `0750`. The realistic way to reach that refusal is a spec change rather than a
+bug — `runAsNonRoot: true`, a restricted Pod Security Standard on the namespace, or `CHOWN` dropped from
+the capability list — and without the check the pod would come up looking healthy.
+
+This is a contract with the spawner, which is where the dependency actually lives: the AgentBox pod sets
+no `runAsUser`, so it starts as root, and explicitly adds `CHOWN`, `FOWNER`, `SETUID`, `SETGID`. Both
+halves are asserted by `credential-isolation-invariants.test.ts`, because neither file states the pairing
+on its own.
+
 | `.siclaw/credentials/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- (via group) |
 | `/etc/siclaw/certs/` | agentbox:agentbox | 0600 | rw | -- | -- |
 | `.siclaw/config/settings.json` | agentbox:agentbox | 0600 | rw | -- | -- |
