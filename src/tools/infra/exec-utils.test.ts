@@ -64,8 +64,12 @@ describe("the output cap and the UTF-8 decode fix have to coexist", () => {
   // decoding on the stream the chunks are STRINGS, so slicing at the cap can end on a lone surrogate —
   // half an emoji. Hence the explicit trim, and hence this test.
   it("keeps multi-byte output intact below the cap", async () => {
-    const text = "中".repeat(200_000) + "🎉";
-    const r = await spawnAsync("/bin/bash", ["-c", `printf '%s' '${text}'`], 30_000);
+    // Generated INSIDE the shell rather than passed as argv. 200k CJK characters is ~600 KB of
+    // arguments, which the AgentBox image's ARG_MAX rejects with E2BIG — this test passed locally only
+    // because macOS allows a larger argument list, and it failed the moment it ran in the container.
+    // The subject here is the output path, so the input must not be the thing that breaks.
+    const r = await spawnAsync("/bin/bash",
+      ["-c", "for i in $(seq 1 20000); do printf '中中中中中中中中中中'; done; printf '🎉'"], 60_000);
     expect((r.stdout.match(/中/g) ?? []).length).toBe(200_000);
     expect(r.stdout, "no replacement characters at any chunk boundary").not.toContain("�");
     expect(r.truncated).toBeFalsy();
