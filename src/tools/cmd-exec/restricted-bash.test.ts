@@ -1598,9 +1598,44 @@ describe("a Secret may only be printed in a form that cannot show its values", (
     }
   });
 
+  it("finds the Secret wherever kubectl accepts it, not just as the first bare word", () => {
+    // Three payloads that defeated the first version of this check. It looked for "the resource" with a
+    // one-liner — the first token after the subcommand that does not start with `-` — which is wrong in
+    // two independent ways, and both were reachable:
+    //
+    //   secret/demo -o yaml            the type/name form: the token is not equal to `secret`
+    //   -o yaml secret demo            `yaml` is a flag VALUE and was taken as the resource
+    //   -n default secret demo -o yaml `default` likewise
+    //
+    // Fixed by testing EVERY non-flag token instead of guessing which one is the resource, which is what
+    // makes flag arity irrelevant — arity is the part that cannot be tracked across kubectl versions.
+    for (const cmd of [
+      "kubectl get secret/demo -o yaml",
+      "kubectl get secrets/demo -o jsonpath={.data.password}",
+      "kubectl get -o yaml secret demo",
+      "kubectl get -o jsonpath={.data.password} secret demo",
+      "kubectl get -n default secret demo -o yaml",
+      "kubectl get --namespace=kube-system secrets -o yaml",
+      "kubectl get pod,secret/demo -o yaml",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("does not chase abbreviations kubectl itself rejects", () => {
+    // `kubectl get sec` fails at the server ("the server doesn't have a resource type"), and Secrets have
+    // no registered short name — checked against a live cluster, so these are not holes. Matching them
+    // would only add false refusals on resources whose names happen to start with those letters.
+    expect(check("kubectl get sec -o yaml")).toBeNull();
+    expect(check("kubectl get secretproviderclasses -o yaml")).toBeNull();
+  });
+
   it("does not restrict other resources", () => {
     expect(check("kubectl get pods -o yaml")).toBeNull();
     expect(check("kubectl get cm x -o jsonpath={.data}")).toBeNull();
+    // A label value that merely contains the word is not a resource reference.
+    expect(check("kubectl get pods -l app=secret -o yaml")).toBeNull();
+    expect(check("kubectl get pod/mypod -o yaml")).toBeNull();
   });
 
   it("names only permitted alternatives in the refusal", () => {

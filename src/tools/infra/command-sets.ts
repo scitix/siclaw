@@ -1267,6 +1267,35 @@ const ALL_NS_ALWAYS_NEED_SELECTOR = new Set(["describe", "events", "top"]);
  * Returns a descriptive reason string if blocked, or null if allowed.
  */
 /**
+ * Does this argv name Secrets as a resource?
+ *
+ * Scans EVERY non-flag token rather than trying to find "the resource", which is what an earlier version
+ * did — and it picked flag VALUES: `kubectl get -o yaml secret demo` and
+ * `kubectl get -n default secret demo -o yaml` both slipped through with `yaml` / `default` mistaken for
+ * the resource. Scanning every positional makes flag arity irrelevant, and arity is exactly the thing
+ * that cannot be tracked reliably across kubectl versions.
+ *
+ * Handles the forms kubectl actually accepts: `secret`, `secrets`, `secret/name`, and comma lists
+ * (`secret,pod`). NOT abbreviations — verified against a live cluster, `kubectl get sec` is rejected by
+ * kubectl itself ("the server doesn't have a resource type"), and Secrets have no registered short name.
+ *
+ * Deliberate false positive: a ConfigMap literally named `secret` (`kubectl get cm secret -o yaml`) is
+ * refused. The wrong direction here leaks a credential; the wrong direction there is one confusing
+ * refusal, so this is the trade taken on purpose.
+ */
+export function argsNameSecrets(args: string[], subcommand: string): boolean {
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("-") || a === subcommand) continue;
+    for (const part of a.split(",")) {
+      const type = part.split("/")[0].trim().toLowerCase();
+      if (type === "secret" || type === "secrets") return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Output formats a Secret may be printed in.
  *
  * `-o json` is safe because the structural sanitizer redacts EVERY value under `data`/`stringData`
@@ -1289,9 +1318,7 @@ const SECRET_SAFE_FORMATS = new Set([null, "wide", "name", "json"]);
  */
 export function checkSecretOutputFormat(args: string[], subcommand: string): string | null {
   if (subcommand !== "get") return null;
-  const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "";
-  const isSecret = /^secrets?$/i.test(resource) || /(^|,)secrets?(,|$)/i.test(resource);
-  if (!isSecret) return null;
+  if (!argsNameSecrets(args, subcommand)) return null;
 
   const format = getKubectlOutputFormat(args);
   if (SECRET_SAFE_FORMATS.has(format ?? null)) return null;
@@ -1335,7 +1362,7 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";
       // custom-columns and yaml are refused outright for a Secret (checkSecretOutputFormat), so do not
       // suggest them there — a hint that names a refused command is worse than no hint.
-      if (/^secrets?$/i.test(resource)) {
+      if (argsNameSecrets(args, subcommand)) {
         return `"kubectl get secrets --all-namespaces -o ${format}" can return excessive data, and for `
           + `Secrets only -o json is permitted at all (values redacted, structure intact):\n`
           + `  kubectl get secrets -A -o json\n`
