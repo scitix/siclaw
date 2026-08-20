@@ -322,6 +322,24 @@ sanitizable output (env, printenv, crictl inspect) are handled by
 
 **Source**: `CONTAINER_SENSITIVE_PATHS` in `src/tools/infra/command-sets.ts:1262-1304`
 
+**What the patterns are matched against.** The raw command text *and* every quote-stripped argument
+containing `/`. Raw text alone is not enough: many of the patterns are end-anchored (`/etc/shadow$`,
+`\.key$`, `/proc/*/environ$`), and a closing quote breaks the anchor — `cat /etc/shadow` was refused
+while `cat "/etc/shadow"` was not. Measured across the list, 11 of 13 representative paths were
+reachable that way, including every TLS key form; the two that held did so because an unanchored rule
+(`/.ssh/`) happened to cover them.
+
+Only arguments containing `/` are re-checked, and the restriction is load-bearing rather than
+conservatism: several patterns (`id_rsa$`, `\.key$`) also match a bare word, so checking every argument
+would refuse `grep id_rsa /var/log/x` — searching for the string names no path and is a legitimate
+diagnostic. A bare relative filename (`cat "id_rsa"`) therefore still passes this text layer; widening
+it needs per-command operand knowledge, not a broader text rule.
+
+The pass is deliberately **command-agnostic** — it screens any command carrying the path, not a list of
+readers — so whitelisting a new tool cannot open a hole here. A GLOB that expands onto a sensitive path
+(`cat /etc/*`) is *not* caught: pre-dates this design, and closing it needs a rule that does not also
+refuse `cat /etc/*release*`.
+
 ### 4.3 Context-Based Whitelisting
 
 Different execution contexts allow different command sets:

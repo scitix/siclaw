@@ -7,7 +7,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { validateCommand } from "./command-validator.js";
-import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
+import { CONTAINER_SENSITIVE_PATHS, getContextAllowedSet } from "./command-sets.js";
 
 import { createPodExecTool } from "../cmd-exec/pod-exec.js";
 import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
@@ -298,5 +298,78 @@ describe("output sanitizer e2e: crictl inspect", () => {
   it("does not sanitize crictl ps", () => {
     const action = analyzeOutput("crictl", ["ps"]);
     expect(action).toBeNull();
+  });
+});
+
+describe("a sensitive path is refused however it is spelled, for every reader", () => {
+  // What this actually guards — checked by reverting each part:
+  //
+  //   1. Quote stripping in the sensitive-path pass. Matching the raw command text alone let a single
+  //      quote defeat every `$`-anchored pattern: `cat /etc/shadow` was refused, `cat "/etc/shadow"`
+  //      was not, because the text the regex saw ended in `"`. 11 of 13 sensitive paths were reachable
+  //      that way — /etc/{shadow,gshadow}, /proc/N/{environ,cmdline,maps}, /proc/kcore and every TLS key
+  //      form (.key/.p12/.pfx/.jks). The two that held did so by accident: the unanchored `/.ssh/` rule
+  //      happened to cover them. Reverting the fix brings 72 spellings back.
+  //   2. Coverage of the pattern list itself — dropping a path from CONTAINER_SENSITIVE_PATHS fails here.
+  //   3. That the pass stays COMMAND-AGNOSTIC. It screens any command carrying the path, which is why
+  //      whitelisting a new reader does NOT open a hole — verified by moving `strings` into a category
+  //      the local context admits, which changes nothing. That is worth pinning precisely because it is
+  //      the property people assume is per-command and would "optimise" away.
+  //
+  // Defence in depth, not the primary control: children run as `sandbox`, which cannot read a
+  // credential file at all. This is the layer that still holds when a command runs as the owner, and
+  // the only layer that is a text decision — which is what makes a quote enough to defeat it.
+  //
+  // The command list is the whitelisted set that can print a file, derived by probing all 587
+  // whitelisted commands across the four contexts. Only three did not refuse, and none reads a file:
+  const NON_READERS = new Set([
+    "printf",   // the path is a format string; it prints the literal
+    "echo",     // likewise — a glob is expanded by the shell, so it can list names, never contents
+    "curl",     // reads a file only via file:// / -T / -d @ / -K, each blocked separately
+  ]);
+
+  const CONTENT_PRINTERS = [
+    "cat", "tac", "head", "tail", "nl", "od", "xxd", "hexdump", "strings", "base64", "base32", "basenc",
+    "cut", "paste", "join", "comm", "diff", "cmp", "sort", "uniq", "shuf", "tr", "fold", "expand",
+    "unexpand", "pr", "rev", "split", "csplit", "fmt", "column", "grep", "egrep", "fgrep", "zgrep",
+    "sed", "awk", "perl", "tee", "jq", "yq", "wc", "look", "iconv", "zcat", "bzcat", "xzcat",
+  ];
+
+  // Literal paths only. A GLOB that expands to one of these — `cat /etc/*` reaching /etc/shadow — is a
+  // real gap, but it predates this work (measured identical on the pre-PR tree) and closing it needs a
+  // rule that does not also refuse `cat /etc/*release*`. Asserting it here would only pin the gap.
+  //
+  // The AgentBox's own credential tree is checked in `local` only, and that is not an oversight: in the
+  // other three contexts the command runs inside the target container, on the node, or on a remote
+  // host, where /app/.siclaw/credentials does not exist. Screening it there would refuse a path that
+  // means nothing, and asserting it would pin behaviour the tool has no reason to have.
+  const CONTAINER_PATHS = [
+    "/etc/shadow",
+    "/etc/kubernetes/admin.conf",
+    "/root/.ssh/id_rsa",
+    "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    "/var/lib/kubelet/pki/kubelet-client-current.pem",
+  ];
+  const AGENTBOX_PATHS = ["/app/.siclaw/credentials/clusters/x.kubeconfig"];
+
+  it("refuses a literal sensitive operand in every context that admits the command", () => {
+    const escaped: string[] = [];
+    let checked = 0;
+    for (const context of ["local", "pod", "node", "host"] as const) {
+      const allowed = getContextAllowedSet(context);
+      const opts = { context, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+      const paths = context === "local" ? [...CONTAINER_PATHS, ...AGENTBOX_PATHS] : CONTAINER_PATHS;
+      for (const c of new Set(CONTENT_PRINTERS)) {
+        if (!allowed.has(c) || NON_READERS.has(c)) continue;
+        for (const path of paths) {
+          for (const p of [`${c} ${path}`, `${c} -- ${path}`, `${c} "${path}"`]) {
+            checked++;
+            if (validateCommand(p, opts) === null) escaped.push(`[${context}] ${p}`);
+          }
+        }
+      }
+    }
+    expect(checked, "expected the whitelists to contain content-printing commands").toBeGreaterThan(200);
+    expect(escaped, "these can print a file and do not screen the operand").toEqual([]);
   });
 });

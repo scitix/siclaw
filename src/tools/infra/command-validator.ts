@@ -6,6 +6,7 @@
 import {
   getContextAllowedSet,
   getCommandBinary,
+  parseArgs,
   validateCommandRestrictions,
 } from "./command-sets.js";
 
@@ -446,8 +447,22 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   // arguments is a potential leak vector.
   if (options?.sensitivePathPatterns) {
     for (const cmd of commands) {
+      // Match the raw text AND each quote-stripped argument that looks like a path. Raw text alone let
+      // a single quote character defeat every `$`-anchored pattern: `cat /etc/shadow` was refused,
+      // `cat "/etc/shadow"` was not, because the text the regex saw ended in `"`. Measured across the
+      // pattern list, 11 of 13 sensitive paths were reachable that way — /etc/shadow, /etc/gshadow,
+      // /proc/N/{environ,cmdline,maps}, /proc/kcore and every TLS key form (.key/.p12/.pfx/.jks). The
+      // two that held did so by accident: an unanchored rule (`/.ssh/`) happened to cover them.
+      //
+      // Only arguments containing `/` are re-checked, and that restriction is load-bearing: the
+      // patterns describe paths, but several of them (`id_rsa$`, `\.key$`) also match a bare word, so
+      // checking every argument would refuse `grep -r id_rsa /var/log` — searching for the string is a
+      // legitimate diagnostic and names no path. A bare relative filename (`cat "id_rsa"`) therefore
+      // still slips through this pass; the owner-side controls remain, and widening it needs per-command
+      // operand knowledge rather than a text rule.
+      const pathish = parseArgs(cmd).filter((a) => a.includes("/"));
       for (const re of options.sensitivePathPatterns) {
-        const hit = re.exec(cmd);
+        const hit = re.exec(cmd) ?? pathish.map((a) => re.exec(a)).find((m) => m !== null) ?? null;
         if (!hit) continue;
         // Name WHAT matched and what to do instead. "Accessing sensitive paths is not allowed" told
         // the agent nothing: not which argument was the problem, not whether the command itself was
