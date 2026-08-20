@@ -32,6 +32,27 @@ fi
 
 echo "capability-check: all advertised commands present ($(echo "$commands" | wc -w) checked)"
 
+# The credential isolation, asserted at BUILD time: `sandbox` must hold no credential group.
+#
+# This is the property everything else rests on. With it, a bypass of the command whitelist yields
+# "Permission denied"; without it, the same bypass yields the kubeconfig — and the setgid bit on kubectl
+# grants access sandbox already has, so it isolates nothing. The image shipped in that state from 2026-04
+# to 2026-08 because nothing anywhere checked. Failing the build is the cheapest place to notice.
+for grp in kubecred hostcred; do
+  if id -nG sandbox 2>/dev/null | tr " " "\n" | grep -qx "$grp"; then
+    echo "capability-check FAILED — sandbox is a member of $grp." >&2
+    echo "Child processes could then read the materialized credentials directly, and kubectl's setgid" >&2
+    echo "bit would grant nothing they lack. Remove -G from the sandbox useradd in Dockerfile.agentbox." >&2
+    exit 1
+  fi
+done
+# And the reader that DOES need the group must still have it.
+if ! id -nG agentbox 2>/dev/null | tr " " "\n" | grep -qx kubecred; then
+  echo "capability-check FAILED — agentbox is not in kubecred; it owns the credential tree." >&2
+  exit 1
+fi
+echo "capability-check: sandbox holds no credential group; agentbox owns the tree"
+
 # `yq` on PATH must be the WRAPPER, not the real binary. Presence is not the property that matters
 # here: yq's expression language opens files on its own, so an image where /usr/local/bin/yq is the
 # plain binary hands every reader of this image an unrestricted file-read primitive. Asserted by

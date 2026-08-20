@@ -111,20 +111,35 @@ credential protection; application layers (2-6) are **secondary defense-in-depth
 
 Two users exist inside the AgentBox container:
 
-| User | UID | Groups (intended) | Groups (**as built today**) | Purpose |
-|------|-----|-------------------|------------------------------|---------|
-| `agentbox` | 1000 | `agentbox`, `kubecred` | `agentbox`, `kubecred`, `hostcred` | Main Node.js process. Owns credentials. |
-| `sandbox` | 1001 | `sandbox` | `sandbox`, **`kubecred`**, **`hostcred`** | All child processes (shell commands). |
+| User | UID | Groups | Purpose |
+|------|-----|--------|---------|
+| `agentbox` | 1000 | `agentbox`, `kubecred`, `hostcred` | Main Node.js process. Owns the credential tree. |
+| `sandbox` | 1001 | `sandbox` | All child processes (shell commands). No credential access. |
 
-> ⚠️ The `sandbox` column is the whole point of this layer, and the image does not currently match
-> it. `Dockerfile.agentbox` creates `sandbox` with `-G kubecred,hostcred`, so child processes can
-> read the materialized credentials directly and the setgid bit on `kubectl` grants access they
-> already have. **Everything below in §3 describes the intended design, not the deployed one** — see
-> §4.6 for what follows from that and what restoring it requires.
+`sandbox` holds **no** credential group, and that is the property everything else in this document
+rests on: a command that gets past the whitelist meets `Permission denied` rather than a kubeconfig.
+The one sandbox-side reader is `kubectl`, which reaches the cluster credentials through its setgid bit
+(§3.2) — a group membership on `sandbox` would give every other binary in the image the same access and
+leave that bit decorative.
 
-The main process (Node.js) runs as `agentbox`. When executing shell commands, it uses
+Host credentials need no sandbox-side reader at all: `ssh` is not in the command registry, so no child
+can dial one, and `host_exec` connects from the node process (running as `agentbox`, the owner) through
+the ssh2 library.
+
+> This was not true between 2026-04 and 2026-08. `sandbox` was granted both credential groups for a
+> setgid `ssh` reader that was never built, and the entrypoint's `chown -R agentbox:kubecred` over the
+> whole tree — correct when written in 2026-03, when the parent WAS a kubecred directory and no
+> low-privilege user was in that group — then re-opened at runtime the traversal the image itself
+> denied. The baked image looked correct; every running container had no isolation. Two guards now make
+> that state unreachable: the build fails (`agentbox-capability-check.sh`) and the container refuses to
+> start (`agentbox-entrypoint.sh`).
+
+The main process runs as `agentbox`. When executing shell commands, it uses
 `sudo -E -u sandbox -- bash -c '<command>'` to drop to the `sandbox` user. The `-E` flag
-preserves the sanitized environment (allowed by `SETENV` in sudoers).
+preserves the sanitized environment (allowed by `SETENV` in sudoers). That drop happens in exactly one
+place — `restricted-bash.ts` — so `node_exec`, `pod_exec`, `host_exec` and the script tools run in the
+node process, as `agentbox`; their safety comes from argument validation and credential brokering
+(§4, §7), not from this layer.
 
 ### 3.2 setgid kubectl
 
@@ -149,16 +164,15 @@ defense — they prevent the agent from misusing its own file tools, but cannot 
 shell commands. The `sandbox` user's filesystem permissions must independently enforce
 the correct access boundaries.
 
-#### Credentials & secrets (sandbox: no access — **not true as built; see §3.1 and §4.6**)
+#### Credentials & secrets (sandbox: no access)
 
-The `sandbox` column below is the intent. As built, `sandbox` is a member of `kubecred` and
-`hostcred`, so it reads every row in this table that is group-readable — and the entrypoint widens it
-further: `chown -R agentbox:kubecred /app/.siclaw/credentials` puts the `hosts/` subtree into
-`kubecred` too, discarding the per-type split the Dockerfile sets up (`clusters/` → `kubecred`,
-`hosts/` → `hostcred`, both `2750`).
+The parent directory is group `kubecred`, mode 0750 — it must be traversable by the group setgid
+`kubectl` runs with, or the one legitimate sandbox-side reader cannot reach a kubeconfig at all. What
+makes that safe is not the mode but the membership: `sandbox` is in no credential group, so kubecred
+traversal means "kubectl and the owner" rather than "every child process". Each credential type below it
+then keeps its own group, setgid, so material written into it inherits the right one — `hosts/` stays
+`hostcred` instead of being flattened into `kubecred` by a recursive chown.
 
-| Path | Owner | Mode | agentbox | sandbox (intended) | kubectl (setgid) |
-|------|-------|------|----------|--------------------|-------------------|
 | `.siclaw/credentials/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- (via group) |
 | `/etc/siclaw/certs/` | agentbox:agentbox | 0600 | rw | -- | -- |
 | `.siclaw/config/settings.json` | agentbox:agentbox | 0600 | rw | -- | -- |
@@ -397,27 +411,18 @@ With OS-level user isolation (Layer 1), the application-level command validation
 - Prevents shell injection via `$()`, backticks, redirections
 - Provides audit trail of blocked commands
 
-These `local`-context rules (pipeOnly, noFilePaths, blockedFlags) must **not** be relaxed on the
-grounds that OS isolation makes them redundant. That reasoning holds only if the sandbox user cannot
-read credential files, and in the current image it can:
+These `local`-context rules (pipeOnly, noFilePaths, blockedFlags) are defense-in-depth, as ADR-010
+intends — but do not read that as licence to relax them. They are what turns a parser bug into a
+refusal rather than a disclosure, and this whitelist is a TEXT match performed before the shell expands
+anything, so it cannot be complete by construction. One review cycle on this file found six bypasses of
+it (`$VAR` expansion, downward globs, `--flag=value`, an attached short-option value, a value-taking
+letter later in an option cluster, and an empty quoted pattern). Each was a full credential disclosure
+only because the OS layer was absent at the time; each is now merely a refused attempt.
 
-```
-useradd --uid 1001 ... -G kubecred,hostcred sandbox   # supplementary groups, not setgid
-chown -R agentbox:kubecred /app/.siclaw/credentials   # dir 0750, files 0640 → group-readable
-chgrp kubecred /usr/local/bin/kubectl; chmod 2755     # setgid adds nothing sandbox lacks
-```
-
-Because `sandbox` holds `kubecred` and `hostcred` as supplementary groups, every reader binary in
-the image can open the materialized credentials — the setgid bit on `kubectl` grants access the
-sandbox user already has. Layer 2 is consequently doing real work here rather than acting purely as
-defense-in-depth, which is the opposite of the intent recorded in ADR-010.
-
-Restoring the intended boundary means dropping those supplementary groups so group access comes
-only from a setgid binary. That is not a one-line change: `kubectl` is covered by its setgid bit,
-but nothing is setgid `hostcred`, so whatever reads host credentials as `sandbox` today has to be
-identified first — and where the reading is done by the node process (which runs as `agentbox`, the
-owner), the membership may simply be unnecessary. Until that is done, treat the command validation
-as load-bearing.
+The reason ADR-010 made OS isolation primary is exactly this asymmetry: the incident that motivated it
+(`kubectl get pods | cut -c1-2000 ~/.siclaw/credentials/kubeconfig`) was fixed at the application layer
+first, and the conclusion recorded there was that "the attack surface is fundamentally too large for
+application-level-only defense". Keep both layers.
 
 ---
 

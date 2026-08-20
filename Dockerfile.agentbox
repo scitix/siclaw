@@ -4,9 +4,14 @@
 #
 # Security: dual-user model (ADR-010, docs/design/security.md)
 #   agentbox — main Node.js process, owns credentials
-#   sandbox  — all child processes (shell commands), reads credentials via shared groups
+#   sandbox  — all child processes (shell commands). NO credential group: it must not be able to
+#              open a credential file at all. The only sandbox-side reader is kubectl, which reaches
+#              the cluster credentials through its setgid bit; a group membership here would hand
+#              every other binary in the image the same access and make that setgid bit decorative.
 #   kubectl  — setgid kubecred group, reads kubeconfig via group permission
-#   ssh (future host_exec) — will be setgid hostcred group, reads SSH credentials via group permission
+#   host credentials — no sandbox-side reader exists: `ssh` is not in the command whitelist, and
+#              host_exec dials from the node process (running as agentbox, the owner) via ssh2. The
+#              setgid `ssh` once planned here was never built and is not needed.
 
 # ── Build stage ──────────────────────────────────────────────────
 FROM node:22.19-slim AS builder
@@ -80,7 +85,7 @@ RUN userdel -r node 2>/dev/null || true \
     && groupadd --gid 1002 kubecred \
     && groupadd --gid 1003 hostcred \
     && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred agentbox \
-    && useradd --uid 1001 -M -s /bin/false -G kubecred,hostcred sandbox \
+    && useradd --uid 1001 -M -s /bin/false sandbox \
     && echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
     && chmod 440 /etc/sudoers.d/sandbox-exec \
     && chgrp kubecred /usr/local/bin/kubectl \
