@@ -1,3 +1,4 @@
+import { kubectlSubcommand, crictlSubcommand } from "./kubectl-sanitize.js";
 import { argsNameSecrets } from "./command-sets.js";
 import { detectSensitiveResource } from "./kubectl-sanitize.js";
 import { describe, it, expect } from "vitest";
@@ -505,5 +506,56 @@ describe("env and printenv output the redactor could not key on", () => {
     const r = out("env", [], "PASSWORD=first-line\nSECOND-LINE-SECRET\nSAFE=ok");
     expect(r).not.toContain("SECOND-LINE-SECRET");
     expect(r, "and the next record survives").toContain("SAFE=ok");
+  });
+});
+
+describe("there is ONE reader for a command's subcommand", () => {
+  it("nobody scans for the first non-dash argument by hand", async () => {
+    // This shape was written SIX times: `args.find(a => !a.startsWith("-"))`. Every copy had the same
+    // defect — a value-taking global flag before the verb hands back the flag's VALUE as the subcommand —
+    // and each copy failed differently: no sanitizer for a Secret read, no sanitizer for a crictl
+    // inspect, no Secret-into-pipe guard. Two of them I wrote myself, one of those in the very commit
+    // that consolidated the others.
+    //
+    // Anything needing a subcommand goes through subcommandSkippingFlagValues with its own arity table.
+    // The remaining hand-rolled scan is dcgmi's, whose miss is fail-CLOSED (an unrecognised subcommand
+    // is refused), so it cannot leak — it is listed explicitly rather than silently tolerated.
+    const { readFileSync, globSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const root = resolve(import.meta.dirname, "../../..");
+    const ALLOWED = new Set(["src/tools/infra/command-sets.ts"]);   // validateDcgmi, fail-closed
+    const offenders: string[] = [];
+    for (const f of globSync("src/tools/**/*.ts", { cwd: root })) {
+      if (f.endsWith(".test.ts") || ALLOWED.has(f)) continue;
+      const code = readFileSync(resolve(root, f), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      if (/\.find\(\s*\(\s*a(?:rg)?\s*(?:,\s*\w+\s*)?\)\s*=>[^)]*!\s*a(?:rg)?\.startsWith\("-"\)/.test(code)) {
+        offenders.push(f);
+      }
+    }
+    expect(offenders, "these scan for a subcommand by hand instead of using the shared reader").toEqual([]);
+  });
+
+  it("skips the values of value-taking flags, for kubectl and crictl alike", () => {
+    expect(kubectlSubcommand(["-n", "default", "get", "secret"])).toBe("get");
+    expect(kubectlSubcommand(["--context", "prod", "get", "pods"])).toBe("get");
+    expect(kubectlSubcommand(["--namespace=x", "get", "pods"]), "inline value consumes nothing").toBe("get");
+    expect(kubectlSubcommand(["get", "pods"])).toBe("get");
+    expect(crictlSubcommand(["-r", "/run/x.sock", "inspect", "abc"])).toBe("inspect");
+    expect(crictlSubcommand(["--runtime-endpoint", "unix:///y", "inspectp", "abc"])).toBe("inspectp");
+    expect(crictlSubcommand(["inspect", "abc"])).toBe("inspect");
+  });
+
+  it("attaches the crictl inspect sanitizer behind a global flag", () => {
+    // Not in the review — found by asking whether the kubectl bug generalised. `crictl -r <sock> inspect`
+    // returned the container's environment, credentials included, with no sanitizer.
+    const CANARY = "SECRET-ENV-CANARY";
+    const payload = JSON.stringify({ info: { config: { envs: [{ key: "API_KEY", value: CANARY }] } } });
+    for (const args of [["inspect", "abc"], ["-r", "/run/x.sock", "inspect", "abc"],
+                        ["--runtime-endpoint", "unix:///y", "inspectp", "abc"]]) {
+      const action = analyzeOutput("crictl", args);
+      expect(action, args.join(" ")).not.toBeNull();
+      expect(applySanitizer(payload, action!), args.join(" ")).not.toContain(CANARY);
+    }
   });
 });

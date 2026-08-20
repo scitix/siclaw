@@ -476,3 +476,29 @@ describe("refusals name what does work", () => {
     expect(err).toContain("/proc/<pid>/status");
   });
 });
+
+describe("a sensitive-output source cannot feed a pipe", () => {
+  const nd = { context: "node" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  it("refuses env and printenv into a pipe", () => {
+    // env output is redacted by matching `KEY=`, and that applies to the LAST stage. Measured leaking:
+    // `printenv PASSWORD | cut -c1-` prints a bare value with no key at all, and
+    // `env | grep PASSWORD | cut -d= -f2-` strips the key before anything sees it.
+    for (const cmd of ["printenv PASSWORD | cut -c1-", "env | grep PASSWORD | cut -d= -f2-",
+                       "env | grep PASSWORD", "printenv | grep KEY", "env | head -20"]) {
+      expect(validateCommand(cmd, nd), cmd).not.toBeNull();
+    }
+  });
+
+  it("names the alternative, because refusing the filter has a real cost", () => {
+    const err = validateCommand("env | grep PASSWORD", nd) ?? "";
+    expect(err).toMatch(/on its own/);
+    expect(err, "and says the unpiped output is already redacted").toMatch(/redacted/);
+  });
+
+  it("leaves the unpiped forms and unrelated pipes alone", () => {
+    for (const cmd of ["printenv PASSWORD", "printenv HOME", "env", "printenv",
+                       "cat /etc/hosts | grep localhost", "ip -j addr | jq ."]) {
+      expect(validateCommand(cmd, nd), cmd).toBeNull();
+    }
+  });
+});

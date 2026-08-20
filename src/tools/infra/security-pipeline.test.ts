@@ -48,14 +48,26 @@ describe("preExecSecurity", () => {
 
   describe("analyzeTarget: last-in-pipeline", () => {
     it("uses last command in pipeline for output analysis", () => {
-      // Pipeline: env (has sanitizer) | wc (no sanitizer)
-      // last-in-pipeline → uses wc → action is null
-      const result = preExecSecurity("env | wc -l", {
+      // The last stage decides the sanitizer, so a pipeline ending in a command that has none gets none.
+      // The fixture used to be `env | wc -l`, which is now REFUSED: losing env's redaction to a later
+      // stage is exactly the leak that refusal exists for, so it can no longer stand in for the general
+      // rule. `cat` carries no sanitizer either way.
+      const result = preExecSecurity("cat /var/log/messages | wc -l", {
         context: "node",
         analyzeTarget: "last-in-pipeline",
       });
       expect(result.error).toBeNull();
       expect(result.action).toBeNull();
+    });
+
+    it("refuses the shape that would lose the FIRST stage's sanitizer", () => {
+      // The other half of the same fact: when the source is protected by its shape and the last stage is
+      // not, analysing the last stage alone silently drops the protection.
+      for (const cmd of ["env | wc -l", "printenv PASSWORD | cut -c1-",
+                         "crictl inspect abc | jq -r '.info.config.envs[0].value'"]) {
+        const result = preExecSecurity(cmd, { context: "node", analyzeTarget: "last-in-pipeline" });
+        expect(result.error, cmd).not.toBeNull();
+      }
     });
 
     it("picks up sanitizer from last command", () => {

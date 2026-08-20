@@ -381,10 +381,42 @@ export function normalizeResourceToken(token: string): string {
  * ordinary kubectl usage, and the flag-arity table needed to see past it already existed here.
  */
 export function kubectlSubcommand(args: string[]): string | undefined {
+  return subcommandSkippingFlagValues(args, FLAGS_WITH_VALUE);
+}
+
+/**
+ * Value-taking global flags for `crictl`. Same problem, different binary: `crictl -r <sock> inspect X`
+ * read as subcommand `<sock>`, so the inspect sanitizer never attached and the container's environment —
+ * including its credentials — came back verbatim.
+ *
+ * Not reported by review; found by asking whether the kubectl bug generalised, which it did.
+ */
+const CRICTL_FLAGS_WITH_VALUE = new Set([
+  "-r", "--runtime-endpoint",
+  "-i", "--image-endpoint",
+  "-c", "--config",
+  "-t", "--timeout",
+]);
+
+export function crictlSubcommand(args: string[]): string | undefined {
+  return subcommandSkippingFlagValues(args, CRICTL_FLAGS_WITH_VALUE);
+}
+
+/**
+ * The first POSITIONAL argument, skipping flags and the values they consume.
+ *
+ * `args.find(a => !a.startsWith("-"))` is the shape this replaces, and it was written six times across
+ * this codebase. Every copy had the same defect — a global flag before the verb hands back the flag's
+ * VALUE as the subcommand — and each copy failed differently: no sanitizer for a Secret read, no
+ * sanitizer for a crictl inspect, no Secret-into-pipe guard. Anything that needs a subcommand goes
+ * through here with its own arity table.
+ */
+function subcommandSkippingFlagValues(args: string[], valueFlags: ReadonlySet<string>): string | undefined {
   let skipNext = false;
   for (const arg of args) {
     if (skipNext) { skipNext = false; continue; }
-    if (FLAGS_WITH_VALUE.has(arg)) { skipNext = true; continue; }
+    // `--flag=value` carries its value inline, so it consumes nothing extra.
+    if (valueFlags.has(arg)) { skipNext = true; continue; }
     if (arg.startsWith("-")) continue;
     return arg.toLowerCase();
   }

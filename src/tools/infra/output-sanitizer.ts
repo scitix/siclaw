@@ -14,6 +14,7 @@
 import {
   detectSensitiveResource,
   kubectlSubcommand,
+  crictlSubcommand,
   getOutputFormat,
   sanitizeJSON,
   redactSensitiveContent,
@@ -297,7 +298,9 @@ function sanitizeCrictlInspect(output: string): string {
 }
 
 OUTPUT_RULES["crictl"] = (args) => {
-  const sub = args.find((a) => !a.startsWith("-"));
+  // Skips the values of `-r`/`--runtime-endpoint` and friends: `crictl -r <sock> inspect X` otherwise
+  // read as subcommand `<sock>` and no sanitizer attached, so the container's env came back verbatim.
+  const sub = crictlSubcommand(args);
   if (sub === "inspect" || sub === "inspecti" || sub === "inspectp") {
     return { type: "sanitize", sanitize: sanitizeCrictlInspect, lineSafe: false };
   }

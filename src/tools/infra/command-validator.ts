@@ -1,3 +1,4 @@
+import { crictlSubcommand } from "./kubectl-sanitize.js";
 /**
  * Unified command validation: shell parsing, context-based whitelist, and restrictions.
  *
@@ -456,6 +457,53 @@ function sensitivePathHint(matched: string): string {
     + "the subject, that is a Portal operation, not a diagnostic one.";
 }
 
+/**
+ * A sensitive-output source feeding a PIPE has no redactor left that can reach it.
+ *
+ * These sources are protected by matching their SHAPE — `KEY=` for env, `.info.config.envs[]` for a
+ * crictl inspect — and that protection applies to the LAST stage's output. Measured leaking:
+ *
+ *   printenv PASSWORD | cut -c1-                          a bare value, no key to match
+ *   env | grep PASSWORD | cut -d= -f2-                     the key stripped before anything sees it
+ *   crictl inspect X | jq -r '.info.config.envs[0].value'   one env value, extracted
+ *
+ * Same shape as a Secret read into a pipe: the guarantee belongs to the source, and the pipe moves the
+ * output out from under it. Refused rather than patched downstream, because once the key is gone there is
+ * nothing to key on.
+ *
+ * Pod and ConfigMap reads are deliberately NOT here: their redaction is pattern-based, so it still
+ * applies to whatever the last stage prints, and refusing every filtered read would cost far more than it
+ * protects.
+ */
+function checkSensitiveSourceIntoPipe(commands: string[]): string | null {
+  if (commands.length < 2) return null;
+  const CRICTL_INSPECT = new Set(["inspect", "inspecti", "inspectp"]);
+  for (let i = 0; i < commands.length - 1; i++) {
+    const bin = getCommandBinary(commands[i]).toLowerCase();
+    if (bin === "env" || bin === "printenv") {
+      return JSON.stringify({
+        error: `Piping ${bin} into another command is not allowed — its values are redacted by matching `
+          + "`KEY=`, and a later stage can strip the key (or print a bare value) so nothing is left to "
+          + "match.",
+        hint: `Run \`${bin}\` on its own: the output comes back with sensitive values already redacted, `
+          + "and can be read directly.",
+      }, null, 2);
+    }
+    if (bin === "crictl") {
+      const sub = crictlSubcommand(parseArgs(commands[i]).slice(1));
+      if (sub && CRICTL_INSPECT.has(sub)) {
+        return JSON.stringify({
+          error: `Piping "crictl ${sub}" into another command is not allowed — its container environment `
+            + "is redacted structurally, and a filter can extract one value with nothing left to match.",
+          hint: "Use the tool's own `json_path` parameter to project the document — it is applied AFTER "
+            + "redaction — or run the inspect on its own and read the sanitized output.",
+        }, null, 2);
+      }
+    }
+  }
+  return null;
+}
+
 export function validateCommand(command: string, options?: ValidateCommandOptions): string | null {
   if (!command || !command.trim()) {
     return "Command must not be empty.";
@@ -525,6 +573,11 @@ export function validateCommand(command: string, options?: ValidateCommandOption
       allowed: [...contextCmds, ...(options?.extraAllowed ?? [])].sort(),
     }, null, 2);
   }
+
+  // 3b. A sensitive-output source feeding a pipe: the redactor keys on the source's shape, and a
+  //     downstream stage can remove it.
+  const sourcePiped = checkSensitiveSourceIntoPipe(commands);
+  if (sourcePiped) return sourcePiped;
 
   // 4. Pipeline validators (e.g., kubectl subcommand checks)
   if (options?.pipelineValidators) {

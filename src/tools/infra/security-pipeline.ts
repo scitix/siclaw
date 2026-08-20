@@ -16,7 +16,7 @@ import {
 } from "./output-sanitizer.js";
 import { processToolOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
-import { detectSensitiveResource, redactDocument, REDACTION_NOTICE } from "./kubectl-sanitize.js";
+import { detectSensitiveResource, redactDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
 
 // ── Pre-exec ────────────────────────────────────────────────────────
 
@@ -182,7 +182,9 @@ function resolveOutputAction(
       const bin = getCommandBinary(cmd);
       if (bin !== "kubectl") return false;
       const kArgs = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
-      const sub = kArgs.find((a) => !a.startsWith("-"))?.toLowerCase();
+      // Shared reader: a global flag before the verb (`kubectl -n default get secret …`) otherwise reads
+      // as subcommand "default", and the sensitive-kubectl fallback never engaged.
+      const sub = kubectlSubcommand(kArgs);
       if (sub !== "get" && sub !== "describe") return false;
       return detectSensitiveResource(kArgs) !== null;
     });
@@ -205,7 +207,7 @@ function resolveOutputAction(
       const bin = getCommandBinary(cmd);
       if (bin === "kubectl") {
         const args = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
-        const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+        const sub = kubectlSubcommand(args);
         if (sub === "exec") {
           const dashIdx = args.indexOf("--");
           if (dashIdx >= 0 && dashIdx < args.length - 1) {

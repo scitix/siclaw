@@ -10,6 +10,7 @@ import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { SAFE_SUBCOMMANDS, checkAllNamespacesRestriction, checkSecretOutputFormat, argsNameSecrets } from "../infra/command-sets.js";
+import { kubectlSubcommand } from "../infra/kubectl-sanitize.js";
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -62,7 +63,11 @@ function checkSecretIntoPipe(commands: string[]): string | null {
   for (let i = 0; i < commands.length - 1; i++) {
     const args = parseArgs(commands[i]);
     if (getCommandBinary(commands[i]).toLowerCase() !== "kubectl") continue;
-    const sub = args.find((a, idx) => idx > 0 && !a.startsWith("-"));
+    // kubectlSubcommand, not a fresh scan: the flag-arity table is the whole point. I wrote this line
+    // by hand in the very commit that consolidated the other two readers, and it reproduced the same
+    // bypass one layer up — `kubectl -n default get secret … | jq -r .data.password` read as subcommand
+    // "default" and was not guarded at all.
+    const sub = kubectlSubcommand(args.slice(1));
     if (sub !== "get" && sub !== "describe") continue;
     if (!argsNameSecrets(args, sub)) continue;
     return JSON.stringify({
