@@ -436,6 +436,26 @@ describe("event-capture handoff", () => {
     // BEFORE unsubscribe — adjacent statements, so nothing can land between them.
     expect(order).toEqual(["capture:on", "capture:off", "unsubscribe"]);
   });
+
+  // A setup failure never captured, so there is nothing for the attempt to give
+  // back — but the CALLER diverted delivery before the run started, so an exit
+  // that stays quiet leaves it diverted across the next microtask. Narrow and
+  // real: a primary that ran a prompt can still be compacting while a fallback
+  // candidate fails setup.
+  it("hands delivery back even when the attempt fails before it captures", async () => {
+    const order: string[] = [];
+    const brain = brainRecordingOrder(order);
+    brain.findModel = () => undefined;
+    const result = await runPromptWithModelRouting(
+      brain,
+      "hi",
+      { enabled: true, strategy: "ordered_fallback", candidates: [{ provider: "openai", modelId: "gone" }] },
+      createModelRouteState(),
+      { onEventCaptureChange: (capturing) => order.push(capturing ? "capture:on" : "capture:off") },
+    );
+    expect(result.exhausted).toBe(true);
+    expect(order).toEqual(["capture:off"]);
+  });
 });
 
 describe("resolveEffectivePolicy (single routing entry)", () => {

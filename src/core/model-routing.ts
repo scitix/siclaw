@@ -1007,6 +1007,13 @@ async function runAttempt(
     }
     model = brain.findModel(candidate.provider, candidate.modelId);
     if (!model) {
+      // Setup failed, so this attempt never captured — but the CALLER handed
+      // delivery over before the run began, and every exit from here has to hand
+      // it back or it stays diverted across the next microtask. Narrow but real:
+      // a primary that ran a prompt can still be compacting while a fallback
+      // candidate fails setup, and that compaction's end event lands in exactly
+      // this window.
+      onEventCaptureChange?.(false);
       unsubscribeProviderResponse?.();
       return {
         checkpoint,
@@ -1043,6 +1050,8 @@ async function runAttempt(
     );
   } catch (err) {
     const message = errorMessage(err);
+    // Same as the not-found exit above: every return hands delivery back.
+    onEventCaptureChange?.(false);
     unsubscribeProviderResponse?.();
     return {
       checkpoint,
