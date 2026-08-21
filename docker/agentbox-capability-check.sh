@@ -38,8 +38,16 @@ echo "capability-check: all advertised commands present ($(echo "$commands" | wc
 # "Permission denied"; without it, the same bypass yields the kubeconfig — and the setgid bit on kubectl
 # grants access sandbox already has, so it isolates nothing. The image shipped in that state from 2026-04
 # to 2026-08 because nothing anywhere checked. Failing the build is the cheapest place to notice.
+# `id -nG sandbox` failing is not the same as sandbox holding no group: a missing user yields an empty
+# list and every membership test below passes. Establish the user exists FIRST, so the check cannot pass
+# by accident.
+if ! sandbox_groups=$(id -nG sandbox 2>/dev/null); then
+  echo "capability-check FAILED: cannot read sandbox's groups — the user is missing or id failed." >&2
+  echo "       The isolation this checks cannot be verified, so refusing rather than assuming." >&2
+  exit 1
+fi
 for grp in kubecred hostcred; do
-  if id -nG sandbox 2>/dev/null | tr " " "\n" | grep -qx "$grp"; then
+  if printf '%s\n' "$sandbox_groups" | tr " " "\n" | grep -qx "$grp"; then
     echo "capability-check FAILED — sandbox is a member of $grp." >&2
     echo "Child processes could then read the materialized credentials directly, and kubectl's setgid" >&2
     echo "bit would grant nothing they lack. Remove -G from the sandbox useradd in Dockerfile.agentbox." >&2

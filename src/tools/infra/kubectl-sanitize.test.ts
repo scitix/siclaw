@@ -993,3 +993,59 @@ describe("a registry credential travels under names the key patterns do not cove
     expect(asString, "the whole block goes, names included").not.toContain("password");
   });
 });
+
+describe("an apply-managed object carries its values twice, whatever its kind", () => {
+  // `kubectl apply` writes a JSON copy of the whole object into an annotation. Secret and ConfigMap were
+  // handled and Pod was not, so an applied Pod's `-o json` — the one permitted format — returned its
+  // container env verbatim while the live `spec` copy beside it was redacted. Verified against a real
+  // applied Pod on a cluster: the canary appeared twice in the response and once after sanitizing.
+  const appliedPod = (envValue: string) => JSON.stringify({
+    apiVersion: "v1", kind: "Pod",
+    metadata: {
+      name: "p", annotations: {
+        "kubectl.kubernetes.io/last-applied-configuration": JSON.stringify({
+          apiVersion: "v1", kind: "Pod", metadata: { name: "p" },
+          spec: { containers: [{ name: "c", env: [{ name: "DB_PASSWORD", value: envValue }] }] },
+        }),
+      },
+    },
+    spec: { containers: [{ name: "c", env: [{ name: "DB_PASSWORD", value: envValue }] }] },
+  });
+
+  it("redacts the annotation copy of a Pod's env", () => {
+    const raw = appliedPod("POD-ANN-CANARY");
+    expect(raw.split("POD-ANN-CANARY").length - 1, "fixture really carries it twice").toBe(2);
+    const out = sanitizeJSON(raw, "pod");
+    expect(out).not.toContain("POD-ANN-CANARY");
+  });
+
+  it("keeps the annotation readable — the shape survives, the value does not", () => {
+    const out = sanitizeJSON(appliedPod("POD-ANN-CANARY"), "pod");
+    expect(out).toContain("last-applied-configuration");
+    expect(out).toContain("DB_PASSWORD");
+  });
+
+  it("covers an annotation under any key, not only the well-known one", () => {
+    const doc = JSON.stringify({
+      apiVersion: "v1", kind: "Pod",
+      metadata: { name: "p", annotations: {
+        "operator.example.com/snapshot": JSON.stringify({
+          spec: { containers: [{ name: "c", env: [{ name: "API_TOKEN", value: "OTHER-KEY-CANARY" }] }] },
+        }),
+      } },
+      spec: { containers: [{ name: "c", env: [] }] },
+    });
+    expect(sanitizeJSON(doc, "pod")).not.toContain("OTHER-KEY-CANARY");
+  });
+
+  it("leaves an ordinary annotation alone", () => {
+    const doc = JSON.stringify({
+      apiVersion: "v1", kind: "Pod",
+      metadata: { name: "p", annotations: { "example.com/owner": "team-sre", "example.com/rev": "12" } },
+      spec: { containers: [{ name: "c", env: [] }] },
+    });
+    const out = sanitizeJSON(doc, "pod");
+    expect(out).toContain("team-sre");
+    expect(out).toContain("\"12\"");
+  });
+});

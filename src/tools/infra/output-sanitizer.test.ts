@@ -496,9 +496,14 @@ describe("env and printenv output the redactor could not key on", () => {
       expect(r, bin).not.toContain("zzz");
       expect(r, bin).toContain("SAFE=x");
     }
-    // And it is no longer claimed to be streamable per line, because it has no lines.
+    // Neither form is streamable per line, and for two different reasons: `-0` output has no lines at
+    // all, and plain `env` output has RECORDS that span lines — `redactEnvOutput` folds continuation
+    // lines before matching, which is what makes the multi-line case below work and is exactly the state
+    // a per-batch streaming call does not have. This assertion said `true` for the plain form while the
+    // next test required folding; they could not both be right.
     expect(analyzeOutput("env", ["-0"])?.lineSafe).toBe(false);
-    expect(analyzeOutput("env", [])?.lineSafe).toBe(true);
+    expect(analyzeOutput("env", [])?.lineSafe).toBe(false);
+    expect(analyzeOutput("printenv", [])?.lineSafe).toBe(false);
   });
 
   it("redacts a multi-line value to its end", () => {

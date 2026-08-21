@@ -514,37 +514,96 @@ export function detectSensitiveResource(
 }
 
 /**
- * Parse -o / --output flag from kubectl args.
+ * Short flags that consume the next token, so a cluster ends at them.
  *
- * Handles: -o json, -o=json, --output json, --output=json,
- *          -o jsonpath='{...}', -o=jsonpath='{...}'
- * Returns format name or null for default table output.
+ * Read off `kubectl get --help` / `logs --help` rather than recalled: `-o -n -l -c -L -k` take values,
+ * `-A -R -w -p -i -t` do not. `-f` is ambiguous — a filename in `get`/`apply`, a boolean `--follow` in
+ * `logs` — and is listed as value-taking because that is the reading that consumes MORE, which cannot
+ * cause a format or `-A` declaration later in the cluster to be missed.
  */
-export function getOutputFormat(args: string[]): string | null {
+const SHORT_FLAGS_WITH_VALUE = new Set(["o", "n", "l", "c", "s", "v", "L", "k", "f"]);
+
+/**
+ * Every output-format declaration in an argv, in the order kubectl sees them.
+ *
+ * Two facts about kubectl's real grammar, both measured against a live cluster, and each was a bypass:
+ *
+ *   LAST WINS.  `kubectl get secret x -o json -o jsonpath={.data.password}` returns the bare base64.
+ *               Both readers here returned the FIRST format, so a Secret-safe `-o json` in front of an
+ *               unsafe one passed the check and kubectl then printed the value.
+ *   CLUSTERS.   pflag reads `-Ao json` and `-Aojson` as `-A` plus `-o json`. Both readers only matched a
+ *               token STARTING with `-o`, so `kubectl get secrets -Ao json` was read as table output —
+ *               permitted, and with no sanitizer attached, while kubectl returned every Secret as JSON.
+ *
+ * Returning the whole list rather than one answer is deliberate: the caller that decides whether a
+ * command may run must refuse if ANY declared format is unsafe (kubectl only prints the last, but a
+ * command carrying an unsafe one is not a command worth defending), while the caller choosing a sanitizer
+ * wants the effective one. One reader, two questions, no third copy.
+ */
+export function kubectlOutputFormats(args: string[]): string[] {
+  const formats: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
-    // --output=json or --output json
+    // `--template=X` is the alias for `-o go-template=X`; `--raw` is not a format at all but a raw API
+    // passthrough, which no printer and no sanitizer covers. Both belong in this list.
+    if (arg === "--template" || arg.startsWith("--template=")) { formats.push("go-template"); continue; }
+    if (arg === "--raw" || arg.startsWith("--raw=")) { formats.push("raw"); continue; }
+
     if (arg === "--output" || arg === "-o") {
       const next = args[i + 1];
-      if (next && !next.startsWith("-")) {
-        return extractFormatName(next);
-      }
+      if (next && !next.startsWith("-")) { formats.push(extractFormatName(next)); i++; }
       continue;
     }
-    if (arg.startsWith("--output=")) {
-      return extractFormatName(arg.slice("--output=".length));
-    }
-    if (arg.startsWith("-o=")) {
-      return extractFormatName(arg.slice("-o=".length));
-    }
-    // kubectl shorthand: -ojson, -oyaml (no space, no equals)
-    if (arg.startsWith("-o") && arg.length > 2 && !arg.startsWith("--")) {
-      return extractFormatName(arg.slice(2));
+    if (arg.startsWith("--output=")) { formats.push(extractFormatName(arg.slice(9))); continue; }
+    if (arg.startsWith("-o=")) { formats.push(extractFormatName(arg.slice(3))); continue; }
+    if (arg.startsWith("--")) continue;
+
+    // A short cluster. Walk it: a value-taking flag ends the cluster and claims the rest of the token,
+    // or the next token when nothing is left. Unknown letters are treated as booleans and scanning
+    // CONTINUES, so an `o` or an `A` behind one is still seen.
+    if (arg.startsWith("-") && arg.length > 1) {
+      for (let k = 1; k < arg.length; k++) {
+        const ch = arg[k];
+        if (!SHORT_FLAGS_WITH_VALUE.has(ch)) continue;
+        let value = arg.slice(k + 1);
+        if (value.startsWith("=")) value = value.slice(1);
+        if (value === "") {
+          const next = args[i + 1];
+          if (next && !next.startsWith("-")) { value = next; i++; }
+        }
+        if (ch === "o" && value !== "") formats.push(extractFormatName(value));
+        break;   // the rest of the token was this flag's value
+      }
     }
   }
+  return formats;
+}
 
-  return null;
+/** Does this argv declare `-A` / `--all-namespaces`, including inside a short cluster? */
+export function kubectlAllNamespaces(args: string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--all-namespaces" || arg === "-A") return true;
+    if (arg.startsWith("--all-namespaces=")) return arg.slice(17) !== "false";
+    if (!arg.startsWith("-") || arg.startsWith("--")) continue;
+    // In a cluster, `A` counts wherever it appears before a value-taking flag consumes the rest.
+    for (let k = 1; k < arg.length; k++) {
+      if (arg[k] === "A") return true;
+      if (SHORT_FLAGS_WITH_VALUE.has(arg[k])) break;
+    }
+  }
+  return false;
+}
+
+/**
+ * The format kubectl will actually use — the LAST declaration, or null for default table output.
+ *
+ * Sanitizer-side callers want this one. Callers deciding whether the command may run at all should use
+ * `kubectlOutputFormats` and reject on any unsafe entry.
+ */
+export function getOutputFormat(args: string[]): string | null {
+  const formats = kubectlOutputFormats(args);
+  return formats.length > 0 ? formats[formats.length - 1] : null;
 }
 
 /** Extract base format name: "jsonpath='{...}'" → "jsonpath" */
@@ -659,37 +718,7 @@ function getItems(obj: any, depth = 0): any[] {
  */
 const LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration";
 
-/** Redact an annotation that carries a copy of the object. Returns whether anything changed. */
-function redactAppliedConfigAnnotation(obj: any): boolean {
-  const ann = obj?.metadata?.annotations;
-  if (!ann || typeof ann !== "object") return false;
-  let redacted = false;
-  for (const key of Object.keys(ann)) {
-    // Keyed on the well-known name, but not ONLY on it: any annotation holding a serialized object with
-    // a data/stringData member is the same disclosure under a different key (a controller's own
-    // last-applied copy, an operator's snapshot).
-    const value = ann[key];
-    if (typeof value !== "string") continue;
-    const carriesData = key === LAST_APPLIED_ANNOTATION
-      || /"(?:data|stringData)"\s*:\s*\{/.test(value);
-    if (!carriesData) continue;
-    ann[key] = REDACTED;
-    redacted = true;
-  }
-  return redacted;
-}
 
-/** ConfigMap variant: the annotation copy is judged by the same patterns as the entries themselves. */
-function redactAppliedConfigInPlace(obj: any): boolean {
-  const ann = obj?.metadata?.annotations;
-  if (!ann || typeof ann !== "object") return false;
-  const value = ann[LAST_APPLIED_ANNOTATION];
-  if (typeof value !== "string") return false;
-  const cleaned = redactSensitiveContent(value);
-  if (cleaned === value) return false;
-  ann[LAST_APPLIED_ANNOTATION] = cleaned;
-  return true;
-}
 
 /**
  * Redact `{name, value}` pairs with a sensitive name, ANYWHERE in the document.
@@ -796,27 +825,98 @@ function redactRegistryAuth(node: unknown, insideAuths = false, depth = 0): bool
 
 /** Sanitize a single Kubernetes object in place; returns whether anything was redacted. */
 function sanitizeObject(obj: any, resourceType: SensitiveResourceType): boolean {
+  let redacted = false;
   switch (resourceType) {
     case "secret": {
-      // All three must run — `||` would short-circuit and leave the later ones raw.
+      // Both must run — `||` would short-circuit and leave the later one raw.
       const data = redactAllValues(obj, "data");
       const stringData = redactAllValues(obj, "stringData");
-      const applied = redactAppliedConfigAnnotation(obj);
-      return data || stringData || applied;
+      redacted = data || stringData;
+      break;
     }
 
     case "configmap": {
       const data = redactByPattern(obj, "data");
       const binaryData = redactByPattern(obj, "binaryData");
-      // Same annotation, same copy of `data` — a ConfigMap's entries are judged by pattern rather than
-      // redacted wholesale, so run the annotation through the text redactor instead of blanking it.
-      const applied = redactAppliedConfigInPlace(obj);
-      return data || binaryData || applied;
+      redacted = data || binaryData;
+      break;
     }
 
     case "pod":
-      return sanitizePodEnv(obj);
+      redacted = sanitizePodEnv(obj);
+      break;
   }
+
+  // `kubectl apply` keeps a JSON copy of the WHOLE object it was given in an annotation, so every
+  // structural pass above has to run a second time on that copy. It is handled here rather than per kind
+  // because doing it per kind is how a kind gets missed: Secret and ConfigMap were covered, Pod was not,
+  // and an apply-managed Pod's `-o json` — the one permitted format — returned its container env
+  // verbatim. Measured against a real applied Pod: the canary appeared twice in the response and once
+  // after sanitizing.
+  const applied = redactAppliedConfig(obj, resourceType);
+  return redacted || applied;
+}
+
+/**
+ * Redact the `last-applied-configuration` copy with the same passes as the live object.
+ *
+ * The copy is a JSON STRING, so the text redactor cannot see the shapes that matter — it does not
+ * recognise the `{name, value}` env form in either compact or pretty JSON, which is documented on
+ * `redactSensitiveNameValuePairs` and is exactly why the Pod case leaked. So the string is parsed,
+ * sanitized structurally, and re-serialized; only when it does not parse does the text redactor apply.
+ */
+function redactAppliedConfig(obj: any, resourceType: SensitiveResourceType): boolean {
+  const ann = obj?.metadata?.annotations;
+  if (!ann || typeof ann !== "object") return false;
+
+  // EVERY annotation whose value is a serialized object, not only the well-known key. A controller's own
+  // snapshot or an operator's copy is the same disclosure under a different name, and the predecessor of
+  // this function already handled that — narrowing it to `last-applied` while widening what it does to
+  // the value would have been a straight regression, caught by the test that pins it.
+  let any = false;
+  for (const key of Object.keys(ann)) {
+    const raw = ann[key];
+    if (typeof raw !== "string" || raw === "") continue;
+    const wellKnown = key === LAST_APPLIED_ANNOTATION;
+    // A cheap shape test for the others, so an ordinary annotation string is not parsed on every object.
+    if (!wellKnown && !/"(?:data|stringData|env|containers|spec)"\s*:/.test(raw)) continue;
+    if (redactOneAnnotation(ann, key, raw, resourceType)) any = true;
+  }
+  return any;
+}
+
+function redactOneAnnotation(
+  ann: Record<string, any>,
+  annKey: string,
+  value: string,
+  resourceType: SensitiveResourceType,
+): boolean {
+  let parsed: any;
+  try { parsed = JSON.parse(value); } catch { parsed = undefined; }
+  if (parsed && typeof parsed === "object") {
+    // A Secret's copy is blanked wholesale, as the live object is; the others get their own passes plus
+    // the shape-agnostic sweep, which covers a copy whose shape does not match this kind.
+    let hit = false;
+    if (resourceType === "secret") {
+      hit = redactAllValues(parsed, "data") || redactAllValues(parsed, "stringData") || hit;
+    } else if (resourceType === "configmap") {
+      hit = redactByPattern(parsed, "data") || redactByPattern(parsed, "binaryData") || hit;
+    } else if (resourceType === "pod") {
+      hit = sanitizePodEnv(parsed) || hit;
+    }
+    hit = redactSensitiveNameValuePairs(parsed) || hit;
+    hit = redactRegistryAuth(parsed) || hit;
+    if (hit) {
+      ann[annKey] = JSON.stringify(parsed);
+      return true;
+    }
+    return false;
+  }
+
+  const cleaned = redactSensitiveContent(value);
+  if (cleaned === value) return false;
+  ann[annKey] = cleaned;
+  return true;
 }
 
 /** Unconditionally replace all values in obj[field] with REDACTED */

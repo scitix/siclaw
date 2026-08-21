@@ -22,8 +22,16 @@ fi
 # binary in the image can open the credentials and the setgid bit on kubectl is decorative — the state
 # this image shipped in between 2026-04 and 2026-08. Refuse to start rather than run with the isolation
 # silently absent.
+# `id -nG sandbox` failing is not the same as sandbox holding no group: a missing user yields an empty
+# list and every membership test below passes. Establish the user exists FIRST, so the check cannot pass
+# by accident.
+if ! sandbox_groups=$(id -nG sandbox 2>/dev/null); then
+  echo "FATAL: cannot read sandbox's groups — the user is missing or id failed." >&2
+  echo "       The isolation this checks cannot be verified, so refusing rather than assuming." >&2
+  exit 1
+fi
 for grp in kubecred hostcred; do
-  if id -nG sandbox 2>/dev/null | tr " " "\n" | grep -qx "$grp"; then
+  if printf '%s\n' "$sandbox_groups" | tr " " "\n" | grep -qx "$grp"; then
     echo "FATAL: sandbox is a member of $grp — credential isolation is not in effect." >&2
     echo "       Remove -G from the sandbox useradd; see docs/design/security.md §3 and ADR-010." >&2
     exit 1

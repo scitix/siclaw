@@ -4,7 +4,7 @@ import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateCommand, extractCommands } from "./command-validator.js";
-import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
+import { CONTAINER_SENSITIVE_PATHS, parseArgs } from "./command-sets.js";
 
 /**
  * The tokenizers in `command-validator.ts` model bash's quoting rules. Every defect found in them so far
@@ -281,5 +281,40 @@ describe("what the tokenizer produces, for the record", () => {
   it("a separator inside a quote is data", () => {
     expect(extractCommands("echo 'a;b'")).toEqual(["echo 'a;b'"]);
     expect(extractCommands('echo "a;b"')).toEqual(['echo "a;b"']);
+  });
+});
+
+describe("ANSI-C escapes that rewrite a path", () => {
+  // `$'…'` decodes escapes, so the argv the process receives is not the text that was screened. Octal and
+  // hex were decoded here; `\u`/`\U` were not, and bash 4.2+ decodes those too — measured in bash 5.2,
+  // where `cat $'\u002fetc\u002fhostname'` reads the real file. The gap mattered because `cut`,
+  // `hexdump` and `od` are whitelisted and have no content redactor, so the path was readable.
+  const SPELLINGS = [
+    "$'\\x2fetc\\x2fshadow'",              // hex — was already covered
+    "$'\\057etc\\057shadow'",              // octal — was already covered
+    "$'\\u002fetc\\u002fshadow'",          // \u — was NOT
+    "$'\\U0000002fetc\\U0000002fshadow'",  // \U — was NOT
+    "$'\\u002fetc/shadow'",                  // mixed
+    "/etc/shadow",                             // the plain form, as the control
+  ];
+  for (const spelling of SPELLINGS) {
+    for (const bin of ["cut -c1", "hexdump", "od", "cat"]) {
+      it(`${bin} ${spelling}`, () => {
+        expect(validateCommand(`${bin} ${spelling}`, opts), `${bin} ${spelling}`).not.toBeNull();
+      });
+    }
+  }
+
+  it("decodes to the same argv the shell would pass", () => {
+    for (const spelling of SPELLINGS.slice(0, 4)) {
+      expect(parseArgs(`cat ${spelling}`).at(-1), spelling).toBe("/etc/shadow");
+    }
+  });
+
+  it("and an escape that names nothing sensitive still runs", () => {
+    expect(validateCommand("echo $'\\u0041\\u0042'", opts)).toBeNull();
+    expect(validateCommand("grep -c $'\\t' /etc/hostname", opts)).toBeNull();
+    // A code point past the Unicode range is left as written, which is what bash does.
+    expect(validateCommand("echo $'\\U0011FFFFx'", opts)).toBeNull();
   });
 });

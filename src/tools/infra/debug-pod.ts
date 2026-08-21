@@ -918,6 +918,8 @@ export async function runInDebugPod(
   let stderr = "";
   let exitCode: number | null = 0;
   let timedOut = false;
+  let truncated = false;
+  let killSignal: string | undefined;
 
   try {
     const result = await kubectlExec(
@@ -930,10 +932,27 @@ export async function runInDebugPod(
     );
     stdout = result.stdout;
     stderr = result.stderr;
+    // The capture ceiling travels with the output or it means nothing downstream: node_exec turns this
+    // into the `output_truncated` note, and dropping it here made a 10 MB-capped read that exited 0
+    // indistinguishable from a complete answer — which is the same false "nothing matched" this change
+    // set exists to remove.
+    //
+    // NOT directly covered by a test, and worth stating rather than leaving to be discovered: the two
+    // ends are (`exec-utils.test.ts` proves spawnAsync REPORTS truncated/signal, `node-exec-truncation`
+    // proves node_exec ACTS on them) but this copy in the middle is not, because exercising it means
+    // driving the real debug-pod lifecycle — namespace create, Job create, name poll, phase poll — from
+    // a mocked spawnAsync, and an attempt at that timed out in three different polls. Reverting this
+    // line therefore fails NOTHING. If you touch this function's result assembly, check by hand that
+    // every field spawnAsync can set still arrives.
+    truncated = result.truncated === true;
     exitCode = 0;
   } catch (err: any) {
     stdout = err.stdout?.trim() ?? "";
     stderr = err.stderr?.trim() ?? err.message;
+    // Both spawn paths carry it — a capped read that then fails is where a prefix is MOST likely to be
+    // read as a complete answer.
+    truncated = err.truncated === true;
+    if (typeof err.signal === "string") killSignal = err.signal;
 
     if (typeof err.code === "number") {
       exitCode = err.code;
@@ -966,7 +985,7 @@ export async function runInDebugPod(
       }
       if (podPhase === "Succeeded" || podPhase === "Failed" || podPhase === "") {
         debugPodCache.remove(spec.userId, clusterKey, spec.nodeName);
-        return { stdout, stderr, exitCode };
+        return { stdout, stderr, exitCode, ...(truncated ? { truncated: true } : {}) };
       }
     }
   }
@@ -974,5 +993,10 @@ export async function runInDebugPod(
   // ── Phase 2: Reset idle timer ─────────────────────────────────────
   debugPodCache.touch(spec.userId, clusterKey, spec.nodeName, idleTimeoutMs);
 
-  return { stdout, stderr, exitCode, ...(timedOut ? { timedOut: true } : {}) };
+  return {
+    stdout, stderr, exitCode,
+    ...(timedOut ? { timedOut: true } : {}),
+    ...(truncated ? { truncated: true } : {}),
+    ...(killSignal ? { signal: killSignal } : {}),
+  };
 }

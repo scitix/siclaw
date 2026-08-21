@@ -166,7 +166,11 @@ export function spawnAsync(
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
     }, timeout);
-    child.on("close", (code) => {
+    // `signal` is the SECOND argument of `close`, and it was being ignored. It is the only way to tell
+    // our own timeout kill (SIGKILL, above) from a command that chose to exit — `code` is null in both
+    // cases, and `classifyExit` has a branch specifically for "SIGKILL means our timeout" that could
+    // never fire because nothing forwarded the signal.
+    child.on("close", (code, killSignal) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       // `truncated` travels on BOTH paths. A capped read that then exits non-zero is the case where a
@@ -174,7 +178,10 @@ export function spawnAsync(
       if (code === 0) resolve({ stdout, stderr, truncated });
       else
         reject(
-          Object.assign(new Error(`exit ${code}`), { code, stdout, stderr, truncated }),
+          Object.assign(new Error(`exit ${code}`), {
+            code, stdout, stderr, truncated,
+            ...(killSignal ? { signal: killSignal } : {}),
+          }),
         );
     });
     child.on("error", (err) => {
@@ -225,6 +232,8 @@ export interface ExecResult {
   timedOut?: boolean;
   /** Output hit the capture ceiling: what is here is a PREFIX, and a search over it proves nothing. */
   truncated?: boolean;
+  /** The signal that killed the child, when one did. Distinguishes our timeout kill from a clean exit. */
+  signal?: string;
 }
 
 // ── Container netns resolution ───────────────────────────────────────

@@ -82,3 +82,44 @@ describe("the output cap and the UTF-8 decode fix have to coexist", () => {
     expect(/[\uD800-\uDBFF]$/.test(r.stdout), "the cut is not half a character").toBe(false);
   });
 });
+
+describe("spawnAsync reports the signal that killed the child", () => {
+  // `close` gives (code, signal) and only `code` was read. Without the signal, a child killed by our own
+  // timeout is indistinguishable from one that chose to exit — both arrive with a null code — so
+  // `classifyExit`'s "SIGKILL means our timeout" branch could never fire and a timed-out read was
+  // attributed to the target.
+  it("surfaces SIGKILL from the timeout path", async () => {
+    // A 200ms budget against a command that would take far longer: the timer sends SIGKILL.
+    await expect(spawnAsync("/bin/bash", ["-c", "sleep 30"], 200)).rejects.toMatchObject({
+      signal: "SIGKILL",
+    });
+  });
+
+  it("surfaces a signal the child received from elsewhere", async () => {
+    await expect(spawnAsync("/bin/bash", ["-c", "kill -TERM $$"], 30_000)).rejects.toMatchObject({
+      signal: "SIGTERM",
+    });
+  });
+
+  it("and reports no signal for an ordinary non-zero exit", async () => {
+    try {
+      await spawnAsync("/bin/bash", ["-c", "exit 3"], 30_000);
+      throw new Error("expected a rejection");
+    } catch (e: any) {
+      expect(e.code).toBe(3);
+      expect(e.signal).toBeUndefined();
+    }
+  });
+
+  it("carries `truncated` on the failing path as well as the succeeding one", async () => {
+    // A capped read that then fails is where a prefix is most likely to be read as a whole answer.
+    try {
+      await spawnAsync("/bin/bash",
+        ["-c", "yes ABCDEFGHIJ | head -c 20000000; exit 1"], 60_000);
+      throw new Error("expected a rejection");
+    } catch (e: any) {
+      expect(e.code).toBe(1);
+      expect(e.truncated).toBe(true);
+    }
+  });
+});

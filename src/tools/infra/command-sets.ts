@@ -1,4 +1,9 @@
-import { normalizeResourceToken } from "./kubectl-sanitize.js";
+import {
+  getOutputFormat,
+  kubectlAllNamespaces,
+  kubectlOutputFormats,
+  normalizeResourceToken,
+} from "./kubectl-sanitize.js";
 /**
  * Shared command whitelist and command-level validators used by
  * restricted-bash, pod-exec, and node-exec tools.
@@ -90,6 +95,22 @@ function decodeShellEscape(chars: string[], at: number, advance: (to: number) =>
     let j = at + 1;
     while (j < chars.length && hex.length < 2 && /[0-9a-fA-F]/.test(chars[j])) hex += chars[j++];
     if (hex) { advance(j - 1); return String.fromCharCode(parseInt(hex, 16)); }
+  }
+  // `\uHHHH` and `\UHHHHHHHH`. bash 4.2+ decodes both — measured in bash 5.2, where
+  // `cat $'/etc/hostname'` reads the real file. Only `\x` and octal were decoded here, so
+  // `$'/etc/shadow'` reached the sensitive-path check as the literal `u002fetcu002fshadow`
+  // while the shell opened `/etc/shadow`. `cut`, `hexdump` and `od` are whitelisted and have no content
+  // redactor, so that was a readable path to a credential file.
+  if (c === "u" || c === "U") {
+    const width = c === "u" ? 4 : 8;
+    let hex = "";
+    let j = at + 1;
+    while (j < chars.length && hex.length < width && /[0-9a-fA-F]/.test(chars[j])) hex += chars[j++];
+    if (hex) {
+      const cp = parseInt(hex, 16);
+      // Reject what String.fromCodePoint would throw on; bash prints those unchanged too.
+      if (cp <= 0x10ffff) { advance(j - 1); return String.fromCodePoint(cp); }
+    }
   }
   if (/[0-7]/.test(c)) {
     let oct = "";
@@ -1491,8 +1512,16 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
   if (subcommand !== "get") return null;
   if (!argsNameSecrets(args, subcommand)) return null;
 
-  const format = getKubectlOutputFormat(args);
-  if (SECRET_SAFE_FORMATS.has(format ?? null)) return null;
+  // EVERY declared format is checked, not the first and not only the effective one.
+  //
+  // kubectl is last-wins: `-o json -o jsonpath={.data.password}` prints the bare base64, measured against
+  // a live cluster. Reading the first format let a safe `-o json` in front of an unsafe one through. And
+  // a command that declares an unsafe format is not worth defending even when kubectl would ignore it —
+  // refusing on ANY unsafe entry costs nothing real and removes a whole class of ordering tricks.
+  const formats = kubectlOutputFormats(args);
+  const unsafe = formats.find((f) => !SECRET_SAFE_FORMATS.has(f));
+  if (formats.length === 0 || unsafe === undefined) return null;
+  const format = unsafe;
 
   return `"kubectl get secret -o ${format}" can print the secret's own values, which no output filter `
     + `can reliably redact — a lone base64 value carries no key name and no recognisable shape. `
@@ -1532,8 +1561,10 @@ function hasBoundingFieldSelector(args: string[]): boolean {
 }
 
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
-  const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
-  if (!hasAllNs) return null;
+  // pflag reads `-Ao json` as `-A -o json`, so an exact-token match missed it — and the format reader
+  // missed the `-o` in the same cluster, which made `kubectl get secrets -Ao json` a permitted,
+  // unsanitized dump of every Secret. One reader for both now.
+  if (!kubectlAllNamespaces(args)) return null;
 
   const hasSelector = args.some(a =>
     a === "-l" ||
@@ -1555,7 +1586,9 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
 
   // get -A + -o yaml/json → blocked (even with selector — bulk serialization is the concern)
   if (subcommand === "get") {
-    const format = getKubectlOutputFormat(args);
+    // The EFFECTIVE format, from the shared reader: last-wins, and it decomposes `-Ao json`. A local
+    // first-wins copy lived here and is what made the clustered form a permitted, unsanitized dump.
+    const format = getOutputFormat(args);
     if (format === "yaml" || format === "json") {
       // An exact server-side node or name selector bounds the response, which is the concern this rule
       // exists for — so the rule is satisfied rather than waived.
@@ -1568,7 +1601,7 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       if (argsNameSecrets(args, subcommand)) {
         return `"kubectl get secrets --all-namespaces -o ${format}" can return excessive data, and for `
           + `Secrets only -o json is permitted at all (values redacted, structure intact):\n`
-          + `  kubectl get secrets -A -o json\n`
+          + `  kubectl get secrets -n <namespace> -o json\n`
           + `  kubectl get secrets -n <namespace>`;
       }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
@@ -1587,32 +1620,7 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
   return null;
 }
 
-/** Extract kubectl output format from args. Handles -o yaml, -oyaml, -o=yaml, --output=yaml. */
-function getKubectlOutputFormat(args: string[]): string | null {
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    // `--template=X` is the long-standing alias for `-o go-template=X`, and it prints a value with no
-    // key beside it. Verified against a live cluster: `kubectl get secret x --template={{.data.password}}`
-    // returns the bare base64. Inspecting only -o/--output treated it as plain table output.
-    if (a === "--template" || a.startsWith("--template=")) return "go-template";
-    // `--raw` is not a format at all — it is a raw API passthrough, which is worse: it returns the API
-    // object with NO printer and no resource for `detectSensitiveResource` to match, so the output
-    // sanitizer attaches nothing. Measured: the Secret comes back verbatim.
-    if (a === "--raw" || a.startsWith("--raw=")) return "raw";
-    if ((a === "-o" || a === "--output") && args[i + 1] && !args[i + 1].startsWith("-")) {
-      return extractKubectlFormatName(args[i + 1]);
-    }
-    if (a.startsWith("--output=")) return extractKubectlFormatName(a.slice(9));
-    if (a.startsWith("-o=")) return extractKubectlFormatName(a.slice(3));
-    if (a.startsWith("-o") && a.length > 2 && !a.startsWith("--")) return extractKubectlFormatName(a.slice(2));
-  }
-  return null;
-}
 
-function extractKubectlFormatName(value: string): string {
-  const eq = value.indexOf("=");
-  return eq > 0 ? value.slice(0, eq) : value;
-}
 
 // Keep backward-compatible export for any external callers
 export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {

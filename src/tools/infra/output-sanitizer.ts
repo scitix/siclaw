@@ -228,8 +228,12 @@ OUTPUT_RULES["env"] = (args) => {
   return {
     type: "sanitize",
     sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
-    // NUL-separated output has no lines, so it cannot be redacted incrementally per line.
-    lineSafe: !nul,
+    // NEVER line-safe, NUL or not. `redactEnvOutput` folds continuation lines: a value containing a
+    // newline is one env RECORD spanning several lines, and the sanitizer joins them before matching —
+    // which is the whole reason a multi-line `PASSWORD=…` is covered. A per-batch streaming call has no
+    // state to fold across, so it would redact the first line of such a record and emit the rest. Same
+    // class as the PEM/document redactor, whose `lineSafe: false` is a few lines above.
+    lineSafe: false,
   };
 };
 
@@ -243,7 +247,9 @@ OUTPUT_RULES["printenv"] = (args) => {
   return {
     type: "sanitize",
     sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
-    lineSafe: !nul,
+    // Same reasoning as `env` above: this redactor folds continuation lines, so a record spanning lines
+    // cannot be redacted a batch at a time. Fixing only `env` left this half of the same rule behind.
+    lineSafe: false,
   };
 };
 

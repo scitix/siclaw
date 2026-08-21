@@ -1655,15 +1655,36 @@ describe("a Secret may only be printed in a form that cannot show its values", (
   });
 
   it("leaves the raw endpoints an SRE actually needs", () => {
-    // `--raw` is refused for a Secret path, not banned: /metrics, /healthz and /version are ordinary
-    // diagnostics and name no resource.
+    // `--raw` is permitted for the endpoints that return no API objects, where having no sanitizer costs
+    // nothing. /metrics, /healthz and /version name no resource.
     for (const cmd of [
       "kubectl get --raw /metrics", "kubectl get --raw /healthz", "kubectl get --raw /version",
-      "kubectl get --raw /api/v1/namespaces/default/pods", "kubectl get --raw /apis",
+      "kubectl get --raw /readyz", "kubectl get --raw /livez",
+      "kubectl get --raw /api", "kubectl get --raw /apis",
       // and a typed name for a resource that is not a Secret
       "kubectl get configmaps.v1. demo -o yaml", "kubectl get pods.v1. -o yaml",
     ]) {
       expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("refuses --raw for anything that returns an API object", () => {
+    // This list used to include `/api/v1/namespaces/default/pods` as PERMITTED, which was wrong: a raw
+    // response arrives with no printer and no resource token, so `detectSensitiveResource` matches
+    // nothing and the sanitizer attaches NOTHING. That path returns every Pod's container env; the
+    // `/configmaps` one returns registry credentials. Refusing a `/secrets` segment while allowing those
+    // two covered the spelling and not the mechanism.
+    for (const cmd of [
+      "kubectl get --raw /api/v1/namespaces/default/pods",
+      "kubectl get --raw /api/v1/namespaces/default/configmaps",
+      "kubectl get --raw /api/v1/namespaces/default/configmaps/registry-auth",
+      "kubectl get --raw=/api/v1/namespaces/default/pods",
+      "kubectl get --raw /apis/apps/v1/deployments",
+      // A discovery path is permitted, but only as the WHOLE path.
+      "kubectl get --raw /api/v1/secrets",
+      "kubectl get --raw /metrics/../api/v1/namespaces/x/secrets/y",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
     }
   });
 

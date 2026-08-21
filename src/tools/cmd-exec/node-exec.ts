@@ -476,6 +476,11 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         // failure announces itself.
         stderr: execResult.stderr,
         context: "node",
+        // Our own timeout kill, so the class says "we stopped it" rather than blaming the target. The
+        // signal was produced upstream and dropped here; `timedOut` is the same event observed without
+        // one (kubectl exited with a null code and no stderr), and `classifyExit` reads only the signal,
+        // so it maps to the kill we would have sent.
+        signal: execResult.signal ?? (execResult.timedOut ? "SIGKILL" : undefined),
       });
       // No tail-window note here: it fires only for `kubectl logs --tail=N`, and `kubectl` is
       // whitelisted for restricted_bash alone (this tool passes no extraAllowed), so the command is

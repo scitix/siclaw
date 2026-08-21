@@ -45,6 +45,28 @@ export { getCommandBinary } from "../infra/command-sets.js";
  * Checks that subcommands are in the safe whitelist.
  * Returns an error message if blocked, or null if all kubectl commands are safe.
  */
+/** The path given to `--raw`, or undefined when the flag is absent. */
+function rawPassthroughPath(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--raw") return args[i + 1] ?? "";
+    if (a.startsWith("--raw=")) return a.slice("--raw=".length);
+  }
+  return undefined;
+}
+
+/**
+ * Endpoints that return no API objects, so having no sanitizer costs nothing.
+ *
+ * Matched on the path's first segment and required to be the WHOLE path (query string aside): `/metrics`
+ * passes, `/metrics/../api/v1/namespaces/x/secrets/y` does not. Discovery endpoints `/api` and `/apis`
+ * list group-versions only — a longer path under them names resources and is refused.
+ */
+function isDiagnosticApiPath(path: string): boolean {
+  const clean = path.split("?")[0].replace(/\/+$/, "");
+  return ["/metrics", "/healthz", "/readyz", "/livez", "/version", "/api", "/apis"].includes(clean);
+}
+
 /**
  * A Secret read that feeds a PIPE has no structural guarantee left.
  *
@@ -116,11 +138,30 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       // `kubectl rollout -n x history …` is refused for naming `x`. Wrong in both directions.
       const afterRollout = args.slice(args.indexOf("rollout") + 1);
       const verb = kubectlSubcommand(afterRollout);
-      if (verb === "history") return null;
+      // `continue`, NOT `return null` — this loop examines every stage of the pipeline, and returning
+      // from it declared the WHOLE command safe because its first stage was. `kubectl rollout history
+      // deploy/x | kubectl delete pod victim` passed, as did `| kubectl exec`, `| kubectl get secret -o
+      // yaml`, and the `;` forms. `SAFE_SUBCOMMANDS` lives only in this function, so nothing downstream
+      // re-checked the verb. Mine, from the commit that added this allowance.
+      if (verb === "history") continue;
       return JSON.stringify({
         error: `kubectl rollout "${verb ?? "(no verb)"}" is not allowed in read-only mode.`,
         hint: "Only `kubectl rollout history` is permitted — the other verbs (undo, restart, pause, "
           + "resume) change cluster state.",
+      }, null, 2);
+    }
+
+    // `auth` is on the safe list as a FAMILY, and it is not one: `can-i` and `whoami` are reads, but
+    // `auth reconcile` creates and updates Roles and RoleBindings — kubectl's own help says "Missing
+    // objects are created". The API's RBAC may still refuse it; this validator's claim that no write can
+    // pass must not depend on that. Same verb-level treatment as `rollout`.
+    if (subcommand === "auth") {
+      const verb = kubectlSubcommand(args.slice(args.indexOf("auth") + 1));
+      if (verb === "can-i" || verb === "whoami") continue;
+      return JSON.stringify({
+        error: `kubectl auth "${verb ?? "(no verb)"}" is not allowed in read-only mode.`,
+        hint: "Only `kubectl auth can-i` and `kubectl auth whoami` are permitted. `auth reconcile` "
+          + "creates and updates RBAC objects.",
       }, null, 2);
     }
 
@@ -155,6 +196,34 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
           hint: 'Add --tail=<N> or --since=<duration>, e.g. "kubectl logs my-pod --tail=1000".',
         }, null, 2);
       }
+    }
+
+    // ── `get --raw` has no printer, so nothing can sanitize it ───
+    //
+    // It is an API passthrough: the response arrives with no printer and no resource token, so
+    // `detectSensitiveResource` matches nothing and the output sanitizer attaches NOTHING. A `/secrets`
+    // path was already refused; `/configmaps` and `/pods` were not, and those carry registry credentials
+    // and container env respectively — the two documents the sanitizer exists for.
+    //
+    // An ALLOW-LIST of paths, not a deny-list of resource kinds. Enumerating which API paths hold
+    // credentials is the same guessing game as enumerating how kubectl spells a Secret — a `/secrets`
+    // segment was already refused and `/configmaps` and `/pods` were not — and this branch has no
+    // sanitizer to fall back on when the guess is wrong.
+    //
+    // Refusing ALL of it was the first attempt and it was too much: `--raw /metrics`, `/healthz` and
+    // `/version` are ordinary diagnostics that return no API objects at all, and an existing test pins
+    // them precisely because someone needed them. So the rule is: the non-object endpoints, and nothing
+    // else. Anything that could return a serialized resource goes through `kubectl get <kind> -o json`,
+    // which is the same data WITH the sanitizer attached.
+    const rawPath = rawPassthroughPath(args);
+    if (rawPath !== undefined && !isDiagnosticApiPath(rawPath)) {
+      return JSON.stringify({
+        error: `\`kubectl get --raw ${rawPath}\` is not allowed: a raw API response arrives with no `
+          + `printer and no resource type, so no output filter can be applied to it.`,
+        hint: "Only the non-object endpoints are permitted this way (/metrics, /healthz, /readyz, /livez, "
+          + "/version, /api, /apis). For a resource, use the typed read — `kubectl get configmap <name> "
+          + "-o json` — which returns the same object through the sanitizer.",
+      }, null, 2);
     }
 
     // ── A Secret may only be printed in a form that cannot show its values ───
@@ -462,7 +531,14 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       // Instrument a PIPELINE so bash reports each stage's status. Only for restricted_bash, and only
       // when there is a pipeline — see pipeline-status.ts for why nowhere else and what it does not cover.
       // Applied BEFORE the sudo wrapping so it runs in the inner bash, whose PIPESTATUS we want.
-      const instrumented = hasPipeline(command);
+      //
+      // FOREGROUND ONLY. The background writer streams straight to a file and never strips the sentinel
+      // or classifies the result, so instrumenting it put `__siclaw_pipe_status_…` into the output the
+      // model reads — breaking any JSON in it — while `kubectl get x | jq .` with kubectl exiting 1 still
+      // completed as a success. That is the exact false empty-result this whole change set exists to
+      // remove, reintroduced on the path that reports last.
+      const wantsBackground = backgroundEnabled && params.run_in_background === true;
+      const instrumented = !wantsBackground && hasPipeline(command);
       let execCommand = instrumented ? instrumentPipeline(command) : command;
       if (isProd) {
         const escaped = execCommand.replace(/'/g, "'\\''");
@@ -472,7 +548,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       // ── Background mode ──────────────────────────────────────────────
       // Hand the fully-wrapped command to the runtime executor and return immediately.
       // The model reads progress via task_output(task_id) and is notified on completion.
-      if (backgroundEnabled && params.run_in_background === true) {
+      if (wantsBackground) {
         // Structural (JSON) sanitizers are not line-safe and cannot be streamed
         // per line without risking a leak — reject background mode for them.
         if (pre.action && !pre.action.lineSafe) {
