@@ -10,6 +10,9 @@ import {
   validateFindInPipeline,
   validateIpInPipeline,
   validateKubectlInPipeline,
+  buildSandboxCommand,
+  SANDBOX_KILL_GRACE_S,
+  OUTER_BACKSTOP_MARGIN_S,
 } from "./restricted-bash.js";
 import { extractPipeline } from "../infra/command-validator.js";
 import { preExecSecurity } from "../infra/security-pipeline.js";
@@ -1810,5 +1813,39 @@ describe("the subcommand and the rollout verb come from one reader", () => {
                        "kubectl --context prod -n x get pods -o json"]) {
       expect(check(cmd), cmd).toBeNull();
     }
+  });
+});
+
+// The production deadline sits on the sandbox side of the UID boundary. This is a command-shape
+// test because the mechanism IS the shape: get the nesting wrong and the timeout lands back outside
+// the boundary, where — with CAP_KILL dropped and the command owned by a different user — it cannot
+// stop anything, while `kill(-pgid)` still reports success for having signalled the outer shell.
+// That combination is what let a call return in 60s over a kubectl that ran for hours.
+describe("buildSandboxCommand", () => {
+  it("runs timeout UNDER sudo, so the killer shares the command's UID", () => {
+    const c = buildSandboxCommand("kubectl get pods", { timeoutS: 60 });
+    expect(c).toBe("sudo -E -u sandbox -- timeout -k 5 60 bash -c 'kubectl get pods'");
+    // The nesting, asserted as an ordering rather than trusted to the literal above.
+    expect(c.indexOf("sudo")).toBeLessThan(c.indexOf("timeout"));
+    expect(c.indexOf("timeout")).toBeLessThan(c.indexOf("bash -c"));
+  });
+
+  it("passes -k so a command that ignores SIGTERM is still killed", () => {
+    expect(buildSandboxCommand("x", { timeoutS: 30 })).toContain(`-k ${SANDBOX_KILL_GRACE_S} 30`);
+    expect(buildSandboxCommand("x", { timeoutS: 30, graceS: 2 })).toContain("-k 2 30");
+  });
+
+  it("escapes single quotes so a quoted command cannot break out of the wrapper", () => {
+    const c = buildSandboxCommand("grep 'a b' f", { timeoutS: 10 });
+    expect(c).toBe("sudo -E -u sandbox -- timeout -k 5 10 bash -c 'grep '\\''a b'\\'' f'");
+  });
+
+  it("keeps the outer backstop strictly later than the sandbox deadline", () => {
+    // Both timers exist; only the inner one can stop the command. If the outer fired first the call
+    // would return over a still-running command, which is the defect this replaces.
+    const sandboxS = 60;
+    const outerS = sandboxS + SANDBOX_KILL_GRACE_S + OUTER_BACKSTOP_MARGIN_S;
+    expect(outerS).toBeGreaterThan(sandboxS + SANDBOX_KILL_GRACE_S);
+    expect(OUTER_BACKSTOP_MARGIN_S).toBeGreaterThan(0);
   });
 });

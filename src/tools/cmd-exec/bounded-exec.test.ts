@@ -11,7 +11,7 @@
 import { describe, it, expect } from "vitest";
 import { execSync } from "node:child_process";
 import {
-  boundedExec, BoundedExecTimeout, BoundedExecFailure, BoundedExecOverflow,
+  boundedExec, BoundedExecTimeout, BoundedExecFailure, BoundedExecOverflow, BoundedExecAborted,
 } from "./bounded-exec.js";
 
 const env = { PATH: process.env.PATH ?? "/usr/bin:/bin" };
@@ -185,6 +185,32 @@ describe("boundedExec — error shapes classifyExit depends on", () => {
     expect(err).toBeInstanceOf(BoundedExecFailure);
     expect(err.code).toBe(7);
     expect(err.timedOut).toBeUndefined();
+    expect((err as any).aborted).toBeUndefined();
+  });
+
+  it("an abort is distinguishable from a timeout despite the identical code/signal pair", async () => {
+    // Both are code=null + SIGKILL, which is all classifyExit looks at — so without a separate
+    // marker a user Stop is described as "killed at the tool's timeout, raise timeout_seconds".
+    const ac = new AbortController();
+    const p = boundedExec("sleep 3", { env, timeoutMs: 60_000, signal: ac.signal, graceMs: 200 })
+      .then(() => null, (e) => e);
+    setTimeout(() => ac.abort(), 100);
+    const err = await p;
+    expect(err).toBeInstanceOf(BoundedExecAborted);
+    expect(err.aborted).toBe(true);
+    expect(err.timedOut).toBeUndefined();
+    // Still the shape classifyExit needs, so nothing downstream has to special-case it to classify.
+    expect(err.code).toBeNull();
+    expect(err.signal).toBe("SIGKILL");
+  });
+
+  it("an already-aborted signal reports the same abort marker", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const err = await boundedExec("echo hi", { env, timeoutMs: 5000, signal: ac.signal })
+      .then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(BoundedExecAborted);
+    expect(err.aborted).toBe(true);
   });
 });
 

@@ -30,6 +30,36 @@ import { hasPipeline, instrumentPipeline, extractPipelineStatus } from "../infra
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { boundedExec } from "./bounded-exec.js";
 
+/**
+ * SIGTERM-to-SIGKILL grace given to the sandbox-side `timeout`, and how much longer the outer
+ * boundedExec timer waits.
+ *
+ * The two deadlines are deliberately ordered. `timeout` runs as the same user as the command and can
+ * end it; the outer timer runs as `agentbox` and, without CAP_KILL, cannot — it only bounds the
+ * CALL. So the inner one must always fire first, and the margin has to cover `timeout`'s own
+ * TERM-then-KILL sequence plus the time for the pipes to close afterwards.
+ */
+export const SANDBOX_KILL_GRACE_S = 5;
+export const OUTER_BACKSTOP_MARGIN_S = 10;
+
+/**
+ * The production command line: drop to `sandbox`, and put the deadline on that side of the UID
+ * boundary.
+ *
+ * The order matters and is the whole point. `sudo` execs `timeout`, which then runs the command — so
+ * `timeout` is itself a `sandbox` process and shares the UID of what it must kill. Wrapping the
+ * other way round (`timeout sudo …`) would put it back outside the boundary, where signalling fails
+ * exactly as it does from the agent.
+ */
+export function buildSandboxCommand(
+  command: string,
+  opts: { timeoutS: number; graceS?: number },
+): string {
+  const escaped = command.replace(/'/g, "'\\''");
+  const grace = opts.graceS ?? SANDBOX_KILL_GRACE_S;
+  return `sudo -E -u sandbox -- timeout -k ${grace} ${opts.timeoutS} bash -c '${escaped}'`;
+}
+
 // ── Re-exports for backward compatibility ────────────────────────────
 
 export { extractCommands, validateShellOperators } from "../infra/command-validator.js";
@@ -509,7 +539,11 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
 
-      const timeout = Math.min(params.timeout_seconds ?? defaultTimeout, 300) * 1000;
+      // The sandbox-side `timeout` owns the deadline; the boundedExec timer is only the backstop for
+      // a channel that never returns, so it must fire LATER or it would pre-empt the one that can
+      // actually stop the command and we would be back to a returning call over a running process.
+      const sandboxTimeoutS = Math.min(params.timeout_seconds ?? defaultTimeout, 300);
+      const timeout = (sandboxTimeoutS + SANDBOX_KILL_GRACE_S + OUTER_BACKSTOP_MARGIN_S) * 1000;
 
       // Sanitized env + KUBECONFIG injection — identical for foreground and background.
       const isProd = process.env.NODE_ENV === "production";
@@ -538,8 +572,13 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const instrumented = !wantsBackground && hasPipeline(command);
       let execCommand = instrumented ? instrumentPipeline(command) : command;
       if (isProd) {
-        const escaped = execCommand.replace(/'/g, "'\\''");
-        execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
+        // The deadline goes on the SANDBOX side. The pod drops CAP_KILL (security.md §5.2 grants
+        // only SETUID, SETGID, CHOWN, FOWNER, AUDIT_WRITE) and the command runs as `sandbox` while
+        // the agent runs as `agentbox`, so signalling from out here reaches the outer shell and
+        // nothing beneath it. `kill(-pgid)` still SUCCEEDS in that case — one group member was
+        // signalled — which is why this looked like it worked: the call returned and the command
+        // kept running. Same shape node_exec already uses.
+        execCommand = buildSandboxCommand(execCommand, { timeoutS: sandboxTimeoutS });
       }
 
       // ── Background mode ──────────────────────────────────────────────
@@ -608,23 +647,42 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           ? extractPipelineStatus((err.stdout ?? "") as string)
           : { stdout: (err.stdout ?? "") as string, statuses: [] };
         const errStdout = errStages.stdout.trim();
-        // In this context the image is ours, so a 127 means the whitelist advertises something the
-        // AgentBox does not ship — classifyExit says that instead of advising a workaround.
-        const judgment = classifyExit({
-          command: params.command,
-          exitCode: err.code,
-          stdout: errStdout,
-          stderr: errStderr,
-          signal: err.signal,
-          context: "local",
-          pipeStatuses: errStages.statuses,
-        });
+        // An ABORT is not a timeout, and must not be described as one. Both arrive as
+        // code=null/SIGKILL, which classifyExit reads as "killed at the tool's timeout — raise
+        // timeout_seconds": advice that makes no sense for a user pressing Stop, and it contradicted
+        // `details`, which only ever set timed_out for a real cap.
+        const aborted = err?.aborted === true;
+        // `timeout` exits 124 when the deadline fires — the documented, distinctive code, and now the
+        // usual way a cap is reported since the sandbox-side wrapper owns the deadline. NOT 137:
+        // that is "killed by SIGKILL", which a container OOM kill produces identically, so claiming
+        // the cap there would misreport it. 137 falls through and is described by its signal.
+        const hitCap = !aborted && (err?.timedOut === true || err?.code === 124);
+        const judgment = aborted
+          ? {
+            exitClass: "interrupted" as const,
+            isError: true,
+            annotation: "[aborted: the run was stopped from outside — a user Stop or a cancelled "
+              + "turn — so the command was killed before it finished. Nothing is wrong with the "
+              + "command and the limit has nothing to do with it; re-run it if the work is still "
+              + "wanted.]",
+            channelLeg: undefined,
+          }
+          : classifyExit({
+            command: params.command,
+            exitCode: err.code,
+            stdout: errStdout,
+            stderr: errStderr,
+            signal: err.signal,
+            context: "local",
+            pipeStatuses: errStages.statuses,
+          });
         // classifyExit's `interrupted` annotation says to raise timeout_seconds but cannot say what
         // it currently is — it does not know. Naming the cap is the difference between advice and an
-        // actionable number, so it is appended rather than reworded there.
-        const capSecs = Math.round(timeout / 1000);
+        // actionable number, so it is appended rather than reworded there. The cap named is the
+        // SANDBOX one, which is what `timeout_seconds` sets; the outer backstop is not the caller's
+        // to tune.
         const notes = (judgment.annotation ? `\n${judgment.annotation}` : "")
-          + (err?.timedOut ? `\n[cap in force: ${capSecs}s]` : "");
+          + (hitCap ? `\n[cap in force: ${sandboxTimeoutS}s]` : "");
         return {
           content: [{ type: "text", text: postExecSecurity(errStdout, pre.action, {
             stderr: errStderr || undefined,
@@ -638,7 +696,11 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             exit_class: judgment.exitClass,
             ...(errStages.statuses.length > 1 ? { pipe_statuses: errStages.statuses } : {}),
             ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
-            ...(err?.timedOut ? { timed_out: true, timeout_seconds: capSecs } : {}),
+            // The text and these fields describe the same event, so they are set from the same
+            // condition. They disagreed before: an abort read as a timeout in prose while
+            // `timed_out` stayed unset.
+            ...(hitCap ? { timed_out: true, timeout_seconds: sandboxTimeoutS } : {}),
+            ...(aborted ? { aborted: true } : {}),
             ...(judgment.isError && { error: true }),
           },
         };

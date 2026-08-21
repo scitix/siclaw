@@ -79,6 +79,21 @@ export class BoundedExecFailure extends Error {
 }
 
 /**
+ * Thrown when the CALLER cancelled — a user Stop, or a turn that was abandoned.
+ *
+ * Separate from the timeout despite arriving in the same code=null/SIGKILL shape, because a caller
+ * reading only that pair describes it as "killed at the tool's timeout, raise timeout_seconds" —
+ * advice that has nothing to do with what happened, over a limit that was never reached.
+ */
+export class BoundedExecAborted extends BoundedExecFailure {
+  readonly aborted = true;
+  constructor(stdout: string, stderr: string) {
+    super(null, stdout, stderr, "SIGKILL");
+    this.name = "BoundedExecAborted";
+  }
+}
+
+/**
  * Thrown when output passed the cap — the role exec's maxBuffer played, which spawn does not have.
  *
  * It reports Node's own `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` as its `code` because that string is what
@@ -114,7 +129,7 @@ export function boundedExec(command: string, opts: BoundedExecOptions): Promise<
   // Checked before spawning, not after: an already-aborted turn should not run a kubectl at all,
   // and the abort handler below would otherwise start one only to kill it.
   if (opts.signal?.aborted) {
-    return Promise.reject(new BoundedExecFailure(null, "", "", "SIGKILL"));
+    return Promise.reject(new BoundedExecAborted("", ""));
   }
   const child = spawn("/bin/bash", ["-c", command], {
     detached: true, // honoured by spawn — this is why the group kill below can work at all
@@ -213,7 +228,7 @@ export function boundedExec(command: string, opts: BoundedExecOptions): Promise<
 
     // An abort gets the same treatment as a timeout, grace included: it had the identical
     // never-settles weakness, since it relied on the same group kill.
-    onAbort = () => killAndBound(() => new BoundedExecFailure(null, stdout, stderr, "SIGKILL"));
+    onAbort = () => killAndBound(() => new BoundedExecAborted(stdout, stderr));
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     timer = setTimeout(() => {
