@@ -70,6 +70,7 @@ import type {
 } from "../shared/delegation-persistence.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
 import { getOrCreateLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
+import { createCoalescedWriter } from "./coalesced-write.js";
 import {
   createModelRouteState,
   normalizeModelRouteState,
@@ -472,6 +473,7 @@ export class AgentBoxSessionManager {
 
   /** Pending plan auto-clear timers, keyed by taskListId (all tasks completed → clear after delay). */
   private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 
   /**
    * Ceiling on concurrent sub-agent child sessions across the WHOLE process, every conversation
@@ -2022,18 +2024,28 @@ export class AgentBoxSessionManager {
    * interleaved snapshot writes can never leave a half-written / truncated file for a
    * concurrent reader (rehydrate-on-restart) — last writer wins cleanly.
    */
-  private persistLedgerSnapshot(taskListId: string): void {
+  /**
+   * Snapshot the ledger to the PV, one write in flight per taskListId.
+   *
+   * Serialisation is a correctness requirement, not a throughput one: write-tmp-then-rename gives no
+   * ordering between concurrent pairs, so the rename that lands last wins. One task_event per turn
+   * hid that by spacing the writes seconds apart; a batched task_create fires N in one synchronous
+   * loop, and a snapshot of one task can then overwrite a snapshot of five — losing tasks on the
+   * next pod restart, when rehydrateLedger reads the file. See coalesced-write.ts.
+   */
+  private persistLedgerSnapshot = createCoalescedWriter(async (taskListId: string) => {
+    // Read INSIDE the write: the coalesced follow-up exists to observe the final state.
     const tasks = getOrCreateLedger(taskListId).snapshot();
     const file = this.ledgerFile(taskListId);
     const tmp = `${file}.${randomUUID()}.tmp`;
-    void fs.promises
-      .writeFile(tmp, JSON.stringify(tasks), "utf8")
-      .then(() => fs.promises.rename(tmp, file))
-      .catch((err) => {
-        console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err);
-        void fs.promises.unlink(tmp).catch(() => {});
-      });
-  }
+    try {
+      await fs.promises.writeFile(tmp, JSON.stringify(tasks), "utf8");
+      await fs.promises.rename(tmp, file);
+    } catch (err) {
+      console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err);
+      void fs.promises.unlink(tmp).catch(() => {});
+    }
+  });
 
   /** Restore the ledger from the PV snapshot — only when the in-memory copy is
    *  empty (i.e. after a process restart; a release-survived ledger is kept). */
