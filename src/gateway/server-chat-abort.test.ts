@@ -299,6 +299,12 @@ describe("startRuntime — chat.abort wiring", () => {
     await waitFor(() => ctx.sendEvent.mock.calls.some(
       ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
     ));
+    const firstTerminal = ctx.sendEvent.mock.calls.find(
+      ([channel, data]) => channel === "chat.event" && data?.turnId === first.turnId && data?.event?.type === "prompt_done",
+    );
+    expect(firstTerminal?.[1]).toMatchObject({
+      event: { type: "prompt_done", aborted: true, reason: "user_cancelled" },
+    });
     expect(promptCalls).toHaveLength(0);
 
     const second = await send({ agentId: "a", userId: "u", text: "try again", sessionId: "S" }, ctx) as { turnId?: string };
@@ -353,7 +359,7 @@ describe("startRuntime — chat.abort wiring", () => {
       delegationId: "d1",
       sessionId: "delegated",
       turnId: ack.turnId,
-      event: { type: "prompt_done" },
+      event: { type: "prompt_done", aborted: true, reason: "user_cancelled" },
     });
   });
 
@@ -398,6 +404,12 @@ describe("startRuntime — chat.abort wiring", () => {
     await waitFor(() => ctx.sendEvent.mock.calls.some(
       ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
     ));
+    const terminal = ctx.sendEvent.mock.calls.find(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    );
+    expect(terminal?.[1]).toMatchObject({
+      event: { type: "prompt_done", aborted: true, reason: "user_cancelled" },
+    });
 
     expect(frontendClient.request.mock.calls.some(([method]: any[]) => method === "delegation.terminal")).toBe(false);
   });
