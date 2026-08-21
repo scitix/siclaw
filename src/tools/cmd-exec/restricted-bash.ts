@@ -1,8 +1,6 @@
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { Type } from "@sinclair/typebox";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -30,8 +28,7 @@ import { classifyExit } from "../infra/exit-classification.js";
 import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { hasPipeline, instrumentPipeline, extractPipelineStatus } from "../infra/pipeline-status.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
-
-const execAsync = promisify(exec);
+import { boundedExec } from "./bounded-exec.js";
 
 // ── Re-exports for backward compatibility ────────────────────────────
 
@@ -575,40 +572,9 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       }
 
       try {
-        const execOpts = {
-          timeout,
-          maxBuffer: 1024 * 1024 * 10,
-          shell: "/bin/bash",
-          detached: true, // make child a process group leader for clean group kill
-          env,
-        };
-
-        const child = exec(execCommand, execOpts as any);
-
-        // Kill the entire process group (shell + all child processes like kubectl exec)
-        // detached: true makes the shell a process group leader, so -pid kills the whole group
-        const onAbort = () => {
-          try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-        };
-        signal?.addEventListener("abort", onAbort, { once: true });
-
-        const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-          let stdout = "";
-          let stderr = "";
-          // Decode on the stream so a multibyte character split across two data
-          // events survives; per-chunk decoding yields two U+FFFD instead.
-          child.stdout?.setEncoding("utf8");
-          child.stderr?.setEncoding("utf8");
-          child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
-          child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
-          child.on("close", (code) => {
-            if (code === 0) resolve({ stdout, stderr });
-            else reject(Object.assign(new Error(`exit ${code}`), { code, stdout, stderr }));
-          });
-          child.on("error", reject);
-        });
-
-        signal?.removeEventListener("abort", onAbort);
+        // The timeout is enforced by boundedExec, not by child_process.exec's own `timeout` —
+        // see bounded-exec.ts for why that one does not bound the call.
+        const { stdout, stderr } = await boundedExec(execCommand, { env, timeoutMs: timeout, signal });
 
         // Strip the sentinel BEFORE anything reads the output: a structural sanitizer parses the whole
         // payload, so a trailing marker would make every instrumented `-o json` pipeline "not JSON".
@@ -653,11 +619,17 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           context: "local",
           pipeStatuses: errStages.statuses,
         });
+        // classifyExit's `interrupted` annotation says to raise timeout_seconds but cannot say what
+        // it currently is — it does not know. Naming the cap is the difference between advice and an
+        // actionable number, so it is appended rather than reworded there.
+        const capSecs = Math.round(timeout / 1000);
+        const notes = (judgment.annotation ? `\n${judgment.annotation}` : "")
+          + (err?.timedOut ? `\n[cap in force: ${capSecs}s]` : "");
         return {
           content: [{ type: "text", text: postExecSecurity(errStdout, pre.action, {
             stderr: errStderr || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
-            ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),
+            ...(notes ? { notes } : {}),
             exitCode: err.code ?? "unknown",
             ...(err.signal ? { signal: err.signal } : {}),
           }) }],
@@ -666,6 +638,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             exit_class: judgment.exitClass,
             ...(errStages.statuses.length > 1 ? { pipe_statuses: errStages.statuses } : {}),
             ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
+            ...(err?.timedOut ? { timed_out: true, timeout_seconds: capSecs } : {}),
             ...(judgment.isError && { error: true }),
           },
         };
