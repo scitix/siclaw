@@ -832,6 +832,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // past the check above is already visible to the drain, instead of appearing after
     // it while it was still in the database.
     const turnAbort = new AbortController();
+    const promptDoneTerminal = (): Record<string, unknown> => turnAbort.signal.aborted
+      ? { type: "prompt_done", aborted: true, reason: "user_cancelled" }
+      : { type: "prompt_done" };
     registerPendingStart(sessionId, turnAbort);
     addLiveTurn(sessionId, turnId, turnAbort);
     if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
@@ -1051,8 +1054,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             },
           });
           if (!alreadyReported()) {
-            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: { type: "prompt_done" } });
-            reportTerminal({ type: "prompt_done" });
+            const terminal = promptDoneTerminal();
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: terminal });
+            reportTerminal(terminal);
           }
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
@@ -1069,8 +1073,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
           // Shutdown, or a box removal, already reported this turn before aborting it.
           if (!alreadyReported()) {
-            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: { type: "prompt_done" } });
-            reportTerminal({ type: "prompt_done" });
+            const terminal = promptDoneTerminal();
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: terminal });
+            reportTerminal(terminal);
           }
         } finally {
           // Only clear if still ours — a fast re-send for the same session would
@@ -1100,8 +1105,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // check. A second, PLAIN terminal would contradict that one: without
         // `aborted` it reads as a turn that completed.
         if (!supervisorEndedTurns.has(turnId)) {
-          context.sendEvent("chat.event", { sessionId, turnId, event: { type: "prompt_done" } });
-          reportTerminal({ type: "prompt_done" });
+          const terminal = promptDoneTerminal();
+          context.sendEvent("chat.event", { sessionId, turnId, event: terminal });
+          reportTerminal(terminal);
         }
       } finally {
         // Anything still queued was never consumed — a steer the user sent into a turn
