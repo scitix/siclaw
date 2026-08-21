@@ -50,7 +50,7 @@ So ask who can settle this. Only the first row reaches his queue:
 | Who can answer | What to do |
 |---|---|
 | **Only the owner** — two sources genuinely disagree and both look real; a figure is illegible and the fact is load-bearing (get it wrong and the thing does not boot) | **File a ticket**, framed as below |
-| **I can** — the constitution or AGENTS gives a ruling; an obvious typo (a switch's draw printed as 1.1W); anything this playbook already left to my judgement (how many pages, what the understanding page says, which sources deserve layering) | **Settle it**, and say on the page how. A ticket here hands back authority already given to me |
+| **I can** — the constitution or AGENTS gives a ruling; an obvious typo (a switch's draw printed as 1.1W); anything this playbook already left to my judgement (what the understanding page says, which natural dimension to slice a data page on) | **Settle it**, and say on the page how. A ticket here hands back authority already given to me. Whether a complete inventory gets a data page is **not** in this column — it must get one |
 | **A later batch** — batching split one record across two slices; a cross-batch reference is not compiled yet | **Mark `⚠️ 存疑` in place, saying what is missing**, then fill it in and clear the mark when the data arrives. **That is progress, not a contradiction** |
 | **The platform's maintainers** — the conversion, rendering or slicing itself misbehaved (a source cut mid-record, a pre-render that will not open, a tool erroring) | **Put it in the batch summary** (report_summary). The owner should not pay for our machinery |
 
@@ -72,11 +72,14 @@ The owner is a domain expert who knows the content — and knows nothing about c
 
 Some sources are not documents that explain something — they are **collections
 of records**: ticket exports, on-call logs, inspection runs, structured data
-tables. They belong in the knowledge base as much as anything else, but forcing
-one into a single narrative page fails both ways: summarising loses the detail,
-transcribing answers no question.
+tables, and **canonical inventories that a reader or Q&A agent will treat as a
+complete set** (published catalogs, encoding↔config maps, entity ID overviews,
+status ledgers). They belong in the knowledge base as much as
+anything else, but forcing one into a single narrative page fails both ways:
+summarising loses the detail, transcribing answers no question.
 
-A source like that can become **two pages**:
+An ordinary collection (tickets, logs, inspection runs, a dump nobody will
+filter as "the complete list") **can** become **two pages**:
 
 - **An understanding page** — what this dataset is, where it comes from, what
   each field means, the distributions that matter (by category, owner, period),
@@ -87,13 +90,33 @@ A source like that can become **two pages**:
   matching line is one complete, readable record.
 
 Both live in `candidate/` and in `index.md`; the understanding page links to the
-data page.
+data page. **Which ordinary collections deserve this, how many pages to split
+into, and what the understanding page says are yours to judge.**
 
-**Which sources deserve this, how many pages to split into, and what the
-understanding page says are yours to judge** — no rule decides it for you. Only
-two extremes are worth naming: cramming hundreds of records into a page meant to
-explain something, and excluding a source because it cannot be transcribed —
-exclusion means "this does not belong in the base", not "I could not handle it".
+A **complete-set inventory** is different. It **must** become those two pages
+(not "may", and not "judge whether a data page is worth it"), and the data page
+must cover **every row of the source table**.
+
+**A handful of "high-frequency decision" sample rows plus a pointer back to raw
+is not compiled.** Q&A searches the wiki only; it will not follow a pointer
+into the source tree. "Does not exist" can be true of the excerpt and false of
+the source inventory.
+
+How to slice a table that will not fit is still yours to judge. These two are
+**not**:
+
+1. Cutting a complete inventory down to a summary-plus-pointer because it is
+   long, because transcription might drift, because the rows are "not the
+   current decision set", or because they belong to a category the current
+   brief did not highlight;
+2. Excluding a source because it cannot be transcribed — exclusion means "this
+   does not belong in the base", not "I could not handle it".
+
+This is especially true for an internal knowledge base (`audience=internal-eng`
+or `redaction=none`): catalog IDs, lookup tables, and internal codes are
+**not redaction targets**. Credentials (passwords / keys) still stay off
+the page. Do not stretch "avoid copying large tables" into hiding the shelf the
+user needs to filter.
 
 A page may hold 5MB (~20,000 typical ticket records); a bundle 100MB and 1000
 pages. If a source truly will not fit, split it along a dimension it already has

@@ -2483,10 +2483,23 @@ async def test_prompt_packs_locale():
 
     with tempfile.TemporaryDirectory() as wd:
         compile_box._ensure_workdir_constitution(wd, "zh")
-        assert "铁则" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")  # zh playbook section header (parallels en "Iron rules")
+        zh_const = (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        assert "铁则" in zh_const  # zh playbook section header (parallels en "Iron rules")
+        assert "全集清单要不要建数据页**不在此列**——必须建" in zh_const
+        assert "摘若干「决策高频」样例 + 其余指路回 raw ≠ 编完" in zh_const
+        assert "普通记录集合" in zh_const and "仍由你判断" in zh_const
+        assert "全集清单不同" in zh_const and "每一行" in zh_const
     with tempfile.TemporaryDirectory() as wd:
         compile_box._ensure_workdir_constitution(wd, None)  # platform default = en
-        assert "Iron rules" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        en_const = (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        assert "Iron rules" in en_const
+        assert (
+            "Whether a complete inventory gets a data page is **not** in this column — it must get one"
+            in en_const
+        )
+        assert "high-frequency decision" in en_const and "is not compiled" in en_const
+        assert "ordinary collection" in en_const and "yours to judge" in en_const
+        assert "complete-set inventory" in en_const and "every row of the source table" in en_const
 
     with tempfile.TemporaryDirectory() as td:
         override = Path(td) / "pb.md"
