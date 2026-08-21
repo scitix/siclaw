@@ -93,3 +93,36 @@ Directive: <future warning>
 Tested: <what was verified>
 Not-tested: <known gaps>
 ```
+
+## Cursor Cloud specific instructions
+
+Dependencies (`npm ci` at root and in `portal-web/`) are installed by the
+startup update script; no manual install is needed.
+
+- **Node version is load-bearing.** The project requires Node `>=22.19.0`
+  because the memory DB uses `node:sqlite`'s FTS5 module, which the VM's default
+  `/exec-daemon/node` (22.14.0) does NOT include — under it, all `src/memory/**`
+  tests fail with `no such module: fts5` and the memory feature is broken. Setup
+  added a `~/.bashrc` line preferring nvm's Node 22.22.2 (which has FTS5), so
+  interactive agent shells resolve `node` to 22.22.2 automatically. If `node
+  --version` ever shows 22.14.0, run `source ~/.bashrc` (or
+  `nvm use 22.22.2`). `npm ci` itself works on either version.
+- **Build before running the local server.** `siclaw local` (via `siclaw.mjs`)
+  imports from `dist/`, so run `npm run build` first, and `npm run build:web`
+  (or `make build-portal-web`) so Portal can serve `portal-web/dist/`. The
+  update script intentionally does not build.
+- **Running the product.** `node siclaw.mjs local` starts Portal + Runtime +
+  in-process AgentBox + SQLite in one process (Portal `:3000`, Runtime `:3001`,
+  internal `:3002`). Health check: `curl http://127.0.0.1:3000/api/health`. It
+  seeds a bootstrap admin `admin` / `admin` and auto-creates the DB at
+  `.siclaw/data/portal.db` and secrets at `.siclaw/local-secrets.json`. On Node
+  < 24, `node:sqlite` needs `--experimental-sqlite`, which `siclaw.mjs`
+  re-execs automatically. `scripts/dev-local.sh` wraps rebuild+restart (add
+  `--web` to also rebuild the frontend, `--wipe` to reset DB/secrets).
+- **LLM provider is required for actual investigations.** The agent core cannot
+  answer without a configured LLM provider (API key). Configuring providers,
+  agents, clusters, skills, etc. through the web UI works fully offline, but
+  running a chat/investigation needs a real provider key set in the Models page.
+- **Lint/test/build commands:** lint == typecheck (`npx tsc --noEmit` or
+  `make typecheck`; no ESLint/Prettier). Backend tests: `npm test`. Frontend
+  tests: `cd portal-web && npm run test`. Full check: `make test`.
