@@ -11,10 +11,12 @@ import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
-import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
+import { classifyExit } from "../infra/exit-classification.js";
+import { jsonPathProjector } from "../infra/json-projection.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import { validatePodName, prepareExecEnv, filterPodNoise } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,10 +28,12 @@ interface PodExecParams {
   namespace?: string;
   container?: string;
   command: string;
+  json_path?: string;
   cluster?: string;
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
+
 
 export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
@@ -47,9 +51,11 @@ Use this tool for in-pod diagnostics such as:
 - Reading config or log files (cat, head, tail, ls, find, grep)
 - Checking resource usage (df, du, free)
 
-Allowed commands (ONLY these are permitted):
+Allowed commands (ONLY these are permitted — policy, not availability: these run inside the
+target container, so a distroless or minimal image may not ship them and the command then fails
+with exit 127):
   network: ip, ifconfig, ping, traceroute, tracepath, ss, netstat, route, arp, ethtool, mtr, bridge, tc, conntrack, nslookup, dig, host, curl
-  text: grep, egrep, fgrep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column
+  text: grep, egrep, fgrep, sort, uniq, wc, head, tail, cut, tr, tac, nl, jq, yq, column
   process: ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc
   file (read-only): cat, ls, pwd, stat, file, find, readlink, realpath, basename, dirname, diff, md5sum, sha256sum
   kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo
@@ -85,6 +91,16 @@ Examples:
       cluster: Type.Optional(
         Type.String({
           description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
+        }),
+      ),
+      json_path: Type.Optional(
+        Type.String({
+          description:
+            "Project a field out of the command's JSON output instead of returning the whole document. " +
+            "Evaluated HERE, not on the target — so it works on a target without jq, which most nodes are. " +
+            "Grammar: .a.b, .a[0] (negative counts from the end), .a[] to map over an array, " +
+            '.["odd key"]. Projection only — there are no filters, conditions or functions. ' +
+            "Applied to the sanitized output before truncation, so it is the way to read a large document.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -126,12 +142,19 @@ Examples:
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as PodExecParams;
 
+      // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
+      // would answer with a kubeconfig error and hide the actual mistake.
+      if (backgroundEnabled && params.run_in_background === true && params.json_path) {
+        return backgroundJsonPathError();
+      }
+
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_exec");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
@@ -171,6 +194,9 @@ Examples:
       // Check pod exists and is Running
       const podCheckErr = await checkPodRunning(
         pod, namespace, env.childEnv, env.kubeconfigPath ?? undefined,
+        // The container the caller named: a Pod that is not Running may still hold a running one, and
+        // that container is often exactly what the call is for.
+        params.container,
       );
       if (podCheckErr) {
         return {
@@ -232,12 +258,17 @@ Examples:
         const { stdout, stderr } = await execFileAsync(
           "kubectl",
           kubectlArgs,
-          { timeout, env: env.childEnv, signal },
+          // Same ceiling restricted_bash uses. Without it Node's 1 MB default applied, and a large
+          // read was killed at that limit — the captured prefix then read as a complete answer.
+          { timeout, env: env.childEnv, signal, maxBuffer: 1024 * 1024 * 10 },
         );
 
         return {
-          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: filterPodNoise(stderr.trim()) || undefined }) }],
-          details: { exitCode: 0 },
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
+            stderr: filterPodNoise(stderr.trim()) || undefined,
+            project: jsonPathProjector(params.json_path),
+          }) }],
+          details: { exitCode: 0, exit_class: "success" },
         };
       } catch (err: any) {
         // User Stop → execFile rejects with an AbortError; surface a clean "Aborted." rather than
@@ -247,10 +278,32 @@ Examples:
         }
         const stdout = (err.stdout?.trim() ?? "") as string;
         const stderr = filterPodNoise((err.stderr?.trim() ?? err.message) as string);
-        const exitCode = err.code ?? "unknown";
+        // `err.code` is the exit code for a command that ran, but a STRING (ENOENT, …) when the
+        // spawn itself failed — classifyExit separates those, so a broken exec path is no longer
+        // reported as the container's own answer.
+        const judgment = classifyExit({
+          command: params.command,
+          exitCode: err.code,
+          stdout,
+          // Unfiltered — filterPodNoise removes the kubectl lines a channel failure is announced in.
+          stderr: (err.stderr?.trim() ?? err.message ?? "") as string,
+          signal: err.signal,
+          context: "pod",
+        });
         return {
-          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${exitCode}]`, pre.action, { stderr: stderr || undefined }) }],
-          details: { exitCode, error: true },
+          content: [{ type: "text", text: postExecSecurity(stdout, pre.action, {
+            stderr: stderr || undefined,
+            project: jsonPathProjector(params.json_path),
+            ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),
+            exitCode: err.code ?? "unknown",
+            ...(err.signal ? { signal: err.signal } : {}),
+          }) }],
+          details: {
+            exitCode: err.code ?? "unknown",
+            exit_class: judgment.exitClass,
+            ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
+            ...(judgment.isError && { error: true }),
+          },
         };
       }
     },

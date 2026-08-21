@@ -130,8 +130,9 @@ export function createSpawnSubagentTool(
   executor = refs.spawnSubagentExecutor,
 ): ToolDefinition {
   // Background (detached) delegation is allowed only when the global switch is on AND this entry
-  // point can receive an async conclusion. On channel/a2a/api/cron (foregroundSubagentOnly) every
-  // launch runs foreground so the turn carries the real answer. run_in_background exec is separate.
+  // point can receive an async conclusion. Only the `channel` session sets foregroundSubagentOnly
+  // (see agent-factory) — there every launch runs foreground so the turn carries the real answer.
+  // web/cli keep background; a2a/api/task never resolve this tool (see `modes` below). exec is separate.
   const backgroundAllowed = RUN_IN_BACKGROUND_ENABLED && !refs.foregroundSubagentOnly;
   return {
     name: "spawn_subagent",

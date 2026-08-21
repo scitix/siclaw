@@ -287,6 +287,15 @@ Container requires `CAP_SETUID` + `CAP_SETGID` capabilities (all others dropped)
 
 Application-level command validation (COMMAND_RULES, whitelist, shell operator blocking) is retained as defense-in-depth, not as primary credential protection.
 
+> **Regressed 2026-04 to 2026-08, restored since.** `sandbox` was granted `kubecred` and `hostcred`
+> alongside the host-credential pipeline, for a setgid `ssh` reader that was never built (and turned out
+> unnecessary — `host_exec` dials from the node process). Combined with an entrypoint line that chowned
+> the whole credential tree to `kubecred`, this made every credential file readable by any child
+> process, leaving the command validation this ADR demotes to defense-in-depth as the only barrier.
+> Neither change was wrong in isolation, and the baked image looked correct — only the running container
+> was exposed, which is why it went unnoticed for four months. The build now fails and the container
+> refuses to start if `sandbox` holds either group.
+
 **Consequences**:
 - ✅ Credential files are OS-protected — no application-level bypass possible for file reads
 - ✅ Pipeline syntax preserved: `kubectl get pods | grep Error` works naturally

@@ -13,12 +13,21 @@
 
 import {
   detectSensitiveResource,
+  kubectlSubcommand,
+  crictlSubcommand,
   getOutputFormat,
   sanitizeJSON,
+  redactSensitiveContent,
+  REDACTION_NOTICE,
   SENSITIVE_ENV_NAME_PATTERNS,
   SENSITIVE_VALUE_PATTERNS,
   type SensitiveResourceType,
 } from "./kubectl-sanitize.js";
+
+// The line-level redactor lives in kubectl-sanitize.ts — the structural
+// sanitizers there need it for ConfigMap entries that hold a whole config file.
+// Re-exported here because this module is its public entry point.
+export { redactSensitiveContent, REDACTION_NOTICE };
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -84,13 +93,14 @@ function makeKubectlJsonSanitizer(
 // ── kubectl rules ────────────────────────────────────────────────────
 
 OUTPUT_RULES["kubectl"] = (args) => {
-  const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+  // Shared with detectSensitiveResource so the two cannot disagree about what a command says.
+  const sub = kubectlSubcommand(args);
 
   // describe: sanitize configmap/pod output; secret describe is safe (shows byte counts only)
   if (sub === "describe") {
     const resource = detectSensitiveResource(args);
     if (resource && resource !== "secret") {
-      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: true };
+      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false };
     }
     return null;
   }
@@ -113,73 +123,25 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (!fmt || safeFormats.has(fmt)) return null;
 
   // All other formats (yaml, jsonpath, go-template, custom-columns) → line-level sanitization
-  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: true };
+  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false };
 };
 
 // ── File-reading command rules ──────────────────────────────────────
 
 const REDACTED = "**REDACTED**";
 
-/**
- * Advisory footer appended (once) by the line-based redactors when anything was
- * redacted. Exported so streaming sanitization (background bash) can strip the
- * per-batch duplicates — the inline **REDACTED** markers carry the actual security
- * property; the footer is cosmetic.
- */
-export const REDACTION_NOTICE = "\n\n⚠️ Sensitive values have been redacted for security.";
-
-/**
- * Redact sensitive content from file-reading command output.
- * Scans each line for:
- *   - KEY=VALUE or KEY: VALUE where KEY matches SENSITIVE_ENV_NAME_PATTERNS
- *   - Values matching SENSITIVE_VALUE_PATTERNS (JWT, PEM, connection strings, etc.)
- */
-/** @public Used by restricted-bash pipeline fallback sanitization */
-export function redactSensitiveContent(output: string): string {
-  const lines = output.split("\n");
-  let redacted = false;
-
-  const result = lines.map((line) => {
-    // Check value patterns first (JWT, PEM, connection string, known prefixes)
-    for (const pattern of SENSITIVE_VALUE_PATTERNS) {
-      if (pattern.test(line)) {
-        redacted = true;
-        return REDACTED;
-      }
-    }
-
-    // Check KEY=VALUE format
-    const eqMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)/);
-    if (eqMatch) {
-      const key = eqMatch[1];
-      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
-        redacted = true;
-        return `${key}=${REDACTED}`;
-      }
-    }
-
-    // Check KEY: VALUE format (YAML-like)
-    const colonMatch = line.match(/^(\s*[A-Za-z_][A-Za-z0-9_.-]*):\s+(.*)/);
-    if (colonMatch) {
-      const key = colonMatch[1].trim();
-      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
-        redacted = true;
-        return `${colonMatch[1]}: ${REDACTED}`;
-      }
-    }
-
-    return line;
-  });
-
-  const sanitized = result.join("\n");
-  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
-}
-
 /** Rule for file-reading commands: always sanitize output */
 const fileReadingRule: OutputRuleFn = (_args) => ({
   type: "sanitize",
   sanitize: redactSensitiveContent,
-  lineSafe: true,
+  // NOT line-safe. `redactSensitiveContent` routes through `redactDocument`, which carries state
+  // across lines so that a PEM body, a YAML block scalar and a mapping nested under a sensitive key
+  // are redacted along with the marker that introduces them. The streaming sanitizer calls a
+  // line-safe action once per batch of complete lines with no state between calls, so a secret split
+  // across two batches had its BEGIN line redacted and its body written to the task output verbatim —
+  // with the redaction notice attached. `false` makes the existing fail-closed guard in
+  // SanitizingLineBuffer refuse to background these commands instead.
+  lineSafe: false,
 });
 
 for (const cmd of [
@@ -196,45 +158,100 @@ for (const cmd of [
  * Redact sensitive values from env/printenv output (KEY=VALUE per line).
  * Matches key names against SENSITIVE_ENV_NAME_PATTERNS.
  */
-function redactEnvOutput(output: string): string {
-  const lines = output.split("\n");
+function redactEnvOutput(output: string, opts?: { separator?: string }): string {
+  // `env -0` / `printenv -0` separate entries with NUL, not newline. Splitting on newlines left the whole
+  // record as one "line" whose first KEY= decided everything, so `SAFE=x<NUL>API_KEY=secret` kept the
+  // secret. The separator is passed in by the rule, the only place that can see the flag.
+  const sep = opts?.separator ?? "\n";
+  const entries = output.split(sep);
   let redacted = false;
 
-  const result = lines.map((line) => {
-    const eqIdx = line.indexOf("=");
-    if (eqIdx <= 0) return line;
+  // An env VALUE may span lines. Per-line splitting masked only the first line of a multi-line secret
+  // and let the remainder through, so a continuation line belongs to the record above it until the next
+  // `KEY=`.
+  const KEY_START = /^[A-Za-z_][A-Za-z0-9_]*=/;
+  const records: string[] = [];
+  for (const entry of entries) {
+    if (sep === "\n" && records.length > 0 && !KEY_START.test(entry)) {
+      records[records.length - 1] += "\n" + entry;
+    } else {
+      records.push(entry);
+    }
+  }
 
-    const key = line.slice(0, eqIdx);
+  const result = records.map((record) => {
+    const eqIdx = record.indexOf("=");
+    if (eqIdx <= 0) return record;
+
+    const key = record.slice(0, eqIdx);
     if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
       redacted = true;
       return `${key}=${REDACTED}`;
     }
 
-    // Also check value patterns (JWT, PEM, etc.)
-    const value = line.slice(eqIdx + 1);
+    // Value patterns (JWT, PEM, …) over the WHOLE value, continuation lines included.
+    const value = record.slice(eqIdx + 1);
     if (SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value))) {
       redacted = true;
       return `${key}=${REDACTED}`;
     }
 
-    return line;
+    return record;
   });
 
-  const sanitized = result.join("\n");
+  const sanitized = result.join(sep);
   return redacted ? sanitized + REDACTION_NOTICE : sanitized;
 }
 
-OUTPUT_RULES["env"] = (_args) => ({
-  type: "sanitize",
-  sanitize: redactEnvOutput,
-  lineSafe: true,
-});
+/**
+ * `printenv NAME` prints the VALUE ALONE — no `KEY=` for the redactor to key on, so a sensitive variable
+ * came back verbatim. The name is only in the argv, and the entire output is that one value: redact all
+ * of it or none of it.
+ */
+function redactBareEnvValue(names: string[]): (output: string) => string {
+  const sensitive = names.some((n) => SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(n)));
+  return (output: string) => {
+    if (!sensitive) return redactEnvOutput(output);
+    return output.trim() ? REDACTED + REDACTION_NOTICE : output;
+  };
+}
 
-OUTPUT_RULES["printenv"] = (_args) => ({
-  type: "sanitize",
-  sanitize: redactEnvOutput,
-  lineSafe: true,
-});
+/** `-0`/`--null` switches the record separator to NUL, which also removes any line structure. */
+function envNulSeparated(args: string[]): boolean {
+  return args.some((a) => a === "-0" || a === "--null");
+}
+
+const NUL_SEPARATOR = String.fromCharCode(0);
+
+OUTPUT_RULES["env"] = (args) => {
+  const nul = envNulSeparated(args);
+  return {
+    type: "sanitize",
+    sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
+    // NEVER line-safe, NUL or not. `redactEnvOutput` folds continuation lines: a value containing a
+    // newline is one env RECORD spanning several lines, and the sanitizer joins them before matching —
+    // which is the whole reason a multi-line `PASSWORD=…` is covered. A per-batch streaming call has no
+    // state to fold across, so it would redact the first line of such a record and emit the rest. Same
+    // class as the PEM/document redactor, whose `lineSafe: false` is a few lines above.
+    lineSafe: false,
+  };
+};
+
+OUTPUT_RULES["printenv"] = (args) => {
+  // `printenv NAME…` prints bare values; `printenv` alone prints KEY=VALUE records.
+  const names = args.filter((a) => !a.startsWith("-"));
+  const nul = envNulSeparated(args);
+  if (names.length > 0) {
+    return { type: "sanitize", sanitize: redactBareEnvValue(names), lineSafe: false };
+  }
+  return {
+    type: "sanitize",
+    sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
+    // Same reasoning as `env` above: this redactor folds continuation lines, so a record spanning lines
+    // cannot be redacted a batch at a time. Fixing only `env` left this half of the same rule behind.
+    lineSafe: false,
+  };
+};
 
 // ── crictl inspect rules ────────────────────────────────────────────
 
@@ -287,7 +304,9 @@ function sanitizeCrictlInspect(output: string): string {
 }
 
 OUTPUT_RULES["crictl"] = (args) => {
-  const sub = args.find((a) => !a.startsWith("-"));
+  // Skips the values of `-r`/`--runtime-endpoint` and friends: `crictl -r <sock> inspect X` otherwise
+  // read as subcommand `<sock>` and no sanitizer attached, so the container's env came back verbatim.
+  const sub = crictlSubcommand(args);
   if (sub === "inspect" || sub === "inspecti" || sub === "inspectp") {
     return { type: "sanitize", sanitize: sanitizeCrictlInspect, lineSafe: false };
   }

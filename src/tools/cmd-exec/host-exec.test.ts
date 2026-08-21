@@ -55,7 +55,7 @@ describe("host_exec", () => {
     expect((result.details as any).error).toBeUndefined();
   });
 
-  it("non-zero exit produces error=true with header", async () => {
+  it("names WHAT a non-zero exit means, not just that there was one", async () => {
     vi.mocked(acquireSshTarget).mockResolvedValueOnce({
       host: "10.0.0.1", port: 22, username: "root",
       auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
@@ -66,8 +66,40 @@ describe("host_exec", () => {
       exitCode: 127,
     });
     const result = await tool.execute("id", { host: "h1", command: "cat /nope" }, undefined, {} as any);
-    expect(result.content[0].text).toContain("Exit code: 127");
+    // Both halves: the code is rendered by postExecSecurity, the class rides in notes. The class has
+    // to be in the TEXT because details is stripped before the model sees the result.
+    expect(result.content[0].text).toContain("[exit code: 127]");
+    expect(result.content[0].text).toContain("dependency_missing");
     expect((result.details as any).error).toBe(true);
+    expect((result.details as any).exit_class).toBe("dependency_missing");
+  });
+
+  it("does not report a no-match as a failed command", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 1 });
+    const result = await tool.execute(
+      "id", { host: "h1", command: "journalctl -u kubelet | grep -i oom" }, undefined, {} as any,
+    );
+    expect((result.details as any).exit_class).toBe("no_match");
+    expect((result.details as any).error).toBeUndefined();
+    expect(result.content[0].text).toContain("no_match");
+  });
+
+  it("appends the annotation after the output instead of pushing the answer down", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "inactive", stderr: "", exitCode: 3 });
+    const result = await tool.execute(
+      "id", { host: "h1", command: "systemctl is-active kubelet" }, undefined, {} as any,
+    );
+    const text = result.content[0].text as string;
+    expect(text.indexOf("inactive")).toBeLessThan(text.indexOf("exit code: 3"));
+    expect((result.details as any).exit_class).toBe("target_reported_failure");
   });
 
   it("foreground: wraps the command as a killable timeout-bounded session and reaps it on abort", async () => {
@@ -135,5 +167,43 @@ describe("host_exec", () => {
     const result = await tool.execute("id", { host: "h1", command: "cat /var/log/messages" }, undefined, {} as any);
     expect((result.details as any).error).toBeUndefined();
     expect((result.details as any).signal).toBe("SIGTERM");
+  });
+});
+
+describe("an SSH failure says WHICH layer failed", () => {
+  // "SSH connection failed" was the whole answer, and the three cases call for different next steps.
+  // Two are readable straight out of the client's text — a review captured
+  // `forwardOut from … failed: (SSH) Channel open failure: No route to host`, where `forwardOut` means
+  // the bastion was reached and could not reach the target.
+  const run = async (message: string, host = "h1") => {
+    vi.mocked(acquireSshTarget).mockResolvedValue({ host: "10.0.0.9", port: 22, username: "u",
+      auth: { type: "password", password: "p" } } as never);
+    vi.mocked(sshExec).mockRejectedValue(new Error(message));
+    const res = await createHostExecTool({ credentialBroker: fakeBroker } as any)
+      .execute("id", { host, command: "uptime" }, undefined, {} as any);
+    return { text: res.content[0].text as string, details: res.details as Record<string, unknown> };
+  };
+
+  it("names the jump hop rather than blaming the bastion", async () => {
+    const r = await run("forwardOut from 214.31.43.1 to 214.31.40.77:22 failed: (SSH) Channel open failure: No route to host");
+    expect(r.details.ssh_stage).toBe("jump_hop");
+    expect(r.text).toMatch(/bastion was reached/);
+  });
+
+  it("separates a rejected credential from an unreachable host", async () => {
+    expect((await run("All configured authentication methods failed")).details.ssh_stage).toBe("authentication");
+    expect((await run("SSH chain connect timeout after 10000ms")).details.ssh_stage).toBe("network");
+  });
+
+  it("says the same host just failed, without refusing to try again", async () => {
+    // Deliberately not a negative cache: the attempt still happens, because a cache would keep a host
+    // that has just recovered locked out. A review reports two ten-second waits — worth reporting, not
+    // worth a state machine that can be wrong.
+    const host = `repeat-${Date.now()}`;
+    const first = await run("SSH chain connect timeout after 10000ms", host);
+    expect(first.text, "nothing to report on the first failure").not.toMatch(/also failed/);
+    const second = await run("SSH chain connect timeout after 10000ms", host);
+    expect(second.text).toMatch(/also failed to connect/);
+    expect(vi.mocked(sshExec).mock.calls.length, "the second attempt was still made").toBeGreaterThan(1);
   });
 });

@@ -33,7 +33,13 @@ export async function checkNodeReady(
     );
     const status = stdout.trim();
     if (status !== "True") {
-      return `Node "${node}" is not Ready (status: ${status || "unknown"}). The node may be down, cordoned, or experiencing issues.`;
+      // Not "cordoned": cordoning sets spec.unschedulable and leaves Ready=True, so naming it here
+      // sends the reader to check a field that cannot produce this condition. A non-True Ready comes
+      // from the kubelet — not reporting, or reporting a problem.
+      return `Node "${node}" is not Ready (status: ${status || "unknown"}). Its kubelet is either not `
+        + `reporting (node down, network partition, kubelet stopped) or reporting a problem `
+        + `(disk/memory pressure, container runtime down). Debug pods are not started on a node in `
+        + `this state — check "kubectl describe node ${node}" conditions first.`;
     }
     return null;
   } catch (err: any) {
@@ -163,11 +169,46 @@ export async function waitForPodDone(
  * Check that a Kubernetes pod exists and is in Running phase.
  * Returns an error message string on failure, or null if the pod is running.
  */
+/**
+ * Names of containers (init included) currently in the running state.
+ *
+ * Only consulted when the Pod-level phase is not Running: the point is to tell "nothing is up" from
+ * "the Pod as a whole is not up, but the container you asked for is".
+ */
+async function runningContainers(
+  pod: string,
+  namespace: string,
+  env?: NodeJS.ProcessEnv,
+  kubeconfigPath?: string,
+): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync(
+      "kubectl",
+      [
+        ...(kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : []),
+        "get", "pod", pod, "-n", namespace, "-o", "json",
+      ],
+      { timeout: KUBECTL_TIMEOUT, env },
+    );
+    const obj = JSON.parse(stdout) as {
+      status?: { containerStatuses?: Array<{ name?: string; state?: Record<string, unknown> }>;
+                 initContainerStatuses?: Array<{ name?: string; state?: Record<string, unknown> }> };
+    };
+    const all = [...(obj.status?.initContainerStatuses ?? []), ...(obj.status?.containerStatuses ?? [])];
+    return all.filter((c) => c.state && "running" in c.state).map((c) => c.name ?? "").filter(Boolean);
+  } catch {
+    // Unreadable ⇒ report nothing rather than guessing a container is up.
+    return [];
+  }
+}
+
 export async function checkPodRunning(
   pod: string,
   namespace: string,
   env?: NodeJS.ProcessEnv,
   kubeconfigPath?: string,
+  /** The container the caller intends to enter. A Pod that is not Running may still hold a running one. */
+  container?: string,
 ): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
@@ -185,10 +226,23 @@ export async function checkPodRunning(
       { timeout: KUBECTL_TIMEOUT, env },
     );
     const phase = stdout.trim();
-    if (phase !== "Running") {
-      return `Pod "${pod}" in namespace "${namespace}" is not Running (phase: ${phase || "unknown"}). Cannot execute scripts in a non-running pod.`;
-    }
-    return null;
+    if (phase === "Running") return null;
+
+    // Phase is a POD-level summary, and exec targets a CONTAINER. A Pod sits at Pending while a
+    // startup-delay init container is already Running — and that container is exactly what the caller
+    // wants to look inside. Refusing on phase alone sent one investigation down the much heavier
+    // node_exec + CRI + host-PID path for a check that would have worked.
+    //
+    // The extra request runs only on the unhappy path: the phase check above still answers the common
+    // case in one call.
+    const running = await runningContainers(pod, namespace, env, kubeconfigPath);
+    if (container && running.includes(container)) return null;
+    if (!container && running.length > 0) return null;
+
+    const detail = running.length > 0
+      ? ` Containers that ARE running: ${running.join(", ")} — name one with the container parameter.`
+      : " No container in it is running either.";
+    return `Pod "${pod}" in namespace "${namespace}" is not Running (phase: ${phase || "unknown"}).${detail}`;
   } catch (err: any) {
     const stderr = (err.stderr?.trim() || err.message) as string;
     if (stderr.includes("not found")) {

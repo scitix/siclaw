@@ -1410,15 +1410,16 @@ describe("validateKubectlInPipeline — inline --kubeconfig rejected (use the cl
 
 // ── Sensitive resource pipeline protection ──────────────────────────
 
-describe("validateKubectlInPipeline — sensitive resource (no pre-execution blocking)", () => {
-  // Sensitive resources are now handled by post-execution sanitization,
-  // not pre-execution blocking. All these should pass through.
+describe("validateKubectlInPipeline — sensitive resources rely on sanitization, EXCEPT a Secret's format", () => {
+  // The rule used to be "no pre-execution blocking: post-execution sanitization handles it". That holds
+  // for a ConfigMap or a Pod, whose secrets are named by keys the redactor can see. It does NOT hold for
+  // a Secret asked for one value: `-o jsonpath={.data.password}` emits a lone base64 blob with no key
+  // beside it and no recognisable shape, and the redactor returned it verbatim. Deciding whether an
+  // arbitrary string is a secret is not a decidable problem, so the FORMAT is refused instead — which is
+  // why three cases moved out of this list and into the block below.
 
   const allowedCmds = [
     "kubectl get secret my-secret -o json",
-    "kubectl get secrets -n default -o yaml",
-    "kubectl get secret my-secret -o jsonpath='{.data.password}'",
-    "kubectl get secret my-secret -o go-template={{.data}}",
     "kubectl get configmap my-config -o yaml",
     "kubectl get cm my-config -o json",
     "kubectl get secret my-secret -ojson",
@@ -1446,10 +1447,14 @@ describe("validateKubectlInPipeline — sensitive resource (no pre-execution blo
     expect(validateKubectlInPipeline(["kubectl get secret -A"])).toBeNull();
   });
 
-  it("blocks kubectl get secret -A -o yaml (bulk serialization)", () => {
+  it("blocks kubectl get secret -A -o yaml — now on the FORMAT, before the volume", () => {
     const err = validateKubectlInPipeline(["kubectl get secret -A -o yaml"]);
     expect(err).not.toBeNull();
-    expect(err).toContain("excessive data");
+    // The format check runs first and is the stronger reason: -o yaml on a Secret can print the value
+    // whether or not it is one namespace or all of them. The bulk-serialization refusal still applies
+    // to every other resource.
+    expect(err).toContain("print the secret");
+    expect(validateKubectlInPipeline(["kubectl get cm -A -o yaml"])).toContain("excessive data");
   });
 
   it("allows kubectl get secret -A -l app=web (has selector)", () => {
@@ -1561,4 +1566,249 @@ describe("validateKubectlInPipeline — rate protection", () => {
       expect(validateKubectlInPipeline([cmd])).toBeNull();
     });
   }
+});
+
+describe("a Secret may only be printed in a form that cannot show its values", () => {
+  // `kubectl get secret demo -o 'jsonpath={.data.password}'` emits a lone base64 blob: no key name
+  // beside it and no recognisable shape, so the text redactor returned it verbatim. That is a complete
+  // secret disclosure, and no output filter can fix it — deciding whether an arbitrary string is a
+  // secret is not a decidable problem. The format has to be refused before the command runs.
+  const check = (cmd: string) => validateKubectlInPipeline([cmd]);
+
+  it("refuses every format that can print a value", () => {
+    for (const fmt of [
+      "jsonpath={.data.password}", "custom-columns=D:.data.password",
+      "go-template={{.data.password}}", "yaml", "jsonpath-as-json={.data}",
+    ]) {
+      expect(check(`kubectl get secret demo -o ${fmt}`), fmt).not.toBeNull();
+    }
+    // Mixed resource lists and a decoding pipeline are the same disclosure.
+    expect(check("kubectl get secret,pod -o yaml")).not.toBeNull();
+  });
+
+  it("permits the forms that cannot", () => {
+    // -o json is safe because the structural sanitizer redacts every data/stringData value
+    // unconditionally rather than judging it; the others never print data at all.
+    for (const cmd of [
+      "kubectl get secret demo -o json", "kubectl get secret demo",
+      "kubectl get secret demo -o name", "kubectl get secret demo -o wide",
+      "kubectl describe secret demo",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("finds the Secret wherever kubectl accepts it, not just as the first bare word", () => {
+    // Three payloads that defeated the first version of this check. It looked for "the resource" with a
+    // one-liner — the first token after the subcommand that does not start with `-` — which is wrong in
+    // two independent ways, and both were reachable:
+    //
+    //   secret/demo -o yaml            the type/name form: the token is not equal to `secret`
+    //   -o yaml secret demo            `yaml` is a flag VALUE and was taken as the resource
+    //   -n default secret demo -o yaml `default` likewise
+    //
+    // Fixed by testing EVERY non-flag token instead of guessing which one is the resource, which is what
+    // makes flag arity irrelevant — arity is the part that cannot be tracked across kubectl versions.
+    for (const cmd of [
+      "kubectl get secret/demo -o yaml",
+      "kubectl get secrets/demo -o jsonpath={.data.password}",
+      "kubectl get -o yaml secret demo",
+      "kubectl get -o jsonpath={.data.password} secret demo",
+      "kubectl get -n default secret demo -o yaml",
+      "kubectl get --namespace=kube-system secrets -o yaml",
+      "kubectl get pod,secret/demo -o yaml",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("covers the spellings a live cluster actually accepts, not the ones that read plausibly", () => {
+    // Third round of holes in this same control. Every payload here was run against a real cluster
+    // first, and the run changed what needed fixing:
+    //
+    //   --template={{.data.password}}   returned the bare base64  → real; `--template` is the alias for
+    //                                                               -o go-template and the format check
+    //                                                               only inspected -o/--output
+    //   get --raw /…/secrets/<name>    returned the whole object  → real, and worse than a format hole:
+    //                                                               a raw API passthrough has no printer
+    //                                                               and no resource token, so the output
+    //                                                               sanitizer attached nothing either
+    //   secrets.v1.  secret.v1.  secrets.   returned the base64   → real, WITH the trailing dot (empty
+    //                                                               group for a core resource)
+    //   secrets.v1   secrets.core                                 → rejected by kubectl itself, so not
+    //                                                               holes; the review's spelling was one
+    //                                                               of these
+    for (const cmd of [
+      "kubectl get secret demo --template={{.data.password}}",
+      "kubectl get secret demo --template='{{.data.password}}'",
+      "kubectl get secret demo --template",
+      "kubectl get secrets.v1. demo -o yaml",
+      "kubectl get secret.v1. demo -o jsonpath={.data.password}",
+      "kubectl get secrets. demo -o yaml",
+      "kubectl get secret.v1./demo -o yaml",
+      "kubectl get --raw /api/v1/namespaces/default/secrets/demo",
+      "kubectl get --raw=/api/v1/namespaces/default/secrets/demo",
+      "kubectl get --raw /api/v1/namespaces/default/secrets",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("leaves the raw endpoints an SRE actually needs", () => {
+    // `--raw` is permitted for the endpoints that return no API objects, where having no sanitizer costs
+    // nothing. /metrics, /healthz and /version name no resource.
+    for (const cmd of [
+      "kubectl get --raw /metrics", "kubectl get --raw /healthz", "kubectl get --raw /version",
+      "kubectl get --raw /readyz", "kubectl get --raw /livez",
+      "kubectl get --raw /api", "kubectl get --raw /apis",
+      // and a typed name for a resource that is not a Secret
+      "kubectl get configmaps.v1. demo -o yaml", "kubectl get pods.v1. -o yaml",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("refuses --raw for anything that returns an API object", () => {
+    // This list used to include `/api/v1/namespaces/default/pods` as PERMITTED, which was wrong: a raw
+    // response arrives with no printer and no resource token, so `detectSensitiveResource` matches
+    // nothing and the sanitizer attaches NOTHING. That path returns every Pod's container env; the
+    // `/configmaps` one returns registry credentials. Refusing a `/secrets` segment while allowing those
+    // two covered the spelling and not the mechanism.
+    for (const cmd of [
+      "kubectl get --raw /api/v1/namespaces/default/pods",
+      "kubectl get --raw /api/v1/namespaces/default/configmaps",
+      "kubectl get --raw /api/v1/namespaces/default/configmaps/registry-auth",
+      "kubectl get --raw=/api/v1/namespaces/default/pods",
+      "kubectl get --raw /apis/apps/v1/deployments",
+      // A discovery path is permitted, but only as the WHOLE path.
+      "kubectl get --raw /api/v1/secrets",
+      "kubectl get --raw /metrics/../api/v1/namespaces/x/secrets/y",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("does not chase abbreviations kubectl itself rejects", () => {
+    // `kubectl get sec` fails at the server ("the server doesn't have a resource type"), and Secrets have
+    // no registered short name — checked against a live cluster, so these are not holes. Matching them
+    // would only add false refusals on resources whose names happen to start with those letters.
+    expect(check("kubectl get sec -o yaml")).toBeNull();
+    expect(check("kubectl get secretproviderclasses -o yaml")).toBeNull();
+  });
+
+  it("does not restrict other resources", () => {
+    expect(check("kubectl get pods -o yaml")).toBeNull();
+    expect(check("kubectl get cm x -o jsonpath={.data}")).toBeNull();
+    // A label value that merely contains the word is not a resource reference.
+    expect(check("kubectl get pods -l app=secret -o yaml")).toBeNull();
+    expect(check("kubectl get pod/mypod -o yaml")).toBeNull();
+  });
+
+  it("names only permitted alternatives in the refusal", () => {
+    const err = check("kubectl get secret demo -o yaml") ?? "";
+    expect(err).toContain("-o json");
+    expect(err).toContain("describe secret");
+    // Must not suggest something the same rule refuses.
+    expect(err).not.toContain("custom-columns");
+  });
+});
+
+describe("rollout is allowed by VERB, not by subcommand", () => {
+  // Trace 3f73a70e: `kubectl rollout history` was refused as a write, and the agent spent five calls
+  // rebuilding the same revision list out of Deployment annotations, ReplicaSet creation times and
+  // images. `history` prints revisions and changes nothing; the other verbs mutate — so the allowance
+  // belongs on the verb.
+  const check = (cmd: string) => validateKubectlInPipeline([cmd]);
+
+  it("permits rollout history", () => {
+    for (const cmd of [
+      "kubectl rollout history deployment/model-api -n simaas",
+      "kubectl rollout history deployment model-api",
+      "kubectl rollout history -n simaas deployment/model-api --revision=138",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("still refuses every verb that changes state", () => {
+    for (const verb of ["undo", "restart", "pause", "resume", "status"]) {
+      const err = check(`kubectl rollout ${verb} deployment/model-api`);
+      expect(err, verb).not.toBeNull();
+      // and the refusal says which verb IS available rather than only what is forbidden
+      expect(err, verb).toContain("history");
+    }
+  });
+
+  it("refuses a bare rollout with no verb", () => {
+    expect(check("kubectl rollout")).not.toBeNull();
+  });
+});
+
+describe("a Secret read cannot be piped", () => {
+  // `-o json` is the ONE permitted Secret format, and it is permitted because the structural sanitizer
+  // redacts every data value. That applies to what the LAST stage prints — so
+  // `kubectl get secret demo -o json | jq -r .data.password` hands back a bare base64 string: not JSON,
+  // nothing structural applies, and unrecognisable to a text redactor for exactly the reason
+  // `-o jsonpath` is refused outright. The premise does not survive a pipe.
+  const check = (cmd: string) => validateKubectlInPipeline(cmd.split(" | "));
+
+  it("refuses a Secret feeding any downstream stage", () => {
+    for (const cmd of ["kubectl get secret demo -o json | jq -r .data.password",
+                       "kubectl get secret demo -o json | jq '.data'",
+                       "kubectl get secrets. demo -o json | jq -r .data.password",
+                       "kubectl get secret/demo -o json | grep password",
+                       "kubectl get secret demo -o json | base64 -d",
+                       "kubectl describe secret demo | grep -i token"]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("names what to do instead", () => {
+    const err = check("kubectl get secret demo -o json | jq .data") ?? "";
+    expect(err).toContain("describe secret");
+    expect(err, "and explains why the format alone is not the guarantee").toMatch(/last stage|redact/i);
+  });
+
+  it("leaves unpiped reads and other resources alone", () => {
+    // Scoped to Secrets: a ConfigMap or Pod is pattern-redacted, which survives reshaping far better,
+    // and refusing every filtered read would cost more than it protects.
+    for (const cmd of ["kubectl get secret demo -o json", "kubectl describe secret demo",
+                       "kubectl get secret demo -o name",
+                       "kubectl get pods -o json | jq '.items[].metadata.name'",
+                       "kubectl get cm x -o json | jq .data"]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+});
+
+describe("the subcommand and the rollout verb come from one reader", () => {
+  const check = (cmd: string) => validateKubectlInPipeline([cmd]);
+  it("is not fooled by a global flag's value", () => {
+    // A local copy of the value-flag list was missing `--as` and others, so `kubectl --as get delete pod
+    // victim` took `get` as the subcommand and the mutating `delete` was never examined. The table now
+    // lives with the sanitizer, because both sides have to agree about where the verb is.
+    for (const cmd of ["kubectl --as get delete pod victim", "kubectl --request-timeout get delete pod v",
+                       "kubectl --as-group get delete pod v", "kubectl --as-uid get delete pod v",
+                       "kubectl --cache-dir get delete pod v", "kubectl --username get delete pod v",
+                       "kubectl --token get apply -f x.yaml"]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("extracts the rollout verb the same way — it was wrong in BOTH directions", () => {
+    // `rollout -n history restart …` read the namespace as the verb and permitted a restart;
+    // `rollout -n x history …` was refused for naming `x`.
+    expect(check("kubectl rollout -n history restart deployment/foo"), "a restart must not pass").not.toBeNull();
+    expect(check("kubectl rollout --as history undo deployment/foo")).not.toBeNull();
+    expect(check("kubectl rollout -n x history deployment/foo"), "a namespaced history must pass").toBeNull();
+    expect(check("kubectl rollout history deployment/foo")).toBeNull();
+  });
+
+  it("leaves ordinary namespaced and impersonated reads alone", () => {
+    for (const cmd of ["kubectl get pods", "kubectl -n kube-system get pods",
+                       "kubectl --as user get pods", "kubectl --request-timeout 30s get pods",
+                       "kubectl --context prod -n x get pods -o json"]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
 });

@@ -39,6 +39,20 @@ describe("host_exec — run_in_background schema gating", () => {
     expect((tool.parameters as any).properties.host).toBeDefined();
     expect((tool.parameters as any).properties.command).toBeDefined();
   });
+
+  it("refuses json_path together with run_in_background, and does not launch", async () => {
+    // The third leg of a rule node_exec and pod_exec already have tests for. Accepting both would
+    // silently drop the projection: the agent asks for one field, gets the whole stream, and has no way
+    // to tell its parameter did nothing. Streaming output cannot be projected — the document is not
+    // complete until the job ends.
+    const tool = createHostExecTool(undefined, wiring);
+    const res = await tool.execute(
+      "call-jp", { host: "myhost", command: "ip -j addr", run_in_background: true, json_path: ".[].ifname" },
+      undefined, {} as any,
+    );
+    expect((res.details as any).reason).toBe("background_json_path_unsupported");
+    expect(fakeExecutor).not.toHaveBeenCalled();
+  });
 });
 
 describe("host_exec — background remote lifecycle", () => {

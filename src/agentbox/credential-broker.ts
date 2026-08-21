@@ -249,8 +249,10 @@ class ResourceRegistry<TMeta extends { name: string }> {
         continue;
       }
       const tmpPath = filePath + ".new";
-      // K8s mode: kubectl/ssh runs as `sandbox` (uid 1001) which is a member
-      // of the kubecred / hostcred group; the file needs group-read.
+      // K8s mode: 0640 + chgrp exists for the SETGID kubectl, which runs with group `kubecred`. It is
+      // not for `sandbox` — that user is in NEITHER credential group, which is what makes the setgid bit
+      // mean something (see ADR-010 and docs/design/security.md §3). `host_exec` needs no group reader at
+      // all: it dials over ssh2 inside the node process, as `agentbox`, the owner.
       // Local mode: sharedGroup gid resolves to null → fall back to 0600.
       fs.writeFileSync(tmpPath, file.content, { mode: desiredMode });
       if (sharedGid !== null) {
@@ -703,10 +705,11 @@ export class CredentialBroker {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the numeric gid of a unix group (e.g. "kubecred", "hostcred"). In
- * K8s mode kubectl / future ssh wrappers are setgid'd to one of these groups
- * so the sandbox uid can read credential files via group permission. Returns
- * null when the group doesn't exist (Local mode, TUI).
+ * Resolve the numeric gid of a unix group (e.g. "kubecred", "hostcred"). In K8s mode `kubectl` is
+ * setgid `kubecred` so it — and only it — can read a kubeconfig from the sandbox side. There is no setgid
+ * ssh and no plan for one; granting `sandbox` these groups for a "future ssh wrapper" is precisely the
+ * change that disabled the isolation for four months. Returns null when the group doesn't exist (Local
+ * mode, TUI).
  *
  * Result is cached across calls — /etc/group is read at most once per group.
  */

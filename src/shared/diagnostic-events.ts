@@ -34,7 +34,14 @@ export type DiagnosticEvent =
       type: "tool_call";
       toolName: string;
       outcome: "success" | "error";
-      durationMs: number;
+      /**
+       * Absent when the start could not be paired to this end — which happens only for an event stream
+       * that carries no toolCallId. Guessing a duration there attributes one call's time to another
+       * (pi-agent runs a same-turn tool batch in parallel), and a wrong number is indistinguishable from
+       * a right one downstream. Optional so "unknown" is expressible; it used to be reported as 0, which
+       * also means "instant".
+       */
+      durationMs?: number;
       userId: string;
       agentId: string | null;
     }

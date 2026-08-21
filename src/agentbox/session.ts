@@ -2831,17 +2831,27 @@ export class AgentBoxSessionManager {
 
       // Tool execution metrics
       if (event.type === "tool_execution_start") {
-        const callId = event.toolCallId ?? `seq-${++toolCallSeq}`;
-        toolStartTimes.set(callId, { name: event.toolName, startMs: Date.now() });
+        // Only a real toolCallId can pair a start with its own end. The old fallback minted `seq-N` on
+        // start and read `seq-<current counter>` on end, which pairs an end with the LATEST start rather
+        // than its own — pi-agent runs a same-turn tool batch in parallel, so under concurrency the
+        // duration was attributed to a different call. Same class of bug as the persistence pairing fixed
+        // in 895c23e4, and the same reason it is invisible: a wrong number looks like a number.
+        //
+        // Without an id there is nothing to pair on, so the metric is SKIPPED rather than guessed. A
+        // missing duration is honest; a duration belonging to another call is not.
+        if (event.toolCallId) {
+          toolStartTimes.set(event.toolCallId, { name: event.toolName, startMs: Date.now() });
+        }
       } else if (event.type === "tool_execution_end") {
-        const callId = event.toolCallId ?? `seq-${toolCallSeq}`;
-        const entry = toolStartTimes.get(callId);
-        toolStartTimes.delete(callId);
+        const callId = event.toolCallId;
+        const entry = callId ? toolStartTimes.get(callId) : undefined;
+        if (callId) toolStartTimes.delete(callId);
         emitDiagnostic({
           type: "tool_call",
           toolName: event.toolName ?? entry?.name ?? "unknown",
           outcome: event.isError ? "error" : "success",
-          durationMs: entry ? Date.now() - entry.startMs : 0,
+          // 0 used to mean both "instant" and "we could not pair this" — indistinguishable downstream.
+          durationMs: entry ? Date.now() - entry.startMs : undefined,
           userId: this.userId ?? "unknown",
           agentId: this.agentId ?? null,
         });

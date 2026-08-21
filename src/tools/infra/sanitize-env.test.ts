@@ -24,13 +24,18 @@ describe("sanitizeEnv", () => {
     expect(result).not.toHaveProperty("SICLAW_SSO_CLIENT_SECRET");
   });
 
-  it("allows SICLAW_DEBUG_IMAGE and SICLAW_CREDENTIALS_DIR", () => {
+  it("allows SICLAW_DEBUG_IMAGE but NOT SICLAW_CREDENTIALS_DIR", () => {
+    // The credentials dir holds no secret, but it POINTS at the credential tree, and it was classified
+    // as harmless on the premise that a child cannot read what it points at — a premise that does not
+    // hold in the current image (security.md §4.6). Handing it over is what makes an expansion payload
+    // trivial: `"$SICLAW_CREDENTIALS_DIR"/clusters/*` needs no knowledge of the layout. The only reader
+    // is the main process reading its own environment, which this does not touch.
     const result = sanitizeEnv({
       SICLAW_DEBUG_IMAGE: "debug:latest",
       SICLAW_CREDENTIALS_DIR: "/app/.siclaw/credentials",
     });
     expect(result).toHaveProperty("SICLAW_DEBUG_IMAGE", "debug:latest");
-    expect(result).toHaveProperty("SICLAW_CREDENTIALS_DIR", "/app/.siclaw/credentials");
+    expect(result).not.toHaveProperty("SICLAW_CREDENTIALS_DIR");
   });
 
   it("blocks common sensitive env vars", () => {
@@ -61,5 +66,29 @@ describe("sanitizeEnv", () => {
       NODE_ENV: "production",
     });
     expect(Object.keys(result)).toHaveLength(5);
+  });
+});
+
+describe("no tool re-injects the credentials pointer after sanitizing", () => {
+  it("has no object literal setting SICLAW_CREDENTIALS_DIR anywhere under src/tools", async () => {
+    // `sanitizeEnv` strips the variable, and two tools used to add it straight back on the next line —
+    // which is why stripping it from the allow-list was not enough on its own. `local-script.ts` built
+    // its child env inline rather than through exec-utils, so the guard on exec-utils' builder never
+    // covered it: reverting that line failed nothing in the whole suite.
+    //
+    // A pointer, not a secret. It holds no credential, but it makes an expansion payload trivial to
+    // write — `"$SICLAW_CREDENTIALS_DIR"/clusters/*` needs no knowledge of the layout, and the
+    // command validator screens text before the shell expands it.
+    const { readFileSync, globSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const root = resolve(import.meta.dirname, "../../..");
+    const offenders: string[] = [];
+    for (const f of globSync("src/tools/**/*.ts", { cwd: root })) {
+      if (f.endsWith(".test.ts")) continue;
+      const code = readFileSync(resolve(root, f), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");   // the design notes name it
+      if (/SICLAW_CREDENTIALS_DIR\s*:/.test(code)) offenders.push(f);
+    }
+    expect(offenders, "these files hand a child a pointer to the credential tree").toEqual([]);
   });
 });

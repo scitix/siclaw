@@ -41,10 +41,18 @@ const BLOCKED_SUFFIXES = [
   "_CREDENTIALS",
 ];
 
-/** SICLAW_* vars that are safe to pass through (non-secret config). */
+/**
+ * SICLAW_* vars that are safe to pass through (non-secret config).
+ *
+ * `SICLAW_CREDENTIALS_DIR` is deliberately NOT here. It holds no secret, but it is a POINTER to the
+ * credential tree, and it was classified as harmless on the premise that a child process cannot read
+ * what it points at. That premise does not hold in the current image (security.md §4.6), and the
+ * pointer is what makes an expansion payload trivial to write: `"$SICLAW_CREDENTIALS_DIR"/clusters/*`
+ * needs no knowledge of the layout. Nothing in a child reads it — the only reader is the main process
+ * reading its OWN environment (core/config.ts), which this does not affect.
+ */
 const SICLAW_SAFE = new Set([
   "SICLAW_DEBUG_IMAGE",
-  "SICLAW_CREDENTIALS_DIR",
 ]);
 
 /** Prefixes to always allow even if they match a suffix pattern. */

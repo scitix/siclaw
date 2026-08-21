@@ -365,7 +365,10 @@ describe("validateCommand — sensitive path patterns (Pass 6)", () => {
         sensitivePathPatterns: patterns,
       });
       expect(err).not.toBeNull();
-      expect(err).toContain("sensitive paths");
+      // Asserted on the machine-readable discriminator, not on the prose: the refusal text now names
+      // what matched and what to do instead, and a phrase assertion would only restate whatever
+      // wording it happens to have.
+      expect(JSON.parse(err as string).rejected_by).toBe("sensitive_path");
     });
   }
 
@@ -382,7 +385,7 @@ describe("validateCommand — sensitive path patterns (Pass 6)", () => {
       sensitivePathPatterns: patterns,
     });
     expect(err).not.toBeNull();
-    expect(err).toContain("sensitive paths");
+    expect(JSON.parse(err as string).rejected_by).toBe("sensitive_path");
   });
 });
 
@@ -417,5 +420,110 @@ describe("validateCommand — happy paths", () => {
 
   it("accepts ps aux in node context", () => {
     expect(validateCommand("ps aux", { context: "node" })).toBeNull();
+  });
+});
+
+describe("a sensitive-path refusal says what matched and what to do instead", () => {
+  const node = { context: "node" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  const refusal = (cmd: string) => JSON.parse(validateCommand(cmd, node) as string);
+
+  it("names the matched text and the rule, instead of a bare denial", () => {
+    // "Accessing sensitive paths is not allowed" told the agent nothing: not which argument, not
+    // whether the command itself was the problem. The usual response was to try another command and
+    // be refused again.
+    const r = refusal("cat /etc/kubernetes/pki/ca.key");
+    expect(r.matched).toBe(".key");
+    expect(r.rejected_by).toBe("sensitive_path");
+    expect(r.hint).toContain(".crt");
+  });
+
+  it("gives advice that fits the kind of secret", () => {
+    expect(refusal("cat /root/.ssh/id_rsa").hint).toContain("host_exec");
+    expect(refusal("cat /var/run/secrets/kubernetes.io/serviceaccount/token").hint).toContain("mounted");
+    expect(refusal("cat /proc/1/environ").hint).toContain("ps");
+    expect(refusal("cat /etc/shadow").hint).toContain("getent");
+    expect(refusal("cat /root/.aws/credentials").hint).toContain("image-pull");
+  });
+
+  it("still refuses — the hint is guidance, not a way through", () => {
+    for (const cmd of ["cat /etc/shadow", "cat /root/.ssh/id_ed25519", "head /proc/1/environ"]) {
+      expect(validateCommand(cmd, node)).not.toBeNull();
+    }
+  });
+});
+
+describe("refusals name what does work", () => {
+  it("tells a rejected shell loop that semicolons are supported", () => {
+    // Trace 026ab91c: `for … done` was refused with the whole allow-list, which reads as "we have never
+    // heard of `for`"; the very next call used `cmd; cmd; cmd` successfully. The capability was there,
+    // the guidance was not.
+    const err = validateCommand("for p in a b c; do kubectl logs $p; done", {
+      context: "local", sensitivePathPatterns: [], extraAllowed: new Set(["kubectl"]),
+    }) ?? "";
+    const parsed = JSON.parse(err);
+    expect(parsed.shell_constructs_rejected, "keywords are separated from missing binaries").toContain("for");
+    expect(parsed.hint).toMatch(/Semicolon-separated/);
+  });
+
+  it("names ps as the substitute for a blocked cmdline", () => {
+    // node_exec b4d9c4b9: status and stack were permitted for the same PID while cmdline was refused,
+    // with no alternative given. The asymmetry is deliberate — a command line carries credentials in its
+    // arguments — so the refusal has to point somewhere.
+    const err = validateCommand("cat /proc/1627110/cmdline", {
+      context: "node", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
+    }) ?? "";
+    expect(err).toContain("ps -p");
+    expect(err).toContain("/proc/<pid>/status");
+  });
+});
+
+describe("a sensitive-output source cannot feed a pipe", () => {
+  const nd = { context: "node" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  it("refuses env and printenv into a pipe", () => {
+    // env output is redacted by matching `KEY=`, and that applies to the LAST stage. Measured leaking:
+    // `printenv PASSWORD | cut -c1-` prints a bare value with no key at all, and
+    // `env | grep PASSWORD | cut -d= -f2-` strips the key before anything sees it.
+    for (const cmd of ["printenv PASSWORD | cut -c1-", "env | grep PASSWORD | cut -d= -f2-",
+                       "env | grep PASSWORD", "printenv | grep KEY", "env | head -20"]) {
+      expect(validateCommand(cmd, nd), cmd).not.toBeNull();
+    }
+  });
+
+  it("names the alternative, because refusing the filter has a real cost", () => {
+    const err = validateCommand("env | grep PASSWORD", nd) ?? "";
+    expect(err).toMatch(/on its own/);
+    expect(err, "and says the unpiped output is already redacted").toMatch(/redacted/);
+  });
+
+  it("leaves the unpiped forms and unrelated pipes alone", () => {
+    for (const cmd of ["printenv PASSWORD", "printenv HOME", "env", "printenv",
+                       "cat /etc/hosts | grep localhost", "ip -j addr | jq ."]) {
+      expect(validateCommand(cmd, nd), cmd).toBeNull();
+    }
+  });
+});
+
+describe("a single quote is not escapable", () => {
+  const nd = { context: "node" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  it("closes on the next quote, so the second command is seen", () => {
+    // bash gives a backslash NO special meaning inside `'…'`, so `echo 'x\'; cmd` is TWO commands —
+    // confirmed by running a shell, which printed both. Three tokenizers here counted preceding
+    // backslashes regardless of quote type and read it as one `echo`, so every downstream check saw only
+    // that: the disallowed-command list, the kubectl verb rules, the redirection ban. It applies to
+    // restricted_bash, node_exec and host_exec, which all hand the string to a shell.
+    for (const cmd of ["echo 'x\\'; kubectl delete pod victim", "true 'x\\'; rm harmless",
+                       "echo 'x\\'; echo hi > /tmp/out", "echo 'x\\'; ip link set eth0 down"]) {
+      expect(extractCommands(cmd).length, cmd).toBe(2);
+      expect(validateCommand(cmd, nd), cmd).not.toBeNull();
+    }
+  });
+
+  it("still honours escapes where bash does", () => {
+    // `"…"` and `$'…'` DO process a backslash, so the count still decides there — and a `;` inside any
+    // quote is data, not a separator.
+    expect(extractCommands('echo "a\\"; b"').length, "escaped quote inside double quotes").toBe(1);
+    expect(extractCommands("grep 'a;b' /var/log/x").length).toBe(1);
+    expect(extractCommands('grep "a;b" /var/log/x').length).toBe(1);
+    expect(validateCommand("grep 'a;b' /var/log/x", nd)).toBeNull();
   });
 });

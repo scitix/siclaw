@@ -5,11 +5,14 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
+import { DebugPodStartupError } from "../infra/debug-pod.js";
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
-import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
+import { classifyExit } from "../infra/exit-classification.js";
+import { jsonPathProjector } from "../infra/json-projection.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import {
   validateNodeName,
   validatePodName,
@@ -20,15 +23,59 @@ import { resolvePodNetnsViaKubectl, validateNetnsName } from "../infra/pod-netns
 import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaKubectl } from "../infra/bg-session.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
+/**
+ * One rendering for a debug-pod startup failure, shared by the foreground and background paths.
+ *
+ * The two used to disagree: background named the stage and reason while foreground collapsed every
+ * failure to `debug_pod_failed`, so the same fault read differently depending on a flag the caller
+ * set for unrelated reasons.
+ *
+ * The field is `cached`, not `retried`: it says this is a replay of a failure this node+image already
+ * produced, which is what tells the agent a further attempt inside the window will not run either.
+ * An earlier revision reported `retried: !cached` and so labelled the FIRST failure as a retry.
+ *
+ * stage/reason/cached go in the TEXT as well as in `details`, because `details` is stripped before
+ * the model sees the result — a distinction only present there cannot be acted on.
+ */
+export function debugPodFailureResult(err: unknown) {
+  const startup = err instanceof DebugPodStartupError ? err : undefined;
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({
+      error: true,
+      message: `Debug pod failed to start: ${message}`,
+      // `err.message` is "exit null" when the underlying kubectl was signalled, which says nothing —
+      // three reviews report exactly that string as the whole diagnosis. The transport's own stderr is
+      // what names the scheduling, admission or image problem.
+      ...(typeof (err as { stderr?: unknown })?.stderr === "string"
+        && (err as { stderr: string }).stderr.trim()
+        ? { transport_stderr: (err as { stderr: string }).stderr.trim().slice(0, 2000) }
+        : {}),
+      ...(startup && {
+        stage: startup.stage,
+        reason: startup.reason,
+        node: startup.nodeName,
+        cached: startup.cached,
+      }),
+    }) }],
+    details: {
+      error: true,
+      reason: startup?.reason ?? "debug_pod_failed",
+      ...(startup && { stage: startup.stage, cached: startup.cached }),
+    },
+  };
+}
+
 export { validateNodeName, validatePodName } from "../infra/exec-utils.js";
 export { validateCommand } from "../infra/command-validator.js";
 
 interface NodeExecParams {
   node?: string;
   command: string;
+  json_path?: string;
   netns?: string;
   pod?: string;
   namespace?: string;
@@ -38,6 +85,7 @@ interface NodeExecParams {
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
+
 
 export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
@@ -58,6 +106,11 @@ Creates a privileged debug pod with nsenter to run the command in the host's ful
 The pod is automatically cleaned up after execution (--rm).
 
 Commands run on the HOST — they have access to the host's tools, filesystem, devices, /proc, /sys, and /dev.
+The list below is what POLICY permits, not what the node has installed: binaries resolve from the
+node's own PATH, so a permitted command can still fail with exit 127 on a node that lacks it. That
+is a property of the node, not of this tool. jq and yq in particular are usually absent, so do NOT
+pipe to a JSON processor — ask the command for JSON (crictl inspectp -o json, ip -j, nvidia-smi -q -x)
+and pass json_path to project the field you want. That is evaluated here, not on the node.
 
 Use this tool for host-level diagnostics that cannot be done from within a pod, such as:
 - Inspecting host network interfaces, routes, and RDMA devices
@@ -76,7 +129,7 @@ Allowed commands (ONLY these are permitted — do NOT use \`which\` to check, ju
   kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo, getconf
   process: ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc, pidstat, pstree, numastat, ipcs
   file (read-only): cat, head, tail, ls, stat, file, wc, find, grep, diff, md5sum, sha256sum, tree, hexdump, od
-  text processing: sort, uniq, cut, tr, jq, yq, column, tac, nl
+  text processing: sort, uniq, cut, tr, column, tac, nl
   logs/services: journalctl, systemctl, timedatectl, hostnamectl
   container: crictl, ctr
   firewall (read-only): iptables, ip6tables
@@ -110,6 +163,10 @@ Examples:
 - node: "node-1", command: "curl -s http://10.0.0.1:8080/healthz"
 - node: "node-1", command: "ps aux | head -20"
 - node: "node-1", command: "journalctl -u kubelet -n 100 | grep error"
+- node: "node-1", command: "journalctl -u kubelet --since '2026-08-17 08:35:00' --until '2026-08-17 09:00:00'"
+  (time windows: journalctl runs on the NODE and its systemd rejects RFC3339 — "2026-08-17T08:35:00Z"
+   fails to parse. Use quoted "YYYY-MM-DD HH:MM:SS", optionally with a trailing UTC. Relative forms
+   like "-30min" and "yesterday" also work.)
 
 To run in a POD's network namespace (host tools + the pod's network view — e.g. RDMA on a pod that lacks the tools), pass pod= directly (one step; the node is resolved for you):
 - pod: "rdma-a", namespace: "rdma-test", command: "show_gids"
@@ -148,6 +205,16 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         Type.String({
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
         })
+      ),
+      json_path: Type.Optional(
+        Type.String({
+          description:
+            "Project a field out of the command's JSON output instead of returning the whole document. " +
+            "Evaluated HERE, not on the target — so it works on a target without jq, which most nodes are. " +
+            "Grammar: .a.b, .a[0] (negative counts from the end), .a[] to map over an array, " +
+            '.["odd key"]. Projection only — there are no filters, conditions or functions. ' +
+            "Applied to the sanitized output before truncation, so it is the way to read a large document.",
+        }),
       ),
       timeout_seconds: Type.Optional(
         Type.Number({
@@ -188,12 +255,19 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
 
+      // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
+      // would answer with a kubeconfig error and hide the actual mistake.
+      if (backgroundEnabled && params.run_in_background === true && params.json_path) {
+        return backgroundJsonPathError();
+      }
+
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_exec");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
@@ -290,10 +364,10 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         try {
           cachedPod = await ensureDebugPodReady(spec, env, { signal });
         } catch (err: any) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-            details: { error: true, reason: "debug_pod_failed" },
-          };
+          // Name the stage and reason rather than one sentence for API errors, scheduling, image
+          // pulls and admission alike — those call for different next steps, and an agent that
+          // cannot tell them apart retries all of them identically.
+          return debugPodFailureResult(err);
         }
         // Pin and capture the EXACT pod name we pinned — release by that name so pin/release
         // always target the same instance even if the cache entry is later replaced (and so
@@ -361,10 +435,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       try {
         fgPod = await ensureDebugPodReady(fgSpec, env, { signal });
       } catch (err: any) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-          details: { error: true, reason: "debug_pod_failed" },
-        };
+        return debugPodFailureResult(err);
       }
       const fgPinnedPodName = acquireDebugPod(fgSpec); // null if the pod vanished; proceed best-effort
       const onAbort = () => killRemoteSessionViaKubectl({
@@ -394,18 +465,51 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
 
       // Assemble output, then sanitize + truncate via unified facade
       const filteredStderr = filterPodNoise(execResult.stderr);
-      const isError = execResult.exitCode !== 0 &&
-        !(execResult.exitCode === null && execResult.stdout.trim());
-      const out = execResult.stdout.trim();
-      // Show the output as a shell would, with the exit code as a trailing annotation
-      // (not a prefix that replaces the body), so a non-zero exit with no output —
-      // e.g. `grep` with no match — reads as an empty result, not a failure.
-      const stdout = isError
-        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
-        : out;
+      // WHAT the exit code means, not just that it was non-zero. The exit code itself is rendered by
+      // postExecSecurity (`exitCode`), which keeps our literals out of the sanitized body; the class
+      // rides in `notes` beside it, because `details` is stripped before the model sees the result.
+      const judgment = classifyExit({
+        command: params.command,
+        exitCode: execResult.exitCode,
+        stdout: execResult.stdout,
+        // Unfiltered: filterPodNoise drops kubectl's own chatter, which is exactly where a channel
+        // failure announces itself.
+        stderr: execResult.stderr,
+        context: "node",
+        // Our own timeout kill, so the class says "we stopped it" rather than blaming the target. The
+        // signal was produced upstream and dropped here; `timedOut` is the same event observed without
+        // one (kubectl exited with a null code and no stderr), and `classifyExit` reads only the signal,
+        // so it maps to the kill we would have sent.
+        signal: execResult.signal ?? (execResult.timedOut ? "SIGKILL" : undefined),
+      });
+      // No tail-window note here: it fires only for `kubectl logs --tail=N`, and `kubectl` is
+      // whitelisted for restricted_bash alone (this tool passes no extraAllowed), so the command is
+      // refused before it can run. See tail-truncation.test.ts, which pins that reachability.
+      // A capped read is a PREFIX. Saying so is the difference between "nothing matched" and "nothing
+      // matched in the part we kept" — a review reported the second being read as the first.
+      const notes = (judgment.annotation ? `\n${judgment.annotation}` : "")
+        + (execResult.truncated ? "\n[output_truncated: output hit the capture ceiling, so the text above "
+          + "is only the beginning — a search over it that finds nothing proves nothing. Narrow the "
+          + "command rather than retrying it unchanged.]" : "");
       return {
-        content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
-        details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
+        content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
+          stderr: filteredStderr || undefined,
+          project: jsonPathProjector(params.json_path),
+          // A `--tail=N` window that came back at exactly N lines reads like a complete answer; the
+          // note says it may not be. Composed with the exit class so both reach the model.
+          ...(notes ? { notes } : {}),
+          // Rendered whenever the run did not exit 0 — the code is a FACT, while `error` below is a
+          // judgment about it, and conflating them hid the code on a no-match.
+          ...(judgment.exitClass !== "success"
+            ? { exitCode: execResult.exitCode ?? "unknown" }
+            : {}),
+        }) }],
+        details: {
+          exitCode: execResult.exitCode ?? 0,
+          exit_class: judgment.exitClass,
+          ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
+          ...(judgment.isError && { error: true }),
+        },
       };
     },
   };

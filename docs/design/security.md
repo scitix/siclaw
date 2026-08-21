@@ -39,14 +39,27 @@ will attempt — intentionally or via prompt injection — to:
 │   │                       │   │                         │ │
 │   │ • Node.js runtime     │   │ • kubectl (setgid)      │ │
 │   │ • LLM API client      │   │ • grep, jq, sort, ...   │ │
-│   │ • Tool validation     │   │ • skill scripts          │ │
+│   │ • Tool validation     │   │   (via restricted_bash) │ │
 │   │ • Reads kubeconfig    │   │ • NO credential access   │ │
+│   │ • Skill scripts       │   │                         │ │
+│   │   (local_script)      │   │                         │ │
 │   └──────────────────────┘   └────────────────────────┘ │
 │                                                          │
 │   Trust boundary: sandbox user cannot read agentbox's    │
 │   files (kubeconfig, mTLS certs, .siclaw/config/)        │
 └──────────────────────────────────────────────────────────┘
 ```
+
+**Skill scripts are NOT in the sandbox.** `restricted_bash` is the only tool that drops privileges
+(`sudo -E -u sandbox`); `local_script` spawns the interpreter directly, so a skill runs as `agentbox` —
+the credential owner. This diagram claimed otherwise, which mattered once "sandbox is in no credential
+group" became the foundation of the isolation: it made Layer 1 look like it covered skills.
+
+That placement is deliberate, not an oversight to fix by wrapping skills in `sudo -u sandbox`: skills
+legitimately run `kubectl` against a bound cluster and read their own files, and a skill is repository
+content reviewed before it ships, not model-authored text. The control on skills is review plus the
+command whitelist their `restricted_bash` calls still go through — not OS-level user separation. Moving
+them into the sandbox would be a separate change with its own migration.
 
 ### 1.3 What We Protect
 
@@ -113,12 +126,33 @@ Two users exist inside the AgentBox container:
 
 | User | UID | Groups | Purpose |
 |------|-----|--------|---------|
-| `agentbox` | 1000 | `agentbox`, `kubecred` | Main Node.js process. Owns credentials. |
+| `agentbox` | 1000 | `agentbox`, `kubecred`, `hostcred` | Main Node.js process. Owns the credential tree. |
 | `sandbox` | 1001 | `sandbox` | All child processes (shell commands). No credential access. |
 
-The main process (Node.js) runs as `agentbox`. When executing shell commands, it uses
+`sandbox` holds **no** credential group, and that is the property everything else in this document
+rests on: a command that gets past the whitelist meets `Permission denied` rather than a kubeconfig.
+The one sandbox-side reader is `kubectl`, which reaches the cluster credentials through its setgid bit
+(§3.2) — a group membership on `sandbox` would give every other binary in the image the same access and
+leave that bit decorative.
+
+Host credentials need no sandbox-side reader at all: `ssh` is not in the command registry, so no child
+can dial one, and `host_exec` connects from the node process (running as `agentbox`, the owner) through
+the ssh2 library.
+
+> This was not true between 2026-04 and 2026-08. `sandbox` was granted both credential groups for a
+> setgid `ssh` reader that was never built, and the entrypoint's `chown -R agentbox:kubecred` over the
+> whole tree — correct when written in 2026-03, when the parent WAS a kubecred directory and no
+> low-privilege user was in that group — then re-opened at runtime the traversal the image itself
+> denied. The baked image looked correct; every running container had no isolation. Two guards now make
+> that state unreachable: the build fails (`agentbox-capability-check.sh`) and the container refuses to
+> start (`agentbox-entrypoint.sh`).
+
+The main process runs as `agentbox`. When executing shell commands, it uses
 `sudo -E -u sandbox -- bash -c '<command>'` to drop to the `sandbox` user. The `-E` flag
-preserves the sanitized environment (allowed by `SETENV` in sudoers).
+preserves the sanitized environment (allowed by `SETENV` in sudoers). That drop happens in exactly one
+place — `restricted-bash.ts` — so `node_exec`, `pod_exec`, `host_exec` and the script tools run in the
+node process, as `agentbox`; their safety comes from argument validation and credential brokering
+(§4, §7), not from this layer.
 
 ### 3.2 setgid kubectl
 
@@ -145,8 +179,30 @@ the correct access boundaries.
 
 #### Credentials & secrets (sandbox: no access)
 
-| Path | Owner | Mode | agentbox | sandbox | kubectl (setgid) |
-|------|-------|------|----------|---------|-------------------|
+The parent directory is group `kubecred`, mode 0750 — it must be traversable by the group setgid
+`kubectl` runs with, or the one legitimate sandbox-side reader cannot reach a kubeconfig at all. What
+makes that safe is not the mode but the membership: `sandbox` is in no credential group, so kubecred
+traversal means "kubectl and the owner" rather than "every child process". Each credential type below it
+then keeps its own group, setgid, so material written into it inherits the right one — `hosts/` stays
+`hostcred` instead of being flattened into `kubecred` by a recursive chown.
+
+**The permission fix is verified, not assumed.** Every chown in the entrypoint ends in `|| true`, so a
+standalone Docker run without `CAP_CHOWN` is not bricked — but that also means the isolation can fail to
+apply in silence. `/app/.siclaw/credentials` is an emptyDir, mounted root-owned, so a chown that does not
+land leaves the tree readable by every child process. The group guard does not cover this case: it checks
+`sandbox`'s group membership, a property of the image, not the directory's owner — so the tree could be
+world-readable with that guard passing.
+
+The entrypoint therefore re-reads owner and mode afterwards and refuses to start unless they are
+`agentbox:kubecred` mode `0750`. The realistic way to reach that refusal is a spec change rather than a
+bug — `runAsNonRoot: true`, a restricted Pod Security Standard on the namespace, or `CHOWN` dropped from
+the capability list — and without the check the pod would come up looking healthy.
+
+This is a contract with the spawner, which is where the dependency actually lives: the AgentBox pod sets
+no `runAsUser`, so it starts as root, and explicitly adds `CHOWN`, `FOWNER`, `SETUID`, `SETGID`. Both
+halves are asserted by `credential-isolation-invariants.test.ts`, because neither file states the pairing
+on its own.
+
 | `.siclaw/credentials/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- (via group) |
 | `/etc/siclaw/certs/` | agentbox:agentbox | 0600 | rw | -- | -- |
 | `.siclaw/config/settings.json` | agentbox:agentbox | 0600 | rw | -- | -- |
@@ -296,6 +352,47 @@ sanitizable output (env, printenv, crictl inspect) are handled by
 
 **Source**: `CONTAINER_SENSITIVE_PATHS` in `src/tools/infra/command-sets.ts:1262-1304`
 
+**What the patterns are matched against.** The raw command text *and* every quote-stripped argument
+containing `/`. Raw text alone is not enough: many of the patterns are end-anchored (`/etc/shadow$`,
+`\.key$`, `/proc/*/environ$`), and a closing quote breaks the anchor — `cat /etc/shadow` was refused
+while `cat "/etc/shadow"` was not. Measured across the list, 11 of 13 representative paths were
+reachable that way, including every TLS key form; the two that held did so because an unanchored rule
+(`/.ssh/`) happened to cover them.
+
+Only arguments containing `/` are re-checked, and the restriction is load-bearing rather than
+conservatism: several patterns (`id_rsa$`, `\.key$`) also match a bare word, so checking every argument
+would refuse `grep id_rsa /var/log/x` — searching for the string names no path and is a legitimate
+diagnostic. A bare relative filename (`cat "id_rsa"`) therefore still passes this text layer; widening
+it needs per-command operand knowledge, not a broader text rule.
+
+The pass is deliberately **command-agnostic** — it screens any command carrying the path, not a list of
+readers — so whitelisting a new tool cannot open a hole here.
+
+**Globs.** An argument containing `*`, `?`, `[` or `{` is compiled to the regex of the paths it can
+expand to and tested against `SENSITIVE_PATH_EXAMPLES`. `cat /etc/*` is refused because that regex
+matches `/etc/shadow`; `cat /etc/*release*` is not, because it matches no example. Screening the glob's
+literal prefix instead would refuse the second, which names no secret — so the intersection is computed,
+not approximated.
+
+Two shell semantics are load-bearing, and both were confirmed by running a shell rather than recalled:
+
+- `*` and `?` do not cross `/`, so `/etc/*` cannot reach `/etc/kubernetes/admin.conf`;
+- `*` and `?` do not match a leading `.`, so `ls /root/*` must stay permitted even though
+  `/root/.bash_history` is on the example list — the shell can never expand it there.
+
+`**` is read as crossing separators. That is the permissive direction: it can only make the compiled
+regex match more examples, so a shell without globstar is refused slightly more often, never less.
+
+The examples exist because the patterns are regexes and a glob cannot be intersected with a regex at
+validation time. They are pinned in both directions — every pattern must match an example, every example
+must be matched by a pattern — so adding a pattern without an example fails a test instead of silently
+leaving globs unscreened for it. The patterns remain authoritative for literal paths; the examples are
+only what globs are compared against.
+
+Residual, stated rather than implied: a suffix-only pattern (`\.key$`) is not reachable through a glob
+in an arbitrary directory — `cat /app/certs/*` is permitted even if a key lives there, because no example
+is under that path. Covering it would mean refusing every `dir/*`.
+
 ### 4.3 Context-Based Whitelisting
 
 Different execution contexts allow different command sets:
@@ -341,6 +438,27 @@ grep: { command: "grep", contexts: ["local"], pipeOnly: true, noFilePaths: true,
 This prevents `kubectl get pods | grep -rl "" /app/.siclaw` from reading credential files
 even though `grep` appears after a pipe.
 
+A path check runs before the shell expands anything, so a literal-prefix rule is only as good as
+the literal: `printf x | column "$SICLAW_CREDENTIALS_DIR"/clusters/*` contains no credential path
+for either that rule or the sensitive-path patterns to match. **A file operand of a stdin-only text
+command therefore rejects a path separator and everything the shell rewrites** — globs included. An
+earlier revision permitted globs, arguing that `*` cannot match `..` and so cannot climb out of the
+workdir; true, and irrelevant, because the credentials live BELOW the workdir (`WORKDIR /app`,
+credentials at `/app/.siclaw/credentials/`), so `head .siclaw/*/*/*` reaches them without naming them.
+
+Args that are not file operands — the grep pattern, the jq/yq expression, `tr`'s SETs — are exempt,
+since a regex legitimately contains `$` and `/`. Getting that exemption right is where the bypasses
+were: the pattern may arrive attached inside a short-option cluster (`-ie.` is `-i -e '.'`), and an
+empty quoted pattern must survive tokenisation, or the operand after it is mistaken for the pattern.
+
+Screening argv is not always enough to bound a command. `yq`'s expression language reads files and
+the environment by itself (`load_str(env(X) + "/y")`), with no flag and no path argument, so `yq`
+carries an expression screen that rejects those operators — plus `eval`, without which a blocked
+operator can be reassembled from string fragments. The AgentBox image reinforces this outside the
+validator by exposing only a wrapper that forces yq's `--security-disable-file-ops` and
+`--security-disable-env-ops`; in the node/pod/host contexts the binary is the customer's, and the
+expression screen is the only layer that applies.
+
 **Source**: `src/tools/infra/command-sets.ts` — `COMMAND_RULES`
 
 ### 4.5 Explicitly Excluded Binaries
@@ -364,9 +482,18 @@ With OS-level user isolation (Layer 1), the application-level command validation
 - Prevents shell injection via `$()`, backticks, redirections
 - Provides audit trail of blocked commands
 
-The `local`-context rules (pipeOnly, noFilePaths, blockedFlags) can be **relaxed** after
-OS isolation is deployed, since the sandbox user cannot read credential files regardless.
-However, they remain as defense-in-depth.
+These `local`-context rules (pipeOnly, noFilePaths, blockedFlags) are defense-in-depth, as ADR-010
+intends — but do not read that as licence to relax them. They are what turns a parser bug into a
+refusal rather than a disclosure, and this whitelist is a TEXT match performed before the shell expands
+anything, so it cannot be complete by construction. One review cycle on this file found six bypasses of
+it (`$VAR` expansion, downward globs, `--flag=value`, an attached short-option value, a value-taking
+letter later in an option cluster, and an empty quoted pattern). Each was a full credential disclosure
+only because the OS layer was absent at the time; each is now merely a refused attempt.
+
+The reason ADR-010 made OS isolation primary is exactly this asymmetry: the incident that motivated it
+(`kubectl get pods | cut -c1-2000 ~/.siclaw/credentials/kubeconfig`) was fixed at the application layer
+first, and the conclusion recorded there was that "the attack surface is fundamentally too large for
+application-level-only defense". Keep both layers.
 
 ---
 

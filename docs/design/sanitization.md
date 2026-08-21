@@ -73,8 +73,8 @@ Command executes → stdout captured
 │ Redaction methods (selected by Layer 1):              │
 │ • sanitizeJSON() — structural: removes data/stringData│
 │   from Secret JSON, envs from Pod/ConfigMap JSON      │
-│ • redactSensitiveContent() — line-level: regex match  │
-│   on KEY=VALUE and KEY: VALUE patterns                │
+│ • redactSensitiveContent() — whole-document: per-line │
+│   key/value matching plus multi-line blocks (see §8)  │
 │ • redactEnvOutput() — specialized for env/printenv    │
 │ • sanitizeCrictlInspect() — JSON env array redaction  │
 └─────────────────────┬───────────────────────────────┘
@@ -251,8 +251,64 @@ under `<userDataDir>/agent/tasks/`, opened `O_NOFOLLOW` to defeat symlink redire
 ```
 src/tools/infra/output-sanitizer.ts      OUTPUT_RULES, analyzeOutput(), applySanitizer(), OutputAction.lineSafe
 src/tools/cmd-exec/disk-output.ts        DiskTaskOutput + SanitizingLineBuffer (background bash sanitize-on-write)
-src/tools/infra/kubectl-sanitize.ts      sanitizeJSON(), detectSensitiveResource(), redaction patterns
+src/tools/infra/kubectl-sanitize.ts      sanitizeJSON(), detectSensitiveResource(), redaction patterns,
+                                         redactLines() / redactDocument() / redactSensitiveContent()
 src/tools/shell/restricted-bash.ts       Pipeline fallback (Layer 3), isSkillScript()
 src/tools/infra/output-sanitizer.test.ts Test coverage for sanitization rules
 src/tools/infra/kubectl-sanitize.test.ts Test coverage for kubectl-specific sanitization
 ```
+
+The line-level redactor lives in `kubectl-sanitize.ts`, not
+`output-sanitizer.ts` — the structural sanitizers need it (see §8) and the
+reverse import would be a cycle. `output-sanitizer.ts` re-exports
+`redactSensitiveContent` / `REDACTION_NOTICE`, so it remains the public entry
+point for callers.
+
+---
+
+## 8. Line-level vs whole-document redaction
+
+Two redactors, and picking the wrong one silently loses coverage:
+
+| Function | Sees | Use when |
+|----------|------|----------|
+| `redactLines()` | one line at a time, **no state carried** | streaming (background bash), where a batch holds an arbitrary slice of lines |
+| `redactDocument()` | the whole text | anything holding a complete document — `redactSensitiveContent`, ConfigMap entries |
+
+`redactDocument` exists because **a secret's body can sit on the lines below its
+key**, where no key name marks it:
+
+```yaml
+api_token: |                    tls.key: |
+  ghp_AAAA…                       -----BEGIN RSA PRIVATE KEY-----
+                                  MIIEvQIBADANBgkq…
+```
+
+A per-line pass redacts the key line and leaves the body — and then the footer
+claims the output was cleaned, which is worse than saying nothing. A block
+scalar owns every following line indented deeper than its key; a PEM block runs
+to its `END` marker. `redactLines` cannot do either and must not pretend to:
+that is the price of the `lineSafe` contract, and it is why streaming is the only
+caller that gets it.
+
+### ConfigMap entries are documents, not values
+
+A ConfigMap data key is usually a filename and its value an entire config file,
+so the secrets are named by the keys **inside** the value. Testing the value as
+one blob checks none of them. The entry is therefore parsed:
+
+- **JSON payload** → walk the parsed tree, judging every nested key
+- **Anything else** → `redactDocument`
+- **Looks like JSON but does not parse, and names a sensitive key** → drop the
+  whole entry; a compact object puts several pairs on one line and an
+  unparseable one gives no confidence that a textual pass rewrote all of them
+- **The data key itself is sensitive** → drop the whole entry
+
+### Both halves of a line are judged
+
+A telling key name redacts whatever it holds; a value that looks like a
+credential is redacted whatever its key is called. Value patterns are matched
+against the **value segment** of a parsed line — anchored patterns like `^eyJ`
+are defeated by indentation and a `key: ` prefix otherwise — with the raw line
+as a fallback, since positional patterns (a connection string, a bearer header)
+can straddle a naive key/value split.

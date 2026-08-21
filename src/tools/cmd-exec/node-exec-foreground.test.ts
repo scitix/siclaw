@@ -57,3 +57,57 @@ describe("node_exec foreground: killable session + abort reap", () => {
     expect((result.details as Record<string, unknown>).error).toBe(true); // "Aborted."
   });
 });
+
+describe("node_exec: the command's own failure information survives", () => {
+  it("keeps the target's stderr AND names the class, even when the body is suppressed", async () => {
+    // `crictl inspectp` output goes through a STRUCTURAL sanitizer, which suppresses the body when it
+    // cannot parse it — which is exactly what a failed run produces. The command's own error text must
+    // still reach the caller, or a failure is reported with no way to see why.
+    runInDebugPod.mockImplementation(async () => ({
+      stdout: "",
+      stderr: 'FATA[0000] no such sandbox "abc" found',
+      exitCode: 1,
+    }));
+
+    const result = await createNodeExecTool().execute(
+      "tc-stderr", { node: "node-1", command: "crictl inspectp abc" },
+      new AbortController().signal, {} as never,
+    );
+
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("no such sandbox");           // the target's own words
+    expect(text).toContain("target_reported_failure");   // and what kind of failure it was
+    expect((result.details as Record<string, unknown>).exit_class).toBe("target_reported_failure");
+  });
+
+  it("separates a dead exec channel from a command that ran and failed", async () => {
+    runInDebugPod.mockImplementation(async () => ({
+      stdout: "",
+      stderr: 'error: unable to upgrade connection: container not found ("debug")',
+      exitCode: 1,
+    }));
+
+    const result = await createNodeExecTool().execute(
+      "tc-channel", { node: "node-1", command: "uptime" },
+      new AbortController().signal, {} as never,
+    );
+
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("channel_error");
+    expect(text).toContain("never ran the command");
+    expect(text).toContain("unable to upgrade connection");  // the transport error itself, verbatim
+    expect((result.details as Record<string, unknown>).exit_class).toBe("channel_error");
+  });
+
+  it("does not report a no-match as a failed tool call", async () => {
+    runInDebugPod.mockImplementation(async () => ({ stdout: "", stderr: "", exitCode: 1 }));
+
+    const result = await createNodeExecTool().execute(
+      "tc-nomatch", { node: "node-1", command: "journalctl -u kubelet | grep -i oom" },
+      new AbortController().signal, {} as never,
+    );
+
+    expect((result.details as Record<string, unknown>).exit_class).toBe("no_match");
+    expect((result.details as Record<string, unknown>).error).toBeUndefined();
+  });
+});

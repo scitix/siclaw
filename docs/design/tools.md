@@ -250,6 +250,121 @@ The context system has two layers:
 
 **Source**: `COMMANDS` and `CONTEXT_POLICIES` in `src/tools/infra/command-sets.ts`
 
+### 6.1b What a Non-Zero Exit Means (`exit-classification.ts`)
+
+Every exec tool reports a non-zero exit through `classifyExit`, which answers a different question
+from "did it exit 0": **whose failure was it?**
+
+| class | meaning | `details.error` |
+|---|---|---|
+| `channel_error` | The exec path failed — the target never ran the command, so the status is not its answer. Includes a spawn failure (`ENOENT`) and a `kubectl exec` transport error. | yes |
+| `dependency_missing` | The command is not on the target (127, or the runtime's "executable file not found"). Retrying cannot help. | yes |
+| `not_executable` | Found but not runnable (126). | yes |
+| `no_match` | The command ran and matched nothing (`grep`/`pgrep`/`test` exiting 1). **Not a failure.** | no |
+| `target_reported_failure` | The command ran and reported this status. The target's own answer. | yes |
+| `interrupted` | Signalled (timeout, abort). Partial output is still a result. | only with no output |
+
+Two contracts hold this together, and neither is derivable from the other:
+
+- **The class must appear in the TEXT.** `details` is stripped from a tool result before the model
+  sees it, so a distinction that lives only there cannot be acted on.
+- **`details.error` must stay accurate**, because it drives the Trace outcome. This is why `no_match`
+  does not set it: a `grep` that matched nothing used to paint a failed tool call.
+
+The annotation is appended by `appendAnnotation` **after** sanitizing and truncating, never folded
+into the body. It is our own statement about the result, not target output — and a structural (JSON)
+sanitizer replaces everything it cannot parse with a suppression notice, which is exactly what a
+failed command's output produces. Folding it in silently ate the classification.
+
+Telling a dead channel from a command that failed needs **stderr**, since `kubectl exec` reports both
+through the exit status. Call sites therefore pass stderr UNFILTERED (`filterPodNoise` removes the
+kubectl lines a channel failure announces itself in). The markers are anchored at line start and only
+consulted when stdout is empty, so a command whose own output contains `error:` is not mistaken for a
+broken channel; `command terminated with exit code N` is deliberately NOT a marker, because it means
+the command did run.
+
+**Which leg broke is a second, independent field.** `exitClass` answers "was this the target's own
+answer"; `channelLeg` answers "where did it break". They are separate because they vary independently —
+merging them would need a class per combination — and because the second one had a hole:
+
+| leg | named by | example |
+|-----|----------|---------|
+| `transport` | kubectl's / the SSH client's own diagnostics | `error dialing backend: EOF` |
+| `namespace_entry` | the wrapper node_exec and host_exec put around the command | `nsenter: cannot open /proc/1/ns/mnt: Permission denied` |
+
+Every channel marker was originally a kubectl string, so the leg *between* the channel and the target had
+none: `nsenter` failing, or a netns that disappeared between resolution and exec, was classified
+`target_reported_failure` — whose annotation tells the agent "that is the target's own answer" — for a
+command the target never received. A `pod=` target dying mid-call is the ordinary way to reach it.
+
+Both markers are unambiguous only because neither wrapper is reachable as a user command: `nsenter` is in
+no context's whitelist and `ip netns exec` is refused by the validator. That is a load-bearing property,
+not a coincidence — if either becomes reachable, a user command's own failure starts being reported as our
+leg breaking, and a test asserts it stays that way.
+
+The leg must reach `details` from every tool that classifies an exit; a field that stops at the judgment
+is invisible to the UI and to metrics, which is the only place it can be read (`details` never reaches the
+model, so the distinction is also stated in the annotation text).
+
+**The classes, and what each one answers.** Every one exists because the exit code alone was reported as
+something untrue, and each was written or corrected against a real trace:
+
+| class | `isError` | the question it answers |
+|-------|-----------|-------------------------|
+| `no_match` | false | The query ran and found nothing — grep, `ps -p`, `findmnt`, and an API NotFound on a named object in the `local` context |
+| `output_truncated` | true | The command RAN; this is a PREFIX. A search over it proves nothing |
+| `pipeline_upstream_failed` | true | An earlier stage failed while the last exited 0 — an empty result means the query failed |
+| `invalid_arguments` | true | The CLIENT refused the flag or printer; the request never reached the cluster |
+| `dependency_missing` | true | The channel worked; the binary is not on the target |
+| `not_executable` | true | Found, could not be run |
+| `interrupted` | varies | Signalled. A SIGKILL with no exit code is OUR timeout, and the annotation says which layers it cannot tell apart |
+| `channel_error` | true | The target never ran it. `channelLeg` says whether the transport or the namespace entry broke |
+| `target_reported_failure` | true | The target ran it and reported this status — its own answer |
+
+Two of these were corrected by reading traces rather than reasoning, and both corrections went from "this
+is fine" to "this is a failure":
+
+- A 141 on the **final** pipeline stage was first treated as a benign SIGPIPE. Nothing is downstream of
+  the last stage, so no consumer could have closed the pipe — it was killed. A trace shows
+  `kubectl logs --tail=-1 | grep -c '…'` returning 141 with **no output** after 83 seconds, while the same
+  shape that completed took 11 seconds and printed `0`; a `grep -c` that finishes always prints a number.
+- `Error from server` was matched as a prefix, so an API NotFound was classified as a dead channel whose
+  annotation said the target never ran the command. The server answered.
+
+The reverse also happened: two reviews asked for `nvidia-smi` and `curl` non-zero exits to be treated as
+success. They are not — those exit non-zero because the target FOUND something (an ECC fault, a failed TLS
+verification), and `target_reported_failure` already says it is the target's own answer rather than a
+transport fault, which is the distinction those reviews wanted. Calling a GPU fault "no match" would be the
+new untruth.
+
+### 6.1c Projecting JSON Output (`json_path`)
+
+`node_exec`, `pod_exec` and `host_exec` accept an optional `json_path` that projects a field out of
+the command's JSON output. It is evaluated **in the AgentBox**, which is the point: the JSON-emitting
+diagnostics that matter (`crictl inspect`, `nvidia-smi -q -x`, `ip -j`) run on targets that usually do
+not have `jq`, so the alternative was pulling the whole document back.
+
+Grammar, in full: `.a.b`, `.a[0]` (negative counts from the end), `.a[]` / `.a[*]` to map over an
+array, `.["quoted name"]`, `.` for the document. **There is no expression language** — no filters,
+conditions, functions or arithmetic. A filter is rejected rather than ignored, so a path that looks
+like jq cannot silently project something else.
+
+Not implemented with jq, deliberately: that would hand agent-authored program text to a process
+running as `agentbox` — the user that owns the credentials — and jq's `$ENV` reads the environment. A
+projection needs none of that, and this evaluator cannot reach outside the parsed document at all.
+
+Its position in the pipeline is a requirement, not a preference (`PostExecOptions.project`):
+
+- **after** sanitization — projecting first would strip the shape a structural sanitizer matches on
+  (crictl's `info.config.envs`) and could hand back a value it would have redacted;
+- **before** truncation — truncated JSON does not parse, so a projection running later would fail
+  exactly on the large documents it exists for.
+
+Two consequences worth knowing: a structural sanitizer appends a redaction notice, which makes its own
+output un-parseable, so the projector parses the JSON span and ignores trailing prose; and it
+re-appends that notice to the projection, because a projected answer must not read as verbatim when it
+is edited.
+
 ### 6.2 Security Strategy: Pre-Execution vs Post-Execution
 
 The security pipeline uses two complementary strategies — understanding which

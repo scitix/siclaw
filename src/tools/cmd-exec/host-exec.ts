@@ -7,8 +7,10 @@ import { renderTextResult } from "../infra/tool-render.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit } from "../infra/exit-classification.js";
+import { jsonPathProjector } from "../infra/json-projection.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
-import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import { validateNodeName, validatePodName } from "../infra/exec-utils.js";
 import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
@@ -16,6 +18,7 @@ import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js
 interface HostExecParams {
   host: string;
   command: string;
+  json_path?: string;
   pod?: string;
   namespace?: string;
   container?: string;
@@ -39,6 +42,63 @@ const HOST_BG_MAX_TTL = 3600;
  * the COMMANDS registry has no ssh / scp / sftp / sshpass entries — those are
  * blocked at the local context whitelist (DESIGN risk #1).
  */
+
+/**
+ * Which layer of the SSH path failed, from the client's own error text.
+ *
+ * "SSH connection failed" was the whole answer, and the three cases call for completely different next
+ * steps. Two of them are visible in the text with no extra work — a review captured
+ * `forwardOut from 214.31.43.1 to 214.31.40.77:22 failed: (SSH) Channel open failure: No route to host`,
+ * where `forwardOut` names the JUMP HOP: the bastion was reached and it could not reach the target, which
+ * is a different investigation from the bastion being unreachable.
+ */
+function classifySshFailure(message: string): { stage: string; hint: string } {
+  if (/forwardOut|Channel open failure/i.test(message)) {
+    return {
+      stage: "jump_hop",
+      hint: "The bastion was reached; the hop from it to the target failed. Check the target's own "
+        + "reachability and the bastion's route to it — the bastion itself is fine.",
+    };
+  }
+  if (/All configured authentication methods failed|Permission denied|publickey|Authentication failure/i.test(message)) {
+    return {
+      stage: "authentication",
+      hint: "The host answered and rejected the credential. Retrying will not help; the binding's key or "
+        + "password needs checking.",
+    };
+  }
+  if (/connect timeout|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|No route to host|ENETUNREACH/i.test(message)) {
+    return {
+      stage: "network",
+      hint: "Nothing answered at the transport layer. If the host is up, this is a network or firewall "
+        + "path problem rather than a credential one.",
+    };
+  }
+  return { stage: "unknown", hint: "The client gave no recognisable stage; see the message above." };
+}
+
+/**
+ * Recent connect-level failures per host, so a second call can SAY the first one just failed.
+ *
+ * Deliberately NOT a negative cache: the attempt is still made. A cache would keep a host that has just
+ * recovered locked out, and the evidence for skipping is thin — a review reports two ten-second waits,
+ * which is not worth a state machine that can be wrong. Reporting costs nothing and is never wrong.
+ */
+const recentSshFailures = new Map<string, { at: number; stage: string }>();
+const SSH_FAILURE_MEMORY_MS = 60_000;
+
+function noteSshFailure(host: string, stage: string): string {
+  const now = Date.now();
+  const prev = recentSshFailures.get(host);
+  recentSshFailures.set(host, { at: now, stage });
+  if (prev && now - prev.at < SSH_FAILURE_MEMORY_MS) {
+    const secs = Math.floor((now - prev.at) / 1000);
+    return ` This host also failed to connect ${secs}s ago (${prev.stage}); the two are almost certainly `
+      + "the same cause, so a third attempt is unlikely to differ.";
+  }
+  return "";
+}
+
 export function createHostExecTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
@@ -80,6 +140,9 @@ Examples (pass the id from host_list; names shown here for readability):
 - host: "<bare-metal-3 id>", command: "nvidia-smi"
 - host: "<storage-1 id>", command: "df -h"
 - host: "<node-a id>", command: "journalctl -u kubelet -n 100 | grep error"
+- host: "<node-a id>", command: "journalctl -u kubelet --since '2026-08-17 08:35:00'"
+  (time windows: journalctl runs on the HOST and its systemd rejects RFC3339 — use quoted
+   "YYYY-MM-DD HH:MM:SS", optionally with a trailing UTC, or a relative form like "-30min".)
 - host: "<node-a id>", command: "tcpdump -i eth0 -nn", run_in_background: true   (open-ended capture; returns immediately — stop it later with job_stop, then task_output(task_id))`,
     parameters: Type.Object({
       host: Type.String({
@@ -98,6 +161,16 @@ Examples (pass the id from host_list; names shown here for readability):
       ),
       container: Type.Optional(
         Type.String({ description: "Container name (multi-container pods). Only used with `pod`." }),
+      ),
+      json_path: Type.Optional(
+        Type.String({
+          description:
+            "Project a field out of the command's JSON output instead of returning the whole document. " +
+            "Evaluated HERE, not on the target — so it works on a target without jq, which most nodes are. " +
+            "Grammar: .a.b, .a[0] (negative counts from the end), .a[] to map over an array, " +
+            '.["odd key"]. Projection only — there are no filters, conditions or functions. ' +
+            "Applied to the sanitized output before truncation, so it is the way to read a large document.",
+        }),
       ),
       timeout_seconds: Type.Optional(
         Type.Number({
@@ -138,6 +211,12 @@ Examples (pass the id from host_list; names shown here for readability):
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as HostExecParams;
 
+      // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
+      // would answer with a kubeconfig error and hide the actual mistake.
+      if (backgroundEnabled && params.run_in_background === true && params.json_path) {
+        return backgroundJsonPathError();
+      }
+
       // Validate host name format (reuse node naming rules — RFC 1123)
       const hostErr = validateNodeName(params.host);
       if (hostErr) {
@@ -167,8 +246,11 @@ Examples (pass the id from host_list; names shown here for readability):
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
-          details: { error: true, reason: "host_acquire_failed" },
+          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node in a cluster this agent is BOUND to, node_exec reaches it without SSH — check with cluster_list first, because that fallback does not exist for an unbound cluster and two reviews reported being sent to it anyway.` }],
+          // Same class as the sshExec failure below: the channel never opened, so this is not the
+          // host's answer. The text already said so; details did not, which left the UI and the
+          // channel outcome unable to tell it from a command that failed.
+          details: { error: true, reason: "host_acquire_failed", exit_class: "channel_error", channel_leg: "transport" },
         };
       }
       // The model often passes an opaque host id; surface the resolved friendly name so the tool
@@ -267,9 +349,12 @@ Examples (pass the id from host_list; names shown here for readability):
           return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
         }
         const msg = err instanceof Error ? err.message : String(err);
+        const ssh = classifySshFailure(msg);
+        const repeat = noteSshFailure(params.host, ssh.stage);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
-          details: { error: true, reason: "ssh_exec_failed", host: params.host },
+          content: [{ type: "text", text: `Error: ${msg}\n\n[ssh_${ssh.stage}: ${ssh.hint}]${repeat}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node in a cluster this agent is BOUND to, node_exec reaches it without SSH — check with cluster_list first, because that fallback does not exist for an unbound cluster and two reviews reported being sent to it anyway.` }],
+          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", channel_leg: "transport",
+                     ssh_stage: ssh.stage, host: params.host },
         };
       } finally {
         signal?.removeEventListener("abort", onAbort);
@@ -282,26 +367,44 @@ Examples (pass the id from host_list; names shown here for readability):
         };
       }
 
-      // Mirror node_exec's error judgment: signal-killed with stdout = OK; otherwise non-zero exit = error.
-      const isError = result.exitCode !== 0 &&
-        !(result.exitCode === null && result.stdout.trim());
-      const stdoutHeader = isError
-        ? `Exit code: ${result.exitCode ?? "unknown"}${result.signal ? ` (signal: ${result.signal})` : ""}\n`
-        : "";
-      const stdoutBody = result.stdout.trim();
-      const truncatedSuffix = result.truncated ? "\n...[output truncated at 10 MB]" : "";
-      const stdout = stdoutHeader + stdoutBody + truncatedSuffix;
-
+      // WHAT the exit code means, from the same helper the other tools use. The code itself is
+      // rendered by postExecSecurity so our literals stay out of the sanitized body; `notes` carries
+      // the truncation notice and the class beside it.
+      const judgment = classifyExit({
+        command: params.command,
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        signal: result.signal,
+        context: "host",
+      });
+      // No tail-window note here — see the note in node-exec.ts: `kubectl` is not in this tool's
+      // whitelist, so the only command the note applies to cannot run.
+      const notes = (result.truncated ? "\n...[output truncated at 10 MB]" : "")
+        + (judgment.annotation ? `\n${judgment.annotation}` : "");
       return {
         content: [{
           type: "text",
-          text: postExecSecurity(stdout, pre.action, { stderr: result.stderr.trim() || undefined }),
+          text: postExecSecurity(result.stdout.trim(), pre.action, {
+            stderr: result.stderr.trim() || undefined,
+            project: jsonPathProjector(params.json_path),
+            ...(notes ? { notes } : {}),
+            // Whenever the run did not exit 0: the code is a FACT, `error` below is the judgment.
+            ...(judgment.exitClass !== "success"
+              ? {
+                  exitCode: result.exitCode ?? "unknown",
+                  ...(result.signal ? { signal: result.signal } : {}),
+                }
+              : {}),
+          }),
         }],
         details: {
           exitCode: result.exitCode,
+          exit_class: judgment.exitClass,
+          ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),
           host: params.host,
           host_label: hostLabel,
-          ...(isError && { error: true }),
+          ...(judgment.isError && { error: true }),
           ...(result.signal ? { signal: result.signal } : {}),
         },
       };

@@ -1,3 +1,9 @@
+import {
+  getOutputFormat,
+  kubectlAllNamespaces,
+  kubectlOutputFormats,
+  normalizeResourceToken,
+} from "./kubectl-sanitize.js";
 /**
  * Shared command whitelist and command-level validators used by
  * restricted-bash, pod-exec, and node-exec tools.
@@ -25,26 +31,97 @@ export function parseArgs(command: string): string[] {
   const args: string[] = [];
   let current = "";
   let inQuote: string | null = null;
-  for (const ch of command) {
+  // An explicitly quoted argument survives even when it is EMPTY. Dropping it silently renumbered
+  // every positional after it: `grep "" .siclaw/*/*/*` arrived as ["grep", ".siclaw/*/*/*"], so the
+  // credential glob became the first positional and was exempted as grep's pattern — while the shell
+  // passes the empty pattern through and grep prints every line of the files behind the glob.
+  let quotedEmpty = false;
+  const flush = () => {
+    if (current || quotedEmpty) args.push(current);
+    current = "";
+    quotedEmpty = false;
+  };
+  const chars = [...command];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     if (inQuote) {
-      if (ch === inQuote) {
+      // ANSI-C quoting ($'…') decodes escapes; a single-quoted string does not, and inside double
+      // quotes a backslash escapes only a few characters. Handled where the quote was opened.
+      if (ch === "\\" && (inQuote === '"' || inQuote === "\u0001")) {
+        const next = chars[i + 1];
+        if (next !== undefined) { current += decodeShellEscape(chars, i + 1, (n) => { i = n; }); continue; }
+      }
+      if (ch === inQuote || (inQuote === "\u0001" && ch === "'")) {
         inQuote = null;
       } else {
         current += ch;
       }
+    } else if (ch === "$" && chars[i + 1] === "'") {
+      // $'…' — the shell DECODES \057 and \x2f here, so `$'\057etc\057shadow'` reaches the process as
+      // /etc/shadow. Treating it as literal text let the sensitive-path check miss the real path
+      // entirely. A sentinel marks the mode so the closing quote is still `'`.
+      inQuote = "\u0001";
+      quotedEmpty = true;
+      i++;
+    } else if (ch === "\\") {
+      // An UNQUOTED backslash escapes the next character and disappears: `cat /etc/shado\w` opens
+      // /etc/shadow. Screening the text as written saw `shado\w` and matched nothing.
+      const next = chars[i + 1];
+      if (next !== undefined) { current += next; i++; }
+      continue;
     } else if (ch === '"' || ch === "'") {
       inQuote = ch;
+      quotedEmpty = true;
     } else if (ch === " " || ch === "\t") {
-      if (current) {
-        args.push(current);
-        current = "";
-      }
+      flush();
     } else {
       current += ch;
     }
   }
-  if (current) args.push(current);
+  flush();
   return args;
+}
+
+/**
+ * Decode one backslash escape at `chars[at]`, advancing the caller's index past what it consumed.
+ *
+ * Only the forms that can rewrite a PATH: octal, hex, and the common control letters. Anything else
+ * yields the character itself, which is what bash does for an unrecognised escape.
+ */
+function decodeShellEscape(chars: string[], at: number, advance: (to: number) => void): string {
+  const c = chars[at];
+  if (c === "x" || c === "X") {
+    let hex = "";
+    let j = at + 1;
+    while (j < chars.length && hex.length < 2 && /[0-9a-fA-F]/.test(chars[j])) hex += chars[j++];
+    if (hex) { advance(j - 1); return String.fromCharCode(parseInt(hex, 16)); }
+  }
+  // `\uHHHH` and `\UHHHHHHHH`. bash 4.2+ decodes both — measured in bash 5.2, where
+  // `cat $'/etc/hostname'` reads the real file. Only `\x` and octal were decoded here, so
+  // `$'/etc/shadow'` reached the sensitive-path check as the literal `u002fetcu002fshadow`
+  // while the shell opened `/etc/shadow`. `cut`, `hexdump` and `od` are whitelisted and have no content
+  // redactor, so that was a readable path to a credential file.
+  if (c === "u" || c === "U") {
+    const width = c === "u" ? 4 : 8;
+    let hex = "";
+    let j = at + 1;
+    while (j < chars.length && hex.length < width && /[0-9a-fA-F]/.test(chars[j])) hex += chars[j++];
+    if (hex) {
+      const cp = parseInt(hex, 16);
+      // Reject what String.fromCodePoint would throw on; bash prints those unchanged too.
+      if (cp <= 0x10ffff) { advance(j - 1); return String.fromCodePoint(cp); }
+    }
+  }
+  if (/[0-7]/.test(c)) {
+    let oct = "";
+    let j = at;
+    while (j < chars.length && oct.length < 3 && /[0-7]/.test(chars[j])) oct += chars[j++];
+    advance(j - 1);
+    return String.fromCharCode(parseInt(oct, 8));
+  }
+  const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", "0": "\0", "\\": "\\", "'": "'", '"': '"' };
+  advance(at);
+  return simple[c] ?? c;
 }
 
 /**
@@ -176,6 +253,11 @@ interface InternalRule {
   command: string;
   pipeOnly?: boolean;
   noFilePaths?: boolean;
+  /**
+   * Flags whose value may begin with "-" (a negative number). Only consulted to stop the value being
+   * validated as a flag — see the note in validateByRule.
+   */
+  valueFlags?: readonly string[];
   blockedFlags?: string[];
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
@@ -216,6 +298,13 @@ function validateByRule(
         if (!allowed.includes(arg)) {
           return JSON.stringify({
             error: `${cmd} ${position === 0 ? "subcommand" : "action"} "${arg}" is not allowed.`,
+            // Listing what IS permitted turns a dead end into a next step. A review reports `crictl exec`
+            // being refused clearly and the caller then guessing at kubelet volume paths, because the
+            // refusal named nothing.
+            allowed: [...allowed],
+            ...(SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`)
+              ? { hint: SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`) }
+              : {}),
           }, null, 2);
         }
         return null;
@@ -231,6 +320,20 @@ function validateByRule(
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
+
+    // A flag's VALUE that begins with "-" is not a flag. `journalctl -b -1` (the previous boot) was
+    // refused with `"-1" is not allowed`, which names the value rather than the parse — an agent
+    // reading that drops the -1 and loses the intent, and never discovers that `-b-1` works.
+    //
+    // Narrow on purpose: only a value matching a NEGATIVE NUMBER is consumed, and only directly after
+    // a flag the command declares as value-taking. Anything else keeps being validated as a flag, so
+    // this cannot become a hole through which an arbitrary token slips past the whitelist.
+    if (
+      rule.valueFlags?.includes(args[i - 1]) &&
+      /^-\d+$/.test(arg)
+    ) {
+      continue;
+    }
 
     if (!arg.startsWith("-")) {
       positionalCount++;
@@ -419,6 +522,35 @@ function checkCurlMethod(method: string | undefined): string | null {
 }
 
 function validateCurl(args: string[]): string | null {
+  // A leading `@` on ANY curl value means "read this local file" — `-w @fmt`, `-H @hdrs`, `-d @body`,
+  // `-F f=@path`, `--config @file`. The flag allow-list only decided WHICH flags were permitted, so `-w`
+  // and `-H` passed and their values read a kubeconfig — printing it, or POSTing it to whatever host the
+  // same command named. Checked first, and for every argument shape, because the flag it rides on is not
+  // what makes it dangerous.
+  //
+  // Refused rather than path-screened: `@` has exactly this one meaning in curl, the file forms have no
+  // read-only use through this tool, and screening the path would still leave `-H @<passing path>
+  // https://attacker` available.
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    const eq = arg.indexOf("=");
+    const candidates = [
+      arg.startsWith("@") ? arg : undefined,                                  // bare @file
+      eq > 0 ? arg.slice(eq + 1) : undefined,                                 // --data=@file, -F n=@file
+      /^-[A-Za-z]@/.test(arg) ? arg.slice(2) : undefined,                     // -d@file
+      /^-{1,2}[A-Za-z][A-Za-z-]*$/.test(arg) ? args[i + 1] : undefined,       // -H @file
+    ];
+    for (const candidate of candidates) {
+      if (candidate?.startsWith("@")) {
+        return JSON.stringify({
+          error: `curl "${candidate}" is not allowed — a leading @ tells curl to read that local file, `
+            + "which can print a credential or send it to a remote host.",
+          hint: "Pass the value inline instead of @file. To read a file, use the dedicated file tools.",
+        }, null, 2);
+      }
+    }
+  }
+
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (!arg.startsWith("-")) {
@@ -589,28 +721,148 @@ function validateDcgmi(args: string[]): string | null {
 
 const NVIDIA_SMI_SAFE_FLAGS = new Set([
   "-q", "--query", "-L", "--list-gpus", "-i",
+  // Display-section FILTER for -q (MEMORY, UTILIZATION, TEMPERATURE, POWER, ECC, CLOCK, PIDS, …).
+  // Read-only: the setters live under different flags (-e/--ecc-config writes ECC, -dm the driver
+  // model, -pl the power limit) and stay blocked because matching is exact-token — extractFlag
+  // only splits on "=", so "-d" never widens to "-dm".
+  "-d", "--display",
 ]);
 const NVIDIA_SMI_SAFE_PREFIXES = [
   "--query-gpu=", "--query-compute-apps=", "--id=", "--format=",
-  "-i=",
+  "-i=", "--display=",
 ];
-const NVIDIA_SMI_SUBCMDS = new Set(["topo", "nvlink"]);
+
+/**
+ * Read-only flags PER SUBCOMMAND.
+ *
+ * Seeing a subcommand used to return null, which accepted the whole invocation and stopped
+ * checking the rest of the argv — so `nvidia-smi nvlink --setcontrol …` and `nvidia-smi nvlink -r`
+ * passed a validator whose own error message promises "only read-only queries". Subcommands carry
+ * their own writes, so each gets its own allowlist (the shape validateDcgmi already uses).
+ */
+/**
+ * Read-only option sets for the nvidia-smi subcommands that have their own.
+ *
+ * Transcribed from a REAL `nvidia-smi topo --help` / `nvlink --help` on a GPU node, not from the
+ * online documentation: the docs list `topo -nvme / -gpu / -nic / -all`, which that driver does not
+ * have, and they give long forms (`--path`, `--nvlink`, `--list`) that do not exist either. Only what
+ * a real binary confirms is listed here — an allowlist that names options nothing accepts is a claim
+ * we cannot back, and the cost of omitting a genuine option is a refusal, not a leak.
+ *
+ * Every WRITE and RESET option is excluded, and the help text is what identifies them:
+ *   nvlink -sc/--setcontrol, -r/--resetcounters, -re/--reseterrorcounters,
+ *          -sLowPwrThres/--setLowPowerThreshold, -sBwMode/--setBandwidthMode
+ * `-re` is the reason this is an allow-list rather than a deny-list: it resets every error counter,
+ * and it was refused before anyone noticed it existed, simply by not being named.
+ *
+ * The deprecated getters (`-gc/--getcontrol`, `-g/--getcounters`) are also left out — nvidia-smi
+ * itself directs callers to `-gt/--getthroughput`.
+ */
+const NVIDIA_SMI_SUBCMD_FLAGS = new Map<string, Set<string>>(Object.entries({
+  topo: new Set([
+    "-m", "--matrix", "-mp", "--matrix_pci",
+    "-i", "--id", "-c", "--cpu", "-n", "--nearest_gpus", "-p", "--gpu_path",
+    "-p2p", "--p2pstatus",
+    "-C", "--get-numa-id-of-nearby-cpu", "-M", "--get-numa-id-of-nearby-mem",
+    "-gnid", "--gpu-numa-id", "-h", "--help",
+  ]),
+  nvlink: new Set([
+    "-h", "--help", "-i", "--id", "-l", "--link",
+    "-s", "--status", "-c", "--capabilities",
+    "-p", "--pcibusid", "-R", "--remotelinkinfo",
+    "-e", "--errorcounters", "-ec", "--crcerrorcounters",
+    "-gt", "--getthroughput",
+    "-gLowPwrInfo", "--getLowPowerInfo", "-gBwMode", "--getBandwidthMode",
+    "-cBridge", "--checkBridge",
+  ]),
+}));
+
+/**
+ * mikefarah yq screens its EXPRESSION, not just its argv.
+ *
+ * The expression language opens files and reads the environment on its own: `load`, `load_str`,
+ * `strload`, `load_xml`, `load_props` and `load_base64` each take a path, and `env` / `strenv` /
+ * `envsubst` reach the environment. None of that is visible to a flag or operand check —
+ * `yq 'load_str(env(SICLAW_CREDENTIALS_DIR) + "/clusters/default.kubeconfig")'` is a single
+ * quoted argument with no path in it.
+ *
+ * `eval` is rejected for the same reason, and rejecting it is what makes screening the literal
+ * text sound: it compiles a STRING as an expression, so `eval("lo" + "ad_str(\"/x\")")` rebuilds a
+ * blocked operator from fragments no token scan can match. Without `eval`, concatenating an
+ * operator name is a yq parse error, so the operator has to appear literally to run at all.
+ *
+ * Key ACCESS is deliberately untouched: an operator call always carries `(`, while
+ * `.spec.containers[].env` — the most common k8s query there is — never does.
+ */
+const YQ_BLOCKED_OPERATORS: readonly { pattern: RegExp; what: string }[] = [
+  { pattern: /(?<![.\w-])(?:str)?load\w*\s*\(/i, what: "a file operator (load / load_str / strload / load_xml / load_props / load_base64)" },
+  { pattern: /(?<![.\w-])(?:str)?env\w*\s*\(/i, what: "an environment operator (env / strenv)" },
+  { pattern: /(?<![.\w-])envsubst/i, what: "the envsubst operator" },
+  { pattern: /(?<![.\w-])eval\s*\(/i, what: "the eval operator, which can reconstruct any blocked operator from string fragments" },
+  { pattern: /(?<![.\w-])system\s*\(/i, what: "the system operator" },
+];
+
+const YQ_ALLOWED_FLAGS = [
+  "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
+  "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
+  "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
+  "--xml-attribute-prefix", "--xml-content-name",
+  "--unwrapScalar", "--nul-output", "--header-preprocess",
+  // NOTE: -s/--split-exp intentionally excluded — mikefarah yq's --split-exp writes each
+  // document to a separate FILE (write capability); output must stay on stdout.
+];
+
+/**
+ * validate() takes full responsibility for a command, so the flag whitelist is applied here
+ * explicitly rather than declaratively — the two are mutually exclusive by design.
+ */
+function validateYq(args: string[]): string | null {
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("-")) continue;
+    for (const { pattern, what } of YQ_BLOCKED_OPERATORS) {
+      if (pattern.test(arg)) {
+        return JSON.stringify({
+          error: `yq expression uses ${what}. These read files and the environment from inside the expression, independent of the arguments, so they are not permitted. Query the piped document instead, and use the dedicated file tools to read a file.`,
+        }, null, 2);
+      }
+    }
+  }
+  return validateByRule(args, { command: "yq", allowedFlags: YQ_ALLOWED_FLAGS });
+}
 
 function validateNvidiaSmi(args: string[]): string | null {
   if (args.length <= 1) return null;
 
+  // nvidia-smi takes its subcommand FIRST, so an unrecognised leading word is a subcommand we do
+  // not permit — not a stray operand to be skipped. `nvidia-smi daemon` starts a root background
+  // daemon and used to be accepted, because the argv walk below only ever inspected flags. Later
+  // positionals stay unchecked on purpose: they are flag values, and every mutating nvidia-smi
+  // operation is either a flag or a leading subcommand.
+  if (!args[1].startsWith("-") && !NVIDIA_SMI_SUBCMD_FLAGS.has(args[1])) {
+    return JSON.stringify({
+      error: `nvidia-smi "${args[1]}" is not an allowed subcommand. Only read-only queries and the ${[...NVIDIA_SMI_SUBCMD_FLAGS.keys()].sort().join(" / ")} subcommands are permitted.`,
+    }, null, 2);
+  }
+
+  // A subcommand switches the whole invocation to that subcommand's flag set. Looked up in a
+  // Map, not an object: `"constructor" in obj` is true through the prototype chain, and the
+  // Function it returns has no .has — a caller could throw the validator by typing that word.
+  const subcmd = args.slice(1).find((a) => !a.startsWith("-") && NVIDIA_SMI_SUBCMD_FLAGS.has(a));
+  const allowed = (subcmd && NVIDIA_SMI_SUBCMD_FLAGS.get(subcmd)) || NVIDIA_SMI_SAFE_FLAGS;
+
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) {
-      if (NVIDIA_SMI_SUBCMDS.has(arg)) return null;
-      continue;
-    }
+    if (!arg.startsWith("-")) continue;
     const flag = extractFlag(arg);
-    if (!NVIDIA_SMI_SAFE_FLAGS.has(flag) && !startsWithAny(arg, NVIDIA_SMI_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `nvidia-smi "${arg}" is not allowed. Only read-only nvidia-smi queries are permitted.`,
-      }, null, 2);
-    }
+    if (allowed.has(flag)) continue;
+    if (!subcmd && startsWithAny(arg, NVIDIA_SMI_SAFE_PREFIXES)) continue;
+    return JSON.stringify({
+      error: subcmd
+        ? `nvidia-smi ${subcmd} "${arg}" is not allowed. Only read-only ${subcmd} queries are permitted.`
+        : `nvidia-smi "${arg}" is not allowed. Only read-only nvidia-smi queries are permitted.`,
+      ...(subcmd && { allowed: [...allowed].sort() }),
+    }, null, 2);
   }
   return null;
 }
@@ -723,8 +975,16 @@ function validateMount(args: string[]): string | null {
     const arg = args[i];
     if (!arg.startsWith("-")) {
       nonFlagCount++;
-      if (nonFlagCount >= 2) {
-        return "mount with device and mountpoint arguments is not allowed. Only listing mounts (mount without arguments or with -l) is permitted.";
+      // ONE operand is already an action, not a listing: `mount /mnt` looks the target up in fstab and
+      // mounts it. The threshold was two — device AND mountpoint — which let the fstab form through.
+      // There is no read-only use for `mount <target>`; listing is the bare command or `-l`.
+      if (nonFlagCount >= 1) {
+        return JSON.stringify({
+          error: `mount with an operand ("${arg}") is not allowed — it mounts a filesystem, and this `
+            + "tool is read-only.",
+          hint: "A bare `mount` (or `mount -l`) lists mounted filesystems; `findmnt` gives the same "
+            + "information with structure.",
+        }, null, 2);
       }
       continue;
     }
@@ -803,6 +1063,105 @@ function validateTee(args: string[]): string | null {
   return null;
 }
 
+// ── Stdin-only text commands: file operands ──────────────────────
+
+/**
+ * Args of a stdin-only text command that are NOT file operands, and may therefore legitimately
+ * carry shell metacharacters: the grep pattern, the jq/yq expression, tr's two SETs.
+ *
+ * `valueFlags` keeps a flag's value from being counted as the expression (`grep -m 5 PATTERN` —
+ * `5` is not the pattern) and lists only flags whose value is NOT a path; a file-taking flag such
+ * as `grep -f` or `jq --rawfile` is left out on purpose so its value is screened like any other
+ * file operand. `patternFlags` supply the pattern themselves, so once one appears there is no
+ * expression left among the positionals and every one of them is a FILE.
+ */
+interface TextExpressionArgs {
+  /**
+   * Single-letter options that CONSUME a value, in getopt terms. Needed because a short-option cluster
+   * carries its value inline from the FIRST value-taking letter onward: grep reads `-ie.` as
+   * `-i -e '.'`, and `-ifoo` as `-i -f oo` — a pattern FILE, not "-i plus a pattern".
+   *
+   * Without this, only the letter at position 1 was examined, so `grep -ie. .siclaw/*\/*\/*` looked
+   * like an unknown boolean flag: the expression quota stayed unspent and the credential glob behind it
+   * was exempted as the pattern.
+   */
+  shortValueFlags?: readonly string[];
+  /** Leading positionals that are an expression, not a file: the grep pattern, jq/yq filter, tr SETs. */
+  positionals: number;
+  /** Flags that supply the expression themselves; their value is a pattern, and no positional is left. */
+  patternFlags?: readonly string[];
+  /**
+   * Flags whose value names a file to READ. In a stdin-only context the flag IS the file read, so it
+   * is refused outright rather than screened. Per command, because the same letter differs: `grep -f`
+   * is a pattern file, `cut -f` is a field list, `sort -f` is --ignore-case.
+   */
+  fileFlags?: readonly string[];
+}
+
+const GREP_EXPRESSION_ARGS: TextExpressionArgs = {
+  positionals: 1,
+  patternFlags: ["-e", "--regexp"],
+  fileFlags: ["-f", "--file"],
+  // e=pattern f=pattern-file m=max-count A/B/C=context d=directories D=devices
+  shortValueFlags: ["e", "f", "m", "A", "B", "C", "d", "D"],
+};
+
+// Keyed by a Map, not a plain object: both the command name and the flag come from the caller, and
+// `obj["constructor"]` resolves through the prototype chain to something that is not a rule.
+const TEXT_EXPRESSION_ARGS = new Map<string, TextExpressionArgs>([
+  ["grep", GREP_EXPRESSION_ARGS],
+  ["egrep", GREP_EXPRESSION_ARGS],
+  ["fgrep", GREP_EXPRESSION_ARGS],
+  ["jq", { positionals: 1, fileFlags: ["-f", "--from-file", "--rawfile", "--slurpfile"], shortValueFlags: ["f"] }],
+  ["yq", { positionals: 1, fileFlags: ["--from-file"], shortValueFlags: ["o", "p"] }],
+  ["wc", { positionals: 0, fileFlags: ["--files0-from"] }],
+  ["sort", { positionals: 0, fileFlags: ["--files0-from"] }],
+  ["tr", { positionals: 2 }],
+]);
+
+/**
+ * A stdin-only text command may not name a path, and the check has to hold BEFORE the shell
+ * expands anything.
+ *
+ * The literal-prefix rule (`/`, `./`, `../`, `~`) and the sensitive-path patterns both match text,
+ * so every form of expansion defeats them. The credentials sit INSIDE the workdir — `WORKDIR /app`,
+ * credentials at `/app/.siclaw/credentials/` — which is what makes this reachable without ever
+ * spelling a credential path:
+ *
+ *     printf x | head .siclaw/*\/*\/*                    ← glob, no literal, no leading /
+ *     printf x | column .sic*\/credentials/clusters/*     ← partial component
+ *     printf x | head .siclaw/{credentials,x}/clusters/*  ← brace expansion
+ *     printf x | column "$SICLAW_CREDENTIALS_DIR"/clusters/*
+ *
+ * So the rule is not "reject things that look expanded" but: **a file operand may not contain a
+ * path separator or any construct the shell rewrites.** Reaching a credential from the workdir
+ * requires at least one `/` (the tree is two levels down, and nothing in the whitelist can create a
+ * symlink or change directory), which is what makes screening for `/` plus the expansion
+ * metacharacters sufficient rather than a guess about which shapes are dangerous.
+ *
+ * An earlier revision of this rule allowed globs, reasoning that `*` cannot match `..` and so cannot
+ * climb out of the workdir. That is true and irrelevant: the credentials are BELOW the workdir, not
+ * above it. The exception is gone — the payloads above are regression tests.
+ *
+ * Values of flags are screened the same way, since `--file=$SICLAW_CREDENTIALS_DIR/x` hides the
+ * operand inside a token that starts with `-`. Expression values are exempt: a grep pattern
+ * legitimately contains `$`, `[` and `/`.
+ *
+ * Scope note: this is defense in depth, not the boundary. The same payloads work on `sort`, `cut`,
+ * `head`, `tail` and `grep`, which have shipped in the image all along, and the documented boundary
+ * for credentials is filesystem permissions — see security.md §4.6 for why that boundary is not
+ * currently where ADR-010 says it is.
+ */
+const TEXT_OPERAND_FORBIDDEN = /[/*?[\]{}~`]|\$/;
+
+function rejectPathishOperand(baseName: string, arg: string, what: string): string | null {
+  const bare = arg.replace(/["']/g, "");
+  if (!TEXT_OPERAND_FORBIDDEN.test(bare)) return null;
+  return JSON.stringify({
+    error: `${baseName} ${what} "${arg}" names a path, or contains a glob or expansion that the shell would turn into one. ${baseName} may only process piped input — use the dedicated file tools to read a file.`,
+  }, null, 2);
+}
+
 // ── Entry point ──────────────────────────────────────────────────
 
 /**
@@ -829,15 +1188,62 @@ function applyContextPolicy(
         error: `"${baseName}" can only be used after a pipe (|). Direct file reading is not allowed — use the dedicated file tools instead.`,
       }, null, 2);
     }
-    // noFilePaths (implicit): block positional args that look like paths
+    // noFilePaths (implicit): no operand, and no flag value, may name a path.
+    const spec = TEXT_EXPRESSION_ARGS.get(baseName);
+    let expressionsLeft = spec?.positionals ?? 0;
+    let expressionValueFollows = false;
     for (let i = 1; i < args.length; i++) {
       const arg = args[i];
-      if (arg.startsWith("-")) continue;
-      if (arg !== "" && (arg.startsWith("/") || arg.startsWith("./") || arg.startsWith("../") || arg.startsWith("~"))) {
-        return JSON.stringify({
-          error: `${baseName} cannot take file path arguments — it should only process piped input. Use the dedicated file tools instead.`,
-        }, null, 2);
+
+      // The value of a pattern-supplying flag is an expression, not a path — `grep -e 'foo$bar'`
+      // and `grep -e '/var/log/pods'` are ordinary regexes and must not be screened as operands.
+      if (expressionValueFollows) { expressionValueFollows = false; continue; }
+
+      // `-` means stdin, which is the only input these commands are supposed to have.
+      if (arg === "-") continue;
+
+      if (arg.startsWith("-")) {
+        // Short options cluster, and the value belongs to the FIRST letter that takes one: grep reads
+        // `-ie.` as `-i -e '.'` and `-ifoo` as `-i -f oo`. extractFlag only splits on `=`, and an
+        // earlier revision only examined the letter at position 1 — so `-ie.` read as an unknown
+        // boolean, the expression quota stayed unspent, and `grep -ie. .siclaw/*/*/*` was accepted.
+        // It prints every line of the credential files behind that glob.
+        let flag = extractFlag(arg);
+        let inlineValue = arg.length > flag.length ? arg.slice(flag.length).replace(/^=/, "") : "";
+        if (!inlineValue && !arg.startsWith("--") && arg.length > 2 && spec?.shortValueFlags) {
+          for (let c = 1; c < arg.length; c++) {
+            if (!spec.shortValueFlags.includes(arg[c])) continue;
+            flag = `-${arg[c]}`;
+            inlineValue = arg.slice(c + 1);   // "" means the value is the NEXT token
+            break;
+          }
+        }
+
+        if (spec?.fileFlags?.includes(flag)) {
+          return JSON.stringify({
+            error: `${baseName} "${flag}" reads a file, which is not allowed here — ${baseName} may only process piped input. Use the dedicated file tools to read a file.`,
+          }, null, 2);
+        }
+
+        if (spec?.patternFlags?.includes(flag)) {
+          // The pattern came from the flag, so no positional is the expression any more.
+          expressionsLeft = 0;
+          if (!inlineValue) expressionValueFollows = true;
+          continue;
+        }
+
+        // Any other flag's value is screened like an operand: `--file=$DIR/x` hides a path inside a
+        // token that starts with `-`, which an operand-only check never looks at.
+        if (inlineValue) {
+          const err = rejectPathishOperand(baseName, inlineValue, `flag value for "${flag}"`);
+          if (err) return err;
+        }
+        continue;
       }
+
+      if (expressionsLeft > 0) { expressionsLeft--; continue; }
+      const err = rejectPathishOperand(baseName, arg, "file operand");
+      if (err) return err;
     }
   }
 
@@ -879,7 +1285,7 @@ function applyCommandConstraints(
   def: CommandDef,
 ): string | null {
   const hasDeclarative = def.blockedFlags || def.allowedFlags ||
-    def.allowedSubcommands || def.positionals || def.requiredFlags;
+    def.allowedSubcommands || def.positionals || def.requiredFlags || def.valueFlags;
 
   // Custom validator takes priority (escape hatch for complex commands)
   if (def.validate) {
@@ -904,6 +1310,7 @@ function applyCommandConstraints(
     allowedSubcommands: def.allowedSubcommands,
     positionals: def.positionals,
     requiredFlags: def.requiredFlags,
+    valueFlags: def.valueFlags,
   });
 }
 
@@ -914,6 +1321,58 @@ function applyCommandConstraints(
  * (for pipe-only enforcement).
  * Returns an error message string if blocked, or null if allowed.
  */
+/**
+ * What to do instead, for the refusals a review saw someone work around by guessing.
+ *
+ * Keyed on `command subcommand`. Only entries where a real substitute exists — an empty hint is worse
+ * than none, and the `allowed` list beside it already covers the general case.
+ */
+// Also a Map, for the same reason.
+const SUBCOMMAND_ALTERNATIVES = new Map<string, string>(Object.entries({
+  "crictl exec": "Entering a container is not available here. Use `pod_exec` (which enters through the "
+    + "Kubernetes API with the same read-only validation), or read what you need from outside with "
+    + "`crictl inspect` / `crictl logs`.",
+  "crictl run": "This tool does not start containers. `crictl inspect`, `crictl ps` and `crictl logs` "
+    + "cover inspection of what is already running.",
+  "crictl rm": "This tool is read-only; container lifecycle changes are out of scope.",
+  "crictl rmi": "This tool is read-only; image removal is out of scope.",
+  "crictl stop": "This tool is read-only; stopping a container is out of scope.",
+}));
+
+/**
+ * Flags that turn a read-only tool into a command RUNNER, and other write switches that survive an
+ * `allowedSubcommands` match.
+ *
+ * `allowedSubcommands` returns as soon as the subcommand is in the set, so nothing after it is examined.
+ * That is how `ip -batch /tmp/commands` passed: `-batch` reads a FILE OF COMMANDS and executes them, so
+ * the whole read-only argument collapses. `bridge`, `tc` and `rdma` share the switch. `conntrack -z`
+ * zeroes counters, and `nvme`'s `--output-file` writes to disk.
+ */
+// A Map, not an object literal: a command named `constructor` or `toString` reads a Function off
+// Object.prototype, and the `.flags.test()` below then throws. This PR already fixed that class of bug
+// in the rule lookups and an existing test caught me reintroducing it here.
+const WRITE_FLAGS_BY_COMMAND = new Map<string, { flags: RegExp; why: string }>(Object.entries({
+  ip:        { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  bridge:    { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  tc:        { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  rdma:      { flags: /^(-batch|-b|--batch)$/, why: "-batch reads a file of commands and executes them" },
+  conntrack: { flags: /^(-z|--zero|-D|--delete|-F|--flush|-U|--update|-I|--create)$/,
+               why: "it modifies or clears connection tracking state" },
+  nvme:      { flags: /^(--output-file|-o|--fw-file)(=.*)?$/, why: "it writes to a file on the target" },
+}));
+
+/** A write switch present on an otherwise read-only command. */
+function checkWriteFlags(cmd: string, args: string[]): string | null {
+  const rule = WRITE_FLAGS_BY_COMMAND.get(cmd);
+  if (!rule) return null;
+  const hit = args.slice(1).find((a) => rule.flags.test(a));
+  if (!hit) return null;
+  return JSON.stringify({
+    error: `${cmd} "${hit}" is not allowed — ${rule.why}.`,
+    hint: "This tool is read-only. Issue the individual read commands instead of a batch or a write.",
+  }, null, 2);
+}
+
 export function validateCommandRestrictions(
   cmd: string,
   options?: { context?: string; piped?: boolean },
@@ -929,7 +1388,15 @@ export function validateCommandRestrictions(
   const ctxErr = applyContextPolicy(baseName, args, options?.context, options?.piped);
   if (ctxErr) return ctxErr;
 
-  // 2. Command-intrinsic constraints (validate function or declarative rules)
+  // 2. Write switches, BEFORE any per-command validator or allowedSubcommands match. Both of those
+  //    return as soon as the subcommand/action looks read-only and never examine the rest of the
+  //    argument list — which is how `ip -batch <file>` passed: validateIp skips leading flags to find
+  //    the object, so it never saw that `-batch` makes the whole thing a command runner. A permitted
+  //    verb does not make its flags safe.
+  const writeFlag = checkWriteFlags(baseName, args);
+  if (writeFlag) return writeFlag;
+
+  // 3. Command-intrinsic constraints (validate function or declarative rules)
   return applyCommandConstraints(baseName, args, def);
 }
 
@@ -972,9 +1439,132 @@ const ALL_NS_ALWAYS_NEED_SELECTOR = new Set(["describe", "events", "top"]);
  *
  * Returns a descriptive reason string if blocked, or null if allowed.
  */
+/**
+ * Does this argv name Secrets as a resource?
+ *
+ * Scans EVERY non-flag token rather than trying to find "the resource", which is what an earlier version
+ * did — and it picked flag VALUES: `kubectl get -o yaml secret demo` and
+ * `kubectl get -n default secret demo -o yaml` both slipped through with `yaml` / `default` mistaken for
+ * the resource. Scanning every positional makes flag arity irrelevant, and arity is exactly the thing
+ * that cannot be tracked reliably across kubectl versions.
+ *
+ * Handles the forms kubectl actually accepts: `secret`, `secrets`, `secret/name`, and comma lists
+ * (`secret,pod`). NOT abbreviations — verified against a live cluster, `kubectl get sec` is rejected by
+ * kubectl itself ("the server doesn't have a resource type"), and Secrets have no registered short name.
+ *
+ * Deliberate false positive: a ConfigMap literally named `secret` (`kubectl get cm secret -o yaml`) is
+ * refused. The wrong direction here leaks a credential; the wrong direction there is one confusing
+ * refusal, so this is the trade taken on purpose.
+ */
+export function argsNameSecrets(args: string[], subcommand: string): boolean {
+  // `get --raw /api/v1/namespaces/x/secrets/y` names a Secret in a PATH, not a resource token: the
+  // loop below takes `split("/")[0]` and gets "" for an absolute path, so it saw nothing. Any
+  // `/secrets` segment counts.
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    const rawPath = a === "--raw" ? args[i + 1] : a.startsWith("--raw=") ? a.slice("--raw=".length) : undefined;
+    if (rawPath && rawPath.split("?")[0].split("/").some((seg) => seg === "secrets" || seg === "secret")) {
+      return true;
+    }
+  }
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("-") || a === subcommand) continue;
+    for (const part of a.split(",")) {
+      // `type/name`, then `type.version[.group]` — kubectl accepts both, and the second needs the
+      // TRAILING dot for a core-group resource. Checked against a live cluster rather than assumed:
+      //
+      //   secrets.v1.   leaks      secrets.v1     rejected by kubectl ("no resource type")
+      //   secret.v1.    leaks      secrets.core   rejected
+      //   secrets.      leaks
+      //
+      // So the review's spelling (`secrets.v1`) is not itself reachable, but the family is — taking the
+      // segment before the first dot covers every form kubectl actually accepts.
+      const type = normalizeResourceToken(part);
+      if (type === "secret" || type === "secrets") return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Output formats a Secret may be printed in.
+ *
+ * `-o json` is safe because the structural sanitizer redacts EVERY value under `data`/`stringData`
+ * unconditionally — it does not try to judge the value. Table, `wide` and `name` never print `data` at
+ * all. Everything else must be refused, because it can emit a bare value with no key beside it:
+ *
+ *     kubectl get secret demo -o 'jsonpath={.data.password}'   →  c3VwZXItc2VjcmV0
+ *
+ * A text redactor cannot save that. It keys on sensitive NAMES or on value shapes, and one base64 blob
+ * on its own has neither — nor should it be asked to, since guessing whether an arbitrary string is a
+ * secret is not a decidable problem. `-o yaml` is refused for the same reason and not an obvious one:
+ * a Secret whose data key is not itself sensitive-sounding (`config: <base64>`) sails through the key
+ * matcher.
+ */
+const SECRET_SAFE_FORMATS = new Set([null, "wide", "name", "json"]);
+
+/**
+ * Refuse a Secret read whose output format could print the secret itself.
+ * Returns a reason string, or null when the command is fine.
+ */
+export function checkSecretOutputFormat(args: string[], subcommand: string): string | null {
+  if (subcommand !== "get") return null;
+  if (!argsNameSecrets(args, subcommand)) return null;
+
+  // EVERY declared format is checked, not the first and not only the effective one.
+  //
+  // kubectl is last-wins: `-o json -o jsonpath={.data.password}` prints the bare base64, measured against
+  // a live cluster. Reading the first format let a safe `-o json` in front of an unsafe one through. And
+  // a command that declares an unsafe format is not worth defending even when kubectl would ignore it —
+  // refusing on ANY unsafe entry costs nothing real and removes a whole class of ordering tricks.
+  const formats = kubectlOutputFormats(args);
+  const unsafe = formats.find((f) => !SECRET_SAFE_FORMATS.has(f));
+  if (formats.length === 0 || unsafe === undefined) return null;
+  const format = unsafe;
+
+  return `"kubectl get secret -o ${format}" can print the secret's own values, which no output filter `
+    + `can reliably redact — a lone base64 value carries no key name and no recognisable shape. `
+    + `Use one of:\n`
+    + `  kubectl get secret <name> -o json      (values redacted, structure intact)\n`
+    + `  kubectl get secret <name>              (type, key count, age)\n`
+    + `  kubectl describe secret <name>         (key names and byte counts, no values)`;
+}
+
+/**
+ * Does a field selector pin the result to ONE node or ONE object by name?
+ *
+ * `-A -o json` is refused because serializing every object of a kind is the concern. A server-side
+ * `--field-selector spec.nodeName=<exact>` removes that concern rather than papering over it: the
+ * apiserver returns one node's pods, which is the same order of magnitude as `-n <namespace> -o json`
+ * — already permitted. Seven separate review findings hit this, all of them node-scoped triage that
+ * then had to fall back to custom-columns and lose the nested fields it needed.
+ *
+ * Narrow on purpose. `status.phase=Running` across all namespaces is NOT bounded and stays refused, and
+ * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
+ * selector names a single node or a single object", nothing looser.
+ */
+function hasBoundingFieldSelector(args: string[]): boolean {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--field-selector" && args[i + 1]) values.push(args[i + 1]);
+    else if (a.startsWith("--field-selector=")) values.push(a.slice("--field-selector=".length));
+  }
+  for (const raw of values) {
+    for (const term of raw.split(",")) {
+      const m = /^\s*(spec\.nodeName|metadata\.name)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
+      if (m && m[2].trim().length > 0) return true;
+    }
+  }
+  return false;
+}
+
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
-  const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
-  if (!hasAllNs) return null;
+  // pflag reads `-Ao json` as `-A -o json`, so an exact-token match missed it — and the format reader
+  // missed the `-o` in the same cluster, which made `kubectl get secrets -Ao json` a permitted,
+  // unsanitized dump of every Secret. One reader for both now.
+  if (!kubectlAllNamespaces(args)) return null;
 
   const hasSelector = args.some(a =>
     a === "-l" ||
@@ -985,40 +1575,52 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
   // describe/events/top -A without selector → always blocked
   if (ALL_NS_ALWAYS_NEED_SELECTOR.has(subcommand)) {
     if (!hasSelector) {
-      return `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on large clusters.`;
+      return `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on `
+        + `large clusters. Add a selector, or name a namespace:\n`
+        + `  kubectl ${subcommand} -A -l <key>=<value>\n`
+        + `  kubectl ${subcommand} -A --field-selector <field>=<value>\n`
+        + `  kubectl ${subcommand} -n <namespace>`;
     }
     return null;
   }
 
   // get -A + -o yaml/json → blocked (even with selector — bulk serialization is the concern)
   if (subcommand === "get") {
-    const format = getKubectlOutputFormat(args);
+    // The EFFECTIVE format, from the shared reader: last-wins, and it decomposes `-Ao json`. A local
+    // first-wins copy lived here and is what made the clustered form a permitted, unsanitized dump.
+    const format = getOutputFormat(args);
     if (format === "yaml" || format === "json") {
-      return `"kubectl get --all-namespaces -o ${format}" can return excessive data. Use -n <namespace> to target a specific namespace, or use -o wide/name/custom-columns instead.`;
+      // An exact server-side node or name selector bounds the response, which is the concern this rule
+      // exists for — so the rule is satisfied rather than waived.
+      if (hasBoundingFieldSelector(args)) return null;
+      // A refusal that names no runnable alternative gets retried in another shape and refused again.
+      // The resource is echoed back so the suggestion is copy-pasteable rather than a template.
+      const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";
+      // custom-columns and yaml are refused outright for a Secret (checkSecretOutputFormat), so do not
+      // suggest them there — a hint that names a refused command is worse than no hint.
+      if (argsNameSecrets(args, subcommand)) {
+        return `"kubectl get secrets --all-namespaces -o ${format}" can return excessive data, and for `
+          + `Secrets only -o json is permitted at all (values redacted, structure intact):\n`
+          + `  kubectl get secrets -n <namespace> -o json\n`
+          + `  kubectl get secrets -n <namespace>`;
+      }
+      return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
+        + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
+        + `server-side --field-selector that pins spec.nodeName or metadata.name to ONE exact value IS `
+        + `accepted, because it bounds what the apiserver serializes. A label selector or a phase filter `
+        + `is not — those can still match the whole cluster. Instead:\n`
+        + `  kubectl get ${resource} -A --field-selector spec.nodeName=<node> -o json   (accepted)\n`
+        + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`
+        + `   (add the fields you need — these two exist on every resource)\n`
+        + `  kubectl get ${resource} -A -o wide                     (a fixed, bounded set of columns)\n`
+        + `  kubectl get ${resource} -n <namespace> -o ${format}    (full serialization, one namespace)`;
     }
   }
 
   return null;
 }
 
-/** Extract kubectl output format from args. Handles -o yaml, -oyaml, -o=yaml, --output=yaml. */
-function getKubectlOutputFormat(args: string[]): string | null {
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if ((a === "-o" || a === "--output") && args[i + 1] && !args[i + 1].startsWith("-")) {
-      return extractKubectlFormatName(args[i + 1]);
-    }
-    if (a.startsWith("--output=")) return extractKubectlFormatName(a.slice(9));
-    if (a.startsWith("-o=")) return extractKubectlFormatName(a.slice(3));
-    if (a.startsWith("-o") && a.length > 2 && !a.startsWith("--")) return extractKubectlFormatName(a.slice(2));
-  }
-  return null;
-}
 
-function extractKubectlFormatName(value: string): string {
-  const eq = value.indexOf("=");
-  return eq > 0 ? value.slice(0, eq) : value;
-}
 
 // Keep backward-compatible export for any external callers
 export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {
@@ -1069,6 +1671,8 @@ export interface CommandDef {
   requiredFlags?: string[];
   /** Custom validator — mutually exclusive with declarative constraint fields above. */
   validate?: (args: string[]) => string | null;
+  /** Flags whose value may begin with "-" (e.g. journalctl -b -1). */
+  valueFlags?: readonly string[];
 }
 
 /**
@@ -1099,15 +1703,9 @@ export const COMMANDS: Record<string, CommandDef> = {
   jq:     { category: "text" },
   tac:    { category: "text" }, // reverse-cat — read-only
   nl:     { category: "text" }, // number lines — read-only
-  yq:     { category: "text", allowedFlags: [
-    "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
-    "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
-    "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
-    "--xml-attribute-prefix", "--xml-content-name",
-    "--unwrapScalar", "--nul-output", "--header-preprocess",
-    // NOTE: -s/--split-exp intentionally excluded — mikefarah yq's --split-exp writes each
-    // document to a separate FILE (write capability); output must stay on stdout.
-  ] },
+  // validateYq screens the EXPRESSION — yq's file and env operators need no flag and no path
+  // argument — and applies YQ_ALLOWED_FLAGS itself, since validate() takes full responsibility.
+  yq:     { category: "text", validate: validateYq },
   column: { category: "text" },
 
   // ── network diagnostics ──
@@ -1250,7 +1848,8 @@ export const COMMANDS: Record<string, CommandDef> = {
   tree:      { category: "file", allowedFlags: TREE_FLAGS }, // default-deny: -o (write output to file) rejected; positional dirs are read targets
 
   // ── system logs & services ──
-  journalctl:  { category: "services", allowedFlags: [
+  // valueFlags: `-b -1` / `-n -100` pass a NEGATIVE value; without this the value is read as a flag.
+  journalctl:  { category: "services", valueFlags: ["-b", "--boot", "-n", "--lines", "-p", "--priority"], allowedFlags: [
     "-u", "--unit", "-n", "--lines", "--since", "--until",
     "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
     "--no-pager", "-o", "--output", "-r", "--reverse",
@@ -1404,6 +2003,30 @@ const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
   host: { available: ALL_COMMAND_CATEGORIES },
 };
 
+/**
+ * Commands the AgentBox IMAGE must actually provide.
+ *
+ * This is the one execution context whose binaries we control, so here — and only here — the
+ * whitelist can be an availability promise rather than an admission policy. node_exec resolves
+ * binaries in the node's namespaces and pod_exec inside the target container, so no image of ours
+ * can make a guarantee for them.
+ *
+ * Scoped to what restricted-bash ADVERTISES: the text-processing category plus kubectl. The
+ * `local` context permits ~128 commands because it shares the category table with the node tools,
+ * and requiring `nvidia-smi`, `crictl` or `ib_write_bw` in this image would be meaningless — those
+ * are permitted there only because the table is shared, and nothing tells the agent they exist.
+ *
+ * Consumed by docker/agentbox-capability-check.sh, which fails the build on a missing entry: `yq`
+ * and `column` were whitelisted and advertised for a long time while no image ever shipped them,
+ * and the only symptom was exit 127 at runtime.
+ */
+export function agentboxRequiredCommands(): string[] {
+  const text = Object.entries(COMMANDS)
+    .filter(([, def]) => def.category === "text")
+    .map(([cmd]) => cmd);
+  return [...text, "kubectl"].sort();
+}
+
 // ── Context-based allowed command set ──────────────────────────
 
 const contextAllowedCache = new Map<string, ReadonlySet<string>>();
@@ -1488,4 +2111,56 @@ export const CONTAINER_SENSITIVE_PATHS: RegExp[] = [
   /\.mysql_history/,
   /\.psql_history/,
   /\.node_repl_history/,
+];
+
+/**
+ * One concrete path per pattern above.
+ *
+ * The patterns are regexes, so nothing can be intersected with them directly — deciding whether a glob
+ * and a regex can match a common string is not something to attempt at validation time. A glob is
+ * therefore tested against these literals instead: `cat /etc/*` compiles to `^/etc/(?!\.)[^/]*$`, which
+ * matches `/etc/shadow`, so it is refused; `cat /etc/*release*` compiles to a regex that matches none of
+ * them, so it runs.
+ *
+ * The list can drift from the patterns, so it is pinned in both directions: every pattern must match at
+ * least one example, and every example must be matched by some pattern. Adding a pattern without an
+ * example fails the test rather than silently leaving globs unscreened for it.
+ *
+ * These are EXAMPLES, not the protected set — the patterns remain authoritative for literal paths.
+ */
+export const SENSITIVE_PATH_EXAMPLES: readonly string[] = [
+  "/run/secrets/kubernetes.io/serviceaccount/token",
+  "/var/run/secrets/kubernetes.io/serviceaccount/token",
+  "/proc/1/environ",
+  "/proc/1/cmdline",
+  "/proc/1/fd/3",
+  "/proc/1/mem",
+  "/proc/1/maps",
+  "/proc/1/smaps",
+  "/proc/kcore",
+  "/etc/shadow",
+  "/etc/gshadow",
+  "/etc/master.passwd",
+  "/root/.ssh/config",
+  "/root/.ssh/id_rsa",
+  "/root/.ssh/id_ed25519",
+  "/root/.ssh/id_ecdsa",
+  "/etc/ssl/private/server.key",
+  "/etc/ssl/private/keystore.p12",
+  "/etc/ssl/private/keystore.pfx",
+  "/etc/ssl/private/keystore.jks",
+  "/root/.aws/credentials",
+  "/root/.gcp/application_default_credentials.json",
+  "/root/.azure/accessTokens.json",
+  "/root/.docker/config.json",
+  "/etc/kubernetes/pki/apiserver.crt",
+  "/etc/kubernetes/admin.conf",
+  "/var/lib/kubelet/pki/kubelet-client-current.pem",
+  "/var/lib/kubelet/pods/2b1f/volumes/kubernetes.io~secret/default-token/token",
+  "/var/lib/etcd/member/snap/db",
+  "/root/.bash_history",
+  "/root/.zsh_history",
+  "/root/.mysql_history",
+  "/root/.psql_history",
+  "/root/.node_repl_history",
 ];

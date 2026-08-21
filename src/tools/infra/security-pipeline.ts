@@ -16,7 +16,7 @@ import {
 } from "./output-sanitizer.js";
 import { processToolOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
-import { detectSensitiveResource } from "./kubectl-sanitize.js";
+import { detectSensitiveResource, redactDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
 
 // ── Pre-exec ────────────────────────────────────────────────────────
 
@@ -65,6 +65,35 @@ export interface PostExecOptions {
   stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
   hasSensitiveKubectl?: boolean;
+  /**
+   * Exit code of a FAILED run. Renders a trailing "[exit code: N]" annotation,
+   * and an empty body as "(no output)".
+   *
+   * Callers must pass it here rather than splicing it into `stdout` themselves.
+   * The annotation is our own literal, so it is appended AFTER sanitization —
+   * mixed into the body it makes a structural (JSON) sanitizer fail to parse,
+   * which suppresses the WHOLE result: the real kubectl error, whatever partial
+   * stdout there was, and the exit code itself. A `kubectl get pod -o json` that
+   * returns NotFound then reads as "Failed to parse … for sanitization", i.e. a
+   * tool malfunction rather than the diagnostic answer it actually is.
+   */
+  exitCode?: number | string;
+  /** Signal name, rendered inside the exit annotation. Requires `exitCode`. */
+  signal?: string;
+  /** Literal trailer (e.g. a truncation notice). Appended after sanitization. */
+  notes?: string;
+  /**
+   * Optional projection of the SANITIZED stdout (json_path). Its position is a security and a
+   * correctness requirement, not a preference:
+   *
+   *   - AFTER sanitization, because projecting first would strip the shape a structural sanitizer
+   *     matches on (crictl's `info.config.envs`) and could surface a value it would have redacted;
+   *   - BEFORE truncation, because truncated JSON does not parse — the feature would fail on exactly
+   *     the large documents it exists for;
+   *   - BEFORE the literal trailers below, because it must see the command's document, not our
+   *     `[exit code: N]` line.
+   */
+  project?: (sanitizedStdout: string) => string;
 }
 
 /**
@@ -85,13 +114,56 @@ export function postExecSecurity(
   action: OutputAction | null,
   opts?: PostExecOptions,
 ): string {
-  let sanitized = applySanitizer(stdout, action);
-  if (opts?.hasSensitiveKubectl) {
-    sanitized = redactSensitiveContent(sanitized);
+  // Sanitize the command's own stdout, and only when there IS one. An empty body
+  // holds nothing to redact, whereas a structural sanitizer would fail to parse
+  // it and suppress the result — dropping the exit code and stderr that are the
+  // only evidence of what went wrong.
+  let sanitized = stdout;
+  if (stdout.trim()) {
+    sanitized = applySanitizer(sanitized, action);
+    if (opts?.hasSensitiveKubectl) {
+      sanitized = redactSensitiveContent(sanitized);
+    }
   }
-  const combined = opts?.stderr
-    ? sanitized + `\n\nSTDERR:\n${opts.stderr}`
-    : sanitized;
+
+  // Projection sits between sanitization and our own literals: it must see the command's document
+  // and nothing we appended to it.
+  if (opts?.project) {
+    sanitized = opts.project(sanitized);
+  }
+
+  // Everything below is literal text we generate, so it is appended after
+  // sanitization — see PostExecOptions.exitCode for why the order matters.
+  let combined =
+    opts?.exitCode !== undefined ? sanitized.trim() || "(no output)" : sanitized;
+  if (opts?.notes) combined += opts.notes;
+  if (opts?.exitCode !== undefined) {
+    const sig = opts.signal ? ` (signal: ${opts.signal})` : "";
+    combined += `\n[exit code: ${opts.exitCode}${sig}]`;
+  }
+  // stderr is redacted as a DOCUMENT, not line by line.
+  //
+  // It used to be appended verbatim, on the rationale that redacting it would break the JSON validity
+  // of a combined blob — a rationale that stopped applying once stdout is sanitized in isolation
+  // above. A command that echoes a token in its error message was leaking it through the one channel
+  // nothing looked at.
+  //
+  // `redactLines` was the wrong primitive for it, and the reason is worth stating so it is not chosen
+  // again: it is the LINE-SAFE one, for the streaming sanitizer that only ever sees whatever lines a
+  // batch happens to contain. Foreground stderr is the complete text, so a secret whose body sits
+  // BELOW its marker — a PEM key, a YAML block scalar, a nested mapping under `password:` — had its
+  // marker line redacted while the body went straight through, and the redaction notice then said the
+  // output was clean. `redactDocument` carries state across lines and does no JSON parsing, so nothing
+  // about prose argues against it.
+  if (opts?.stderr) {
+    const { text: safeStderr, redacted: stderrRedacted } = redactDocument(opts.stderr);
+    combined += `\n\nSTDERR:\n${safeStderr}`;
+    // Announce it once: the structural sanitizers above append their own notice, and two identical
+    // warnings read as a bug. A secret found ONLY in stderr still has to be announced.
+    if (stderrRedacted && !combined.includes(REDACTION_NOTICE.trim())) {
+      combined += REDACTION_NOTICE;
+    }
+  }
   return processToolOutput(combined);
 }
 
@@ -110,7 +182,9 @@ function resolveOutputAction(
       const bin = getCommandBinary(cmd);
       if (bin !== "kubectl") return false;
       const kArgs = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
-      const sub = kArgs.find((a) => !a.startsWith("-"))?.toLowerCase();
+      // Shared reader: a global flag before the verb (`kubectl -n default get secret …`) otherwise reads
+      // as subcommand "default", and the sensitive-kubectl fallback never engaged.
+      const sub = kubectlSubcommand(kArgs);
       if (sub !== "get" && sub !== "describe") return false;
       return detectSensitiveResource(kArgs) !== null;
     });
@@ -133,7 +207,7 @@ function resolveOutputAction(
       const bin = getCommandBinary(cmd);
       if (bin === "kubectl") {
         const args = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
-        const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+        const sub = kubectlSubcommand(args);
         if (sub === "exec") {
           const dashIdx = args.indexOf("--");
           if (dashIdx >= 0 && dashIdx < args.length - 1) {

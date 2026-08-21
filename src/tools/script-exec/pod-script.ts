@@ -13,7 +13,7 @@ import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import { validatePodName, prepareExecEnv, spawnAsync, stdinExecCmd } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
 import { spawn } from "node:child_process";
 
@@ -124,9 +124,10 @@ Examples:
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_script");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
@@ -173,6 +174,9 @@ Examples:
       // Pre-check: pod exists and is Running
       const podCheckErr = await checkPodRunning(
         pod, namespace, env.childEnv, env.kubeconfigPath ?? undefined,
+        // The container the caller named: a Pod that is not Running may still hold a running one, and
+        // that container is often exactly what the call is for.
+        params.container,
       );
       if (podCheckErr) {
         return {
@@ -249,7 +253,7 @@ Examples:
         const stdout = err.stdout?.trim() ?? "";
         const stderr = err.stderr?.trim() ?? err.message;
         return {
-          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${err.code ?? "unknown"}]`, null, { stderr: stderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: stderr || undefined, exitCode: err.code ?? "unknown" }) }],
           details: { exitCode: err.code ?? null, error: true },
         };
       }

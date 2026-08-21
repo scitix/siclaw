@@ -24,7 +24,8 @@ import { postExecSecurity } from "../infra/security-pipeline.js";
 import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaKubectl } from "../infra/bg-session.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
+import { debugPodFailureResult } from "../cmd-exec/node-exec.js";
 
 interface NodeScriptParams {
   node?: string;
@@ -153,9 +154,10 @@ Examples:
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_script");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
@@ -246,8 +248,10 @@ Examples:
           cachedPod = await ensureDebugPodReady(spec, env, { signal });
         } catch (err: any) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-            details: { error: true, reason: "debug_pod_failed" },
+            // Same payload node_exec returns: stage, reason, node, whether it is a memo replay, and the
+            // transport's stderr. "Debug pod failed to start" on its own was the entire diagnosis here,
+            // and a review reported two identical undiagnosable failures because of it.
+            ...debugPodFailureResult(err),
           };
         }
         const pinnedPodName = acquireDebugPod(spec);
@@ -302,8 +306,7 @@ Examples:
         fgPod = await ensureDebugPodReady(fgSpec, env, { signal });
       } catch (err: any) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-          details: { error: true, reason: "debug_pod_failed" },
+          ...debugPodFailureResult(err),
         };
       }
       const fgPinnedPodName = acquireDebugPod(fgSpec); // null if the pod vanished; proceed best-effort
@@ -336,11 +339,8 @@ Examples:
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
       const out = execResult.stdout.trim();
-      const stdout = isError
-        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
-        : out;
       return {
-        content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: filteredStderr || undefined }) }],
+        content: [{ type: "text", text: postExecSecurity(out, null, { stderr: filteredStderr || undefined, ...(isError && { exitCode: execResult.exitCode ?? "unknown" }) }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
       };
     },

@@ -6,6 +6,8 @@ import {
   SENSITIVE_ENV_NAME_PATTERNS,
   SENSITIVE_KEY_PATTERNS,
   SENSITIVE_VALUE_PATTERNS,
+  redactLines,
+  redactSensitiveContent,
 } from "./kubectl-sanitize.js";
 
 // ── detectSensitiveResource ──────────────────────────────────────────
@@ -451,11 +453,18 @@ describe("sanitizeJSON", () => {
   });
 
   describe("error handling", () => {
-    it("returns error for invalid JSON", () => {
-      const result = sanitizeJSON("not json at all", "secret");
-      expect(result).toContain("error");
-      expect(result).toContain("Failed to parse");
-      expect(result).not.toContain("not json at all");
+    it("keeps non-JSON output instead of suppressing it, and says the structural pass did not run", () => {
+      // Was: replace everything with "Failed to parse … Raw output suppressed". The usual reason
+      // `-o json` returns non-JSON is that kubectl wrote an API error to stderr, so suppression deleted
+      // the `Error from server (NotFound)` the caller needed and made it look like a sanitizer fault.
+      // Four separate reviews reported that misdiagnosis.
+      const apiError = 'Error from server (NotFound): pods "gone" not found';
+      const out = sanitizeJSON(apiError, "pod");
+      expect(out, "the API error must survive").toContain("NotFound");
+      expect(out, "and the caller must be told the structural pass did not run").toMatch(/not JSON/i);
+      // Still redacted as TEXT, since the structural sanitizer genuinely did not apply.
+      const withSecret = "token=AKIAIOSFODNN7EXAMPLE not json";
+      expect(sanitizeJSON(withSecret, "pod")).not.toContain("AKIAIOSFODNN7EXAMPLE");
     });
   });
 
@@ -464,6 +473,172 @@ describe("sanitizeJSON", () => {
       const input = JSON.stringify({ kind: "Secret", data: { a: "b" } });
       const result = sanitizeJSON(input, "secret");
       expect(result).toContain("⚠️ Sensitive values have been redacted");
+    });
+
+    // A redaction claim on untouched output is worse than no claim: it invites
+    // the reader to treat the text as safe when nothing was checked off.
+    it("does NOT claim redaction when nothing was redacted", () => {
+      const input = JSON.stringify({
+        kind: "ConfigMap",
+        data: { "app.conf": "log_level: debug\nreplicas: 3" },
+      });
+      const result = sanitizeJSON(input, "configmap");
+      expect(result).not.toContain("redacted");
+      expect(result).toContain("log_level: debug");
+    });
+
+    it("still claims redaction when only a later item was redacted", () => {
+      const input = JSON.stringify({
+        kind: "List",
+        items: [
+          { kind: "ConfigMap", data: { "clean.conf": "a: 1" } },
+          { kind: "ConfigMap", data: { "creds.conf": "token: ghp_aaaaaaaaaaaaaaaaaaaa" } },
+        ],
+      });
+      const result = sanitizeJSON(input, "configmap");
+      expect(result).toContain("⚠️ Sensitive values have been redacted");
+      expect(result).toContain("**REDACTED**");
+    });
+  });
+
+  // A ConfigMap entry is normally an entire config FILE, and its secrets are
+  // named by the keys INSIDE it. Matching the file as one blob checks neither
+  // those inner keys nor the ^-anchored value patterns, so everything leaked.
+  describe("ConfigMap — whole-file entries are redacted line by line", () => {
+    const promConfig = [
+      "scrape_configs:",
+      "  - job_name: node",
+      "    authorization:",
+      "      credentials: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig",
+      "    remote_write:",
+      "      - url: https://push.example.com",
+      "        headers:",
+      "          Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
+      "        token: ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      // Key NOT in the vocabulary: only the value patterns can catch this one.
+      "        upstream: sk-proj-abcdefghijklmnop",
+      "    scrape_interval: 30s",
+    ].join("\n");
+
+    const sanitizeEntry = (value: string): string => {
+      const input = JSON.stringify({
+        kind: "ConfigMap",
+        data: { "prometheus.yml": value },
+      });
+      const result = sanitizeJSON(input, "configmap");
+      return JSON.parse(result.split("\n\n⚠️")[0]).data["prometheus.yml"];
+    };
+
+    it("redacts every secret inside the file", () => {
+      const out = sanitizeEntry(promConfig);
+      expect(out).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
+      expect(out).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+      expect(out).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+      // The one whose KEY is not in the vocabulary — this is what actually
+      // exercises the value patterns on a prefixed line. Without it every
+      // assertion above passes on key-name matching alone.
+      expect(out).not.toContain("sk-proj-abcdefghijklmnop");
+    });
+
+    it("keeps the rest of the file diagnosable", () => {
+      const out = sanitizeEntry(promConfig);
+      expect(out).toContain("job_name: node");
+      expect(out).toContain("scrape_interval: 30s");
+      expect(out).toContain("url: https://push.example.com");
+    });
+
+    it("keeps the indent and key name of a redacted line", () => {
+      const out = sanitizeEntry(promConfig);
+      // Names WHICH setting was redacted, and does not break the YAML block.
+      expect(out).toContain("      credentials: **REDACTED**");
+      expect(out).toContain("          Authorization: **REDACTED**");
+      expect(out).toContain("        upstream: **REDACTED**");
+    });
+
+    it("keeps a nested mapping's field names while redacting their values", () => {
+      // `authorization:` opens a mapping — the key line has no value to redact,
+      // and dropping the whole block would hide which fields were configured.
+      const out = sanitizeEntry(promConfig);
+      expect(out).toContain("    authorization:");
+      expect(out).toContain("credentials: **REDACTED**");
+    });
+
+    it("redacts a nested value whose own field name is innocuous", () => {
+      // The parent key already said this is a credential region; judging `inner`
+      // on its own merits (not in the vocabulary, value not token-shaped) leaks it.
+      const out = sanitizeEntry("password:\n  inner: plain_value\nmode: on\n");
+      expect(out).not.toContain("plain_value");
+      expect(out).toContain("inner: **REDACTED**");
+      expect(out).toContain("mode: on");
+    });
+
+    it("drops the whole entry for a multi-line PEM block", () => {
+      // Only the BEGIN line matches, so a per-line pass would leak the body.
+      const out = sanitizeEntry(
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\n-----END RSA PRIVATE KEY-----",
+      );
+      expect(out).toBe("**REDACTED**");
+      expect(out).not.toContain("MIIEvQIBADANBgkq");
+      expect(out).not.toContain("hkiG9w0BAQEFAASC");
+    });
+
+    // Each of these shapes leaked in full while the footer claimed otherwise.
+    it("redacts a YAML block scalar's body, not just its key line", () => {
+      const out = sanitizeEntry("api_token: |\n  ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nlog: debug\n");
+      expect(out).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+      expect(out).toContain("log: debug");
+    });
+
+    it("redacts a folded block scalar too", () => {
+      const out = sanitizeEntry("secret_blob: >-\n  hunter2\n  more\nmode: on\n");
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("mode: on");
+    });
+
+    it("redacts a YAML sequence entry", () => {
+      const out = sanitizeEntry("users:\n  - password: hunter2\n  - name: bob\n");
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("name: bob");
+    });
+
+    it("redacts a quoted key with no surrounding space", () => {
+      const out = sanitizeEntry('password:hunter2\nmode:strict\n');
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("mode:strict");
+    });
+
+    it("redacts an INI assignment with spaces around =", () => {
+      const out = sanitizeEntry("aws_secret_access_key = AKIAIOSFODNN7EXAMPLE\nregion = us-east-1\n");
+      expect(out).not.toContain("AKIAIOSFODNN7EXAMPLE");
+      expect(out).toContain("region = us-east-1");
+    });
+
+    it("keeps a connection string redacted despite the key/value split", () => {
+      // `postgresql://…` splits into key `postgresql` + `//user:pass@…`, which no
+      // longer matches the ://-anchored pattern — the raw line must be checked too.
+      const out = sanitizeEntry("postgresql://user:pass@db:5432/mydb");
+      expect(out).not.toContain("user:pass");
+    });
+
+    it("walks a JSON payload's nested keys", () => {
+      const out = sanitizeEntry(
+        '{"log":"debug","auth":{"token":"plain-secret-value"},"items":[{"password":"hunter2"}]}',
+      );
+      expect(out).not.toContain("plain-secret-value");
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("debug");
+    });
+
+    it("drops an unparseable JSON payload that names a sensitive key", () => {
+      // A compact object puts several pairs on one line; if we could not parse it
+      // we cannot claim a line-oriented pass rewrote all of them.
+      const out = sanitizeEntry('{"token":"abc","trunc');
+      expect(out).toBe("**REDACTED**");
+    });
+
+    it("leaves unparseable JSON alone when no sensitive key is named", () => {
+      const out = sanitizeEntry('{"log":"debug","trunc');
+      expect(out).toContain("debug");
     });
   });
 });
@@ -479,10 +654,19 @@ describe("SENSITIVE_ENV_NAME_PATTERNS", () => {
     "API_KEY", "APIKEY", "API-KEY",
     "PRIVATE_KEY", "PRIVATE-KEY",
     "SSH_KEY", "ENCRYPTION_KEY",
+    "Authorization", "authorization", "HTTP_AUTHORIZATION", "X-Authorization",
+    // Kubernetes names key material with a dot; kubeconfig-shaped and registry
+    // credentials show up verbatim in ConfigMaps.
+    "tls.key", "client-key-data", "jwt", "JWT_SECRET", ".dockerconfigjson", "dockercfg",
   ];
   const shouldNotMatch = [
     "LOG_LEVEL", "NODE_ENV", "JAVA_OPTS", "PORT", "HOST",
     "KEY_COUNT", "KEYBOARD_LAYOUT", "KEY_PREFIX",
+    // kube-apiserver diagnostic flags must stay readable — the pattern is
+    // end-anchored precisely so these survive.
+    "authorization-mode", "authorization-webhook-config-file",
+    // The public half of a TLS pair, and a key COUNT rather than key material.
+    "tls.crt", "ca.crt", "keydata_version",
   ];
 
   for (const name of shouldMatch) {
@@ -508,6 +692,10 @@ describe("SENSITIVE_VALUE_PATTERNS", () => {
     "ghp_abc123def456",
     "gho_abc123",
     "glpat-xyz789",
+    // Positional backstop: caught wherever it sits on the line, whatever the
+    // key is called — the ^-anchored patterns above cannot see it there.
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
+    "          authorization: bearer abcdefghijklmnopqrstuvwxyz",
   ];
   const shouldNotMatch = [
     "https://api.example.com",
@@ -516,6 +704,8 @@ describe("SENSITIVE_VALUE_PATTERNS", () => {
     "42",
     "us-east-1",
     "server { listen 80; }",
+    // Too short to be a credential, and the word alone must not trigger.
+    "Bearer token",
   ];
 
   for (const value of shouldMatch) {
@@ -528,4 +718,334 @@ describe("SENSITIVE_VALUE_PATTERNS", () => {
       expect(SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value))).toBe(false);
     });
   }
+});
+
+describe("a ConfigMap entry whose value is JSON on one line", () => {
+  // The `-o json` path walks such a payload (redactByPattern). The yaml / describe / pipeline-fallback
+  // path reaches the same text through the line redactors, where the key on the line is a FILENAME and
+  // the blob matches no value pattern — so every secret inside it used to survive.
+  const leaks = (s: string) => /hunter2|plain-secret-value/.test(s);
+
+  it("redacts secrets inside a compact JSON value on the yaml path", () => {
+    const yaml = [
+      "data:",
+      `  app.json: '{"token":"plain-secret-value","password":"hunter2"}'`,
+      `  compact: {"password":"hunter2"}`,
+      "  plain.conf: |",
+      "    listen 8080",
+    ].join("\n");
+    const out = redactSensitiveContent(yaml);
+    expect(leaks(out)).toBe(false);
+    expect(out).toContain("**REDACTED**");
+    // Non-secret configuration is still readable — the point is per-entry granularity.
+    expect(out).toContain("listen 8080");
+  });
+
+  it("stays on one line, so it cannot corrupt the surrounding document", () => {
+    const line = `  app.json: '{"password":"hunter2"}'`;
+    const { text } = redactLines(line);
+    expect(text.split("\n")).toHaveLength(1);
+    expect(leaks(text)).toBe(false);
+  });
+
+  it("redacts a bare JSON object occupying the whole line", () => {
+    const { text, redacted } = redactLines('{"token":"plain-secret-value"}');
+    expect(redacted).toBe(true);
+    expect(leaks(text)).toBe(false);
+  });
+
+  it("leaves a JSON value with no sensitive key alone", () => {
+    const line = `  app.json: '{"listen":8080,"name":"web"}'`;
+    const { text, redacted } = redactLines(line);
+    expect(redacted).toBe(false);
+    expect(text).toBe(line);
+  });
+});
+
+describe("a mixed-resource response is judged per item", () => {
+  // `kubectl get pod,secret -o json` returns ONE List holding both, and detectSensitiveResource stops
+  // at the first sensitive type named in the command — so every item was treated as a Pod, the
+  // Secret's `data` came back verbatim, and the redaction notice went out anyway. A notice over an
+  // untouched secret is worse than no notice at all.
+  const leaks = (s: string, needle: string) => s.includes(needle);
+
+  it("redacts each kind by its own rules, not by the command's first match", () => {
+    const mixed = JSON.stringify({ kind: "List", items: [
+      { kind: "Pod", spec: { containers: [{ env: [{ name: "PASSWORD", value: "pod-secret" }] }] } },
+      { kind: "Secret", data: { password: "c2VjcmV0", config: "b3RoZXI=" } },
+      { kind: "ConfigMap", data: { "app.json": '{"token":"cm-secret"}' } },
+    ]});
+    const out = sanitizeJSON(mixed, "pod");   // as detectSensitiveResource would have inferred
+    expect(leaks(out, "pod-secret")).toBe(false);
+    expect(leaks(out, "c2VjcmV0")).toBe(false);
+    // Every value under a Secret's data goes, including one whose key is not sensitive-sounding.
+    expect(leaks(out, "b3RoZXI=")).toBe(false);
+    expect(leaks(out, "cm-secret")).toBe(false);
+  });
+
+  it("reaches a Secret nested inside another List", () => {
+    const nested = JSON.stringify({ kind: "List", items: [
+      { kind: "List", items: [{ kind: "Secret", data: { p: "bmVzdGVk" } }] },
+    ]});
+    expect(leaks(sanitizeJSON(nested, "secret"), "bmVzdGVk")).toBe(false);
+  });
+
+  it("falls back to the command's type when an item carries no kind", () => {
+    // A single object fetched by name does not always include `kind`; then the command is the only
+    // evidence there is.
+    const noKind = JSON.stringify({ data: { password: "c2VjcmV0" } });
+    expect(leaks(sanitizeJSON(noKind, "secret"), "c2VjcmV0")).toBe(false);
+  });
+});
+
+describe("a Secret managed with kubectl apply carries its values twice", () => {
+  // `kubectl apply` writes a JSON copy of the whole object — including `data` — into
+  // kubectl.kubernetes.io/last-applied-configuration. The sanitizer redacted `data`, appended its
+  // "redacted" notice, and returned the base64 verbatim inside the annotation.
+  //
+  // That defeated the Secret control at its foundation: `-o json` is the one format permitted, and it is
+  // permitted BECAUSE the structural sanitizer was believed to cover it. Most Secrets are applied rather
+  // than created, so most Secrets were affected.
+  //
+  // Missed originally because the verification fixture used `kubectl create secret generic`, which writes
+  // no such annotation — a blind spot in the fixture, not in the reasoning. Reproduced on a real applied
+  // Secret before fixing.
+  const CANARY = "UDAtQ0FOQVJZLUJBU0U2NA==";
+  const applied = (extra: Record<string, string> = {}) => JSON.stringify({
+    apiVersion: "v1", kind: "Secret", type: "Opaque",
+    metadata: {
+      name: "demo", namespace: "default",
+      annotations: {
+        "kubectl.kubernetes.io/last-applied-configuration":
+          `{"apiVersion":"v1","data":{"password":"${CANARY}"},"kind":"Secret","metadata":{"name":"demo"}}`,
+        ...extra,
+      },
+    },
+    data: { password: CANARY },
+  });
+
+  it("redacts the annotation copy, not just the data field", () => {
+    const out = sanitizeJSON(applied(), "secret");
+    expect(out).not.toContain(CANARY);
+    expect(out).toContain("REDACTED");
+    // the key names stay readable — the structure is still useful
+    expect(out).toContain("password");
+  });
+
+  it("catches the same disclosure under a different annotation key", () => {
+    // Keyed on the well-known name would be enough for kubectl, but a controller or operator writing its
+    // own last-applied copy is the same disclosure. Any annotation holding a serialized data/stringData
+    // object is redacted.
+    const out = sanitizeJSON(applied({
+      "some-operator.example.com/snapshot": `{"kind":"Secret","data":{"token":"${CANARY}"}}`,
+    }), "secret");
+    expect(out).not.toContain(CANARY);
+  });
+
+  it("leaves an ordinary annotation alone", () => {
+    const out = sanitizeJSON(applied({ "meta.helm.sh/release-name": "my-release" }), "secret");
+    expect(out).toContain("my-release");
+  });
+
+  it("judges a ConfigMap's annotation copy by pattern, not wholesale", () => {
+    // A ConfigMap's entries are judged by pattern rather than blanked, so its annotation copy is too —
+    // blanking it would throw away a whole config file the agent legitimately needs to read.
+    const cm = JSON.stringify({
+      apiVersion: "v1", kind: "ConfigMap",
+      metadata: { name: "c", annotations: {
+        "kubectl.kubernetes.io/last-applied-configuration":
+          '{"kind":"ConfigMap","data":{"app.conf":"listen 8080\npassword=hunter2"}}',
+      } },
+      data: { "app.conf": "listen 8080\npassword=hunter2" },
+    });
+    const out = sanitizeJSON(cm, "configmap");
+    expect(out).not.toContain("hunter2");
+    expect(out, "the non-secret part of the file survives").toContain("listen 8080");
+  });
+});
+
+describe("a payload the agent reshaped in the pipeline is still redacted", () => {
+  // From a real trace (9d088e8e, E018), reported as a high-severity finding: "sensitive env vars in
+  // kubectl JSON were not structurally redacted — access keys and API keys reached the tool result and
+  // the persisted trace in plaintext. This is an actual data exposure, not a theoretical risk."
+  //
+  // The command was
+  //   kubectl get pod X -n ns -o json | jq '{podIP:…,containers:[.spec.containers[]|{name,ports,env,…}]}'
+  // so what the sanitizer saw was jq's object: `containers` at the TOP level, no `kind`, no `items`.
+  // detectSensitiveResource still said "pod" from the args, the missing kind fell back to it, and
+  // sanitizePodEnv looked for `spec.containers` and found nothing. Four credential env vars went out
+  // verbatim, with outcome:success and no redaction notice.
+  //
+  // The text redactor is not a fallback here either — measured: it misses the JSON `{name, value}` env
+  // shape in compact AND pretty form.
+  const CANARY = "CANARY-CREDENTIAL-VALUE";
+  const reshaped = JSON.stringify({
+    podIP: "10.45.173.235",
+    containers: [{
+      name: "head",
+      ports: [{ containerPort: 6379 }],
+      env: [
+        { name: "LOG_SYNC_ACCESS_KEY_SECRET", value: CANARY },
+        { name: "SWANLAB_API_KEY", value: CANARY },
+        { name: "AI4SLAB_RUN_ROOT", value: "/volume/data/run04" },
+        // The real trace also carried LOG_SYNC_ACCESS_KEY_ID. It is deliberately NOT redacted and is
+        // asserted separately below: an access key ID is an identifier, not a credential — it cannot
+        // authenticate on its own, its paired *_SECRET is redacted, and masking it would make "which key
+        // is this pod configured with" unanswerable. Chasing identifiers is how a redactor becomes noise.
+        { name: "LOG_SYNC_ACCESS_KEY_ID", value: "AKIA-IDENTIFIER-NOT-A-SECRET" },
+      ],
+    }],
+    annotations: {},
+  }, null, 2);
+
+  it("redacts credentials with no kind, no items and no spec to walk", () => {
+    const out = sanitizeJSON(reshaped, "pod");
+    expect(out).not.toContain(CANARY);
+    expect(out).toContain("REDACTED");
+    // Names and non-secret values stay — the projection is still useful.
+    expect(out).toContain("SWANLAB_API_KEY");
+    expect(out).toContain("/volume/data/run04");
+    expect(out, "an access key ID is an identifier, not a credential").toContain("AKIA-IDENTIFIER-NOT-A-SECRET");
+  });
+
+  it("does not go silent when the shape is unrecognised", () => {
+    // The failure mode was not "redacted the wrong thing", it was redacting NOTHING and saying nothing.
+    const out = sanitizeJSON(reshaped, "pod");
+    expect(out, "a redaction must be announced").toMatch(/REDACTED|redacted/);
+  });
+
+  it("still redacts the native shape, and a Secret's data unconditionally", () => {
+    // The shape-agnostic sweep runs IN ADDITION to the structural pass, never instead of it: no name
+    // heuristic can decide that a Secret's `data` values are secret — the structural pass just knows.
+    const native = JSON.stringify({ kind: "Pod", spec: { containers: [{ env: [
+      { name: "MYSQL_PASSWORD", value: CANARY }] }] } });
+    expect(sanitizeJSON(native, "pod")).not.toContain(CANARY);
+    const secret = JSON.stringify({ kind: "Secret", data: { blandkey: "Ym9yaW5n" } });
+    const out = sanitizeJSON(secret, "secret");
+    expect(out, "a bland key name gives the heuristic nothing to match").not.toContain("Ym9yaW5n");
+  });
+
+  it("leaves an ordinary name/value pair alone", () => {
+    const cm = JSON.stringify({ items: [{ kind: "ConfigMap", data: { a: "b" },
+      metadata: { name: "c", labels: { name: "not-a-secret" } } }] });
+    expect(sanitizeJSON(cm, "configmap")).toContain("not-a-secret");
+  });
+});
+
+describe("a registry credential travels under names the key patterns do not cover", () => {
+  // `.dockerconfigjson` was matched by name. The same credential also arrives as `config.json`, as a bare
+  // `auth`, and inside a ConfigMap entry holding a whole file — all three returned the value verbatim, in
+  // JSON and in YAML.
+  const CRED = "dXNlcjpwYXNz";                 // base64("user:pass")
+
+  it("redacts it in a ConfigMap, whatever the entry is called", () => {
+    const cm = JSON.stringify({ kind: "ConfigMap", metadata: { name: "c" }, data: {
+      "config.json": JSON.stringify({ auths: { "registry.example": { auth: CRED } } }),
+      auth: CRED,
+      "safe.conf": "listen 8080",
+    }});
+    const out = sanitizeJSON(cm, "configmap");
+    expect(out).not.toContain(CRED);
+    expect(out, "the rest of the ConfigMap still reads").toContain("listen 8080");
+  });
+
+  it("redacts the whole auths block in YAML", () => {
+    // `auths` is a credential map by definition, so the block is sensitive as a KEY — which is what makes
+    // the nested mapping collapse without needing to know the registry names inside it.
+    expect(redactSensitiveContent(`auths:\n  registry:\n    auth: ${CRED}\n`)).not.toContain(CRED);
+    expect(redactSensitiveContent(`auth: ${CRED}\n`), "and a bare line too").not.toContain(CRED);
+  });
+
+  it("does NOT treat `auth` as a sensitive name", () => {
+    // This is the whole reason the rule is two signals rather than a key pattern: these are ordinary
+    // configuration, and a redactor that eats them is one people work around.
+    for (const line of ["auth: none", "auth: ldap", "auth: rbac", "auth: Bearer",
+                        "auth_mode: rbac", "authorization-mode: RBAC", "auths_enabled: true"]) {
+      expect(redactSensitiveContent(`${line}\n`).trim(), line).toBe(line);
+    }
+  });
+
+  it("keys on the docker encoding, not on base64-looking text", () => {
+    // The value signal is "decodes to X:Y with printable halves", which is what the encoding IS.
+    const notCredential = Buffer.from("just some plain text").toString("base64");
+    expect(redactSensitiveContent(`auth: ${notCredential}\n`)).toContain(notCredential);
+    const isCredential = Buffer.from("robot$acct:AbCd1234").toString("base64");
+    expect(redactSensitiveContent(`auth: ${isCredential}\n`)).not.toContain(isCredential);
+  });
+
+  it("redacts every credential field inside an auths subtree", () => {
+    // Two paths, both safe, with different fidelity — worth pinning because the difference is not
+    // obvious and a future reader could "fix" the wrong one:
+    //
+    //   as a real object   the structural pass redacts field by field, so the field NAMES survive and
+    //                      the reader can still see what was configured
+    //   as a string (a whole file inside a ConfigMap entry) the text path collapses the `auths` block,
+    //                      because it cannot know which of the nested names are values
+    const asObject = sanitizeJSON(JSON.stringify({ kind: "ConfigMap",
+      auths: { r: { username: "u", password: "p", identitytoken: "t", auth: CRED } } }), "configmap");
+    for (const secret of ["\"p\"", "\"t\"", CRED]) expect(asObject).not.toContain(secret);
+    expect(asObject, "field names survive on the structural path").toContain("identitytoken");
+    expect(asObject, "and so does a non-credential field").toContain("\"u\"");
+
+    const asString = sanitizeJSON(JSON.stringify({ kind: "ConfigMap",
+      data: { "cfg.json": JSON.stringify({ auths: { r: { password: "p", auth: CRED } } }) } }), "configmap");
+    expect(asString).not.toContain(CRED);
+    expect(asString, "the whole block goes, names included").not.toContain("password");
+  });
+});
+
+describe("an apply-managed object carries its values twice, whatever its kind", () => {
+  // `kubectl apply` writes a JSON copy of the whole object into an annotation. Secret and ConfigMap were
+  // handled and Pod was not, so an applied Pod's `-o json` — the one permitted format — returned its
+  // container env verbatim while the live `spec` copy beside it was redacted. Verified against a real
+  // applied Pod on a cluster: the canary appeared twice in the response and once after sanitizing.
+  const appliedPod = (envValue: string) => JSON.stringify({
+    apiVersion: "v1", kind: "Pod",
+    metadata: {
+      name: "p", annotations: {
+        "kubectl.kubernetes.io/last-applied-configuration": JSON.stringify({
+          apiVersion: "v1", kind: "Pod", metadata: { name: "p" },
+          spec: { containers: [{ name: "c", env: [{ name: "DB_PASSWORD", value: envValue }] }] },
+        }),
+      },
+    },
+    spec: { containers: [{ name: "c", env: [{ name: "DB_PASSWORD", value: envValue }] }] },
+  });
+
+  it("redacts the annotation copy of a Pod's env", () => {
+    const raw = appliedPod("POD-ANN-CANARY");
+    expect(raw.split("POD-ANN-CANARY").length - 1, "fixture really carries it twice").toBe(2);
+    const out = sanitizeJSON(raw, "pod");
+    expect(out).not.toContain("POD-ANN-CANARY");
+  });
+
+  it("keeps the annotation readable — the shape survives, the value does not", () => {
+    const out = sanitizeJSON(appliedPod("POD-ANN-CANARY"), "pod");
+    expect(out).toContain("last-applied-configuration");
+    expect(out).toContain("DB_PASSWORD");
+  });
+
+  it("covers an annotation under any key, not only the well-known one", () => {
+    const doc = JSON.stringify({
+      apiVersion: "v1", kind: "Pod",
+      metadata: { name: "p", annotations: {
+        "operator.example.com/snapshot": JSON.stringify({
+          spec: { containers: [{ name: "c", env: [{ name: "API_TOKEN", value: "OTHER-KEY-CANARY" }] }] },
+        }),
+      } },
+      spec: { containers: [{ name: "c", env: [] }] },
+    });
+    expect(sanitizeJSON(doc, "pod")).not.toContain("OTHER-KEY-CANARY");
+  });
+
+  it("leaves an ordinary annotation alone", () => {
+    const doc = JSON.stringify({
+      apiVersion: "v1", kind: "Pod",
+      metadata: { name: "p", annotations: { "example.com/owner": "team-sre", "example.com/rev": "12" } },
+      spec: { containers: [{ name: "c", env: [] }] },
+    });
+    const out = sanitizeJSON(doc, "pod");
+    expect(out).toContain("team-sre");
+    expect(out).toContain("\"12\"");
+  });
 });

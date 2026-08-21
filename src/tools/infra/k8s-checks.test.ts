@@ -42,6 +42,21 @@ describe("checkNodeReady", () => {
     expect(err).toContain("status: False");
   });
 
+  it("does not send the reader to a field that cannot produce this condition", async () => {
+    // The old message offered "down, cordoned, or experiencing issues". Cordoning sets
+    // spec.unschedulable and leaves Ready=True, so it can never be the cause of a non-True Ready —
+    // naming it costs a wasted `kubectl get node -o yaml` on the wrong field. A non-True Ready comes
+    // from the kubelet: not reporting, or reporting a problem.
+    //
+    // Reverting this message failed nothing in the whole suite, which is why the guard is here.
+    mockExecFile.mockResolvedValueOnce({ stdout: "False" });
+    const err = (await checkNodeReady("node-1")) ?? "";
+    expect(err).not.toMatch(/cordon/i);
+    expect(err).toMatch(/kubelet/i);
+    // and it names the command that actually shows the cause
+    expect(err).toContain("kubectl describe node node-1");
+  });
+
   it("returns 'unknown' when status empty", async () => {
     mockExecFile.mockResolvedValueOnce({ stdout: "" });
     const err = await checkNodeReady("node-1");
@@ -144,5 +159,46 @@ describe("waitForPodDone", () => {
     const promise = waitForPodDone("p", 5_000, undefined, controller.signal, undefined, "ns", "terminal");
     controller.abort();
     await expect(promise).rejects.toThrow(/Aborted|Timed out/);
+  });
+});
+
+describe("a Pod that is not Running may still hold a running container", () => {
+  // pod_exec-4 (high): the Pod sat at Pending while the named startup-delay init container was already
+  // Running, and exec into it was refused on the POD-level phase. The investigation fell back to
+  // node_exec + CRI + host PIDs for a check that would have worked.
+  const pod = (phase: string, running: string[], init: string[] = []) => JSON.stringify({
+    status: {
+      phase,
+      initContainerStatuses: init.map((name) => ({ name, state: { running: {} } })),
+      containerStatuses: running.map((name) => ({ name, state: { running: {} } })),
+    },
+  });
+
+  it("admits the container the caller named", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", [], ["startup-delay"]) });
+    expect(await checkPodRunning("p", "ns", undefined, undefined, "startup-delay")).toBeNull();
+  });
+
+  it("refuses a container that is not running, and says which are", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", [], ["startup-delay"]) });
+    const err = await checkPodRunning("p", "ns", undefined, undefined, "app");
+    expect(err).toContain("startup-delay");
+    expect(err, "a refusal that names the runnable option").toMatch(/container parameter/);
+  });
+
+  it("still refuses when nothing at all is running", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", []) });
+    const err = await checkPodRunning("p", "ns", undefined, undefined, "app");
+    expect(err).toMatch(/No container/);
+  });
+
+  it("costs nothing on the happy path", async () => {
+    mockExecFile.mockReset();
+    mockExecFile.mockResolvedValueOnce({ stdout: "Running" });
+    expect(await checkPodRunning("p", "ns")).toBeNull();
+    expect(mockExecFile, "one call, not two").toHaveBeenCalledTimes(1);
   });
 });

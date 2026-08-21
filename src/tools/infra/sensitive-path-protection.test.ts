@@ -6,8 +6,8 @@
  * entry points: pod_exec, node_exec, and validateCommand.
  */
 import { describe, it, expect } from "vitest";
-import { validateCommand } from "./command-validator.js";
-import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
+import { validateCommand, globToPathRegExp } from "./command-validator.js";
+import { CONTAINER_SENSITIVE_PATHS, SENSITIVE_PATH_EXAMPLES, getContextAllowedSet } from "./command-sets.js";
 
 import { createPodExecTool } from "../cmd-exec/pod-exec.js";
 import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
@@ -110,7 +110,9 @@ describe("validateCommand blocks sensitive paths in all contexts", () => {
           sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
         });
         expect(err).not.toBeNull();
-        expect(err).toContain("sensitive paths");
+        // The discriminator, not the prose — the refusal now names the matched text and an
+        // alternative, and a phrase assertion would break on any rewording of it.
+        expect(JSON.parse(err as string).rejected_by).toBe("sensitive_path");
       });
     }
   }
@@ -296,5 +298,153 @@ describe("output sanitizer e2e: crictl inspect", () => {
   it("does not sanitize crictl ps", () => {
     const action = analyzeOutput("crictl", ["ps"]);
     expect(action).toBeNull();
+  });
+});
+
+describe("a sensitive path is refused however it is spelled, for every reader", () => {
+  // What this actually guards — checked by reverting each part:
+  //
+  //   1. Quote stripping in the sensitive-path pass. Matching the raw command text alone let a single
+  //      quote defeat every `$`-anchored pattern: `cat /etc/shadow` was refused, `cat "/etc/shadow"`
+  //      was not, because the text the regex saw ended in `"`. 11 of 13 sensitive paths were reachable
+  //      that way — /etc/{shadow,gshadow}, /proc/N/{environ,cmdline,maps}, /proc/kcore and every TLS key
+  //      form (.key/.p12/.pfx/.jks). The two that held did so by accident: the unanchored `/.ssh/` rule
+  //      happened to cover them. Reverting the fix brings 72 spellings back.
+  //   2. Coverage of the pattern list itself — dropping a path from CONTAINER_SENSITIVE_PATHS fails here.
+  //   3. That the pass stays COMMAND-AGNOSTIC. It screens any command carrying the path, which is why
+  //      whitelisting a new reader does NOT open a hole — verified by moving `strings` into a category
+  //      the local context admits, which changes nothing. That is worth pinning precisely because it is
+  //      the property people assume is per-command and would "optimise" away.
+  //
+  // Defence in depth, not the primary control: children run as `sandbox`, which cannot read a
+  // credential file at all. This is the layer that still holds when a command runs as the owner, and
+  // the only layer that is a text decision — which is what makes a quote enough to defeat it.
+  //
+  // The command list is the whitelisted set that can print a file, derived by probing all 587
+  // whitelisted commands across the four contexts. Only three did not refuse, and none reads a file:
+  const NON_READERS = new Set([
+    "printf",   // the path is a format string; it prints the literal
+    "echo",     // likewise — a glob is expanded by the shell, so it can list names, never contents
+    "curl",     // reads a file only via file:// / -T / -d @ / -K, each blocked separately
+  ]);
+
+  const CONTENT_PRINTERS = [
+    "cat", "tac", "head", "tail", "nl", "od", "xxd", "hexdump", "strings", "base64", "base32", "basenc",
+    "cut", "paste", "join", "comm", "diff", "cmp", "sort", "uniq", "shuf", "tr", "fold", "expand",
+    "unexpand", "pr", "rev", "split", "csplit", "fmt", "column", "grep", "egrep", "fgrep", "zgrep",
+    "sed", "awk", "perl", "tee", "jq", "yq", "wc", "look", "iconv", "zcat", "bzcat", "xzcat",
+  ];
+
+  // Literal paths only. A GLOB that expands to one of these — `cat /etc/*` reaching /etc/shadow — is a
+  // real gap, but it predates this work (measured identical on the pre-PR tree) and closing it needs a
+  // rule that does not also refuse `cat /etc/*release*`. Asserting it here would only pin the gap.
+  //
+  // The AgentBox's own credential tree is checked in `local` only, and that is not an oversight: in the
+  // other three contexts the command runs inside the target container, on the node, or on a remote
+  // host, where /app/.siclaw/credentials does not exist. Screening it there would refuse a path that
+  // means nothing, and asserting it would pin behaviour the tool has no reason to have.
+  const CONTAINER_PATHS = [
+    "/etc/shadow",
+    "/etc/kubernetes/admin.conf",
+    "/root/.ssh/id_rsa",
+    "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    "/var/lib/kubelet/pki/kubelet-client-current.pem",
+  ];
+  const AGENTBOX_PATHS = ["/app/.siclaw/credentials/clusters/x.kubeconfig"];
+
+  it("refuses a literal sensitive operand in every context that admits the command", () => {
+    const escaped: string[] = [];
+    let checked = 0;
+    for (const context of ["local", "pod", "node", "host"] as const) {
+      const allowed = getContextAllowedSet(context);
+      const opts = { context, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+      const paths = context === "local" ? [...CONTAINER_PATHS, ...AGENTBOX_PATHS] : CONTAINER_PATHS;
+      for (const c of new Set(CONTENT_PRINTERS)) {
+        if (!allowed.has(c) || NON_READERS.has(c)) continue;
+        for (const path of paths) {
+          for (const p of [`${c} ${path}`, `${c} -- ${path}`, `${c} "${path}"`]) {
+            checked++;
+            if (validateCommand(p, opts) === null) escaped.push(`[${context}] ${p}`);
+          }
+        }
+      }
+    }
+    expect(checked, "expected the whitelists to contain content-printing commands").toBeGreaterThan(200);
+    expect(escaped, "these can print a file and do not screen the operand").toEqual([]);
+  });
+});
+
+describe("a glob must not expand onto a sensitive path", () => {
+  // `cat /etc/shadow` was refused and `cat /etc/*` was not — and the shell expands the second onto the
+  // first. Screening the glob's literal prefix would have been the easy rule and the wrong one: it also
+  // refuses `cat /etc/*release*`, which names no secret. So the glob is compiled to the regex of the
+  // paths it can produce and tested against representative literals.
+  const opts = { context: "pod" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  const refused = (cmd: string) => validateCommand(cmd, opts) !== null;
+
+  it("refuses globs that can reach one", () => {
+    for (const cmd of [
+      "cat /etc/*", "cat /etc/kubernetes/*", "head /etc/*", "strings /etc/*",
+      "cat /proc/*/environ", "cat /proc/1/fd/*", "cat /root/.ssh/*", "cat /var/run/secrets/*",
+      "cat /var/lib/kubelet/pki/*", "cat /etc/ssl/private/*", "cat /root/.aws/*",
+      "cat /etc/sh*", "cat /etc/?hadow", "cat /etc/[sg]hadow",   // every wildcard form
+      "cat /etc/{shadow,hosts}",                                  // brace expansion
+      'cat "/etc/*"',                                             // quoted — the glob still expands
+      "cat /etc/**",
+    ]) {
+      expect(refused(cmd), cmd).toBe(true);
+    }
+  });
+
+  it("names the file it would have reached", () => {
+    const err = JSON.parse(validateCommand("cat /etc/*", opts) as string);
+    expect(err.rejected_by).toBe("sensitive_path");
+    expect(err.matched).toBe("/etc/*");
+    expect(err.expands_onto).toMatch(/^\/etc\/g?shadow$|^\/etc\/master\.passwd$/);
+    expect(err.hint, "the hint must be about the material, not about the glob").toBeTruthy();
+  });
+
+  it("leaves legitimate globs alone", () => {
+    for (const cmd of [
+      "cat /etc/*release*",          // the case a prefix rule would have broken
+      "cat /etc/*.conf", "cat /etc/sysconfig/*", "ls /etc/kubernetes/manifests/*",
+      "ls /proc/*/status", "cat /proc/*/status",
+      "cat /var/log/*.log", "head /var/log/*", "ls /tmp/*",
+      "cat /sys/class/net/*/mtu",
+      // A wildcard at the start of a segment does not match a leading dot — confirmed by running a
+      // shell, not recalled. Without that rule these are refused because the example list holds
+      // /root/.bash_history and /root/.ssh/…, which the shell can never expand here.
+      "ls /root/*", "ls /home/*",
+    ]) {
+      expect(refused(cmd), cmd).toBe(false);
+    }
+  });
+
+  it("keeps the example list and the pattern list in step", () => {
+    // The examples are what globs are tested against, so a pattern with no example leaves globs
+    // unscreened for it — silently. Pinned in both directions.
+    for (const re of CONTAINER_SENSITIVE_PATHS) {
+      expect(
+        SENSITIVE_PATH_EXAMPLES.some((e) => re.test(e)),
+        `no example matches ${re} — globs are not screened for it`,
+      ).toBe(true);
+    }
+    for (const example of SENSITIVE_PATH_EXAMPLES) {
+      expect(
+        CONTAINER_SENSITIVE_PATHS.some((re) => re.test(example)),
+        `${example} is not matched by any pattern — a stale example widens the glob check`,
+      ).toBe(true);
+    }
+  });
+
+  it("compiles the glob semantics that matter", () => {
+    // Asserted directly, because both are easy to get wrong in a way the payload tests above would
+    // still pass by luck.
+    expect(globToPathRegExp("/etc/*")!.test("/etc/shadow")).toBe(true);
+    expect(globToPathRegExp("/etc/*")!.test("/etc/kubernetes/admin.conf"), "* must not cross /").toBe(false);
+    expect(globToPathRegExp("/root/*")!.test("/root/.bash_history"), "* must not match a leading dot").toBe(false);
+    expect(globToPathRegExp("/root/.*")!.test("/root/.bash_history"), "an explicit dot still matches").toBe(true);
+    expect(globToPathRegExp("/etc/**")!.test("/etc/kubernetes/admin.conf"), "** crosses /").toBe(true);
+    expect(globToPathRegExp("/etc/[")).not.toBeNull();   // an unterminated class must not throw
   });
 });
