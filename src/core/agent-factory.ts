@@ -10,8 +10,7 @@ import {
   getAgentDir,
   DefaultResourceLoader,
   SessionManager,
-  AuthStorage,
-  ModelRegistry,
+  ModelRuntime,
   createReadTool,
   createEditTool,
   createWriteTool,
@@ -326,18 +325,7 @@ export async function createSiclawSession(
   // a command — all three exec tools share the merged registry.
   initExtraCommands();
 
-  const authStorage = AuthStorage.create();
-
-  // Bridge Siclaw-configured apiKey into pi-agent's credential chain (highest priority)
-  const defaultLlm = getDefaultLlm();
-  if (defaultLlm?.apiKey) {
-    const providerName = config.default?.provider ?? Object.keys(config.providers)[0];
-    if (providerName) {
-      authStorage.setRuntimeApiKey(providerName, defaultLlm.apiKey);
-    }
-  }
-
-  // Ensure settings.json exists for ModelRegistry (pi-agent reads models from file).
+  // Ensure settings.json exists for ModelRuntime (pi-agent reads models from file).
   // When env vars created a provider in memory but no file exists, materialize it.
   const configPath = getConfigPath();
   if (!fs.existsSync(configPath) && Object.keys(config.providers).length > 0) {
@@ -346,7 +334,20 @@ export async function createSiclawSession(
     fs.writeFileSync(configPath, JSON.stringify({ providers: config.providers }, null, 2) + "\n");
   }
   const modelsJson = fs.existsSync(configPath) ? configPath : undefined;
-  const modelRegistry = ModelRegistry.create(authStorage, modelsJson);
+  const agentDir = getAgentDir();
+  const modelRuntime = await ModelRuntime.create({
+    authPath: path.join(agentDir, "auth.json"),
+    modelsPath: modelsJson,
+  });
+
+  // Bridge Siclaw-configured apiKey into pi-agent's credential chain (highest priority).
+  const defaultLlm = getDefaultLlm();
+  if (defaultLlm?.apiKey) {
+    const providerName = config.default?.provider ?? Object.keys(config.providers)[0];
+    if (providerName) {
+      await modelRuntime.setRuntimeApiKey(providerName, defaultLlm.apiKey);
+    }
+  }
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
@@ -689,12 +690,10 @@ export async function createSiclawSession(
   // it was an implicit default in the old DefaultResourceLoader and must now
   // be supplied explicitly. createAgentSessionServices builds + reloads the
   // resource loader from resourceLoaderOptions, so no separate reload here.
-  const agentDir = getAgentDir();
   const services = await createAgentSessionServices({
     cwd,
     agentDir,
-    authStorage,
-    modelRegistry,
+    modelRuntime,
     resourceLoaderOptions: {
       // Agent-owned identity is rendered inside the assembled prompt before
       // the hardcoded Safety section. Dynamic profile/knowledge context stays
@@ -751,7 +750,7 @@ export async function createSiclawSession(
 
   // Resolve the initial model: prefer the user's configured default over pi-agent's built-in
   const configuredModel = defaultLlm
-    ? modelRegistry.find(
+    ? modelRuntime.getModel(
         config.default?.provider ?? Object.keys(config.providers)[0],
         defaultLlm.model.id,
       )

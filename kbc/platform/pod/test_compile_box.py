@@ -2979,6 +2979,7 @@ def test_apply_session_config():
     KBC_*; the boot-time KBC_PK_MODE=off kill switch outranks consumer config."""
     keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
             "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY", "OPENAI_AUTH_TOKEN",
+            "KBC_PI_BASE_URL", "KBC_PI_MODEL", "KBC_PI_PROVIDER", "KBC_PI_API_KEY",
             "KBC_ENGINE", "KBC_COMPILE_MODEL", "KBC_TEST_MODEL", "KBC_PK_BLUE_MODEL",
             "KBC_PK_MODE")
     backup = {k: os.environ.get(k) for k in keys}
@@ -3045,6 +3046,29 @@ def test_apply_session_config():
             "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
         ))
 
+        # Pi is a first-class engine with its own authority block. Credentials
+        # are later delivered to the Node runner over JSONL, never inherited by
+        # an OPENAI_/ANTHROPIC_ process environment.
+        compile_box._apply_session_config({
+            "llm": {
+                "engine": "pi_sdk",
+                "protocol": "openai_compatible",
+                "provider": "moonshotai",
+                "base_url": "https://api.moonshot.cn/v1",
+                "api_key": "kimi-key",
+                "model": "kimi-k3",
+            },
+        })
+        assert os.environ["KBC_ENGINE"] == "pi_sdk"
+        assert os.environ["KBC_PI_PROVIDER"] == "moonshotai"
+        assert os.environ["KBC_PI_BASE_URL"] == "https://api.moonshot.cn/v1"
+        assert os.environ["KBC_PI_API_KEY"] == "kimi-key"
+        assert os.environ["KBC_PI_MODEL"] == "kimi-k3"
+        assert not any(key in os.environ for key in (
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY", "OPENAI_AUTH_TOKEN",
+        ))
+
         # kb-test is the production-consumer/blue tier. The selected blue role
         # must therefore drive the interactive test session as well, while an
         # explicit test-only override still wins.
@@ -3059,7 +3083,7 @@ def test_apply_session_config():
             }})
             raise AssertionError("mismatched engine/protocol must fail closed")
         except ValueError as exc:
-            assert "requires protocol" in str(exc), exc
+            assert "requires one of" in str(exc), exc
 
         # ops kill switch: runtime-level off beats consumer "auto"
         os.environ["KBC_PK_MODE"] = "off"

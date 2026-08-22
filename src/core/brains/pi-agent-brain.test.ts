@@ -24,8 +24,8 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     settingsManager: {
       getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16, keepRecentTokens: 20 })),
     },
-    modelRegistry: {
-      find: vi.fn((provider: string, id: string) => ({
+    modelRuntime: {
+      getModel: vi.fn((provider: string, id: string) => ({
         id, name: id, provider, contextWindow: 1000, maxTokens: 100, reasoning: false,
       })),
       registerProvider: vi.fn(),
@@ -416,17 +416,17 @@ describe("PiAgentBrain", () => {
     expect(brain.getModel()).toBeUndefined();
   });
 
-  it("setModel looks up via modelRegistry and calls session.setModel", async () => {
+  it("setModel looks up via modelRuntime and calls session.setModel", async () => {
     const session = makeFakeSession();
     const brain = new PiAgentBrain(session);
     await brain.setModel({ id: "m2", name: "M2", provider: "p", contextWindow: 0, maxTokens: 0, reasoning: false });
-    expect(session.modelRegistry.find).toHaveBeenCalledWith("p", "m2");
+    expect(session.modelRuntime.getModel).toHaveBeenCalledWith("p", "m2");
     expect(session.setModel).toHaveBeenCalled();
   });
 
   it("setModel is a no-op when model not found", async () => {
     const session = makeFakeSession({
-      modelRegistry: { find: vi.fn(() => undefined), registerProvider: vi.fn() },
+      modelRuntime: { getModel: vi.fn(() => undefined), registerProvider: vi.fn() },
     });
     const brain = new PiAgentBrain(session);
     await brain.setModel({ id: "x", name: "x", provider: "x", contextWindow: 0, maxTokens: 0, reasoning: false });
@@ -435,7 +435,7 @@ describe("PiAgentBrain", () => {
 
   it("findModel returns undefined when registry returns undefined", () => {
     const session = makeFakeSession({
-      modelRegistry: { find: vi.fn(() => undefined), registerProvider: vi.fn() },
+      modelRuntime: { getModel: vi.fn(() => undefined), registerProvider: vi.fn() },
     });
     const brain = new PiAgentBrain(session);
     expect(brain.findModel("p", "id")).toBeUndefined();
@@ -448,11 +448,11 @@ describe("PiAgentBrain", () => {
     expect(info).toMatchObject({ id: "id", provider: "prov" });
   });
 
-  it("registerProvider delegates to modelRegistry", () => {
+  it("registerProvider delegates to modelRuntime", () => {
     const session = makeFakeSession();
     const brain = new PiAgentBrain(session);
     brain.registerProvider!("name", { baseUrl: "u", models: [] });
-    expect(session.modelRegistry.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
+    expect(session.modelRuntime.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
   });
 
   it("restores a checkpoint by branching the session leaf and rebuilding agent messages", () => {
@@ -564,6 +564,12 @@ describe("PiAgentBrain", () => {
       const session = makeFakeSession();
       new PiAgentBrain(session).applyModelParams({ reasoningEffort: "xhigh" });
       expect(session.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    });
+
+    it("supports the max reasoning effort used by Kimi K3", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "max" });
+      expect(session.setThinkingLevel).toHaveBeenCalledWith("max");
     });
 
     it("ignores an invalid reasoning effort (no throw, no call)", () => {

@@ -1,0 +1,23 @@
+{
+  "name": "siclaw-kbc-pi-runner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test dist/main.node-test.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.82.1",
+    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@earendil-works/pi-tui": "0.82.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.8",
+    "typescript": "5.9.3"
+  }
+}

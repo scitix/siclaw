@@ -25,56 +25,18 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Iterator, Mapping
+from typing import Iterable, Iterator, Mapping
 
 from aiohttp import web
-
-
-@dataclass(frozen=True)
-class EngineTool:
-    """One engine-neutral MCP tool owned by KBC."""
-
-    name: str
-    description: str
-    input_schema: dict
-    handler: Callable[[dict], Awaitable[str]]
-
-
-# Claude-message-shaped compatibility values.  ``compile_box`` deliberately
-# dispatches by class name so these need only carry the fields it reads.
-class TextBlock:
-    def __init__(self, text: str):
-        self.text = text
-
-
-class ToolUseBlock:
-    def __init__(self, name: str, input_: dict | None = None):
-        self.name = name
-        self.input = input_ or {}
-
-
-class AssistantMessage:
-    def __init__(self, content: list):
-        self.content = content
-
-
-class StreamEvent:
-    pass
-
-
-class ResultMessage:
-    def __init__(
-        self,
-        *,
-        is_error: bool = False,
-        api_error_status: int | None = None,
-        subtype: str = "success",
-    ):
-        self.is_error = is_error
-        self.api_error_status = api_error_status
-        self.subtype = subtype
+from engine_protocol import (
+    AssistantMessage,
+    EngineTool,
+    ResultMessage,
+    StreamEvent,
+    TextBlock,
+    ToolUseBlock,
+)
 
 
 _CLOSED = object()

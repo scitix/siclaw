@@ -1,7 +1,7 @@
-# Compile-pod image = Python + both agent SDK adapters + the kbc compile brain.
+# Compile-pod image = Python + three agent SDK adapters + the kbc compile brain.
 #
 # Each pinned SDK ships its matching runtime binary; /session selects exactly
-# one engine for a run (claude_agent_sdk or codex_sdk).
+# one engine for a run (claude_agent_sdk, codex_sdk, or pi_sdk).
 #
 # build:  docker build -f platform/pod/Dockerfile -t kbc-compile-pod .   (run from kbc/ = build ctx)
 # run (production; LLM via an Anthropic-compatible model proxy):
@@ -10,6 +10,15 @@
 #     -e ANTHROPIC_API_KEY=<token>               \   # or pass a key directly
 #     -v /path/to/workdir:/work                  \   # workdir with raw sources
 #     kbc-compile-pod
+FROM node:22.19-bookworm-slim AS pi-runner
+
+WORKDIR /build
+COPY platform/pod/pi-runner/package.json platform/pod/pi-runner/package-lock.json ./
+RUN npm ci
+COPY platform/pod/pi-runner/tsconfig.json ./
+COPY platform/pod/pi-runner/src/ ./src/
+RUN npm run build && npm prune --omit=dev
+
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates bubblewrap poppler-utils \
@@ -37,6 +46,13 @@ COPY CLAUDE.md /app/CLAUDE.md
 COPY platform/pod/*.py /app/
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
+# Pi is a Node SDK. Keep the Python controller authoritative and run one small
+# JSONL companion in the same single-tenant Pod; only its exact production
+# dependencies and compiled JS cross the build-stage boundary.
+COPY --from=pi-runner /usr/local/bin/node /usr/local/bin/node
+COPY --from=pi-runner /build/package.json /app/pi-runner/package.json
+COPY --from=pi-runner /build/node_modules/ /app/pi-runner/node_modules/
+COPY --from=pi-runner /build/dist/main.js /app/pi-runner/dist/main.js
 
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1

@@ -118,7 +118,7 @@ export interface BrainToolDefinition {
 
 /** Per-model runtime tunables forwarded from the control plane's modelConfig.params. */
 export interface BrainModelParams {
-  /** Reasoning effort: off|minimal|low|medium|high|xhigh. */
+  /** Reasoning effort: off|minimal|low|medium|high|xhigh|max. */
   reasoningEffort?: string;
 }
 
