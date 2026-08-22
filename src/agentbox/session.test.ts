@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getOrCreateLedger, resetLedgers } from "../core/task-ledger.js";
 
 /**
  * Tests for AgentBoxSessionManager.
@@ -160,6 +161,7 @@ beforeEach(() => {
 afterEach(() => {
   process.chdir(origCwd);
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  resetLedgers();
   vi.restoreAllMocks();
 });
 
@@ -642,6 +644,40 @@ describe("AgentBoxSessionManager — list + get + activeCount", () => {
     expect(mgr.activeCount()).toBe(1);
     await mgr.close("a");
     expect(mgr.activeCount()).toBe(0);
+  });
+
+  // The durable plan is what a pod restart reads back, and close() is documented as deliberately
+  // leaving it behind. Coalescing the snapshot writes introduced a way to destroy it: the follow-up
+  // re-reads the ledger, and if it ran after close() had dropped the in-memory copy it recreated an
+  // empty one and renamed `[]` over the good file. Observed as snapshots [["1"], []].
+  it("keeps the durable plan when a queued snapshot write outlives close()", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("plan-close");
+    const ledgerPath = path.join(_cfgUserDataDir, "agent", "sessions", "plan-close", ".plan-ledger.json");
+
+    // A batch: several requests in one synchronous burst, so one write is in flight and another is
+    // queued behind it — the shape that made the race reachable.
+    const ledger = getOrCreateLedger("plan-close");
+    ledger.create({ subject: "step one", description: "" });
+    const writer = (mgr as any).persistLedgerSnapshot as (k: string) => void;
+    writer("plan-close");
+    ledger.create({ subject: "step two", description: "" });
+    writer("plan-close");
+    writer("plan-close");
+
+    await mgr.close("plan-close");
+
+    // close() drains before deleting, so the file must exist and hold BOTH tasks. An empty array
+    // here is the regression: the plan was destroyed by its own persister.
+    expect(fs.existsSync(ledgerPath)).toBe(true);
+    const persisted = JSON.parse(fs.readFileSync(ledgerPath, "utf8")) as Array<{ subject: string }>;
+    expect(persisted.map((t) => t.subject)).toEqual(["step one", "step two"]);
+
+    // And nothing arriving after closure may rewrite it.
+    writer("plan-close");
+    for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 5));
+    const after = JSON.parse(fs.readFileSync(ledgerPath, "utf8")) as unknown[];
+    expect(after).toHaveLength(2);
   });
 
   it("persists and rehydrates model route state across release/rebuild", async () => {
