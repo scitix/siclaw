@@ -122,6 +122,16 @@ export type BoundedExecOptions = {
   /** Overridable so tests do not have to wait out the real grace. */
   graceMs?: number;
   cwd?: string;
+  /**
+   * Stop whatever this process cannot reach itself, called once on the first stop condition.
+   *
+   * The group kill below only reaches processes this UID may signal. Where the command runs as
+   * someone else — production drops to `sandbox` — it reaches the outer shell and nothing under it,
+   * and still reports success for having signalled one member. Without this hook a timeout was
+   * handled (the command carries its own deadline) while an abort and an overflow returned over a
+   * command that kept running. Best-effort and asynchronous: the deadline is still enforced.
+   */
+  reap?: () => void;
 };
 
 export function boundedExec(command: string, opts: BoundedExecOptions): Promise<BoundedExecResult> {
@@ -191,6 +201,9 @@ export function boundedExec(command: string, opts: BoundedExecOptions): Promise<
       if (stopping) return; // first reason wins: neither the deadline nor the error moves
       stopping = makeError;
       killGroup();
+      // After the group kill, not instead of it: the two cover different halves of the tree, and
+      // this one is the only half that can reach a command running as another user.
+      try { opts.reap?.(); } catch { /* best-effort */ }
       graceTimer = setTimeout(() => settle(() => {
         // Reaching here means the kill did not land and the process is still alive. Detaching the
         // pipes keeps it from feeding a buffer nobody reads, and unref releases the handle it holds

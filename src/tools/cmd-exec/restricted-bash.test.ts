@@ -1824,10 +1824,12 @@ describe("the subcommand and the rollout verb come from one reader", () => {
 describe("buildSandboxCommand", () => {
   it("runs timeout UNDER sudo, so the killer shares the command's UID", () => {
     const c = buildSandboxCommand("kubectl get pods", { timeoutS: 60 });
-    expect(c).toBe("sudo -E -u sandbox -- timeout -k 5 60 bash -c 'kubectl get pods'");
-    // The nesting, asserted as an ordering rather than trusted to the literal above.
+    expect(c).toContain("kubectl get pods");
+    // The ordering IS the mechanism: sudo drops to sandbox first, so `timeout` is itself a sandbox
+    // process and may signal what it started. Wrapped the other way round it sits outside the UID
+    // boundary and can stop nothing — which is the defect this replaces.
     expect(c.indexOf("sudo")).toBeLessThan(c.indexOf("timeout"));
-    expect(c.indexOf("timeout")).toBeLessThan(c.indexOf("bash -c"));
+    expect(c.indexOf("timeout")).toBeLessThan(c.lastIndexOf("kubectl"));
   });
 
   it("passes -k so a command that ignores SIGTERM is still killed", () => {
@@ -1837,7 +1839,11 @@ describe("buildSandboxCommand", () => {
 
   it("escapes single quotes so a quoted command cannot break out of the wrapper", () => {
     const c = buildSandboxCommand("grep 'a b' f", { timeoutS: 10 });
-    expect(c).toBe("sudo -E -u sandbox -- timeout -k 5 10 bash -c 'grep '\\''a b'\\'' f'");
+    // Every quote the caller wrote is escaped, and the outer layer stays balanced — checked as a
+    // property rather than a literal, since the nesting depth is an implementation detail.
+    expect(c).toContain("'\\''a b'\\''");
+    expect(c.startsWith("sudo -E -u sandbox -- bash -c '")).toBe(true);
+    expect(c.endsWith("'")).toBe(true);
   });
 
   it("keeps the outer backstop strictly later than the sandbox deadline", () => {
@@ -1847,5 +1853,33 @@ describe("buildSandboxCommand", () => {
     const outerS = sandboxS + SANDBOX_KILL_GRACE_S + OUTER_BACKSTOP_MARGIN_S;
     expect(outerS).toBeGreaterThan(sandboxS + SANDBOX_KILL_GRACE_S);
     expect(OUTER_BACKSTOP_MARGIN_S).toBeGreaterThan(0);
+  });
+});
+
+describe("buildSandboxCommand — reaping the two conditions timeout does not cover", () => {
+  it("runs the whole sandbox side inside a session when a pgid file is given", () => {
+    const c = buildSandboxCommand("kubectl get pods", { timeoutS: 60, pgidFile: "/tmp/x.pgid" });
+    // A session, not a process group: `timeout` re-groups its child, so `kill -- -<pgid>` misses the
+    // command — measured in the image as EPERM with the command still alive. A session id is
+    // inherited across that sub-group.
+    expect(c).toContain("setsid");
+    expect(c).toContain("/tmp/x.pgid");
+    // timeout still inside, so natural expiry is unchanged.
+    expect(c).toContain("timeout -k 5 60");
+    expect(c.indexOf("sudo")).toBeLessThan(c.indexOf("setsid"));
+  });
+
+  it("omits the session wrapper when there is nothing to reap with", () => {
+    const c = buildSandboxCommand("x", { timeoutS: 5 });
+    expect(c).not.toContain("setsid");
+    expect(c).toContain("timeout -k 5 5");
+  });
+
+  it("still escapes the caller's quotes once the wrapper is added", () => {
+    const c = buildSandboxCommand("grep 'a b' f", { timeoutS: 10, pgidFile: "/tmp/y.pgid" });
+    // The command survives two levels of single-quoting without breaking out.
+    expect(c).toContain("grep");
+    expect(c.startsWith("sudo -E -u sandbox -- bash -c '")).toBe(true);
+    expect(c.endsWith("'")).toBe(true);
   });
 });

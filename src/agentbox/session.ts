@@ -3346,6 +3346,18 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
         }
       }
+      // Same reason close() drains: both plan writers are asynchronous and hold the only durable
+      // copy. This is the SIGTERM path, and the caller exits the process straight after — so a
+      // batch's queued event appends and its final snapshot are lost here unless they are awaited.
+      // Per session, since the queues are keyed by it.
+      try {
+        await Promise.all([
+          this.persistLedgerSnapshot.drain(id),
+          this.taskEventQueue.drain(id),
+        ]);
+      } catch (err) {
+        console.warn(`[agentbox-session] draining plan writes for ${id} during closeAll failed:`, err);
+      }
       this.teardownTracing(id, managed);
       emitDiagnostic({ type: "session_released", sessionId: id });
     }

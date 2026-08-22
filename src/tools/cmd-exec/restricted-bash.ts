@@ -29,6 +29,10 @@ import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { hasPipeline, instrumentPipeline, extractPipelineStatus } from "../infra/pipeline-status.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { boundedExec } from "./bounded-exec.js";
+import { spawn } from "node:child_process";
+import {
+  backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript,
+} from "../infra/bg-session.js";
 
 /**
  * SIGTERM-to-SIGKILL grace given to the sandbox-side `timeout`, and how much longer the outer
@@ -53,11 +57,44 @@ export const OUTER_BACKSTOP_MARGIN_S = 10;
  */
 export function buildSandboxCommand(
   command: string,
-  opts: { timeoutS: number; graceS?: number },
+  opts: { timeoutS: number; graceS?: number; pgidFile?: string },
 ): string {
-  const escaped = command.replace(/'/g, "'\\''");
   const grace = opts.graceS ?? SANDBOX_KILL_GRACE_S;
-  return `sudo -E -u sandbox -- timeout -k ${grace} ${opts.timeoutS} bash -c '${escaped}'`;
+  const inner = `timeout -k ${grace} ${opts.timeoutS} bash -c '${command.replace(/'/g, "'\\''")}'`;
+  // Natural expiry is only ONE of three ways a run stops. An abort and an output overflow are
+  // decided out here, and out here cannot signal a `sandbox` process — so those two need a handle on
+  // the sandbox side. A SESSION is that handle: `timeout` puts its child in its own process GROUP,
+  // so a group is not enough, while a session id is inherited across that sub-group and reaps the
+  // lot (bg-session.ts documents this from the node_exec path, where it was found the same way).
+  const withSession = opts.pgidFile
+    ? wrapBackgroundSession(inner, opts.pgidFile)
+    : inner;
+  const escaped = withSession.replace(/'/g, "'\\''");
+  return `sudo -E -u sandbox -- bash -c '${escaped}'`;
+}
+
+/**
+ * Reap everything the sandbox-side session still holds, AS sandbox.
+ *
+ * sudoers grants `agentbox ALL=(sandbox) NOPASSWD: ALL`, so becoming sandbox is the whole trick:
+ * the same signal that returns EPERM from the agent lands from here. Measured in the image —
+ * `kill -- -<pgid>` as sandbox still failed, because `timeout` had re-grouped its child; the session
+ * is what covers it.
+ *
+ * Best-effort by construction: it races the command finishing on its own, and the sandbox-side
+ * `timeout` remains the backstop if this misses.
+ */
+export function reapSandboxSession(pgidFile: string): void {
+  try {
+    const script = backgroundSessionKillScript(pgidFile);
+    // Detached and unref'd: this runs while the caller is settling, and must not hold the loop.
+    const child = spawn("sudo", ["-n", "-E", "-u", "sandbox", "--", "bash", "-c", script], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.on("error", () => { /* best-effort */ });
+    child.unref();
+  } catch { /* best-effort */ }
 }
 
 // ── Re-exports for backward compatibility ────────────────────────────
@@ -539,14 +576,19 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
 
-      // The sandbox-side `timeout` owns the deadline; the boundedExec timer is only the backstop for
-      // a channel that never returns, so it must fire LATER or it would pre-empt the one that can
-      // actually stop the command and we would be back to a returning call over a running process.
-      const sandboxTimeoutS = Math.min(params.timeout_seconds ?? defaultTimeout, 300);
-      const timeout = (sandboxTimeoutS + SANDBOX_KILL_GRACE_S + OUTER_BACKSTOP_MARGIN_S) * 1000;
-
       // Sanitized env + KUBECONFIG injection — identical for foreground and background.
       const isProd = process.env.NODE_ENV === "production";
+
+      // Whose deadline is it. In production the sandbox-side `timeout` owns it and the boundedExec
+      // timer is only a backstop for a channel that never returns — so it must fire LATER, or it
+      // pre-empts the only timer that can actually stop the command. Outside production there is no
+      // sudo and no wrapper, so the boundedExec timer IS the deadline and must not be padded:
+      // extending it unconditionally turned `timeout_seconds: 1` into a 16-second ceiling, and a
+      // command that should have timed out returned successfully instead.
+      const sandboxTimeoutS = Math.min(params.timeout_seconds ?? defaultTimeout, 300);
+      const timeout = isProd
+        ? (sandboxTimeoutS + SANDBOX_KILL_GRACE_S + OUTER_BACKSTOP_MARGIN_S) * 1000
+        : sandboxTimeoutS * 1000;
       const env: Record<string, string> = {
         ...sanitizeEnv(process.env as Record<string, string>),
         SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
@@ -571,6 +613,10 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const wantsBackground = backgroundEnabled && params.run_in_background === true;
       const instrumented = !wantsBackground && hasPipeline(command);
       let execCommand = instrumented ? instrumentPipeline(command) : command;
+      // Set in production only, where the command runs as another user: it is both the sandbox-side
+      // session's record and the handle used to reap it. Outside production there is no UID boundary
+      // and the group kill already reaches everything.
+      const sandboxPgidFile = isProd ? backgroundPgidFile(toolCallId) : undefined;
       if (isProd) {
         // The deadline goes on the SANDBOX side. The pod drops CAP_KILL (security.md §5.2 grants
         // only SETUID, SETGID, CHOWN, FOWNER, AUDIT_WRITE) and the command runs as `sandbox` while
@@ -578,7 +624,10 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         // nothing beneath it. `kill(-pgid)` still SUCCEEDS in that case — one group member was
         // signalled — which is why this looked like it worked: the call returned and the command
         // kept running. Same shape node_exec already uses.
-        execCommand = buildSandboxCommand(execCommand, { timeoutS: sandboxTimeoutS });
+        execCommand = buildSandboxCommand(execCommand, {
+          timeoutS: sandboxTimeoutS,
+          pgidFile: sandboxPgidFile,
+        });
       }
 
       // ── Background mode ──────────────────────────────────────────────
@@ -613,7 +662,15 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       try {
         // The timeout is enforced by boundedExec, not by child_process.exec's own `timeout` —
         // see bounded-exec.ts for why that one does not bound the call.
-        const { stdout, stderr } = await boundedExec(execCommand, { env, timeoutMs: timeout, signal });
+        const { stdout, stderr } = await boundedExec(execCommand, {
+          env,
+          timeoutMs: timeout,
+          signal,
+          // Covers the two stop conditions the sandbox-side `timeout` does not: an abort and an
+          // output overflow are decided here, and the group kill this process can perform does not
+          // cross the UID boundary.
+          ...(sandboxPgidFile ? { reap: () => reapSandboxSession(sandboxPgidFile) } : {}),
+        });
 
         // Strip the sentinel BEFORE anything reads the output: a structural sanitizer parses the whole
         // payload, so a trailing marker would make every instrumented `-o json` pipeline "not JSON".
