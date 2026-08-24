@@ -1081,6 +1081,28 @@ describe("consumeAgentSse — abort finalization", () => {
     expect(finalized.metadata.reason).toBe("stream_error");
   });
 
+  it("finalizes even when the terminal error flush THROWS first", async () => {
+    // flushTerminalError persists rows and invokes the caller's onEvent callback, so it can throw.
+    // Written as two sequential awaits in one finally, a throw from the first skips the finalizer
+    // just as effectively as being outside the finally — the same defect, one level in. Hence the
+    // nested try/finally, and hence this test.
+    const events = [
+      { type: "tool_execution_start", toolName: "node_exec", args: { command: "x" } },
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "model exploded" } },
+    ];
+    await expect(consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "s",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (_e, eventType) => {
+        // The terminal flush emits stream_error; throwing here is the caller-callback failure mode.
+        if (eventType === "stream_error") throw new Error("consumer callback blew up");
+      },
+    })).rejects.toThrow("consumer callback blew up");
+    expect(updateCalls.find((u) => u.metadata?.status === "abandoned")).toBeDefined();
+  });
+
   it("a failed tool_execution_end write leaves the row reachable by the finalizer", async () => {
     // tool_execution_end peeks and only shifts after the write succeeds. Shifting first meant a
     // throwing persist erased the entry, so the row stayed `running` and the finalizer could no

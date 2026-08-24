@@ -1061,8 +1061,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     streamFault = err;
     throw err;
   } finally {
-    await flushTerminalError();
-    await finalizeUnfinishedRows();
+    // NESTED finally, not two sequential awaits. `flushTerminalError` persists and invokes a
+    // caller callback, so it can throw — and a throw from the first statement of a finally block
+    // skips the rest of that block just as effectively as being outside it. Writing these in
+    // sequence reproduced the very defect this change exists to fix, one level further in: the
+    // finalizer must be unconditionally reachable, which means it belongs in a finally of its own.
+    try {
+      await flushTerminalError();
+    } finally {
+      await finalizeUnfinishedRows();
+    }
   }
 
   // ── Terminal finalization ────────────────────────────────────────────
