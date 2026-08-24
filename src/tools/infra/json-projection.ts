@@ -128,6 +128,20 @@ function walk(value: unknown, steps: Step[]): unknown[] {
   return walk((value as Record<string, unknown>)[step.name], rest);
 }
 
+/**
+ * Read a path's VALUES out of an already-parsed document, rather than a rendered projection.
+ *
+ * Same grammar, same walker — a caller that needs a field in order to build its next command must not
+ * bring its own path reader, or the two grammars drift and `.a[0]` starts meaning different things in
+ * different parts of the tree. Returns `[]` for a path that matches nothing, which is why the caller
+ * has to distinguish "absent" from "present and empty" itself.
+ */
+export function readJsonPath(value: unknown, path: string): unknown[] {
+  const steps = parseJsonPath(path);
+  if ("error" in steps) return [];
+  return walk(value, steps);
+}
+
 /** Render a projection so a scalar reads as a scalar — the point is to spend less context, not more. */
 function render(results: unknown[]): string {
   if (results.length === 1) {
@@ -170,6 +184,20 @@ function parseJsonBody(body: string): unknown | typeof NOT_JSON {
   } catch {
     return NOT_JSON;
   }
+}
+
+/**
+ * Parse a body that has already been through the output sanitizer, tolerating the notice a structural
+ * sanitizer appends to its own output (which is what makes that output un-parseable). `undefined` when
+ * the body is not JSON at all.
+ *
+ * Exported so a caller that needs the VALUES rather than a rendered projection reads them the same
+ * way this file does. Reading sanitized text is the point: a second parser over raw stdout would see
+ * the values the sanitizer removed.
+ */
+export function parseSanitizedJson(body: string): unknown | undefined {
+  const parsed = parseJsonBody(body);
+  return parsed === NOT_JSON ? undefined : parsed;
 }
 
 /**
