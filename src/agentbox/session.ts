@@ -806,14 +806,22 @@ export class AgentBoxSessionManager {
       status: "queued" | "running" | GroupItemStatus;
       summary: string;
       childSessionId: string;
+      activity?: string;
     };
     const states: ItemState[] = tasks.map(() => ({ status: "queued", summary: "", childSessionId: "" }));
+    let reduceChildSessionId: string | undefined;
     const breaker = new GroupCircuitBreaker();
 
     const emit = (phase: "map" | "reduce") =>
       onProgress?.({
         phase,
-        items: states.map((s, index) => ({ index, status: s.status })),
+        items: states.map((s, index) => ({
+          index,
+          status: s.status,
+          ...(s.childSessionId ? { childSessionId: s.childSessionId } : {}),
+          ...(s.activity ? { activity: s.activity } : {}),
+        })),
+        ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
       });
 
     const skipReason = (): string =>
@@ -860,16 +868,33 @@ export class AgentBoxSessionManager {
             return undefined;
           }
           // Mark `running` + emit only once the slot is acquired — an item still waiting for a
-          // limiter slot must stay `queued`, not report as running.
+          // limiter slot must stay `queued`, not report as running. Pre-assign the exact session
+          // id runSpawnedSubagent will persist so the live UI can open the child transcript from
+          // the first running frame instead of waiting for the terminal result.
+          const childSessionId = randomUUID();
+          state.childSessionId = childSessionId;
           state.status = "running";
           emit("map");
-          return this.runSpawnedSubagent(childReq, { ...traceCtx }, undefined, mapAbort.signal);
+          return this.runSpawnedSubagent(
+            childReq,
+            { ...traceCtx, childSessionId },
+            (progress) => {
+              const activity = progress.activity?.trim();
+              if (!activity || activity === state.activity) return;
+              state.activity = activity;
+              emit("map");
+            },
+            mapAbort.signal,
+          );
         })));
       } catch (err) {
         res = {
           status: "failed",
           summary: `Sub-agent errored: ${err instanceof Error ? err.message : String(err)}`,
-          childSessionId: "",
+          // The id was already exposed in the running frame and may already own
+          // persisted rows. Keep it stable even if an unexpected exception
+          // escapes runSpawnedSubagent before it can return its normal envelope.
+          childSessionId: state.childSessionId,
           toolCalls: 0,
           durationMs: 0,
         };
@@ -929,7 +954,6 @@ export class AgentBoxSessionManager {
     const usableCount = states.filter((s) => s.status === "done" || s.status === "partial").length;
 
     let reduceSummary: string | undefined;
-    let reduceChildSessionId: string | undefined;
     let reduceTruncated = false;
     let reduceError: string | undefined;    // reduce ran but did not complete → drives status + groupSummary (kept off the report as its own key)
     let reduceSkippedForCancel = false;      // reduce requested but skipped because the user cancelled
@@ -945,7 +969,6 @@ export class AgentBoxSessionManager {
       if (userAbort.signal.aborted) {
         reduceSkippedForCancel = true;
       } else if (doneCount > 0 && !breaker.tripped) {
-        emit("reduce");
         const outcomes: GroupItemOutcome[] = states.map((s, i) => ({
           item: tasks[i].item,
           status: s.status as GroupItemStatus,
@@ -963,9 +986,19 @@ export class AgentBoxSessionManager {
           spawnId: `${groupId}#reduce`,
         };
         try {
-          const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() =>
-            this.runSpawnedSubagent(reduceReq, { ...traceCtx }, undefined, userAbort.signal),
-          )));
+          const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() => {
+            // Match map-item semantics: advertise the reduce child only after it owns
+            // an execution slot. Until then the batch remains in its completed map
+            // state instead of exposing a session that has not started yet.
+            reduceChildSessionId = randomUUID();
+            emit("reduce");
+            return this.runSpawnedSubagent(
+              reduceReq,
+              { ...traceCtx, childSessionId: reduceChildSessionId },
+              undefined,
+              userAbort.signal,
+            );
+          })));
           if (reduceRes.status === "done") {
             // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
             // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
@@ -1227,10 +1260,24 @@ export class AgentBoxSessionManager {
       lastEmitAt = Date.now();
       const snapshot = latest;
       latest = null;
+      const items = snapshot.items.map(({ index, status, childSessionId, activity }) => ({
+        index,
+        status,
+        ...(childSessionId ? { child_session_id: childSessionId } : {}),
+        ...(activity ? { activity } : {}),
+      }));
       void this.persistDelegationEvent({
         type: "delegation.emit_chat_event",
         sessionId: parentSessionId,
-        event: { type: "group_progress", job_id: jobId, phase: snapshot.phase, items: snapshot.items },
+        event: {
+          type: "group_progress",
+          job_id: jobId,
+          phase: snapshot.phase,
+          items,
+          ...(snapshot.reduceChildSessionId
+            ? { reduce_child_session_id: snapshot.reduceChildSessionId }
+            : {}),
+        },
       }).catch((err) => {
         // Best-effort live update (never rethrow): correctness rebuilds from the persisted per-child
         // + terminal events on refetch. Log so a systematically failing progress channel is visible.

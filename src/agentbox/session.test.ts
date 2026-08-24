@@ -981,9 +981,9 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     // and mock the child runner so no real child sessions spin up — we assert only trace threading.
     const ensureSpy = vi.spyOn(tracingRecorder, "ensureToolSpan").mockReturnValue(SC as any);
     vi.spyOn(tracingRecorder, "getRootTraceId").mockReturnValue(T1);
-    const runSpy = vi.spyOn(mgr, "runSpawnedSubagent").mockResolvedValue({
-      status: "done", summary: "ok", childSessionId: "c", toolCalls: 0, durationMs: 1,
-    });
+    const runSpy = vi.spyOn(mgr, "runSpawnedSubagent").mockImplementation(async (_request: any, opts: any) => ({
+      status: "done", summary: "ok", childSessionId: opts.childSessionId, toolCalls: 0, durationMs: 1,
+    }));
 
     await mgr.createSpawnSubagentExecutor()(baseReq({ reducePrompt: "Summarize" }), undefined, undefined);
 
@@ -998,7 +998,56 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     for (const call of runSpy.mock.calls) {
       expect(call[1]?.spawnSpanContext).toBe(SC);
       expect(call[1]?.mainTraceId).toBe(T1);
+      expect(call[1]?.childSessionId).toMatch(/^[0-9a-f-]{36}$/);
     }
+    expect(new Set(runSpy.mock.calls.map((call: any[]) => call[1]?.childSessionId)).size).toBe(4);
+  });
+
+  it("does not expose the reduce session until its execution slot is acquired", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    vi.spyOn(mgr, "runSpawnedSubagent").mockImplementation(async (request: any, opts: any, onProgress: any) => {
+      onProgress?.({
+        status: "running",
+        toolCalls: 1,
+        steps: [],
+        activity: `Running ${request.spawnId}`,
+      });
+      return { status: "done", summary: "ok", childSessionId: opts.childSessionId, toolCalls: 0, durationMs: 1 };
+    });
+
+    let releaseReduce: () => void = () => {};
+    const reduceGate = new Promise<void>((resolve) => { releaseReduce = resolve; });
+    let reduceQueuedResolve: () => void = () => {};
+    const reduceQueued = new Promise<void>((resolve) => { reduceQueuedResolve = resolve; });
+    let slotRequestCount = 0;
+    mgr.podSubagentLimiter = {
+      run: async (fn: () => Promise<unknown>) => {
+        slotRequestCount++;
+        if (slotRequestCount === 4) {
+          reduceQueuedResolve();
+          await reduceGate;
+        }
+        return fn();
+      },
+    };
+
+    const progress: any[] = [];
+    const pending = mgr.runSubagentGroup(
+      baseReq({ reducePrompt: "Summarize" }),
+      (frame: any) => progress.push(frame),
+    );
+
+    await reduceQueued;
+    expect(progress.some((frame) => frame.phase === "reduce")).toBe(false);
+    expect(progress.some((frame) => frame.items.some(
+      (item: any) => item.index === 0 && item.activity === "Running grp1#0",
+    ))).toBe(true);
+
+    releaseReduce();
+    const report = await pending;
+    const reduceFrame = progress.find((frame) => frame.phase === "reduce");
+    expect(reduceFrame?.reduceChildSessionId).toBe(report.reduceChildSessionId);
+    expect(reduceFrame?.reduceChildSessionId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it("map partial + slow reduce: group timer disarmed before reduce, overall is partial not timed_out", async () => {
@@ -1599,13 +1648,18 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
     await new Promise((r) => setTimeout(r, 120)); // let the group settle (before the 600ms coalesce)
 
     // group_progress is LIVE-ONLY (emit_chat_event, never append_event) and carries the groupId
-    // + per-item status array so the card animates without a full refetch.
+    // + per-item status/session array so the card animates and can open a running child's
+    // transcript without waiting for the terminal result/refetch.
     const progress = sent.filter(
       (e) => e.type === "delegation.emit_chat_event" && e.event?.type === "group_progress",
     );
     expect(progress.length).toBeGreaterThan(0);
     expect(progress[0].event.job_id).toBe("grpbg");
     expect(Array.isArray(progress[0].event.items)).toBe(true);
+    const liveRunningItems = progress.flatMap((e) => e.event.items)
+      .filter((item: any) => item.status === "running");
+    expect(liveRunningItems.length).toBeGreaterThan(0);
+    expect(liveRunningItems.every((item: any) => typeof item.child_session_id === "string" && item.child_session_id.length > 0)).toBe(true);
 
     // The completion notice reuses the subagent_done channel but flags is_group so the frontend
     // does an authoritative refetch (it can't fold full per-item detail from this event alone).
@@ -1629,9 +1683,19 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
 
     const emitter = mgr.makeGroupProgressEmitter("p1", "grpX");
     // First emit flushes immediately (lastEmitAt=0 → elapsed ≫ throttle): an early "map, running" frame.
-    emitter.emit({ phase: "map", items: [{ index: 0, status: "running" }, { index: 1, status: "running" }] });
+    emitter.emit({
+      phase: "map",
+      items: [
+        { index: 0, status: "running", childSessionId: "child-0", activity: "Running kubectl…" },
+        { index: 1, status: "queued" },
+      ],
+    });
     // The terminal frame lands within the throttle window → held as the pending trailing frame.
-    emitter.emit({ phase: "reduce", items: [{ index: 0, status: "done" }, { index: 1, status: "failed" }] });
+    emitter.emit({
+      phase: "reduce",
+      items: [{ index: 0, status: "done" }, { index: 1, status: "failed" }],
+      reduceChildSessionId: "reduce-1",
+    });
     // Settle BEFORE the trailing timer fires: it must flush the pending terminal frame, not drop it.
     emitter.settle();
 
@@ -1641,8 +1705,16 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
     // The last live frame the card sees is the terminal one: reduce phase, every item terminal.
     expect(last.event.job_id).toBe("grpX");
     expect(last.event.phase).toBe("reduce");
+    expect(last.event.reduce_child_session_id).toBe("reduce-1");
     expect(last.event.items.every((it: any) => it.status !== "running" && it.status !== "queued")).toBe(true);
     expect(last.event.items).toEqual([{ index: 0, status: "done" }, { index: 1, status: "failed" }]);
+
+    // The wire shape is explicit snake_case. Queued items without a real session must not expose
+    // a fake drill-in target.
+    expect(frames[0].event.items).toEqual([
+      { index: 0, status: "running", child_session_id: "child-0", activity: "Running kubectl…" },
+      { index: 1, status: "queued" },
+    ]);
 
     // Idempotent: a second settle finds no pending frame → no extra emit (matches the double
     // settle() in the .then + .finally of startBackgroundSubagentGroup).

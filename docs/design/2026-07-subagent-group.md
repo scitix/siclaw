@@ -182,11 +182,19 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 ### Progress (two paths that must not be confused)
 
 - **Foreground:** the tool's `onUpdate` carries either legacy per-child steps (collapse) or the
-  aggregate status array + phase (batch: map x/N → reduce). The executor emits a union of the two
-  progress shapes; the tool bridge and the frontend both dispatch by shape.
+  aggregate status array + phase (batch: map x/N → reduce). Batch updates use the same wire names
+  as background events: `child_session_id` and the latest `activity` per started item, plus
+  `reduce_child_session_id` once the reducer owns an execution slot. The executor emits a union of
+  the two progress shapes; the tool bridge and the frontend both dispatch by shape.
 - **Background:** `onUpdate` goes dead after `launched`, so live per-item progress rides a
   **`group_progress` chat event** (same `emit_chat_event` channel as `subagent_done`, throttled,
-  **live-only — never persisted**). It carries `job_id`, `phase`, and `[{index, status}]`.
+  **live-only — never persisted**). It carries `job_id`, `phase`, and
+  `[{index, status, child_session_id?, activity?}]` plus `reduce_child_session_id?` during the
+  reduce phase.
+  A child id is assigned only after the item acquires an execution slot, immediately before its
+  first `running` frame, and the same id is passed into `runSpawnedSubagent`; queued/skipped-never-
+  started items therefore expose no false drill-in. The reduce id follows the same rule and is
+  present from the first reduce frame.
   Correctness comes from the persisted per-child + terminal events: the card rebuilds from them
   on reload / refetch (per-child grouped by the `{groupId}#` prefix), so a dropped or coalesced
   progress frame costs immediacy, never correctness.

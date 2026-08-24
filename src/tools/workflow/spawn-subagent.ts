@@ -248,13 +248,25 @@ export function createSpawnSubagentTool(
               const done = progress.items.filter(
                 (i) => i.status !== "queued" && i.status !== "running",
               ).length;
+              const items = progress.items.map(({ index, status, childSessionId, activity: itemActivity }) => ({
+                index,
+                status,
+                ...(childSessionId ? { child_session_id: childSessionId } : {}),
+                ...(itemActivity ? { activity: itemActivity } : {}),
+              }));
               const activity =
                 progress.phase === "reduce"
                   ? "Summarizing results…"
                   : `Running sub-agents… ${done}/${total} done`;
               onUpdate({
                 content: [{ type: "text" as const, text: activity }],
-                details: { phase: progress.phase, items: progress.items },
+                details: {
+                  phase: progress.phase,
+                  items,
+                  ...(progress.reduceChildSessionId
+                    ? { reduce_child_session_id: progress.reduceChildSessionId }
+                    : {}),
+                },
               });
             } else {
               onUpdate({

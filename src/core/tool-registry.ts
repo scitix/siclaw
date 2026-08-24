@@ -163,11 +163,17 @@ export interface SpawnSubagentGroupRequest {
 export interface GroupItemProgress {
   index: number;
   status: "queued" | "running" | GroupItemStatus;
+  /** Assigned once the item owns an execution slot; absent while it is still queued/skipped. */
+  childSessionId?: string;
+  /** Latest concise child activity suitable for the parent group card. */
+  activity?: string;
 }
 export interface SubagentGroupProgress {
   /** "map" while item children run; "reduce" while the summary child runs. */
   phase: "map" | "reduce";
   items: GroupItemProgress[];
+  /** Assigned immediately before the reduce child starts. */
+  reduceChildSessionId?: string;
 }
 
 /** One item's terminal record in the group report. */
