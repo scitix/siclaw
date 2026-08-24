@@ -347,11 +347,19 @@ function isTaskTool(toolName?: string | null): boolean {
 
 function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
   if (m.role !== "tool") return undefined;
-  // A tool the user Stopped is finalized with metadata.status="stopped" (outcome stays null —
-  // see sse-consumer abort finalization). Map it to "aborted" so it shows the terminal ⊘ state
-  // even after a history refetch, instead of falling through to "running" (spinner forever).
+  // A tool whose turn ended without a result is finalized with outcome=null and a terminal
+  // metadata.status (see the sse-consumer's terminal finalization). Map all of them to "aborted"
+  // so the row shows the terminal ⊘ state even after a history refetch, instead of falling through
+  // to "running" — a forever-spinner.
+  //
+  // "abandoned" is the record-was-lost case (EOF / disconnect / exception / the parent turn simply
+  // ending), as opposed to "stopped", a deliberate user act. Without it listed here the row falls
+  // through to the stale timer, which is the visible half of that defect AND the wrong instrument:
+  // delegate_to_agent's bucket is 4 minutes, so a genuinely long delegation gets painted as an
+  // error while an abandoned row keeps spinning until the timer trips. Both questions are answered
+  // by reading the status the writer already recorded.
   const status = m.metadata?.status;
-  if (status === "stopped" || status === "aborted" || status === "killed") return "aborted";
+  if (status === "stopped" || status === "abandoned" || status === "aborted" || status === "killed") return "aborted";
   if (isStaleRunningTool(m)) return "error";
   if (m.outcome === "error" || m.outcome === "blocked") return "error";
   if (m.outcome === "success") return "success";

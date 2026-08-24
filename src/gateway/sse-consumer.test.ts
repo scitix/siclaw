@@ -9,6 +9,8 @@ import { AgentBoxClient } from "./agentbox/client.js";
 const appendCalls: any[] = [];
 const updateCalls: any[] = [];
 let appendCounter = 0;
+/** Make the NEXT updateMessage throw — exercises the peek-then-shift contract. */
+let updateShouldThrowOnce = false;
 
 vi.mock("./chat-repo.js", () => ({
   appendMessage: vi.fn(async (msg: any) => {
@@ -16,6 +18,10 @@ vi.mock("./chat-repo.js", () => ({
     return `msg-${++appendCounter}`;
   }),
   updateMessage: vi.fn(async (msg: any) => {
+    if (updateShouldThrowOnce) {
+      updateShouldThrowOnce = false;
+      throw new Error("update failed");
+    }
     updateCalls.push(msg);
   }),
   incrementMessageCount: vi.fn(async () => {}),
@@ -42,10 +48,21 @@ function mkClient(events: unknown[], onBeforeEvent?: (event: unknown) => void): 
   return c as unknown as AgentBoxClient;
 }
 
+/** A client that yields events and then THROWS — the transport-fault exit path. */
+function mkThrowingClient(events: unknown[], err: Error): AgentBoxClient {
+  return {
+    async *streamEvents(_sessionId: string) {
+      for (const e of events) yield e;
+      throw err;
+    },
+  } as unknown as AgentBoxClient;
+}
+
 beforeEach(() => {
   appendCalls.length = 0;
   updateCalls.length = 0;
   appendCounter = 0;
+  updateShouldThrowOnce = false;
 });
 
 // ── Tests ──────────────────────────────────────────────
@@ -797,7 +814,11 @@ describe("consumeAgentSse — tool execution", () => {
     });
     expect(toolRow.toolInput).toContain("check pods");
     expect(toolRow.metadata.status).toBe("running");
-    expect(updateCalls).toHaveLength(0);
+    // The stream ended without a tool_execution_end, so the terminal finalizer closes the row.
+    // (It used to assert updateCalls was empty — that was the pre-fix behaviour, where the row
+    // stayed `running` in the DB permanently.)
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0].metadata.status).toBe("abandoned");
   });
 
   it("marks outcome=blocked when details.blocked is true", async () => {
@@ -997,13 +1018,83 @@ describe("consumeAgentSse — abort finalization", () => {
     expect(partial.metadata?.incomplete).toBe(true);
   });
 
-  it("does NOT finalize tool rows on a normal (non-abort) stream end", async () => {
+  // ⚠️ This test previously asserted the OPPOSITE — "does NOT finalize tool rows on a normal
+  // (non-abort) stream end" — and it was a deliberate decision, not a gap. It is inverted here
+  // because leaving the row `running` forever corrupts the audit record: production sampling found
+  // a peer still executing in 58/58 such cases, so the work happened and only the record was lost.
+  //
+  // Note WHY the old assertion would still have passed: it looked for status === "stopped", and this
+  // path writes "abandoned". A test kept as-is would have gone green for the wrong reason — which is
+  // exactly the false-pass this suite must not accumulate.
+  it("finalizes an unfinished tool row on a normal (non-abort) stream end, as abandoned", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "node_exec", args: { command: "x" } },
       // stream ends without a tool_execution_end, but the turn was NOT aborted
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const finalized = updateCalls.find((u) => u.metadata?.status === "abandoned");
+    expect(finalized).toBeDefined();
+    // outcome stays NULL: "error" would be a false claim about work that most likely succeeded, and
+    // would put these rows in the failure set that feeds the nightly analyzer.
+    expect(finalized.outcome).toBeNull();
+    expect(finalized.metadata.reason).toBe("stream_ended");
+    expect(typeof finalized.metadata.duration_ms).toBe("number");
+    // updateMessage REPLACES columns, so the row's identity must be re-sent or the card loses it.
+    expect(finalized.toolName).toBe("node_exec");
+    expect(finalized.toolInput).toContain("x");
+    // "abandoned" is NOT "stopped": the second names a deliberate user act with a known actor.
     expect(updateCalls.find((u) => u.metadata?.status === "stopped")).toBeUndefined();
+  });
+
+  it("still marks a user Stop as stopped, not abandoned", async () => {
+    const controller = new AbortController();
+    // Abort mid-stream, not before: a pre-aborted signal stops the loop before the start event is
+    // processed, so there would be no pending row to finalize at all.
+    const client = {
+      async *streamEvents() {
+        yield { type: "tool_execution_start", toolName: "node_exec", args: { command: "x" } };
+        controller.abort();
+        yield { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "(unprocessed)" } };
+      },
+    } as unknown as AgentBoxClient;
+    await consumeAgentSse({
+      client, sessionId: "s", userId: "u", persistMessages: true, signal: controller.signal,
+    });
+    const finalized = updateCalls.find((u) => u.metadata?.status === "stopped");
+    expect(finalized).toBeDefined();
+    expect(finalized.metadata.reason).toBe("user_stop");
+    expect(updateCalls.find((u) => u.metadata?.status === "abandoned")).toBeUndefined();
+  });
+
+  it("finalizes when the event loop THROWS — the finalizer is inside the finally", async () => {
+    // The old block sat AFTER the try/finally, so an exception propagated straight past it and the
+    // row was stranded. This is the one exit that cannot be covered by moving the condition alone.
+    const client = mkThrowingClient(
+      [{ type: "tool_execution_start", toolName: "node_exec", args: { command: "x" } }],
+      new Error("transport blew up"),
+    );
+    await expect(consumeAgentSse({
+      client, sessionId: "s", userId: "u", persistMessages: true,
+    })).rejects.toThrow("transport blew up");
+    const finalized = updateCalls.find((u) => u.metadata?.status === "abandoned");
+    expect(finalized).toBeDefined();
+    expect(finalized.metadata.reason).toBe("stream_error");
+  });
+
+  it("a failed tool_execution_end write leaves the row reachable by the finalizer", async () => {
+    // tool_execution_end peeks and only shifts after the write succeeds. Shifting first meant a
+    // throwing persist erased the entry, so the row stayed `running` and the finalizer could no
+    // longer see it — the case that most needs finalizing was the one it could not reach.
+    updateShouldThrowOnce = true;
+    const events = [
+      { type: "tool_execution_start", toolName: "node_exec", args: { command: "x" } },
+      { type: "tool_execution_end", toolName: "node_exec", result: { content: [{ type: "text", text: "ok" }] } },
+    ];
+    await expect(consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true,
+    })).rejects.toThrow("update failed");
+    // The first update threw; the finalizer then wrote the row as abandoned rather than losing it.
+    expect(updateCalls.find((u) => u.metadata?.status === "abandoned")).toBeDefined();
   });
 });
 

@@ -19,6 +19,20 @@ describe("toPilotMessage — stopped tool rows render as aborted", () => {
     expect(toPilotMessage(toolMsg({ metadata: { status: "killed" } })).toolStatus).toBe("aborted")
   })
 
+  it("maps \"abandoned\" — the record-was-lost case — to aborted, without waiting for a timer", () => {
+    // The gateway writes "abandoned" when the turn ended without a result and the user did NOT
+    // press Stop (EOF / disconnect / exception / the parent turn ending). Omitting it here is what
+    // leaves the row to the stale timer — which is both the visible half of the defect and the
+    // wrong instrument: delegate_to_agent's bucket is 4 minutes, so a long-running delegation is
+    // painted as an error while an abandoned row spins until the timer trips.
+    const pm = toPilotMessage(toolMsg({
+      outcome: null,
+      // A fresh started_at, so the stale timer could NOT be what produced the verdict.
+      metadata: { status: "abandoned", reason: "stream_ended", started_at: new Date().toISOString() },
+    }))
+    expect(pm.toolStatus).toBe("aborted")
+  })
+
   it("still maps a genuinely running row (no terminal status) to \"running\"", () => {
     const pm = toPilotMessage(toolMsg({ outcome: null, metadata: { status: "running", started_at: new Date().toISOString() } }))
     expect(pm.toolStatus).toBe("running")

@@ -319,6 +319,18 @@ function shiftPending<T>(map: Map<string, T[]>, key: string): T | undefined {
   return value;
 }
 
+/**
+ * Read the head of a pending queue WITHOUT removing it.
+ *
+ * tool_execution_end must peek, write, and only then shift. Removing first meant that a failed
+ * persist dropped the entry on the floor: the row stayed `running` forever and the finalizer below
+ * could no longer see it, so the one case that most needs finalizing was the one case it could not
+ * reach.
+ */
+function peekPending<T>(map: Map<string, T[]>, key: string): T | undefined {
+  return map.get(key)?.[0];
+}
+
 /** Everything captured at tool_execution_start that its tool_execution_end
  *  (and the abort finalizer) needs to complete the row. */
 interface PendingToolCall {
@@ -349,6 +361,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     appendMessage({ ...input, traceId: opts.traceId ?? null });
 
   let assistantContent = "";
+  /** Set when the event loop throws, so the finalizer can name the exit. */
+  let streamFault: unknown;
   let currentMsgText = "";
   let resultText = "";
   let taskReportText = "";
@@ -638,7 +652,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         if (toolResult?.details?.blocked) outcome = "blocked";
         else if (toolResult?.details?.error) outcome = "error";
 
-        const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
+        // PEEK, not shift — the entry is retired only once its row is written (below). See
+        // peekPending: a throwing persist used to erase the entry, stranding the row as `running`
+        // beyond the finalizer's reach.
+        const pendingKey = toolCallKey(evt, toolName);
+        const pendingCall = peekPending(pendingToolCalls, pendingKey);
         const durationMs = pendingCall ? Date.now() - pendingCall.startMs : undefined;
         const preThinkingMs = pendingCall?.preThinkingMs;
         // Surface duration + pre-thinking on the live event for frontend.
@@ -682,6 +700,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             await incrementMessageCount(sessionId);
           }
         }
+        // Retire the entry only now: the row carries its outcome, so the finalizer must not
+        // touch it. Reached only if the writes above did not throw.
+        shiftPending(pendingToolCalls, pendingKey);
 
         // task_report detection — use toolName from this event, not lastToolName
         // (lastToolName tracks the last *started* tool, unreliable with parallel calls)
@@ -1035,25 +1056,53 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // which emits another agent_start/agent_end cycle. The loop ends naturally
       // when the agentbox closes the SSE stream after prompt() fully resolves.
     }
+  } catch (err) {
+    // Recorded only to name the exit in the finalizer below; the error still propagates.
+    streamFault = err;
+    throw err;
   } finally {
     await flushTerminalError();
+    await finalizeUnfinishedRows();
   }
 
-  // ── Abort finalization ───────────────────────────────────────────────
-  // The loop above breaks on `signal.aborted` (L205) the moment the user hits Stop. At that
-  // point any tool whose tool_execution_start row was persisted but never got a matching
-  // tool_execution_end is left with outcome=null / metadata.status="running" — so it would
-  // spin forever in the UI and a history refetch would re-paint it as running. Finalize those
-  // rows here as "stopped" (mirroring a background job's stopped representation: outcome stays
-  // null, metadata.status="stopped"), and persist any partial assistant text so the words the
-  // model already streamed don't vanish on the next refetch.
-  if (persist && signal?.aborted) {
+  // ── Terminal finalization ────────────────────────────────────────────
+  // Any tool whose tool_execution_start row was persisted but never got a matching
+  // tool_execution_end is left with outcome=null / metadata.status="running" — it would spin in
+  // the UI until a stale timer trips, and the DB row stays "running" FOREVER, corrupting audit,
+  // metrics and every trace analysis built on them. That row is the audit record: nothing
+  // recomputes it later.
+  //
+  // This runs on EVERY exit, not only on Stop. It used to be an abort-only block sitting AFTER
+  // the try/finally, so EOF, disconnect, a thrown error, and a parent turn that simply ended all
+  // skipped it — and the thrown-error case skipped it precisely because the block was outside the
+  // finally. Both are fixed here: it is inside the finally, and it is unconditional.
+  //
+  // TWO STATUSES, and the distinction is load-bearing:
+  //   • stopped   — the user pressed Stop. A deliberate act with a known actor.
+  //   • abandoned — the record was lost while the peer was, as far as anyone knows, still working.
+  // Production analysis found a peer executing in 58/58 sampled cases, continuing a median ≈255s
+  // after the row was orphaned. So `outcome` stays NULL for both: writing "error" would be a false
+  // statement about work that most likely succeeded, and would inject those rows into the failure
+  // set that feeds the nightly analyzer — the very instrument used to decide what to fix next.
+  //
+  // ⚠️ DEPLOY ORDER: the analysis layer must classify `stopped | abandoned | aborted | killed` as
+  // "terminated without a result" — excluded from the failed, empty, running AND success sets —
+  // and that change must SHIP FIRST. An outcome-less row is currently counted as `empty` when it
+  // carries no text and as `success` when it carries partial text (which this function writes), so
+  // deploying this writer first would silently inflate the success rate. Rows written in the gap
+  // are misclassified permanently.
+  async function finalizeUnfinishedRows(): Promise<void> {
+  if (persist) {
+    const stopped = signal?.aborted === true;
+    const reason = stopped ? "user_stop" : streamFault ? "stream_error" : "stream_ended";
     for (const queue of pendingToolCalls.values()) {
       for (const pendingCall of queue) {
         if (!pendingCall.messageId) continue;
         const stoppedMeta: Record<string, unknown> = {
-          status: "stopped",
+          status: stopped ? "stopped" : "abandoned",
+          reason,
           started_at: new Date(pendingCall.startMs).toISOString(),
+          duration_ms: Date.now() - pendingCall.startMs,
         };
         try {
           // updateMessage REPLACES columns (it is not a partial patch), so we must re-send
@@ -1089,6 +1138,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       }
       assistantContent = "";
     }
+  }
   }
 
   // Fallback: if no message_end arrived but we have accumulated text
