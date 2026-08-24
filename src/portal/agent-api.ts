@@ -19,7 +19,11 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
-import { encodeSubagentModelsForDb } from "../core/subagent-models.js";
+import {
+  canonicalTierConfig,
+  encodeSubagentModelsForDb,
+  type SubagentTierConfigEntry,
+} from "../core/subagent-models.js";
 import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
@@ -91,6 +95,21 @@ function normalizedToolCapabilities(value: unknown): string {
   const parsed = safeParseJson<string[] | null>(value, null);
   if (!Array.isArray(parsed) || parsed.length === 0) return "";
   return JSON.stringify([...new Set(parsed)].sort());
+}
+
+/**
+ * Canonical comparison form for a stored tier list.
+ *
+ * NOT `normalizedToolCapabilities`: that one dedupes with a Set and sorts, which
+ * is meaningless for objects — Set never collapses two equal-valued objects, and
+ * the default sort compares them as "[object Object]". Reuses the same canonical
+ * form the revision is computed over, so "changed" here means exactly what
+ * "different revision" means downstream.
+ */
+function normalizedSubagentModels(value: unknown): string {
+  const parsed = safeParseJson<SubagentTierConfigEntry[]>(value, [] as SubagentTierConfigEntry[]);
+  if (!Array.isArray(parsed) || parsed.length === 0) return "";
+  return canonicalTierConfig(parsed);
 }
 
 
@@ -308,7 +327,7 @@ export function registerAgentRoutes(
     // The Web settings form sends a complete snapshot on every Save. Read the
     // fields whose side effects must be change-driven so an unrelated rename,
     // model edit, or binding save does not invalidate warm sessions.
-    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities"]
+    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities", "subagent_models"]
       .some((field) => field in body);
     let current: {
       idle_timeout_sec?: unknown;
@@ -316,10 +335,11 @@ export function registerAgentRoutes(
       agent_type?: unknown;
       is_production?: unknown;
       tool_capabilities?: unknown;
+      subagent_models?: unknown;
     } | undefined;
     if (needsCurrentState) {
       const [rows] = await db.query(
-        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities FROM agents WHERE id = ?",
+        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities, subagent_models FROM agents WHERE id = ?",
         [params.id],
       ) as any;
       current = rows[0];
@@ -359,6 +379,9 @@ export function registerAgentRoutes(
     const toolCapabilitiesChanged =
       encodedToolCapabilities !== undefined &&
       normalizedToolCapabilities(encodedToolCapabilities) !== normalizedToolCapabilities(current?.tool_capabilities);
+    const subagentModelsChanged =
+      encodedSubagentModels !== undefined &&
+      normalizedSubagentModels(encodedSubagentModels) !== normalizedSubagentModels(current?.subagent_models);
 
     // Capture the current idle window before the update — needed to detect the
     // resident(0) → finite transition, which (unlike every other transition)
@@ -466,7 +489,12 @@ export function registerAgentRoutes(
     // invalidate warm sessions so the next turn immediately restores with the
     // latest editable prompt (no AgentBox kill and no 30s idle wait).
     const reloadResources: string[] = [];
-    if (toolCapabilitiesChanged || agentTypeChanged) reloadResources.push("tools");
+    // A tier edit changes the MENU, which is baked into a session's tool
+    // description at creation — so a warm session keeps advertising the old one
+    // while the next turn's binding already carries the new candidates. The two
+    // revisions then disagree on every spawn and tiering silently stops working
+    // until the session happens to die. Reloading `tools` invalidates it.
+    if (toolCapabilitiesChanged || agentTypeChanged || subagentModelsChanged) reloadResources.push("tools");
     if (promptChanged) reloadResources.push("prompt");
     if (reloadResources.length > 0) {
       const payload = { agentId: params.id, resources: reloadResources };

@@ -153,6 +153,20 @@ function normalizeRequiredString(raw: unknown): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
+/**
+ * Read `whenToUse`, accepting the snake_case spelling as an alias.
+ *
+ * `config.getAgent` is a control-plane RPC whose every other field is snake_case
+ * (`tool_capabilities`, `agent_type`, `model_provider`), so a control plane
+ * emitting `when_to_use` is following that RPC's convention, not breaking it —
+ * while the tools payload this ends up in is camelCase like the rest of the
+ * AgentBox wire. Accepting both is what lets each boundary keep its own
+ * convention instead of one side silently producing an empty menu.
+ */
+function readWhenToUse(entry: Record<string, unknown>): unknown {
+  return entry.whenToUse ?? entry.when_to_use;
+}
+
 function normalizeWhenToUse(raw: unknown): string | undefined {
   const trimmed = normalizeRequiredString(raw);
   if (trimmed === undefined) return undefined;
@@ -197,7 +211,7 @@ export function normalizeSubagentTierMenu(raw: unknown): NormalizeResult<Subagen
     if (seen.has(tier)) return reject(`menu declares tier "${tier}" more than once`);
     seen.add(tier);
 
-    const whenToUse = normalizeWhenToUse(entry.whenToUse);
+    const whenToUse = normalizeWhenToUse(readWhenToUse(entry));
     if (whenToUse === undefined) {
       return reject(
         `menu tier "${tier}" whenToUse must be ${WHEN_TO_USE_MIN_CHARS}-${WHEN_TO_USE_MAX_CHARS} code points with no control characters`,
@@ -487,6 +501,23 @@ export function projectTierMenuFromConfig(
   entries: unknown,
   computeRevision: (canonical: string) => string,
 ): SubagentTierMenu | null {
+  // A control plane may deliver the menu ALREADY PROJECTED —
+  // `{revision, items:[{tier, whenToUse}]}` — rather than the config array. That
+  // is the better shape for it to send: the menu channel has no business seeing
+  // provider/modelId, so projecting on the producer side discloses strictly less.
+  //
+  // Handling only the config array made the feature silently absent on exactly
+  // those deployments: this returned null, no menu reached the tool description,
+  // and `spawn_subagent` never exposed the parameter — with every unit test still
+  // green, because they all fed the Standalone shape.
+  if (isRecord(entries) && Array.isArray(entries.items)) {
+    const normalized = normalizeSubagentTierMenu(entries);
+    // Keep the producer's revision: it has to match the one that accompanies the
+    // candidates, and recomputing here would be computing it over a projection
+    // that no longer carries provider/modelId.
+    return normalized.ok ? normalized.value : null;
+  }
+
   if (!Array.isArray(entries) || entries.length === 0) return null;
 
   const items: SubagentTierMenuItem[] = [];
@@ -494,9 +525,9 @@ export function projectTierMenuFromConfig(
   for (const raw of entries) {
     if (!isRecord(raw)) return null;
     const tier = normalizeTier(raw.tier);
-    const whenToUse = normalizeWhenToUse(raw.whenToUse);
-    const provider = normalizeRequiredString(raw.provider);
-    const modelId = normalizeRequiredString(raw.modelId);
+    const whenToUse = normalizeWhenToUse(readWhenToUse(raw));
+    const provider = normalizeRequiredString(raw.provider ?? raw.model_provider);
+    const modelId = normalizeRequiredString(raw.modelId ?? raw.model_id);
     if (!tier || !whenToUse || !provider || !modelId) return null;
     items.push({ tier, whenToUse });
     canonicalEntries.push({ tier, provider, modelId, whenToUse });

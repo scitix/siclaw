@@ -523,6 +523,62 @@ describe("registerAgentRoutes", () => {
       );
     });
 
+    it("reloads tools when the sub-agent tier list changes", async () => {
+      // The menu is baked into a session's tool description at creation, while the
+      // next turn's binding already carries the new candidates. Without this
+      // reload a warm session advertises the old menu against new candidates, the
+      // revisions disagree on every spawn, and tiering silently stops working
+      // until that session happens to die.
+      query
+        // Order matters: the tier reference check runs BEFORE the current-state read.
+        .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: JSON.stringify([
+            { tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" },
+          ]),
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          subagent_models: [
+            { tier: "deep", provider: "p", modelId: "m", whenToUse: "causal reasoning across sources" },
+          ],
+        },
+      }));
+
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("does not reload tools when the tier list is resubmitted unchanged", async () => {
+      // Compared through the same canonical form the revision uses, so a no-op
+      // save does not kick warm sessions.
+      const tiers = [{ tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" }];
+      query
+        .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: JSON.stringify(tiers),
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { subagent_models: tiers },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalledWith("a1", "agent.reload", expect.anything());
+    });
+
     it("does not reload prompt or tools when the complete form resubmits identical values", async () => {
       query
         .mockResolvedValueOnce([[{

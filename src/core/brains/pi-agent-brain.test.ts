@@ -296,6 +296,31 @@ describe("PiAgentBrain", () => {
     expect(brain.getContextUsage()).toEqual({ tokens: 50, contextWindow: 100, percent: 0 });
   });
 
+  describe("captureModelParams", () => {
+    it("reads the level back so a caller can restore it", () => {
+      // pi carries the current thinking level across a model switch whenever the
+      // target supports thinking (_getThinkingLevelForModelSwitch returns
+      // this.thinkingLevel), and applyModelParams cannot lower it — an absent
+      // effort is a no-op, not a reset. So a rejected sub-agent tier that raised
+      // the level would leave the fallback model running raised, changing the
+      // cost and latency of work nobody asked to be expensive. Capture/restore is
+      // the only way down.
+      const session = makeFakeSession({ thinkingLevel: "xhigh" });
+      const brain = new PiAgentBrain(session);
+      expect(brain.captureModelParams()).toEqual({ reasoningEffort: "xhigh" });
+    });
+
+    it("returns undefined rather than throwing when the level is unavailable", () => {
+      const session = makeFakeSession();
+      Object.defineProperty(session, "thinkingLevel", {
+        get() { throw new Error("not available"); },
+      });
+      const brain = new PiAgentBrain(session);
+      expect(() => brain.captureModelParams()).not.toThrow();
+      expect(brain.captureModelParams()).toBeUndefined();
+    });
+  });
+
   describe("checkContextFitForModelPrompt (pure fit check)", () => {
     it("never compacts and never prompts, whatever the verdict", async () => {
       // This is the whole reason it exists separately from

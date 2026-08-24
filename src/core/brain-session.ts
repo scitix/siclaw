@@ -228,6 +228,19 @@ export interface BrainSession {
    */
   checkContextFitForModelPrompt?(model: BrainModelInfo, text: string): BrainContextPreflightResult;
 
+  /**
+   * Read the runtime tunables currently in effect, so a caller can restore them.
+   *
+   * Needed because `applyModelParams` is a SETTER with no reset — an absent
+   * `reasoningEffort` is a no-op, not a clear — and `setModel` does not restore a
+   * default either: pi carries the current thinking level across a model switch
+   * whenever the new model supports thinking, and only falls back to the default
+   * when it does not. So a rejected sub-agent tier that raised the level leaves it
+   * raised on the model it fell back to, silently changing that model's cost and
+   * latency. Capture before, restore after.
+   */
+  captureModelParams?(): BrainModelParams | undefined;
+
   /** Register a provider dynamically (from gateway DB config). */
   registerProvider?(name: string, config: Record<string, unknown>): void;
 

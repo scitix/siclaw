@@ -330,6 +330,23 @@ export class PiAgentBrain implements BrainSession {
     this.session.modelRegistry.registerProvider(name, config as any);
   }
 
+  /**
+   * Snapshot the tunables in effect, for restoring after a failed tier attempt.
+   *
+   * See `BrainSession.captureModelParams`: pi's `setModel` carries the current
+   * thinking level across a switch when the target supports thinking
+   * (`_getThinkingLevelForModelSwitch` returns `this.thinkingLevel`), so nothing
+   * in the ordinary set/switch path puts a raised level back down.
+   */
+  captureModelParams(): BrainModelParams | undefined {
+    try {
+      const level = this.session.thinkingLevel;
+      return typeof level === "string" ? { reasoningEffort: level } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   applyModelParams(params: BrainModelParams): void {
     // reasoningEffort → session thinking level. pi maps this to the provider's
     // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.

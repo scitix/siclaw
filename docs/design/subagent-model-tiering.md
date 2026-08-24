@@ -298,7 +298,7 @@ contract, not an implementation detail.
 
 | Carrier | Field | Shape | Contains credentials |
 |---|---|---|---|
-| Agent config read (`config.getAgent`) | `subagent_model_tiers` | Config form (tier + provider + modelId + whenToUse) | No |
+| Agent config read (`config.getAgent`) | `subagent_model_tiers` | **Either** the config form (tier + provider + modelId + whenToUse) **or** an already-projected `SubagentTierMenu` — see below | No |
 | tools sync payload (`ToolsPayload`, `sync-handlers.ts:647`) | `subagentTierMenu` | `SubagentTierMenu` | No |
 | Model binding (`config.getModelBinding` → `binding`) | `subagentTiers` | `SubagentTierCandidates` | **Yes** |
 | AgentBox prompt body | `subagentTiers` | `SubagentTierCandidates` | **Yes** |
@@ -336,6 +336,32 @@ field:
 `tier` is the only field common to both, and it is the join key. **Credentials
 appear only in `SubagentTierCandidates`** — anything that puts a `modelConfig` on
 the menu channel is a bug, not a convenience.
+
+#### `config.getAgent` accepts two shapes, and a control plane should send the projected one
+
+The Gateway accepts either the raw config array or an already-projected
+`SubagentTierMenu`. **Projecting on the producer side is preferable**: the menu
+channel has no business seeing `provider` / `modelId`, so a control plane that
+projects before answering discloses strictly less than one that hands over its
+whole config for the Gateway to trim.
+
+The two differ in where the revision comes from. A config array is hashed by the
+Gateway over the canonical form; a projected menu **keeps the producer's
+revision**, because that value has to match the one shipped with the candidates,
+and re-hashing a projection that no longer carries `provider`/`modelId` could
+never reproduce it.
+
+Field names: this RPC is snake_case throughout (`tool_capabilities`,
+`agent_type`, `model_provider`), so a control plane emitting `when_to_use` is
+following its convention rather than breaking the contract. The Gateway accepts
+both spellings and normalizes to camelCase for the tools payload, which is
+camelCase like the rest of the AgentBox wire. Each boundary keeps its own
+convention; neither side has to adopt the other's.
+
+**This is contract surface between two implementations, so it is covered by a
+test built from real upstream-shaped fixtures** rather than from this repo's own
+writer — the whole suite was green while the projection returned null for the
+upstream shape and the feature did not exist there.
 
 ### 6.2 Version skew
 

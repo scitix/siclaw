@@ -47,7 +47,7 @@ import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "
 import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
 import { normalizeAgentType } from "../core/agent-types.js";
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
-import type { BrainSession } from "../core/brain-session.js";
+import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
@@ -557,6 +557,15 @@ export class AgentBoxSessionManager {
     const requested = plan?.requestedTier ?? null;
     const parentCandidate = plan?.effectiveParent ?? null;
 
+    // The child's tunables BEFORE any tier touches them. A rejected tier that
+    // raised the thinking level would otherwise leave it raised: pi carries the
+    // current level across a model switch whenever the target model supports
+    // thinking, and `applyModelParams` cannot lower it (an absent effort is a
+    // no-op, not a reset). Without this a tier asking for `xhigh` that fails its
+    // fit check leaves the PARENT model running at `xhigh` — quietly changing the
+    // cost and latency of work the caller never asked to be expensive.
+    const baselineParams = child.brain.captureModelParams?.();
+
     const applyParent = async (
       reason: TierFallbackReason | undefined,
       source: TierSelectionSource,
@@ -566,7 +575,9 @@ export class AgentBoxSessionManager {
         // whatever the factory gave it.
         return { requestedTier: requested, resolvedTier: null, source, fallbackReason: reason };
       }
-      const applied = await this.putBrainOnCandidate(child.brain, parentCandidate, briefing, false);
+      const applied = await this.putBrainOnCandidate(
+        child.brain, parentCandidate, briefing, false, baselineParams,
+      );
       if (!applied.ok) {
         return {
           requestedTier: requested,
@@ -625,6 +636,12 @@ export class AgentBoxSessionManager {
     candidate: ModelRouteCandidate,
     briefing: string,
     checkFit: boolean,
+    /**
+     * Tunables to restore when the candidate carries none of its own. Supplied on
+     * the FALLBACK path, where a rejected tier may have left the level raised and
+     * neither `setModel` nor `applyModelParams` will lower it.
+     */
+    restoreParams?: BrainModelParams,
   ): Promise<{ ok: true } | { ok: false; reason: TierFallbackReason; detail?: string }> {
     const resolved = withResolvedCandidateConfig(candidate);
     try {
@@ -639,14 +656,17 @@ export class AgentBoxSessionManager {
           detail: `${resolved.provider}/${resolved.modelId}`,
         };
       }
-      // setModel is called UNCONDITIONALLY, without a `modelNeedsRebind` guard —
-      // unlike the routing runner. That is deliberate on the fallback path: a
-      // rejected tier has already applied ITS params, and `applyModelParams` is a
-      // setter with no reset (an absent `reasoning_effort` is a no-op, not a
-      // clear), so the only thing that restores the target model's own level is
-      // pi's own setModel, which re-reads the persisted default. Skipping it when
-      // the model happens to be unchanged would leave the tier's level behind.
+      // Unconditional, without a `modelNeedsRebind` guard — the routing runner can
+      // skip a no-op switch, this path cannot, because the switch is also what
+      // re-clamps the level to the target model's capabilities.
       await brain.setModel(model);
+
+      // Restore the pre-tier baseline BEFORE applying the candidate's own params,
+      // so an explicit setting still wins. `setModel` does not do this for us: pi
+      // carries the current thinking level across a switch whenever the target
+      // supports thinking, so a rejected `xhigh` tier would otherwise leave the
+      // parent model running at `xhigh`.
+      if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
       applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
 
       if (checkFit && brain.checkContextFitForModelPrompt) {
