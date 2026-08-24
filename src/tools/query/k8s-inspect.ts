@@ -31,6 +31,7 @@ import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity, preExecSecurity } from "../infra/security-pipeline.js";
 import { applySanitizer } from "../infra/output-sanitizer.js";
+import { redactDocument } from "../infra/kubectl-sanitize.js";
 import { validateKubectlInPipeline } from "../infra/kubectl-readonly-policy.js";
 import {
   buildSandboxCommand, SANDBOX_KILL_GRACE_S, OUTER_BACKSTOP_MARGIN_S,
@@ -82,15 +83,17 @@ function outerTimeoutMs(isProd: boolean): number {
  * a new relation would push the total over. Adding relations therefore forces a deliberate revisit
  * instead of silently starting to truncate.
  */
-const MAX_TOTAL_CHARS = 3_000;
+const MAX_TOTAL_CHARS = 5_500;
 const MAX_SUBJECT_CHARS = 700;
-// 400, not 300: a node's abnormal conditions now carry their reason and transition time, which is
-// what makes the section worth reading instead of a prompt to go run `describe`. The arithmetic still
-// closes — worst case for the pod kind is 220 + 700 + 960 + 2*400 = 2680 against 3000 — and the test
-// over the relation table is what keeps that true as relations are added.
+// 400, not 300: a node's abnormal conditions carry their reason and transition time, which is what
+// makes the section worth reading instead of a prompt to go run `describe`.
 const MAX_NEIGHBOUR_CHARS = 400;
 const MAX_EVENT_LINES = 6;
-const MAX_EVENT_CHARS = 160;
+// FailedScheduling messages commonly enumerate several rejection classes. 160 characters cut off
+// the reason the pending-pod skill asks the reader to act on, so events receive most of the bundle's
+// budget. The output still stays below processToolOutput's 8000-character truncation threshold:
+// 220 + 700 + 6*600 + 2*400 = 5320 for the current largest relation table.
+const MAX_EVENT_CHARS = 600;
 /** Section headers, the `=== kind ns/name ===` line and the trailing `status:` line. */
 const CHROME_CHARS = 220;
 
@@ -121,12 +124,19 @@ type ProbeResult = ProbeOk | ProbeBad;
 function classifyProbeFailure(stderr: string, timedOut: boolean): ProbeBad {
   if (timedOut) return { ok: false, reason: "timeout" };
   const s = stderr.toLowerCase();
-  if (/not found|notfound/.test(s)) return { ok: false, reason: "not_found" };
+  // Only the API's typed NotFound answer proves the object is absent. A broad `not found` match also
+  // catches `/bin/bash: kubectl: command not found` and missing exec credential plugins, turning a
+  // local dependency failure into a successful existence answer.
+  if (/error from server\s*\(notfound\)\s*:/.test(s)) return { ok: false, reason: "not_found" };
   if (/forbidden|is not allowed|cannot list|cannot get/.test(s)) return { ok: false, reason: "forbidden" };
   if (/connection refused|no such host|i\/o timeout|dial tcp|unable to connect/.test(s)) {
     return { ok: false, reason: "unreachable" };
   }
-  return { ok: false, reason: "error", detail: firstLine(stderr) };
+  // This detail is later promoted into the model-visible summary rather than passed as stderr to
+  // postExecSecurity, so redact it here. Credential plugins and proxies can write secrets to stderr.
+  const { text, redacted } = redactDocument(stderr);
+  const detail = firstLine(text) + (redacted ? " [sensitive content redacted]" : "");
+  return { ok: false, reason: "error", ...(detail ? { detail } : {}) };
 }
 
 function firstLine(text: string): string {
@@ -217,13 +227,26 @@ function getJsonCommand(resource: string, name: string, namespace: string | unde
 /**
  * Events for one object, newest last.
  *
- * `--field-selector involvedObject.name=` rather than `kubectl describe`, because describe's Events
- * section is the same data with no way to bound it, and because an exact single-value field selector
- * is what lets the `-A` form pass the all-namespaces restriction (`hasBoundingFieldSelector`).
+ * Prefer the subject UID over its name. Events outlive a deleted object for a while, and another kind
+ * in the same namespace may have the same name; the UID is the only selector that identifies this
+ * exact incarnation. Fall back to name + kind only for malformed/legacy objects without a usable UID.
+ * An exact selector also lets the `-A` form pass the all-namespaces restriction.
  */
-function eventsCommand(name: string, namespace: string | undefined, scope: "cluster" | "namespace"): string {
+function eventsCommand(
+  name: string,
+  namespace: string | undefined,
+  scope: "cluster" | "namespace",
+  uid: string | undefined,
+  kind: string | undefined,
+): string {
   const where = scope === "cluster" ? " -A" : nsFlag(namespace, "namespace");
-  return `kubectl get events${where} --field-selector involvedObject.name=${name} --sort-by=.lastTimestamp`;
+  const selector = uid && !badName(uid)
+    ? `involvedObject.uid=${uid}`
+    : [
+        `involvedObject.name=${name}`,
+        ...(kind && !badName(kind) ? [`involvedObject.kind=${kind}`] : []),
+      ].join(",");
+  return `kubectl get events${where} --field-selector ${selector} --sort-by=.lastTimestamp`;
 }
 
 // ── Rendering ───────────────────────────────────────────────────────
@@ -305,7 +328,13 @@ export async function collectObject(
   const sections: Section[] = [];
 
   // Events and the declared neighbours are all independent of each other — one wait for all of them.
-  const eventsPromise = runProbe(eventsCommand(params.name, ns, spec.scope), deps);
+  const eventsPromise = runProbe(eventsCommand(
+    params.name,
+    ns,
+    spec.scope,
+    str(parsed, ".metadata.uid"),
+    str(parsed, ".kind"),
+  ), deps);
   const neighbourPromises = spec.relations.map(async (rel: Relation) => {
     const n = rel.neighbour;
     if (n.via === "list") {

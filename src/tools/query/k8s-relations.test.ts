@@ -107,6 +107,29 @@ describe("renderPodContainers", () => {
     expect(out).toContain("exit 137");
   });
 
+  it("reports a currently terminated container, which has no lastState on its first exit", () => {
+    const out = renderPodContainers({
+      status: { containerStatuses: [{
+        name: "app", ready: false, restartCount: 0,
+        state: { terminated: { reason: "OOMKilled", exitCode: 137, signal: 9 } },
+      }] },
+    });
+    expect(out).toContain("terminated: OOMKilled exit 137 signal 9");
+  });
+
+  it("includes init-container failures that prevent the regular containers from starting", () => {
+    const out = renderPodContainers({
+      status: { initContainerStatuses: [{
+        name: "setup", ready: false, restartCount: 4,
+        state: { waiting: { reason: "CrashLoopBackOff" } },
+        lastState: { terminated: { reason: "Error", exitCode: 2 } },
+      }] },
+    });
+    expect(out).toContain("init/setup");
+    expect(out).toContain("CrashLoopBackOff");
+    expect(out).toContain("last: Error exit 2");
+  });
+
   it("omits the restart count when there have been none", () => {
     const out = renderPodContainers({ status: { containerStatuses: [{ name: "app", ready: true, restartCount: 0 }] } });
     expect(out).toContain("ready");
@@ -176,7 +199,10 @@ describe("renderPod", () => {
   });
 
   it("says phase unknown rather than inventing one", () => {
-    expect(renderPod({})).toContain("unknown");
+    const out = renderPod({});
+    expect(out).toContain("unknown");
+    expect(out).toContain("conditions: none reported");
+    expect(out).not.toContain("conditions: conditions:");
   });
 
   it("shows a deleting pod's timestamp and the finalizers holding it", () => {

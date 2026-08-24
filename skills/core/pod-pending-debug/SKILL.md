@@ -23,8 +23,10 @@ The scheduler's `FailedScheduling` event carries the reason, and this returns th
 alongside its phase and container states in a single call.
 
 Two things to read carefully:
-- The **full** `FailedScheduling` message — it says how many nodes were evaluated and why each was
-  rejected, and that count is what separates "no capacity anywhere" from "one taint on one node".
+- The `FailedScheduling` message — it says how many nodes were evaluated and why each was rejected,
+  and that count is what separates "no capacity anywhere" from "one taint on one node". The compact
+  bundle keeps substantially more of long scheduler messages, but if a line ends in `…`, fetch that
+  event with `kubectl get events` or `kubectl describe pod` before concluding from the missing tail.
 - The final `status:` line. An **empty** events section on a Pending pod is itself the finding: the
   scheduler never spoke, which points at a missing scheduler, a webhook, or a `schedulerName` nothing
   is servicing — a different problem from every pattern below. `partial (events: …)` means the

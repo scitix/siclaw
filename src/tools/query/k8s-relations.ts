@@ -138,23 +138,39 @@ function conditionSummary(obj: unknown, wanted: string): string {
   return parts.join("  ") || "conditions: none reported";
 }
 
-/** Per-container: readiness, restarts, and why it last died — the fields a CrashLoop question needs. */
+/** One terminated state, current or previous. */
+function renderTermination(state: unknown, label: "terminated" | "last"): string {
+  const reason = str(state, ".reason") ?? "Terminated";
+  const exit = str(state, ".exitCode");
+  const signal = str(state, ".signal");
+  const msg = safeText(str(state, ".message"));
+  return `${label}: ${reason}${exit !== undefined ? ` exit ${exit}` : ""}`
+    + `${signal !== undefined ? ` signal ${signal}` : ""}${msg ? ` — ${msg}` : ""}`;
+}
+
+/** Per-container: current state, readiness, restarts, and why it last died. */
 export function renderPodContainers(obj: unknown): string {
-  const statuses = all(obj, ".status.containerStatuses[]");
+  const statuses = [
+    ...all(obj, ".status.initContainerStatuses[]").map((status) => ({ status, role: "init" as const })),
+    ...all(obj, ".status.containerStatuses[]").map((status) => ({ status, role: "container" as const })),
+    ...all(obj, ".status.ephemeralContainerStatuses[]").map((status) => ({ status, role: "ephemeral" as const })),
+  ];
   if (statuses.length === 0) {
     // Not an error: a Pending pod that never got scheduled has no container statuses at all, and
     // saying so is the answer rather than a gap.
     return "containers: none started yet";
   }
   const lines: string[] = [];
-  for (const cs of statuses) {
-    const name = str(cs, ".name") ?? "?";
+  for (const { status: cs, role } of statuses) {
+    const rawName = str(cs, ".name") ?? "?";
+    const name = role === "container" ? rawName : `${role}/${rawName}`;
     const ready = one(cs, ".ready") === true;
     const restarts = Number(str(cs, ".restartCount") ?? "0");
-    const bits: string[] = [ready ? "ready" : "not ready"];
+    const bits: string[] = role === "container" ? [ready ? "ready" : "not ready"] : [];
     if (restarts > 0) bits.push(`${restarts} restart${restarts === 1 ? "" : "s"}`);
 
-    // Why it is not running now...
+    // Why it is not running now. Init and ephemeral statuses are included because an init-container
+    // image pull or crash prevents every regular container from starting.
     const waiting = str(cs, ".state.waiting.reason");
     if (waiting) {
       const msg = safeText(str(cs, ".state.waiting.message"));
@@ -166,13 +182,16 @@ export function renderPodContainers(obj: unknown): string {
       const image = str(cs, ".image");
       if (image) bits.push(`image: ${image}`);
     }
-    // ...and why it died last time, which is the one CrashLoopBackOff never tells you.
-    const lastReason = str(cs, ".lastState.terminated.reason");
-    if (lastReason) {
-      const exit = str(cs, ".lastState.terminated.exitCode");
-      const lastMsg = safeText(str(cs, ".lastState.terminated.message"));
-      bits.push(`last: ${lastReason}${exit ? ` exit ${exit}` : ""}${lastMsg ? ` — ${lastMsg}` : ""}`);
-    }
+    if (!waiting && role !== "container" && one(cs, ".state.running") !== undefined) bits.push("running");
+
+    // A terminal pod has the reason in CURRENT state. CrashLoopBackOff has it in lastState. Reading
+    // only the latter made a one-shot `Error`/`OOMKilled` pod look like an unexplained non-ready one.
+    const terminated = one(cs, ".state.terminated");
+    if (terminated !== undefined) bits.push(renderTermination(terminated, "terminated"));
+    const lastTerminated = one(cs, ".lastState.terminated");
+    if (lastTerminated !== undefined) bits.push(renderTermination(lastTerminated, "last"));
+
+    if (bits.length === 0) bits.push("state unknown");
     lines.push(`  ${name}  ${bits.join("  ")}`);
   }
   return `containers:\n${lines.join("\n")}`;
@@ -206,7 +225,8 @@ export function renderPod(obj: unknown): string {
     lines.push(`reason:     ${reason}${msg ? ` — ${msg}` : ""}`);
   }
   lines.push(renderPodContainers(obj));
-  lines.push(`conditions: ${conditionSummary(obj, "Ready")}`);
+  const conditions = conditionSummary(obj, "Ready");
+  lines.push(conditions.startsWith("conditions:") ? conditions : `conditions: ${conditions}`);
   return lines.join("\n");
 }
 

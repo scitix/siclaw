@@ -35,7 +35,10 @@ const failure = (stderr: string) => Object.assign(new Error("boom"), { stderr })
 
 const POD = {
   kind: "Pod",
-  metadata: { name: "web", namespace: "default", ownerReferences: [{ kind: "ReplicaSet", name: "web-7d9f" }] },
+  metadata: {
+    name: "web", namespace: "default", uid: "pod-uid-123",
+    ownerReferences: [{ kind: "ReplicaSet", name: "web-7d9f" }],
+  },
   spec: { nodeName: "node-42" },
   status: {
     phase: "Running",
@@ -46,7 +49,10 @@ const POD = {
     }],
   },
 };
-const NODE = { kind: "Node", spec: { taints: [] }, status: { conditions: [{ type: "Ready", status: "True" }] } };
+const NODE = {
+  kind: "Node", metadata: { uid: "node-uid-456" }, spec: { taints: [] },
+  status: { conditions: [{ type: "Ready", status: "True" }] },
+};
 const RS = { kind: "ReplicaSet", spec: { replicas: 3 }, status: { readyReplicas: 2 } };
 
 const pod = (overrides: Record<string, unknown> = {}) => JSON.stringify({ ...POD, ...overrides });
@@ -103,6 +109,21 @@ describe("runProbe — the read-only policy applies to the tool's own commands",
       const d = deps({ "get pod web": failure(stderr) });
       const r = await runProbe("kubectl get pod web -o json", d);
       expect(r, stderr).toMatchObject({ ok: false, reason: expected });
+    }
+  });
+
+  it("does not report a missing kubectl or credential plugin as an absent object", async () => {
+    const d = deps({ "get pod web": failure("/bin/bash: kubectl: command not found") });
+    expect(await runProbe("kubectl get pod web -o json", d)).toMatchObject({ ok: false, reason: "error" });
+  });
+
+  it("redacts a generic stderr detail before it can enter the summary", async () => {
+    const d = deps({ "get pod web": failure("API_TOKEN=hunter2") });
+    const result = await runProbe("kubectl get pod web -o json", d);
+    expect(result).toMatchObject({ ok: false, reason: "error" });
+    if (!result.ok) {
+      expect(result.detail).not.toContain("hunter2");
+      expect(result.detail).toContain("REDACTED");
     }
   });
 
@@ -260,6 +281,18 @@ describe("collectObject — neighbours", () => {
     expect(dp.seen.find((c) => c.includes("get events"))).toContain("-n prod");
   });
 
+  it("selects events by the fetched object's UID, not a reusable name", async () => {
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset web-7d9f": JSON.stringify(RS),
+    });
+    await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    const eventCall = d.seen.find((c) => c.includes("get events"))!;
+    expect(eventCall).toContain("--field-selector involvedObject.uid=pod-uid-123");
+    expect(eventCall).not.toContain("involvedObject.name=web");
+  });
+
   it("runs the neighbour reads concurrently, not one after another", async () => {
     // The whole point is one wait instead of one per edge. A serial implementation passes every other
     // test in this file.
@@ -335,6 +368,21 @@ describe("collectObject — the size budget", () => {
     expect(text).toContain("--- events (30, newest 6) ---");
     expect(text).toContain("Event29");
     expect(text).not.toContain("Event0 ");
+  });
+
+  it("keeps a realistic long FailedScheduling reason instead of clipping it at 160 characters", async () => {
+    const reason = "0/100 nodes are available: "
+      + "10 Insufficient cpu, 20 Insufficient memory, 30 had untolerated taint, "
+      + "40 did not match Pod node affinity/selector; preemption is not helpful for scheduling TAIL";
+    const events = `LAST SEEN TYPE REASON OBJECT MESSAGE\n1m Warning FailedScheduling pod/web ${reason}`;
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify(RS),
+      "get events": events,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("TAIL");
   });
 
   it("states an empty events list rather than omitting the section", async () => {
