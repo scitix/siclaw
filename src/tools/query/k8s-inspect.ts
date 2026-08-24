@@ -80,11 +80,11 @@ function outerTimeoutMs(isProd: boolean): number {
  * to emit a single line each. A budget that depends on renderers staying terse is not a budget.
  *
  * So a neighbour gets less than the subject — it is a one-line summary by design — and
- * `worstCaseChars` computes the ceiling from the relation table, which is what lets a test fail when
- * a new relation would push the total over. Adding relations therefore forces a deliberate revisit
- * instead of silently starting to truncate.
+ * `worstCaseChars` computes a conservative ceiling from the relation table, including the longest
+ * legal object identity, section chrome and the trailing status. Adding relations therefore forces a
+ * deliberate revisit instead of silently starting to truncate.
  */
-const MAX_TOTAL_CHARS = 5_500;
+const MAX_TOTAL_CHARS = 7_000;
 const MAX_SUBJECT_CHARS = 700;
 // 400, not 300: a node's abnormal conditions carry their reason and transition time, which is what
 // makes the section worth reading instead of a prompt to go run `describe`.
@@ -92,18 +92,24 @@ const MAX_NEIGHBOUR_CHARS = 400;
 const MAX_EVENT_LINES = 6;
 // FailedScheduling messages commonly enumerate several rejection classes. 160 characters cut off
 // the reason the pending-pod skill asks the reader to act on, so events receive most of the bundle's
-// budget. The output still stays below processToolOutput's 8000-character truncation threshold:
-// 220 + 700 + 6*600 + 2*400 = 5320 for the current largest relation table.
+// budget. The total ceiling still stays below processToolOutput's 8000-character truncation
+// threshold, with enough room for legal object names and the trailing status line.
 const MAX_EVENT_CHARS = 600;
-/** Section headers, the `=== kind ns/name ===` line and the trailing `status:` line. */
-const CHROME_CHARS = 220;
+const MAX_SUBJECT_HEADER_CHARS = 340;
+const MAX_EVENT_HEADER_CHARS = 80;
+const MAX_NEIGHBOUR_HEADER_CHARS = 330;
+const MAX_STATUS_CHARS = 256;
+const MAX_JOIN_CHARS = 24;
 
 /** The largest output this kind can produce, from the table. Exported so a test can hold it to the budget. */
 export function worstCaseChars(spec: { relations: unknown[] }): number {
-  return CHROME_CHARS
+  return MAX_SUBJECT_HEADER_CHARS
     + MAX_SUBJECT_CHARS
+    + MAX_EVENT_HEADER_CHARS
     + MAX_EVENT_LINES * MAX_EVENT_CHARS
-    + spec.relations.length * MAX_NEIGHBOUR_CHARS;
+    + spec.relations.length * (MAX_NEIGHBOUR_HEADER_CHARS + MAX_NEIGHBOUR_CHARS)
+    + MAX_STATUS_CHARS
+    + MAX_JOIN_CHARS;
 }
 
 export const BUDGET = { MAX_TOTAL_CHARS, MAX_SUBJECT_CHARS, MAX_NEIGHBOUR_CHARS, MAX_EVENT_LINES, MAX_EVENT_CHARS };
@@ -286,6 +292,24 @@ function statusLine(subjectOk: boolean, misses: string[]): string {
   return misses.length === 0 ? "status: ok" : `status: partial (${misses.join(", ")})`;
 }
 
+/**
+ * Bound the variable body while preserving the one piece callers use to judge completeness.
+ *
+ * Clipping the fully joined string removed the trailing `status:` line first — exactly backwards:
+ * a long but partial answer then looked complete. If the body itself overflows, say so in status and
+ * reserve the suffix before clipping anything else.
+ */
+function renderBundle(parts: string[], misses: string[]): string {
+  const body = parts.join("\n\n");
+  let status = statusLine(true, misses);
+  let suffix = `\n\n${status}`;
+  if (body.length + suffix.length <= MAX_TOTAL_CHARS) return body + suffix;
+
+  status = statusLine(true, [...misses, "output: truncated"]);
+  suffix = `\n\n${status}`;
+  return clip(body, MAX_TOTAL_CHARS - suffix.length) + suffix;
+}
+
 // ── Orchestration ───────────────────────────────────────────────────
 
 export interface K8sInspectParams {
@@ -295,7 +319,7 @@ export interface K8sInspectParams {
   cluster?: string;
 }
 
-interface Section { label: string; text: string }
+interface Section { label: string; target?: string; text: string }
 
 /**
  * Fetch the subject, then every neighbour its kind declares, then render.
@@ -350,16 +374,24 @@ export async function collectObject(
       const cmd = `kubectl get ${n.kind} -A --field-selector ${n.selector(params.name)} -o json`;
       return { rel, result: await runProbe(cmd, deps) };
     }
-    const name = str(parsed, n.nameAt);
-    if (!name) return { rel, result: undefined };
-    const kind = typeof n.kind === "string" ? n.kind : str(parsed, n.kind.at);
-    if (!kind || badName(kind)) return { rel, result: undefined };
-    return { rel, result: await runProbe(getJsonCommand(kind.toLowerCase(), name, ns, n.scope), deps) };
+    const target = n.resolve
+      ? n.resolve(parsed)
+      : (() => {
+          const name = str(parsed, n.nameAt);
+          const kind = typeof n.kind === "string" ? n.kind : str(parsed, n.kind.at);
+          return name && kind ? { name, kind } : undefined;
+        })();
+    if (!target || badName(target.name) || badName(target.kind)) return { rel, result: undefined };
+    return {
+      rel,
+      target: target.name,
+      result: await runProbe(getJsonCommand(target.kind.toLowerCase(), target.name, ns, n.scope), deps),
+    };
   });
 
   const [events, neighbours] = await Promise.all([eventsPromise, Promise.all(neighbourPromises)]);
 
-  for (const { rel, result } of neighbours) {
+  for (const { rel, result, target } of neighbours) {
     // `undefined` means the subject does not name this neighbour — a bare pod has no owner. Absent by
     // nature is not a miss, and reporting it as one would make every static pod look degraded.
     if (result === undefined) continue;
@@ -372,7 +404,7 @@ export async function collectObject(
       misses.push(`${rel.label}: unparseable`);
       continue;
     }
-    sections.push({ label: rel.label, text: clip(rel.render(obj), MAX_NEIGHBOUR_CHARS) });
+    sections.push({ label: rel.label, ...(target ? { target } : {}), text: clip(rel.render(obj), MAX_NEIGHBOUR_CHARS) });
   }
 
   const parts: string[] = [
@@ -388,10 +420,11 @@ export async function collectObject(
     misses.push(`events: ${events.reason}`);
   }
 
-  for (const s of sections) parts.push(`--- ${s.label} ---\n${s.text}`);
+  for (const s of sections) {
+    parts.push(`--- ${s.label}${s.target ? ` (${s.target})` : ""} ---\n${s.text}`);
+  }
 
-  parts.push(statusLine(true, misses));
-  return { text: clip(parts.join("\n\n"), MAX_TOTAL_CHARS), failed: false };
+  return { text: renderBundle(parts, misses), failed: false };
 }
 
 // ── Tool ────────────────────────────────────────────────────────────

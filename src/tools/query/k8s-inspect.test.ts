@@ -185,8 +185,8 @@ describe("collectObject — the status line", () => {
     expect(statusOf(text)).toBe("status: ok");
     expect(failed).toBe(false);
     expect(text).toContain("OOMKilled");
-    expect(text).toContain("--- node ---");
-    expect(text).toContain("--- owner ---");
+    expect(text).toContain("--- node (node-42) ---");
+    expect(text).toContain("--- owner (web-7d9f) ---");
   });
 
   it("names a failed neighbour in status and still returns the subject", async () => {
@@ -200,7 +200,7 @@ describe("collectObject — the status line", () => {
     });
     const { text, failed } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(statusOf(text)).toBe("status: partial (node: forbidden)");
-    expect(text).not.toContain("--- node ---");
+    expect(text).not.toContain("--- node (");
     // A neighbour failure must not fail the call — the subject is still the answer.
     expect(failed).toBe(false);
     expect(text).toContain("OOMKilled");
@@ -253,7 +253,7 @@ describe("collectObject — neighbours", () => {
     const d = deps({ "get pod web": bare, "get node node-42": JSON.stringify(NODE), "get events": "x" });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text.trimEnd().endsWith("status: ok")).toBe(true);
-    expect(text).not.toContain("--- owner ---");
+    expect(text).not.toContain("--- owner (");
     expect(text).not.toContain("owner:");
   });
 
@@ -265,6 +265,29 @@ describe("collectObject — neighbours", () => {
     const d = deps({ "get pod web": jobOwned, "get node node-42": JSON.stringify(NODE), "get events": "x" });
     await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(d.seen.some((c) => c.includes("get job batch-1"))).toBe(true);
+  });
+
+  it("follows the controller owner rather than the first ownerReference", async () => {
+    const multiplyOwned = JSON.stringify({
+      ...POD,
+      metadata: {
+        name: "web", namespace: "default",
+        ownerReferences: [
+          { kind: "ConfigMap", name: "auxiliary-owner" },
+          { kind: "ReplicaSet", name: "web-controller", controller: true },
+        ],
+      },
+    });
+    const d = deps({
+      "get pod web": multiplyOwned,
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset web-controller": JSON.stringify(RS),
+      "get events": "x",
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(d.seen.some((c) => c.includes("get replicaset web-controller"))).toBe(true);
+    expect(d.seen.some((c) => c.includes("get configmap auxiliary-owner"))).toBe(false);
+    expect(text).toContain("--- owner (web-controller) ---");
   });
 
   it("asks for a node's pods with an exact field selector, the only form the policy admits", async () => {
@@ -363,6 +386,8 @@ describe("collectObject — the size budget", () => {
     const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get events": "x" });
     const { text } = await collectObject(spec, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text.length).toBeLessThanOrEqual(BUDGET.MAX_TOTAL_CHARS);
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (output: truncated)");
+    expect(text.split("\n").filter((line) => line.startsWith("status:"))).toHaveLength(1);
   });
 
   it("keeps the newest events and says how many there were", async () => {

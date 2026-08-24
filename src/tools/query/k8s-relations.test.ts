@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import {
   KINDS, KNOWN_KINDS, resolveKind,
   renderPod, renderPodContainers, renderNode, renderOwner, renderPodDistribution,
-  safeText, str, all, one,
+  resolveControllerOwner, safeText, str, all, one,
 } from "./k8s-relations.js";
 
 describe("path reading", () => {
@@ -391,11 +391,18 @@ describe("the table", () => {
     expect(selector).not.toContain("!=");
   });
 
-  it("reads a pod owner's KIND from the object rather than assuming one", () => {
-    // A pod's controller is a ReplicaSet, a Job, a StatefulSet or a CRD. Fixing the kind here would
-    // silently skip every case but one.
+  it("resolves the controller owner and keeps its declared kind", () => {
+    expect(resolveControllerOwner({
+      metadata: { ownerReferences: [
+        { kind: "ConfigMap", name: "auxiliary-owner" },
+        { kind: "Job", name: "batch-1", controller: true },
+      ] },
+    })).toEqual({ kind: "Job", name: "batch-1" });
+
+    // A pod's controller is a ReplicaSet, a Job, a StatefulSet or a CRD. The table delegates the
+    // selection to the object-aware resolver rather than assuming a kind or an array position.
     const rel = KINDS.pod.relations.find((r) => r.label === "owner")!;
     expect(rel.neighbour.via).toBe("name");
-    expect(typeof rel.neighbour.kind === "object").toBe(true);
+    expect(rel.neighbour.via === "name" && typeof rel.neighbour.resolve).toBe("function");
   });
 });

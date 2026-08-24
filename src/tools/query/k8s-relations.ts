@@ -78,6 +78,11 @@ export function all(obj: unknown, path: string): unknown[] {
 
 // ── The relation shape ──────────────────────────────────────────────
 
+export interface NamedNeighbourTarget {
+  name: string;
+  kind: string;
+}
+
 /** Where a neighbour is fetched from: a name carried by the subject, or a list query over it. */
 export type Neighbour =
   /**
@@ -85,7 +90,24 @@ export type Neighbour =
    * too, which `ownerReferences` needs — a pod's owner is a ReplicaSet, a Job, a StatefulSet or a
    * CRD, and hardcoding one of them would silently skip the others.
    */
-  | { via: "name"; nameAt: string; kind: string | { at: string }; scope: "cluster" | "namespace" }
+  | {
+      via: "name";
+      nameAt: string;
+      kind: string | { at: string };
+      resolve?: never;
+      scope: "cluster" | "namespace";
+    }
+  /**
+   * Some relations cannot be expressed as two independent paths. OwnerReferences are an unordered
+   * set, for example: the controller is the entry with `controller: true`, not necessarily index 0.
+   */
+  | {
+      via: "name";
+      resolve: (subject: unknown) => NamedNeighbourTarget | undefined;
+      nameAt?: never;
+      kind?: never;
+      scope: "cluster" | "namespace";
+    }
   /** No name to follow — a field-selector query. `node -> pods scheduled here` is the case. */
   | { via: "list"; kind: string; selector: (subjectName: string) => string; scope: "all-namespaces" };
 
@@ -276,6 +298,25 @@ export function renderPodDistribution(obj: unknown): string {
   return `pods: ${items.length} total (${parts.join(", ")})`;
 }
 
+/**
+ * The owner that actually controls a pod.
+ *
+ * Kubernetes permits multiple ownerReferences and assigns no meaning to their order. At most one is
+ * the controller; choosing index 0 can therefore walk to an auxiliary owner and omit the ReplicaSet,
+ * Job or other controller that determines the pod's lifecycle. Legacy objects occasionally omit the
+ * flag, so the first complete reference remains a compatibility fallback only when none is marked.
+ */
+export function resolveControllerOwner(obj: unknown): NamedNeighbourTarget | undefined {
+  const refs = all(obj, ".metadata.ownerReferences[]");
+  const complete = refs.flatMap((ref) => {
+    const name = str(ref, ".name");
+    const kind = str(ref, ".kind");
+    return name && kind ? [{ ref, name, kind }] : [];
+  });
+  const selected = complete.find(({ ref }) => one(ref, ".controller") === true) ?? complete[0];
+  return selected ? { name: selected.name, kind: selected.kind } : undefined;
+}
+
 // ── The table ───────────────────────────────────────────────────────
 
 /**
@@ -303,14 +344,13 @@ export const KINDS: Record<string, KindSpec> = {
         render: renderNode,
       },
       {
-        // The pod's controller. `ownerReferences[0]` because a pod has exactly one controller in
-        // practice, and the kind travels with the reference — see Neighbour's comment for why it is
-        // read rather than fixed.
+        // The kind travels with the selected controller reference — a pod may be owned by a
+        // ReplicaSet, Job, StatefulSet or a custom controller, so fixing it here would silently skip
+        // every other case.
         label: "owner",
         neighbour: {
           via: "name",
-          nameAt: ".metadata.ownerReferences[0].name",
-          kind: { at: ".metadata.ownerReferences[0].kind" },
+          resolve: resolveControllerOwner,
           scope: "namespace",
         },
         render: renderOwner,
