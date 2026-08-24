@@ -10,15 +10,29 @@
  * ("all" = web+api+a2a+channel, the interactive family; scheduled is its own
  * selectable bucket).
  *
- * Two predicate flavours:
- *  - session-level (`entrySessionPredicate`): for per-session queries (session
- *    list, session/prompt counts). Trace sessions are excluded.
- *  - message-level (`entryMessagePredicate`): for per-message/tool queries
- *    (tool audit, tool counts, timing). A parent-attributed trace child's rows
- *    (delegation / sub-agent) are counted under its parent's entry via a LEFT
- *    JOIN on the parent session — the parent's own `spawn_subagent` / delegation
- *    tool call and the child's tool calls are all real calls, so counting both
- *    is the honest total, not a double count.
+ * Three predicate flavours, and WHICH ONE a query takes is a semantic choice,
+ * not a matter of which alias is in scope:
+ *
+ *  - session-level (`entrySessionPredicate`): per-session queries (session list,
+ *    session counts). Trace sessions excluded.
+ *
+ *  - prompt-level (`entryPromptPredicate`): counting `role='user'` rows, i.e.
+ *    "how many requests did people make". Trace sessions excluded, WITHOUT
+ *    parent attribution. A trace child's opening `role='user'` row is the task
+ *    text its parent generated — a sub-agent briefing or a delegated
+ *    instruction — never something a user typed, so attributing it to the
+ *    parent's entry would count one human request as two.
+ *
+ *  - message-level (`entryMessagePredicate`): per-tool / per-assistant queries
+ *    (tool audit, tool counts, timing). Here a parent-attributed child's rows
+ *    (delegation / sub-agent) DO count under the parent's entry: the parent's
+ *    own `spawn_subagent` call and the child's tool calls are all real calls,
+ *    so counting both is the honest total of work performed.
+ *
+ * ⚠️ Do NOT use `entryMessagePredicate` for a `role='user'` count. That is
+ * exactly how sub-agent briefings inflated `totalPrompts` while the sibling
+ * `adapter.ts` summary excluded them, leaving two endpoints disagreeing about
+ * one number.
  */
 
 import { nonTraceOriginPredicate, parentAttributedOriginPredicate } from "./session-origin.js";
@@ -114,9 +128,28 @@ export function entrySessionPredicate(entry: EntryMode, alias = "s"): string {
 }
 
 /**
- * Message-level predicate (per-message / per-tool queries) WITH parent
+ * Prompt-level predicate: for counting `role='user'` rows.
+ *
+ * Identical to {@link entrySessionPredicate} — trace sessions excluded, no
+ * parent join — and separately named because the DIFFERENCE FROM
+ * {@link entryMessagePredicate} is the contract, not an implementation detail.
+ * A prompt count answers "how many requests did people make", and a trace
+ * child's opening `role='user'` row was written by its parent agent, not by a
+ * person: a sub-agent briefing, or a coordinator's delegated instruction.
+ *
+ * Callers must NOT pass a `parentAlias` to their channel/user filters here —
+ * there is no parent join, so referencing it is a SQL error.
+ */
+export function entryPromptPredicate(entry: EntryMode, alias = "s"): string {
+  return entrySessionPredicate(entry, alias);
+}
+
+/**
+ * Message-level predicate (per-tool / per-assistant queries) WITH parent
  * attribution: a delegation OR sub-agent child session's rows count under the
  * parent's entry.
+ *
+ * NOT for `role='user'` counts — see {@link entryPromptPredicate}.
  *
  * Returns:
  *  - `join`: a LEFT JOIN clause binding `parentAlias` to `sAlias`'s parent

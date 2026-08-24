@@ -5,6 +5,7 @@ import {
   actorUserColumn,
   channelColExpr,
   entrySessionPredicate,
+  entryPromptPredicate,
   entryMessagePredicate,
   type EntryMode,
 } from "./metrics-entry.js";
@@ -94,6 +95,35 @@ describe("entrySessionPredicate", () => {
     // A specific entry like "api" is an exact origin match, so origin='delegation'
     // rows can't satisfy it — they're excluded from session-level queries.
     expect(entrySessionPredicate("api")).not.toContain("delegation");
+  });
+});
+
+describe("entryPromptPredicate (no parent attribution)", () => {
+  it("excludes trace sessions without inheriting the parent's entry", () => {
+    // A role='user' count answers "how many requests did people make". A trace
+    // child's opening user row is the task text its PARENT wrote — a sub-agent
+    // briefing or a delegated instruction — so attributing it to the parent's
+    // entry counts one human request twice.
+    const p = entryPromptPredicate("api", "s");
+    expect(p).toContain("s.origin = 'api'");
+    expect(p).not.toContain("parent_s");
+    expect(p).not.toContain("'subagent'");
+  });
+
+  it("overview excludes every trace origin and never attributes to a parent", () => {
+    const p = entryPromptPredicate("all", "s");
+    for (const origin of TRACE_ORIGINS) expect(p).toContain(`'${origin}'`);
+    expect(p).toContain("NOT IN");
+    expect(p).not.toContain("parent_s");
+  });
+
+  it("differs from entryMessagePredicate — the two are not interchangeable", () => {
+    // Pins the distinction the bug erased: tool telemetry inherits the parent,
+    // prompt counts do not.
+    const prompt = entryPromptPredicate("api", "s");
+    const { predicate: message } = entryMessagePredicate("api");
+    expect(prompt).not.toBe(message);
+    expect(message).toContain("parent_s");
   });
 });
 

@@ -56,7 +56,7 @@ import {
   normalizeChatSessionTitle,
   truncateChatSessionTitle,
 } from "./chat-session-fields.js";
-import { normalizeEntry, entrySessionPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
+import { normalizeEntry, entrySessionPredicate, entryPromptPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
 import {
@@ -3712,6 +3712,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Message/tool-level: count a delegation child's rows under its PARENT's
     // entry so sub-agent tool calls stay auditable. msg.join adds the parent LEFT JOIN.
     const msg = entryMessagePredicate(entry);
+    // Prompt-level: NOT msg — a role='user' count must not inherit the parent's
+    // entry (see entryPromptPredicate).
+    const promptPred = entryPromptPredicate(entry, "s");
     // Channel sub-axis: narrow to one channel (only meaningful for entry=channel).
     const channelId = entry === "channel" ? (query.channelId || null) : null;
     // User filter is origin-aware: channel sessions group by the actual sender
@@ -3735,14 +3738,16 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as [Array<{ c: number }>, unknown];
     const totalSessions = Number(sRows[0]?.c ?? 0);
 
+    // Prompts count HUMAN requests, so no parent attribution and no parent join:
+    // a trace child's opening user row is its parent's task text, not a request
+    // somebody made. Keeps this equal to the adapter summary's totalPrompts.
     const pParams: unknown[] = [from, to];
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      ${msg.join}
       WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
-        AND ${msg.predicate}
+        AND ${promptPred}
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
-    totalPromptsSql += userChanCond("s", pParams, "parent_s");
+    totalPromptsSql += userChanCond("s", pParams);
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
     const totalPrompts = Number(pRows[0]?.c ?? 0);
 
@@ -3827,11 +3832,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const dpParams: unknown[] = [from, to];
     let dailyPromptsSql = `SELECT DATE(m.created_at) AS day, COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      ${msg.join}
       WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
-        AND ${msg.predicate}
+        AND ${promptPred}
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
-    dailyPromptsSql += userChanCond("s", dpParams, "parent_s");
+    dailyPromptsSql += userChanCond("s", dpParams);
     dailyPromptsSql += " GROUP BY DATE(m.created_at)";
 
     const dtParams: unknown[] = [from, to];
