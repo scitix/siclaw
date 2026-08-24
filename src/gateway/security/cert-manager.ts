@@ -29,6 +29,34 @@ import forge from "node-forge";
 /** CA validity: 10 years */
 const CA_VALIDITY_DAYS = 3650;
 
+/**
+ * A random serial as a MINIMAL positive DER integer.
+ *
+ * `"00" + hex(16 random bytes)` produced roughly one certificate in 512 that its own CA rejected,
+ * and this is why. A DER INTEGER must carry no redundant leading zero: one is required only when the
+ * first byte would otherwise look negative. The blind prefix broke that whenever the random part
+ * already began with 0x00 AND the byte after it was below 0x80 — the encoder wrote 17 bytes, any
+ * reader normalised them back to 16, and the re-encoded TBSCertificate was then one byte shorter
+ * than the bytes the signature covered. Measured: the TBS went 421 → 420 with the enclosing SEQUENCE
+ * length dropping a1 → a0, so both node-forge and openssl refused the signature, openssl calling it
+ * `illegal padding`. 1/256 for the leading zero times 1/2 for the high bit is 1/512, which is the
+ * rate observed over several thousand issuances.
+ *
+ * The bug needed BOTH conditions, which is what made it look random and survive a first inspection:
+ * a leading zero followed by a high-bit byte is legal and verifies fine.
+ */
+export function randomSerialHex(randomBytes: (n: number) => Buffer = crypto.randomBytes): string {
+  // Strip the leading zeros DER would not allow.
+  let bytes = Array.from(randomBytes(16));
+  while (bytes.length > 1 && bytes[0] === 0) bytes = bytes.slice(1);
+  // A serial must be positive and non-zero; ensure a value even in the astronomically unlikely
+  // all-zero case.
+  if (bytes.length === 1 && bytes[0] === 0) bytes = [1];
+  // ONE zero, and only when the top bit would otherwise mark it negative.
+  if (bytes[0] >= 0x80) bytes.unshift(0);
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export interface CertificateIdentity {
   agentId: string;
   orgId: string;
@@ -263,13 +291,14 @@ export class CertificateManager {
   }
 
   private static createCertificateStatic(opts: CertOpts): string {
+    // See randomSerialHex — the previous `"00" + hex(random)` made ~1 certificate in 512
+    // unverifiable by its own CA.
     const publicKeyForge = forge.pki.publicKeyFromPem(opts.publicKey);
     const privateKeyForge = forge.pki.privateKeyFromPem(opts.signingKey);
 
     const cert = forge.pki.createCertificate();
     cert.publicKey = publicKeyForge;
-    const serialBytes = forge.random.getBytesSync(16);
-    cert.serialNumber = "00" + forge.util.bytesToHex(serialBytes);
+    cert.serialNumber = randomSerialHex();
 
     const notBefore = new Date();
     const notAfter = new Date();

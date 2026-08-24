@@ -618,25 +618,36 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       // remove, reintroduced on the path that reports last.
       const wantsBackground = backgroundEnabled && params.run_in_background === true;
       const instrumented = !wantsBackground && hasPipeline(command);
-      let execCommand = instrumented ? instrumentPipeline(command) : command;
+      const baseCommand = instrumented ? instrumentPipeline(command) : command;
       // Set in production only, where the command runs as another user: it is both the sandbox-side
       // session's record and the handle used to reap it. Outside production there is no UID boundary
       // and the group kill already reaches everything.
       const sandboxPgidFile = isProd ? backgroundPgidFile(toolCallId) : undefined;
-      if (isProd) {
+      /**
+       * The command line for one mode, built per mode rather than once.
+       *
+       * The deadline differs between them — a background job keeps its old unbounded lifetime, a
+       * foreground one must be bounded — and the two are NOT decided at the same point: a background
+       * launch that the executor declines falls through and runs in the foreground. Baking the
+       * choice in up front meant that fallback inherited the background command, so a foreground run
+       * went out with no sandbox deadline at all and only the padded outer backstop, stopping a
+       * `timeout_seconds: 1` command at about 16 seconds.
+       *
+       * The session is on both, because both have to be stoppable.
+       */
+      const wrapForMode = (mode: "foreground" | "background"): string => {
+        if (!isProd) return baseCommand;
         // The deadline goes on the SANDBOX side. The pod drops CAP_KILL (security.md §5.2 grants
         // only SETUID, SETGID, CHOWN, FOWNER, AUDIT_WRITE) and the command runs as `sandbox` while
         // the agent runs as `agentbox`, so signalling from out here reaches the outer shell and
         // nothing beneath it. `kill(-pgid)` still SUCCEEDS in that case — one group member was
         // signalled — which is why this looked like it worked: the call returned and the command
         // kept running. Same shape node_exec already uses.
-        execCommand = buildSandboxCommand(execCommand, {
-          // A background job keeps its old unbounded lifetime; only the turn-blocking path gets a
-          // deadline. Both get the session, because both need to be stoppable.
-          ...(wantsBackground ? {} : { timeoutS: sandboxTimeoutS }),
+        return buildSandboxCommand(baseCommand, {
+          ...(mode === "foreground" ? { timeoutS: sandboxTimeoutS } : {}),
           pgidFile: sandboxPgidFile,
         });
-      }
+      };
 
       // ── Background mode ──────────────────────────────────────────────
       // Hand the fully-wrapped command to the runtime executor and return immediately.
@@ -649,7 +660,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         }
         try {
           const { jobId, outputFile } = bg!.executor!({
-            command: execCommand,
+            command: wrapForMode("background"),
             env,
             cwd: process.cwd(),
             action: pre.action,
@@ -677,7 +688,9 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       try {
         // The timeout is enforced by boundedExec, not by child_process.exec's own `timeout` —
         // see bounded-exec.ts for why that one does not bound the call.
-        const { stdout, stderr } = await boundedExec(execCommand, {
+        // Also the path a declined background launch lands on, which is why the mode is named
+        // here rather than inherited: a fallback must carry the foreground deadline.
+        const { stdout, stderr } = await boundedExec(wrapForMode("foreground"), {
           env,
           timeoutMs: timeout,
           signal,
