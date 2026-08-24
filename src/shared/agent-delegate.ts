@@ -20,12 +20,50 @@ export interface DelegateArtifact {
   residual_state: string;
 }
 
+/**
+ * A span context flattened for the wire.
+ *
+ * NOT an OTel SpanContext object: this crosses a process boundary and is JSON, so it carries only
+ * the two hex ids and the flags byte. The receiving side rebuilds a remote parent from them. Kept
+ * deliberately minimal — anything richer would tie the two processes to one tracing SDK version.
+ */
+export interface WireSpanContext {
+  traceId: string;
+  spanId: string;
+  traceFlags?: number;
+}
+
 /** box → gateway: delegate a bounded task to a peer agent. */
 export interface DelegateRequest {
   /** Target peer agent id (must be in the coordinator's roster). */
   peerAgentId: string;
   /** The bounded task / question for the peer. */
   text: string;
+  /**
+   * The coordinator turn's root trace id, so the peer's turn joins the SAME trace instead of
+   * starting its own. Without it a delegation is unobservable as one call tree: every coordinator
+   * trace sampled showed sessionCount 1, with the peer's work sitting in a separate trace nobody
+   * could reach from it.
+   *
+   * Optional on purpose — absent means "no trace to join", which is the pre-existing behaviour and
+   * is what an older caller sends. The peer then generates its own id exactly as before.
+   */
+  traceId?: string;
+  /**
+   * The `delegate_to_agent` tool span, when the coordinator could capture it. Makes the peer's root
+   * span a CHILD of the tool call rather than a sibling rooted at the same trace — the difference
+   * between "these turns are related" and an actual call tree.
+   *
+   * Independent of `traceId`: the span may be uncapturable (tracing disabled, parent trace already
+   * ended) while the trace id is still known and still worth joining.
+   */
+  parentSpanContext?: WireSpanContext;
+  /**
+   * The coordinator's tool-call id for this delegation. Correlates the peer's turn with the exact
+   * tool row that dispatched it — a coordinator may run several delegations concurrently, and
+   * session ids alone cannot say which row is which.
+   */
+  toolCallId?: string;
   /** Coordinator's session id (metadata / correlation + peer-session lineage/ownership). */
   parentSessionId?: string;
   /**

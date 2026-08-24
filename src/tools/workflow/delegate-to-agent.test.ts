@@ -85,7 +85,13 @@ describe("delegate_to_agent tool", () => {
     const exec = vi.fn(async () => okResp());
     const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
     const r = await tool.execute("c1", { agent_id: "agent-net", agent_name: "net-agent", task: "check sh-1 coredns" });
-    expect(exec).toHaveBeenCalledWith({ peerAgentId: "agent-net", text: "check sh-1 coredns" }, expect.any(Function), undefined);
+    // toolCallId is forwarded so the peer's turn can nest under THIS tool span and be correlated
+    // with THIS tool row — a coordinator may have several delegations in flight, and a session id
+    // alone cannot say which row is which.
+    expect(exec).toHaveBeenCalledWith(
+      { peerAgentId: "agent-net", text: "check sh-1 coredns", peerSessionId: undefined, toolCallId: "c1" },
+      expect.any(Function), undefined,
+    );
     expect(text(r)).toContain("Result from net-agent");
     expect(text(r)).toContain("CoreDNS OOMKilled x3");
     // Card-facing details: target + status + summary the AgentWorkCard reads.
@@ -101,7 +107,10 @@ describe("delegate_to_agent tool", () => {
     const exec = vi.fn(async () => okResp());
     const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
     await tool.execute("c1", { agent_id: "gpu-agent", task: "check gpu-1" });
-    expect(exec).toHaveBeenCalledWith({ peerAgentId: "agent-gpu", text: "check gpu-1" }, expect.any(Function), undefined);
+    expect(exec).toHaveBeenCalledWith(
+      { peerAgentId: "agent-gpu", text: "check gpu-1", peerSessionId: undefined, toolCallId: "c1" },
+      expect.any(Function), undefined,
+    );
   });
 
   it("rejects an unknown target and lists the available agents", async () => {
@@ -120,7 +129,10 @@ describe("delegate_to_agent tool", () => {
     const ac = new AbortController();
     ac.abort();
     const r = await tool.execute("c1", { agent_id: "agent-net", task: "x" }, ac.signal);
-    expect(exec).toHaveBeenCalledWith({ peerAgentId: "agent-net", text: "x" }, expect.any(Function), ac.signal);
+    expect(exec).toHaveBeenCalledWith(
+      { peerAgentId: "agent-net", text: "x", peerSessionId: undefined, toolCallId: "c1" },
+      expect.any(Function), ac.signal,
+    );
     expect(text(r)).toMatch(/was stopped/i);
     expect((r.details as any).status).toBe("stopped");
   });

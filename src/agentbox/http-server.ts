@@ -16,6 +16,7 @@ import { loadConfig, resolveTracingEnvironment } from "../core/config.js";
 import type { SiclawConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { isValidTraceId, isValidSpanId, TraceFlags, type SpanContext } from "@opentelemetry/api";
 import { reinitTracing } from "../shared/tracing/otel-provider.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
@@ -76,6 +77,15 @@ interface PromptRequestBody {
   origin?: OriginKind;
   /** Present when a coordinator agent delegated this turn over the mesh. */
   delegation?: DelegationContext;
+  /**
+   * Trace context of the turn that dispatched this one. TOP LEVEL, not inside `delegation` — the
+   * management plane's router reconstructs that object, so a field nested there never arrives.
+   * Typed loosely because both are untrusted wire input; validated at use.
+   */
+  traceId?: unknown;
+  parentSpanContext?: unknown;
+  /** The dispatching delegate_to_agent tool-call id, for row-level correlation. */
+  delegationToolCallId?: unknown;
   modelProvider?: string;
   modelId?: string;
   systemPromptTemplate?: string;
@@ -102,6 +112,27 @@ interface PromptRequestBody {
  * Non-`agent_end` events (and the case where the brain exposes no usage yet)
  * pass through untouched.
  */
+/**
+ * Rebuild an OTel SpanContext from the flattened wire form, or nothing.
+ *
+ * Validated rather than trusted: this crosses a process boundary and arrives as untyped JSON, and
+ * the SDK silently DISCARDS a malformed remote parent — so an unchecked value degrades to "no
+ * parent" with no signal, which reads identically to tracing being off. `isRemote` is what tells
+ * the SDK this parent was not created in-process.
+ */
+export function toSpanContext(raw: unknown): SpanContext | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const { traceId, spanId, traceFlags } = raw as Record<string, unknown>;
+  if (typeof traceId !== "string" || !isValidTraceId(traceId)) return undefined;
+  if (typeof spanId !== "string" || !isValidSpanId(spanId)) return undefined;
+  return {
+    traceId,
+    spanId,
+    traceFlags: typeof traceFlags === "number" ? traceFlags : TraceFlags.SAMPLED,
+    isRemote: true,
+  };
+}
+
 function enrichAgentEndEvent(brain: BrainSession, event: any): any {
   if (event?.type !== "agent_end") return event;
   const usage = brain.getContextUsage?.();
@@ -1039,7 +1070,18 @@ export function createHttpServer(
     // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
     // after model setup so a setModel switch is not captured as prompt activity;
     // closed in actuallyFinish, which every terminal path funnels through.
-    tracingRecorder.startPrompt(managed.id, promptText, body.userId);
+    // traceId / parentSpanContext arrive on a DELEGATED or sub-agent turn and are what make this
+    // turn part of the dispatching turn's trace rather than a trace of its own. Both are read from
+    // the TOP LEVEL of the body: the management plane's router reconstructs `delegation`, so a
+    // field nested there never arrives. Absent on an ordinary user prompt, which is the whole
+    // point — that turn IS the root.
+    tracingRecorder.startPrompt(
+      managed.id,
+      promptText,
+      body.userId,
+      typeof body.traceId === "string" ? body.traceId : undefined,
+      toSpanContext(body.parentSpanContext),
+    );
 
     const actuallyFinish = () => {
       managed._promptDone = true;

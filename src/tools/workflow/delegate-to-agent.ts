@@ -121,7 +121,9 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
         });
       };
       const continueSessionId = params.session_id?.trim() || undefined;
-      const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId }, onProgress, signal)
+      // toolCallId travels with the request so the peer's turn can nest under THIS tool span and be
+      // correlated with THIS tool row — a coordinator may have several delegations in flight.
+      const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId, toolCallId }, onProgress, signal)
         .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
 
       // Stopped by the coordinator (turn aborted): the relay was torn down and

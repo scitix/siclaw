@@ -9,6 +9,7 @@ import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
 import type { OriginKind, DelegationContext } from "../../core/types.js";
+import type { WireSpanContext } from "../../shared/agent-delegate.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
 
@@ -39,6 +40,20 @@ export interface PromptOptions {
   origin?: OriginKind;
   /** Present when a coordinator agent delegated this turn over the mesh. */
   delegation?: DelegationContext;
+  /**
+   * Trace context of the turn that DISPATCHED this one (delegation / sub-agent), so the child
+   * joins the parent's trace instead of starting its own.
+   *
+   * TOP LEVEL, never nested inside `delegation`: the management plane's router reconstructs that
+   * object, so a field placed there is dropped in transit. All three are optional — absent is the
+   * pre-existing behaviour (the child generates its own id), which is what keeps this additive
+   * across a rolling upgrade.
+   */
+  traceId?: string;
+  /** The dispatching tool's span, when it could be captured. Makes the child's root its CHILD. */
+  parentSpanContext?: WireSpanContext;
+  /** The dispatching `delegate_to_agent` tool-call id, for row-level correlation. */
+  delegationToolCallId?: string;
   /** Model provider to use for this prompt */
   modelProvider?: string;
   /** Model ID to use for this prompt */

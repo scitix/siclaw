@@ -630,6 +630,13 @@ export async function handleDelegate(
           modelRouting: binding.modelRouting,
           systemPrompt: binding.systemPrompt ?? undefined,
           origin: "api",
+          // TOP LEVEL, not nested under `delegation` — the management plane's router RECONSTRUCTS
+          // prompt.delegation, so a field placed inside it is dropped in transit. Absent means
+          // "no trace to join", which is what an older caller sends and what the peer already
+          // handles by generating its own id.
+          traceId: body.traceId,
+          parentSpanContext: body.parentSpanContext,
+          delegationToolCallId: body.toolCallId,
           delegation: {
             delegationId,
             parentSessionId: body.parentSessionId,
@@ -697,6 +704,12 @@ export async function handleDelegate(
       modelRouting: binding.modelRouting,
       systemPromptTemplate: binding.systemPrompt ?? undefined,
       origin: "api",
+      // Same fields as the remote path, and top-level for the same reason — a peer reached
+      // in-process must land in the coordinator's trace exactly as a remote one does, or the
+      // call tree depends on where the box happens to be scheduled.
+      traceId: body.traceId,
+      parentSpanContext: body.parentSpanContext,
+      delegationToolCallId: body.toolCallId,
       delegation: {
         delegationId,
         parentSessionId: body.parentSessionId,

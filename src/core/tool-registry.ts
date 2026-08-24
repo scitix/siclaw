@@ -375,7 +375,17 @@ export interface DelegateProgress {
  * Absent → the `delegate_to_agent` tool stays out of the resolved tool list.
  */
 export type DelegateToAgentExecutor = (
-  req: { peerAgentId: string; text: string; peerSessionId?: string },
+  req: {
+    peerAgentId: string;
+    text: string;
+    peerSessionId?: string;
+    /**
+     * The coordinator's tool-call id for THIS delegation. The executor turns it into the tool span
+     * the peer's root nests under, and forwards it so the peer's turn can be correlated with the
+     * exact tool row that dispatched it. Concurrent delegations make session ids insufficient here.
+     */
+    toolCallId?: string;
+  },
   onProgress?: (p: DelegateProgress) => void,
   /** Aborts the delegation when the coordinator's turn is stopped: closes the
    *  relay stream and cancels the peer's turn. */

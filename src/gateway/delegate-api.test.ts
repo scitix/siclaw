@@ -193,6 +193,44 @@ describe("handleDelegate — parentSessionId identity binding (P1)", () => {
   });
 });
 
+describe("handleDelegate — trace context forwarding (C3)", () => {
+  const TRACE = "0123456789abcdef0123456789abcdef";
+  const SPAN = "0123456789abcdef";
+
+  it("forwards traceId / parentSpanContext / toolCallId at the prompt's TOP LEVEL", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess",
+      traceId: TRACE,
+      parentSpanContext: { traceId: TRACE, spanId: SPAN, traceFlags: 1 },
+      toolCallId: "call-7",
+    }), makeRes() as any, identity, deps);
+
+    const sent = promptMock.mock.calls[0][0];
+    expect(sent.traceId).toBe(TRACE);
+    expect(sent.parentSpanContext).toEqual({ traceId: TRACE, spanId: SPAN, traceFlags: 1 });
+    expect(sent.delegationToolCallId).toBe("call-7");
+    // TOP LEVEL is a contract, not a style choice: the management plane's router RECONSTRUCTS
+    // prompt.delegation, so a field nested inside it is dropped in transit. Asserting the absence
+    // is what stops a future refactor from "tidying" these into the delegation object.
+    expect(sent.delegation.traceId).toBeUndefined();
+    expect(sent.delegation.parentSpanContext).toBeUndefined();
+  });
+
+  it("omits them when the caller sent none — an older caller must still work", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    await handleDelegate(
+      makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }),
+      makeRes() as any, identity, deps,
+    );
+    const sent = promptMock.mock.calls[0][0];
+    // Absent means "no trace to join" — the peer then generates its own id, exactly as before.
+    expect(sent.traceId).toBeUndefined();
+    expect(sent.parentSpanContext).toBeUndefined();
+    expect(sent.delegationToolCallId).toBeUndefined();
+  });
+});
+
 describe("handleDelegate — cancellation during cold spawn (P1)", () => {
   it("does not prompt the peer if the coordinator disconnects during getOrCreate", async () => {
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });

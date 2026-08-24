@@ -100,7 +100,7 @@ vi.mock("./gateway-client.js", () => ({
 }));
 
 // Import SUT after mocks.
-import { createHttpServer, resolveDelegation } from "./http-server.js";
+import { createHttpServer, resolveDelegation, toSpanContext } from "./http-server.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1853,5 +1853,38 @@ describe("resolveDelegation (worker autonomy — readOnly is explicit opt-in)", 
   it("honors an EXPLICIT read-only=true opt-in (future read-only tier)", () => {
     expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "web")?.readOnly).toBe(true);
     expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "api")?.readOnly).toBe(true);
+  });
+});
+
+// ── Delegation trace context (C3) ─────────────────────────────────────────────
+// A delegated turn joins the DISPATCHING turn's trace instead of starting its own. The span context
+// crosses a process boundary as untyped JSON, and the OTel SDK silently DISCARDS a malformed remote
+// parent — so an unvalidated value degrades to "no parent" with no signal, which is indistinguishable
+// from tracing being off. Hence validation here rather than trust.
+describe("toSpanContext — rebuilding a remote parent from the wire", () => {
+  const TRACE = "0123456789abcdef0123456789abcdef";
+  const SPAN = "0123456789abcdef";
+
+  it("rebuilds a valid context and marks it REMOTE", () => {
+    expect(toSpanContext({ traceId: TRACE, spanId: SPAN, traceFlags: 1 })).toEqual({
+      traceId: TRACE, spanId: SPAN, traceFlags: 1, isRemote: true,
+    });
+  });
+
+  it("defaults traceFlags rather than dropping the parent over a missing flag byte", () => {
+    expect(toSpanContext({ traceId: TRACE, spanId: SPAN })?.traceFlags).toBe(1);
+  });
+
+  it("rejects anything malformed — a bad id must not reach the SDK", () => {
+    expect(toSpanContext(undefined)).toBeUndefined();
+    expect(toSpanContext(null)).toBeUndefined();
+    expect(toSpanContext("not-an-object")).toBeUndefined();
+    expect(toSpanContext({ spanId: SPAN })).toBeUndefined();
+    expect(toSpanContext({ traceId: TRACE })).toBeUndefined();
+    expect(toSpanContext({ traceId: "short", spanId: SPAN })).toBeUndefined();
+    expect(toSpanContext({ traceId: TRACE, spanId: "short" })).toBeUndefined();
+    // All-zero ids are OTel's "invalid" sentinels; isValidTraceId/isValidSpanId reject them.
+    expect(toSpanContext({ traceId: "0".repeat(32), spanId: SPAN })).toBeUndefined();
+    expect(toSpanContext({ traceId: TRACE, spanId: "0".repeat(16) })).toBeUndefined();
   });
 });

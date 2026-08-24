@@ -2744,8 +2744,28 @@ export class AgentBoxSessionManager {
           // on message_end. Build the same {assistant|tool} step shape the card renders.
           const pending = new Map<string, { toolName?: string; args?: unknown }>();
           let childSessionId: string | undefined;
+          // Join the coordinator's trace, exactly as spawn_subagent does (see the mainTraceId /
+          // spawnSpanContext pair above). Two INDEPENDENT lookups, deliberately:
+          //   • the root trace id is known whenever this turn has one, tracing on or off — it is
+          //     what makes the peer's rows group with the coordinator's in the DB;
+          //   • the tool span may be uncapturable (tracing disabled, parent trace already ended),
+          //     and its absence must not cost us the trace id as well. With it the peer's root
+          //     nests UNDER this tool call; without it the peer still shares the trace.
+          const parentSpan = req.toolCallId
+            ? tracingRecorder.ensureToolSpan(id, req.toolCallId, "delegate_to_agent")
+            : undefined;
           return gc.delegateStream(
-            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId },
+            {
+              peerAgentId: req.peerAgentId,
+              text: req.text,
+              parentSessionId: id,
+              peerSessionId: req.peerSessionId,
+              toolCallId: req.toolCallId,
+              traceId: tracingRecorder.getRootTraceId(id),
+              parentSpanContext: parentSpan
+                ? { traceId: parentSpan.traceId, spanId: parentSpan.spanId, traceFlags: parentSpan.traceFlags }
+                : undefined,
+            },
             (evt) => {
               const e = evt as any;
               const t = String(e?.type ?? "");
