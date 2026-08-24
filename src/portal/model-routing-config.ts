@@ -162,6 +162,15 @@ export async function resolveAgentSubagentTiers(raw: unknown): Promise<{
   for (const entry of entries) {
     const modelConfig = configs.get(entry.provider);
     if (!modelConfig) return { menu: null, candidates: null };
+    // The provider existing is not enough — the MODEL must still be in it. A model
+    // deleted or renamed after the tier list was written leaves a dangling
+    // reference, and shipping it would advertise a tier whose candidate the child
+    // then cannot resolve. Catching it here turns a per-child fallback into a
+    // whole-list "not configured", which is the honest state.
+    const models = Array.isArray((modelConfig as { models?: unknown }).models)
+      ? (modelConfig as { models: Array<{ id?: unknown }> }).models
+      : [];
+    if (!models.some((m) => m?.id === entry.modelId)) return { menu: null, candidates: null };
     items.push({ tier: entry.tier, whenToUse: entry.whenToUse });
     candidates.push({
       tier: entry.tier,

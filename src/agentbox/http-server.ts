@@ -9,7 +9,7 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import type { TLSSocket } from "node:tls";
-import type { AgentBoxSessionManager } from "./session.js";
+import type { AgentBoxSessionManager, ManagedSession } from "./session.js";
 import type { SessionMode, OriginKind, DelegationContext } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
 import { loadConfig, resolveTracingEnvironment } from "../core/config.js";
@@ -347,6 +347,24 @@ function defaultPromptTextForMedia(media?: PromptMedia): string {
   if (hasFiles) return "Please analyze the attached PDF.";
   if (hasImages) return "Please analyze the attached image.";
   return "";
+}
+
+/**
+ * Drop this turn's tier state. Called on EVERY terminal path — normal finish,
+ * setup failure, and abort (which funnels through `actuallyFinish`).
+ *
+ * Both fields are turn-scoped and one of them holds credentials, so leaving them
+ * behind is not merely untidy: a later SYNTHETIC turn (a background-work
+ * notification prompting the parent) runs without an HTTP body, so it would
+ * install nothing and silently inherit whatever the previous turn left — its
+ * model, and its apiKey, past a rotation.
+ *
+ * A background sub-agent group is unaffected: it carries the plan it captured at
+ * dispatch as a value, not a reference to session state.
+ */
+function clearTurnTierState(managed: ManagedSession): void {
+  managed.subagentTierCandidates = null;
+  managed.effectiveModelCandidate = null;
 }
 
 /**
@@ -976,6 +994,10 @@ export function createHttpServer(
       // Release the brain.prompt mutex so a follow-up prompt isn't blocked.
       managed._promptInflight = null;
       releasePromptInflight();
+      // Cleanup before the response is logged and sent: a setup failure leaves the
+      // turn's credential-bearing tier state installed, and a later synthetic turn
+      // carries no HTTP body to overwrite it.
+      clearTurnTierState(managed);
       logPromptResponse(500, "setup_failed", err, managed.id);
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
     };
@@ -1096,6 +1118,7 @@ export function createHttpServer(
     const actuallyFinish = () => {
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
+      clearTurnTierState(managed);
 
       // Emit prompt metrics via diagnostic event bus
       const currStats = managed.brain.getSessionStats();

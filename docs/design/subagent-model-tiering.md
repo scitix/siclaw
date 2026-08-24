@@ -770,19 +770,24 @@ three hand-rolled queries — three copies is how one of them ends up without
 | `chat-gateway.ts:282` — local binding resolution | Candidates |
 | `adapter.ts` `config.getAgent` handler | Config form (`subagent_model_tiers`) |
 | `adapter.ts` `config.getModelBinding` handler | Candidates |
-| `cli-snapshot-api.ts` + `cli-snapshot-types.ts` + `cli-main.ts` | **Both** menu and candidates — see below |
+| CLI snapshot | **Nothing** — see below |
+**The TUI carries no tier state at all, and must not.** Earlier drafts required the
+CLI snapshot to carry both payloads, on the assumption that the TUI needed a menu
+because it has no tools channel to deliver one. That assumption was wrong: the TUI
+does not construct a `spawnSubagentExecutor` (`cli-main.ts`, "No
+spawnSubagentExecutor → background sub-agents stay TUI-unavailable; that needs the
+agentbox child-session machinery"), so `spawn_subagent` is not registered there at
+all.
 
-**The TUI is a special case: it does not go through the AgentBox tools sync
-channel.** The two-channel split in §4 assumes a tools payload exists to carry the
-menu; in TUI mode there is none. So the CLI snapshot must carry **both** the menu and
-the candidates, and the TUI's session construction takes its menu snapshot from there
-instead of from box-level state.
+With no sub-agents there is nothing to tier. Shipping tier state to the TUI would
+mean delivering **credentials** to a surface that has no consumer for them — a
+strictly worse outcome than delivering nothing.
 
-This is not a second design — the snapshot plays the role the tools channel plays
-elsewhere, and §5's revision rules apply unchanged. But it does mean the snapshot
-payload is the one place where menu and candidates travel together, so the
-confidentiality rule in §6.1 has to be enforced at the point of *use* there: the
-menu half feeds the tool description, the candidate half must not.
+So: no `subagent_models` in the CLI snapshot query, no tier fields in
+`cli-snapshot-types.ts`, and no menu in the TUI's session construction. If the TUI
+ever gains the child-session machinery, tiering becomes reachable and this section
+has to be revisited **together with** the credential-delivery question, not as a
+mechanical field addition.
 
 ### 11.7 Portal UI
 

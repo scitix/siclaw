@@ -380,7 +380,15 @@ export class PiAgentBrain implements BrainSession {
       };
     }
 
-    const tokens = estimateCurrentContextTokens(this.session) + promptTokens;
+    // A REQUEST is not just the conversation. On a freshly created sub-agent the
+    // message history is nearly empty while the system prompt, the skill/knowledge
+    // preamble folded into it, and the tool schemas are the bulk of what gets sent
+    // — so counting messages alone would pass a tier whose window the real request
+    // then overflows, and by then the prompt has started and cannot be taken back.
+    const tokens =
+      estimateCurrentContextTokens(this.session)
+      + estimateRequestOverheadTokens(this.session)
+      + promptTokens;
     if (tokens > budget) {
       return {
         ok: false,
@@ -520,6 +528,44 @@ function estimatePromptTokens(text: string): number {
       timestamp: Date.now(),
     } as any,
   ]);
+}
+
+/**
+ * Tokens a request carries beyond the conversation: the system prompt and every
+ * active tool's schema.
+ *
+ * `estimateCurrentContextTokens` prefers pi's own `getContextUsage()`, which
+ * reports what the LAST request actually consumed. A session that has never
+ * prompted has no such reading and falls back to counting messages — and a
+ * just-created sub-agent's messages are nearly empty while its system prompt and
+ * tool schemas are most of the payload. Without this, a fit check against a
+ * smaller tier window passes on a child that cannot possibly fit.
+ *
+ * Deliberately an over-estimate rather than an under-estimate: being wrong high
+ * costs a needless fallback to the parent model, being wrong low costs a
+ * mid-stream failure that nothing can recover from.
+ *
+ * Defensive throughout — this runs on a hot-ish path against an SDK surface we do
+ * not own, and a fit check that throws would be worse than one that guesses.
+ */
+function estimateRequestOverheadTokens(session: AgentSession): number {
+  let text = "";
+  try {
+    const systemPrompt = session.systemPrompt;
+    if (typeof systemPrompt === "string") text += systemPrompt;
+  } catch { /* not exposed on this build — fall through to tools */ }
+
+  try {
+    const tools = session.getAllTools?.();
+    if (Array.isArray(tools)) {
+      for (const tool of tools) {
+        // name + description + parameter schema, which is what a provider is sent.
+        text += JSON.stringify(tool ?? "");
+      }
+    }
+  } catch { /* ignore — the system prompt alone is still better than nothing */ }
+
+  return estimatePromptTokens(text);
 }
 
 function estimateCurrentContextTokens(session: AgentSession): number {

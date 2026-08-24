@@ -39,7 +39,7 @@ import {
   RUN_IN_BACKGROUND_ENABLED,
   isSubagentGroupEnabled,
 } from "../../core/subagent-registry.js";
-import { renderTierMenuForDescription } from "../../core/subagent-models.js";
+import { renderTierMenuForDescription, type ChildModelOutcome } from "../../core/subagent-models.js";
 import { validateAndRenderGroupPlan } from "../../agentbox/subagent-group.js";
 
 interface SpawnSubagentParams {
@@ -50,6 +50,27 @@ interface SpawnSubagentParams {
   subagent_type?: string;
   run_in_background?: boolean;
   model_tier?: string;
+}
+
+/**
+ * Snake_case tier fields for one item's report, shared by the batch and the
+ * collapsed-single paths so they cannot describe the same thing differently.
+ *
+ * Requested vs resolved plus a reason is what separates "the report is weak",
+ * "the lead picked the wrong tier" and "the candidate never arrived" — they look
+ * identical from outside otherwise. Identifiers only; credentials never leave the
+ * candidate payload.
+ */
+function tierFieldsForReport(outcome: ChildModelOutcome | undefined): Record<string, unknown> {
+  if (!outcome) return {};
+  return {
+    requested_tier: outcome.requestedTier ?? undefined,
+    resolved_tier: outcome.resolvedTier ?? undefined,
+    selection_source: outcome.source,
+    effective_provider: outcome.provider,
+    effective_model_id: outcome.modelId,
+    fallback_reason: outcome.fallbackReason,
+  };
 }
 
 function errorResult(message: string) {
@@ -398,21 +419,7 @@ function toToolOutput(
           status: r.status,
           summary: r.summary,
           child_session_id: r.childSessionId,
-          // Which model ran this item, and why it may differ from what was asked.
-          // Without requested-vs-resolved plus a reason, "the report is weak",
-          // "the lead picked the wrong tier" and "the candidate never arrived"
-          // are indistinguishable from the outside. Identifiers only — this
-          // record is non-model-visible detail for the group card.
-          ...(r.tierOutcome
-            ? {
-                requested_tier: r.tierOutcome.requestedTier ?? undefined,
-                resolved_tier: r.tierOutcome.resolvedTier ?? undefined,
-                selection_source: r.tierOutcome.source,
-                effective_provider: r.tierOutcome.provider,
-                effective_model_id: r.tierOutcome.modelId,
-                fallback_reason: r.tierOutcome.fallbackReason,
-              }
-            : {}),
+          ...tierFieldsForReport(r.tierOutcome),
         })),
         duration_ms: result.durationMs,
         ...(result.reduceChildSessionId ? { reduce_child_session_id: result.reduceChildSessionId } : {}),
@@ -429,7 +436,15 @@ function toToolOutput(
       ...modelVisible,
       // Legacy single-spawn fields for the AgentWorkCard (it reads these from details): the raw item,
       // capsule/full report, child session for drill-in, tool-call + duration counters, and the steps.
-      item_results: [{ ...single, item: items[0], child_session_id: result.childSessionId }],
+      // Same tier fields the batch path reports — a single task is the common case,
+      // so omitting them here would leave the most-used path unable to show which
+      // model ran or why it fell back.
+      item_results: [{
+        ...single,
+        item: items[0],
+        child_session_id: result.childSessionId,
+        ...tierFieldsForReport(result.tierOutcome),
+      }],
       summary: result.summary,
       tool_calls: result.toolCalls,
       duration_ms: result.durationMs,

@@ -497,6 +497,48 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
   });
 });
 
+describe("http-server — sub-agent tier turn state", () => {
+  const REV = "a".repeat(64);
+  const tiers = {
+    revision: REV,
+    candidates: [{
+      tier: "fast",
+      provider: "p",
+      modelId: "m",
+      modelConfig: { apiKey: "tier-secret", baseUrl: "https://tier.invalid", models: [] },
+    }],
+  };
+
+  it("installs candidates for the turn and CLEARS them when it ends", async () => {
+    // Credential-bearing turn state. A later SYNTHETIC turn carries no HTTP body,
+    // so anything left behind would be silently reused — the previous turn's model
+    // and its apiKey, past a rotation.
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "tier-1", subagentTiers: tiers });
+    expect(r.status).toBe(200);
+    const managed = sm.sessions.get("tier-1");
+    expect(managed).toBeDefined();
+    expect(managed!.subagentTierCandidates).toBeNull();
+    expect(managed!.effectiveModelCandidate).toBeNull();
+  });
+
+  it("clears them on a turn that never carried any", async () => {
+    // Absent means "no tiers this turn", which must overwrite rather than preserve.
+    await getJson(port, "/api/prompt", "POST", { text: "one", sessionId: "tier-2", subagentTiers: tiers });
+    await getJson(port, "/api/prompt", "POST", { text: "two", sessionId: "tier-2" });
+    expect(sm.sessions.get("tier-2")!.subagentTierCandidates).toBeNull();
+  });
+
+  it("ignores a malformed payload instead of failing the turn", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "tier-3",
+      subagentTiers: { revision: "not-hex", candidates: [] },
+    });
+    expect(r.status).toBe(200);
+    expect(sm.sessions.get("tier-3")!.subagentTierCandidates).toBeNull();
+  });
+});
+
 describe("http-server — prompt + session lifecycle", () => {
   it("POST /api/prompt creates a session and returns ok", async () => {
     const r = await getJson(port, "/api/prompt", "POST", { text: "hi" });

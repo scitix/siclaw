@@ -639,6 +639,13 @@ export class AgentBoxSessionManager {
           detail: `${resolved.provider}/${resolved.modelId}`,
         };
       }
+      // setModel is called UNCONDITIONALLY, without a `modelNeedsRebind` guard —
+      // unlike the routing runner. That is deliberate on the fallback path: a
+      // rejected tier has already applied ITS params, and `applyModelParams` is a
+      // setter with no reset (an absent `reasoning_effort` is a no-op, not a
+      // clear), so the only thing that restores the target model's own level is
+      // pi's own setModel, which re-reads the persisted default. Skipping it when
+      // the model happens to be unchanged would leave the tier's level behind.
       await brain.setModel(model);
       applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
 
@@ -2582,21 +2589,10 @@ export class AgentBoxSessionManager {
     // long batch straddle a configuration change and report both halves as one.
     const tierOutcome = await this.applyChildModel(child, request.tierPlan, request.prompt);
 
-    // The one non-recoverable case: even the parent's effective model could not be
-    // applied, so there is nothing left to fall back to (§7.4). Fail the child here
-    // rather than prompting a brain we know is misconfigured — and rather than
-    // looping, which would burn the whole fan-out on a broken session.
-    if (tierOutcome.failed) {
-      const detail = tierOutcome.detail ? `: ${tierOutcome.detail}` : "";
-      return {
-        status: "failed",
-        summary: `Sub-agent could not be placed on a model${detail}`,
-        childSessionId: childSessionId,
-        toolCalls: 0,
-        durationMs: 0,
-        tierOutcome,
-      };
-    }
+    // A `failed` outcome means not even the parent's effective model could be
+    // applied, so there is nothing left to fall back to (§7.4). It is NOT handled
+    // here: it throws at the prompt boundary below, so the failure funnels through
+    // the same cleanup and terminal-event persistence as any other.
 
     // Sub-agent trace: open a ROOT span that NESTS under the parent's spawn_subagent tool
     // span (spawnSpanContext) so its tree hangs beneath that tool call in Langfuse; falls back
@@ -2776,6 +2772,16 @@ export class AgentBoxSessionManager {
       // no-op with no active run — so DON'T start the prompt at all, or it would run a fresh,
       // un-aborted turn. Throw straight into the stopRequested branch below.
       if (stopRequested) throw new Error("stopped before sub-agent prompt started");
+      // Not even the parent's effective model could be applied (§7.4). Throw rather
+      // than returning early: this path has to reach the same `finally` — which
+      // shuts down an MCP manager this child opened — and the terminal-event
+      // persistence below, or the card sticks "Running" on reload and the child
+      // leaks its connections.
+      if (tierOutcome.failed) {
+        throw new Error(
+          `sub-agent could not be placed on a model${tierOutcome.detail ? `: ${tierOutcome.detail}` : ""}`,
+        );
+      }
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );
