@@ -55,6 +55,26 @@ describe("delegate_to_agent tool", () => {
     expect(tool.description).toContain("list_delegates");
   });
 
+  it("states the call is synchronous and that a plan is not a result", () => {
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: vi.fn() as any }));
+    // A coordinator read a plan-shaped return as "still working" and waited, then re-delegated the
+    // same question twice. Both facts below are what the description exists to state; a future edit
+    // that drops either one reproduces that trace.
+    expect(tool.description).toContain("SYNCHRONOUS");
+    expect(tool.description).toContain("not still working in the background");
+    expect(tool.description).toContain("Narration that describes a plan is not a result");
+    // Where the rest of the text went — this is what stops a re-delegation to recover it.
+    expect(tool.description).toContain("the complete record stays in the peer's own session");
+    // Must NOT promise findings unconditionally: what comes back may be narration.
+    expect(tool.description).not.toContain("and get back its findings");
+    // Nor call that narration a "summary". Without an artifact the model receives resp.finalText
+    // VERBATIM (see the `const summary = a ? a.findings : resp.finalText` shaping below) — an
+    // accumulated narrative whose START is dropped when it exceeds the budget. A summary is never
+    // missing its beginning, so the word would misdescribe exactly the case that matters.
+    expect(tool.description).not.toContain("a summary of");
+    expect(tool.description).toContain("drops the START of a long narration");
+  });
+
   it("resolves the target and calls the executor, shaping the AgentWorkCard result", async () => {
     const exec = vi.fn(async () => okResp());
     const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));

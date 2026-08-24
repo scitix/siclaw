@@ -55,10 +55,22 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
     label: "Delegate to Agent",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("delegate_to_agent")), 0, 0),
     renderResult: renderTextResult,
+    // The first two sentences are a statement of FACT about this call's semantics, not advice, and
+    // they are here rather than in a prompt because a tool description is the one channel prompt
+    // customization cannot bypass. Both were added because a coordinator read a plan-shaped return
+    // as "the peer is still working" and waited, then re-delegated the same question twice.
+    // Do not soften them into "returns the peer's findings": what comes back may be narration, and
+    // saying otherwise is what produced the misreading. See
+    // docs/design/2026-08-25-coordinator-prompt-proposal.md (Proposal 1).
     description:
-      "Delegate a bounded task to one of your specialist agents and get back its findings. The peer runs the " +
-      "task in its OWN environment under its own capabilities and persona (you don't constrain it) and reports " +
-      "back — you keep oversight. Use this when a task belongs to a peer's domain/resources rather than your " +
+      "Delegate a bounded task to one of your specialist agents. This call is SYNCHRONOUS: it returns when the " +
+      "peer's turn ends — the peer is not still working in the background afterwards. You get the peer's " +
+      "structured findings when it reported them, otherwise its narration from that turn, both subject to " +
+      "a size budget that drops the START of a long narration; the complete record stays in the peer's own " +
+      "session. Narration that describes a plan is " +
+      "not a result. The peer runs the " +
+      "task in its OWN environment under its own capabilities and persona (you don't constrain it) — you keep " +
+      "oversight. Use this when a task belongs to a peer's domain/resources rather than your " +
       "own. Pass the target's `agent_id` (the [id: …] value below) and `agent_name`. " +
       "First use list_delegates(query=<target cluster/host/node>) to confirm WHICH agent covers the target " +
       "(the coverage is not listed here — only counts). To continue an earlier line of work with the SAME " +
