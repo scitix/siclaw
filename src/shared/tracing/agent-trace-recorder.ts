@@ -476,6 +476,20 @@ function perCallTokenAttributes(usage: unknown): Attributes {
  * external/gateway trace ids in. Keep this caller comment so it is not mistaken for
  * dead code and dropped again.
  */
+/**
+ * The id to stamp on this prompt's DB rows: the caller's, when it supplied a well-formed one, else
+ * a fresh random id. Used by the two id-only paths of startPrompt (tracing off / no attachment),
+ * which have no span to inherit from but must still honour the caller's grouping intent.
+ *
+ * Validation matters as much as adoption: an id that reaches the DB unvalidated groups rows under
+ * something that is not a trace id, and the row is the audit record — nothing rewrites it later.
+ */
+function adoptOrGenerateTraceId(traceId?: string): string {
+  if (traceId && isValidTraceId(traceId)) return traceId;
+  if (traceId) console.debug(`[tracing] ignoring invalid supplied trace id: ${traceId}`);
+  return randomBytes(16).toString("hex");
+}
+
 function rootContextForTrace(traceId?: string): Context {
   if (!traceId || !isValidTraceId(traceId)) {
     if (traceId) console.debug(`[tracing] ignoring invalid trace id: ${traceId}`);
@@ -531,7 +545,12 @@ export const tracingRecorder = {
   startPrompt(sessionId: string, promptText?: string, userId?: string, traceId?: string, parentSpanContext?: SpanContext): void {
     if (!isTracingEnabled()) {
       try {
-        promptTraceIds.set(sessionId, randomBytes(16).toString("hex"));
+        // A SUPPLIED traceId is honoured here too. The DB trace_id is what groups a delegated /
+        // sub-agent turn with the parent turn that dispatched it, and that grouping is the entire
+        // reason the caller passed an id — it does not depend on spans being exported. Generating a
+        // random one on this path silently split every child into its own trace in exactly the
+        // deployments where tracing is off, which is most of them.
+        promptTraceIds.set(sessionId, adoptOrGenerateTraceId(traceId));
       } catch (err) {
         console.warn("[tracing] startPrompt (id-only) error:", err);
       }
@@ -541,7 +560,9 @@ export const tracingRecorder = {
       const attachment = attachments.get(sessionId);
       if (!attachment) {
         console.debug(`[tracing] startPrompt with no attachment for ${sessionId}; id-only`);
-        promptTraceIds.set(sessionId, randomBytes(16).toString("hex"));
+        // Same reasoning as the tracing-off path above: no attachment means no span to nest, not
+        // that the caller's grouping intent stops applying.
+        promptTraceIds.set(sessionId, adoptOrGenerateTraceId(traceId));
         return;
       }
       // A pre-existing trace means a prior endPrompt was missed — abort it cleanly.

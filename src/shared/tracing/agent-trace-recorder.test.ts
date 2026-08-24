@@ -1007,4 +1007,34 @@ describe("root span trace id (decoupled per-prompt id)", () => {
     expect(tid).toMatch(/^[0-9a-f]{32}$/);
     expect(tid).not.toBe("not-a-valid-trace-id");
   });
+
+  // ── The two id-only paths ──────────────────────────────────────────────────
+  // A supplied traceId is what groups a delegated / sub-agent turn with the parent turn in the DB,
+  // and these two paths used to replace it with a random id — so the grouping silently failed in
+  // exactly the deployments where tracing is off. The stamped id does not depend on span export.
+  it("honours a supplied traceId with tracing DISABLED (DB grouping must not need an exporter)", () => {
+    __installTracerProviderForTest(null); // isTracingEnabled() → false
+    tracingRecorder.attach(SID, makeBrain(), {});
+    tracingRecorder.startPrompt(SID, undefined, undefined, "0123456789abcdef0123456789abcdef");
+    expect(tracingRecorder.getRootTraceId(SID)).toBe("0123456789abcdef0123456789abcdef");
+  });
+
+  it("honours a supplied traceId when there is NO attachment", () => {
+    // No attach() — the id-only branch inside the tracing-enabled path.
+    tracingRecorder.startPrompt(SID, undefined, undefined, "0123456789abcdef0123456789abcdef");
+    expect(tracingRecorder.getRootTraceId(SID)).toBe("0123456789abcdef0123456789abcdef");
+  });
+
+  it("still generates a random id on both id-only paths when none is supplied or it is invalid", () => {
+    // Unchanged behaviour for an ordinary root prompt, which passes no traceId at all.
+    __installTracerProviderForTest(null);
+    tracingRecorder.startPrompt(SID);
+    expect(tracingRecorder.getRootTraceId(SID)).toMatch(/^[0-9a-f]{32}$/);
+
+    // An invalid id must NOT reach the DB: the row is the audit record and nothing rewrites it.
+    tracingRecorder.startPrompt("other-session", undefined, undefined, "not-a-valid-trace-id");
+    const stamped = tracingRecorder.getRootTraceId("other-session");
+    expect(stamped).toMatch(/^[0-9a-f]{32}$/);
+    expect(stamped).not.toBe("not-a-valid-trace-id");
+  });
 });
