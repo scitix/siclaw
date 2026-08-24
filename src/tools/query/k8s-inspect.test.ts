@@ -755,6 +755,21 @@ describe("collectObject — the size budget", () => {
     expect(text).toMatch(/events \(0[^)]*(retained|TTL|expire)/);
   });
 
+  it("keeps the resolved neighbour name when its response will not parse", async () => {
+    // Same consequence as a forbidden read, so the same treatment: the probe exited fine and the body was
+    // not JSON, and neither of those un-resolves the name we followed to get here.
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": "not json at all",
+      "get replicaset web-7d9f": JSON.stringify(RS),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("--- node (node-42) ---");
+    expect(text).toContain("not read: unparseable");
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (node: unparseable)");
+  });
+
   it("does not turn an unparseable event response into a genuine empty list", async () => {
     const d = deps({
       "get pod web": pod(),

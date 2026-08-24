@@ -592,6 +592,12 @@ export function kubectlOutputFormats(args: string[]): string[] {
  *
  * Short clusters are walked the same way `kubectlOutputFormats` walks them: a value-taking letter claims
  * the rest of the token, or the next token when nothing is left, so `-Ao json` consumes `json`.
+ *
+ * ⚠️ `FLAGS_WITH_VALUE` is kubectl's GLOBAL value-flag table, not the union of every subcommand's own.
+ * `get --label-columns <cols>`, `--subresource <sub>` and `--filename <f>` in their space-separated form
+ * therefore leave their VALUE in this list. A caller that reads a position out of the result must not
+ * assume the position is right: it must fail closed on a list longer than it expects, which is sound
+ * because an unconsumed value can only ADD an entry, never remove one. See `namesCoreResource`.
  */
 export function kubectlPositionals(args: string[]): string[] {
   const positionals: string[] = [];

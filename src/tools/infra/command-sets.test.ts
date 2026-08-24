@@ -2110,6 +2110,59 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
     }
   });
 
+  it("refuses when a subcommand flag's value lands in the resource slot", () => {
+    // `kubectlPositionals` consumes kubectl's GLOBAL value flags, not each subcommand's own, so
+    // `--label-columns events` leaves `events` sitting where the resource goes while the real resource is
+    // the CRD behind it. An unconsumed value can only ADD a positional, never remove one, which is why
+    // requiring exactly [subcommand, resource] closes the whole family instead of one flag at a time.
+    const SEL = "--field-selector involvedObject.name=x,involvedObject.kind=Y";
+    for (const cmd of [
+      `kubectl get --label-columns events widgets.example.com -A ${SEL} -o json`,
+      `kubectl get --subresource events widgets.example.com -A ${SEL} -o json`,
+      `kubectl get --filename events widgets.example.com -A ${SEL} -o json`,
+      // A trailing name is the same shape: more positionals than the rule reasons about.
+      `kubectl get events some-event -A ${SEL} -o json`,
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("refuses a spec.nodeName selector on anything but core Pods", () => {
+    // The bound claimed is "one node's pods", which is a fact about Pods. A CRD can declare a
+    // `spec.nodeName` selectable field that carries no such bound, and this exception would then be
+    // authorising a full `-A -o json` of that CRD.
+    for (const cmd of [
+      "kubectl get widgets.example.com -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get --label-columns pods widgets.example.com -A --field-selector spec.nodeName=node-1 -o json",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+    // The real thing still works, in every spelling kubectl takes for it.
+    for (const cmd of [
+      "kubectl get pods -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get po -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get pods.v1. -A --field-selector spec.nodeName=node-1 -o json",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("reads the trailing dot as the core group, so events.v1 is not events.v1.", () => {
+    // kubectl spells a core resource `events`, `events.` or `events.v1.`. `events.v1` means resource
+    // `events` in an API GROUP named `v1` — a legal group name a CRD can take. Filtering empty segments
+    // away erased that distinction and let every `events.<version>` through as core.
+    const SEL = "--field-selector involvedObject.name=x,involvedObject.kind=Y";
+    for (const cmd of [
+      `kubectl get events.v1 -A ${SEL} -o json`,
+      `kubectl get events.v2 -A ${SEL} -o json`,
+      `kubectl get events.v1beta1 -A ${SEL} -o json`,
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+    expect(check(`kubectl get events. -A ${SEL} -o json`)).toBeNull();
+    expect(check(`kubectl get events.v1. -A ${SEL} -o json`)).toBeNull();
+  });
+
   it("still accepts the core-group spellings kubectl actually takes", () => {
     for (const cmd of [
       "kubectl get events -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",

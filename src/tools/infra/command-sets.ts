@@ -1573,11 +1573,17 @@ function hasBoundingFieldSelector(args: string[]): boolean {
   const selector = effectiveFieldSelector(args);
   if (selector === undefined) return false;
   const pinned = pinnedSelectorFields(selector);
-  if (pinned.has("spec.nodeName") || pinned.has("metadata.name")) return true;
+  // `metadata.name` needs no resource check: every resource has it, and a name is unique within a
+  // namespace whatever the Kind, so the bound holds universally.
+  if (pinned.has("metadata.name")) return true;
+  // `spec.nodeName` does NOT. The bound being claimed is "one node's pods", which is a fact about Pods —
+  // a CRD can declare a `spec.nodeName` selectable field carrying no such bound, and this rule would
+  // then be authorising a full `-A -o json` of that CRD.
+  if (pinned.has("spec.nodeName") && namesCoreResource(args, CORE_POD_NAMES)) return true;
   // `involvedObject` is a field of core/v1 Event and describes an identity nowhere else, so the rest of
   // this rule is scoped to that exact resource — read from the resource POSITION, not matched as a
   // substring anywhere in the argv.
-  if (!namesCoreEventsResource(args)) return false;
+  if (!namesCoreResource(args, CORE_EVENT_NAMES)) return false;
   // A uid is globally unique to one object incarnation, so it needs no companion.
   if (pinned.has("involvedObject.uid")) return true;
   return pinned.has("involvedObject.name") && pinned.has("involvedObject.kind");
@@ -1621,39 +1627,55 @@ function pinnedSelectorFields(selector: string): Map<string, string> {
 }
 
 const CORE_EVENT_NAMES = new Set(["event", "events", "ev"]);
+const CORE_POD_NAMES = new Set(["pod", "pods", "po"]);
+
+/** `v1`, `v2beta1` — an API VERSION, which is what sits between a core resource and its trailing dot. */
+const API_VERSION_RE = /^v\d+((alpha|beta)\d+)?$/;
 
 /**
- * Is the query's resource the CORE-group Events resource, and nothing else?
+ * Is the query's resource one of `names`, in the CORE group, and nothing else?
  *
- * Precise on purpose, and it replaced a scan that was not. The first version walked every token not
- * starting with `-` and took the segment before the first dot, which granted the exception to two things
- * it should never have covered: `events.example.com`, a CRD that merely starts with the word, and any
- * command with `events` sitting in a flag's VALUE (`--sort-by events`). Neither is a query against
- * Events, and a rule that grants an exception on the resource's identity cannot be decided by a
- * substring. `kubectlPositionals` consumes flag values by arity, so the resource is read from the
- * resource POSITION.
+ * Every exception in `hasBoundingFieldSelector` is a claim about a specific resource's fields, so each
+ * one has to know which resource actually ran. Two earlier versions of this got it wrong in different
+ * ways, and both are worth stating because the shape of the mistake recurs:
  *
- * Core group only, because `involvedObject` is a field of `core/v1` Event. `events.events.k8s.io` is a
- * different API group whose corresponding field is `regarding`, so a selector on `involvedObject` is not
- * even meaningful there — and `events.example.com` is somebody's CRD.
+ *   a SUBSTRING scan over every non-flag token, taking the segment before the first dot. It granted the
+ *   exception to `events.example.com` (a CRD that merely starts with the word), to
+ *   `events.events.k8s.io` (a different API group, whose corresponding field is `regarding`), and to any
+ *   command with `events` sitting in a flag's VALUE — `--sort-by events` is not a query against Events.
  *
- * The previous version leaned on "the apiserver rejects `involvedObject` on anything else anyway". That
- * is defence by downstream, which is exactly what this file does not do: the predicate has to be right on
- * its own. Ambiguity FAILS CLOSED — a refusal here only withdraws the exception, and the ordinary
- * refusal it falls back to names a runnable alternative.
+ *   then a POSITIONAL read that trusted the position. `kubectlPositionals` consumes kubectl's GLOBAL
+ *   value flags, not each subcommand's own, so `get --label-columns events widgets.example.com` left
+ *   `events` sitting in the resource slot while the real resource was the CRD behind it.
+ *
+ * Hence the exact-length requirement rather than an ever-growing flag table: an unconsumed flag value can
+ * only ADD a positional, never remove one, so demanding exactly `[subcommand, resource]` turns every such
+ * shape into a refusal instead of a fail-open. It costs the legitimate
+ * `kubectl get events <name> -A …` its exception, which is a command that makes little sense anyway, and
+ * a refusal here only withdraws the exception — the ordinary refusal it falls back to names a runnable
+ * alternative.
+ *
+ * The TRAILING DOT is load-bearing. kubectl spells a core-group resource `events` or `events.` or
+ * `events.v1.`; `events.v1` means resource `events` in an API GROUP called `v1`, which is a legal group
+ * name a CRD can use. An earlier version filtered empty segments away, which erased exactly that
+ * distinction and let `events.v1`, `events.v2` and `events.v1beta1` all pass as core.
+ *
+ * The very first version leaned on "the apiserver rejects these selectors on anything else anyway". That
+ * is defence by downstream, which is not how this file works: the predicate has to be right on its own,
+ * and ambiguity FAILS CLOSED.
  */
-function namesCoreEventsResource(args: string[]): boolean {
-  // [subcommand, resource, ...names]
-  const resource = kubectlPositionals(args)[1];
-  if (resource === undefined) return false;
-  // `events,pods` is several resources at once; the bound would have to hold for every one of them.
-  if (resource.includes(",")) return false;
-  const [type, ...qualifier] = resource.split("/")[0].split(".");
-  if (!CORE_EVENT_NAMES.has(type)) return false;
-  // `events` and `events.` carry no group; `events.v1.` names the core group's version. Anything else is
-  // a group, and a group is not core.
-  const group = qualifier.filter((part) => part.length > 0);
-  return group.length === 0 || (group.length === 1 && /^v\d+((alpha|beta)\d+)?$/.test(group[0]));
+function namesCoreResource(args: string[], names: ReadonlySet<string>): boolean {
+  const positionals = kubectlPositionals(args);
+  if (positionals.length !== 2) return false;
+  const resource = positionals[1];
+  // `events,pods` is several resources at once and the bound would have to hold for every one of them;
+  // `events/x` is the type/name form, which this rule does not reason about.
+  if (resource.includes(",") || resource.includes("/")) return false;
+  const parts = resource.split(".");
+  if (!names.has(parts[0])) return false;
+  if (parts.length === 1) return true;                      // `events`
+  if (parts[parts.length - 1] !== "") return false;         // `events.v1` / `events.example.com`
+  return parts.slice(1, -1).every((part) => API_VERSION_RE.test(part));  // `events.` / `events.v1.`
 }
 
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {

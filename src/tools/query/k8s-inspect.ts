@@ -551,6 +551,10 @@ export async function collectObject(
     }
     const obj = parseSanitizedJson(result.text);
     if (obj === undefined) {
+      // Same consequence as a failed read, so the same treatment: the probe exited fine and the body was
+      // not JSON (a sanitizer that suppressed the document, a kubectl that printed a warning), and none
+      // of that un-resolves the name we followed to get here.
+      if (target) sections.push({ label: rel.label, target, text: "not read: unparseable" });
       misses.push(`${rel.label}: unparseable`);
       continue;
     }
