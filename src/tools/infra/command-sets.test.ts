@@ -2088,11 +2088,38 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
     }
   });
 
-  it("scopes the involvedObject rule to events, the only resource that has the field", () => {
-    // On anything else the apiserver rejects the selector outright, so admitting it would trade a
-    // refusal the agent can act on for a confusing server error.
-    expect(check("kubectl get pods -A --field-selector involvedObject.name=web,involvedObject.kind=Pod -o json"))
-      .not.toBeNull();
+  it("scopes the involvedObject rule to the CORE events resource, read from the resource position", () => {
+    // Three reproductions of the first version's substring scan, which took the segment before the first
+    // dot of every non-flag token. Each one granted the exception to something that is not a query
+    // against core/v1 Event — where `involvedObject` is the only place the field exists.
+    for (const cmd of [
+      // Not events at all.
+      "kubectl get pods -A --field-selector involvedObject.name=web,involvedObject.kind=Pod -o json",
+      // Somebody's CRD that merely starts with the word.
+      "kubectl get events.example.com -A --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      // A different API group, whose corresponding field is `regarding`.
+      "kubectl get events.events.k8s.io -A --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      // `events` sitting in a flag's VALUE, not in the resource position. `--sort-by` takes a value, so
+      // a scan that skips only tokens starting with `-` reads this as the resource.
+      "kubectl get secrets -A --sort-by events --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      "kubectl get pods -A -n events --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      // Several resources at once: the bound would have to hold for every one of them.
+      "kubectl get events,pods -A --field-selector involvedObject.name=x,involvedObject.kind=Pod -o json",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("still accepts the core-group spellings kubectl actually takes", () => {
+    for (const cmd of [
+      "kubectl get events -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+      "kubectl get event -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+      "kubectl get events.v1. -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+      // A global value-flag before the verb is ordinary usage and must not displace the resource read.
+      "kubectl --context prod get events -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
   });
 
   it("reads the LAST --field-selector, because a repeat replaces rather than intersects", () => {

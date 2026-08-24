@@ -2,6 +2,7 @@ import {
   getOutputFormat,
   kubectlAllNamespaces,
   kubectlOutputFormats,
+  kubectlPositionals,
   normalizeResourceToken,
 } from "./kubectl-sanitize.js";
 /**
@@ -1568,16 +1569,15 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
  * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
  * selector names a single node or a single object identity", nothing looser.
  */
-function hasBoundingFieldSelector(args: string[], subcommand: string): boolean {
+function hasBoundingFieldSelector(args: string[]): boolean {
   const selector = effectiveFieldSelector(args);
   if (selector === undefined) return false;
   const pinned = pinnedSelectorFields(selector);
   if (pinned.has("spec.nodeName") || pinned.has("metadata.name")) return true;
-  // `involvedObject.*` is a field of Events and describes an identity nowhere else, so the rest of this
-  // rule is scoped to that resource. An imprecise resource read is safe in this DIRECTION: a false
-  // positive only unlocks a branch that still demands the Kind, and the apiserver rejects
-  // `involvedObject.*` outright on any other resource, so nothing is served that would not have been.
-  if (!argsNameEvents(args, subcommand)) return false;
+  // `involvedObject` is a field of core/v1 Event and describes an identity nowhere else, so the rest of
+  // this rule is scoped to that exact resource — read from the resource POSITION, not matched as a
+  // substring anywhere in the argv.
+  if (!namesCoreEventsResource(args)) return false;
   // A uid is globally unique to one object incarnation, so it needs no companion.
   if (pinned.has("involvedObject.uid")) return true;
   return pinned.has("involvedObject.name") && pinned.has("involvedObject.kind");
@@ -1620,18 +1620,40 @@ function pinnedSelectorFields(selector: string): Map<string, string> {
   return pinned;
 }
 
-const EVENT_RESOURCE_TOKENS = new Set(["event", "events", "ev"]);
+const CORE_EVENT_NAMES = new Set(["event", "events", "ev"]);
 
-/** Does the command name the Events resource? Same token walk `argsNameSecrets` uses. */
-function argsNameEvents(args: string[], subcommand: string): boolean {
-  for (let i = 1; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("-") || a === subcommand) continue;
-    for (const part of a.split(",")) {
-      if (EVENT_RESOURCE_TOKENS.has(normalizeResourceToken(part))) return true;
-    }
-  }
-  return false;
+/**
+ * Is the query's resource the CORE-group Events resource, and nothing else?
+ *
+ * Precise on purpose, and it replaced a scan that was not. The first version walked every token not
+ * starting with `-` and took the segment before the first dot, which granted the exception to two things
+ * it should never have covered: `events.example.com`, a CRD that merely starts with the word, and any
+ * command with `events` sitting in a flag's VALUE (`--sort-by events`). Neither is a query against
+ * Events, and a rule that grants an exception on the resource's identity cannot be decided by a
+ * substring. `kubectlPositionals` consumes flag values by arity, so the resource is read from the
+ * resource POSITION.
+ *
+ * Core group only, because `involvedObject` is a field of `core/v1` Event. `events.events.k8s.io` is a
+ * different API group whose corresponding field is `regarding`, so a selector on `involvedObject` is not
+ * even meaningful there — and `events.example.com` is somebody's CRD.
+ *
+ * The previous version leaned on "the apiserver rejects `involvedObject` on anything else anyway". That
+ * is defence by downstream, which is exactly what this file does not do: the predicate has to be right on
+ * its own. Ambiguity FAILS CLOSED — a refusal here only withdraws the exception, and the ordinary
+ * refusal it falls back to names a runnable alternative.
+ */
+function namesCoreEventsResource(args: string[]): boolean {
+  // [subcommand, resource, ...names]
+  const resource = kubectlPositionals(args)[1];
+  if (resource === undefined) return false;
+  // `events,pods` is several resources at once; the bound would have to hold for every one of them.
+  if (resource.includes(",")) return false;
+  const [type, ...qualifier] = resource.split("/")[0].split(".");
+  if (!CORE_EVENT_NAMES.has(type)) return false;
+  // `events` and `events.` carry no group; `events.v1.` names the core group's version. Anything else is
+  // a group, and a group is not core.
+  const group = qualifier.filter((part) => part.length > 0);
+  return group.length === 0 || (group.length === 1 && /^v\d+((alpha|beta)\d+)?$/.test(group[0]));
 }
 
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
@@ -1666,7 +1688,7 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
     if (format === "yaml" || format === "json") {
       // An exact server-side node or name selector bounds the response, which is the concern this rule
       // exists for — so the rule is satisfied rather than waived.
-      if (hasBoundingFieldSelector(args, subcommand)) return null;
+      if (hasBoundingFieldSelector(args)) return null;
       // A refusal that names no runnable alternative gets retried in another shape and refused again.
       // The resource is echoed back so the suggestion is copy-pasteable rather than a template.
       const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";

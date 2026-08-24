@@ -538,6 +538,14 @@ export async function collectObject(
         });
         continue;
       }
+      // The read failed, but the NAME we resolved is still an answer — and for this tool it is the
+      // point. `.spec.nodeName` resolved `node-42`; the node read being forbidden does not un-resolve
+      // it, and that name is the argument the next step needs (node_script, node-logs, the CSI and
+      // Terminating skills all continue with it). Dropping it left the output with no node name
+      // anywhere, since a pod's own summary does not carry one — so a forbidden neighbour cost the
+      // caller the round-trip this tool exists to save. The section states the identity, the `status:`
+      // line states the failure; neither is a substitute for the other.
+      if (target) sections.push({ label: rel.label, target, text: `not read: ${result.reason}` });
       misses.push(`${rel.label}: ${result.reason}`);
       continue;
     }

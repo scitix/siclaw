@@ -202,7 +202,10 @@ describe("collectObject — the status line", () => {
 
   it("names a failed neighbour in status and still returns the subject", async () => {
     // The lesson from #493: an absent section and a forbidden section look identical and call for
-    // opposite next steps, so the difference has to be stated.
+    // opposite next steps, so the difference has to be stated. The first version of this test then
+    // asserted `not.toContain("--- node (")` — demanding the two look identical, the very thing the
+    // comment above says must not happen. The section IS emitted, carrying the resolved name and the
+    // reason; what makes it distinguishable from a healthy read is the text, not the absence.
     const d = deps({
       "get pod web": pod(),
       "get node node-42": failure('Error from server (Forbidden): nodes "node-42" is forbidden'),
@@ -211,7 +214,11 @@ describe("collectObject — the status line", () => {
     });
     const { text, failed } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(statusOf(text)).toBe("status: partial (node: forbidden)");
-    expect(text).not.toContain("--- node (");
+    expect(text).toContain("--- node (node-42) ---");
+    expect(text).toContain("not read: forbidden");
+    // …and carries no node CONTENT, since none was read. `no taints` is what renderNode emits for the
+    // NODE fixture, so its absence is what separates this from a successful read.
+    expect(text).not.toContain("no taints");
     // A neighbour failure must not fail the call — the subject is still the answer.
     expect(failed).toBe(false);
     expect(text).toContain("OOMKilled");
@@ -386,6 +393,52 @@ describe("collectObject — neighbours", () => {
     });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (node: forbidden)");
+  });
+
+  it("keeps the resolved neighbour NAME when the read of it fails", async () => {
+    // The name is the argument the next step needs, and a pod's own summary does not carry one — so
+    // dropping it on a failed read left the output with no node name anywhere, costing the caller
+    // exactly the round-trip this tool exists to save. Resolving `.spec.nodeName` succeeded; only the
+    // node read failed.
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": failure('Error from server (Forbidden): nodes "node-42" is forbidden'),
+      "get replicaset web-7d9f": JSON.stringify(RS),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("--- node (node-42) ---");
+    expect(text).toContain("not read: forbidden");
+    // And the failure is still declared — the section is not a substitute for the status line.
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (node: forbidden)");
+  });
+
+  it("says nothing about a neighbour the subject never names", async () => {
+    // An unscheduled pod has no `.spec.nodeName`, so there is no read to report on at all. (Guarded by
+    // the early return before the probe, not by the failure path below — stated because the two look
+    // the same from the output.)
+    const d = deps({
+      "get pod web": pod({ spec: {} }),
+      "get replicaset web-7d9f": JSON.stringify(RS),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).not.toContain("--- node");
+    expect(text).not.toContain("not read:");
+  });
+
+  it("does not invent a target for a failed LIST relation, which has no single name", async () => {
+    // This is where keeping the name has to be conditional: a node's `pods` query resolves no single
+    // object, so there is nothing to carry forward and a section headed by a fabricated name would be
+    // worse than the status line alone.
+    const d = deps({
+      "get node node-42": JSON.stringify(NODE),
+      "get pods": failure('Error from server (Forbidden): pods is forbidden'),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.node, { kind: "node", name: "node-42" }, d);
+    expect(text).not.toContain("not read:");
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (pods: forbidden)");
   });
 
   it("keeps a list relation's not_found a gap, because the finding's wording does not apply to it", async () => {
