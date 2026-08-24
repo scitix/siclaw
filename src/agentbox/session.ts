@@ -69,7 +69,8 @@ import type {
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
-import { getOrCreateLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
+import { getOrCreateLedger, peekLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
+import { createCoalescedWriter, createSerialQueue } from "./keyed-writes.js";
 import {
   createModelRouteState,
   normalizeModelRouteState,
@@ -472,6 +473,7 @@ export class AgentBoxSessionManager {
 
   /** Pending plan auto-clear timers, keyed by taskListId (all tasks completed → clear after delay). */
   private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 
   /**
    * Ceiling on concurrent sub-agent child sessions across the WHOLE process, every conversation
@@ -1959,6 +1961,20 @@ export class AgentBoxSessionManager {
     await this.persistAppendMessage(buildTaskEventChatMessage(sessionId, event));
   }
 
+  /**
+   * Task-event appends, one at a time per taskListId — see keyed-writes.ts for why order matters
+   * here while the snapshot writer coalesces instead.
+   */
+  private taskEventQueue = createSerialQueue<{ sessionId: string; event: TaskEvent }>(
+    async ({ sessionId, event }) => {
+      try {
+        await this.persistTaskEvent(sessionId, event);
+      } catch (err) {
+        console.warn(`[agentbox-session] task_event persist failed for ${sessionId}:`, err);
+      }
+    },
+  );
+
   // ── Backend task-ledger durability (design §14) ────────────────────────────
   // The ledger is in-memory (task-ledger.ts), keyed by taskListId == session id.
   // The module map survives session release within a process; these helpers add
@@ -2022,18 +2038,34 @@ export class AgentBoxSessionManager {
    * interleaved snapshot writes can never leave a half-written / truncated file for a
    * concurrent reader (rehydrate-on-restart) — last writer wins cleanly.
    */
-  private persistLedgerSnapshot(taskListId: string): void {
-    const tasks = getOrCreateLedger(taskListId).snapshot();
+  /**
+   * Snapshot the ledger to the PV, one write in flight per taskListId.
+   *
+   * Serialisation is a correctness requirement, not a throughput one: write-tmp-then-rename gives no
+   * ordering between concurrent pairs, so the rename that lands last wins. One task_event per turn
+   * hid that by spacing the writes seconds apart; a batched task_create fires N in one synchronous
+   * loop, and a snapshot of one task can then overwrite a snapshot of five — losing tasks on the
+   * next pod restart, when rehydrateLedger reads the file. See coalesced-write.ts.
+   */
+  private persistLedgerSnapshot = createCoalescedWriter(async (taskListId: string) => {
+    // Read INSIDE the write: the coalesced follow-up exists to observe the final state. peek, NOT
+    // getOrCreate — a follow-up that outlives close() would otherwise create a fresh empty ledger
+    // and rename `[]` over the durable snapshot that closure deliberately keeps. close() drains
+    // this writer first, so reaching here with no ledger means the session is already gone and
+    // there is nothing left to record.
+    const ledger = peekLedger(taskListId);
+    if (!ledger) return;
+    const tasks = ledger.snapshot();
     const file = this.ledgerFile(taskListId);
     const tmp = `${file}.${randomUUID()}.tmp`;
-    void fs.promises
-      .writeFile(tmp, JSON.stringify(tasks), "utf8")
-      .then(() => fs.promises.rename(tmp, file))
-      .catch((err) => {
-        console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err);
-        void fs.promises.unlink(tmp).catch(() => {});
-      });
-  }
+    try {
+      await fs.promises.writeFile(tmp, JSON.stringify(tasks), "utf8");
+      await fs.promises.rename(tmp, file);
+    } catch (err) {
+      console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err);
+      void fs.promises.unlink(tmp).catch(() => {});
+    }
+  });
 
   /** Restore the ledger from the PV snapshot — only when the in-memory copy is
    *  empty (i.e. after a process restart; a release-survived ledger is kept). */
@@ -2590,9 +2622,12 @@ export class AgentBoxSessionManager {
       // Task ledger events are persisted (refresh recovery, design §14 Approach A)
       // in addition to being streamed live below.
       if (isTaskEvent(event)) {
-        void this.persistTaskEvent(id, event).catch((err) =>
-          console.warn(`[agentbox-session] task_event persist failed for ${id}:`, err),
-        );
+        // Queued per taskListId, not fired off independently. These are a LOG replayed in order to
+        // rebuild the plan, and the receiver sequences them by arrival — so two appends racing can
+        // be recorded in either order, and last-write-wins replay then applies a stale status over a
+        // fresh one or re-adds a deleted task. Batching made that ordinary: one turn now emits
+        // several in a single synchronous loop.
+        this.taskEventQueue.push(event.taskListId ?? id, { sessionId: id, event });
         // Snapshot the (shared) ledger to the PV session dir so the backend plan
         // survives a pod/process restart — keyed by the event's taskListId (the
         // parent's id, even when a sub-agent mutated a task it owns).
@@ -3267,6 +3302,19 @@ export class AgentBoxSessionManager {
         clearTimeout(hideTimer);
         this.ledgerHideTimers.delete(sessionId);
       }
+      // Let the outstanding writes finish BEFORE the in-memory ledger goes away. Both read it, and
+      // both are asynchronous: dropping it first leaves a snapshot write to find nothing (writing an
+      // empty plan over the durable one this comment promises to keep) and a queued event append
+      // describing a task the plan no longer has. Draining is bounded — these are a file write and
+      // an append each.
+      try {
+        await Promise.all([
+          this.persistLedgerSnapshot.drain(sessionId),
+          this.taskEventQueue.drain(sessionId),
+        ]);
+      } catch (err) {
+        console.warn(`[agentbox-session] draining plan writes for ${sessionId} failed:`, err);
+      }
       deleteLedger(sessionId);
       this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
@@ -3297,6 +3345,18 @@ export class AgentBoxSessionManager {
         } catch (err) {
           console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
         }
+      }
+      // Same reason close() drains: both plan writers are asynchronous and hold the only durable
+      // copy. This is the SIGTERM path, and the caller exits the process straight after — so a
+      // batch's queued event appends and its final snapshot are lost here unless they are awaited.
+      // Per session, since the queues are keyed by it.
+      try {
+        await Promise.all([
+          this.persistLedgerSnapshot.drain(id),
+          this.taskEventQueue.drain(id),
+        ]);
+      } catch (err) {
+        console.warn(`[agentbox-session] draining plan writes for ${id} during closeAll failed:`, err);
       }
       this.teardownTracing(id, managed);
       emitDiagnostic({ type: "session_released", sessionId: id });

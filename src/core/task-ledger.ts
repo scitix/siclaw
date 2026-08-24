@@ -160,6 +160,17 @@ export function getOrCreateLedger(taskListId: string): TaskLedger {
   return l;
 }
 
+/**
+ * The ledger if it exists — never creating one.
+ *
+ * For readers that must not resurrect a closed session's plan. A deferred writer using
+ * getOrCreateLedger after deleteLedger gets a fresh EMPTY ledger and, if it then persists, writes an
+ * empty snapshot over the durable one that closure deliberately leaves behind.
+ */
+export function peekLedger(taskListId: string): TaskLedger | undefined {
+  return ledgers.get(taskListId);
+}
+
 /** Drop one ledger — called on permanent session closure to bound memory. */
 export function deleteLedger(taskListId: string): void {
   ledgers.delete(taskListId);
