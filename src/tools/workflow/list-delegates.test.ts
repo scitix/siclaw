@@ -68,6 +68,29 @@ describe("list_delegates tool", () => {
     expect((r as any).details.match_basis).toBe("exact_resource_binding");
   });
 
+  it("a query renders only the kind that matched, not the other kind's irrelevant total", async () => {
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
+    const t = text(await tool.execute("c1", { query: "roce-test" }));
+    expect(t).toContain("clusters matched: roce-test");
+    // Was `hosts: no match (N total)` — a count of resources irrelevant to the question, which
+    // invites reading a large total as if it were coverage.
+    expect(t).not.toContain("no match");
+    expect(t).not.toContain("hosts:");
+  });
+
+  it("match_basis distinguishes a zero-match query from a successful one and from browsing", async () => {
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
+    // A query that matched nothing did NOT perform an exact_resource_binding match. Reporting one
+    // made a miss indistinguishable from a hit in telemetry — which is how "46 empty results" was
+    // initially misread. details is stripped before the model sees it, so this is telemetry only.
+    const miss = await tool.execute("c1", { query: "no-such-cluster" });
+    expect((miss as any).details.total).toBe(0);
+    expect((miss as any).details.match_basis).toBe("no_match");
+
+    const browse = await tool.execute("c1", {});
+    expect((browse as any).details.match_basis).toBe("browse");
+  });
+
   it("matches exact host bindings case-insensitively", async () => {
     const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
     const r = await tool.execute("c1", { query: "GPU-1" });

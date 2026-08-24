@@ -139,8 +139,15 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
         if (!q) {
           return `- ${m.name} [id: ${m.id}]${desc} (clusters: ${m.clusters.length}, hosts: ${m.hosts.length})`;
         }
-        // Query: show which bindings matched the target.
-        return `- ${m.name} [id: ${m.id}]${desc}\n    ${renderMatched("clusters", m.clusters, mc)}\n    ${renderMatched("hosts", m.hosts, mh)}`;
+        // Query: show ONLY the kind(s) that matched. An agent reaches this list only because
+        // something matched, so the other kind's line is always "no match (N total)" — a count of
+        // resources irrelevant to the question, once observed verbatim as `hosts: no match (2991
+        // total)` on a cluster query. It is pure context noise and invites reading a large total as
+        // if it were coverage.
+        const kinds: string[] = [];
+        if (mc.length > 0) kinds.push(renderMatched("clusters", m.clusters, mc));
+        if (mh.length > 0) kinds.push(renderMatched("hosts", m.hosts, mh));
+        return `- ${m.name} [id: ${m.id}]${desc}\n    ${kinds.join("\n    ")}`;
       });
 
       // Resolve the outstanding retry offer BEFORE rendering, and independently of
@@ -207,7 +214,12 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
         details: {
           total,
           shown: page.length,
-          match_basis: q ? "exact_resource_binding" : "browse",
+          // Three values, not two: a query that matched NOTHING did not perform an
+          // exact_resource_binding match, and reporting one is wrong on its own terms — it made a
+          // zero-result call indistinguishable in telemetry from a successful lookup. `details` is
+          // stripped before the model sees a result (CLAUDE.md), so this is a telemetry/UI fix with
+          // no model-visible effect; assert on the field, never on the prose beside it.
+          match_basis: !q ? "browse" : total > 0 ? "exact_resource_binding" : "no_match",
           binding_name_confirmed: bindingNameConfirmed,
           ...(hasMore ? { next_cursor: String(nextOffset) } : {}),
         },
