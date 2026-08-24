@@ -48,11 +48,18 @@ import {
   resolveEffectivePolicy,
   shouldUseModelRouteRunner,
   unsupportedPromptMediaMessage,
+  withResolvedCandidateCompat,
+  applyModelParamsForCandidate,
   type ModelRouteCandidate,
   type ModelRouteEvent,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
 import { withResolvedModelCompat } from "../core/model-compat.js";
+import {
+  isTierPayloadCleared,
+  normalizeSubagentTierCandidates,
+  type SubagentTierCandidates,
+} from "../core/subagent-models.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 
@@ -87,6 +94,15 @@ interface PromptRequestBody {
   systemPromptTemplate?: string;
   modelConfig?: Record<string, unknown>;
   modelRouting?: ModelRoutePolicy;
+  /**
+   * Sub-agent tier CANDIDATES for this turn — `{revision, candidates:[…]}`, each
+   * carrying its own `modelConfig` (credentials included).
+   *
+   * Per-turn and never cached: an absent field means "no tiers this turn" and MUST
+   * clear whatever the session held, or a withdrawn model stays reachable and
+   * outlives a credential rotation.
+   */
+  subagentTiers?: unknown;
   /** Image attachments forwarded as vision input (vision-capable models only). */
   images?: PromptImage[];
   /** PDF attachments forwarded as native file input (PDF-capable models only). */
@@ -334,25 +350,26 @@ function defaultPromptTextForMedia(media?: PromptMedia): string {
 }
 
 /**
- * Same resolution as `withResolvedModelCompat`, applied to every candidate's own
- * config. A fallback candidate is registered from its OWN modelConfig, so
- * resolving only the turn's binding would leave the chain's later models on
- * whatever shape the control plane happened to state — the failure would simply
- * move one candidate down.
+ * Normalize this turn's tier candidates and resolve wire-compat on each one.
+ *
+ * Returns null for an absent payload (no tiers this turn) AND for a malformed one:
+ * a bad tier list disables tiering for the turn but must never fail it, because a
+ * configuration problem is not worth losing the user's work over.
  */
-function withResolvedCandidateCompat(
-  policy: ModelRoutePolicy | undefined,
-): ModelRoutePolicy | undefined {
-  if (!policy?.candidates?.length) return policy;
-  let changed = false;
-  const candidates = policy.candidates.map((candidate) => {
-    if (!candidate.modelConfig) return candidate;
-    const resolved = withResolvedModelCompat(candidate.modelConfig);
-    if (resolved === candidate.modelConfig) return candidate;
-    changed = true;
-    return { ...candidate, modelConfig: resolved };
-  });
-  return changed ? { ...policy, candidates } : policy;
+function resolveTurnTierCandidates(raw: unknown): SubagentTierCandidates | null {
+  if (isTierPayloadCleared(raw)) return null;
+  const normalized = normalizeSubagentTierCandidates(raw);
+  if (!normalized.ok) {
+    console.warn(`[agentbox] ignoring invalid subagent tier candidates: ${normalized.reason}`);
+    return null;
+  }
+  return {
+    revision: normalized.value.revision,
+    candidates: normalized.value.candidates.map((candidate) => ({
+      ...candidate,
+      modelConfig: withResolvedModelCompat(candidate.modelConfig),
+    })),
+  };
 }
 
 /**
@@ -366,35 +383,6 @@ function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate |
     modelId: body.modelId,
     modelConfig: body.modelConfig,
   };
-}
-
-/**
- * Apply one candidate's runtime tunables. Snake_case on the wire → camelCase
- * `BrainModelParams`.
- *
- * The candidate's own `params` win; the turn's top-level `modelConfig.params` are
- * the fallback. That order matters in both directions: a control plane hydrates
- * each candidate with its PROVIDER config, which carries no `params`, so reading
- * only the candidate would drop the effort the caller asked for on every routed
- * turn — while reading only the top level would ignore a per-candidate override.
- */
-function applyModelParamsForCandidate(
-  brain: BrainSession,
-  candidate: ModelRouteCandidate,
-  turnModelConfig: Record<string, unknown> | undefined,
-): void {
-  if (!brain.applyModelParams) return;
-  const raw = readParams(candidate.modelConfig) ?? readParams(turnModelConfig);
-  if (!raw) return;
-  const effort = raw.reasoning_effort;
-  brain.applyModelParams({
-    reasoningEffort: typeof effort === "string" ? effort : undefined,
-  });
-}
-
-function readParams(config: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  const params = config?.params;
-  return params && typeof params === "object" ? params as Record<string, unknown> : undefined;
 }
 
 /**
@@ -1002,6 +990,15 @@ export function createHttpServer(
         });
       }
 
+      // Tier candidates are TURN state and are installed unconditionally —
+      // including being cleared. Skipping the assignment when the field is absent
+      // would let the previous turn's credentials stay live on this session.
+      //
+      // Compat resolution matters here for the same reason it does for routing
+      // candidates: a descriptor without `api` is dropped by pi's `parseModels`
+      // and surfaces as "model not found" rather than as a protocol error.
+      managed.subagentTierCandidates = resolveTurnTierCandidates(body.subagentTiers);
+
       // Provider registration and model lookup for this turn's binding are NOT
       // done here — they belong to `runAttempt`, per candidate. See
       // `resolveEffectivePolicy` for why, and `requestBindingCandidate` below for
@@ -1240,6 +1237,13 @@ export function createHttpServer(
         shouldAbort: () => managed._aborted,
         applyCandidateModelParams: (candidate) => {
           applyModelParamsForCandidate(managed.brain, candidate, body.modelConfig);
+        },
+        // Publish the candidate this turn is actually running on, so a
+        // spawn_subagent issued DURING the prompt can fall back to it. Nothing
+        // else can answer that mid-turn: activeCandidateKey is only written after
+        // an attempt succeeds, and getModel() carries no credentials or params.
+        onAttemptReady: (candidate) => {
+          managed.effectiveModelCandidate = candidate;
         },
         // The runner owns this flag for the duration of the run, because only it
         // can flip it in the same synchronous block as its own subscribe /

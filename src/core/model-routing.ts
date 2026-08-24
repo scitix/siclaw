@@ -1,5 +1,6 @@
 import { modelNeedsRebind } from "./brain-session.js";
 import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptMedia } from "./brain-session.js";
+import { withResolvedModelCompat } from "./model-compat.js";
 
 export type ModelRouteFailureKind =
   | "billing"
@@ -188,6 +189,25 @@ export interface RunPromptWithModelRoutingOptions {
    * fallback would stream live and defeat the point of buffering it.
    */
   onEventCaptureChange?: (capturing: boolean) => void;
+  /**
+   * The attempt is fully set up and about to prompt: provider registered, model
+   * set, params applied, preflight passed. Fires with the candidate that is
+   * ACTUALLY about to run, `modelConfig` included.
+   *
+   * This exists because nothing else can answer "which model is this turn on?"
+   * *during* the turn. `state.activeCandidateKey` is only written after an attempt
+   * SUCCEEDS, so mid-prompt it still holds the previous turn's value (or nothing
+   * on the first turn), and `brain.getModel()` identifies the model but carries
+   * neither credentials nor applied params — so neither can be used to run a
+   * child. Sub-agent tiering needs exactly that: every fallback lands on the
+   * model the parent is actually running, not on the configured primary the
+   * parent may already have failed over from.
+   *
+   * Position is load-bearing: after preflight, so a candidate that never got to
+   * run is never recorded as effective; before `brain.prompt()`, so it is
+   * available to any tool call the prompt makes.
+   */
+  onAttemptReady?: (candidate: ModelRouteCandidate) => void;
   now?: () => number;
 }
 
@@ -806,7 +826,7 @@ export async function runPromptWithModelRouting(
     const streamFromStart = optimisticPrimaryStream && i === 0;
     const attemptResult = await runAttempt(
       brain, text, candidate, emitBrainEvent, streamFromStart, media, options.applyCandidateModelParams,
-      options.onEventCaptureChange,
+      options.onEventCaptureChange, options.onAttemptReady,
     );
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
@@ -992,6 +1012,7 @@ async function runAttempt(
   media?: PromptMedia,
   applyCandidateModelParams?: (candidate: ModelRouteCandidate) => void,
   onEventCaptureChange?: (capturing: boolean) => void,
+  onAttemptReady?: (candidate: ModelRouteCandidate) => void,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -1131,6 +1152,10 @@ async function runAttempt(
         },
       };
     }
+    // Setup is complete and preflight passed — this candidate IS the turn's
+    // effective model from here on. Publish it before prompting so a tool call
+    // made during the prompt (spawn_subagent above all) can read it.
+    onAttemptReady?.(candidate);
     await brain.prompt(text, media);
   } catch (err) {
     const message = errorMessage(err);
@@ -1473,4 +1498,82 @@ function errorMessage(err: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// ── Candidate setup helpers, shared with the sub-agent tier path ─────────────
+//
+// These were local to `agentbox/http-server.ts` with a single call site each. They
+// are exported here because a tiered sub-agent has to perform the SAME setup on its
+// child brain, and a second copy would drift — which is exactly the failure
+// `model-compat` has already been through, where a rule fixed on one side was not
+// fixed on the other.
+
+/**
+ * Resolve wire-compat on every candidate's OWN config.
+ *
+ * A fallback candidate is registered from its own `modelConfig`, so resolving only
+ * the turn's binding would leave the chain's later models on whatever shape the
+ * control plane happened to state — the failure would simply move one candidate
+ * down. Skipping it entirely is worse: a descriptor without `api` is dropped by
+ * pi's `parseModels`, which surfaces as "model not found" rather than as a protocol
+ * error.
+ */
+export function withResolvedCandidateCompat(
+  policy: ModelRoutePolicy | undefined,
+): ModelRoutePolicy | undefined {
+  if (!policy?.candidates?.length) return policy;
+  let changed = false;
+  const candidates = policy.candidates.map((candidate) => {
+    if (!candidate.modelConfig) return candidate;
+    const resolved = withResolvedModelCompat(candidate.modelConfig);
+    if (resolved === candidate.modelConfig) return candidate;
+    changed = true;
+    return { ...candidate, modelConfig: resolved };
+  });
+  return changed ? { ...policy, candidates } : policy;
+}
+
+/**
+ * Resolve wire-compat on ONE candidate's config — the tier path's equivalent of
+ * the policy-wide pass above.
+ */
+export function withResolvedCandidateConfig(candidate: ModelRouteCandidate): ModelRouteCandidate {
+  if (!candidate.modelConfig) return candidate;
+  const resolved = withResolvedModelCompat(candidate.modelConfig);
+  return resolved === candidate.modelConfig ? candidate : { ...candidate, modelConfig: resolved };
+}
+
+function readCandidateParams(
+  config: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const params = config?.params;
+  return params && typeof params === "object" ? params as Record<string, unknown> : undefined;
+}
+
+/**
+ * Apply one candidate's runtime tunables. Snake_case on the wire → camelCase
+ * `BrainModelParams`.
+ *
+ * The candidate's own `params` win; the turn's top-level `modelConfig.params` are
+ * the fallback. That order matters in both directions: a control plane hydrates
+ * each candidate with its PROVIDER config, which carries no `params`, so reading
+ * only the candidate would drop the effort the caller asked for on every routed
+ * turn — while reading only the top level would ignore a per-candidate override.
+ *
+ * MUST run after `setModel`, unconditionally — including when the rebind was
+ * skipped. The level is session state a previous candidate or turn may have moved,
+ * so "no model change" does not mean "no params change".
+ */
+export function applyModelParamsForCandidate(
+  brain: BrainSession,
+  candidate: ModelRouteCandidate,
+  turnModelConfig: Record<string, unknown> | undefined,
+): void {
+  if (!brain.applyModelParams) return;
+  const raw = readCandidateParams(candidate.modelConfig) ?? readCandidateParams(turnModelConfig);
+  if (!raw) return;
+  const effort = raw.reasoning_effort;
+  brain.applyModelParams({
+    reasoningEffort: typeof effort === "string" ? effort : undefined,
+  });
 }

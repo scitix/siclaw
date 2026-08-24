@@ -211,6 +211,23 @@ export interface BrainSession {
    */
   ensureContextForModelPrompt?(model: BrainModelInfo, text: string): Promise<BrainContextPreflightResult>;
 
+  /**
+   * PURE context-fit check: does this prompt fit that model's window as things
+   * stand? Estimate only — no compaction, no model call, no session mutation.
+   *
+   * Distinct from {@link ensureContextForModelPrompt}, whose name is accurate:
+   * that one COMPACTS when over budget, which rewrites history and spends a model
+   * round-trip to produce the summary. Running it against a freshly created
+   * sub-agent would compact the one thing that child's context consists of — its
+   * task briefing — and would spend a model call to decide whether to spend a
+   * model call.
+   *
+   * Used when switching a child onto a tier model whose window may be smaller
+   * than the parent's: a miss falls back to the parent rather than attempting the
+   * prompt and failing mid-stream.
+   */
+  checkContextFitForModelPrompt?(model: BrainModelInfo, text: string): BrainContextPreflightResult;
+
   /** Register a provider dynamically (from gateway DB config). */
   registerProvider?(name: string, config: Record<string, unknown>): void;
 

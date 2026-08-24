@@ -339,6 +339,60 @@ export class PiAgentBrain implements BrainSession {
     }
   }
 
+  /**
+   * Pure fit check — see `BrainSession.checkContextFitForModelPrompt`.
+   *
+   * Shares the estimation with `ensureContextForModelPrompt` but stops at the
+   * verdict: it never calls `session.compact()`, so it neither rewrites history
+   * nor issues a model request. `compacted` is therefore always false.
+   *
+   * Note it deliberately does NOT consult `compaction.enabled`: this answers
+   * "does it fit", and whether compaction *could* rescue an over-budget prompt is
+   * the caller's decision, not part of the measurement.
+   */
+  checkContextFitForModelPrompt(
+    model: BrainModelInfo,
+    text: string,
+  ): BrainContextPreflightResult {
+    const settings = this.session.settingsManager.getCompactionSettings();
+    const contextWindow = Math.max(0, Math.floor(model.contextWindow || 0));
+    const reserveTokens = Math.max(0, Math.floor(settings.reserveTokens || 0));
+    const promptTokens = estimatePromptTokens(text) + Math.min(
+      PiAgentBrain.PROMPT_PREFLIGHT_SAFETY_TOKENS,
+      Math.max(0, Math.floor(contextWindow * 0.02)),
+    );
+    const budget = contextWindow - reserveTokens;
+
+    if (contextWindow <= 0) {
+      return {
+        ok: false,
+        compacted: false,
+        contextWindow,
+        errorMessage: `Context fit check failed for ${model.provider}/${model.id}: context window must be greater than 0 tokens (received ${contextWindow}).`,
+      };
+    }
+    if (budget <= 0) {
+      return {
+        ok: false,
+        compacted: false,
+        contextWindow,
+        errorMessage: `Context fit check failed for ${model.provider}/${model.id}: context window ${contextWindow} tokens must exceed compaction reserve ${reserveTokens} tokens.`,
+      };
+    }
+
+    const tokens = estimateCurrentContextTokens(this.session) + promptTokens;
+    if (tokens > budget) {
+      return {
+        ok: false,
+        compacted: false,
+        tokens,
+        contextWindow,
+        errorMessage: `Context fit check failed: estimated ${tokens} tokens exceeds ${model.provider}/${model.id} budget ${budget}.`,
+      };
+    }
+    return { ok: true, compacted: false, tokens, contextWindow };
+  }
+
   async ensureContextForModelPrompt(
     model: BrainModelInfo,
     text: string,
