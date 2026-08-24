@@ -1883,3 +1883,28 @@ describe("buildSandboxCommand — reaping the two conditions timeout does not co
     expect(c.endsWith("'")).toBe(true);
   });
 });
+
+// A background job is the fourth way a run stops, and the only one with no deadline of its own.
+describe("buildSandboxCommand — background jobs", () => {
+  it("gets the session but NO deadline, so a long job is not killed at the foreground default", () => {
+    const c = buildSandboxCommand("kubectl logs -f pod", { pgidFile: "/tmp/bg.pgid" });
+    // Stoppable...
+    expect(c).toContain("setsid");
+    expect(c).toContain("/tmp/bg.pgid");
+    // ...but not on a clock. Background exists to outlive the turn and had no cap before; wrapping
+    // it in the foreground default would have started killing long jobs at 60 seconds.
+    expect(c).not.toContain("timeout -k");
+  });
+
+  it("still drops to sandbox and keeps the command intact", () => {
+    const c = buildSandboxCommand("kubectl logs -f pod", { pgidFile: "/tmp/bg.pgid" });
+    expect(c.startsWith("sudo -E -u sandbox -- bash -c '")).toBe(true);
+    expect(c).toContain("kubectl logs -f pod");
+  });
+
+  it("a foreground run still carries its deadline", () => {
+    const c = buildSandboxCommand("kubectl get pods", { timeoutS: 60, pgidFile: "/tmp/fg.pgid" });
+    expect(c).toContain("timeout -k 5 60");
+    expect(c).toContain("setsid");
+  });
+});

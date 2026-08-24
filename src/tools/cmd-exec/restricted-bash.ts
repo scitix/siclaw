@@ -57,10 +57,16 @@ export const OUTER_BACKSTOP_MARGIN_S = 10;
  */
 export function buildSandboxCommand(
   command: string,
-  opts: { timeoutS: number; graceS?: number; pgidFile?: string },
+  opts: { timeoutS?: number; graceS?: number; pgidFile?: string },
 ): string {
   const grace = opts.graceS ?? SANDBOX_KILL_GRACE_S;
-  const inner = `timeout -k ${grace} ${opts.timeoutS} bash -c '${command.replace(/'/g, "'\\''")}'`;
+  const quoted = `bash -c '${command.replace(/'/g, "'\\''")}'`;
+  // No deadline for a background job. It exists to outlive the turn, and it had no cap before —
+  // wrapping it in the foreground default would have started killing long jobs at 60 seconds. Its
+  // stop condition is job_stop, which is what the session below is for.
+  const inner = opts.timeoutS === undefined
+    ? quoted
+    : `timeout -k ${grace} ${opts.timeoutS} ${quoted}`;
   // Natural expiry is only ONE of three ways a run stops. An abort and an output overflow are
   // decided out here, and out here cannot signal a `sandbox` process — so those two need a handle on
   // the sandbox side. A SESSION is that handle: `timeout` puts its child in its own process GROUP,
@@ -625,7 +631,9 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         // signalled — which is why this looked like it worked: the call returned and the command
         // kept running. Same shape node_exec already uses.
         execCommand = buildSandboxCommand(execCommand, {
-          timeoutS: sandboxTimeoutS,
+          // A background job keeps its old unbounded lifetime; only the turn-blocking path gets a
+          // deadline. Both get the session, because both need to be stoppable.
+          ...(wantsBackground ? {} : { timeoutS: sandboxTimeoutS }),
           pgidFile: sandboxPgidFile,
         });
       }
@@ -650,6 +658,13 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             parentSessionId: bg!.sessionIdRef?.current ?? "",
             jobId: toolCallId,
             isProd,
+            // The FOURTH way a run stops, and the one that has no deadline of its own: job_stop.
+            // The runner's own kill is a process-group kill from this UID, which is why onAbort
+            // exists at all — node_exec uses it to reap across a boundary the local kill cannot
+            // cross, and a production background command is behind the same one. Without it a
+            // stopped job keeps running as `sandbox` until the inner timeout expires, up to 300s
+            // after the user asked it to stop.
+            ...(sandboxPgidFile ? { onAbort: () => reapSandboxSession(sandboxPgidFile) } : {}),
           });
           return backgroundLaunchedResult(jobId, outputFile, "Running in the background.");
         } catch (err) {
