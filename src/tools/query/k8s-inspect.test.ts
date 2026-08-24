@@ -542,6 +542,57 @@ describe("collectObject — the size budget", () => {
     expect(order, "oldest first, newest last").toEqual([...order].sort((a, b) => a - b));
   });
 
+  it("takes a repeated event's latest activity, not the origin its eventTime holds", async () => {
+    // The precedence `skills/core/cluster-events/references/` establishes for the v1 shape that
+    // `kubectl get events` returns. A v1 event converted from events.k8s.io can carry the ORIGIN in
+    // eventTime and the latest activity in lastTimestamp, so reading eventTime first sorts a currently
+    // firing event to a month ago and drops it out of the newest window. Live shape: a count=177309
+    // BackOff whose lastTimestamp was minutes old and firstTimestamp a month earlier.
+    const events = JSON.stringify({
+      kind: "EventList",
+      items: [
+        {
+          eventTime: "2026-07-27T10:50:45Z", lastTimestamp: "2026-08-24T09:05:43Z",
+          firstTimestamp: "2026-07-27T10:50:45Z", count: 177309,
+          type: "Normal", reason: "BackOff", involvedObject: { kind: "Pod", name: "web" },
+          message: "still firing",
+        },
+        {
+          lastTimestamp: "2026-08-01T00:00:00Z", type: "Normal", reason: "Pulled",
+          involvedObject: { kind: "Pod", name: "web" }, message: "older but after the origin",
+        },
+      ],
+    });
+    const d = deps({
+      "get pod web": pod(), "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify(RS), "get events": events,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text.indexOf("still firing")).toBeGreaterThan(text.indexOf("older but after the origin"));
+    // The rendered time is the latest activity too, not the origin the model would then reason from.
+    expect(text).toContain("2026-08-24T09:05:43Z");
+  });
+
+  it("still prefers a series' own last-observed time over the frozen flat field", async () => {
+    // A series event's lastTimestamp stays at first write, so lastTimestamp must not outrank series.
+    const events = JSON.stringify({
+      kind: "EventList",
+      items: [{
+        series: { count: 9, lastObservedTime: "2026-08-24T09:00:00Z" },
+        lastTimestamp: "2026-01-01T00:00:00Z",
+        type: "Warning", reason: "Unhealthy", involvedObject: { kind: "Pod", name: "web" },
+        message: "series event",
+      }],
+    });
+    const d = deps({
+      "get pod web": pod(), "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify(RS), "get events": events,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("2026-08-24T09:00:00Z");
+    expect(text).not.toContain("2026-01-01");
+  });
+
   it("keeps a realistic long FailedScheduling reason instead of clipping it at 160 characters", async () => {
     const reason = "0/100 nodes are available: "
       + "10 Insufficient cpu, 20 Insufficient memory, 30 had untolerated taint, "

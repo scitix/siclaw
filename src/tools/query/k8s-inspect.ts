@@ -327,10 +327,22 @@ function renderEvents(text: string): string | undefined {
   const parsed = parseSanitizedJson(text);
   if (parsed === undefined) return undefined;
 
+  /**
+   * LATEST activity, in the precedence `skills/core/cluster-events/references/` establishes for the
+   * shape `kubectl get events` actually returns (`v1`): a series records its truth in
+   * `series.lastObservedTime` while the flat `lastTimestamp` stays frozen at first write, so series
+   * comes first; then `lastTimestamp`, the v1 field for a repeated event; `eventTime` after it, because
+   * that is the `events.k8s.io` spelling and on a v1 event converted from it, `eventTime` can hold the
+   * ORIGIN while `lastTimestamp` holds the latest. Reading eventTime first would then place a currently
+   * firing event at its origin and sort it out of the newest window — measured live: a `count=177309`
+   * BackOff event whose lastTimestamp was minutes old and whose firstTimestamp was a month earlier.
+   * `firstTimestamp` and `creationTimestamp` are last: they answer a different question and are only
+   * better than nothing.
+   */
   const eventTime = (event: unknown): string | undefined =>
     str(event, ".series.lastObservedTime")
-      ?? str(event, ".eventTime")
       ?? str(event, ".lastTimestamp")
+      ?? str(event, ".eventTime")
       ?? str(event, ".firstTimestamp")
       ?? str(event, ".metadata.creationTimestamp");
   const timestamp = (event: unknown): number => {
