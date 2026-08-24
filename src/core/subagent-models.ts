@@ -466,6 +466,14 @@ export interface SubagentTierPlan {
     provider: string;
     modelId: string;
     modelConfig?: Record<string, unknown>;
+    /**
+     * The tunables in effect on the parent when this plan was captured — the
+     * restore target for a child that tried a tier and fell back.
+     *
+     * Shaped structurally rather than imported, keeping this module dependency
+     * free. Absent when the parent turn never went through the routing runner.
+     */
+    params?: { reasoningEffort?: string };
   } | null;
 }
 

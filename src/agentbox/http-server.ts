@@ -365,6 +365,7 @@ function defaultPromptTextForMedia(media?: PromptMedia): string {
 function clearTurnTierState(managed: ManagedSession): void {
   managed.subagentTierCandidates = null;
   managed.effectiveModelCandidate = null;
+  managed.effectiveModelParams = null;
 }
 
 /**
@@ -1267,6 +1268,10 @@ export function createHttpServer(
         // an attempt succeeds, and getModel() carries no credentials or params.
         onAttemptReady: (candidate) => {
           managed.effectiveModelCandidate = candidate;
+          // Captured HERE, after the runner applied this candidate's params, so it
+          // is the parent's real level rather than a clamped or default-shaped
+          // guess. A child that falls back from a tier restores to this.
+          managed.effectiveModelParams = managed.brain.captureModelParams?.() ?? null;
         },
         // The runner owns this flag for the duration of the run, because only it
         // can flip it in the same synchronous block as its own subscribe /

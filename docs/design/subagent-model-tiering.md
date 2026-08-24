@@ -652,6 +652,14 @@ Referential decay is answered without cascading:
 
 - **Do not cascade** on delete — the deletion paths are many, and coupling them
   spreads the blast radius.
+- **A dangling entry is skipped, never fatal to the list.** The resolver drops the
+  entries it cannot hydrate and keeps the rest, so deleting one model of two leaves
+  the other usable. Collapsing the whole list was worse than it sounds: the menu is
+  built from the raw config on a separate path, so the candidate side would go
+  empty while the menu still advertised every tier — the revisions then disagree
+  and even the *healthy* tiers fail with `revision_mismatch`.
+- **The revision is computed over the full config, not the surviving subset**, or
+  the two channels stop matching for exactly the same reason.
 - **Runtime already degrades safely**: `findModel` misses and the child falls back
   (§7.2).
 - **The fallback must be legible**: a dangling reference surfaces as a

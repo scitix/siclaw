@@ -187,6 +187,20 @@ export interface ManagedSession {
    * already have failed over away from it.
    */
   effectiveModelCandidate: ModelRouteCandidate | null;
+  /**
+   * The runtime tunables actually in effect on the PARENT after its attempt was
+   * set up — captured by the same `onAttemptReady` hook, which fires after the
+   * params have been applied.
+   *
+   * This is the only correct restore target for a child that tried a tier and had
+   * to fall back. A child's own pre-tier value is NOT usable for it: pi clamps the
+   * thinking level to the current model's capabilities, so a child that started on
+   * a non-reasoning model reads back `off` regardless of what the deployment's
+   * default is — and pi's own `setModel` would have given that default rather than
+   * the clamped value (`_getThinkingLevelForModelSwitch` consults
+   * `supportsThinking()` on the model being switched AWAY from).
+   */
+  effectiveModelParams: BrainModelParams | null;
   /** Whether the current prompt was aborted (prevents empty response retry) */
   _aborted: boolean;
   /**
@@ -496,9 +510,15 @@ export class AgentBoxSessionManager {
    * parent just found broken. Falls back to the box's last binding, which is what
    * every child used before tiering existed.
    */
-  private effectiveParentCandidate(parentSessionId: string): ModelRouteCandidate | null {
-    const live = this.sessions.get(parentSessionId)?.effectiveModelCandidate;
-    if (live) return live;
+  private effectiveParentCandidate(
+    parentSessionId: string,
+  ): (ModelRouteCandidate & { params?: BrainModelParams }) | null {
+    const parent = this.sessions.get(parentSessionId);
+    const live = parent?.effectiveModelCandidate;
+    // Carry the parent's ACTUAL tunables alongside its model. Only meaningful
+    // together: restoring one without the other puts the child on the right model
+    // at the wrong level.
+    if (live) return { ...live, params: parent?.effectiveModelParams ?? undefined };
     if (this.delegationModelProvider && this.delegationModelId) {
       return {
         provider: this.delegationModelProvider,
@@ -557,15 +577,6 @@ export class AgentBoxSessionManager {
     const requested = plan?.requestedTier ?? null;
     const parentCandidate = plan?.effectiveParent ?? null;
 
-    // The child's tunables BEFORE any tier touches them. A rejected tier that
-    // raised the thinking level would otherwise leave it raised: pi carries the
-    // current level across a model switch whenever the target model supports
-    // thinking, and `applyModelParams` cannot lower it (an absent effort is a
-    // no-op, not a reset). Without this a tier asking for `xhigh` that fails its
-    // fit check leaves the PARENT model running at `xhigh` — quietly changing the
-    // cost and latency of work the caller never asked to be expensive.
-    const baselineParams = child.brain.captureModelParams?.();
-
     const applyParent = async (
       reason: TierFallbackReason | undefined,
       source: TierSelectionSource,
@@ -575,8 +586,23 @@ export class AgentBoxSessionManager {
         // whatever the factory gave it.
         return { requestedTier: requested, resolvedTier: null, source, fallbackReason: reason };
       }
+      // Restore params ONLY when a tier was actually attempted and rejected —
+      // `reason` is undefined on the plain inherit path.
+      //
+      // On inherit nothing has touched the child's tunables, so restoring anything
+      // would CHANGE behaviour rather than preserve it: pi's own `setModel`
+      // consults `supportsThinking()` on the model it is switching away from, and
+      // gives the deployment default when that model is non-reasoning. Writing a
+      // captured value over that would override the default with a clamped
+      // artifact — breaking "no tiers configured ⇒ behaviour identical to today"
+      // for every deployment that never configured a tier.
+      //
+      // On fallback the tier HAS moved the level and neither `setModel` nor
+      // `applyModelParams` can lower it, so the parent's own captured params are
+      // the restore target.
       const applied = await this.putBrainOnCandidate(
-        child.brain, parentCandidate, briefing, false, baselineParams,
+        child.brain, parentCandidate, briefing, false,
+        reason ? plan?.effectiveParent?.params : undefined,
       );
       if (!applied.ok) {
         return {
@@ -3263,6 +3289,7 @@ export class AgentBoxSessionManager {
       // Installed per turn by the prompt path; a session starts with none.
       subagentTierCandidates: null,
       effectiveModelCandidate: null,
+      effectiveModelParams: null,
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,

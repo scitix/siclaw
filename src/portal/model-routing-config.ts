@@ -160,18 +160,28 @@ export async function resolveAgentSubagentTiers(raw: unknown): Promise<{
   const items: SubagentTierMenu["items"] = [];
   const candidates: SubagentTierCandidates["candidates"] = [];
   for (const entry of entries) {
+    items.push({ tier: entry.tier, whenToUse: entry.whenToUse });
+
+    // A dangling entry is SKIPPED, not fatal to the whole list.
+    //
+    // Returning null for the first unresolvable tier took every healthy tier down
+    // with it — and asymmetrically, because the menu is built from the raw config
+    // on a separate path: the menu would still advertise every tier while the
+    // candidate side went empty, so the revisions disagreed and even the healthy
+    // tiers failed with revision_mismatch. Delete one model of two and neither
+    // worked.
+    //
+    // Skipping instead leaves the healthy tiers usable and lets the dangling one
+    // report `candidate_missing`, which is precisely the case §5 defines that
+    // reason for.
     const modelConfig = configs.get(entry.provider);
-    if (!modelConfig) return { menu: null, candidates: null };
-    // The provider existing is not enough — the MODEL must still be in it. A model
-    // deleted or renamed after the tier list was written leaves a dangling
-    // reference, and shipping it would advertise a tier whose candidate the child
-    // then cannot resolve. Catching it here turns a per-child fallback into a
-    // whole-list "not configured", which is the honest state.
+    if (!modelConfig) continue;
+    // The provider existing is not enough — the MODEL must still be in it.
     const models = Array.isArray((modelConfig as { models?: unknown }).models)
       ? (modelConfig as { models: Array<{ id?: unknown }> }).models
       : [];
-    if (!models.some((m) => m?.id === entry.modelId)) return { menu: null, candidates: null };
-    items.push({ tier: entry.tier, whenToUse: entry.whenToUse });
+    if (!models.some((m) => m?.id === entry.modelId)) continue;
+
     candidates.push({
       tier: entry.tier,
       provider: entry.provider,
@@ -179,6 +189,10 @@ export async function resolveAgentSubagentTiers(raw: unknown): Promise<{
       modelConfig,
     });
   }
+
+  // No tier resolved at all: report "no tiers" rather than a menu backed by
+  // nothing, which would offer the lead choices that can never be honoured.
+  if (candidates.length === 0) return { menu: null, candidates: null };
 
   // Same canonical form the menu projection uses, so both sides agree.
   const revision = sha256Hex(canonicalTierConfig(entries));
