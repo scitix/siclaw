@@ -1,26 +1,41 @@
 /**
  * Entry-form axis for audit / metrics filtering.
  *
- * Mirrors `chat_sessions.origin`, which records how a session was created:
- *   web     → origin IS NULL   (Portal Web UI — the default)
- *   api     → origin = 'api'   (external API key, /api/v1/run)
- *   a2a     → origin = 'a2a'   (agent-to-agent)
- *   channel → origin = 'channel' (IM channels: Feishu / DingTalk)
- *   scheduled → origin = 'task'   (cron / scheduled runs)
- *   (delegation → origin = 'delegation' — sub-agent execution traces, never a
- *    top-level entry; its tool calls inherit the PARENT session's entry.)
+ * Mirrors `chat_sessions.origin` — see `session-origin.ts` for the full origin
+ * vocabulary and which values are execution traces. The entry axis covers the
+ * NON-trace origins (web / api / a2a / channel) plus `task` as its own
+ * `scheduled` bucket; trace rows are never a top-level entry.
  *
  * The audit UI can view one entry at a time or the combined **overview**
  * ("all" = web+api+a2a+channel, the interactive family; scheduled is its own
  * selectable bucket).
  *
- * Two predicate flavours:
- *  - session-level (`entrySessionPredicate`): for per-session queries (session
- *    list, session/prompt counts). Delegation sessions are excluded (traces).
- *  - message-level (`entryMessagePredicate`): for per-message/tool queries
- *    (tool audit, tool counts, timing). A delegation child's rows are counted
- *    under its parent's entry via a LEFT JOIN on the parent session.
+ * Three predicate flavours, and WHICH ONE a query takes is a semantic choice,
+ * not a matter of which alias is in scope:
+ *
+ *  - session-level (`entrySessionPredicate`): per-session queries (session list,
+ *    session counts). Trace sessions excluded.
+ *
+ *  - prompt-level (`entryPromptPredicate`): counting `role='user'` rows, i.e.
+ *    "how many requests did people make". Trace sessions excluded, WITHOUT
+ *    parent attribution. A trace child's opening `role='user'` row is the task
+ *    text its parent generated — a sub-agent briefing or a delegated
+ *    instruction — never something a user typed, so attributing it to the
+ *    parent's entry would count one human request as two.
+ *
+ *  - message-level (`entryMessagePredicate`): per-tool / per-assistant queries
+ *    (tool audit, tool counts, timing). Here a parent-attributed child's rows
+ *    (delegation / sub-agent) DO count under the parent's entry: the parent's
+ *    own `spawn_subagent` call and the child's tool calls are all real calls,
+ *    so counting both is the honest total of work performed.
+ *
+ * ⚠️ Do NOT use `entryMessagePredicate` for a `role='user'` count. That is
+ * exactly how sub-agent briefings inflated `totalPrompts` while the sibling
+ * `adapter.ts` summary excluded them, leaving two endpoints disagreeing about
+ * one number.
  */
+
+import { nonTraceOriginPredicate, parentAttributedOriginPredicate } from "./session-origin.js";
 
 export type EntryMode = "all" | "web" | "api" | "a2a" | "channel" | "scheduled";
 
@@ -57,11 +72,11 @@ export function actorUserColumn(alias = "s"): string {
  *
  * `channel_id` and `sender_external_id` are stamped on the PARENT channel
  * session only. A MESSAGE-LEVEL query that uses {@link entryMessagePredicate}'s
- * parent join counts a delegation child's rows (origin='delegation', these
- * columns NULL) under the parent's channel entry — so it MUST filter/project via
- * `COALESCE(child, parent)`, or those rows vanish the moment a channel/sender
- * filter is applied. Pass `parentAlias` for such queries. Omit it for
- * SESSION-LEVEL queries (no parent join; a delegation child is never a channel
+ * parent join counts a parent-attributed child's rows (delegation / sub-agent,
+ * where these columns are NULL) under the parent's channel entry — so it MUST
+ * filter/project via `COALESCE(child, parent)`, or those rows vanish the moment
+ * a channel/sender filter is applied. Pass `parentAlias` for such queries. Omit
+ * it for SESSION-LEVEL queries (no parent join; such a child is never a channel
  * session there) — passing it would reference an unjoined alias.
  *
  * Centralized so every filter site inherits the same parent-aware form and the
@@ -88,9 +103,9 @@ export function normalizeEntry(raw: string | null | undefined): EntryMode {
 }
 
 /**
- * Base origin predicate for one session alias, with NO delegation handling.
- * "all" (overview) = the interactive family (web+api+a2a+channel): everything
- * except scheduled (`task`) and `delegation` traces.
+ * Base origin predicate for one session alias, with NO parent attribution.
+ * "all" (overview) = the interactive family (web+api+a2a+channel): every
+ * non-trace origin, so scheduled (`task`) and every execution trace are out.
  */
 function baseOriginPredicate(entry: EntryMode, alias: string): string {
   switch (entry) {
@@ -100,12 +115,12 @@ function baseOriginPredicate(entry: EntryMode, alias: string): string {
     case "channel": return `${alias}.origin = 'channel'`;
     case "scheduled": return `${alias}.origin = 'task'`;
     case "all":
-    default: return `(${alias}.origin IS NULL OR ${alias}.origin NOT IN ('task', 'delegation'))`;
+    default: return nonTraceOriginPredicate(alias);
   }
 }
 
 /**
- * Session-level predicate (per-session queries). Excludes delegation traces.
+ * Session-level predicate (per-session queries). Excludes execution traces.
  * Returns a parenthesized SQL fragment over the given session alias (default "s").
  */
 export function entrySessionPredicate(entry: EntryMode, alias = "s"): string {
@@ -113,15 +128,42 @@ export function entrySessionPredicate(entry: EntryMode, alias = "s"): string {
 }
 
 /**
- * Message-level predicate (per-message / per-tool queries) WITH delegation
- * inheritance: a delegation child session's rows count under the parent's entry.
+ * Prompt-level predicate: for counting `role='user'` rows.
+ *
+ * Identical to {@link entrySessionPredicate} — trace sessions excluded, no
+ * parent join — and separately named because the DIFFERENCE FROM
+ * {@link entryMessagePredicate} is the contract, not an implementation detail.
+ * A prompt count answers "how many requests did people make", and a trace
+ * child's opening `role='user'` row was written by its parent agent, not by a
+ * person: a sub-agent briefing, or a coordinator's delegated instruction.
+ *
+ * Callers must NOT pass a `parentAlias` to their channel/user filters here —
+ * there is no parent join, so referencing it is a SQL error.
+ */
+export function entryPromptPredicate(entry: EntryMode, alias = "s"): string {
+  return entrySessionPredicate(entry, alias);
+}
+
+/**
+ * Message-level predicate (per-tool / per-assistant queries) WITH parent
+ * attribution: a delegation OR sub-agent child session's rows count under the
+ * parent's entry.
+ *
+ * NOT for `role='user'` counts — see {@link entryPromptPredicate}.
  *
  * Returns:
  *  - `join`: a LEFT JOIN clause binding `parentAlias` to `sAlias`'s parent
  *    session (empty string if inheritance is disabled).
  *  - `predicate`: a parenthesized fragment to AND into the WHERE clause.
  *
- * With inheritance: `<entry on s> OR (s.origin='delegation' AND <entry on parent_s>)`.
+ * With inheritance:
+ * `<entry on s> OR (s.origin IN (<parent-attributed>) AND parent_s.id IS NOT NULL
+ * AND <entry on parent_s>)`.
+ *
+ * The `parent_s.id IS NOT NULL` term is required for correctness — see the
+ * comment at the predicate. A trace row whose parent is absent belongs to NO
+ * entry bucket; it must not fall through to the one whose test a NULL happens
+ * to satisfy.
  */
 export function entryMessagePredicate(
   entry: EntryMode,
@@ -136,8 +178,20 @@ export function entryMessagePredicate(
   }
 
   const join = `LEFT JOIN chat_sessions ${parentAlias} ON ${sAlias}.parent_session_id = ${parentAlias}.id`;
+  // `parentAlias.id IS NOT NULL` is load-bearing, not defensive: an unmatched
+  // LEFT JOIN makes every parent column NULL, and two buckets READ a NULL origin
+  // as a match — `web` is literally `origin IS NULL`, and `all` starts with the
+  // same disjunct. Without this guard an orphan trace row satisfies the parent
+  // branch and lands in Web/Overview, which is precisely where a trace must
+  // never appear.
+  //
+  // Orphans are legitimate and expected, not corruption: a delegation whose
+  // parent could not be validated is persisted with a NULL parent ON PURPOSE
+  // (delegate-api never writes an unverified parent ref), and a parent removed
+  // by deletion or retention leaves its children behind.
   const predicate =
     `(${baseOriginPredicate(entry, sAlias)} ` +
-    `OR (${sAlias}.origin = 'delegation' AND ${baseOriginPredicate(entry, parentAlias)}))`;
+    `OR (${parentAttributedOriginPredicate(sAlias)} AND ${parentAlias}.id IS NOT NULL ` +
+    `AND ${baseOriginPredicate(entry, parentAlias)}))`;
   return { join, predicate };
 }
