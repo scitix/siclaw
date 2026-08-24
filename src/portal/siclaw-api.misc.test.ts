@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import { parentAttributedOriginPredicate } from "./session-origin.js";
 
 vi.mock("../gateway/db.js", () => ({
   getDb: vi.fn(),
@@ -696,7 +697,7 @@ describe("siclaw-api misc routes", () => {
       expect(Array.isArray(body.logs)).toBe(true);
     });
 
-    it("entry=api filters by origin (with delegation inheritance) + joins agents", async () => {
+    it("entry=api filters by origin (with parent attribution) + joins agents", async () => {
       query.mockResolvedValueOnce([[], []]);
       await runRoute(router, fakeReq({
         url: "/api/v1/siclaw/metrics/audit?from=1000&to=2000&entry=api",
@@ -705,7 +706,8 @@ describe("siclaw-api misc routes", () => {
       }));
       const sql: string = query.mock.calls[0][0];
       expect(sql).toContain("s.origin = 'api'");
-      expect(sql).toContain("s.origin = 'delegation' AND parent_s.origin = 'api'"); // inheritance
+      // Both trace kinds that work on behalf of a parent turn are attributed to it.
+      expect(sql).toContain(`${parentAttributedOriginPredicate("s")} AND parent_s.origin = 'api'`);
       expect(sql).toContain("LEFT JOIN agents a ON s.agent_id = a.id");             // agentName
     });
 

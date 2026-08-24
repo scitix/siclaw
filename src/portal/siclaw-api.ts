@@ -57,6 +57,7 @@ import {
   truncateChatSessionTitle,
 } from "./chat-session-fields.js";
 import { normalizeEntry, entrySessionPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
+import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
 import {
   assembleExporterHeaders,
@@ -2153,21 +2154,21 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const { page, pageSize, offset } = parsePagination(query);
     const db = getDb();
 
-    // origin='task' and origin='delegation' sessions are execution traces —
-    // they live in the same table so FK + audit paths keep working, but the
-    // user-facing Chat list should hide them. Their entry points are task-run
-    // pages and delegated investigation cards.
+    // Trace sessions (see session-origin.ts: task / delegation / subagent) are
+    // execution traces — they live in the same table so FK + audit paths keep
+    // working, but the user-facing Chat list should hide them. Their entry points
+    // are task-run pages, delegated investigation cards, and sub-agent cards.
     const [[countRows], [listRows]] = await Promise.all([
       db.query(
         `SELECT COUNT(*) AS count FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))`,
+           AND ${nonTraceOriginPredicate("")}`,
         [params.id, auth.userId],
       ),
       db.query(
         `SELECT * FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))
+           AND ${nonTraceOriginPredicate("")}
          ORDER BY last_active_at DESC LIMIT ? OFFSET ?`,
         [params.id, auth.userId, pageSize, offset],
       ),

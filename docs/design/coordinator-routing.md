@@ -100,6 +100,52 @@ confirmed retry misses, the coordinator does not guess or loop. It tells the
 user that no authorized agent covers the supplied name and that the name may be
 an alias.
 
+## A delegated agent runs under its own configuration
+
+Delegation hands a *request* to another agent. It does not hand over a runtime
+environment, and the coordinator has no say in how the peer processes it:
+
+- the peer's **model** (provider, model id, model config, routing policy) and
+  **system prompt** come from the peer's own binding, resolved from the peer's
+  agent id at dispatch time;
+- its **capabilities, tool whitelist, skills, knowledge, and credentials** are
+  the peer's own. The coordinator does not narrow them, and no coordinator-side
+  preference is forwarded;
+- the delegation marker carried with the request exists for the result-artifact
+  contract, anti-recursion, and audit. It is not an authorization downgrade;
+- consequently a coordinator on a large model delegating to a peer on a small
+  one is normal, and the reverse is too. Neither side observes the other's
+  model selection.
+
+A dispatch that cannot resolve the peer's own binding **fails closed**. Falling
+back to the coordinator's configuration would silently run the peer as something
+it is not.
+
+### Sub-agents are a different mechanism
+
+A **sub-agent** is one agent's internal way of isolating context for part of its
+*own* work: same agent, same configuration, a fresh context window. So the two
+mechanisms have opposite inheritance rules, and conflating them is a live
+hazard — the word "delegation" is overloaded on the wire (a sub-agent's spawn id
+travels as `delegation_id`, its persistence rides the delegation event channel),
+which is historical and describes the transport, not the concept.
+
+| | Who configures the child | Tool whitelist |
+|---|---|---|
+| Delegation (coordinator → peer) | The **peer's** own binding | The peer's own |
+| Sub-agent (agent → its child) | The **parent's** current configuration | Inherited from the parent, never wider |
+
+The sub-agent rule is a containment property: a restricted agent must not be
+able to escape its whitelist by spawning a child that falls back to the global
+tool set. The delegation rule is an independence property: two agents manage
+their own permissions, and a coordinator is not a privilege source for its
+roster.
+
+They are also separate `chat_sessions.origin` values (`delegation` vs
+`subagent`) — both execution traces rather than top-level conversations, but
+never interchangeable in a query. See `src/portal/session-origin.ts` for the
+origin vocabulary; any new trace origin is registered there, not at call sites.
+
 ## Runtime placement contract
 
 Roster membership authorizes *which agent* may receive a delegated task; it

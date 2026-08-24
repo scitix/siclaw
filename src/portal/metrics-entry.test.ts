@@ -8,6 +8,7 @@ import {
   entryMessagePredicate,
   type EntryMode,
 } from "./metrics-entry.js";
+import { TRACE_ORIGINS, parentAttributedOriginPredicate } from "./session-origin.js";
 
 describe("actorUserColumn", () => {
   it("attributes channel rows to the sender (sender_external_id), else user_id", () => {
@@ -68,10 +69,21 @@ describe("entrySessionPredicate", () => {
     expect(entrySessionPredicate(entry)).toContain(frag);
   });
 
-  it("'all' (overview) = interactive family: excludes task + delegation", () => {
+  it("'all' (overview) = interactive family: excludes every trace origin", () => {
     const p = entrySessionPredicate("all");
     expect(p).toContain("s.origin IS NULL");
-    expect(p).toContain("NOT IN ('task', 'delegation')");
+    // Asserted against the registry, not a pinned string: a new trace origin
+    // must be excluded here automatically, which is exactly what 'subagent'
+    // was not for a month.
+    for (const origin of TRACE_ORIGINS) expect(p).toContain(`'${origin}'`);
+    expect(p).toContain("NOT IN");
+  });
+
+  it("excludes sub-agent children from the overview (regression)", () => {
+    // origin='subagent' shipped before this axis existed and was omitted from
+    // every hardcoded exclusion list: sub-agent children counted as top-level
+    // sessions in the overview.
+    expect(entrySessionPredicate("all")).toContain("'subagent'");
   });
 
   it("honors a custom alias", () => {
@@ -85,18 +97,27 @@ describe("entrySessionPredicate", () => {
   });
 });
 
-describe("entryMessagePredicate (delegation inheritance)", () => {
-  it("emits a parent join and inherits the parent's entry for delegation rows", () => {
+describe("entryMessagePredicate (parent attribution)", () => {
+  it("emits a parent join and inherits the parent's entry for attributed rows", () => {
     const { join, predicate } = entryMessagePredicate("api");
     expect(join).toBe("LEFT JOIN chat_sessions parent_s ON s.parent_session_id = parent_s.id");
-    // direct match on s OR (delegation child whose parent matches the entry)
+    // direct match on s OR (attributed child whose parent matches the entry)
     expect(predicate).toContain("s.origin = 'api'");
-    expect(predicate).toContain("s.origin = 'delegation' AND parent_s.origin = 'api'");
+    expect(predicate).toContain(`${parentAttributedOriginPredicate("s")} AND parent_s.origin = 'api'`);
   });
 
-  it("overview inherits parent for delegation children too", () => {
+  it("attributes BOTH delegation and sub-agent children to the parent", () => {
+    // The two are different mechanisms — a delegated peer runs under its own
+    // config, a sub-agent is the parent's own context isolation — but both do
+    // work on behalf of a parent turn, so both inherit its entry.
+    const { predicate } = entryMessagePredicate("api");
+    expect(predicate).toContain("'delegation'");
+    expect(predicate).toContain("'subagent'");
+  });
+
+  it("overview inherits parent for attributed children too", () => {
     const { predicate } = entryMessagePredicate("all");
-    expect(predicate).toContain("s.origin = 'delegation'");
+    expect(predicate).toContain(parentAttributedOriginPredicate("s"));
     expect(predicate).toContain("parent_s.origin");
   });
 
@@ -110,6 +131,6 @@ describe("entryMessagePredicate (delegation inheritance)", () => {
     const { join, predicate } = entryMessagePredicate("scheduled", { sAlias: "m_s", parentAlias: "p" });
     expect(join).toContain("LEFT JOIN chat_sessions p ON m_s.parent_session_id = p.id");
     expect(predicate).toContain("m_s.origin = 'task'");
-    expect(predicate).toContain("m_s.origin = 'delegation' AND p.origin = 'task'");
+    expect(predicate).toContain(`${parentAttributedOriginPredicate("m_s")} AND p.origin = 'task'`);
   });
 });
