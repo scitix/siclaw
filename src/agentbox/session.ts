@@ -92,6 +92,8 @@ type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanConte
 
 export interface ManagedSession {
   id: string;
+  /** User identity bound to this conversation's tools and child-session persistence. */
+  userId?: string;
   brain: BrainSession;
   session: AgentSession;  // backward compat — only guaranteed for pi-agent brain
   createdAt: Date;
@@ -2222,7 +2224,7 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: "web",
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
-      userId: this.userId,
+      userId: request.userId,
       agentId,
       knowledgeDir: this.knowledgeDir,
       // A spawned sub-agent must never be broader than its parent: inherit the
@@ -2552,12 +2554,18 @@ export class AgentBoxSessionManager {
     systemPromptTemplate?: string,
     activeMode: AgentMode = "normal",
     delegation?: DelegationContext,
+    requestUserId?: string,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
+    const effectiveUserId = requestUserId?.trim() || this.userId;
 
     const existing = this.sessions.get(id);
     if (existing) {
       existing.lastActiveAt = new Date();
+      if (effectiveUserId && existing.userId && effectiveUserId !== existing.userId) {
+        throw new Error(`Session ${id} is already bound to a different user`);
+      }
+      const needsUserIdentityRebuild = Boolean(effectiveUserId && !existing.userId);
       // Config invalidation is stronger than the ordinary release timer:
       // even if the next message races the 0ms timer, an idle session must be
       // rebuilt so it cannot run one extra turn with stale prompt/tool state.
@@ -2610,11 +2618,15 @@ export class AgentBoxSessionManager {
           existing.delegation.parentSessionId = delegation.parentSessionId;
           existing.delegation.parentAgentId = delegation.parentAgentId;
         }
-        if ((existing.activeMode === activeMode && sameDelegation) || !existing._promptDone) {
+        if (
+          (existing.activeMode === activeMode && sameDelegation && !needsUserIdentityRebuild) ||
+          !existing._promptDone ||
+          existing._promptInflight
+        ) {
           return existing;
         }
         console.log(
-          `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode}/${delegationSignature(existing.delegation)} -> ${activeMode}/${delegationSignature(delegation)}`,
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/${effectiveUserId ?? "anonymous"}`,
         );
         await this.releaseForRebuild(id, existing);
       }
@@ -2785,7 +2797,7 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
-      userId: this.userId,
+      userId: effectiveUserId,
       agentId: this.agentId ?? null,
       knowledgeDir: this.knowledgeDir,
       // Per-agent tool capability whitelist. null = unrestricted (falls back to
@@ -2837,6 +2849,7 @@ export class AgentBoxSessionManager {
 
     const managed: ManagedSession = {
       id,
+      userId: effectiveUserId,
       brain: result.brain,
       session: result.session,
       createdAt: new Date(),
@@ -2891,7 +2904,7 @@ export class AgentBoxSessionManager {
     // routing, brain events + model_route_* events reach the recorder via
     // emitSessionExtraEvent → handleEvent instead.
     if (isTracingEnabled()) {
-      tracingRecorder.attach(id, result.brain, { userId: this.userId, agentId: this.agentId });
+      tracingRecorder.attach(id, result.brain, { userId: effectiveUserId, agentId: this.agentId });
       managed._tracingUnsub = result.brain.subscribe((event: any) => {
         if (managed._routeBrainEventsThroughExtra) return;
         tracingRecorder.handleEvent(id, event);
@@ -2934,7 +2947,7 @@ export class AgentBoxSessionManager {
           outcome: event.isError ? "error" : "success",
           // 0 used to mean both "instant" and "we could not pair this" — indistinguishable downstream.
           durationMs: entry ? Date.now() - entry.startMs : undefined,
-          userId: this.userId ?? "unknown",
+          userId: effectiveUserId ?? "unknown",
           agentId: this.agentId ?? null,
         });
       }

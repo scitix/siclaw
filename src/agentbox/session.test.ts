@@ -255,6 +255,31 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(opts.agentId).toBe("agent-a");
   });
 
+  it("prefers the request user identity when the shared AgentBox has no USER_ID", async () => {
+    const mgr = new AgentBoxSessionManager();
+
+    const session = await mgr.getOrCreate(
+      "sess-request-user",
+      "web",
+      undefined,
+      "normal",
+      undefined,
+      "user-from-prompt",
+    );
+
+    expect(session.userId).toBe("user-from-prompt");
+    expect(lastCreateSiclawSession.calls[0].userId).toBe("user-from-prompt");
+  });
+
+  it("rejects reusing one resident session for a different user", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("sess-owned", "web", undefined, "normal", undefined, "alice");
+
+    await expect(
+      mgr.getOrCreate("sess-owned", "web", undefined, "normal", undefined, "bob"),
+    ).rejects.toThrow(/different user/);
+  });
+
   it("uses the delegated read-only persona exclusively", async () => {
     const mgr = new AgentBoxSessionManager();
     mgr.agentTypeState = "sre";
@@ -881,6 +906,7 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
       // precede startPrompt (else startPrompt takes the id-only branch, no span).
       expect(startSpy).toHaveBeenCalledWith("child-1", "do x", "u1", T1, SC);
       expect(attachSpy).toHaveBeenCalledWith("child-1", expect.anything(), expect.objectContaining({ userId: "u1" }));
+      expect(lastCreateSiclawSession.calls.at(-1)?.userId).toBe("u1");
       expect(attachSpy.mock.invocationCallOrder[0]).toBeLessThan(startSpy.mock.invocationCallOrder[0]);
       // done → completed; detach runs after endPrompt (finally safety net).
       expect(endSpy).toHaveBeenCalledWith("child-1", "completed");

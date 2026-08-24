@@ -167,6 +167,12 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 - **`skipped` items are never persisted as a child event** (never started; `skipped` is not in
   the delegation status enum) — they exist only in the aggregate report and the batch terminal
   event's item detail.
+- **User identity is request-scoped in a shared AgentBox.** K8s AgentBoxes are shared per agent and
+  commonly have no process-level `USER_ID`; `/api/prompt.userId` is therefore passed into
+  `getOrCreate`, bound to the managed session, and used when building both the parent and spawned
+  child tool contexts. Reusing one resident session with a different non-empty user id is rejected
+  instead of silently attributing child sessions to the wrong user. This keeps child transcript
+  ownership aligned with the parent session and makes the read-only child messages API usable.
 
 ### Job model & notification
 
@@ -209,8 +215,10 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
   no-reduce call renders as the legacy **AgentWorkCard** (its collapse events are legacy-shaped,
   so this path is unchanged). The now-deleted `spawn_subagent_group` tool name is still
   recognised as the batch form so historical sessions keep rendering.
-- **Batch card:** progress bar + one status row per item (each row drills into its child
-  session) + the reduce summary + a drill-in to the reduce child. Children's `delegation_event`s
+- **Batch card:** progress bar + one expandable status row per item + an expandable reduce section.
+  Each expanded area reads its child session and renders the same inline execution component as a
+  single sub-agent (`SubagentSteps` + the shared tool card), refreshing persisted history while the
+  child runs. Children's `delegation_event`s
   are naturally hidden, so no per-child `AgentWorkCard`. It renders both a foreground batch's
   inline report (`item_results` in the tool result) and a background batch's folded metadata
   (`groupItems` from persisted events, `groupProgress` from the live event, `groupStatus`/reduce

@@ -826,7 +826,14 @@ export function createHttpServer(
     // A delegated agent runs under its own configuration; delegation does not
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode, delegation);
+    const managed = await sessionManager.getOrCreate(
+      body.sessionId,
+      body.mode,
+      body.systemPromptTemplate,
+      activeMode,
+      delegation,
+      body.userId,
+    );
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped

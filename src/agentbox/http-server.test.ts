@@ -216,8 +216,15 @@ function makeFakeSessionManager() {
     markPendingAbort: vi.fn(),
     consumePendingAbort: vi.fn(() => false),
     discardPendingNotifications: vi.fn(),
-    getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, activeMode?: unknown) => {
-      getOrCreateCalls.push({ id, activeMode });
+    getOrCreate: async (
+      id?: string,
+      _mode?: unknown,
+      _systemPromptTemplate?: unknown,
+      activeMode?: unknown,
+      _delegation?: unknown,
+      userId?: string,
+    ) => {
+      getOrCreateCalls.push({ id, activeMode, userId });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
@@ -876,6 +883,17 @@ describe("http-server — prompt + session lifecycle", () => {
 
     await getJson(port, "/api/prompt", "POST", { text: "plain question", sessionId: "plain-a" });
     expect(lastMode()).toBe("normal");
+  });
+
+  it("passes the prompt user identity into session creation", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "inspect the cluster",
+      sessionId: "owned-session",
+      userId: "user-42",
+    });
+
+    expect(r.status).toBe(200);
+    expect(sm.getOrCreateCalls.at(-1)?.userId).toBe("user-42");
   });
 
   it("POST /api/prompt rejects a second prompt while the session is still running", async () => {
