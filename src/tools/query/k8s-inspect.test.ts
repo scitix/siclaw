@@ -360,6 +360,48 @@ describe("collectObject — neighbours", () => {
     expect(eventCall).toContain("involvedObject.kind=Pod");
   });
 
+  it("reports a missing named neighbour as a finding, not as a gap in our own data", async () => {
+    // A pod still assigned to a node whose object is gone is the sharpest diagnosis this tool can
+    // produce. Filing it under `status: partial (node: not_found)` reads as "we failed to look".
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": failure('Error from server (NotFound): nodes "node-42" not found'),
+      "get replicaset web-7d9f": JSON.stringify(RS),
+      "get events": NO_EVENTS,
+    });
+    const { text, failed } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("--- node (node-42) ---");
+    expect(text).toContain("not found");
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: ok");
+    expect(failed).toBe(false);
+  });
+
+  it("still reports a neighbour we were not allowed to read as a gap", async () => {
+    // The distinction is the point: forbidden means we do not know, not_found means we do.
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": failure('Error from server (Forbidden): nodes "node-42" is forbidden'),
+      "get replicaset web-7d9f": JSON.stringify(RS),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (node: forbidden)");
+  });
+
+  it("keeps a list relation's not_found a gap, because the finding's wording does not apply to it", async () => {
+    // A list has no named target, so rendering "the subject names it" would state something false about
+    // a query that merely came back NotFound. The stderr here is the API's TYPED NotFound — the only
+    // form classified as not_found — so the exclusion is actually exercised.
+    const d = deps({
+      "get node node-42": JSON.stringify(NODE),
+      "get pods": failure("Error from server (NotFound): the server could not find the requested resource"),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.node, { kind: "node", name: "node-42" }, d);
+    expect(text).not.toContain("the subject names it");
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (pods: not_found)");
+  });
+
   it("runs the neighbour reads concurrently, not one after another", async () => {
     // The whole point is one wait instead of one per edge. A serial implementation passes every other
     // test in this file.

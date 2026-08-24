@@ -84,7 +84,19 @@ export interface NamedNeighbourTarget {
   kind: string;
 }
 
-/** Where a neighbour is fetched from: a name carried by the subject, or a list query over it. */
+/**
+ * Where a neighbour is fetched from: a name carried by the subject, or a list query over it.
+ *
+ * `scope` says whether the neighbour is read cluster-wide or inside a namespace, and for `namespace` it
+ * means THE SUBJECT'S namespace — the only one a relation can currently express.
+ *
+ * That is not a limitation to work around, for the edges that exist: Kubernetes requires an owner to be
+ * either cluster-scoped or in the same namespace as its dependent, so `ownerReferences` cannot point
+ * elsewhere. It is written down because the field NAME implies a generality the reader might supply —
+ * a future relation crossing namespaces would inherit the subject's and query the wrong one silently,
+ * which is exactly the kind of confident wrong answer this file is trying not to produce. Such a
+ * relation must add the path to the neighbour's namespace, not reuse `namespace` and hope.
+ */
 export type Neighbour =
   /**
    * The subject names the neighbour. `nameAt` is where; `kindAt` lets the kind come from the object

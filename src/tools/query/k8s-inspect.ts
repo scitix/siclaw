@@ -478,6 +478,25 @@ export async function collectObject(
     // nature is not a miss, and reporting it as one would make every static pod look degraded.
     if (result === undefined) continue;
     if (!result.ok) {
+      // A NAMED neighbour that does not exist is an ANSWER about existence, not a gap in ours — the same
+      // distinction classifyExit already draws for a local NotFound. A pod whose node object is gone is
+      // the sharpest diagnosis this tool can produce, and reporting it as `partial (node: not_found)`
+      // filed it under our own failure to look.
+      //
+      // A LIST relation is excluded because the FINDING does not apply to it, not because not_found
+      // means something different there: a list has no named target, so "the subject names it" would be
+      // a false statement about a query that simply came back NotFound. A list of an existing resource
+      // returns an empty list, and a missing resource TYPE is not the API's typed NotFound, so this is
+      // an unreachable state as far as the apiserver goes — which is a reason to word it honestly rather
+      // than a reason to leave it unhandled.
+      if (result.reason === "not_found" && rel.neighbour.via !== "list") {
+        sections.push({
+          label: rel.label,
+          ...(target ? { target } : {}),
+          text: "not found: the subject names it, but the object does not exist",
+        });
+        continue;
+      }
       misses.push(`${rel.label}: ${result.reason}`);
       continue;
     }
