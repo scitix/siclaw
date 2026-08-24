@@ -157,7 +157,13 @@ export function entryPromptPredicate(entry: EntryMode, alias = "s"): string {
  *  - `predicate`: a parenthesized fragment to AND into the WHERE clause.
  *
  * With inheritance:
- * `<entry on s> OR (s.origin IN (<parent-attributed>) AND <entry on parent_s>)`.
+ * `<entry on s> OR (s.origin IN (<parent-attributed>) AND parent_s.id IS NOT NULL
+ * AND <entry on parent_s>)`.
+ *
+ * The `parent_s.id IS NOT NULL` term is required for correctness — see the
+ * comment at the predicate. A trace row whose parent is absent belongs to NO
+ * entry bucket; it must not fall through to the one whose test a NULL happens
+ * to satisfy.
  */
 export function entryMessagePredicate(
   entry: EntryMode,
@@ -172,8 +178,20 @@ export function entryMessagePredicate(
   }
 
   const join = `LEFT JOIN chat_sessions ${parentAlias} ON ${sAlias}.parent_session_id = ${parentAlias}.id`;
+  // `parentAlias.id IS NOT NULL` is load-bearing, not defensive: an unmatched
+  // LEFT JOIN makes every parent column NULL, and two buckets READ a NULL origin
+  // as a match — `web` is literally `origin IS NULL`, and `all` starts with the
+  // same disjunct. Without this guard an orphan trace row satisfies the parent
+  // branch and lands in Web/Overview, which is precisely where a trace must
+  // never appear.
+  //
+  // Orphans are legitimate and expected, not corruption: a delegation whose
+  // parent could not be validated is persisted with a NULL parent ON PURPOSE
+  // (delegate-api never writes an unverified parent ref), and a parent removed
+  // by deletion or retention leaves its children behind.
   const predicate =
     `(${baseOriginPredicate(entry, sAlias)} ` +
-    `OR (${parentAttributedOriginPredicate(sAlias)} AND ${baseOriginPredicate(entry, parentAlias)}))`;
+    `OR (${parentAttributedOriginPredicate(sAlias)} AND ${parentAlias}.id IS NOT NULL ` +
+    `AND ${baseOriginPredicate(entry, parentAlias)}))`;
   return { join, predicate };
 }

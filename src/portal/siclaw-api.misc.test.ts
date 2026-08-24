@@ -706,8 +706,11 @@ describe("siclaw-api misc routes", () => {
       }));
       const sql: string = query.mock.calls[0][0];
       expect(sql).toContain("s.origin = 'api'");
-      // Both trace kinds that work on behalf of a parent turn are attributed to it.
-      expect(sql).toContain(`${parentAttributedOriginPredicate("s")} AND parent_s.origin = 'api'`);
+      // Both trace kinds that work on behalf of a parent turn are attributed to
+      // it — but only when the parent row is actually present.
+      expect(sql).toContain(
+        `${parentAttributedOriginPredicate("s")} AND parent_s.id IS NOT NULL AND parent_s.origin = 'api'`,
+      );
       expect(sql).toContain("LEFT JOIN agents a ON s.agent_id = a.id");             // agentName
     });
 

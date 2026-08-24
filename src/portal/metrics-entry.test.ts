@@ -131,9 +131,27 @@ describe("entryMessagePredicate (parent attribution)", () => {
   it("emits a parent join and inherits the parent's entry for attributed rows", () => {
     const { join, predicate } = entryMessagePredicate("api");
     expect(join).toBe("LEFT JOIN chat_sessions parent_s ON s.parent_session_id = parent_s.id");
-    // direct match on s OR (attributed child whose parent matches the entry)
+    // direct match on s OR (attributed child with a PRESENT parent matching the entry)
     expect(predicate).toContain("s.origin = 'api'");
-    expect(predicate).toContain(`${parentAttributedOriginPredicate("s")} AND parent_s.origin = 'api'`);
+    expect(predicate).toContain(
+      `${parentAttributedOriginPredicate("s")} AND parent_s.id IS NOT NULL AND parent_s.origin = 'api'`,
+    );
+  });
+
+  it("requires a present parent, so orphan traces fall out of every bucket", () => {
+    // An unmatched LEFT JOIN NULLs every parent column, and a NULL origin
+    // SATISFIES the two buckets that test for it: `web` is `origin IS NULL`,
+    // and `all` opens with the same disjunct. Without the guard, a delegation
+    // persisted with a NULL parent (never an unverified ref) or a child whose
+    // parent was deleted/pruned would count as Web/Overview traffic.
+    for (const entry of ["web", "all"] as const) {
+      expect(entryMessagePredicate(entry).predicate).toContain("parent_s.id IS NOT NULL");
+    }
+  });
+
+  it("guards the parent branch under a custom parent alias too", () => {
+    const { predicate } = entryMessagePredicate("web", { sAlias: "m_s", parentAlias: "p" });
+    expect(predicate).toContain("p.id IS NOT NULL");
   });
 
   it("attributes BOTH delegation and sub-agent children to the parent", () => {
@@ -161,6 +179,8 @@ describe("entryMessagePredicate (parent attribution)", () => {
     const { join, predicate } = entryMessagePredicate("scheduled", { sAlias: "m_s", parentAlias: "p" });
     expect(join).toContain("LEFT JOIN chat_sessions p ON m_s.parent_session_id = p.id");
     expect(predicate).toContain("m_s.origin = 'task'");
-    expect(predicate).toContain(`${parentAttributedOriginPredicate("m_s")} AND p.origin = 'task'`);
+    expect(predicate).toContain(
+      `${parentAttributedOriginPredicate("m_s")} AND p.id IS NOT NULL AND p.origin = 'task'`,
+    );
   });
 });
