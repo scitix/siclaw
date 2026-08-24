@@ -16,7 +16,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const boundedExecCalls: string[] = [];
 
-vi.mock("./bounded-exec.js", () => ({
+vi.mock("../infra/bounded-exec.js", () => ({
   boundedExec: (command: string) => {
     boundedExecCalls.push(command);
     // Resolve as an empty success: the command line is what is under test, not the run.

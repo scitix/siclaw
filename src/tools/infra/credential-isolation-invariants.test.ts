@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { resolve } from "node:path";
 
 /**
@@ -124,13 +125,40 @@ describe("credential isolation: the entrypoint does not re-open what the image c
 });
 
 describe("credential isolation: only one code path drops to sandbox", () => {
-  it("is restricted-bash, and nothing else", () => {
-    // The audit behind removing the groups: if another tool ran as sandbox and read a credential file
-    // directly, removing the membership would break it. Only restricted-bash drops privileges, and its
-    // credential reader is kubectl (setgid). Everything else runs in the node process, as agentbox.
-    const rb = readFileSync(resolve(repoRoot, "src/tools/cmd-exec/restricted-bash.ts"), "utf8");
-    expect(rb).toMatch(/sudo -E -u sandbox/);
+  // This used to assert that the drop lived in restricted-bash.ts and in none of six named files. The
+  // wrapping has since moved to infra/sandbox-exec.ts so a second read-only tool could reuse it
+  // instead of importing a tool module, which makes the "one path" claim checkable directly rather
+  // than by enumerating the files it must not be in.
+  //
+  // Why a SECOND caller does not weaken the audit this invariant came from: the concern was a
+  // sandbox-side process needing to read a credential file itself, since that is what dropping the
+  // group memberships would break. Every caller here reaches credentials only through setgid
+  // `kubectl`, exactly as restricted_bash does — so the number of callers is not the property that
+  // matters. The number of IMPLEMENTATIONS is, and it is one.
+  it("has exactly one implementation of the drop, in infra/sandbox-exec.ts", () => {
+    const files = execSync("git ls-files 'src/**/*.ts'", { cwd: repoRoot, encoding: "utf8" })
+      .split("\n").map((f) => f.trim()).filter((f) => f && !f.endsWith(".test.ts"));
 
+    // Both spellings. The argv form was a blind spot in the previous version of this test: its regex
+    // only matched the shell string, so `spawn("sudo", ["-n", "-E", "-u", "sandbox", …])` — which is
+    // how the session reap becomes sandbox — would have passed in any file at all.
+    const asString = /sudo\s+(?:-\S+\s+)*-u\s+sandbox/;
+    const asArgv = /"sudo"\s*,\s*\[[^\]]*"sandbox"/s;
+
+    const offenders = files.filter((f) => {
+      const body = readFileSync(resolve(repoRoot, f), "utf8");
+      // Strip comments so the prose references in tool-registry.ts and background-bash-runner.ts,
+      // which describe the wrapping without performing it, are not counted.
+      const code = body.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      return asString.test(code) || asArgv.test(code);
+    });
+
+    expect(offenders).toEqual(["src/tools/infra/sandbox-exec.ts"]);
+  });
+
+  it("keeps the drop out of the tools that must run as agentbox", () => {
+    // Retained from the original: these read credentials or manage cluster resources in the node
+    // process, and a sandbox child in any of them would need the group membership back.
     for (const f of [
       "src/tools/cmd-exec/node-exec.ts",
       "src/tools/cmd-exec/pod-exec.ts",
