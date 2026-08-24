@@ -1,6 +1,14 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import { AGENT_TYPES, normalizeAgentType, effectiveAgentPrompt, effectiveCapabilityKeys } from "./agent-types.js";
+import {
+  AGENT_TYPES,
+  COORDINATOR_DEFAULT_PROMPT,
+  SRE_DEFAULT_PROMPT,
+  normalizeAgentType,
+  effectiveAgentPrompt,
+  effectiveCapabilityKeys,
+} from "./agent-types.js";
 
 describe("agent-types", () => {
   it("has the four designed types; built-ins lock caps and supply editable prompt defaults", () => {
@@ -72,5 +80,38 @@ describe("agent-types", () => {
     expect(effectiveAgentPrompt("knowledge_qa", null)).toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("custom", "custom truth")).toBe("custom truth");
     expect(effectiveAgentPrompt("custom", "")).toBeUndefined();
+  });
+
+  // ── Digest tripwire ──────────────────────────────────────────────────────────
+  // Deliberately the kind of test that breaks on every rewording. It asserts NOTHING about whether
+  // the wording is good — only that a change to it was acknowledged. The coordinator prompt has a
+  // second copy outside this repository (see the comment on the constant), and a one-sided edit is
+  // otherwise caught by nothing at all. Known limitation: this can only see THIS side change.
+  it("COORDINATOR_DEFAULT_PROMPT digest — update BOTH copies when this fails", () => {
+    const digest = createHash("sha256").update(COORDINATOR_DEFAULT_PROMPT, "utf8").digest("hex");
+    expect(
+      digest,
+      "COORDINATOR_DEFAULT_PROMPT changed. If that is deliberate: (1) update this digest, and " +
+        "(2) make the SAME edit to the management plane's default-coordinator-prompt constant — " +
+        "otherwise deployed coordinators keep the old text and this change does nothing. See " +
+        "docs/design/2026-08-25-coordinator-prompt-proposal.md.",
+    ).toBe("287e609535c888396d828f18a152ff963d856792cd9f24f00fd0248f220eae5d");
+  });
+
+  it("the continuation rule is coordinator-scoped and carves out input-required", () => {
+    // Scope: editing the coordinator's constant must not reach the SRE agent. Asserted by digest so
+    // that an accidental edit to SRE_DEFAULT_PROMPT fails here rather than shipping silently.
+    expect(createHash("sha256").update(SRE_DEFAULT_PROMPT, "utf8").digest("hex")).toBe(
+      "5aa1d8449c26501f38bd573f8f300076dfed8b76664633f517c6961392fd87d4",
+    );
+    expect(SRE_DEFAULT_PROMPT).not.toContain("session_id");
+
+    // The carve-out is the load-bearing half: a returned question is exactly the shape the
+    // continuation rule fires on (a delegation that came back without findings), so without it the
+    // rule instructs the coordinator to continue a session that is waiting on the USER — which ends
+    // with it inventing an answer and reporting a conclusion built on it.
+    expect(COORDINATOR_DEFAULT_PROMPT).toContain("asking for the completed result");
+    expect(COORDINATOR_DEFAULT_PROMPT).toContain("a returned question belongs to the USER");
+    expect(COORDINATOR_DEFAULT_PROMPT).toContain("do not answer on the user's behalf");
   });
 });

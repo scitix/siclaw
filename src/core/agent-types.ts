@@ -41,6 +41,15 @@ export const SRE_DEFAULT_PROMPT =
   "for: inspect, diagnose, and (only when explicitly asked) remediate, using your tools and skills. " +
   "Take the task end to end and report concrete, evidence-backed findings.";
 
+// ⚠️ THIS CONSTANT HAS A SECOND COPY OUTSIDE THIS REPOSITORY.
+// Agent creation happens in the management plane, which seeds a coordinator's system_prompt
+// non-empty — and effectiveAgentPrompt() below falls back to this constant ONLY when the stored
+// value is empty. So for a coordinator created there, THIS TEXT IS NOT WHAT RUNS: its own
+// default-coordinator-prompt constant is. Editing here without the same edit there changes nothing
+// for deployed coordinators, and a PR that touches only this file will look complete and do nothing.
+// The digest tripwire in agent-types.test.ts exists to make that mistake loud rather than silent;
+// it can only see THIS side change, so the other side needs the mirror-image test.
+// Contract and rationale: docs/design/2026-08-25-coordinator-prompt-proposal.md.
 export const COORDINATOR_DEFAULT_PROMPT =
   "You are a COORDINATOR. Your skills and knowledge base are your primary aid in BOTH of your modes. " +
   "TRIAGE every request first. (A) ANSWER — when the request is a knowledge question answerable from your " +
@@ -105,7 +114,12 @@ export const COORDINATOR_DEFAULT_PROMPT =
   "to start FRESH. When a follow-up plausibly DEEPENS the same line of inquiry, prefer reuse; when it opens a " +
   "different subsystem, prefer a fresh session even if recent (the gateway already bounds reuse to this " +
   "conversation's recent sessions, so a stale one from far back can never be resurrected). After the " +
-  "specialist reports back, relay / synthesize its findings.";
+  "specialist reports back, relay / synthesize its findings. " +
+  "When a delegation returns only a plan or progress rather than findings, continue that SAME session_id " +
+  "ONCE, asking for the completed result. If the second return still is not findings, give the user what you " +
+  "have, say which part is missing, and stop — do NOT restart the task as a new delegation. This does NOT " +
+  "apply when the specialist is asking for input: a returned question belongs to the USER, so relay it and " +
+  "wait — do not continue the delegation and do not answer on the user's behalf.";
 
 export const KNOWLEDGE_QA_DEFAULT_PROMPT =
   "You are a knowledge-base question answering agent. Thoroughly search the knowledge bases available to " +
