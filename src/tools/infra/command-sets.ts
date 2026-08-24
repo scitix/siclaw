@@ -2,6 +2,7 @@ import {
   getOutputFormat,
   kubectlAllNamespaces,
   kubectlOutputFormats,
+  kubectlPositionals,
   normalizeResourceToken,
 } from "./kubectl-sanitize.js";
 /**
@@ -1532,32 +1533,149 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
 }
 
 /**
- * Does a field selector pin the result to ONE node or ONE object by name?
+ * Does a field selector pin the result to ONE node or ONE object identity?
  *
  * `-A -o json` is refused because serializing every object of a kind is the concern. A server-side
  * `--field-selector spec.nodeName=<exact>` removes that concern rather than papering over it: the
  * apiserver returns one node's pods, which is the same order of magnitude as `-n <namespace> -o json`
- * — already permitted. Seven separate review findings hit this, all of them node-scoped triage that
- * then had to fall back to custom-columns and lose the nested fields it needed.
+ * — already permitted. `involvedObject.uid=<exact>` is the Event equivalent: one immutable object
+ * incarnation, across namespaces. Seven separate review findings hit the node case, all of them
+ * node-scoped triage that then had to fall back to custom-columns and lose the nested fields it needed.
+ *
+ * `involvedObject.name=<exact>` is admitted only IN CONJUNCTION with `involvedObject.kind`, and only on
+ * the Events resource. It is needed because the kubelet does not build a node's event reference from
+ * the node object: it writes `ObjectReference{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}`, so
+ * every kubelet-emitted node event carries the node NAME in the uid field. A uid selector therefore
+ * silently misses exactly the events node triage needs — NodeNotReady, Rebooted, ImageGCFailed,
+ * FreeDiskSpaceFailed — while the controller-manager's events (real uid) still match, so the result
+ * looks like a short list rather than a broken query.
+ *
+ * Why the conjunction, and not the name alone. The first version of this rule admitted the bare name on
+ * the argument that it was "the same order as `metadata.name`", and that argument was WRONG. On Events
+ * the two fields bound completely different things: `metadata.name` names ONE event object, while
+ * `involvedObject.name` names every event about anything called that — of any Kind, in every namespace,
+ * and Events are many-per-object. So the bare name bounds neither the namespace count nor the Kind, and
+ * `-A -o json` with it is not "a single object identity" in any sense. Pinning the Kind restores the
+ * bound to the accepted shape: for a cluster-scoped Kind exactly one object, for a namespaced one at
+ * most one per namespace, which is the same structure as the already-permitted `spec.nodeName` (one
+ * node's pods across all namespaces).
+ *
+ * The unbounded case is a STRUCTURAL claim, not an observation: the cluster available for measurement
+ * held 59 events in its whole TTL window with no name spanning two namespaces, which is too idle to
+ * demonstrate the fan-out. A selector that places no bound on namespace or Kind is refused on the
+ * structure, not on a measured blast radius.
  *
  * Narrow on purpose. `status.phase=Running` across all namespaces is NOT bounded and stays refused, and
  * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
- * selector names a single node or a single object", nothing looser.
+ * selector names a single node or a single object identity", nothing looser.
  */
 function hasBoundingFieldSelector(args: string[]): boolean {
-  const values: string[] = [];
+  const selector = effectiveFieldSelector(args);
+  if (selector === undefined) return false;
+  const pinned = pinnedSelectorFields(selector);
+  // `metadata.name` needs no resource check: every resource has it, and a name is unique within a
+  // namespace whatever the Kind, so the bound holds universally.
+  if (pinned.has("metadata.name")) return true;
+  // `spec.nodeName` does NOT. The bound being claimed is "one node's pods", which is a fact about Pods —
+  // a CRD can declare a `spec.nodeName` selectable field carrying no such bound, and this rule would
+  // then be authorising a full `-A -o json` of that CRD.
+  if (pinned.has("spec.nodeName") && namesCoreResource(args, CORE_POD_NAMES)) return true;
+  // `involvedObject` is a field of core/v1 Event and describes an identity nowhere else, so the rest of
+  // this rule is scoped to that exact resource — read from the resource POSITION, not matched as a
+  // substring anywhere in the argv.
+  if (!namesCoreResource(args, CORE_EVENT_NAMES)) return false;
+  // A uid is globally unique to one object incarnation, so it needs no companion.
+  if (pinned.has("involvedObject.uid")) return true;
+  return pinned.has("involvedObject.name") && pinned.has("involvedObject.kind");
+}
+
+/**
+ * The selector that will actually RUN. `--field-selector` is a plain string flag, so a repeat REPLACES
+ * rather than intersects — exactly the last-wins semantics `getOutputFormat` already had to model for
+ * `-o`. An earlier version OR-ed every occurrence, which made
+ * `--field-selector metadata.name=x --field-selector status.phase=Running` pass the check while kubectl
+ * ran the unbounded second one.
+ */
+function effectiveFieldSelector(args: string[]): string | undefined {
+  let last: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--field-selector" && args[i + 1]) values.push(args[i + 1]);
-    else if (a.startsWith("--field-selector=")) values.push(a.slice("--field-selector=".length));
+    if (a === "--field-selector" && args[i + 1] !== undefined) last = args[i + 1];
+    else if (a.startsWith("--field-selector=")) last = a.slice("--field-selector=".length);
   }
-  for (const raw of values) {
-    for (const term of raw.split(",")) {
-      const m = /^\s*(spec\.nodeName|metadata\.name)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
-      if (m && m[2].trim().length > 0) return true;
-    }
+  return last;
+}
+
+/**
+ * Fields pinned to ONE exact value. A negation pins nothing, an empty value pins nothing, and two terms
+ * naming the same field are a SET rather than a pin — `a=1,a=2` matches nothing at the apiserver but
+ * must not read here as "a is pinned twice".
+ */
+function pinnedSelectorFields(selector: string): Map<string, string> {
+  const pinned = new Map<string, string>();
+  const seen = new Set<string>();
+  for (const term of selector.split(",")) {
+    const m = /^\s*([A-Za-z][\w.]*)\s*(!=|==|=)\s*([^,!=]*?)\s*$/.exec(term);
+    if (!m) continue;
+    const [, field, op, value] = m;
+    if (seen.has(field)) { pinned.delete(field); continue; }
+    seen.add(field);
+    if (op === "!=" || value.length === 0) continue;
+    pinned.set(field, value);
   }
-  return false;
+  return pinned;
+}
+
+const CORE_EVENT_NAMES = new Set(["event", "events", "ev"]);
+const CORE_POD_NAMES = new Set(["pod", "pods", "po"]);
+
+/** `v1`, `v2beta1` — an API VERSION, which is what sits between a core resource and its trailing dot. */
+const API_VERSION_RE = /^v\d+((alpha|beta)\d+)?$/;
+
+/**
+ * Is the query's resource one of `names`, in the CORE group, and nothing else?
+ *
+ * Every exception in `hasBoundingFieldSelector` is a claim about a specific resource's fields, so each
+ * one has to know which resource actually ran. Two earlier versions of this got it wrong in different
+ * ways, and both are worth stating because the shape of the mistake recurs:
+ *
+ *   a SUBSTRING scan over every non-flag token, taking the segment before the first dot. It granted the
+ *   exception to `events.example.com` (a CRD that merely starts with the word), to
+ *   `events.events.k8s.io` (a different API group, whose corresponding field is `regarding`), and to any
+ *   command with `events` sitting in a flag's VALUE — `--sort-by events` is not a query against Events.
+ *
+ *   then a POSITIONAL read that trusted the position. `kubectlPositionals` consumes kubectl's GLOBAL
+ *   value flags, not each subcommand's own, so `get --label-columns events widgets.example.com` left
+ *   `events` sitting in the resource slot while the real resource was the CRD behind it.
+ *
+ * Hence the exact-length requirement rather than an ever-growing flag table: an unconsumed flag value can
+ * only ADD a positional, never remove one, so demanding exactly `[subcommand, resource]` turns every such
+ * shape into a refusal instead of a fail-open. It costs the legitimate
+ * `kubectl get events <name> -A …` its exception, which is a command that makes little sense anyway, and
+ * a refusal here only withdraws the exception — the ordinary refusal it falls back to names a runnable
+ * alternative.
+ *
+ * The TRAILING DOT is load-bearing. kubectl spells a core-group resource `events` or `events.` or
+ * `events.v1.`; `events.v1` means resource `events` in an API GROUP called `v1`, which is a legal group
+ * name a CRD can use. An earlier version filtered empty segments away, which erased exactly that
+ * distinction and let `events.v1`, `events.v2` and `events.v1beta1` all pass as core.
+ *
+ * The very first version leaned on "the apiserver rejects these selectors on anything else anyway". That
+ * is defence by downstream, which is not how this file works: the predicate has to be right on its own,
+ * and ambiguity FAILS CLOSED.
+ */
+function namesCoreResource(args: string[], names: ReadonlySet<string>): boolean {
+  const positionals = kubectlPositionals(args);
+  if (positionals.length !== 2) return false;
+  const resource = positionals[1];
+  // `events,pods` is several resources at once and the bound would have to hold for every one of them;
+  // `events/x` is the type/name form, which this rule does not reason about.
+  if (resource.includes(",") || resource.includes("/")) return false;
+  const parts = resource.split(".");
+  if (!names.has(parts[0])) return false;
+  if (parts.length === 1) return true;                      // `events`
+  if (parts[parts.length - 1] !== "") return false;         // `events.v1` / `events.example.com`
+  return parts.slice(1, -1).every((part) => API_VERSION_RE.test(part));  // `events.` / `events.v1.`
 }
 
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
@@ -1607,8 +1725,10 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
         + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
         + `server-side --field-selector that pins spec.nodeName or metadata.name to ONE exact value IS `
-        + `accepted, because it bounds what the apiserver serializes. A label selector or a phase filter `
-        + `is not — those can still match the whole cluster. Instead:\n`
+        + `accepted, because it bounds what the apiserver serializes. On events, involvedObject.uid `
+        + `alone is accepted, and involvedObject.name only TOGETHER with involvedObject.kind — a name `
+        + `with no kind matches events for any Kind in every namespace. A label selector or a phase `
+        + `filter is not accepted — those can still match the whole cluster. Instead:\n`
         + `  kubectl get ${resource} -A --field-selector spec.nodeName=<node> -o json   (accepted)\n`
         + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`
         + `   (add the fields you need — these two exist on every resource)\n`

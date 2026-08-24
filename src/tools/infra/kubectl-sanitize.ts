@@ -580,6 +580,50 @@ export function kubectlOutputFormats(args: string[]): string[] {
   return formats;
 }
 
+/**
+ * The POSITIONAL arguments, in order, with flag VALUES consumed by arity — for `get` that is
+ * `[subcommand, resource, ...names]`.
+ *
+ * Written because scanning "every token that does not start with `-`" reads a flag's value as a resource,
+ * which is the bug family this file already carries two scars from: `kubectl --as get delete pod victim`
+ * read `get` as the verb, and `kubectl -n default get secret` read `default` as it. A rule that GRANTS an
+ * exception on the resource's identity cannot afford the same mistake — `--sort-by events` is not a query
+ * against Events.
+ *
+ * Short clusters are walked the same way `kubectlOutputFormats` walks them: a value-taking letter claims
+ * the rest of the token, or the next token when nothing is left, so `-Ao json` consumes `json`.
+ *
+ * ⚠️ `FLAGS_WITH_VALUE` is kubectl's GLOBAL value-flag table, not the union of every subcommand's own.
+ * `get --label-columns <cols>`, `--subresource <sub>` and `--filename <f>` in their space-separated form
+ * therefore leave their VALUE in this list. A caller that reads a position out of the result must not
+ * assume the position is right: it must fail closed on a list longer than it expects, which is sound
+ * because an unconsumed value can only ADD an entry, never remove one. See `namesCoreResource`.
+ */
+export function kubectlPositionals(args: string[]): string[] {
+  const positionals: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (FLAGS_WITH_VALUE.has(arg)) { i++; continue; }
+    if (arg.startsWith("--")) continue;
+    if (arg.startsWith("-") && arg.length > 1) {
+      for (let k = 1; k < arg.length; k++) {
+        if (!SHORT_FLAGS_WITH_VALUE.has(arg[k])) continue;
+        let value = arg.slice(k + 1);
+        if (value.startsWith("=")) value = value.slice(1);
+        if (value === "") {
+          const next = args[i + 1];
+          if (next && !next.startsWith("-")) i++;
+        }
+        break;
+      }
+      continue;
+    }
+    if (arg === "-") continue;
+    positionals.push(arg.toLowerCase());
+  }
+  return positionals;
+}
+
 /** Does this argv declare `-A` / `--all-namespaces`, including inside a short cluster? */
 export function kubectlAllNamespaces(args: string[]): boolean {
   for (const arg of args) {

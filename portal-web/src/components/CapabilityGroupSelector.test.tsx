@@ -24,6 +24,20 @@ const countChecked = (html: string) => (html.match(/checked=""/g) || []).length
 // escaped form when asserting label text.
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 
+// The tool count the banner must report, taken from the TABLE rather than written
+// out as a number. The two count assertions below used to hardcode "5 tools" and
+// "9 tools" with a `// 5 + 4 distinct tools` comment, so adding one tool to one
+// group turned this into a red test that said nothing about the component — the
+// arithmetic it pinned was the table's, not the renderer's.
+//
+// KNOWN LIMIT, stated rather than implied: this cannot exercise DEDUPLICATION,
+// because every group in the real table is disjoint, so a renderer that summed
+// group lengths would pass too. The same was true of the hardcoded version (9 is
+// both 5+4 and |union|). What the assertions do pin is the pluralisation and that
+// the count follows the SELECTED groups.
+const toolCount = (...keys: string[]) =>
+  new Set(keys.flatMap((key) => CAPABILITY_GROUPS.find((g) => g.key === key)!.tools)).size
+
 describe("CapabilityGroupSelector — render contract", () => {
   it("shows the Unrestricted banner and no checked boxes for an empty selection", () => {
     const html = render(new Set())
@@ -38,16 +52,16 @@ describe("CapabilityGroupSelector — render contract", () => {
     const html = render(new Set(["read_files"]))
     expect(html).toContain("Restricted")
     expect(html).not.toContain("Unrestricted")
-    // read_files grants 5 tools; "1 group" must be singular.
-    expect(html).toContain("1 group · 5 tools")
+    // "1 group" must be singular.
+    expect(html).toContain(`1 group · ${toolCount("read_files")} tools`)
     expect(html).toContain("Capability groups (1 / 11)")
     expect(countChecked(html)).toBe(1)
   })
 
   it("pluralizes groups and sums the deduped tool count for a multi-group selection", () => {
     const html = render(new Set(["read_files", "run_commands"]))
-    // 5 + 4 distinct tools, plural "groups".
-    expect(html).toContain("2 groups · 9 tools")
+    // Plural "groups", and the count covers both selections.
+    expect(html).toContain(`2 groups · ${toolCount("read_files", "run_commands")} tools`)
     expect(html).toContain("Capability groups (2 / 11)")
     expect(countChecked(html)).toBe(2)
   })

@@ -29,7 +29,12 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   read_files:      ["read", "grep", "find", "ls", "knowledge_cite"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
-  run_commands:    ["bash", "node_exec", "pod_exec", "host_exec"],
+  // `k8s_inspect` sits here rather than in `inspect_infra` on purpose. That group is REGISTRY metadata
+  // — it touches no API server — so putting a live cluster read in it would hand every
+  // metadata-only agent a capability it does not have today. Under `run_commands` the expansion is
+  // zero instead: everything the tool can read, `bash` can already read through the same read-only
+  // kubectl policy, so it adds round-trip efficiency and no reach.
+  run_commands:    ["bash", "node_exec", "pod_exec", "host_exec", "k8s_inspect"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
   search_memory:   ["memory_search", "memory_get"],
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①

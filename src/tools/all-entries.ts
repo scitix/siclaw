@@ -19,6 +19,7 @@ import { registration as localScript } from "./script-exec/local-script.js";
 import { registration as hostScript } from "./script-exec/host-script.js";
 // query
 import { registration as clusterList } from "./query/cluster-list.js";
+import { registration as k8sInspect } from "./query/k8s-inspect.js";
 import { registration as hostList } from "./query/host-list.js";
 // knowledge_search removed — replaced by LLM Wiki (Read tool + .siclaw/knowledge/)
 // resolve_pod_netns removed — node_exec/pod_exec/*_script auto-resolve pod→netns
@@ -52,7 +53,7 @@ export const allToolEntries: ToolEntry[] = [
   // ── script-exec ──
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
-  clusterList, hostList,
+  clusterList, hostList, k8sInspect,
   memorySearch, memoryGet, knowledgeCite,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,

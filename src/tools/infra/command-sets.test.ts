@@ -2051,9 +2051,144 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
       "kubectl get pods -A --field-selector=spec.nodeName=node-1 -o json",
       "kubectl get pods -A --field-selector spec.nodeName=n1,status.phase=Running -o json",
       "kubectl get pods -A --field-selector metadata.name=mypod -o yaml",
+      "kubectl get events -A --field-selector involvedObject.uid=123e4567-e89b-12d3-a456-426614174000 -o json",
     ]) {
       expect(check(cmd), cmd).toBeNull();
     }
+  });
+
+  it("accepts an event selector pinned by involvedObject.name AND kind together", () => {
+    // The name is needed because the kubelet writes a node event's reference as
+    // `{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}`, so the uid field holds the NAME and a uid
+    // selector misses every kubelet-emitted node event (NodeNotReady, Rebooted, ImageGCFailed) while
+    // still matching the controller-manager's — a short list, not a visible failure.
+    for (const cmd of [
+      "kubectl get events -A --field-selector involvedObject.name=node-1,involvedObject.kind=Node -o json",
+      "kubectl get events -A --field-selector involvedObject.kind=Node,involvedObject.name=node-1 -o json",
+      "kubectl get ev -A --field-selector involvedObject.name=node-1,involvedObject.kind=Node -o json",
+      // A uid is globally unique to one incarnation, so it stands alone.
+      "kubectl get events -A --field-selector involvedObject.uid=123e4567-e89b-12d3-a456-426614174000 -o json",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("refuses involvedObject.name with no kind — it is not one object", () => {
+    // The first version of this rule accepted the bare name, on the argument that it was "the same order
+    // as metadata.name". That was wrong: on Events those fields bound different things. `metadata.name`
+    // names ONE event; `involvedObject.name` names every event about anything called that, of any Kind,
+    // in every namespace, and Events are many-per-object. Nothing bounds the namespace count or the Kind.
+    for (const cmd of [
+      "kubectl get events -A --field-selector involvedObject.name=node-1 -o json",
+      "kubectl get events -A --field-selector involvedObject.name=web -o yaml",
+      // The kind alone bounds nothing either: every node in the cluster is a Node.
+      "kubectl get events -A --field-selector involvedObject.kind=Node -o json",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("scopes the involvedObject rule to the CORE events resource, read from the resource position", () => {
+    // Three reproductions of the first version's substring scan, which took the segment before the first
+    // dot of every non-flag token. Each one granted the exception to something that is not a query
+    // against core/v1 Event — where `involvedObject` is the only place the field exists.
+    for (const cmd of [
+      // Not events at all.
+      "kubectl get pods -A --field-selector involvedObject.name=web,involvedObject.kind=Pod -o json",
+      // Somebody's CRD that merely starts with the word.
+      "kubectl get events.example.com -A --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      // A different API group, whose corresponding field is `regarding`.
+      "kubectl get events.events.k8s.io -A --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      // `events` sitting in a flag's VALUE, not in the resource position. `--sort-by` takes a value, so
+      // a scan that skips only tokens starting with `-` reads this as the resource.
+      "kubectl get secrets -A --sort-by events --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      "kubectl get pods -A -n events --field-selector involvedObject.name=x,involvedObject.kind=Y -o json",
+      // Several resources at once: the bound would have to hold for every one of them.
+      "kubectl get events,pods -A --field-selector involvedObject.name=x,involvedObject.kind=Pod -o json",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("refuses when a subcommand flag's value lands in the resource slot", () => {
+    // `kubectlPositionals` consumes kubectl's GLOBAL value flags, not each subcommand's own, so
+    // `--label-columns events` leaves `events` sitting where the resource goes while the real resource is
+    // the CRD behind it. An unconsumed value can only ADD a positional, never remove one, which is why
+    // requiring exactly [subcommand, resource] closes the whole family instead of one flag at a time.
+    const SEL = "--field-selector involvedObject.name=x,involvedObject.kind=Y";
+    for (const cmd of [
+      `kubectl get --label-columns events widgets.example.com -A ${SEL} -o json`,
+      `kubectl get --subresource events widgets.example.com -A ${SEL} -o json`,
+      `kubectl get --filename events widgets.example.com -A ${SEL} -o json`,
+      // A trailing name is the same shape: more positionals than the rule reasons about.
+      `kubectl get events some-event -A ${SEL} -o json`,
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+  });
+
+  it("refuses a spec.nodeName selector on anything but core Pods", () => {
+    // The bound claimed is "one node's pods", which is a fact about Pods. A CRD can declare a
+    // `spec.nodeName` selectable field that carries no such bound, and this exception would then be
+    // authorising a full `-A -o json` of that CRD.
+    for (const cmd of [
+      "kubectl get widgets.example.com -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get --label-columns pods widgets.example.com -A --field-selector spec.nodeName=node-1 -o json",
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+    // The real thing still works, in every spelling kubectl takes for it.
+    for (const cmd of [
+      "kubectl get pods -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get po -A --field-selector spec.nodeName=node-1 -o json",
+      "kubectl get pods.v1. -A --field-selector spec.nodeName=node-1 -o json",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("reads the trailing dot as the core group, so events.v1 is not events.v1.", () => {
+    // kubectl spells a core resource `events`, `events.` or `events.v1.`. `events.v1` means resource
+    // `events` in an API GROUP named `v1` — a legal group name a CRD can take. Filtering empty segments
+    // away erased that distinction and let every `events.<version>` through as core.
+    const SEL = "--field-selector involvedObject.name=x,involvedObject.kind=Y";
+    for (const cmd of [
+      `kubectl get events.v1 -A ${SEL} -o json`,
+      `kubectl get events.v2 -A ${SEL} -o json`,
+      `kubectl get events.v1beta1 -A ${SEL} -o json`,
+    ]) {
+      expect(check(cmd), cmd).not.toBeNull();
+    }
+    expect(check(`kubectl get events. -A ${SEL} -o json`)).toBeNull();
+    expect(check(`kubectl get events.v1. -A ${SEL} -o json`)).toBeNull();
+  });
+
+  it("still accepts the core-group spellings kubectl actually takes", () => {
+    for (const cmd of [
+      "kubectl get events -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+      "kubectl get event -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+      "kubectl get events.v1. -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+      // A global value-flag before the verb is ordinary usage and must not displace the resource read.
+      "kubectl --context prod get events -A --field-selector involvedObject.name=n1,involvedObject.kind=Node -o json",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("reads the LAST --field-selector, because a repeat replaces rather than intersects", () => {
+    // `--field-selector` is a plain string flag, so kubectl runs only the last one — the same last-wins
+    // semantics `getOutputFormat` already models for `-o`. OR-ing every occurrence let a bounded first
+    // selector authorise an unbounded second one that is what actually ran.
+    expect(check("kubectl get pods -A --field-selector metadata.name=x --field-selector status.phase=Running -o json"))
+      .not.toBeNull();
+    // And the converse still passes: an unbounded first, a bounded last.
+    expect(check("kubectl get pods -A --field-selector status.phase=Running --field-selector metadata.name=x -o json"))
+      .toBeNull();
+  });
+
+  it("treats two terms on one field as a set, not as a pin", () => {
+    // `a=1,a=2` matches nothing at the apiserver, but it must not read here as "a is pinned twice".
+    expect(check("kubectl get pods -A --field-selector metadata.name=x,metadata.name=y -o json")).not.toBeNull();
   });
 
   it("still refuses anything that can match the whole cluster", () => {
@@ -2063,6 +2198,7 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
       "kubectl get pods -A -l app=x -o json",
       "kubectl get pods -A --field-selector spec.nodeName!=node-1 -o json",   // a negation is not a pin
       "kubectl get pods -A --field-selector spec.nodeName= -o json",          // empty value pins nothing
+      "kubectl get events -A --field-selector involvedObject.name!=node-1,involvedObject.kind=Node -o json",
     ]) {
       expect(check(cmd), cmd).not.toBeNull();
     }
@@ -2072,6 +2208,11 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
     const err = check("kubectl get pods -A -o json") ?? "";
     expect(err).toContain("spec.nodeName");
     expect(err, "and says why a label selector is not equivalent").toMatch(/label selector|phase filter/);
+    // The hint enumerates the accepted fields in prose, so a field admitted by the rule and missing
+    // here tells the agent its own working command is impossible — and the conjunction has to be stated,
+    // or the agent retries the bare name it just had refused.
+    expect(err).toContain("involvedObject.name");
+    expect(err).toContain("involvedObject.kind");
   });
 });
 

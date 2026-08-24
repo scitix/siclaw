@@ -15,15 +15,16 @@ When a pod is stuck in `ErrImagePull` or `ImagePullBackOff`, follow this flow to
 
 ## Diagnostic Flow
 
-### 1. Get pod info
+### 1. Get pod info — one call
 
-```bash
-kubectl get pod <pod> -n <ns> -o jsonpath='{.spec.nodeName}'
-kubectl get pod <pod> -n <ns> -o jsonpath='{.status.containerStatuses[*].image}'
-kubectl get pod <pod> -n <ns> -o jsonpath='{.status.containerStatuses[0].state.waiting.message}'
+```
+k8s_inspect(kind: "pod", name: "<pod>", namespace: "<ns>")
 ```
 
-Note the **node name**, **image name**, and **waiting message** (may already contain the root cause).
+All three things this step needs come back together: the **waiting reason and message** (which may
+already be the root cause), the **image** including its registry prefix, and the **node name** in the
+`node` section — which is the argument step 2 needs, and the reason this used to cost three separate
+reads before the node was even known.
 
 Also check the image registry:
 - If the image has **no registry prefix** (e.g. `nginx:latest`, `envoyproxy/gateway:v1.2.8`), it pulls from **Docker Hub** (`docker.io`).

@@ -13,25 +13,31 @@ When a pod is stuck in `CrashLoopBackOff`, `Error`, `OOMKilled`, or `RunContaine
 
 ## Diagnostic Flow
 
-### 1. Get pod status
+### 1. Read the pod and its surroundings — one call
 
-```bash
-kubectl get pod <pod> -n <ns> -o wide
+```
+k8s_inspect(kind: "pod", name: "<pod>", namespace: "<ns>")
 ```
 
-Note the **STATUS**, **RESTARTS** count, and **NODE**. A high restart count confirms the pod is crash-looping.
+This returns, in a single call, everything the first two steps of this flow used to take three or
+four: the phase, the per-container readiness and restart count, the **last termination reason and
+exit code**, the pod's recent events, the state of the **node** it runs on, and its **owner**'s
+replica counts.
 
-### 2. Describe the pod
+What to read:
+- `last: OOMKilled exit 137` → memory limit; go to §"OOMKilled" below.
+- `last: Error exit <n>` → the application exited; step 2 (previous logs) is the next move.
+- `waiting: <reason>` → it never started. `ImagePullBackOff` / `ErrImagePull` belong to the
+  `image-pull-debug` skill, `CreateContainerConfigError` to a missing ConfigMap or Secret.
+- The `node` section — a node that is `Ready=False`, cordoned, or under `MemoryPressure` explains a
+  crash that has nothing to do with the pod.
+- The final `status:` line. `partial (node: forbidden)` means that section is **missing**, not empty,
+  so do not conclude the node is healthy; an empty events section means the pod genuinely has none.
 
-```bash
-kubectl describe pod <pod> -n <ns>
-```
+Reach for `kubectl describe pod <pod> -n <ns>` only when you need something the summary does not
+carry — volume mounts, the full probe configuration, or the complete event history.
 
-Focus on:
-- **State** and **Last State** under each container — note the `reason`, `exit code`, and `signal`
-- **Events** section at the bottom — look for `BackOff`, `Failed`, `Unhealthy`, or `OOMKilling` events
-
-### 3. Get previous container logs
+### 2. Get previous container logs
 
 ```bash
 kubectl logs <pod> -n <ns> --previous --tail=200
@@ -49,9 +55,9 @@ If `--previous` fails with "previous terminated container not found", try curren
 kubectl logs <pod> -n <ns> --tail=200
 ```
 
-### 4. Match error and conclude
+### 3. Match error and conclude
 
-Match the information from steps 2-3 against the patterns below. Once a pattern matches, **report the root cause to the user and stop**.
+Match the information from steps 1-2 against the patterns below. Once a pattern matches, **report the root cause to the user and stop**.
 
 ---
 

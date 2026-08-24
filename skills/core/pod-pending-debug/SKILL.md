@@ -13,13 +13,45 @@ When a pod is stuck in `Pending` state, follow this flow to identify why the sch
 
 ## Diagnostic Flow
 
-### 1. Describe the pod
+### 1. Read the pod and its events — one call
 
-```bash
-kubectl describe pod <pod> -n <ns>
+```
+k8s_inspect(kind: "pod", name: "<pod>", namespace: "<ns>")
 ```
 
-Focus on the **Events** section. The scheduler's `FailedScheduling` event contains the reason. Note the full event message — it lists how many nodes were evaluated and why each was rejected.
+The scheduler's `FailedScheduling` event carries the reason, and this returns the pod's events
+alongside its phase and container states in a single call.
+
+Two things to read carefully:
+- The `FailedScheduling` message — it says how many nodes were evaluated and why each was rejected,
+  and that count is what separates "no capacity anywhere" from "one taint on one node". The compact
+  bundle keeps substantially more of long scheduler messages, but if a line ends in `…`, fetch that
+  event with `kubectl get events` or `kubectl describe pod` before concluding from the missing tail.
+- The final `status:` line. `partial (events: …)` means the events could not be read at all — nothing
+  below applies until that is fixed.
+
+An **empty** events section is not a conclusion. Events expire on a TTL (commonly one hour), so zero
+events means *none are retained*, which covers two opposite situations:
+
+- the scheduler never spoke — a missing scheduler, an admission webhook, or a `schedulerName` nothing
+  is servicing. Reachable, and a different problem from every pattern below.
+- the scheduler spoke long ago and the record aged out. **This is the likely one for a pod that has
+  been Pending for hours**, i.e. exactly when the events are empty.
+
+Use the pod's own `PodScheduled` condition to tell them apart — it is part of the object, so it does
+not expire. `PodScheduled=False (Unschedulable: …)` carries the scheduler's verdict and its message
+survives the event that first reported it; if the pod has no `PodScheduled` condition at all, the
+scheduler genuinely has not processed it. Read the pod's age against the cluster's event retention
+before treating an empty section as evidence of anything.
+
+If the message names a specific node, read that node the same way:
+
+```
+k8s_inspect(kind: "node", name: "<node>")
+```
+
+Reach for `kubectl describe pod <pod> -n <ns>` when you need the pod's affinity rules, tolerations or
+volume declarations verbatim.
 
 ### 2. Match scheduling failure and investigate
 
