@@ -27,10 +27,22 @@ Two things to read carefully:
   and that count is what separates "no capacity anywhere" from "one taint on one node". The compact
   bundle keeps substantially more of long scheduler messages, but if a line ends in `…`, fetch that
   event with `kubectl get events` or `kubectl describe pod` before concluding from the missing tail.
-- The final `status:` line. An **empty** events section on a Pending pod is itself the finding: the
-  scheduler never spoke, which points at a missing scheduler, a webhook, or a `schedulerName` nothing
-  is servicing — a different problem from every pattern below. `partial (events: …)` means the
-  opposite, that the events could not be read at all.
+- The final `status:` line. `partial (events: …)` means the events could not be read at all — nothing
+  below applies until that is fixed.
+
+An **empty** events section is not a conclusion. Events expire on a TTL (commonly one hour), so zero
+events means *none are retained*, which covers two opposite situations:
+
+- the scheduler never spoke — a missing scheduler, an admission webhook, or a `schedulerName` nothing
+  is servicing. Reachable, and a different problem from every pattern below.
+- the scheduler spoke long ago and the record aged out. **This is the likely one for a pod that has
+  been Pending for hours**, i.e. exactly when the events are empty.
+
+Use the pod's own `PodScheduled` condition to tell them apart — it is part of the object, so it does
+not expire. `PodScheduled=False (Unschedulable: …)` carries the scheduler's verdict and its message
+survives the event that first reported it; if the pod has no `PodScheduled` condition at all, the
+scheduler genuinely has not processed it. Read the pod's age against the cluster's event retention
+before treating an empty section as evidence of anything.
 
 If the message names a specific node, read that node the same way:
 

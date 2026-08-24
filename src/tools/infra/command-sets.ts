@@ -1541,34 +1541,94 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
  * incarnation, across namespaces. Seven separate review findings hit the node case, all of them
  * node-scoped triage that then had to fall back to custom-columns and lose the nested fields it needed.
  *
- * `involvedObject.name=<exact>` is admitted for a measured reason, not for symmetry. The kubelet does
- * not build a node's event reference from the node object: it writes
- * `ObjectReference{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}`, so every kubelet-emitted node
- * event carries the node NAME in the uid field. A uid selector therefore silently misses exactly the
- * events node triage needs — NodeNotReady, Rebooted, ImageGCFailed, FreeDiskSpaceFailed — while the
- * controller-manager's events (real uid) still match, so the result looks like a short list rather than
- * a broken query. Only the name selector matches both.
+ * `involvedObject.name=<exact>` is admitted only IN CONJUNCTION with `involvedObject.kind`, and only on
+ * the Events resource. It is needed because the kubelet does not build a node's event reference from
+ * the node object: it writes `ObjectReference{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}`, so
+ * every kubelet-emitted node event carries the node NAME in the uid field. A uid selector therefore
+ * silently misses exactly the events node triage needs — NodeNotReady, Rebooted, ImageGCFailed,
+ * FreeDiskSpaceFailed — while the controller-manager's events (real uid) still match, so the result
+ * looks like a short list rather than a broken query.
  *
- * Its bound is the same ORDER as the already-accepted `metadata.name`: a given name exists at most once
- * per namespace, so both are bounded by the namespace count and neither can match the whole cluster. A
- * name is less unique than a uid — that is the exact difference, and it is the difference already
- * accepted for `metadata.name`.
+ * Why the conjunction, and not the name alone. The first version of this rule admitted the bare name on
+ * the argument that it was "the same order as `metadata.name`", and that argument was WRONG. On Events
+ * the two fields bound completely different things: `metadata.name` names ONE event object, while
+ * `involvedObject.name` names every event about anything called that — of any Kind, in every namespace,
+ * and Events are many-per-object. So the bare name bounds neither the namespace count nor the Kind, and
+ * `-A -o json` with it is not "a single object identity" in any sense. Pinning the Kind restores the
+ * bound to the accepted shape: for a cluster-scoped Kind exactly one object, for a namespaced one at
+ * most one per namespace, which is the same structure as the already-permitted `spec.nodeName` (one
+ * node's pods across all namespaces).
+ *
+ * The unbounded case is a STRUCTURAL claim, not an observation: the cluster available for measurement
+ * held 59 events in its whole TTL window with no name spanning two namespaces, which is too idle to
+ * demonstrate the fan-out. A selector that places no bound on namespace or Kind is refused on the
+ * structure, not on a measured blast radius.
  *
  * Narrow on purpose. `status.phase=Running` across all namespaces is NOT bounded and stays refused, and
  * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
  * selector names a single node or a single object identity", nothing looser.
  */
-function hasBoundingFieldSelector(args: string[]): boolean {
-  const values: string[] = [];
+function hasBoundingFieldSelector(args: string[], subcommand: string): boolean {
+  const selector = effectiveFieldSelector(args);
+  if (selector === undefined) return false;
+  const pinned = pinnedSelectorFields(selector);
+  if (pinned.has("spec.nodeName") || pinned.has("metadata.name")) return true;
+  // `involvedObject.*` is a field of Events and describes an identity nowhere else, so the rest of this
+  // rule is scoped to that resource. An imprecise resource read is safe in this DIRECTION: a false
+  // positive only unlocks a branch that still demands the Kind, and the apiserver rejects
+  // `involvedObject.*` outright on any other resource, so nothing is served that would not have been.
+  if (!argsNameEvents(args, subcommand)) return false;
+  // A uid is globally unique to one object incarnation, so it needs no companion.
+  if (pinned.has("involvedObject.uid")) return true;
+  return pinned.has("involvedObject.name") && pinned.has("involvedObject.kind");
+}
+
+/**
+ * The selector that will actually RUN. `--field-selector` is a plain string flag, so a repeat REPLACES
+ * rather than intersects — exactly the last-wins semantics `getOutputFormat` already had to model for
+ * `-o`. An earlier version OR-ed every occurrence, which made
+ * `--field-selector metadata.name=x --field-selector status.phase=Running` pass the check while kubectl
+ * ran the unbounded second one.
+ */
+function effectiveFieldSelector(args: string[]): string | undefined {
+  let last: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--field-selector" && args[i + 1]) values.push(args[i + 1]);
-    else if (a.startsWith("--field-selector=")) values.push(a.slice("--field-selector=".length));
+    if (a === "--field-selector" && args[i + 1] !== undefined) last = args[i + 1];
+    else if (a.startsWith("--field-selector=")) last = a.slice("--field-selector=".length);
   }
-  for (const raw of values) {
-    for (const term of raw.split(",")) {
-      const m = /^\s*(spec\.nodeName|metadata\.name|involvedObject\.uid|involvedObject\.name)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
-      if (m && m[2].trim().length > 0) return true;
+  return last;
+}
+
+/**
+ * Fields pinned to ONE exact value. A negation pins nothing, an empty value pins nothing, and two terms
+ * naming the same field are a SET rather than a pin — `a=1,a=2` matches nothing at the apiserver but
+ * must not read here as "a is pinned twice".
+ */
+function pinnedSelectorFields(selector: string): Map<string, string> {
+  const pinned = new Map<string, string>();
+  const seen = new Set<string>();
+  for (const term of selector.split(",")) {
+    const m = /^\s*([A-Za-z][\w.]*)\s*(!=|==|=)\s*([^,!=]*?)\s*$/.exec(term);
+    if (!m) continue;
+    const [, field, op, value] = m;
+    if (seen.has(field)) { pinned.delete(field); continue; }
+    seen.add(field);
+    if (op === "!=" || value.length === 0) continue;
+    pinned.set(field, value);
+  }
+  return pinned;
+}
+
+const EVENT_RESOURCE_TOKENS = new Set(["event", "events", "ev"]);
+
+/** Does the command name the Events resource? Same token walk `argsNameSecrets` uses. */
+function argsNameEvents(args: string[], subcommand: string): boolean {
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("-") || a === subcommand) continue;
+    for (const part of a.split(",")) {
+      if (EVENT_RESOURCE_TOKENS.has(normalizeResourceToken(part))) return true;
     }
   }
   return false;
@@ -1606,7 +1666,7 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
     if (format === "yaml" || format === "json") {
       // An exact server-side node or name selector bounds the response, which is the concern this rule
       // exists for — so the rule is satisfied rather than waived.
-      if (hasBoundingFieldSelector(args)) return null;
+      if (hasBoundingFieldSelector(args, subcommand)) return null;
       // A refusal that names no runnable alternative gets retried in another shape and refused again.
       // The resource is echoed back so the suggestion is copy-pasteable rather than a template.
       const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";
@@ -1620,10 +1680,11 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
         + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
-        + `server-side --field-selector that pins spec.nodeName, metadata.name, involvedObject.uid or `
-        + `involvedObject.name to ONE exact value IS `
-        + `accepted, because it bounds what the apiserver serializes. A label selector or a phase filter `
-        + `is not — those can still match the whole cluster. Instead:\n`
+        + `server-side --field-selector that pins spec.nodeName or metadata.name to ONE exact value IS `
+        + `accepted, because it bounds what the apiserver serializes. On events, involvedObject.uid `
+        + `alone is accepted, and involvedObject.name only TOGETHER with involvedObject.kind — a name `
+        + `with no kind matches events for any Kind in every namespace. A label selector or a phase `
+        + `filter is not accepted — those can still match the whole cluster. Instead:\n`
         + `  kubectl get ${resource} -A --field-selector spec.nodeName=<node> -o json   (accepted)\n`
         + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`
         + `   (add the fields you need — these two exist on every resource)\n`

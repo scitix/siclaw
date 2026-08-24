@@ -82,6 +82,19 @@ export function all(obj: unknown, path: string): unknown[] {
 export interface NamedNeighbourTarget {
   name: string;
   kind: string;
+  /**
+   * The referenced object's uid, when the reference carries one. A name is NOT an identity: delete a
+   * ReplicaSet and let a rolled-back Deployment recreate one with the same name and template hash, and
+   * a name-only fetch returns a real object that is not the one this pod references — reported as its
+   * owner, with `status: ok`. The uid is what turns that into a finding.
+   */
+  uid?: string;
+  /**
+   * `apps/v1`, or `v1` for the core group. Two Kinds can share a name across API groups (a CRD `Job`
+   * beside `batch/v1` Job), and a bare `kubectl get job <name>` resolves to whichever the discovery
+   * client prefers — silently the wrong object.
+   */
+  apiVersion?: string;
 }
 
 /**
@@ -400,7 +413,16 @@ export function resolveControllerOwner(obj: unknown): NamedNeighbourTarget | und
     return name && kind ? [{ ref, name, kind }] : [];
   });
   const selected = complete.find(({ ref }) => one(ref, ".controller") === true) ?? complete[0];
-  return selected ? { name: selected.name, kind: selected.kind } : undefined;
+  if (!selected) return undefined;
+  // uid and apiVersion are both REQUIRED fields on an ownerReference, but they are read as optional
+  // here: this runs on whatever the apiserver returned, and a summary that throws away the identity
+  // check because one field was missing is worse than one that checks when it can.
+  return {
+    name: selected.name,
+    kind: selected.kind,
+    uid: str(selected.ref, ".uid"),
+    apiVersion: str(selected.ref, ".apiVersion"),
+  };
 }
 
 // ── The table ───────────────────────────────────────────────────────

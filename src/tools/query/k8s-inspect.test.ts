@@ -402,6 +402,84 @@ describe("collectObject — neighbours", () => {
     expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (pods: not_found)");
   });
 
+  it("reports a reused owner name as a finding instead of a stranger's replica counts", async () => {
+    // A name is not an identity. Delete a ReplicaSet and let a rolled-back Deployment recreate one with
+    // the same name and template hash, and a name-only fetch returns a real object that is NOT the one
+    // this pod references — previously rendered as its owner, with `status: ok`.
+    const owned = JSON.stringify({
+      ...POD,
+      metadata: {
+        ...POD.metadata,
+        ownerReferences: [{ kind: "ReplicaSet", name: "web-7d9f", uid: "rs-uid-OLD", apiVersion: "apps/v1", controller: true }],
+      },
+    });
+    const d = deps({
+      "get pod web": owned,
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify({ ...RS, metadata: { uid: "rs-uid-NEW" } }),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("--- owner (web-7d9f) ---");
+    expect(text).toContain("name reused");
+    // The stranger's counts must NOT be attributed to this pod.
+    expect(text).not.toContain("desired 3");
+  });
+
+  it("renders the owner normally when the uid matches", async () => {
+    const owned = JSON.stringify({
+      ...POD,
+      metadata: {
+        ...POD.metadata,
+        ownerReferences: [{ kind: "ReplicaSet", name: "web-7d9f", uid: "rs-uid-1", apiVersion: "apps/v1", controller: true }],
+      },
+    });
+    const d = deps({
+      "get pod web": owned,
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify({ ...RS, metadata: { uid: "rs-uid-1" } }),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("desired 3");
+    expect(text).not.toContain("name reused");
+  });
+
+  it("keeps the owner summary when the reference carries no uid to check against", async () => {
+    // The POD fixture's ownerReference has no uid. Dropping the summary because one field is missing
+    // would be worse than checking when we can — and `.spec.nodeName` can never carry a uid at all.
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify({ ...RS, metadata: { uid: "whatever" } }),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).toContain("desired 3");
+    expect(text).not.toContain("name reused");
+  });
+
+  it("qualifies an owner fetch with its API group, so a same-named CRD cannot answer for it", async () => {
+    // A bare `kubectl get job <name>` resolves via the discovery client's preferred version, so a CRD
+    // Kind sharing a built-in's name silently answers instead.
+    const owned = JSON.stringify({
+      ...POD,
+      metadata: {
+        ...POD.metadata,
+        ownerReferences: [{ kind: "Job", name: "batch-1", uid: "job-uid", apiVersion: "batch/v1", controller: true }],
+      },
+    });
+    const d = deps({
+      "get pod web": owned,
+      "get node node-42": JSON.stringify(NODE),
+      "get job.batch batch-1": JSON.stringify({ kind: "Job", metadata: { uid: "job-uid" }, spec: { parallelism: 2 }, status: {} }),
+      "get events": NO_EVENTS,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(d.seen.some((c) => c.includes("get job.batch batch-1"))).toBe(true);
+    expect(text).toContain("desired 2");
+  });
+
   it("runs the neighbour reads concurrently, not one after another", async () => {
     // The whole point is one wait instead of one per edge. A serial implementation passes every other
     // test in this file.
@@ -427,16 +505,21 @@ describe("the three deadlines", () => {
   // total, whose abort carries boundedExec's reap. The three numbers come from three places —
   // SANDBOX_KILL_GRACE_S from infra, the per-probe cap from this file, the total derived from it — so
   // shrinking the infra constant silently inverts the prod ordering with no other test noticing.
-  it("orders inner kill before the total, and the total before the padded prod backstop", () => {
-    expect(DEADLINES.PROBE_TIMEOUT_MS).toBeLessThan(DEADLINES.TOTAL_TIMEOUT_MS);
-    expect(DEADLINES.TOTAL_TIMEOUT_MS).toBeLessThan(DEADLINES.outerTimeoutMs(true));
+  it("lets the only killing timer fire before the one that can merely abandon", () => {
+    // `timeout -k <grace> <n>` sends TERM at n and KILL at n+grace, so a command ignoring TERM lives
+    // until the KILL. That KILL must land before the outer timer gives up, or the outer abandons a call
+    // whose process is still running as `sandbox`.
+    expect(DEADLINES.PROBE_WORST_CASE_MS).toBeGreaterThan(DEADLINES.PROBE_TIMEOUT_MS);
+    expect(DEADLINES.PROBE_WORST_CASE_MS).toBeLessThan(DEADLINES.outerTimeoutMs(true));
   });
 
-  it("leaves room for both sequential legs, so a slow subject cannot fake a neighbour timeout", () => {
-    // A call is two SEQUENTIAL legs: the subject, then events and neighbours concurrently. A total under
-    // 2 × the per-probe cap lets the subject eat the second leg's budget and report every neighbour as a
-    // timeout it never reached — a fabricated diagnosis, not a slow one.
-    expect(DEADLINES.TOTAL_TIMEOUT_MS).toBeGreaterThan(2 * DEADLINES.PROBE_TIMEOUT_MS);
+  it("covers both sequential legs at their WORST case, not at their timeout", () => {
+    // A call is two SEQUENTIAL legs: the subject, then events and neighbours concurrently. The budget has
+    // to cover 2 × what a probe can actually take, which is the KILL point and not the TERM point —
+    // deriving it from the 8s cap left a 13s first leg with 7s for the second, and every neighbour was
+    // then reported as a timeout it never reached. That is a fabricated diagnosis, not a slow one, and it
+    // is the exact failure this derivation exists to rule out.
+    expect(DEADLINES.TOTAL_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * DEADLINES.PROBE_WORST_CASE_MS);
   });
 
   it("uses the unpadded probe cap off the sandbox path, where it is the only deadline", () => {
@@ -608,11 +691,15 @@ describe("collectObject — the size budget", () => {
     expect(text).toContain("TAIL");
   });
 
-  it("states an empty events list rather than omitting the section", async () => {
-    // For a Pending pod, no events means the scheduler never spoke — that is the finding.
+  it("states an empty events list, and says retention could explain it", async () => {
+    // An omitted section reads as "not looked at", so the zero is stated. But zero events does NOT mean
+    // none were emitted — Events expire on a TTL, and a pod Pending for longer than the retention
+    // window has none precisely BECAUSE its diagnosis is old. Naming only the first reading is what led
+    // the pod-pending skill to conclude "the scheduler never spoke" from the opposite evidence.
     const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get replicaset": JSON.stringify(RS), "get events": NO_EVENTS });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
-    expect(text).toContain("--- events (0) ---");
+    expect(text).toContain("--- events (0");
+    expect(text).toMatch(/events \(0[^)]*(retained|TTL|expire)/);
   });
 
   it("does not turn an unparseable event response into a genuine empty list", async () => {

@@ -43,7 +43,10 @@ import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import { loadConfig } from "../../core/config.js";
-import { all, KNOWN_KINDS, resolveKind, safeText, str, type KindSpec, type Relation } from "./k8s-relations.js";
+import {
+  all, KNOWN_KINDS, resolveKind, safeText, str,
+  type KindSpec, type NamedNeighbourTarget, type Relation,
+} from "./k8s-relations.js";
 
 /**
  * Budgets. The per-probe cap bounds one hung API call; the total bounds the tool. Both are well under
@@ -57,26 +60,34 @@ import { all, KNOWN_KINDS, resolveKind, safeText, str, type KindSpec, type Relat
  * can actually kill anything. So the outer one is padded by the same margin restricted_bash uses,
  * and only in production, where the wrapper exists at all.
  *
- * What that padding actually buys, stated because the arithmetic is not obvious and was previously
- * described as something it is not. In production the ordering comes out as
+ * In production the ordering comes out as
  *
- *   inner `timeout -k 5 8` (8s, as `sandbox` — the only timer that can KILL)
- *     < total (20s, abandons the tool; its abort is what carries boundedExec's reap)
- *       < outer per-probe (23s, padded past the inner one)
+ *   inner TERM at 8s, inner KILL at 13s  (as `sandbox` — the only timer that can KILL)
+ *     < outer per-probe (23s, padded past the inner KILL; abandons the CALL only)
+ *       < total (30s, the overall backstop; its abort carries boundedExec's reap)
  *
- * so the outer per-probe timer never fires in production and the TOTAL is the effective backstop. That
- * is fine — the total aborts with a reap — and the padding is not therefore pointless: the path where it
- * does the work is the non-production one, which has no sandbox wrapper and hence no inner timeout at
- * all, leaving the unpadded 8s outer timer as the ONLY deadline on a probe.
+ * The outer timer firing before the total is harmless because the inner KILL has already ended the
+ * process by 13s; what matters is that the only timer able to kill fires FIRST. The padding earns its
+ * keep on the non-production path, which has no sandbox wrapper and hence no inner timeout at all,
+ * leaving the unpadded 8s outer timer as the ONLY deadline on a probe.
  */
 const PROBE_TIMEOUT_MS = 8_000;
 
 /**
- * Derived, not picked. A call is two SEQUENTIAL legs — the subject, then events and neighbours
- * concurrently — so a total below 2 × the per-probe cap lets a slow subject eat the second leg's budget
- * and report every neighbour as a timeout it never actually reached. Plus a margin for process spawn.
+ * A probe's WORST case, which is not its timeout. `timeout -k <grace> <n>` sends TERM at n and KILL at
+ * n + grace, so a command that ignores TERM runs for the full 13s. Deriving the total from the 8s cap
+ * instead of this was the same mistake twice over: the budget then under-covered the very failure its
+ * own comment says it exists to prevent.
  */
-const TOTAL_TIMEOUT_MS = PROBE_TIMEOUT_MS * 2 + 4_000;
+const PROBE_WORST_CASE_MS = PROBE_TIMEOUT_MS + SANDBOX_KILL_GRACE_S * 1000;
+
+/**
+ * Derived, not picked. A call is two SEQUENTIAL legs — the subject, then events and neighbours
+ * concurrently — so a total below 2 × a probe's WORST case lets a slow subject eat the second leg's
+ * budget and report every neighbour as a timeout it never actually reached: a fabricated diagnosis, and
+ * the one this derivation exists to rule out. Plus a margin for process spawn.
+ */
+const TOTAL_TIMEOUT_MS = PROBE_WORST_CASE_MS * 2 + 4_000;
 
 function outerTimeoutMs(isProd: boolean): number {
   return isProd
@@ -149,7 +160,7 @@ export const BUDGET = {
  * deadlines come from three places — `SANDBOX_KILL_GRACE_S` from `infra`, the per-probe cap from here,
  * the total derived from it — so the ordering is not guaranteed by any one of them.
  */
-export const DEADLINES = { PROBE_TIMEOUT_MS, TOTAL_TIMEOUT_MS, outerTimeoutMs };
+export const DEADLINES = { PROBE_TIMEOUT_MS, PROBE_WORST_CASE_MS, TOTAL_TIMEOUT_MS, outerTimeoutMs };
 
 /** How a probe ended. `not_found` is an ANSWER about existence, not a failure — see classifyExit. */
 type ProbeFailure = "not_found" | "forbidden" | "timeout" | "refused" | "unreachable" | "error";
@@ -264,6 +275,19 @@ const NAME_RE = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/i;
 
 function badName(value: string): boolean {
   return value.length === 0 || value.length > 253 || !NAME_RE.test(value);
+}
+
+/**
+ * `ReplicaSet` + `apps/v1` → `replicaset.apps`, kubectl's own group-qualified spelling. A bare
+ * `kubectl get job <name>` is resolved by the discovery client's preferred version, so a CRD Kind
+ * sharing a built-in's name silently answers for it. Falls back to the bare Kind when the reference
+ * carries no group — the core group has none, and a reference missing `apiVersion` gives us nothing
+ * better to say than the Kind.
+ */
+function groupQualifiedResource(kind: string, apiVersion: string | undefined): string {
+  const group = apiVersion && apiVersion.includes("/") ? apiVersion.split("/")[0] : undefined;
+  const qualified = group ? `${kind.toLowerCase()}.${group}` : kind.toLowerCase();
+  return badName(qualified) ? kind.toLowerCase() : qualified;
 }
 
 function nsFlag(namespace: string | undefined, scope: "cluster" | "namespace" | "all-namespaces"): string {
@@ -468,7 +492,10 @@ export async function collectObject(
       const cmd = `kubectl get ${n.kind} -A --field-selector ${n.selector(params.name)} -o json`;
       return { rel, result: await runProbe(cmd, deps) };
     }
-    const target = n.resolve
+    // A path-based reference carries no uid or apiVersion, and cannot: `.spec.nodeName` is a bare
+    // string. So the identity check below is available exactly where the reference is a real
+    // ownerReference, which is where a name can be reused by a different object.
+    const target: NamedNeighbourTarget | undefined = n.resolve
       ? n.resolve(parsed)
       : (() => {
           const name = str(parsed, n.nameAt);
@@ -476,16 +503,18 @@ export async function collectObject(
           return name && kind ? { name, kind } : undefined;
         })();
     if (!target || badName(target.name) || badName(target.kind)) return { rel, result: undefined };
+    const resource = groupQualifiedResource(target.kind, target.apiVersion);
     return {
       rel,
       target: target.name,
-      result: await runProbe(getJsonCommand(target.kind.toLowerCase(), target.name, ns, n.scope), deps),
+      expectedUid: target.uid,
+      result: await runProbe(getJsonCommand(resource, target.name, ns, n.scope), deps),
     };
   });
 
   const [events, neighbours] = await Promise.all([eventsPromise, Promise.all(neighbourPromises)]);
 
-  for (const { rel, result, target } of neighbours) {
+  for (const { rel, result, target, expectedUid } of neighbours) {
     // `undefined` means the subject does not name this neighbour — a bare pod has no owner. Absent by
     // nature is not a miss, and reporting it as one would make every static pod look degraded.
     if (result === undefined) continue;
@@ -517,6 +546,22 @@ export async function collectObject(
       misses.push(`${rel.label}: unparseable`);
       continue;
     }
+    // A name is not an identity. When the reference carried a uid, the object that answered to the name
+    // has to BE that object — otherwise the name was reused (a deleted ReplicaSet recreated by a
+    // rolled-back Deployment keeps its template hash) and rendering its replica counts would attribute a
+    // stranger's state to this pod. The mismatch is the FINDING: the referenced owner is gone, which is
+    // why the name was free to take. Checked only when both uids are known, so a reference or an object
+    // that omits one keeps the summary it had before.
+    const actualUid = str(obj, ".metadata.uid");
+    if (expectedUid && actualUid && expectedUid !== actualUid) {
+      sections.push({
+        label: rel.label,
+        ...(target ? { target } : {}),
+        text: "name reused: a different object answers to this name now, so the one the subject "
+          + "references is gone (uid mismatch)",
+      });
+      continue;
+    }
     sections.push({ label: rel.label, ...(target ? { target } : {}), text: clip(rel.render(obj), MAX_NEIGHBOUR_CHARS) });
   }
 
@@ -530,8 +575,13 @@ export async function collectObject(
     if (rendered === undefined) {
       misses.push("events: unparseable");
     } else {
-      // No events is an answer worth stating: for a Pending pod it means the scheduler never spoke.
-      parts.push(rendered || "--- events (0) ---");
+      // An empty list is stated rather than omitted — an absent section reads as "not looked at". But it
+      // is TWO states and the API cannot tell them apart: nothing was ever emitted, or
+      // everything was and the TTL expired it. Saying only `(0)` invited the first reading, and the
+      // pod-pending skill was written on it — but a pod pending longer than the retention window has no
+      // events precisely BECAUSE the diagnosis is old, so "the scheduler never spoke" is exactly
+      // backwards there. The condition outlives the event, which is where to look instead.
+      parts.push(rendered || "--- events (0 — none retained; a TTL window can expire them) ---");
     }
   } else {
     misses.push(`events: ${events.reason}`);
