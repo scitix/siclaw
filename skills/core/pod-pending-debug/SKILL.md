@@ -13,13 +13,31 @@ When a pod is stuck in `Pending` state, follow this flow to identify why the sch
 
 ## Diagnostic Flow
 
-### 1. Describe the pod
+### 1. Read the pod and its events — one call
 
-```bash
-kubectl describe pod <pod> -n <ns>
+```
+k8s_inspect(kind: "pod", name: "<pod>", namespace: "<ns>")
 ```
 
-Focus on the **Events** section. The scheduler's `FailedScheduling` event contains the reason. Note the full event message — it lists how many nodes were evaluated and why each was rejected.
+The scheduler's `FailedScheduling` event carries the reason, and this returns the pod's events
+alongside its phase and container states in a single call.
+
+Two things to read carefully:
+- The **full** `FailedScheduling` message — it says how many nodes were evaluated and why each was
+  rejected, and that count is what separates "no capacity anywhere" from "one taint on one node".
+- The final `status:` line. An **empty** events section on a Pending pod is itself the finding: the
+  scheduler never spoke, which points at a missing scheduler, a webhook, or a `schedulerName` nothing
+  is servicing — a different problem from every pattern below. `partial (events: …)` means the
+  opposite, that the events could not be read at all.
+
+If the message names a specific node, read that node the same way:
+
+```
+k8s_inspect(kind: "node", name: "<node>")
+```
+
+Reach for `kubectl describe pod <pod> -n <ns>` when you need the pod's affinity rules, tolerations or
+volume declarations verbatim.
 
 ### 2. Match scheduling failure and investigate
 

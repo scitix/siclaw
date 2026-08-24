@@ -23,13 +23,23 @@ Note the **STATUS** of each node. Healthy nodes show `Ready`. Look for `NotReady
 
 ### 2. Inspect specific node conditions
 
-For any node showing issues:
+For any node showing issues — one call per node:
 
-```bash
-kubectl describe node <node>
+```
+k8s_inspect(kind: "node", name: "<node>")
 ```
 
-Focus on the **Conditions** section. Key conditions:
+This returns the node's conditions, taints, cordon state and allocatable capacity together with its
+recent events **and** the phase distribution of the pods scheduled on it — the last of which would
+otherwise be a separate `kubectl get pods --field-selector spec.nodeName=…` call.
+
+Read the final `status:` line: `partial (pods: …)` means the distribution is **missing**, so an
+absent pod count is not evidence that the node is empty.
+
+Reach for `kubectl describe node <node>` when you need the **Allocated resources** table (what the
+scheduled pods have requested, as opposed to what the node offers) or the node's labels verbatim.
+
+Key conditions:
 
 | Condition | Healthy Value | Problem Value | Meaning |
 |-----------|--------------|---------------|---------|

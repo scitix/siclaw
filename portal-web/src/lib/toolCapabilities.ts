@@ -21,7 +21,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "read_files", name: "Read files", description: "Read & search files and knowledge pages", tools: ["read", "grep", "find", "ls", "knowledge_cite"] },
   { key: "write_sandbox", name: "Write & author skills", description: "Write/edit scratch files and author skills (sandboxed to user-data)", tools: ["write", "edit", "skill_preview"] },
   { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only discovery of bound clusters and hosts", tools: ["cluster_list", "host_list"] },
-  { key: "run_commands", name: "Run commands", description: "Execute whitelisted shell commands (kubectl read-only)", tools: ["bash", "node_exec", "pod_exec", "host_exec"] },
+  { key: "run_commands", name: "Run commands", description: "Execute whitelisted shell commands (kubectl read-only)", tools: ["bash", "node_exec", "pod_exec", "host_exec", "k8s_inspect"] },
   { key: "run_scripts", name: "Run scripts", description: "Execute scripts on node / pod / host", tools: ["node_script", "pod_script", "local_script", "host_script"] },
   { key: "search_memory", name: "Search memory", description: "Semantic search over long-term memory", tools: ["memory_search", "memory_get"] },
   { key: "plan_tasks", name: "Plan tasks", description: "Create and track a task ledger", tools: ["task_create", "task_update", "task_list", "task_get"] },
