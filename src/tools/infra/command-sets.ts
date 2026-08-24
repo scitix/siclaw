@@ -1541,9 +1541,22 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
  * incarnation, across namespaces. Seven separate review findings hit the node case, all of them
  * node-scoped triage that then had to fall back to custom-columns and lose the nested fields it needed.
  *
+ * `involvedObject.name=<exact>` is admitted for a measured reason, not for symmetry. The kubelet does
+ * not build a node's event reference from the node object: it writes
+ * `ObjectReference{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}`, so every kubelet-emitted node
+ * event carries the node NAME in the uid field. A uid selector therefore silently misses exactly the
+ * events node triage needs — NodeNotReady, Rebooted, ImageGCFailed, FreeDiskSpaceFailed — while the
+ * controller-manager's events (real uid) still match, so the result looks like a short list rather than
+ * a broken query. Only the name selector matches both.
+ *
+ * Its bound is the same ORDER as the already-accepted `metadata.name`: a given name exists at most once
+ * per namespace, so both are bounded by the namespace count and neither can match the whole cluster. A
+ * name is less unique than a uid — that is the exact difference, and it is the difference already
+ * accepted for `metadata.name`.
+ *
  * Narrow on purpose. `status.phase=Running` across all namespaces is NOT bounded and stays refused, and
  * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
- * selector names a single node or a single object", nothing looser.
+ * selector names a single node or a single object identity", nothing looser.
  */
 function hasBoundingFieldSelector(args: string[]): boolean {
   const values: string[] = [];
@@ -1554,7 +1567,7 @@ function hasBoundingFieldSelector(args: string[]): boolean {
   }
   for (const raw of values) {
     for (const term of raw.split(",")) {
-      const m = /^\s*(spec\.nodeName|metadata\.name|involvedObject\.uid)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
+      const m = /^\s*(spec\.nodeName|metadata\.name|involvedObject\.uid|involvedObject\.name)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
       if (m && m[2].trim().length > 0) return true;
     }
   }
@@ -1607,7 +1620,8 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
         + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
-        + `server-side --field-selector that pins spec.nodeName, metadata.name or involvedObject.uid to ONE exact value IS `
+        + `server-side --field-selector that pins spec.nodeName, metadata.name, involvedObject.uid or `
+        + `involvedObject.name to ONE exact value IS `
         + `accepted, because it bounds what the apiserver serializes. A label selector or a phase filter `
         + `is not — those can still match the whole cluster. Instead:\n`
         + `  kubectl get ${resource} -A --field-selector spec.nodeName=<node> -o json   (accepted)\n`

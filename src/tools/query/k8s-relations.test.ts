@@ -204,6 +204,117 @@ describe("renderPod", () => {
     expect(out).not.toContain("whatever");
   });
 
+  it("omits the healthy True conditions every running pod carries", () => {
+    // A pod's non-Ready conditions are READINESS assertions, the inverse of a node's: `Initialized=True`
+    // is the normal state, and a node-shaped rule prints all four with their transition times. Measured
+    // on a live healthy pod: ~200 of the 700-char subject budget spent saying nothing.
+    const out = renderPod({
+      status: {
+        phase: "Running",
+        conditions: [
+          { type: "Initialized", status: "True", lastTransitionTime: "2026-08-24T09:00:00Z" },
+          { type: "Ready", status: "True", lastTransitionTime: "2026-08-24T09:01:00Z" },
+          { type: "ContainersReady", status: "True", lastTransitionTime: "2026-08-24T09:01:00Z" },
+          { type: "PodScheduled", status: "True", lastTransitionTime: "2026-08-24T08:59:00Z" },
+        ],
+      },
+    });
+    expect(out).toContain("Ready=True");
+    expect(out).not.toContain("Initialized");
+    expect(out).not.toContain("ContainersReady");
+    expect(out).not.toContain("PodScheduled");
+    expect(out).not.toContain("2026-08-24");
+  });
+
+  it("prints a Pending pod's PodScheduled=False with the scheduler's own breakdown", () => {
+    // The sharp half of the same fix: under the node rule this line was DROPPED, and its message
+    // outlives the FailedScheduling event — past the event TTL it is the only copy of the answer left in
+    // the cluster. The message is what carries it; the reason alone says only "Unschedulable".
+    const out = renderPod({
+      status: {
+        phase: "Pending",
+        conditions: [{
+          type: "PodScheduled", status: "False", reason: "Unschedulable",
+          message: "0/115 nodes are available: 3 Insufficient cpu, 112 node(s) didn't match node affinity",
+          lastTransitionTime: "2026-08-24T09:55:00Z",
+        }],
+      },
+    });
+    expect(out).toContain("PodScheduled=False");
+    expect(out).toContain("Unschedulable");
+    expect(out).toContain("3 Insufficient cpu");
+    expect(out).toContain("since 2026-08-24T09:55:00Z");
+  });
+
+  it("treats a pod's Unknown condition as an answer, not as healthy", () => {
+    // `notTrue` covers Unknown deliberately: a kubelet that stopped reporting leaves conditions Unknown,
+    // and for a readiness assertion that is as much of an answer as False. A policy flag named for a
+    // boolean would have hidden this third value.
+    const out = renderPod({
+      status: {
+        phase: "Running",
+        conditions: [{ type: "ContainersReady", status: "Unknown", reason: "NodeLost" }],
+      },
+    });
+    expect(out).toContain("ContainersReady=Unknown");
+    expect(out).toContain("NodeLost");
+  });
+
+  it("folds two conditions reporting the identical explanation onto one line", () => {
+    // Measured on a live ImagePullBackOff pod: `Ready` and `ContainersReady` agreed on status, reason,
+    // message and transition time, and printing both spent ~110 of the 700-char subject budget restating
+    // one fact. This is the ordinary shape of a pod that is not ready.
+    const why = "ContainersNotReady";
+    const message = "containers with unready status: [gateway]";
+    const at = "2026-07-27T10:50:36Z";
+    const out = renderPod({
+      status: {
+        phase: "Pending",
+        conditions: [
+          { type: "Ready", status: "False", reason: why, message, lastTransitionTime: at },
+          { type: "ContainersReady", status: "False", reason: why, message, lastTransitionTime: at },
+        ],
+      },
+    });
+    expect(out).toContain(`Ready/ContainersReady=False (${why}: ${message}) since ${at}`);
+    expect(out.split(why)).toHaveLength(2);
+  });
+
+  it("keeps conditions whose explanations differ apart", () => {
+    const out = renderPod({
+      status: {
+        phase: "Pending",
+        conditions: [
+          { type: "Ready", status: "False", reason: "ContainersNotReady" },
+          { type: "PodScheduled", status: "False", reason: "Unschedulable" },
+        ],
+      },
+    });
+    expect(out).toContain("Ready=False (ContainersNotReady)");
+    expect(out).toContain("PodScheduled=False (Unschedulable)");
+  });
+
+  it("reports DisruptionTarget=True, which breaks the pod's own polarity", () => {
+    // Pod conditions are MIXED, so this is not "invert the node rule": `DisruptionTarget=True` means the
+    // pod is being evicted, while its absence or False is the ordinary state.
+    const evicting = renderPod({
+      status: {
+        phase: "Running",
+        conditions: [
+          { type: "Ready", status: "True" },
+          { type: "DisruptionTarget", status: "True", reason: "EvictionByEvictionAPI" },
+        ],
+      },
+    });
+    expect(evicting).toContain("DisruptionTarget=True");
+    expect(evicting).toContain("EvictionByEvictionAPI");
+
+    const ordinary = renderPod({
+      status: { phase: "Running", conditions: [{ type: "DisruptionTarget", status: "False" }] },
+    });
+    expect(ordinary).not.toContain("DisruptionTarget");
+  });
+
   it("says phase unknown rather than inventing one", () => {
     const out = renderPod({});
     expect(out).toContain("unknown");
@@ -287,6 +398,43 @@ describe("renderNode", () => {
     });
     expect(out).toContain("Ready=False (KubeletNotReady) since 2026-08-24T09:55:00Z");
     expect(out).toContain("DiskPressure=True (KubeletHasDiskPressure) since 2026-08-24T09:50:00Z");
+  });
+
+  it("does not fold a healthy Ready together with an asserting pressure condition", () => {
+    // Both carry no explanation, so a fold keyed on the rendered tail alone would produce
+    // `Ready/DiskPressure=True` — one line claiming a shared cause for two OPPOSITE findings, since the
+    // two sit on different sides of the kind's polarity rule.
+    const out = renderNode({
+      status: { conditions: [{ type: "Ready", status: "True" }, { type: "DiskPressure", status: "True" }] },
+    });
+    expect(out).toContain("Ready=True");
+    expect(out).toContain("DiskPressure=True");
+    expect(out).not.toContain("Ready/DiskPressure");
+  });
+
+  it("prints the reason AND the message, not the reason alone", () => {
+    // Deliberate reversal. Reason-only holds for `KubeletHasDiskPressure`/"kubelet has disk pressure",
+    // where the message restates the reason — and fails for every condition whose detail lives only in
+    // the message. Cheap where it is redundant, load-bearing where it is not.
+    const out = renderNode({
+      status: { conditions: [{
+        type: "Ready", status: "False", reason: "KubeletNotReady",
+        message: "container runtime network not ready: cni config uninitialized",
+      }] },
+    });
+    expect(out).toContain("KubeletNotReady");
+    expect(out).toContain("cni config uninitialized");
+  });
+
+  it("clips a long condition message, which shares its budget with the fields after it", () => {
+    // Conditions are not the last thing in the section — taints and allocatable capacity follow, and an
+    // unclipped message is what would eat them.
+    const out = renderNode({
+      status: { conditions: [{ type: "Ready", status: "False", reason: "R", message: "x".repeat(500) }] },
+      spec: { taints: [{ key: "gpu", effect: "NoSchedule" }] },
+    });
+    expect(out).not.toContain("x".repeat(200));
+    expect(out).toContain("gpu:NoSchedule");
   });
 
   it("falls back to the condition message when there is no reason", () => {
@@ -380,6 +528,36 @@ describe("the table", () => {
   it("returns undefined for a kind it does not cover, so the caller can say so", () => {
     expect(resolveKind("deployment")).toBeUndefined();
     expect(resolveKind("")).toBeUndefined();
+  });
+
+  it("resolves every kind's own exact spelling, including one that ends in s", () => {
+    // Table-driven because the risk is a FUTURE row: chopping a trailing `s` before trying the literal
+    // spelling turns `endpoints` into `endpoint`, `ingress` into `ingres`, and the kind resolves to
+    // nothing the day it is added. No spelling in the table ends in `s` today, so a hand-written case
+    // would not guard the row that breaks.
+    for (const name of KNOWN_KINDS) {
+      expect(resolveKind(name), name).toBe(KINDS[name]);
+    }
+  });
+
+  it("does not answer a kind lookup out of Object.prototype", () => {
+    // `kind` is a model-supplied string and `KINDS` is an object literal, so a bare index lookup returns
+    // a truthy Function for these. The caller's `if (!spec)` then passes and the first `spec.relations`
+    // throws. Same bug class as the denial-reason Map lookup in the Feishu path.
+    for (const hostile of ["constructor", "toString", "valueOf", "__proto__", "hasOwnProperty"]) {
+      expect(resolveKind(hostile), hostile).toBeUndefined();
+    }
+  });
+
+  it("chooses each kind's event selector from the table, and a node's cannot be uid", () => {
+    // The kubelet builds a node event's reference as `{Kind:"Node", Name:n, UID:types.UID(n)}` — the uid
+    // field holds the NAME — so a uid selector misses every kubelet-emitted node event. Which selector
+    // works is a fact about who writes the events, i.e. per kind, which is why it is a table column.
+    expect(KINDS.pod.eventsBy).toBe("uid");
+    expect(KINDS.node.eventsBy).toBe("name");
+    for (const [name, spec] of Object.entries(KINDS)) {
+      expect(["uid", "name"], name).toContain(spec.eventsBy);
+    }
   });
 
   it("advertises exactly the kinds in the table", () => {

@@ -50,15 +50,33 @@ import { all, KNOWN_KINDS, resolveKind, safeText, str, type KindSpec, type Relat
  * restricted_bash's 60s default because this is a fixed set of small reads — if they are slow the
  * cluster is the finding, and reporting that quickly beats waiting.
  *
- * The two deadlines on a single probe are ORDERED, and getting that wrong is the bug #507 fixed in
+ * The deadlines on a single probe are ORDERED, and getting that wrong is the bug #507 fixed in
  * restricted_bash: in production the command runs as `sandbox` behind `timeout`, while the
  * `boundedExec` timer runs as `agentbox` with no CAP_KILL and can therefore only abandon the CALL,
  * not stop the command. Setting both to the same 8s let the outer one pre-empt the only timer that
  * can actually kill anything. So the outer one is padded by the same margin restricted_bash uses,
  * and only in production, where the wrapper exists at all.
+ *
+ * What that padding actually buys, stated because the arithmetic is not obvious and was previously
+ * described as something it is not. In production the ordering comes out as
+ *
+ *   inner `timeout -k 5 8` (8s, as `sandbox` — the only timer that can KILL)
+ *     < total (20s, abandons the tool; its abort is what carries boundedExec's reap)
+ *       < outer per-probe (23s, padded past the inner one)
+ *
+ * so the outer per-probe timer never fires in production and the TOTAL is the effective backstop. That
+ * is fine — the total aborts with a reap — and the padding is not therefore pointless: the path where it
+ * does the work is the non-production one, which has no sandbox wrapper and hence no inner timeout at
+ * all, leaving the unpadded 8s outer timer as the ONLY deadline on a probe.
  */
 const PROBE_TIMEOUT_MS = 8_000;
-const TOTAL_TIMEOUT_MS = 15_000;
+
+/**
+ * Derived, not picked. A call is two SEQUENTIAL legs — the subject, then events and neighbours
+ * concurrently — so a total below 2 × the per-probe cap lets a slow subject eat the second leg's budget
+ * and report every neighbour as a timeout it never actually reached. Plus a margin for process spawn.
+ */
+const TOTAL_TIMEOUT_MS = PROBE_TIMEOUT_MS * 2 + 4_000;
 
 function outerTimeoutMs(isProd: boolean): number {
   return isProd
@@ -95,7 +113,16 @@ const MAX_EVENT_LINES = 6;
 // budget. The total ceiling still stays below processToolOutput's 8000-character truncation
 // threshold, with enough room for legal object names and the trailing status line.
 const MAX_EVENT_CHARS = 600;
-const MAX_SUBJECT_HEADER_CHARS = 340;
+/**
+ * The subject header is `=== <resource> <ns>/<name> ===` and is deliberately NOT clipped: the identity
+ * of what was read has to survive intact, or a bundle stops being attributable. So the budget carries
+ * its worst case rather than its typical one — a namespace and a name may each be a full 253-character
+ * DNS subdomain. The previous 340 was the typical case, which made the arithmetic this comment block
+ * insists on wrong by ~200 characters.
+ */
+const MAX_DNS_NAME_CHARS = 253;
+const MAX_RESOURCE_TOKEN_CHARS = 32;
+const MAX_SUBJECT_HEADER_CHARS = "===  / ===".length + MAX_RESOURCE_TOKEN_CHARS + 2 * MAX_DNS_NAME_CHARS;
 const MAX_EVENT_HEADER_CHARS = 80;
 const MAX_NEIGHBOUR_HEADER_CHARS = 330;
 const MAX_STATUS_CHARS = 256;
@@ -112,7 +139,17 @@ export function worstCaseChars(spec: { relations: unknown[] }): number {
     + MAX_JOIN_CHARS;
 }
 
-export const BUDGET = { MAX_TOTAL_CHARS, MAX_SUBJECT_CHARS, MAX_NEIGHBOUR_CHARS, MAX_EVENT_LINES, MAX_EVENT_CHARS };
+export const BUDGET = {
+  MAX_TOTAL_CHARS, MAX_SUBJECT_CHARS, MAX_NEIGHBOUR_CHARS, MAX_EVENT_LINES, MAX_EVENT_CHARS,
+  MAX_SUBJECT_HEADER_CHARS, MAX_DNS_NAME_CHARS,
+};
+
+/**
+ * Exported so the ordering the block above asserts can be checked rather than reasoned about. The three
+ * deadlines come from three places — `SANDBOX_KILL_GRACE_S` from `infra`, the per-probe cap from here,
+ * the total derived from it — so the ordering is not guaranteed by any one of them.
+ */
+export const DEADLINES = { PROBE_TIMEOUT_MS, TOTAL_TIMEOUT_MS, outerTimeoutMs };
 
 /** How a probe ended. `not_found` is an ANSWER about existence, not a failure — see classifyExit. */
 type ProbeFailure = "not_found" | "forbidden" | "timeout" | "refused" | "unreachable" | "error";
@@ -245,20 +282,28 @@ function getJsonCommand(resource: string, name: string, namespace: string | unde
  * parsing because modern events may carry their latest time in `eventTime` or `series`, not only the
  * legacy `lastTimestamp` field accepted by kubectl's `--sort-by`.
  *
- * Prefer the subject UID over its name. Events outlive a deleted object for a while, and another kind
- * in the same namespace may have the same name; the UID is the only selector that identifies this
- * exact incarnation. Fall back to name + kind only for malformed/legacy objects without a usable UID.
- * An exact selector also lets the `-A` form pass the all-namespaces restriction.
+ * WHICH selector is a per-kind fact and comes from the table (`KindSpec.eventsBy`) rather than from a
+ * rule inferred here: a pod's uid names the exact incarnation that crashed, while a node's kubelet
+ * writes the node NAME into the uid field and a uid selector therefore misses every kubelet-emitted
+ * node event. See the field's own documentation for the kubelet reference.
+ *
+ * `name` is paired with `involvedObject.kind` where the object's own kind is known, since a name alone
+ * is only unique within a kind. Either form is an exact single-value selector, which is what lets the
+ * `-A` form pass the all-namespaces restriction (`hasBoundingFieldSelector`, command-sets.ts).
+ *
+ * A uid-preferring kind with no usable uid falls back to the name form rather than going unfiltered —
+ * a malformed or legacy object still has events worth reading.
  */
 function eventsCommand(
   name: string,
   namespace: string | undefined,
   scope: "cluster" | "namespace",
+  eventsBy: "uid" | "name",
   uid: string | undefined,
   kind: string | undefined,
 ): string {
   const where = scope === "cluster" ? " -A" : nsFlag(namespace, "namespace");
-  const selector = uid && !badName(uid)
+  const selector = eventsBy === "uid" && uid && !badName(uid)
     ? `involvedObject.uid=${uid}`
     : [
         `involvedObject.name=${name}`,
@@ -401,6 +446,7 @@ export async function collectObject(
     params.name,
     ns,
     spec.scope,
+    spec.eventsBy,
     str(parsed, ".metadata.uid"),
     str(parsed, ".kind"),
   ), deps);

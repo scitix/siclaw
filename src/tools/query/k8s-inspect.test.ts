@@ -7,7 +7,7 @@
  * restricted_bash would have refused, and that is only checkable by looking at what it tried to run.
  */
 import { describe, it, expect } from "vitest";
-import { runProbe, collectObject, worstCaseChars, BUDGET, type ProbeDeps } from "./k8s-inspect.js";
+import { runProbe, collectObject, worstCaseChars, BUDGET, DEADLINES, type ProbeDeps } from "./k8s-inspect.js";
 import { KINDS } from "./k8s-relations.js";
 
 /** A fake exec that records every command line and answers from a table. */
@@ -319,7 +319,7 @@ describe("collectObject — neighbours", () => {
     expect(dp.seen.find((c) => c.includes("get events"))).toContain("-n prod");
   });
 
-  it("selects events by the fetched object's UID, not a reusable name", async () => {
+  it("selects a pod's events by the fetched object's UID, not a reusable name", async () => {
     const d = deps({
       "get pod web": pod(),
       "get node node-42": JSON.stringify(NODE),
@@ -330,6 +330,34 @@ describe("collectObject — neighbours", () => {
     expect(eventCall).toContain("--field-selector involvedObject.uid=pod-uid-123");
     expect(eventCall).not.toContain("involvedObject.name=web");
     expect(eventCall).toContain("-o json");
+  });
+
+  it("selects a NODE's events by name and kind, because its uid field holds the name", async () => {
+    // The NODE fixture carries a real uid, so a uid-preferring implementation passes every other test in
+    // this file and returns a short list here: the kubelet writes `UID:types.UID(nodeName)`, so
+    // NodeNotReady / Rebooted / ImageGCFailed never match a uid selector while the controller-manager's
+    // events (real uid) do. Reverting `eventsBy` to an unconditional uid preference fails this.
+    const d = deps({ "get node node-42": JSON.stringify(NODE), "get pods": JSON.stringify({ items: [] }) });
+    await collectObject(KINDS.node, { kind: "node", name: "node-42" }, d);
+    const eventCall = d.seen.find((c) => c.includes("get events"))!;
+    expect(eventCall).toContain("involvedObject.name=node-42");
+    // Paired, because a name is unique only within a kind — a pod named after its node would match too.
+    expect(eventCall).toContain("involvedObject.kind=Node");
+    expect(eventCall).not.toContain("involvedObject.uid");
+    expect(eventCall).not.toContain("node-uid-456");
+  });
+
+  it("falls back to the name form when a uid-preferring kind has no usable uid", async () => {
+    // Never unfiltered: `-A -o json` without a bounding selector is refused outright, so a missing uid
+    // must degrade to the other exact form rather than to no selector.
+    const d = deps({
+      "get pod web": pod({ metadata: { name: "web", namespace: "default" } }),
+      "get node node-42": JSON.stringify(NODE),
+    });
+    await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    const eventCall = d.seen.find((c) => c.includes("get events"))!;
+    expect(eventCall).toContain("involvedObject.name=web");
+    expect(eventCall).toContain("involvedObject.kind=Pod");
   });
 
   it("runs the neighbour reads concurrently, not one after another", async () => {
@@ -350,6 +378,30 @@ describe("collectObject — neighbours", () => {
   });
 });
 
+describe("the three deadlines", () => {
+  // #507's lesson, as arithmetic. Only the inner `timeout -k 5 8` runs as `sandbox` and can KILL; the
+  // outer per-probe timer runs as `agentbox` without CAP_KILL and can merely abandon the call, leaving
+  // the process behind. So the killing timer must fire FIRST, and the one that fires next must be the
+  // total, whose abort carries boundedExec's reap. The three numbers come from three places —
+  // SANDBOX_KILL_GRACE_S from infra, the per-probe cap from this file, the total derived from it — so
+  // shrinking the infra constant silently inverts the prod ordering with no other test noticing.
+  it("orders inner kill before the total, and the total before the padded prod backstop", () => {
+    expect(DEADLINES.PROBE_TIMEOUT_MS).toBeLessThan(DEADLINES.TOTAL_TIMEOUT_MS);
+    expect(DEADLINES.TOTAL_TIMEOUT_MS).toBeLessThan(DEADLINES.outerTimeoutMs(true));
+  });
+
+  it("leaves room for both sequential legs, so a slow subject cannot fake a neighbour timeout", () => {
+    // A call is two SEQUENTIAL legs: the subject, then events and neighbours concurrently. A total under
+    // 2 × the per-probe cap lets the subject eat the second leg's budget and report every neighbour as a
+    // timeout it never reached — a fabricated diagnosis, not a slow one.
+    expect(DEADLINES.TOTAL_TIMEOUT_MS).toBeGreaterThan(2 * DEADLINES.PROBE_TIMEOUT_MS);
+  });
+
+  it("uses the unpadded probe cap off the sandbox path, where it is the only deadline", () => {
+    expect(DEADLINES.outerTimeoutMs(false)).toBe(DEADLINES.PROBE_TIMEOUT_MS);
+  });
+});
+
 describe("collectObject — the size budget", () => {
   // The first version of this suite asserted a length on a deliberately noisy fixture, and passed with
   // the final clip removed: `renderNode` and `renderOwner` emit one line each, so no fixture built from
@@ -362,6 +414,20 @@ describe("collectObject — the size budget", () => {
       expect(worstCaseChars(spec), `${name} (${spec.relations.length} relations)`)
         .toBeLessThanOrEqual(BUDGET.MAX_TOTAL_CHARS);
     }
+  });
+
+  it("budgets the header for the longest legal identity, since it is never clipped", async () => {
+    // The header is deliberately unclipped — identity has to survive or a bundle stops being
+    // attributable — so the budget must carry its WORST case. A namespace and a name may each be a full
+    // DNS subdomain; the previous hand-picked 340 was the typical case, understating it by ~200 chars.
+    const name = "n".repeat(BUDGET.MAX_DNS_NAME_CHARS);
+    const namespace = "s".repeat(BUDGET.MAX_DNS_NAME_CHARS);
+    const d = deps({ [`get pod ${name}`]: pod({ metadata: { name, namespace, uid: "u" } }), "get events": NO_EVENTS });
+    const { text } = await collectObject({ ...KINDS.pod, relations: [] }, { kind: "pod", name, namespace }, d);
+    const header = text.split("\n")[0];
+    expect(header, "the identity is not truncated").toContain(name);
+    expect(header).toContain(namespace);
+    expect(header.length).toBeLessThanOrEqual(BUDGET.MAX_SUBJECT_HEADER_CHARS);
   });
 
   it("would fail if a kind grew relations without the budget being revisited", () => {
@@ -409,6 +475,29 @@ describe("collectObject — the size budget", () => {
     expect(text).toContain("--- events (30, newest 6) ---");
     expect(text).toContain("Event29");
     expect(text).not.toContain("Event0 ");
+  });
+
+  it("sorts events by time when the apiserver returns them out of order", async () => {
+    // The `eventList` helper emits ascending `metadata.creationTimestamp` — the LAST of five fallbacks —
+    // so no other test in this file can fail if either the sorting or the fallback chain regresses. This
+    // one carries the time ONLY in `eventTime`, in descending order, which is what a modern events.k8s.io
+    // response looks like.
+    const at = (minute: number) => new Date(Date.UTC(2026, 0, 1, 0, minute)).toISOString();
+    const events = JSON.stringify({
+      kind: "EventList",
+      items: [7, 3, 9, 1].map((minute) => ({
+        eventTime: at(minute), type: "Warning", reason: `At${minute}`,
+        involvedObject: { kind: "Pod", name: "web" }, message: `minute ${minute}`,
+      })),
+    });
+    const d = deps({
+      "get pod web": pod(), "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify(RS), "get events": events,
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    const order = [1, 3, 7, 9].map((m) => text.indexOf(`minute ${m}`));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(order, "oldest first, newest last").toEqual([...order].sort((a, b) => a - b));
   });
 
   it("keeps a realistic long FailedScheduling reason instead of clipping it at 160 characters", async () => {

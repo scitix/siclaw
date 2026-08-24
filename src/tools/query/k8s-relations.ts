@@ -123,8 +123,51 @@ export interface Relation {
 // ── Renderers ───────────────────────────────────────────────────────
 
 /**
- * `Ready=True`, plus any condition that is asserting a problem — and for an abnormal one, WHY and
- * SINCE WHEN.
+ * Which conditions earn a line, per kind.
+ *
+ * Polarity is NOT uniform across kinds and cannot be read off the value. A node's non-Ready conditions
+ * are PROBLEM assertions — `DiskPressure=True` is bad and `False` is the normal state of every working
+ * node. A pod's are READINESS assertions — `PodScheduled=True` is the normal state and `False` is the
+ * answer. The first version printed every True condition, which is right for a node and exactly
+ * inverted for a pod: measured on a live healthy pod, four timestamped `=True` lines took ~200 of the
+ * subject section's 700 characters, and a broken pod's `Ready=False` was buried in that green wall.
+ *
+ * The sharper half is what was DROPPED rather than what was added: a Pending pod's
+ * `PodScheduled=False (Unschedulable)` is the one field that answers why it is Pending, and the old
+ * rule printed nothing for it. Its message also outlives the `FailedScheduling` event, so for a pod
+ * pending longer than the event TTL it is the only copy of the answer left in the cluster.
+ */
+export interface ConditionPolicy {
+  /** Printed even when healthy: the kind's one-line verdict. */
+  wanted: string;
+  /**
+   * When a NON-wanted condition of this kind is worth a line. `notTrue` means anything other than
+   * `True`, `Unknown` included — a kubelet that stopped reporting leaves conditions Unknown, and for a
+   * readiness assertion that is as much of an answer as `False`. Naming this after the k8s status values
+   * rather than a boolean is deliberate: `abnormal: "false"` read as "not abnormal", and its actual
+   * meaning covered a third value it did not name.
+   */
+  abnormalWhen: "True" | "notTrue";
+  /** Types that break the kind's own rule — a pod's `DisruptionTarget=True` means it is being evicted. */
+  invert?: readonly string[];
+}
+
+const NODE_CONDITIONS: ConditionPolicy = { wanted: "Ready", abnormalWhen: "True" };
+const POD_CONDITIONS: ConditionPolicy = { wanted: "Ready", abnormalWhen: "notTrue", invert: ["DisruptionTarget"] };
+
+/**
+ * A condition message is clipped harder than other promoted text.
+ *
+ * It shares a section budget with the fields around it (a node's taints and allocatable capacity come
+ * AFTER the conditions and are what a clip would eat), and the specific thing worth having is short: a
+ * scheduler's `0/115 nodes are available: 3 Insufficient cpu, 112 node(s) didn't match …` fits well
+ * inside this.
+ */
+const MAX_CONDITION_MESSAGE_CHARS = 120;
+
+/**
+ * The `wanted` condition, plus every condition this kind considers abnormal — and for an abnormal one,
+ * WHY and SINCE WHEN.
  *
  * A bare `DiskPressure=True` was the first version and it was too thin to be worth printing: the
  * reader's next question is always the reason and the transition time, so they had to run
@@ -132,32 +175,62 @@ export interface Relation {
  * node went NotReady four minutes ago" and "it has been NotReady for a week" call for different
  * investigations, and a pod that crashed in between is explained by the first and not the second.
  *
- * A healthy condition still gets nothing but its name. `Ready=True` needs no excuse, and
- * `MemoryPressure=False` is the normal state of every working node — printing either with its
- * timestamp would crowd out the line that matters.
+ * A healthy `wanted` gets nothing but its name — `Ready=True` needs no excuse, and its transition time
+ * would crowd out the line that matters. A healthy non-wanted condition gets no line at all:
+ * `MemoryPressure=False` is the normal state of every working node, and `PodScheduled=True` of every
+ * running pod.
+ *
+ * The reason AND the message, when both exist. An earlier version printed only the reason, on the
+ * grounds that a reason is the machine-readable form of the same fact — which holds for
+ * `KubeletHasDiskPressure` / "kubelet has disk pressure" and fails for exactly the case this summary
+ * exists to answer: `Unschedulable` names the category while the message carries the per-node-class
+ * breakdown. Occasionally paying for the same sentence twice, clipped, is the cheaper mistake.
+ *
+ * Conditions carrying the SAME explanation are folded onto one line, measured on a live
+ * ImagePullBackOff pod: `Ready` and `ContainersReady` reported an identical status, reason, message and
+ * transition time, which is ~110 characters of a 700-character budget spent restating one fact — and it
+ * is the ordinary shape of a pod that is not ready, not an edge case. Folding requires a NON-EMPTY
+ * explanation: an empty one says only "no reason given", so merging on it would assert a shared cause
+ * that nothing in the object supports, and across the wanted/abnormal boundary it would be actively
+ * wrong — a node's `Ready=True` and `DiskPressure=True` are opposite findings that happen to share a
+ * blank tail.
  */
-function conditionSummary(obj: unknown, wanted: string): string {
+function conditionSummary(obj: unknown, policy: ConditionPolicy): string {
   const conds = all(obj, ".status.conditions[]");
-  const parts: string[] = [];
-  const describe = (type: string, status: string, c: unknown): string => {
+  /** One rendered line, still open for another condition type reporting the identical explanation. */
+  interface Entry { types: string[]; status: string; tail: string }
+  const entries: Entry[] = [];
+  const tailOf = (c: unknown): string => {
     const reason = str(c, ".reason");
     const since = str(c, ".lastTransitionTime");
-    const message = safeText(str(c, ".message"));
-    // The message only when there is no reason: a reason is the machine-readable form of the same
-    // fact, and printing both is usually the same sentence twice.
-    const why = reason ?? message;
-    return `${type}=${status}${why ? ` (${why})` : ""}${since ? ` since ${since}` : ""}`;
+    const message = safeText(str(c, ".message"), MAX_CONDITION_MESSAGE_CHARS);
+    const why = [reason, message].filter(Boolean).join(": ");
+    return `${why ? ` (${why})` : ""}${since ? ` since ${since}` : ""}`;
+  };
+  const isAbnormal = (type: string, status: string): boolean => {
+    const rule = policy.invert?.includes(type)
+      ? (policy.abnormalWhen === "True" ? "notTrue" : "True")
+      : policy.abnormalWhen;
+    return rule === "True" ? status === "True" : status !== "True";
+  };
+  const add = (type: string, status: string, tail: string, first: boolean): void => {
+    const shared = tail === "" ? undefined : entries.find((e) => e.status === status && e.tail === tail);
+    if (shared) { shared.types.push(type); return; }
+    const entry: Entry = { types: [type], status, tail };
+    if (first) entries.unshift(entry); else entries.push(entry);
   };
   for (const c of conds) {
     const type = str(c, ".type");
     const status = str(c, ".status");
     if (!type || !status) continue;
-    if (type === wanted) {
-      parts.unshift(status === "True" ? `${type}=True` : describe(type, status, c));
+    if (type === policy.wanted) {
+      // A healthy `wanted` needs no excuse, so it carries no tail and never absorbs another condition.
+      add(type, status, status === "True" ? "" : tailOf(c), true);
       continue;
     }
-    if (status === "True") parts.push(describe(type, status, c));
+    if (isAbnormal(type, status)) add(type, status, tailOf(c), false);
   }
+  const parts = entries.map((e) => `${e.types.join("/")}=${e.status}${e.tail}`);
   return parts.join("  ") || "conditions: none reported";
 }
 
@@ -248,14 +321,14 @@ export function renderPod(obj: unknown): string {
     lines.push(`reason:     ${reason}${msg ? ` — ${msg}` : ""}`);
   }
   lines.push(renderPodContainers(obj));
-  const conditions = conditionSummary(obj, "Ready");
+  const conditions = conditionSummary(obj, POD_CONDITIONS);
   lines.push(conditions.startsWith("conditions:") ? conditions : `conditions: ${conditions}`);
   return lines.join("\n");
 }
 
 /** A node, as a neighbour of something else or as the subject. */
 export function renderNode(obj: unknown): string {
-  const bits: string[] = [conditionSummary(obj, "Ready")];
+  const bits: string[] = [conditionSummary(obj, NODE_CONDITIONS)];
   const taints = all(obj, ".spec.taints[]");
   if (taints.length === 0) {
     bits.push("no taints");
@@ -329,6 +402,21 @@ export function resolveControllerOwner(obj: unknown): NamedNeighbourTarget | und
 export interface KindSpec {
   resource: string;
   scope: "cluster" | "namespace";
+  /**
+   * Which field selector finds this kind's events — a per-kind fact about WHO writes them, not a style
+   * choice, so it lives in the table.
+   *
+   * `uid` is the stronger selector where it works: events outlive a deleted object for a while, and a
+   * name can be reused by the next incarnation, so a pod's uid names the exact one that crashed.
+   *
+   * A node needs `name`, because the kubelet does not derive its node reference from the node object.
+   * It writes `ObjectReference{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}` — the node's NAME
+   * in the uid field. So a uid selector matches the controller-manager's node events and misses every
+   * kubelet-emitted one: NodeNotReady, Rebooted, ImageGCFailed, FreeDiskSpaceFailed, which is the exact
+   * set `node-health-check` exists to read. The name selector matches both, and a node name is a stable
+   * identity in a way a pod name is not — the reuse this trades away is the same physical machine.
+   */
+  eventsBy: "uid" | "name";
   render: (obj: unknown) => string;
   relations: Relation[];
 }
@@ -337,6 +425,7 @@ export const KINDS: Record<string, KindSpec> = {
   pod: {
     resource: "pod",
     scope: "namespace",
+    eventsBy: "uid",
     render: renderPod,
     relations: [
       {
@@ -361,6 +450,7 @@ export const KINDS: Record<string, KindSpec> = {
   node: {
     resource: "node",
     scope: "cluster",
+    eventsBy: "name",
     render: renderNode,
     relations: [
       {
@@ -383,12 +473,32 @@ export const KINDS: Record<string, KindSpec> = {
 /** The kinds the tool advertises, for the schema and the error message. */
 export const KNOWN_KINDS = Object.keys(KINDS);
 
+const ALIASES: Record<string, string> = { po: "pod", no: "node" };
+
+/**
+ * Own properties only. `KINDS` and `ALIASES` are object literals, so they inherit Object.prototype and
+ * a bare index lookup answers `constructor`, `toString` and `__proto__` with a truthy non-KindSpec —
+ * from a model-supplied string. The caller's `if (!spec)` then passes and the first `spec.relations`
+ * throws. Same bug class as the denial-reason Map lookup in the Feishu path.
+ */
+function own<T>(table: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
 /**
  * Normalise what the model asked for. Accepts the singular, the plural and kubectl's short form,
  * because those are what the SKILL.md prose and the model's own habits produce.
+ *
+ * The EXACT spelling is tried before any de-pluralising. Stripping a trailing `s` unconditionally read
+ * `ingress` as `ingres` and `endpoints` as `endpoint`, so the table's own promise — supporting a kind is
+ * adding a row — would have silently failed for every kind whose singular ends in s, at the moment
+ * someone added the row and not before.
  */
 export function resolveKind(raw: string): KindSpec | undefined {
-  const k = raw.trim().toLowerCase().replace(/s$/, "");
-  const aliases: Record<string, string> = { po: "pod", no: "node" };
-  return KINDS[aliases[k] ?? k];
+  const k = raw.trim().toLowerCase();
+  for (const candidate of [own(ALIASES, k) ?? k, k.replace(/s$/, ""), k.replace(/es$/, "")]) {
+    const hit = own(KINDS, candidate);
+    if (hit) return hit;
+  }
+  return undefined;
 }

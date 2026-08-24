@@ -2057,6 +2057,20 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
     }
   });
 
+  it("accepts an event selector pinned by involvedObject.name, the only form a node's events answer to", () => {
+    // Not symmetry with the uid form: the kubelet writes a node event's reference as
+    // `{Kind:"Node", Name:nodeName, UID:types.UID(nodeName)}`, so the uid field holds the NAME and a uid
+    // selector misses every kubelet-emitted node event (NodeNotReady, Rebooted, ImageGCFailed) while
+    // still matching the controller-manager's — a short list, not a visible failure. One name exists
+    // once per namespace, the same bound `metadata.name` already carries.
+    for (const cmd of [
+      "kubectl get events -A --field-selector involvedObject.name=node-1 -o json",
+      "kubectl get events -A --field-selector involvedObject.name=node-1,involvedObject.kind=Node -o json",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
   it("still refuses anything that can match the whole cluster", () => {
     for (const cmd of [
       "kubectl get pods -A -o json",
@@ -2064,6 +2078,10 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
       "kubectl get pods -A -l app=x -o json",
       "kubectl get pods -A --field-selector spec.nodeName!=node-1 -o json",   // a negation is not a pin
       "kubectl get pods -A --field-selector spec.nodeName= -o json",          // empty value pins nothing
+      // A kind alone bounds nothing — every node in the cluster is a Node. Admitting the name field must
+      // not admit the field it is paired with.
+      "kubectl get events -A --field-selector involvedObject.kind=Node -o json",
+      "kubectl get events -A --field-selector involvedObject.name!=node-1 -o json",
     ]) {
       expect(check(cmd), cmd).not.toBeNull();
     }
@@ -2073,6 +2091,9 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
     const err = check("kubectl get pods -A -o json") ?? "";
     expect(err).toContain("spec.nodeName");
     expect(err, "and says why a label selector is not equivalent").toMatch(/label selector|phase filter/);
+    // The hint enumerates the accepted fields in prose, so a field admitted by the regex and missing
+    // here tells the agent its own working command is impossible.
+    expect(err).toContain("involvedObject.name");
   });
 });
 
