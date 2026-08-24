@@ -369,6 +369,7 @@ export async function handleDingTalkMessage(
     modelFingerprint: modelBinding?.modelFingerprint,
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
+    subagentTiers: modelBinding?.subagentTiers,
     systemPromptTemplate,
   };
   try {

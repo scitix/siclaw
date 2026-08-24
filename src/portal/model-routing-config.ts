@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
@@ -7,6 +8,17 @@ import {
   type ModelRouteCandidate,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
+import {
+  canonicalTierConfig,
+  type SubagentTierCandidates,
+  type SubagentTierConfigEntry,
+  type SubagentTierMenu,
+} from "../core/subagent-models.js";
+
+/** The one hash used for tier revisions, so every producer agrees. */
+export function sha256Hex(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
 
 export interface PrimaryModelRef {
   provider: string;
@@ -116,6 +128,53 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
     });
   }
   return out;
+}
+
+/**
+ * Resolve an agent's stored tier config into the two wire payloads.
+ *
+ * ONE resolver for every Standalone binding-production path (`chat-gateway`, the
+ * `config.getModelBinding` handler, and the CLI snapshot). Three hand-rolled
+ * copies is how one of them ends up without a revision, or without the column,
+ * and the failure is silent — tiering just never engages there.
+ *
+ * The revision is a SHA-256 over the canonical, order-normalized config, so the
+ * menu and the candidates always agree when they describe the same configuration
+ * regardless of which path produced them. That agreement is the whole point:
+ * `resolveTierSelection` refuses to honour a tier whose two channels disagree.
+ *
+ * Returns `{menu: null, candidates: null}` when the agent has no tiers, or when a
+ * tier names a provider this deployment cannot resolve — a partially-resolvable
+ * list is not shipped half-applied, because a menu entry with no candidate behind
+ * it reads to the lead as an offer it cannot fulfil.
+ */
+export async function resolveAgentSubagentTiers(raw: unknown): Promise<{
+  menu: SubagentTierMenu | null;
+  candidates: SubagentTierCandidates | null;
+}> {
+  const entries = safeParseJson<SubagentTierConfigEntry[]>(raw, [] as SubagentTierConfigEntry[]);
+  if (!Array.isArray(entries) || entries.length === 0) return { menu: null, candidates: null };
+
+  const configs = await loadProviderConfigs([...new Set(entries.map((e) => e.provider))]);
+
+  const items: SubagentTierMenu["items"] = [];
+  const candidates: SubagentTierCandidates["candidates"] = [];
+  for (const entry of entries) {
+    const modelConfig = configs.get(entry.provider);
+    if (!modelConfig) return { menu: null, candidates: null };
+    items.push({ tier: entry.tier, whenToUse: entry.whenToUse });
+    candidates.push({
+      tier: entry.tier,
+      provider: entry.provider,
+      modelId: entry.modelId,
+      modelConfig,
+    });
+  }
+
+  // Same canonical form the menu projection uses, so both sides agree.
+  const revision = sha256Hex(canonicalTierConfig(entries));
+
+  return { menu: { revision, items }, candidates: { revision, candidates } };
 }
 
 function stripRuntimeCandidateConfig(policy: ModelRoutePolicy): ModelRoutePolicy {

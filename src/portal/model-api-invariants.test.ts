@@ -70,12 +70,17 @@ function extractModelEntrySelects(src: string): string[] {
  *   than a descriptor. It reads the protocol off the provider row it joined, so
  *   the api_type assertion would pass anyway — the exclusion exists to keep the
  *   call-site count below honest about what actually hydrates a descriptor.
+ * - `SELECT 1`: pure existence probes (does this provider/model pair exist?).
+ *   They project no columns at all, so there is nothing to hydrate — the
+ *   sub-agent tier write validator uses one to reject a tier naming a model this
+ *   deployment does not have.
  */
 const DESCRIPTOR_FREE_PROJECTIONS = [
   /^SELECT \* FROM model_entries/i,
   /^SELECT model_id FROM model_entries/i,
   /^SELECT me\.id FROM model_entries/i,
   /^SELECT me\.model_id, me\.api_type, me\.max_tokens_field/i,
+  /^SELECT 1 FROM model_entries/i,
 ];
 
 describe("model_entries SELECTs feeding buildProviderModelDescriptor", () => {

@@ -2027,6 +2027,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     modelFingerprint: modelBinding?.modelFingerprint,
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
+    subagentTiers: modelBinding?.subagentTiers,
     systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
     ...(images.length ? { images } : {}),
   };

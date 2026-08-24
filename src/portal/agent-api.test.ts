@@ -12,6 +12,24 @@ import { signToken } from "./auth.js";
 import { registerAgentRoutes } from "./agent-api.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
+/**
+ * Read one column's bound value out of an INSERT call by NAME.
+ *
+ * These assertions used hardcoded positions, which silently shift every time a
+ * column is added to `agents` — three of them broke on the `subagent_models`
+ * addition, and a position that has shifted still type-checks and can still pass
+ * against the wrong value. Resolving the index from the statement's own column
+ * list makes the assertion say what it means.
+ */
+function insertedColumn(call: [string, unknown[]], column: string): unknown {
+  const [sql, values] = call;
+  const columns = sql.match(/INSERT INTO \w+ \(([^)]+)\)/i)?.[1];
+  if (!columns) throw new Error(`could not parse column list from: ${sql}`);
+  const index = columns.split(",").map((c) => c.trim()).indexOf(column);
+  if (index < 0) throw new Error(`column ${column} not in INSERT: ${columns}`);
+  return values[index];
+}
+
 const JWT_SECRET = "test-agent-secret";
 const ADMIN_TOKEN = signToken("admin-1", "admin", "admin", JWT_SECRET);
 const USER_TOKEN = signToken("u1", "user", "user", JWT_SECRET);
@@ -291,9 +309,12 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(201);
-      const insertArgs = query.mock.calls[0][1];
-      expect(insertArgs[8]).toBe("coordinator"); // agent_type
-      expect(insertArgs[9]).toBeNull();
+      // main's VALUE (a built-in type no longer materializes its default prompt
+      // into system_prompt — the Addendum refactor) read through the by-NAME
+      // accessor, because this branch adds a column and positional indices into
+      // the INSERT would silently start pointing at the wrong value.
+      expect(insertedColumn(query.mock.calls[0], "agent_type")).toBe("coordinator");
+      expect(insertedColumn(query.mock.calls[0], "system_prompt")).toBeNull();
     });
 
     it("persists a maintainer-supplied prompt for a built-in type", async () => {
@@ -308,7 +329,7 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(201);
-      expect(query.mock.calls[0][1][9]).toBe("single truth");
+      expect(insertedColumn(query.mock.calls[0], "system_prompt")).toBe("single truth");
     });
 
     it("keeps a custom agent's system_prompt on create", async () => {
@@ -324,8 +345,7 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(201);
-      const insertArgs = query.mock.calls[0][1];
-      expect(insertArgs[9]).toBe("keep me");
+      expect(insertedColumn(query.mock.calls[0], "system_prompt")).toBe("keep me");
     });
   });
 

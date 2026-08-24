@@ -678,20 +678,36 @@ Referential decay is answered without cascading:
   leak through echoed tool output.
 - The resolution chain lands at `session.ts:2199`
 
-### 11.4 Propagation: 13 forwarding sites plus an invariant
+### 11.4 Propagation: 8 forwarding sites (+ the TUI snapshot) plus an invariant
 
-binding → prompt body is a **field-by-field copy everywhere, never a spread**. The
-13 sites: `chat-gateway.ts:479,512,768`, `a2a-gateway.ts:756`,
-`delegate-api.ts:630,697`, `task-coordinator.ts:291`,
-`channels/lark.ts:1837,1864`, `channels/dingtalk.ts:369`,
-`cli-snapshot-api.ts:556,564`, `cli-main.ts:100`.
+binding → prompt body is a **field-by-field copy everywhere, never a spread**.
 
-(`agent-api.ts:120` is **not** one — it is a local variable declaration.)
+⚠️ **Correction to earlier drafts, which said 13.** That count came from grepping
+`modelRouting:` and treating every hit as a forwarding site. Three hits are not:
+`chat-gateway.ts` and `channels/lark.ts` each pass those fields to
+`modelOptionsSupportImageInput` (a vision-capability check that has no business
+carrying tier state), and `agent-api.ts:120` is a local variable declaration.
+Verified by implementation — adding the field to the check sites is a type error.
+
+The **8** real binding → prompt sites:
+
+| File | Sites |
+|---|---|
+| `chat-gateway.ts` | 3 |
+| `delegate-api.ts` | 2 (remote `delegation.start` + local `client.prompt`) |
+| `a2a-gateway.ts` | 1 |
+| `task-coordinator.ts` | 1 (cron) |
+| `channels/lark.ts` | 1 |
+| `channels/dingtalk.ts` | 1 |
+
+Plus the TUI, which is not a binding forward at all but a snapshot — see §11.6.
 
 Missing one means tiering silently does nothing on that entry path. **An invariant
-test pins both the field's presence and the count of 13**, following
+test pins both the field's presence and the site count**, following
 `model-api-invariants.test.ts`, which pins its own call-site count for the same
-reason.
+reason. Note that the type system already catches part of this: `PromptOptions`
+declares the field, so a site that forwards it is checked, while a site that
+forgets it simply compiles — which is exactly why the count needs pinning.
 
 Collapsing the 13 into a `bindingToPromptFields()` helper is the more thorough fix,
 but the sites differ in detail (`delegate-api.ts:697` uses `systemPromptTemplate`

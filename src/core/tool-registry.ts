@@ -12,6 +12,7 @@ import type {
   SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
 } from "./types.js";
 import type { DelegateResponse, DelegateRosterMember } from "../shared/agent-delegate.js";
+import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
@@ -60,6 +61,11 @@ export interface SpawnSubagentRequest {
   taskListId: string;
   /** Stable id tying the parent tool call to the child session (lineage/observability). */
   spawnId: string;
+  /**
+   * Immutable tier decision context, captured once when the tool call dispatched
+   * and shared by every child of that call. Absent = no tiering (inherit).
+   */
+  tierPlan?: SubagentTierPlan;
 }
 
 /**
@@ -91,6 +97,8 @@ export interface SpawnSubagentReport {
   interruptedTool?: string;
   /** The sub-agent's execution steps (reasoning + tool calls), so the UI can show a collapsed log after completion. */
   steps?: SubagentStep[];
+  /** Which model this child ran on and why — see {@link SubagentGroupItemResult.tierOutcome}. */
+  tierOutcome?: ChildModelOutcome;
 }
 
 /** One step of a sub-agent's run — its reasoning text or a tool call — for a main-agent-like live view. */
@@ -165,6 +173,18 @@ export interface SpawnSubagentGroupRequest {
   taskListId: string;
   /** toolCallId, reused as the groupId (`{groupId}#{index}` tags each child delegation). */
   spawnId: string;
+  /**
+   * The tier the caller asked for, or null/absent for none. Resolved into a
+   * {@link SubagentTierPlan} by the executor at dispatch — the tool layer passes
+   * the request, not the resolution, because only the executor can see session
+   * state.
+   */
+  modelTier?: string | null;
+  /**
+   * The resolved plan, filled in by the executor and then shared by every child of
+   * this dispatch. Not supplied by the tool layer.
+   */
+  tierPlan?: SubagentTierPlan;
 }
 
 /** Live progress for a FOREGROUND group (background groups report via the group_progress event). */
@@ -192,6 +212,19 @@ export interface SubagentGroupItemResult {
   summary: string;
   /** The child's persisted session id for UI drill-in; empty string for `skipped` items. */
   childSessionId: string;
+  /**
+   * Which model this item actually ran on, and why.
+   *
+   * `resolvedTier` alone would show THAT a fallback happened but never WHY, so
+   * "the lead chose badly", "the tier name is wrong or its model was deleted" and
+   * "the candidate never arrived" would stay indistinguishable — and one of the
+   * three mitigations for a mis-picked tier is "a weak child report exposes it",
+   * which needs the tier to be visible per item.
+   *
+   * Identifiers only. Credentials never leave the candidate payload, and this
+   * whole record is non-model-visible detail for the group card anyway.
+   */
+  tierOutcome?: ChildModelOutcome;
 }
 
 /**
@@ -442,6 +475,16 @@ export interface ToolRefs {
    * all. Does NOT affect `run_in_background` exec (node/pod/bash), a within-turn primitive.
    */
   foregroundSubagentOnly?: boolean;
+  /**
+   * The sub-agent model tier MENU this session advertises — credential-free
+   * `{tier, whenToUse}` entries. Absent/null means this deployment has no tiers,
+   * and then `spawn_subagent` exposes no `model_tier` parameter at all.
+   *
+   * Supplied at session construction from the session's snapshot, not read live:
+   * the tool schema and description are built once, so the menu the lead is shown
+   * must be the menu its choice is resolved against.
+   */
+  subagentTierMenu?: SubagentTierMenu | null;
   /** Cancels a running background job (sub-agent or bash). Enables the job_stop tool. */
   jobStopExecutor?: JobStopExecutor;
   /**

@@ -73,6 +73,12 @@ export interface PromptOptions {
   };
   /** Optional ordered model fallback policy. Omitted means legacy single-model behavior. */
   modelRouting?: ModelRoutePolicy;
+  /**
+   * Sub-agent model tier CANDIDATES for this turn (credentials included).
+   * Passthrough — the AgentBox normalizes on arrival, since nothing validates it
+   * here. Absent means "no tiers this turn" and CLEARS any the session held.
+   */
+  subagentTiers?: unknown;
   /** Image attachments (raw base64, no data: prefix) forwarded as vision input. */
   images?: Array<{ mimeType: string; data: string }>;
   /** File attachments forwarded as native model file input. */

@@ -25,7 +25,7 @@ import { assembleExporterHeaders, type ExporterAuth } from "./tracing-exporters.
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
-import { resolveAgentModelRouting } from "./model-routing-config.js";
+import { resolveAgentModelRouting, resolveAgentSubagentTiers } from "./model-routing-config.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
@@ -2150,6 +2150,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // capabilities and an immutable behavior contract; system_prompt stores
       // only the optional Agent-owned Addendum.
       agent_type: agent.agent_type,
+      // Sub-agent model tiers in CONFIG form ({tier, provider, modelId,
+      // whenToUse}). The Gateway projects the credential-free half of this into
+      // the tools payload as the tier menu; the candidates travel separately on
+      // the binding. Same defensive JSON parse as tool_capabilities.
+      subagent_model_tiers: safeParseJson<unknown[] | null>(agent.subagent_models, null),
     };
   });
 
@@ -2310,10 +2315,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getModelBinding", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing, subagent_models, system_prompt FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
-    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; subagent_models?: unknown; system_prompt?: string | null } | undefined;
     if (!agent?.model_provider || !agent?.model_id) {
       return { binding: null };
     }
@@ -2337,6 +2342,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       provider: agent.model_provider,
       modelId: agent.model_id,
     });
+    // Candidates only — the menu rides the tools channel (see chat-gateway).
+    const subagentTiers = (await resolveAgentSubagentTiers(agent.subagent_models)).candidates;
     return {
       binding: {
         modelProvider: p.name,
@@ -2350,6 +2357,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           models,
         },
         ...(modelRouting ? { modelRouting } : {}),
+        ...(subagentTiers ? { subagentTiers } : {}),
         systemPrompt: agent.system_prompt ?? null,
       },
     };

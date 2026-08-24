@@ -19,6 +19,7 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { encodeSubagentModelsForDb } from "../core/subagent-models.js";
 import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
@@ -35,6 +36,38 @@ import { safeParseJson } from "../gateway/dialect-helpers.js";
  * object, so this is safe across MySQL + SQLite and non-breaking for the
  * already-tolerant frontend coercers.
  */
+/**
+ * Reject a tier entry naming a provider/model this deployment does not have.
+ *
+ * Shape validation cannot catch this, and the runtime degrades silently when it
+ * happens: `findModel` misses and every child falls back to the inherited model,
+ * so a typo looks exactly like "tiering was never configured". Refusing the write
+ * is where it can still be reported to whoever made the mistake.
+ *
+ * Returns an error message, or undefined when everything resolves.
+ */
+async function validateSubagentTierRefs(
+  db: ReturnType<typeof getDb>,
+  encoded: string | null | undefined,
+): Promise<string | undefined> {
+  if (!encoded) return undefined;
+  type TierRef = { tier: string; provider: string; modelId: string };
+  const entries = safeParseJson<TierRef[]>(encoded, [] as TierRef[]);
+  if (!Array.isArray(entries)) return undefined;
+  for (const entry of entries) {
+    const [rows] = await db.query(
+      `SELECT 1 FROM model_entries me
+         JOIN model_providers mp ON me.provider_id = mp.id
+        WHERE mp.name = ? AND me.model_id = ? LIMIT 1`,
+      [entry.provider, entry.modelId],
+    ) as any;
+    if (!rows?.length) {
+      return `tier "${entry.tier}" references unknown model ${entry.provider}/${entry.modelId}`;
+    }
+  }
+  return undefined;
+}
+
 function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   if (!row) return row;
   const agentType = normalizeAgentType(row.agent_type);
@@ -46,6 +79,7 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
     // built-in default in system_prompt. The settings UI edits only the real
     // addendum while legacy clients can keep reading the raw column.
     agent_prompt_addendum: agentPromptAddendum(agentType, row.system_prompt) ?? null,
+    subagent_models: safeParseJson(row.subagent_models, null),
   };
 }
 
@@ -124,18 +158,27 @@ export function registerAgentRoutes(
     const db = getDb();
     let modelRouting: string | null | undefined;
     let toolCapabilities: string | null | undefined;
+    let subagentModels: string | null | undefined;
     try {
       modelRouting = encodeModelRoutingForDb(body.model_routing);
       toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
+      subagentModels = encodeSubagentModelsForDb(body.subagent_models);
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    // Shape is valid; now check the models actually exist. Without this the first
+    // symptom of a typo is every fan-out silently running on the inherited model.
+    const tierRefError = await validateSubagentTierRefs(db, subagentModels);
+    if (tierRefError) {
+      sendJson(res, 400, { error: tierRefError });
       return;
     }
 
     const agentType = normalizeAgentType(body.agent_type);
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -145,6 +188,7 @@ export function registerAgentRoutes(
         body.model_id ?? null,
         modelRouting ?? null,
         toolCapabilities ?? null,
+        subagentModels ?? null,
         agentType,
         // Built-in type contracts live in code. Persist only the optional
         // Agent-owned addendum so an edit cannot replace core type behavior.
@@ -242,6 +286,21 @@ export function registerAgentRoutes(
         encodedToolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
+    let encodedSubagentModels: string | null | undefined;
+    if ("subagent_models" in body) {
+      try {
+        encodedSubagentModels = encodeSubagentModelsForDb(body.subagent_models);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+      const tierRefError = await validateSubagentTierRefs(db, encodedSubagentModels);
+      if (tierRefError) {
+        sendJson(res, 400, { error: tierRefError });
         return;
       }
     }
@@ -369,6 +428,11 @@ export function registerAgentRoutes(
     if (encodedToolCapabilities !== undefined) {
       setClauses.push("tool_capabilities = ?");
       values.push(encodedToolCapabilities);
+    }
+
+    if (encodedSubagentModels !== undefined) {
+      setClauses.push("subagent_models = ?");
+      values.push(encodedSubagentModels);
     }
 
     if (setClauses.length === 0) {
@@ -675,9 +739,13 @@ export function registerAgentRoutes(
     try {
       await conn.beginTransaction();
 
+      // ⚠️ Every per-agent config column must be listed here. `tool_capabilities`
+      // was missing, so a cloned agent silently lost its tool restriction — a
+      // clone that is BROADER than its source is a privilege bug, not a cosmetic
+      // one. Adding a column to `agents` means adding it here too.
       await conn.query(
-        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, agent_type, system_prompt, is_production, icon, color, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newId,
           newName,
@@ -686,6 +754,8 @@ export function registerAgentRoutes(
           source.model_provider,
           source.model_id,
           source.model_routing,
+          source.tool_capabilities,
+          source.subagent_models,
           source.agent_type ?? "custom",
           source.system_prompt,
           source.is_production,

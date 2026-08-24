@@ -350,18 +350,26 @@ export function encodeSubagentModelsForDb(value: unknown): string | null | undef
 // ── Resolution (§5 revision protocol + §7.2 fallback reasons) ────────────────
 
 /**
- * Why a spawn did not run on the tier it asked for. Reported per item so a
+ * Why a child did not run on the tier it asked for. Reported per item so a
  * misrouted child is diagnosable — without it, "the report is weak", "the lead
  * chose badly" and "the candidate never arrived" look identical from outside.
  *
- * Only the reasons decidable from the tier state live here; failures further
- * downstream (model not found, preflight, parent restore) are named by the
- * caller that observes them.
+ * The first three are decidable from tier state alone (`resolveTierSelection`);
+ * the rest are observed while putting the brain on the model.
+ *
+ * `parent_fallback_failed` is terminal, not a fallback: the parent's effective
+ * model is the last resort by definition, so a child whose parent restore also
+ * fails FAILS rather than trying a third model. Looping here would burn a whole
+ * fan-out retrying a broken session.
  */
 export type TierFallbackReason =
   | "revision_mismatch"
   | "candidate_missing"
-  | "unknown_tier";
+  | "unknown_tier"
+  | "model_not_found"
+  | "context_overflow"
+  | "model_setup_failed"
+  | "parent_fallback_failed";
 
 /** Which resolution level produced the outcome, for the per-item report. */
 export type TierSelectionSource = "env" | "request" | "type_default" | "inherit";
@@ -416,6 +424,102 @@ export function resolveTierSelection(
   if (!candidate) return { kind: "fallback", reason: "candidate_missing" };
 
   return { kind: "tier", candidate };
+}
+
+/**
+ * The immutable tier decision context for ONE `spawn_subagent` dispatch.
+ *
+ * Captured once, when the tool call is dispatched, and reused by every child of
+ * that call: the single-task collapse path, each map child, every later wave of
+ * the worker pool, the detached background continuation, and the reduce child.
+ *
+ * The alternative — each child reading current state as it starts — lets a long
+ * batch straddle a configuration change, so its first wave runs one model and the
+ * rest another while the reduce merges both into one report where the difference
+ * is invisible.
+ *
+ * `effectiveParent` is a `ModelRouteCandidate`-shaped record rather than an
+ * import, keeping this module dependency-free.
+ */
+export interface SubagentTierPlan {
+  menu: SubagentTierMenu | null;
+  candidates: SubagentTierCandidates | null;
+  /** What the caller asked for; null means "no tier", i.e. inherit. */
+  requestedTier: string | null;
+  /** Which resolution level produced `requestedTier`. */
+  selectionSource?: TierSelectionSource;
+  effectiveParent: {
+    provider: string;
+    modelId: string;
+    modelConfig?: Record<string, unknown>;
+  } | null;
+}
+
+/** What actually happened when a child was put on a model. Feeds the per-item report. */
+export interface ChildModelOutcome {
+  requestedTier: string | null;
+  resolvedTier: string | null;
+  source: TierSelectionSource;
+  fallbackReason?: TierFallbackReason;
+  /** The model the child actually runs on — identifiers only, never credentials. */
+  provider?: string;
+  modelId?: string;
+  /** Set only when even the parent could not be applied; the child must fail. */
+  failed?: boolean;
+  detail?: string;
+}
+
+/**
+ * Project the stored CONFIG form into the menu payload.
+ *
+ * This is the projection that keeps credentials off the menu channel: it copies
+ * `tier` and `whenToUse` and drops `provider` / `modelId` entirely, so no caller
+ * can leak the model inventory into a tool description by forwarding "the config".
+ *
+ * The revision must match the one the candidate side computes, so both are derived
+ * from the same canonical form — see the Standalone resolver. `computeRevision` is
+ * injected rather than imported to keep this module free of node:crypto (it runs in
+ * the same bundle as browser-adjacent code).
+ *
+ * Returns null for absent/empty config, which is the CLEAR signal.
+ */
+export function projectTierMenuFromConfig(
+  entries: unknown,
+  computeRevision: (canonical: string) => string,
+): SubagentTierMenu | null {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  const items: SubagentTierMenuItem[] = [];
+  const canonicalEntries: SubagentTierConfigEntry[] = [];
+  for (const raw of entries) {
+    if (!isRecord(raw)) return null;
+    const tier = normalizeTier(raw.tier);
+    const whenToUse = normalizeWhenToUse(raw.whenToUse);
+    const provider = normalizeRequiredString(raw.provider);
+    const modelId = normalizeRequiredString(raw.modelId);
+    if (!tier || !whenToUse || !provider || !modelId) return null;
+    items.push({ tier, whenToUse });
+    canonicalEntries.push({ tier, provider, modelId, whenToUse });
+  }
+
+  return { revision: computeRevision(canonicalTierConfig(canonicalEntries)), items };
+}
+
+/**
+ * The canonical string a tier revision is computed over: sorted by tier, only the
+ * fields that define the configuration.
+ *
+ * Sorting is what makes the revision independent of storage and serialization
+ * order — the menu and the candidates are produced by different code paths, and a
+ * revision that depended on ordering would report a mismatch for two descriptions
+ * of the same configuration.
+ */
+export function canonicalTierConfig(entries: SubagentTierConfigEntry[]): string {
+  return JSON.stringify(
+    [...entries]
+      .map((e) => ({ tier: e.tier, provider: e.provider, modelId: e.modelId, whenToUse: e.whenToUse }))
+      .sort((a, b) => (a.tier < b.tier ? -1 : a.tier > b.tier ? 1 : 0)),
+  );
 }
 
 /**

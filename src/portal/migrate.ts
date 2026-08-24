@@ -644,6 +644,14 @@ export async function runPortalMigrations(): Promise<void> {
   // JSON column type) for MySQL+SQLite dual-compat. NULL = no selection = all
   // tools (backward-compatible with agents predating this feature).
   await safeAlterTable(db, "agents", "tool_capabilities", "TEXT DEFAULT NULL");
+  // Sub-agent model tiers: JSON array of {tier, provider, modelId, whenToUse}.
+  // TEXT (not a JSON column type) for MySQL+SQLite dual-compat, like
+  // model_routing and tool_capabilities. NULL = no tiers = children inherit the
+  // parent's model, which is the pre-feature behaviour.
+  //
+  // Standalone only: under Upstream mode the tier config lives in the management
+  // plane's own storage and this column stays NULL.
+  await safeAlterTable(db, "agents", "subagent_models", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "agents", "agent_type", "VARCHAR(32) NOT NULL DEFAULT 'custom'");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");

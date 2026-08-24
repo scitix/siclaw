@@ -31,6 +31,11 @@ import {
 } from "../shared/agentbox-sync-status.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { decodeSkillFileContent, normalizeSkillFiles, type SkillPackageFile } from "../shared/skill-package.js";
+import {
+  isTierPayloadCleared,
+  normalizeSubagentTierMenu,
+  type SubagentTierMenu,
+} from "../core/subagent-models.js";
 
 // ── MCP handler ───────────────────────────────────────────────────────
 
@@ -778,6 +783,17 @@ interface ToolsPayload {
   allowedTools: string[] | null;
   /** Agent type (sre/coordinator/knowledge_qa/custom) — drives capabilities and prompt fallback. */
   agentType: string;
+  /**
+   * Sub-agent model tier MENU — `{revision, items:[{tier, whenToUse}]}`, credential
+   * free. It rides the tools channel rather than the prompt binding because it is
+   * consumed while BUILDING a session's tool description, which happens before any
+   * binding is applied; delivered per-prompt it would never reach the schema.
+   *
+   * `null` (or absent) CLEARS it. An empty `items` array is malformed, not a clear
+   * — it would leave a revision on this side with nothing to match on the candidate
+   * side. See docs/design/subagent-model-tiering.md §5.
+   */
+  subagentTierMenu?: unknown;
 }
 
 const VALID_AGENT_TYPES = new Set(["sre", "coordinator", "knowledge_qa", "custom"]);
@@ -793,6 +809,15 @@ export interface ToolsStateTarget {
   harnessResolvedState?: boolean;
   /** Agent type resolved from the tool-capabilities payload. */
   agentTypeState?: string;
+  /**
+   * Latest sub-agent tier menu for this box, or null when there is none.
+   *
+   * Box-level and mutable, like `allowedToolsState`. A SESSION does not read this
+   * directly at spawn time — it snapshots it at creation (the menu that built its
+   * tool schema is the menu it must honour), so a reload changes what the NEXT
+   * session advertises rather than retroactively changing this one.
+   */
+  subagentTierMenuState?: SubagentTierMenu | null;
 }
 
 /**
@@ -836,6 +861,24 @@ export function createToolsHandler(
       target.allowedToolsState = allowed;
       target.agentTypeState = payload.agentType;
       target.harnessResolvedState = true;
+
+      // Tier menu: null/absent clears; malformed is REFUSED (and also clears, so a
+      // session cannot keep advertising a menu that has been withdrawn as invalid).
+      // A rejection is logged and never thrown — a bad tier list is a config
+      // problem, and failing the reload would be strictly worse than running
+      // without tiers.
+      const rawMenu = payload?.subagentTierMenu;
+      if (isTierPayloadCleared(rawMenu)) {
+        target.subagentTierMenuState = null;
+      } else {
+        const normalized = normalizeSubagentTierMenu(rawMenu);
+        if (normalized.ok) {
+          target.subagentTierMenuState = normalized.value;
+        } else {
+          console.warn(`[tools] ignoring invalid subagent tier menu: ${normalized.reason}`);
+          target.subagentTierMenuState = null;
+        }
+      }
       return allowed ? allowed.length : 0;
     },
 

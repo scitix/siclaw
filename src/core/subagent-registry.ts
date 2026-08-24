@@ -9,6 +9,8 @@
  * sub-agent can spawn another. This holds regardless of subagent type.
  */
 
+import type { TierSelectionSource } from "./subagent-models.js";
+
 export interface SubagentType {
   /** Unique selector, e.g. "general-purpose". */
   agentType: string;
@@ -173,6 +175,33 @@ const BUILTINS: Record<string, SubagentType> = {
   [GENERAL_PURPOSE.agentType]: GENERAL_PURPOSE,
 };
 
+/**
+ * Apply the tier resolution order (design §3.7) to produce the tier a spawn should
+ * attempt, plus which level decided it.
+ *
+ * Order: env override > tool parameter > subagent type default > inherit. `off`
+ * short-circuits to inherit and ignores both lower levels, which is what makes it
+ * a usable rollback lever — an agent whose prompt keeps asking for a tier must
+ * still stop tiering when ops says so.
+ */
+export function resolveRequestedTier(
+  requestedTier?: string | null,
+  subagentType?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { tier: string | null; source: TierSelectionSource } {
+  const override = getSubagentModelTierOverride(env);
+  if (override.mode === "off") return { tier: null, source: "inherit" };
+  if (override.mode === "pin") return { tier: override.tier, source: "env" };
+
+  const asked = typeof requestedTier === "string" ? requestedTier.trim() : "";
+  if (asked !== "") return { tier: asked, source: "request" };
+
+  const typeDefault = getSubagentType(subagentType)?.defaultModelTier?.trim();
+  if (typeDefault) return { tier: typeDefault, source: "type_default" };
+
+  return { tier: null, source: "inherit" };
+}
+
 /** All registered sub-agent types (built-in; user/Portal-defined types may be added later). */
 export function listSubagentTypes(): SubagentType[] {
   return Object.values(BUILTINS);
@@ -198,6 +227,34 @@ export function getSubagentType(name?: string): SubagentType | undefined {
  * tool layer), so a multi-item plan or a reduce_prompt is rejected and the tool degrades to a
  * pure single-task spawn (pre-batch behaviour).
  */
+/**
+ * Ops override for sub-agent model tiering, from `SICLAW_SUBAGENT_MODEL_TIER`.
+ *
+ * Three values, and deliberately NOT four:
+ *   unset / empty  → no intervention; resolution proceeds from the tool parameter
+ *   "off"          → tiering disabled; every child inherits the parent's model
+ *   anything else  → a tier name, pinned for every child
+ *
+ * There is no `inherit` value on purpose. "Inherit everywhere" is what `off`
+ * means, and giving one behaviour two spellings is exactly how Claude Code
+ * shipped a bug where `CLAUDE_CODE_SUBAGENT_MODEL=inherit` silently suppressed
+ * the per-call parameter — they later had to redefine `inherit` as equivalent to
+ * unset. One spelling, one meaning.
+ *
+ * An unknown tier name is NOT validated here: it falls back to inheritance at
+ * resolution time like any other unknown name, so a typo in ops config degrades
+ * a deployment's tiering rather than breaking its turns.
+ */
+export function getSubagentModelTierOverride(
+  env: NodeJS.ProcessEnv = process.env,
+): { mode: "none" } | { mode: "off" } | { mode: "pin"; tier: string } {
+  const raw = env.SICLAW_SUBAGENT_MODEL_TIER;
+  if (raw == null || raw.trim() === "") return { mode: "none" };
+  const value = raw.trim();
+  if (value.toLowerCase() === "off") return { mode: "off" };
+  return { mode: "pin", tier: value };
+}
+
 export function isSubagentGroupEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env.SICLAW_SUBAGENT_GROUP_ENABLED;
   if (raw == null || raw.trim() === "") return true;

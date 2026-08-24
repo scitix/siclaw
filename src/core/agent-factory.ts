@@ -159,6 +159,12 @@ export interface CreateSiclawSessionOpts {
   taskListId?: string;
   /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
   spawnSubagentExecutor?: import("./tool-registry.js").SpawnSubagentExecutor;
+  /**
+   * Sub-agent model tier menu to advertise on `spawn_subagent`. Absent/null → the
+   * parameter is not exposed at all, so a deployment without tiers never shows the
+   * model a concept it cannot use.
+   */
+  subagentTierMenu?: import("./subagent-models.js").SubagentTierMenu | null;
   /** Runtime bridge that cancels a background job — sub-agent or bash (design §7). */
   jobStopExecutor?: import("./tool-registry.js").JobStopExecutor;
   /** Runtime bridge that launches a background bash command. Injected by agentbox / TUI host. */
@@ -537,6 +543,10 @@ export async function createSiclawSession(
       // are web/channel/cli only, so those entries never expose it. web/cli keep
       // background (persistent clients). run_in_background exec is untouched.
       foregroundSubagentOnly: mode === "channel" || opts?.delegation != null,
+      // The tier menu this session will advertise. Passed in rather than read from
+      // box state because the tool schema is built HERE, once: the menu the lead is
+      // shown has to be the one its choice is later resolved against.
+      subagentTierMenu: opts?.subagentTierMenu ?? null,
       jobStopExecutor: opts?.jobStopExecutor,
       backgroundExecExecutor: opts?.backgroundExecExecutor,
       taskOutputReader: opts?.taskOutputReader,

@@ -26,6 +26,8 @@ import {
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import { projectTierMenuFromConfig } from "../core/subagent-models.js";
+import { sha256Hex } from "../portal/model-routing-config.js";
 import { requireAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
 import type {
   DelegationAppendMessagePayload,
@@ -296,8 +298,13 @@ export async function handleToolCapabilities(
       parseToolCapabilitiesAtBoundary(agent?.tool_capabilities),
     );
     const allowedTools = resolveCapabilities(capsKeys);
+    // The sub-agent tier MENU rides this channel rather than the prompt binding,
+    // because a session's tool description is built at creation and a per-prompt
+    // field would arrive too late to appear in it. Credential-free by contract:
+    // only {tier, whenToUse}. `null` clears whatever the box held.
+    const subagentTierMenu = projectTierMenuFromConfig(agent?.subagent_model_tiers, sha256Hex);
     // agentType rides along for capabilities and legacy-row prompt fallback.
-    sendJson(res, 200, { allowedTools, agentType });
+    sendJson(res, 200, { allowedTools, agentType, subagentTierMenu });
   } catch (err) {
     console.error("[internal-api] tool-capabilities error:", err);
     sendJson(res, 500, { error: "Internal server error" });
