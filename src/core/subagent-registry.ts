@@ -9,8 +9,6 @@
  * sub-agent can spawn another. This holds regardless of subagent type.
  */
 
-export type SubagentModel = "sonnet" | "opus" | "haiku" | "inherit";
-
 export interface SubagentType {
   /** Unique selector, e.g. "general-purpose". */
   agentType: string;
@@ -18,8 +16,21 @@ export interface SubagentType {
   whenToUse: string;
   /** Appended to the base SRE system prompt when building the child. */
   systemPromptAddendum: string;
-  /** Model override; "inherit" uses the parent's model. */
-  model?: SubagentModel;
+  /**
+   * Default model TIER for children of this type — a selector into the agent's
+   * configured tier list (`subagent-models.ts`), NOT a model id.
+   *
+   * Level 3 of the resolution order: it applies when the caller supplied no
+   * `model_tier`. Absent means inherit the parent's model, so there is no
+   * "inherit" sentinel to write — the previous field carried one and it was
+   * indistinguishable from "unset".
+   *
+   * This replaced a `model?: "sonnet" | "opus" | "haiku" | "inherit"` field that
+   * nothing ever read. Those aliases could not work here: models are administered
+   * by a control plane and several providers coexist, so a family alias does not
+   * identify anything. See docs/design/subagent-model-tiering.md §11.5.
+   */
+  defaultModelTier?: string;
 }
 
 /**
@@ -153,7 +164,9 @@ const GENERAL_PURPOSE: SubagentType = {
     "Do exactly the task described, gather the requested evidence, and end with a concise findings " +
     "report — the caller only sees your final report, not your steps. Do not ask for confirmation; " +
     "if blocked, report what you found and what's missing.",
-  model: "inherit",
+  // No defaultModelTier: a general-purpose child inherits the parent's model, and
+  // absent IS inherit. Setting a tier here would pick a model for every caller
+  // that did not ask for one.
 };
 
 const BUILTINS: Record<string, SubagentType> = {
