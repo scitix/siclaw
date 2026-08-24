@@ -34,8 +34,9 @@ import { applySanitizer } from "../infra/output-sanitizer.js";
 import { redactDocument } from "../infra/kubectl-sanitize.js";
 import { validateKubectlInPipeline } from "../infra/kubectl-readonly-policy.js";
 import {
-  buildSandboxCommand, SANDBOX_KILL_GRACE_S, OUTER_BACKSTOP_MARGIN_S,
+  buildSandboxCommand, reapSandboxSession, SANDBOX_KILL_GRACE_S, OUTER_BACKSTOP_MARGIN_S,
 } from "../infra/sandbox-exec.js";
+import { backgroundPgidFile } from "../infra/bg-session.js";
 import { boundedExec } from "../infra/bounded-exec.js";
 import { parseSanitizedJson } from "../infra/json-projection.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
@@ -175,8 +176,15 @@ export async function runProbe(command: string, deps: ProbeDeps): Promise<ProbeR
   });
   if (pre.error) return { ok: false, reason: "refused", detail: firstLine(pre.error) };
 
+  // In production an abort/output overflow is decided by the agentbox process, which cannot signal
+  // the sandbox-owned kubectl. Record a sandbox-side session so boundedExec's reap hook can stop the
+  // whole tree immediately instead of leaving it alive until the inner timeout expires.
+  const sandboxPgidFile = deps.isProd ? backgroundPgidFile("k8s-inspect") : undefined;
   const line = deps.isProd
-    ? buildSandboxCommand(command, { timeoutS: Math.ceil(PROBE_TIMEOUT_MS / 1000) })
+    ? buildSandboxCommand(command, {
+        timeoutS: Math.ceil(PROBE_TIMEOUT_MS / 1000),
+        pgidFile: sandboxPgidFile,
+      })
     : command;
 
   const exec = deps.exec ?? boundedExec;
@@ -185,6 +193,7 @@ export async function runProbe(command: string, deps: ProbeDeps): Promise<ProbeR
       env: deps.env,
       timeoutMs: outerTimeoutMs(deps.isProd),
       ...(deps.signal ? { signal: deps.signal } : {}),
+      ...(sandboxPgidFile ? { reap: () => reapSandboxSession(sandboxPgidFile) } : {}),
     });
     // Sanitize before anything reads it, including this file. Parsing raw stdout instead would show
     // this code the values the sanitizer exists to remove.

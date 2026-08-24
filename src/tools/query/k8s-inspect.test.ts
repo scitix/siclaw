@@ -144,15 +144,18 @@ describe("runProbe — the read-only policy applies to the tool's own commands",
     // production the inner `timeout` runs as `sandbox` and is the only one that can KILL the command,
     // while the outer timer runs as agentbox without CAP_KILL and can only abandon the call. If the
     // outer fires first it pre-empts the only effective deadline.
-    const seen: Array<{ command: string; timeoutMs: number }> = [];
-    const exec = ((command: string, opts: { timeoutMs: number }) => {
-      seen.push({ command, timeoutMs: opts.timeoutMs });
+    const seen: Array<{ command: string; timeoutMs: number; reap?: () => void }> = [];
+    const exec = ((command: string, opts: { timeoutMs: number; reap?: () => void }) => {
+      seen.push({ command, timeoutMs: opts.timeoutMs, ...(opts.reap ? { reap: opts.reap } : {}) });
       return Promise.resolve({ stdout: "{}", stderr: "" });
     }) as unknown as ProbeDeps["exec"];
 
     await runProbe("kubectl get pod web -o json", { env: {}, isProd: true, exec });
     const innerS = Number(/timeout -k \d+ (\d+)/.exec(seen[0].command)![1]);
     expect(seen[0].timeoutMs).toBeGreaterThan(innerS * 1000);
+    expect(seen[0].command).toContain("setsid sh -c");
+    expect(seen[0].command).toContain("siclaw-bg-k8s-inspect-");
+    expect(seen[0].reap).toEqual(expect.any(Function));
 
     // Outside production there is no wrapper, so the outer timer IS the deadline and padding it would
     // silently extend every probe — the other half of that same fix.
@@ -160,6 +163,7 @@ describe("runProbe — the read-only policy applies to the tool's own commands",
     await runProbe("kubectl get pod web -o json", { env: {}, isProd: false, exec });
     expect(seen[0].command).not.toContain("timeout -k");
     expect(seen[0].timeoutMs).toBe(8_000);
+    expect(seen[0].reap).toBeUndefined();
   });
 });
 
