@@ -65,9 +65,8 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
     description:
       "Delegate a bounded task to one of your specialist agents. This call is SYNCHRONOUS: it returns when the " +
       "peer's turn ends — the peer is not still working in the background afterwards. You get the peer's " +
-      "structured findings when it reported them, otherwise its narration from that turn, both subject to " +
-      "a size budget that drops the START of a long narration; the complete record stays in the peer's own " +
-      "session. Narration that describes a plan is " +
+      "structured findings when it reported them, otherwise its narration from that turn. A long result may " +
+      "reach you shortened; the complete record stays in the peer's own session. Narration that describes a plan is " +
       "not a result. The peer runs the " +
       "task in its OWN environment under its own capabilities and persona (you don't constrain it) — you keep " +
       "oversight. Use this when a task belongs to a peer's domain/resources rather than your " +

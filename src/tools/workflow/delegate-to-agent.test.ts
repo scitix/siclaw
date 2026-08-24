@@ -67,12 +67,18 @@ describe("delegate_to_agent tool", () => {
     expect(tool.description).toContain("the complete record stays in the peer's own session");
     // Must NOT promise findings unconditionally: what comes back may be narration.
     expect(tool.description).not.toContain("and get back its findings");
-    // Nor call that narration a "summary". Without an artifact the model receives resp.finalText
-    // VERBATIM (see the `const summary = a ? a.findings : resp.finalText` shaping below) — an
-    // accumulated narrative whose START is dropped when it exceeds the budget. A summary is never
-    // missing its beginning, so the word would misdescribe exactly the case that matters.
+    // Nor call that narration a "summary": without an artifact the model receives resp.finalText
+    // VERBATIM (see the `const summary = a ? a.findings : resp.finalText` shaping below), so there
+    // is no condensation step to name.
     expect(tool.description).not.toContain("a summary of");
-    expect(tool.description).toContain("drops the START of a long narration");
+    // The shortening is stated WITHOUT naming an algorithm, and without claiming both branches are
+    // capped. Neither is true uniformly: only the narration is truncated today (MAX_FINAL_TEXT,
+    // tail-kept), report_findings has no cap at all, and C1 replaces the narration's tail-keep with
+    // head+tail. A description that names the algorithm is wrong on one branch now and on both
+    // later; "may reach you shortened" is what stays true across all three states.
+    expect(tool.description).toContain("may reach you shortened");
+    expect(tool.description).not.toContain("drops the START");
+    expect(tool.description).not.toContain("both subject to");
   });
 
   it("resolves the target and calls the executor, shaping the AgentWorkCard result", async () => {
