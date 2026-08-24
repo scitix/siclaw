@@ -56,6 +56,17 @@ const NODE = {
 const RS = { kind: "ReplicaSet", spec: { replicas: 3 }, status: { readyReplicas: 2 } };
 
 const pod = (overrides: Record<string, unknown> = {}) => JSON.stringify({ ...POD, ...overrides });
+const eventList = (messages: string[] = []) => JSON.stringify({
+  kind: "EventList",
+  items: messages.map((message, index) => ({
+    metadata: { creationTimestamp: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString() },
+    type: index % 2 === 0 ? "Warning" : "Normal",
+    reason: `Event${index}`,
+    involvedObject: { kind: "Pod", name: "web" },
+    message,
+  })),
+});
+const NO_EVENTS = eventList();
 
 describe("runProbe — the read-only policy applies to the tool's own commands", () => {
   it("runs an ordinary read", async () => {
@@ -179,7 +190,7 @@ describe("collectObject — the status line", () => {
       "get pod web": pod(),
       "get node node-42": JSON.stringify(NODE),
       "get replicaset web-7d9f": JSON.stringify(RS),
-      "get events": "LAST SEEN   TYPE      REASON\n2m          Warning   BackOff   Back-off restarting",
+      "get events": eventList(["Back-off restarting"]),
     });
     const { text, failed } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(statusOf(text)).toBe("status: ok");
@@ -196,7 +207,7 @@ describe("collectObject — the status line", () => {
       "get pod web": pod(),
       "get node node-42": failure('Error from server (Forbidden): nodes "node-42" is forbidden'),
       "get replicaset web-7d9f": JSON.stringify(RS),
-      "get events": "LAST SEEN   TYPE\n2m          Warning",
+      "get events": eventList(["warning"]),
     });
     const { text, failed } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(statusOf(text)).toBe("status: partial (node: forbidden)");
@@ -208,7 +219,7 @@ describe("collectObject — the status line", () => {
 
   it("emits exactly one status line, always last, in every outcome", async () => {
     const scenarios: Array<Record<string, string | Error>> = [
-      { "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get events": "x" },
+      { "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get events": NO_EVENTS },
       { "get pod web": pod(), "get node node-42": failure("Forbidden"), "get events": failure("Forbidden") },
       { "get pod web": failure('Error from server (NotFound): pods "web" not found') },
       { "get pod web": "this is not json at all" },
@@ -250,7 +261,7 @@ describe("collectObject — neighbours", () => {
   it("omits a neighbour the subject does not name, without calling it a miss", async () => {
     // A static pod has no ownerReferences. Reporting that as degraded would make every one look broken.
     const bare = JSON.stringify({ ...POD, metadata: { name: "web", namespace: "default" } });
-    const d = deps({ "get pod web": bare, "get node node-42": JSON.stringify(NODE), "get events": "x" });
+    const d = deps({ "get pod web": bare, "get node node-42": JSON.stringify(NODE), "get events": NO_EVENTS });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text.trimEnd().endsWith("status: ok")).toBe(true);
     expect(text).not.toContain("--- owner (");
@@ -262,7 +273,7 @@ describe("collectObject — neighbours", () => {
       ...POD,
       metadata: { name: "web", namespace: "default", ownerReferences: [{ kind: "Job", name: "batch-1" }] },
     });
-    const d = deps({ "get pod web": jobOwned, "get node node-42": JSON.stringify(NODE), "get events": "x" });
+    const d = deps({ "get pod web": jobOwned, "get node node-42": JSON.stringify(NODE), "get events": NO_EVENTS });
     await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(d.seen.some((c) => c.includes("get job batch-1"))).toBe(true);
   });
@@ -282,7 +293,7 @@ describe("collectObject — neighbours", () => {
       "get pod web": multiplyOwned,
       "get node node-42": JSON.stringify(NODE),
       "get replicaset web-controller": JSON.stringify(RS),
-      "get events": "x",
+      "get events": NO_EVENTS,
     });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(d.seen.some((c) => c.includes("get replicaset web-controller"))).toBe(true);
@@ -291,7 +302,7 @@ describe("collectObject — neighbours", () => {
   });
 
   it("asks for a node's pods with an exact field selector, the only form the policy admits", async () => {
-    const d = deps({ "get node node-42": JSON.stringify(NODE), "get pods": JSON.stringify({ items: [] }), "get events": "x" });
+    const d = deps({ "get node node-42": JSON.stringify(NODE), "get pods": JSON.stringify({ items: [] }), "get events": NO_EVENTS });
     const { text } = await collectObject(KINDS.node, { kind: "node", name: "node-42" }, d);
     const podsCall = d.seen.find((c) => c.includes("get pods"))!;
     expect(podsCall).toContain("--field-selector spec.nodeName==node-42");
@@ -318,6 +329,7 @@ describe("collectObject — neighbours", () => {
     const eventCall = d.seen.find((c) => c.includes("get events"))!;
     expect(eventCall).toContain("--field-selector involvedObject.uid=pod-uid-123");
     expect(eventCall).not.toContain("involvedObject.name=web");
+    expect(eventCall).toContain("-o json");
   });
 
   it("runs the neighbour reads concurrently, not one after another", async () => {
@@ -329,7 +341,7 @@ describe("collectObject — neighbours", () => {
       live++; peak = Math.max(peak, live);
       const body = command.includes("get pod web") ? pod()
         : command.includes("get node") ? JSON.stringify(NODE)
-        : command.includes("get replicaset") ? JSON.stringify(RS) : "x";
+        : command.includes("get replicaset") ? JSON.stringify(RS) : NO_EVENTS;
       return new Promise((resolve) => setTimeout(() => { live--; resolve({ stdout: body, stderr: "" }); }, 20));
     }) as unknown as ProbeDeps["exec"];
     await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, { env: {}, isProd: false, exec });
@@ -368,7 +380,7 @@ describe("collectObject — the size budget", () => {
   // and the total clip on a shape where no individual part is over its cap.
   it("caps the subject section itself, not merely the total", async () => {
     const spec = { ...KINDS.pod, render: () => "z".repeat(50_000), relations: [] };
-    const d = deps({ "get pod web": pod(), "get events": "x" });
+    const d = deps({ "get pod web": pod(), "get events": NO_EVENTS });
     const { text } = await collectObject(spec, { kind: "pod", name: "web", namespace: "default" }, d);
     const subjectSection = text.split("\n\n")[1] ?? "";
     expect(subjectSection.length).toBeLessThanOrEqual(BUDGET.MAX_SUBJECT_CHARS);
@@ -383,7 +395,7 @@ describe("collectObject — the size budget", () => {
       render: () => "n".repeat(BUDGET.MAX_NEIGHBOUR_CHARS),
     }));
     const spec = { ...KINDS.pod, relations: many };
-    const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get events": "x" });
+    const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get events": NO_EVENTS });
     const { text } = await collectObject(spec, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text.length).toBeLessThanOrEqual(BUDGET.MAX_TOTAL_CHARS);
     expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (output: truncated)");
@@ -391,7 +403,7 @@ describe("collectObject — the size budget", () => {
   });
 
   it("keeps the newest events and says how many there were", async () => {
-    const events = ["LAST SEEN  TYPE  REASON", ...Array.from({ length: 30 }, (_, i) => `${i}m  Normal  Event${i}`)].join("\n");
+    const events = eventList(Array.from({ length: 30 }, (_, i) => `Event${i}`));
     const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get replicaset": JSON.stringify(RS), "get events": events });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text).toContain("--- events (30, newest 6) ---");
@@ -403,7 +415,7 @@ describe("collectObject — the size budget", () => {
     const reason = "0/100 nodes are available: "
       + "10 Insufficient cpu, 20 Insufficient memory, 30 had untolerated taint, "
       + "40 did not match Pod node affinity/selector; preemption is not helpful for scheduling TAIL";
-    const events = `LAST SEEN TYPE REASON OBJECT MESSAGE\n1m Warning FailedScheduling pod/web ${reason}`;
+    const events = eventList([reason]);
     const d = deps({
       "get pod web": pod(),
       "get node node-42": JSON.stringify(NODE),
@@ -416,8 +428,32 @@ describe("collectObject — the size budget", () => {
 
   it("states an empty events list rather than omitting the section", async () => {
     // For a Pending pod, no events means the scheduler never spoke — that is the finding.
-    const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get replicaset": JSON.stringify(RS), "get events": "" });
+    const d = deps({ "get pod web": pod(), "get node node-42": JSON.stringify(NODE), "get replicaset": JSON.stringify(RS), "get events": NO_EVENTS });
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text).toContain("--- events (0) ---");
+  });
+
+  it("does not turn an unparseable event response into a genuine empty list", async () => {
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify(RS),
+      "get events": "not an EventList",
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).not.toContain("--- events (0) ---");
+    expect(text.trimEnd().split("\n").at(-1)).toBe("status: partial (events: unparseable)");
+  });
+
+  it("redacts an event message before promoting it into the summary", async () => {
+    const d = deps({
+      "get pod web": pod(),
+      "get node node-42": JSON.stringify(NODE),
+      "get replicaset": JSON.stringify(RS),
+      "get events": eventList(["DB_PASSWORD=hunter2"]),
+    });
+    const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
+    expect(text).not.toContain("hunter2");
+    expect(text).toContain("REDACTED");
   });
 });

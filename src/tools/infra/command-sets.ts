@@ -1532,13 +1532,14 @@ export function checkSecretOutputFormat(args: string[], subcommand: string): str
 }
 
 /**
- * Does a field selector pin the result to ONE node or ONE object by name?
+ * Does a field selector pin the result to ONE node or ONE object identity?
  *
  * `-A -o json` is refused because serializing every object of a kind is the concern. A server-side
  * `--field-selector spec.nodeName=<exact>` removes that concern rather than papering over it: the
  * apiserver returns one node's pods, which is the same order of magnitude as `-n <namespace> -o json`
- * — already permitted. Seven separate review findings hit this, all of them node-scoped triage that
- * then had to fall back to custom-columns and lose the nested fields it needed.
+ * — already permitted. `involvedObject.uid=<exact>` is the Event equivalent: one immutable object
+ * incarnation, across namespaces. Seven separate review findings hit the node case, all of them
+ * node-scoped triage that then had to fall back to custom-columns and lose the nested fields it needed.
  *
  * Narrow on purpose. `status.phase=Running` across all namespaces is NOT bounded and stays refused, and
  * neither is a set or a negation (`!=`, comma-joined alternatives on the same field). The rule is "this
@@ -1553,7 +1554,7 @@ function hasBoundingFieldSelector(args: string[]): boolean {
   }
   for (const raw of values) {
     for (const term of raw.split(",")) {
-      const m = /^\s*(spec\.nodeName|metadata\.name)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
+      const m = /^\s*(spec\.nodeName|metadata\.name|involvedObject\.uid)\s*==?\s*([^,!=]+?)\s*$/.exec(term);
       if (m && m[2].trim().length > 0) return true;
     }
   }
@@ -1606,7 +1607,7 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
         + `${resource} in the cluster is the concern, so a client-side selector does not lift it. A `
-        + `server-side --field-selector that pins spec.nodeName or metadata.name to ONE exact value IS `
+        + `server-side --field-selector that pins spec.nodeName, metadata.name or involvedObject.uid to ONE exact value IS `
         + `accepted, because it bounds what the apiserver serializes. A label selector or a phase filter `
         + `is not — those can still match the whole cluster. Instead:\n`
         + `  kubectl get ${resource} -A --field-selector spec.nodeName=<node> -o json   (accepted)\n`

@@ -43,7 +43,7 @@ import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import { loadConfig } from "../../core/config.js";
-import { KNOWN_KINDS, resolveKind, str, type KindSpec, type Relation } from "./k8s-relations.js";
+import { all, KNOWN_KINDS, resolveKind, safeText, str, type KindSpec, type Relation } from "./k8s-relations.js";
 
 /**
  * Budgets. The per-probe cap bounds one hung API call; the total bounds the tool. Both are well under
@@ -240,7 +240,10 @@ function getJsonCommand(resource: string, name: string, namespace: string | unde
 }
 
 /**
- * Events for one object, newest last.
+ * Events for one object. JSON keeps the message separate from kubectl's table prefix, so the
+ * free-text field can be redacted before it is promoted into the summary. Sorting is done after
+ * parsing because modern events may carry their latest time in `eventTime` or `series`, not only the
+ * legacy `lastTimestamp` field accepted by kubectl's `--sort-by`.
  *
  * Prefer the subject UID over its name. Events outlive a deleted object for a while, and another kind
  * in the same namespace may have the same name; the UID is the only selector that identifies this
@@ -261,7 +264,7 @@ function eventsCommand(
         `involvedObject.name=${name}`,
         ...(kind && !badName(kind) ? [`involvedObject.kind=${kind}`] : []),
       ].join(",");
-  return `kubectl get events${where} --field-selector ${selector} --sort-by=.lastTimestamp`;
+  return `kubectl get events${where} --field-selector ${selector} -o json`;
 }
 
 // ── Rendering ───────────────────────────────────────────────────────
@@ -272,18 +275,51 @@ function clip(text: string, max: number): string {
 }
 
 /**
- * Keep the newest events. `--sort-by` puts them last, so the tail is what matters — and the header is
- * dropped because the columns are self-evident and cost a line of the budget.
+ * Keep the newest events and render only the diagnostic fields. Returning `undefined` distinguishes
+ * an invalid response from a valid empty EventList.
  */
-function renderEvents(text: string): string {
-  const lines = text.split("\n").map((l) => l.trimEnd()).filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return "";
-  const body = lines[0].startsWith("LAST SEEN") || lines[0].startsWith("NAMESPACE") ? lines.slice(1) : lines;
-  if (body.length === 0) return "";
-  const shown = body.slice(-MAX_EVENT_LINES);
-  const omitted = body.length - shown.length;
-  const head = `--- events (${body.length}${omitted > 0 ? `, newest ${shown.length}` : ""}) ---`;
-  return [head, ...shown.map((l) => clip(l, MAX_EVENT_CHARS))].join("\n");
+function renderEvents(text: string): string | undefined {
+  const parsed = parseSanitizedJson(text);
+  if (parsed === undefined) return undefined;
+
+  const eventTime = (event: unknown): string | undefined =>
+    str(event, ".series.lastObservedTime")
+      ?? str(event, ".eventTime")
+      ?? str(event, ".lastTimestamp")
+      ?? str(event, ".firstTimestamp")
+      ?? str(event, ".metadata.creationTimestamp");
+  const timestamp = (event: unknown): number => {
+    const value = eventTime(event);
+    if (!value) return 0;
+    const parsedTime = Date.parse(value);
+    return Number.isFinite(parsedTime) ? parsedTime : 0;
+  };
+
+  const events = all(parsed, ".items[]")
+    .map((event, index) => ({ event, index, timestamp: timestamp(event) }))
+    .sort((a, b) => a.timestamp - b.timestamp || a.index - b.index);
+  if (events.length === 0) return "";
+
+  const shown = events.slice(-MAX_EVENT_LINES);
+  const omitted = events.length - shown.length;
+  const head = `--- events (${events.length}${omitted > 0 ? `, newest ${shown.length}` : ""}) ---`;
+  const lines = shown.map(({ event }) => {
+    const when = eventTime(event) ?? "time unknown";
+    const type = str(event, ".type") ?? "Unknown";
+    const reason = str(event, ".reason") ?? "Unknown";
+    const objectKind = str(event, ".involvedObject.kind");
+    const objectName = str(event, ".involvedObject.name");
+    const object = objectKind || objectName
+      ? `${objectKind ?? "Object"}/${objectName ?? "?"}`
+      : undefined;
+    const count = str(event, ".series.count") ?? str(event, ".count");
+    const prefix = [when, type, reason, object, count && Number(count) > 1 ? `x${count}` : undefined]
+      .filter(Boolean).join("  ");
+    const messageBudget = Math.max(80, MAX_EVENT_CHARS - prefix.length - 3);
+    const message = safeText(str(event, ".message") ?? str(event, ".note"), messageBudget);
+    return clip(`${prefix}${message ? ` — ${message}` : ""}`, MAX_EVENT_CHARS);
+  });
+  return [head, ...lines].join("\n");
 }
 
 /** `status:` values, in the vocabulary get-node-logs.sh established. */
@@ -414,8 +450,12 @@ export async function collectObject(
 
   if (events.ok) {
     const rendered = renderEvents(events.text);
-    // No events is an answer worth stating: for a Pending pod it means the scheduler never spoke.
-    parts.push(rendered || "--- events (0) ---");
+    if (rendered === undefined) {
+      misses.push("events: unparseable");
+    } else {
+      // No events is an answer worth stating: for a Pending pod it means the scheduler never spoke.
+      parts.push(rendered || "--- events (0) ---");
+    }
   } else {
     misses.push(`events: ${events.reason}`);
   }

@@ -79,6 +79,12 @@ describe("safeText — a promoted free-text field", () => {
     expect(out.endsWith("…")).toBe(true);
   });
 
+  it("accepts a larger caller-owned budget for event messages", () => {
+    const out = safeText("x".repeat(500), 400)!;
+    expect(out).toHaveLength(400);
+    expect(out.endsWith("…")).toBe(true);
+  });
+
   it("returns undefined for absent and whitespace-only input, so callers omit the field", () => {
     expect(safeText(undefined)).toBeUndefined();
     expect(safeText("   \n ")).toBeUndefined();

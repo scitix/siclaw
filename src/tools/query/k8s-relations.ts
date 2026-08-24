@@ -18,8 +18,9 @@ import { readJsonPath } from "../infra/json-projection.js";
 import { redactDocument } from "../infra/kubectl-sanitize.js";
 
 /**
- * Maximum length of a cluster-supplied free-text field promoted into the summary.
- * A container's death message is occasionally a whole stack trace.
+ * Default maximum length of a cluster-supplied free-text field promoted into the summary.
+ * A container's death message is occasionally a whole stack trace; callers with their own enclosing
+ * line budget (Events) may pass a different ceiling.
  */
 const MAX_MESSAGE_CHARS = 200;
 
@@ -47,12 +48,12 @@ const MAX_MESSAGE_CHARS = 200;
  * redactor that scans anywhere in a line, which is a change to the sanitization layer for every
  * caller — not something to invent inside one renderer.
  */
-export function safeText(raw: string | undefined): string | undefined {
+export function safeText(raw: string | undefined, maxChars = MAX_MESSAGE_CHARS): string | undefined {
   if (!raw) return undefined;
   const { text } = redactDocument(raw);
   const flat = text.replace(/\s+/g, " ").trim();
   if (!flat) return undefined;
-  return flat.length > MAX_MESSAGE_CHARS ? flat.slice(0, MAX_MESSAGE_CHARS - 1) + "…" : flat;
+  return flat.length > maxChars ? flat.slice(0, maxChars - 1) + "…" : flat;
 }
 
 // ── Reading values out of a fetched object ──────────────────────────

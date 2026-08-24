@@ -2051,6 +2051,7 @@ describe("a bounded server-side selector satisfies the bulk-output rule", () => 
       "kubectl get pods -A --field-selector=spec.nodeName=node-1 -o json",
       "kubectl get pods -A --field-selector spec.nodeName=n1,status.phase=Running -o json",
       "kubectl get pods -A --field-selector metadata.name=mypod -o yaml",
+      "kubectl get events -A --field-selector involvedObject.uid=123e4567-e89b-12d3-a456-426614174000 -o json",
     ]) {
       expect(check(cmd), cmd).toBeNull();
     }
