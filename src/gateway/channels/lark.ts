@@ -1860,6 +1860,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     sessionId,
     modelProvider: modelBinding?.modelProvider,
     modelId: modelBinding?.modelId,
+    releaseId: modelBinding?.releaseId,
+    modelFingerprint: modelBinding?.modelFingerprint,
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
     systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,

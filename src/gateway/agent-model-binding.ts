@@ -9,6 +9,10 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
 
 export interface ResolvedModelBinding {
+  /** Effective Agent Type Release selected by the control plane. */
+  releaseId?: string;
+  /** Digest of the immutable model snapshot in that Release. */
+  modelFingerprint?: string;
   modelProvider: string;
   modelId: string;
   modelConfig: {

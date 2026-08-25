@@ -43,6 +43,10 @@ export interface PromptOptions {
   modelProvider?: string;
   /** Model ID to use for this prompt */
   modelId?: string;
+  /** Effective immutable release identity for runtime observation. */
+  releaseId?: string;
+  /** Fingerprint of the release model snapshot for runtime observation. */
+  modelFingerprint?: string;
   /** Agent ID (for logging/context) */
   agentId?: string;
   /** Custom system prompt template from agent settings */

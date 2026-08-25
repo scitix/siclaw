@@ -287,6 +287,8 @@ export class TaskCoordinator {
         agentId,
         modelProvider: binding.modelProvider,
         modelId: binding.modelId,
+        releaseId: binding.releaseId,
+        modelFingerprint: binding.modelFingerprint,
         modelConfig: binding.modelConfig,
         modelRouting: binding.modelRouting,
         systemPromptTemplate: binding.systemPrompt ?? undefined,

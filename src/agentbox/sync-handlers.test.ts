@@ -10,6 +10,7 @@ import {
   createToolsHandler,
   knowledgeHandler,
   mcpHandler,
+  modelHandler,
   promptHandler,
   readBoxSyncStatus,
   skillsHandler,
@@ -289,6 +290,20 @@ describe("promptHandler.postReload", () => {
     await expect(promptHandler.fetch(null)).resolves.toBeNull();
     await expect(promptHandler.materialize(null)).resolves.toBe(0);
     await promptHandler.postReload!({
+      sessions: [{ id: "s1", brain: dummyBrain, invalidate }],
+    });
+    expect(invalidate).toHaveBeenCalledOnce();
+  });
+});
+
+describe("modelHandler.postReload", () => {
+  const dummyBrain = { reload: async () => {} };
+
+  it("invalidates warm sessions without fetching secrets or local state", async () => {
+    const invalidate = vi.fn();
+    await expect(modelHandler.fetch(null)).resolves.toBeNull();
+    await expect(modelHandler.materialize(null)).resolves.toBe(0);
+    await modelHandler.postReload!({
       sessions: [{ id: "s1", brain: dummyBrain, invalidate }],
     });
     expect(invalidate).toHaveBeenCalledOnce();

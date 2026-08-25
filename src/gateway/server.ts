@@ -788,6 +788,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       agentId,
       modelProvider: params.modelProvider as string | undefined,
       modelId: params.modelId as string | undefined,
+      releaseId: params.releaseId as string | undefined,
+      modelFingerprint: params.modelFingerprint as string | undefined,
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
       origin: origin as PromptOptions["origin"],
@@ -2029,6 +2031,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // omits `resources` for its legacy all-bindings refresh; including prompt
     // here would rebuild every warm brain for unrelated binding changes.
     const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge"];
+    const wantsModel = resourceTypes.includes("model");
+    const expectedReleaseId = params.releaseId as string | undefined;
+    const expectedModelFingerprint = params.modelFingerprint as string | undefined;
+    let preparedReleaseId = "";
+    let preparedModelFingerprint = "";
+    if (wantsModel) {
+      const binding = await resolveAgentModelBinding(agentId, frontendClient);
+      if (!binding) throw new Error(`model binding unavailable for agent ${agentId}`);
+      preparedReleaseId = binding.releaseId ?? "";
+      preparedModelFingerprint = binding.modelFingerprint ?? "";
+      if (expectedReleaseId && preparedReleaseId !== expectedReleaseId) {
+        throw new Error(`model binding release ${preparedReleaseId || "<empty>"} does not match expected ${expectedReleaseId}`);
+      }
+      if (expectedModelFingerprint && preparedModelFingerprint !== expectedModelFingerprint) {
+        throw new Error(`model binding fingerprint ${preparedModelFingerprint || "<empty>"} does not match expected ${expectedModelFingerprint}`);
+      }
+    }
 
     const boxes = await agentBoxManager.list();
     // Only "running" boxes are reachable — Pending/Terminating/Succeeded/Failed
@@ -2039,7 +2058,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     if (targets.length === 0) {
       console.log(`[rpc] agent.reload: no active boxes for agent=${agentId}, skipping`);
-      return { ok: true, reloaded: [], skipped: resourceTypes, boxes: 0 };
+      return {
+        ok: true, reloaded: [], skipped: resourceTypes, boxes: 0,
+        preparedReleaseId, preparedModelFingerprint,
+      };
     }
 
     // Fan out across boxes AND resource types concurrently so one slow box
@@ -2067,7 +2089,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const reloaded = Array.from(reloadedSet);
     const failed = Array.from(failedSet);
     console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
-    return { ok: true, reloaded, failed, boxes: targets.length };
+    return {
+      ok: true, reloaded, failed, boxes: targets.length,
+      preparedReleaseId, preparedModelFingerprint,
+    };
   });
 
   // agent.syncStatus — read the box's observed inventory. Reload ACK only
@@ -2095,6 +2120,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           knowledge: status.knowledge ?? { syncedAt: null, repos: [] },
           skills: status.skills ?? { names: [] },
           mcp: status.mcp ?? { names: [] },
+          model: status.model ?? null,
         };
       } catch (err: any) {
         const message = String(err?.message ?? err);

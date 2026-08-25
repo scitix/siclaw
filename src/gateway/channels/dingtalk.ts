@@ -365,6 +365,8 @@ export async function handleDingTalkMessage(
     sessionId,
     modelProvider: modelBinding?.modelProvider,
     modelId: modelBinding?.modelId,
+    releaseId: modelBinding?.releaseId,
+    modelFingerprint: modelBinding?.modelFingerprint,
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
     systemPromptTemplate,

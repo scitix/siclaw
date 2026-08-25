@@ -20,4 +20,10 @@ export interface BoxSyncStatus {
   };
   skills: { names: string[] };
   mcp: { names: string[] };
+  /** Last release model that completed a successful turn in this box. */
+  model?: {
+    releaseId: string;
+    modelFingerprint: string;
+    observedAt: string;
+  } | null;
 }

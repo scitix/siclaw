@@ -138,6 +138,7 @@ describe("agent.syncStatus RPC", () => {
       },
       skills: { names: ["k8s-debug"] },
       mcp: { names: [] },
+      model: null,
     });
     expect(getJsonCalls).toEqual([{ endpoint: "https://b1", path: "/api/sync-status" }]);
     expect(clientCalls).toEqual([{

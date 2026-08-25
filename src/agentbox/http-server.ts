@@ -35,6 +35,7 @@ import { detectLanguage } from "../shared/detect-language.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import {
   candidateSupportsPromptMedia,
+  candidateKey,
   clearModelRouteUserSelectionIfDifferent,
   filterCandidatesForPromptMedia,
   markModelRouteUserSelection,
@@ -78,6 +79,8 @@ interface PromptRequestBody {
   delegation?: DelegationContext;
   modelProvider?: string;
   modelId?: string;
+  releaseId?: string;
+  modelFingerprint?: string;
   systemPromptTemplate?: string;
   modelConfig?: Record<string, unknown>;
   modelRouting?: ModelRoutePolicy;
@@ -612,6 +615,10 @@ export function createHttpServer(
   // request routing would silently pick the wrong broker. We instead bind
   // these handlers per-httpServer and hand them to the route loop below.
   const perServerHandlers: Partial<Record<GatewaySyncType, AgentBoxSyncHandler<any>>> = {};
+  // Updated only after a turn completes successfully. A reload ACK means the
+  // next turn is prepared; this state is the stronger evidence that a box has
+  // actually run with the published model binding.
+  let observedModel: { releaseId: string; modelFingerprint: string; observedAt: string } | null = null;
   if (sessionManager.credentialBroker) {
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
@@ -745,10 +752,13 @@ export function createHttpServer(
    * intended to send.
    */
   addRoute("GET", "/api/sync-status", async (_req, res) => {
-    sendJson(res, 200, readBoxSyncStatus({
-      knowledgeDir: sessionManager.knowledgeDir,
-      knowledgeHandler: perServerKnowledgeHandler,
-    }));
+    sendJson(res, 200, {
+      ...readBoxSyncStatus({
+        knowledgeDir: sessionManager.knowledgeDir,
+        knowledgeHandler: perServerKnowledgeHandler,
+      }),
+      model: observedModel,
+    });
   });
 
   /**
@@ -1208,6 +1218,18 @@ export function createHttpServer(
       } else {
         console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
         promptOutcome = "completed";
+        const intendedCandidate = body.modelProvider && body.modelId
+          ? candidateKey({ provider: body.modelProvider, modelId: body.modelId })
+          : undefined;
+        const ranIntendedModel = intendedCandidate !== undefined
+          && result?.activeCandidateKey === intendedCandidate;
+        if (ranIntendedModel && body.releaseId && body.modelFingerprint) {
+          observedModel = {
+            releaseId: body.releaseId,
+            modelFingerprint: body.modelFingerprint,
+            observedAt: new Date().toISOString(),
+          };
+        }
       }
       onPromptFinish();
     }).catch((err) => {
