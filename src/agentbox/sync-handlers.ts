@@ -106,6 +106,27 @@ export const promptHandler: AgentBoxSyncHandler<null> = {
   },
 };
 
+// ── Model handler ────────────────────────────────────────────────────
+
+/**
+ * Model bindings are resolved by the Gateway for every prompt. Invalidating
+ * the warm brain makes the next turn rebuild with the just-published Release,
+ * including provider configuration and credentials. Session invalidation is
+ * turn-safe: a currently running prompt completes on the old Release.
+ */
+export const modelHandler: AgentBoxSyncHandler<null> = {
+  type: "model",
+  async fetch(): Promise<null> {
+    return null;
+  },
+  async materialize(): Promise<number> {
+    return 0;
+  },
+  async postReload(context: ReloadContext): Promise<void> {
+    invalidateSessions(context);
+  },
+};
+
 // ── Skills helpers ────────────────────────────────────────────────────
 
 /** Write a single skill (specs + scripts) into the resolved directory */
@@ -718,11 +739,12 @@ const handlers = new Map<GatewaySyncType, AgentBoxSyncHandler<any>>([
   ["skills", skillsHandler],
   ["knowledge", knowledgeHandler],
   ["prompt", promptHandler],
+  ["model", modelHandler],
 ]);
 
 /**
- * Look up the static handler for a given sync type. MCP, skills, knowledge and
- * prompt are process-global and carry no per-box broker state.
+ * Look up the static handler for a given sync type. MCP, skills, knowledge,
+ * prompt and model are process-global and carry no per-box broker state.
  *
  * cluster/host handlers are NOT registered in this map: each AgentBox
  * httpServer constructs its own factory-bound instance (closing over

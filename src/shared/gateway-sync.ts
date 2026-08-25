@@ -15,7 +15,7 @@
 // ── Scalar types ──────────────────────────────────────────────────────
 
 /** Every syncable type is identified by a well-known key. */
-export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge" | "tools" | "prompt";
+export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge" | "tools" | "prompt" | "model";
 
 // ── Config / descriptor interfaces ────────────────────────────────────
 
@@ -193,6 +193,17 @@ export const GATEWAY_SYNC_DESCRIPTORS: Record<GatewaySyncType, GatewaySyncDescri
     // There is no prompt payload to sync at startup. Each message already
     // resolves the latest prompt through config.getAgent; reload only evicts
     // warm sessions so the next turn rebuilds immediately.
+    initialSync: false,
+  },
+  model: {
+    type: "model",
+    gatewayPath: "",
+    reloadPath: "/api/reload-model",
+    retry: { maxRetries: 1, baseDelayMs: 1000 },
+    requiresGatewayClient: false,
+    // Model credentials and provider config continue to resolve per message.
+    // Reload is an identity-bound session invalidation, not a secret-bearing
+    // payload sync.
     initialSync: false,
   },
 };

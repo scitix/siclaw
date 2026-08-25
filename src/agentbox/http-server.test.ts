@@ -359,6 +359,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
         },
         skills: { names: ["k8s-debug"] },
         mcp: { names: ["incidents"] },
+        model: null,
       });
     } finally {
       mockConfigState.knowledgeDir = "knowledge";
@@ -366,6 +367,63 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       mockConfigState.mcpServers = {};
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("reports a release model only after a successful turn completes", async () => {
+    const session = await sm.getOrCreate("observed-model");
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const before = await getJson(port, "/api/sync-status");
+    expect(before.data.model).toBeNull();
+
+    const prompt = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "observed-model",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      releaseId: "release-2",
+      modelFingerprint: "fingerprint-2",
+    });
+    expect(prompt.status).toBe(200);
+    await flushAsync();
+
+    const after = await getJson(port, "/api/sync-status");
+    expect(after.data.model).toMatchObject({
+      releaseId: "release-2",
+      modelFingerprint: "fingerprint-2",
+    });
+    expect(new Date(after.data.model.observedAt).toString()).not.toBe("Invalid Date");
+  });
+
+  it("does not verify the release model when a fallback answered the turn", async () => {
+    const session = await sm.getOrCreate("observed-fallback");
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+    const prompt = await getJson(port, "/api/prompt", "POST", {
+      text: "hi", sessionId: "observed-fallback",
+      modelProvider: "missing-provider", modelId: "missing-model",
+      modelConfig: modelConfigWithInput(["text"]),
+      releaseId: "release-2", modelFingerprint: "fingerprint-2",
+      modelRouting: {
+        enabled: true, strategy: "ordered_fallback",
+        candidates: [
+          { provider: "missing-provider", modelId: "missing-model", modelConfig: modelConfigWithInput(["text"]) },
+          { provider: "anthropic", modelId: "claude" },
+        ],
+      },
+    });
+    expect(prompt.status).toBe(200);
+    await flushAsync();
+    expect((await getJson(port, "/api/sync-status")).data.model).toBeNull();
   });
 
   it("GET /api/internal/box-status reports drained when the box holds nothing", async () => {

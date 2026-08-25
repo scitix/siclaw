@@ -14,9 +14,10 @@ describe("GATEWAY_SYNC_DESCRIPTORS", () => {
     "knowledge",
     "tools",
     "prompt",
+    "model",
   ];
 
-  it("contains exactly the seven expected syncable types", () => {
+  it("contains exactly the eight expected syncable types", () => {
     const actual = Object.keys(GATEWAY_SYNC_DESCRIPTORS).sort();
     expect(actual).toEqual([...expectedTypes].sort());
   });
@@ -100,6 +101,14 @@ describe("GATEWAY_SYNC_DESCRIPTORS", () => {
     expect(d.initialSync).toBe(false);
     expect(d.gatewayPath).toBe("");
     expect(d.reloadPath).toBe("/api/reload-prompt");
+  });
+
+  it("model: rebuilds sessions without transporting credentials", () => {
+    const d = GATEWAY_SYNC_DESCRIPTORS.model;
+    expect(d.requiresGatewayClient).toBe(false);
+    expect(d.initialSync).toBe(false);
+    expect(d.gatewayPath).toBe("");
+    expect(d.reloadPath).toBe("/api/reload-model");
   });
 
   it("all reload paths are unique", () => {

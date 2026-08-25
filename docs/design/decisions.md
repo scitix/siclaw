@@ -559,3 +559,50 @@ than profile) must not be evicted while it is still running.
   the old (richer) payload by ignoring the extra fields.
 
 **Files**: `src/gateway/metrics-aggregator.ts`, `src/shared/metrics-types.ts`, `src/agentbox/http-server.ts`, `src/gateway/server.ts`, `src/portal/siclaw-api.ts`, `portal-web/src/hooks/useMetrics.ts`
+
+---
+
+## ADR-015: Agent Type Releases Apply at Turn Boundaries
+
+**Status**: Active
+
+**Context**:
+An external management server can move an Agent Type's production Release while
+existing AgentBoxes and sessions are warm. Skills, MCP, knowledge, prompt, and
+model configuration belong to one immutable Release, but replacing a model in
+the middle of an in-flight turn would make one turn span two configurations.
+Treating a generic reload ACK as proof that a particular model was prepared also
+allows stale or unrelated Release notifications to report success.
+
+**Decision**:
+Release application is identity-bound and happens at a turn boundary:
+
+- A release reload carries the expected `releaseId` and `modelFingerprint`.
+- Runtime resolves the current binding from the management server and rejects a
+  notification whose observed identity does not match the expected identity.
+- `model` is a reload type whose AgentBox action invalidates warm sessions. The
+  existing invalidation fence lets an in-flight turn finish and rebuilds the
+  session before its next prompt.
+- The next prompt remains the only carrier of provider credentials and model
+  configuration. Reload notifications carry identity, never secrets.
+- Runtime reports the observed Release identity and number of reached boxes.
+  Zero boxes means cold-start convergence, not runtime model verification.
+- A reload ACK proves preparation only. AgentBox records an observed release
+  and model fingerprint after a real turn completes successfully; only that
+  observed inventory can satisfy management-server runtime verification.
+
+**Consequences**:
+
+- ✅ Existing Agents switch models without a Pod restart on their next turn.
+- ✅ A turn never mixes model configurations.
+- ✅ Reload events are safe to retry and stale Release ACKs are detectable.
+- ✅ Provider credentials stay on the established prompt/config channel.
+- ⚠️ "Published" and "applied to an online box" are distinct states.
+- ⚠️ "Prepared for next turn" and "successfully ran a turn" are distinct
+  states; promotion gates consume only the latter.
+- ⚠️ Management servers predating this contract must keep model deliveries
+  pending while an older Runtime is deployed; rolling upgrades should deploy
+  Runtime support before relying on verified model delivery.
+
+**Files**: `src/shared/gateway-sync.ts`, `src/gateway/server.ts`,
+`src/gateway/agent-model-binding.ts`, `src/agentbox/sync-handlers.ts`
