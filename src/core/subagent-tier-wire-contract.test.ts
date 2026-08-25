@@ -134,6 +134,37 @@ describe("tier menu wire contract", () => {
   });
 });
 
+describe("the golden fixture is byte-pinned so cross-repo drift is detectable", () => {
+  /**
+   * Digest of the fixture as it stands. Changing the fixture fails this, and the
+   * failure IS the reminder: the other implementation holds a copy, and a contract
+   * change has to be propagated deliberately rather than noticed in production.
+   *
+   * Update this value in the same commit that changes the fixture, and say in the
+   * commit message that the other side needs the same bytes.
+   */
+  const EXPECTED_SHA256 = "8cc4d0dfe1c5f356e6841763caa3b09ac257ea8b54366b73869910f3a1952fd8";
+
+  it("has not drifted without the digest being updated", () => {
+    const bytes = fs.readFileSync(
+      path.join(path.dirname(url.fileURLToPath(import.meta.url)), "__fixtures__/subagent-tier-wire.golden.json"),
+    );
+    const actual = crypto.createHash("sha256").update(bytes).digest("hex");
+    expect(
+      actual,
+      "fixture changed — update EXPECTED_SHA256 and propagate the same bytes to the other implementation",
+    ).toBe(EXPECTED_SHA256);
+  });
+
+  it("does not try to carry its own digest", () => {
+    // Deliberately absent: a digest over the whole file cannot live inside it —
+    // adding the field changes the bytes it is supposed to describe. The value is
+    // published HERE and in the fixture's header comment, and the other side
+    // verifies its copy by hashing the file and comparing against it.
+    expect(Object.keys(golden).some((k) => k.toLowerCase().includes("sha"))).toBe(false);
+  });
+});
+
 describe("the golden fixture matches what this implementation enforces", () => {
   // The fixture states the rules as DATA so neither implementation can quietly
   // relax one. If a constant here moves, this fails and the fixture (and the

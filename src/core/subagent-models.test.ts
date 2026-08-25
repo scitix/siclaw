@@ -9,6 +9,8 @@ import {
   normalizeSubagentTierMenu,
   persistableTierOutcome,
   renderTierMenuForDescription,
+  sanitizeWireItemStatuses,
+  sanitizeWireTierOutcome,
   resolveTierSelection,
   type SubagentTierCandidates,
   type SubagentTierMenu,
@@ -337,6 +339,78 @@ describe("persistableTierOutcome", () => {
       source: "type_default",
     });
     expect(projected).toEqual({ resolvedTier: "deep", source: "type_default" });
+  });
+});
+
+describe("sanitizeWireTierOutcome (runtime allow-list)", () => {
+  it("keeps only the allow-listed keys, dropping anything else", () => {
+    // The producer-side projection is compile-time; this is the consumer-side
+    // runtime one. An HTTP boundary types its body by ASSERTION, which strips
+    // nothing, so without this a caller could write credentials into a durable
+    // record just by including them.
+    const result = sanitizeWireTierOutcome({
+      requestedTier: "fast",
+      resolvedTier: "fast",
+      source: "request",
+      provider: "p",
+      modelId: "m",
+      fallbackReason: "unknown_tier",
+      modelConfig: { apiKey: "sk-leak" },
+      apiKey: "sk-leak-2",
+      detail: "internal",
+      extra: 1,
+    });
+
+    expect(result).toEqual({
+      requestedTier: "fast",
+      resolvedTier: "fast",
+      source: "request",
+      provider: "p",
+      modelId: "m",
+      fallbackReason: "unknown_tier",
+    });
+    expect(JSON.stringify(result)).not.toContain("sk-leak");
+  });
+
+  it("accepts strings only — a nested object is a smuggling attempt, not a value", () => {
+    const result = sanitizeWireTierOutcome({
+      source: "request",
+      provider: { nested: "object" },
+      modelId: ["array"],
+      resolvedTier: 42,
+    });
+    expect(result).toEqual({ source: "request" });
+  });
+
+  it("returns undefined without a usable source, and for non-objects", () => {
+    // `source` is what makes the record meaningful; without it there is nothing
+    // to report.
+    expect(sanitizeWireTierOutcome({ provider: "p" })).toBeUndefined();
+    expect(sanitizeWireTierOutcome({ source: "" })).toBeUndefined();
+    for (const raw of [null, undefined, 42, "tier", []]) {
+      expect(sanitizeWireTierOutcome(raw)).toBeUndefined();
+    }
+  });
+
+  it("sanitizes each item inside a group snapshot and skips malformed entries", () => {
+    const result = sanitizeWireItemStatuses([
+      { index: 0, status: "done", tier: { source: "env", modelConfig: { apiKey: "sk-leak" } } },
+      { index: 1, status: "skipped" },
+      { status: "missing index" },
+      "not an object",
+      { index: 2, status: 99 },
+    ]);
+
+    expect(result).toEqual([
+      { index: 0, status: "done", tier: { source: "env" } },
+      { index: 1, status: "skipped" },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("sk-leak");
+  });
+
+  it("returns undefined for a non-array snapshot", () => {
+    expect(sanitizeWireItemStatuses({ nope: true })).toBeUndefined();
+    expect(sanitizeWireItemStatuses(null)).toBeUndefined();
   });
 });
 

@@ -19,7 +19,20 @@
     "deploy-order note in docs/design/subagent-model-tiering.md applies.",
     "",
     "Copy this file into the other repository verbatim rather than transcribing",
-    "it — a transcription is exactly the step where a spelling drifts."
+    "it — a transcription is exactly the step where a spelling drifts.",
+    "",
+    "VERIFYING A COPY: hash the whole file (sha256) and compare against",
+    "EXPECTED_SHA256 in subagent-tier-wire-contract.test.ts. That constant is",
+    "byte-pinned by a test here, so this file cannot change without someone",
+    "updating the digest — which is the moment to propagate the new bytes.",
+    "The digest is not stored in this file: a hash over the whole file cannot",
+    "live inside it.",
+    "",
+    "As of this writing the two repositories hold DIFFERENT fixtures with",
+    "different top-level structure. Runtime happens to work because the consumer",
+    "tolerates both spellings, but nothing prevents future drift. Picking one",
+    "authoritative copy is a cross-repository decision that has not been made;",
+    "this file is a candidate, not a declaration that it won."
   ],
 
   "projectedMenu": {

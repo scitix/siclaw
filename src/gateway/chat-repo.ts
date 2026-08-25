@@ -9,7 +9,11 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type { GroupItemStatus } from "../core/tool-registry.js";
-import type { PersistedTierOutcome } from "../core/subagent-models.js";
+import {
+  sanitizeWireItemStatuses,
+  sanitizeWireTierOutcome,
+  type PersistedTierOutcome,
+} from "../core/subagent-models.js";
 
 export interface ChatSessionLineageInput {
   /** Parent chat session for delegated child sessions. Null/undefined for normal top-level chat. */
@@ -311,11 +315,17 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
     ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
     ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
     ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
-    ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
-    // Second copy of the same projection (this one is the direct-DB path). A field
-    // added to only one of the two is persisted on some deployments and silently
-    // dropped on others.
-    ...(evt.tier ? { tier: evt.tier } : {}),
+    // Sanitized through the SAME allow-list the RPC path uses — see internal-api.
+    // This is the direct-DB path, and a field handled in only one of the two is
+    // persisted on some deployments and dropped on others.
+    ...(() => {
+      const items = sanitizeWireItemStatuses(evt.itemStatuses);
+      return items ? { item_statuses: items } : {};
+    })(),
+    ...(() => {
+      const tier = sanitizeWireTierOutcome(evt.tier);
+      return tier ? { tier } : {};
+    })(),
   };
 
   return appendMessage({

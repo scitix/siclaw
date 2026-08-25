@@ -26,7 +26,11 @@ import {
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
-import { projectTierMenuFromConfig } from "../core/subagent-models.js";
+import {
+  projectTierMenuFromConfig,
+  sanitizeWireItemStatuses,
+  sanitizeWireTierOutcome,
+} from "../core/subagent-models.js";
 import { sha256Hex } from "../portal/model-routing-config.js";
 import { requireAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
 import type {
@@ -600,18 +604,22 @@ async function appendDelegationEvent(
     ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
     ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
     ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
-    // Group terminal event: per-item status snapshot so the frontend can render never-persisted
-    // (skipped) items on reload instead of the live-only "running" fallback.
-    ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
-    // Single-child terminal event: which model ran it and why (identifiers only).
+    // ⚠️ Both of these are SANITIZED, not copied. This runs on an HTTP boundary
+    // whose body is typed by assertion, which strips nothing — a payload carrying
+    // `modelConfig`, `apiKey` or an internal `detail` would otherwise be written
+    // to a durable record verbatim. The allow-list lives in one place so this path
+    // and the direct-DB one cannot diverge.
     //
-    // ⚠️ Every field the AgentBox sends has to be copied HERE to survive. A group's
-    // tier outcome travels inside `item_statuses` and so was already persisted,
-    // which made the single-child gap invisible — the AgentBox was emitting the
-    // field and nothing downstream stored it. For a DETACHED single spawn this
-    // event is the only surviving record, so dropping it here loses the answer
-    // entirely.
-    ...(evt.tier ? { tier: evt.tier } : {}),
+    // A group's tier outcome rides inside `item_statuses`; a single child's is its
+    // own field, and for a DETACHED spawn that event is the only surviving record.
+    ...(() => {
+      const items = sanitizeWireItemStatuses(evt.itemStatuses);
+      return items ? { item_statuses: items } : {};
+    })(),
+    ...(() => {
+      const tier = sanitizeWireTierOutcome(evt.tier);
+      return tier ? { tier } : {};
+    })(),
   };
 
   return appendDelegationMessage(frontendClient, {

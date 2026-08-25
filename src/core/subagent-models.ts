@@ -557,6 +557,67 @@ export function persistableTierOutcome(outcome: ChildModelOutcome): PersistedTie
   };
 }
 
+/** The only keys allowed to reach storage. Anything else is dropped, silently. */
+const PERSISTED_TIER_KEYS = [
+  "requestedTier",
+  "resolvedTier",
+  "source",
+  "provider",
+  "modelId",
+  "fallbackReason",
+] as const;
+
+/**
+ * Sanitize a tier outcome that arrived over the WIRE, keeping only the allowed
+ * keys and only string values.
+ *
+ * `persistableTierOutcome` above is a compile-time projection applied by the
+ * producer; this is the runtime one applied by the consumer, and both are needed
+ * for different reasons. An HTTP boundary types its body with an assertion, which
+ * strips nothing: a payload carrying `modelConfig`, `apiKey` or an internal
+ * `detail` string reaches the persistence layer intact and gets written. Trusting
+ * the producer here would mean the durable record's contents depend on a caller
+ * we do not control.
+ *
+ * Allow-list rather than deny-list on purpose — a new credential-bearing field
+ * added upstream is then dropped by default instead of being persisted until
+ * someone remembers to exclude it.
+ */
+export function sanitizeWireTierOutcome(raw: unknown): PersistedTierOutcome | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const key of PERSISTED_TIER_KEYS) {
+    const value = raw[key];
+    // Strings only: these are identifiers and enum-ish reasons, so a nested object
+    // here is either a mistake or an attempt to smuggle structure through.
+    if (typeof value === "string" && value !== "") out[key] = value;
+  }
+  if (out.source === undefined) return undefined;
+  return out as unknown as PersistedTierOutcome;
+}
+
+/**
+ * Sanitize a group's per-item snapshot, including each item's tier outcome.
+ *
+ * `index` and `status` pass through as-is (numbers/strings the UI needs); the tier
+ * half goes through the same allow-list as a single child's.
+ */
+export function sanitizeWireItemStatuses(
+  raw: unknown,
+): Array<{ index: number; status: string; tier?: PersistedTierOutcome }> | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: Array<{ index: number; status: string; tier?: PersistedTierOutcome }> = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) continue;
+    const index = typeof entry.index === "number" ? entry.index : undefined;
+    const status = typeof entry.status === "string" ? entry.status : undefined;
+    if (index === undefined || status === undefined) continue;
+    const tier = sanitizeWireTierOutcome(entry.tier);
+    out.push({ index, status, ...(tier ? { tier } : {}) });
+  }
+  return out;
+}
+
 /** What actually happened when a child was put on a model. Feeds the per-item report. */
 export interface ChildModelOutcome {
   requestedTier: string | null;

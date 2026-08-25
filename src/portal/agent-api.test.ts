@@ -645,19 +645,24 @@ describe("registerAgentRoutes", () => {
 
     it("does not reload tools when the tier list is not supplied at all", async () => {
       // The other half: an unrelated edit must not kick warm sessions.
+      //
+      // `description` is not in the needs-current-state set, so this request reads
+      // NO current row — only UPDATE + select-back. An earlier version of this
+      // test mocked a current-state read that never happens, which desynchronised
+      // every later mock and made the request throw; with no status assertion it
+      // passed anyway. Asserting 200 is what makes "no reload" mean "the request
+      // succeeded and chose not to reload" instead of "the request died early".
       query
-        .mockResolvedValueOnce([[{
-          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
-        }], []])
-        .mockResolvedValueOnce([undefined, []])
-        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+        .mockResolvedValueOnce([undefined, []])                       // UPDATE
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);      // select-back
 
-      await runRoute(router, fakeReq({
+      const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1",
         method: "PUT",
         body: { description: "just a rename" },
       }));
 
+      expect(status).toBe(200);
       expect(connMap.notify).not.toHaveBeenCalledWith("a1", "agent.reload", expect.anything());
     });
 

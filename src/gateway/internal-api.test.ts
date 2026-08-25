@@ -673,6 +673,13 @@ describe("handleDelegationEvents", () => {
             source: "request",
             provider: "p",
             modelId: "m",
+            // Fields the producer would never send, present HERE precisely so the
+            // assertion below tests the FILTER rather than the input. An earlier
+            // version of this test passed a clean object and asserted "no apiKey",
+            // which proved nothing.
+            modelConfig: { apiKey: "sk-must-not-persist", baseUrl: "https://leak.invalid" },
+            detail: "internal diagnostic text",
+            apiKey: "sk-also-must-not-persist",
           },
         },
       }))),
@@ -684,7 +691,11 @@ describe("handleDelegationEvents", () => {
     expect(res.statusCode).toBe(200);
     const append = frontend.calls.find((c) => c.method === "chat.appendMessage");
     expect(append).toBeDefined();
-    const metadata = JSON.parse((append!.params as { metadata: string }).metadata);
+    const raw = (append!.params as { metadata: string }).metadata;
+    const metadata = JSON.parse(raw);
+
+    // Exactly the allow-listed keys — nothing more, so a new field upstream is
+    // dropped by default rather than persisted until someone excludes it.
     expect(metadata.tier).toEqual({
       requestedTier: "fast",
       resolvedTier: "fast",
@@ -692,8 +703,59 @@ describe("handleDelegationEvents", () => {
       provider: "p",
       modelId: "m",
     });
-    // Identifiers only — a credential must never reach a persisted record.
-    expect((append!.params as { metadata: string }).metadata).not.toContain("apiKey");
+    // The HTTP boundary types its body by assertion, which strips nothing — so
+    // this is what stops a caller writing credentials into a durable record.
+    expect(raw).not.toContain("apiKey");
+    expect(raw).not.toContain("sk-must-not-persist");
+    expect(raw).not.toContain("leak.invalid");
+    expect(raw).not.toContain("internal diagnostic text");
+  });
+
+  it("sanitizes a group's per-item tier outcomes too", async () => {
+    // Same allow-list, applied inside item_statuses — the group path was already
+    // persisting this field before the single-child one existed, so it needs the
+    // same guard rather than inheriting trust from being older.
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.append_event",
+        event: {
+          parentSessionId: "sess-1",
+          parentAgentId: "agent-1",
+          userId: "u1",
+          delegationId: "group-1",
+          childSessionId: "",
+          targetAgentId: "agent-1",
+          status: "done",
+          capsule: "batch done",
+          itemStatuses: [
+            {
+              index: 0,
+              status: "done",
+              tier: {
+                source: "request",
+                resolvedTier: "fast",
+                modelConfig: { apiKey: "sk-group-leak" },
+              },
+            },
+            { index: 1, status: "skipped" },
+          ],
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const append = frontend.calls.find((c) => c.method === "chat.appendMessage");
+    const raw = (append!.params as { metadata: string }).metadata;
+    const metadata = JSON.parse(raw);
+
+    expect(metadata.item_statuses[0].tier).toEqual({ source: "request", resolvedTier: "fast" });
+    expect(metadata.item_statuses[1]).toEqual({ index: 1, status: "skipped" });
+    expect(raw).not.toContain("sk-group-leak");
   });
 
   it("delivers background assistant messages to a registered channel even when Portal has no chat session", async () => {
