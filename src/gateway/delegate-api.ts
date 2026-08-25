@@ -117,6 +117,33 @@ function markDelegationSettled(delegationId: string): void {
   }
 }
 
+/** A 32-hex OTel trace id, and not the all-zero sentinel. */
+function isWireTraceId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) && !/^0+$/.test(value);
+}
+
+/**
+ * The trace id the PEER's recorder will actually end up using — mirroring `startPrompt`'s
+ * precedence, deliberately, so a row is never bound to an id no span carries.
+ *
+ * The precedence is not obvious and getting it wrong is silent: when a `parentSpanContext` is
+ * present the peer's root span nests under it and therefore inherits ITS trace id, so the separate
+ * `traceId` field is ignored for the span — and the DB id is read back off that span
+ * (`root.spanContext().traceId`). A sender that binds its row to `traceId` while the span used the
+ * parent's would split the delegation across two traces, which is the exact defect C3 exists to
+ * remove, reached by a different route.
+ *
+ * Returns undefined when neither is usable. Leaving the row UNBOUND is correct then: the peer's
+ * recorder will generate an id we never see, and binding to a guess is worse than binding to
+ * nothing — a NULL says "unknown", a wrong id says something false.
+ */
+export function peerEffectiveTraceId(traceId: unknown, parentSpanContext: unknown): string | undefined {
+  const parentTraceId = (parentSpanContext as { traceId?: unknown } | undefined)?.traceId;
+  if (isWireTraceId(parentTraceId)) return parentTraceId;
+  if (isWireTraceId(traceId)) return traceId;
+  return undefined;
+}
+
 /** Whether a control frame for this delegation was already consumed to completion. */
 export function isDelegationSettled(delegationId: string): boolean {
   return settledDelegations.has(delegationId);
@@ -668,8 +695,9 @@ export async function handleDelegate(
       // so both ends land in the coordinator's trace. If the target is old enough not to adopt it,
       // its rows carry a different id and the delegation is ungroupable — the same shortfall as
       // before this change, not a new one.
-      if (delegatedUserMessageId && body.traceId) {
-        void bindMessageTraceId(delegatedUserMessageId, peerSessionId, body.traceId).catch((bindErr) => {
+      const remoteTraceId = peerEffectiveTraceId(body.traceId, body.parentSpanContext);
+      if (delegatedUserMessageId && remoteTraceId) {
+        void bindMessageTraceId(delegatedUserMessageId, peerSessionId, remoteTraceId).catch((bindErr) => {
           console.warn("[delegate-api] failed to bind trace id to the delegated user row:", bindErr);
         });
       }
@@ -756,7 +784,10 @@ export async function handleDelegate(
     // one it generated when none was supplied or tracing could not attach. Prefer it over what we
     // sent: it is what the peer's spans actually carry, so using it keeps rows and spans agreeing
     // even against a box that did not adopt.
-    const peerTraceId = promptResult.traceId ?? body.traceId;
+    // The ack is authoritative when present — it is the id the box actually used. Otherwise fall
+    // back to the SAME precedence the peer's recorder applies (parentSpanContext wins over
+    // traceId), so both delegation paths bind to the id the spans really carry.
+    const peerTraceId = promptResult.traceId ?? peerEffectiveTraceId(body.traceId, body.parentSpanContext);
     if (delegatedUserMessageId) {
       void bindMessageTraceId(delegatedUserMessageId, promptResult.sessionId, peerTraceId).catch((bindErr) => {
         console.warn("[delegate-api] failed to bind trace id to the delegated user row:", bindErr);

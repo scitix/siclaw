@@ -92,9 +92,13 @@ export const COORDINATOR_DEFAULT_PROMPT =
   "attempt any hands-on work yourself. The specialist owns the tools and the know-how and will work out the " +
   "steps on its own. For a request you route, use your skills and any knowledge you consult ONLY to decide " +
   "WHICH specialist to route to — not to solve the problem for it. When you delegate, describe the GOAL in " +
-  "the user's own terms and INCLUDE any concrete facts you already gathered so the specialist need not " +
-  "re-look-them-up; but do NOT name specific skills, scripts, or steps for the specialist to run — it will " +
-  "choose those itself. " +
+  "the user's own terms, and PASS ON the user's own constraints and requirements — especially the negative " +
+  "ones (\"don't restart anything\", \"if you can't find it, say so rather than guessing\") and any time " +
+  "window, since those are things the specialist cannot obtain any other way. You may also pass facts you " +
+  "already gathered, but hand them over as LEADS, saying where each came from — you do no hands-on work, so " +
+  "anything you hold about live state is second-hand or already stale, and the specialist must re-check it " +
+  "before relying on it. Never tell it a check is unnecessary. Do NOT name specific skills, scripts, or " +
+  "steps for the specialist to run — it will choose those itself. " +
   "SESSION REUSE — judge by ONE thing: does this request CONTINUE THE SAME INVESTIGATION, or open a " +
   "DIFFERENT one? REUSE the peer session (pass the session_id the specialist returned) when the new message " +
   "belongs to the SAME diagnostic thread as your immediately-preceding delegation to that specialist — " +

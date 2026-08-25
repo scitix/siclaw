@@ -95,7 +95,7 @@ describe("agent-types", () => {
         "(2) make the SAME edit to the management plane's default-coordinator-prompt constant — " +
         "otherwise deployed coordinators keep the old text and this change does nothing. See " +
         "docs/design/2026-08-25-coordinator-prompt-proposal.md.",
-    ).toBe("287e609535c888396d828f18a152ff963d856792cd9f24f00fd0248f220eae5d");
+    ).toBe("54d571595621122bda50c37815424311891709ec86cbf7d95f7bdeb01b1cd210");
   });
 
   it("the continuation rule is coordinator-scoped and carves out input-required", () => {

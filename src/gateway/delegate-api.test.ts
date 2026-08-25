@@ -55,7 +55,7 @@ vi.mock("./agentbox/client.js", () => ({
   },
 }));
 
-import { getRemoteDelegationIdleTimeoutMs, handleDelegate, isDelegationSettled } from "./delegate-api.js";
+import { getRemoteDelegationIdleTimeoutMs, handleDelegate, isDelegationSettled, peerEffectiveTraceId } from "./delegate-api.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 
 // ── Fakes ─────────────────────────────────────────────────────────────
@@ -255,6 +255,34 @@ describe("handleDelegate — trace context forwarding (C3)", () => {
 
     expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: BOX_TRACE }));
     expect(bindMessageTraceId).toHaveBeenCalledWith(expect.any(String), expect.any(String), BOX_TRACE);
+  });
+
+  // The precedence rule is a pure function, pinned directly: driving the cross-Runtime path here
+  // would wait on the remote turn, which is not the subject. startPrompt nests the peer's root
+  // under parentSpanContext when present, so the root inherits THAT trace id and the DB id is read
+  // back off the span — binding the row to the separate `traceId` field would split the delegation
+  // across two traces, the defect C3 removes, reached by another route.
+  it("peerEffectiveTraceId: parentSpanContext wins, and malformed yields nothing", () => {
+    const A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    expect(peerEffectiveTraceId(TRACE, { traceId: A, spanId: SPAN })).toBe(A);
+    expect(peerEffectiveTraceId(TRACE, undefined)).toBe(TRACE);
+    // A malformed parent falls through to traceId rather than poisoning the result.
+    expect(peerEffectiveTraceId(TRACE, { traceId: "nope" })).toBe(TRACE);
+    // Nothing usable means undefined. A NULL trace_id says "unknown"; a wrong one says something false.
+    expect(peerEffectiveTraceId("not-a-trace-id", undefined)).toBeUndefined();
+    expect(peerEffectiveTraceId(undefined, undefined)).toBeUndefined();
+    expect(peerEffectiveTraceId("0".repeat(32), undefined)).toBeUndefined();
+    expect(peerEffectiveTraceId(123, { traceId: 456 })).toBeUndefined();
+  });
+
+  it("leaves the row UNBOUND rather than binding a malformed trace id", async () => {
+    // A NULL trace_id says "unknown"; a wrong one says something false. The peer's recorder rejects
+    // an invalid id and generates its own, so binding to what we sent would name an id no span uses.
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess", traceId: "not-a-trace-id",
+    }), makeRes() as any, identity, deps);
+    expect(bindMessageTraceId.mock.calls.filter((c) => c[2])).toHaveLength(0);
   });
 
   it("omits them when the caller sent none — an older caller must still work", async () => {
