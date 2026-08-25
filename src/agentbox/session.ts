@@ -2761,6 +2761,7 @@ export class AgentBoxSessionManager {
               parentSessionId: id,
               peerSessionId: req.peerSessionId,
               toolCallId: req.toolCallId,
+              requestContext: req.requestContext,
               traceId: tracingRecorder.getRootTraceId(id),
               parentSpanContext: parentSpan
                 ? { traceId: parentSpan.traceId, spanId: parentSpan.spanId, traceFlags: parentSpan.traceFlags }

@@ -94,6 +94,12 @@ export interface DelegateRequest {
    * session ids alone cannot say which row is which.
    */
   toolCallId?: string;
+  /**
+   * Structured request context (contract §1). Untyped on the wire and validated at the gateway
+   * before the peer starts — see `delegation-request-context.ts`. Absent means the pre-contract
+   * behaviour, which is what keeps this additive.
+   */
+  requestContext?: unknown;
   /** Coordinator's session id (metadata / correlation + peer-session lineage/ownership). */
   parentSessionId?: string;
   /**

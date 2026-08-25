@@ -35,6 +35,10 @@ import type {
 } from "../shared/agent-delegate.js";
 import { DELEGATION_RESULT_SCHEMA_VERSION } from "../shared/agent-delegate.js";
 import { applyResultBudget } from "../shared/delegation-result-budget.js";
+import {
+  validateRequestContext, renderRequestContext, MAX_EXPANDED_TARGETS,
+  type DelegationRequestContextV1,
+} from "../shared/delegation-request-context.js";
 
 /**
  * How many of the coordinator conversation's most-recent delegations to a given
@@ -144,6 +148,56 @@ export function peerEffectiveTraceId(traceId: unknown, parentSpanContext: unknow
   if (isWireTraceId(parentTraceId)) return parentTraceId;
   if (isWireTraceId(traceId)) return traceId;
   return undefined;
+}
+
+/**
+ * §4 — coverage validation, before the peer starts.
+ *
+ * ROUTING correctness, not an access boundary: the peer's own capabilities remain the final say on
+ * what it can reach. This only stops a delegation being handed to an agent that does not cover the
+ * target, which the roster check alone does NOT do — that authorizes the peer, not the resource.
+ *
+ * All-or-nothing on purpose. A partial dispatch would silently narrow what the user asked for, and
+ * silence is the failure mode this contract exists to remove; a rejection naming the uncovered
+ * target lets the coordinator fix it in one turn.
+ *
+ * Exact match only: a short alias once substring-matched the wrong delegate and routed to it.
+ */
+function validateTargetCoverage(
+  ctx: DelegationRequestContextV1,
+  member: DelegateRosterMember,
+): { rejected_by: string; message: string } | null {
+  if (ctx.scope === "all_peer_bindings") {
+    const expanded = member.clusters.length + member.hosts.length;
+    if (expanded > MAX_EXPANDED_TARGETS) {
+      return {
+        rejected_by: "expansion_cap",
+        message: `all_peer_bindings would expand to ${expanded} targets, over the ${MAX_EXPANDED_TARGETS} cap; ` +
+          "enumerate the targets you actually mean",
+      };
+    }
+    return null;
+  }
+  if (ctx.scope !== "exact") return null;
+
+  const clusters = new Set(member.clusters.map((c) => c.trim().toLowerCase()));
+  const hosts = new Set(member.hosts.map((h) => h.trim().toLowerCase()));
+  for (const target of ctx.targets ?? []) {
+    if (target.type === "host") {
+      if (!hosts.has(target.host.trim().toLowerCase())) {
+        return { rejected_by: "target_not_covered", message: `${member.name} is not bound to host ${target.host}` };
+      }
+      continue;
+    }
+    const binding = target.cluster_binding.trim().toLowerCase();
+    if (!clusters.has(binding)) {
+      return {
+        rejected_by: "target_not_covered",
+        message: `${member.name} is not bound to cluster ${target.cluster_binding}`,
+      };
+    }
+  }
+  return null;
 }
 
 /** Whether a control frame for this delegation was already consumed to completion. */
@@ -395,6 +449,24 @@ export async function handleDelegate(
     return;
   }
 
+  // 1b. Validate the structured request context, BEFORE any peer session exists. A rejection here
+  //     must not leave a session, a persisted row, or a box behind: the whole point of validating
+  //     at this boundary is that nothing has happened yet.
+  let requestContext: DelegationRequestContextV1 | undefined;
+  if (body.requestContext !== undefined) {
+    const rejection = validateRequestContext(body.requestContext);
+    if (rejection) {
+      sendJson(res, 400, { error: rejection.message, rejected_by: rejection.rejected_by, ...(rejection.target ? { target: rejection.target } : {}) });
+      return;
+    }
+    requestContext = body.requestContext as DelegationRequestContextV1;
+    const coverage = validateTargetCoverage(requestContext, member);
+    if (coverage) {
+      sendJson(res, 400, { error: coverage.message, rejected_by: coverage.rejected_by });
+      return;
+    }
+  }
+
   // 2. Resolve the peer's own model binding (it runs under ITS config, not the coordinator's).
   const binding = await resolveAgentModelBinding(peerAgentId, deps.frontendClient);
   if (cancelled()) return;
@@ -494,6 +566,12 @@ export async function handleDelegate(
   // the coordinator can OPEN its full session and it survives for later analysis.
   // Link the parent ONLY when validated — never persist an unverified parent ref
   // (resolveReadableSession would otherwise grant the peer session to its owner).
+  // Deterministic rendering, done HERE rather than by having the coordinator assemble prose:
+  // structure that arrives as a paragraph has bought validation and nothing else. Appended, so the
+  // objective in the user's own words still leads and the blocks support it.
+  const renderedContext = requestContext ? renderRequestContext(requestContext) : "";
+  const promptText = renderedContext ? `${text}\n\n${renderedContext}` : text;
+
   const trustedParent = parentTrusted ? body.parentSessionId ?? null : null;
   /** The delegated opening user row, bound to a trace id once the peer's box reports one. */
   let delegatedUserMessageId: string | undefined;
@@ -519,7 +597,17 @@ export async function handleDelegate(
       // this side already holds it. Concurrent delegations make session lineage insufficient on
       // its own: several peer sessions can share one parent turn, and only this says which
       // `delegate_to_agent` row each answers.
-      ...(body.toolCallId ? { metadata: { delegation_tool_call_id: body.toolCallId } } : {}),
+      // The raw structure as well as the rendered text: rendered prose cannot answer "was a
+      // target dropped in transit", which is one of the acceptance questions this contract is
+      // judged on.
+      ...(body.toolCallId || requestContext
+        ? {
+            metadata: {
+              ...(body.toolCallId ? { delegation_tool_call_id: body.toolCallId } : {}),
+              ...(requestContext ? { request_context: requestContext } : {}),
+            },
+          }
+        : {}),
     });
   } catch (err) {
     if (cancelled()) return;
@@ -673,7 +761,7 @@ export async function handleDelegate(
           // The source declares the persistence contract; the management
           // plane reasserts it at the trust boundary before chat.send.
           skipInitialPersistence: true,
-          text,
+          text: promptText,
           agentId: peerAgentId,
           modelProvider: binding.modelProvider,
           modelId: binding.modelId,
@@ -759,7 +847,7 @@ export async function handleDelegate(
       sessionId: peerSessionId,
       turnId: localTurnId,
       userId: ownerUserId,
-      text,
+      text: promptText,
       agentId: peerAgentId,
       modelProvider: binding.modelProvider,
       modelId: binding.modelId,

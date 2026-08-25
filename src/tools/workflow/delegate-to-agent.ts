@@ -31,6 +31,7 @@ interface DelegateParams {
   agent_name?: string;
   task?: string;
   session_id?: string;
+  request_context?: unknown;
 }
 
 function rosterLine(m: DelegateRosterMember): string {
@@ -81,6 +82,67 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       agent_name: Type.Optional(Type.String({ description: "That agent's name (for display; from the list above)." })),
       task: Type.String({ minLength: 1, description: "The bounded task / question for that agent. Be specific about the target resource." }),
       session_id: Type.Optional(Type.String({ description: "Continue a prior peer session (the session_id a previous delegation to this agent returned) so the peer retains context. Omit to start fresh." })),
+      // Structured context, in ADDITION to `task` — never instead of it. The two carry different
+      // things: `task` is the goal in the user's words, this is what can be checked (targets are
+      // verified against the peer's bindings) and what the specialist cannot obtain any other way
+      // (the user's own constraints). Optional, so an older caller is unaffected.
+      request_context: Type.Optional(Type.Object({
+        schema_version: Type.Number({ description: "1" }),
+        mode: Type.Union([Type.Literal("snapshot"), Type.Literal("delta")], {
+          description:
+            "\"snapshot\" = the whole context (required on a first delegation). \"delta\" = only what " +
+            "CHANGED since this peer session's last turn — the peer still holds the rest, and " +
+            "re-sending everything pollutes a context that is already correct.",
+        }),
+        scope: Type.Optional(Type.Union(
+          [Type.Literal("exact"), Type.Literal("all_peer_bindings"), Type.Literal("discovery")],
+          {
+            description:
+              "\"exact\" = you know the targets (send them). \"all_peer_bindings\" = check everything " +
+              "this specialist covers (send NO targets). \"discovery\" = the target is not known yet " +
+              "(send NO targets; a guess is a candidate and goes in observations). In delta mode, " +
+              "scope and targets are sent together or not at all.",
+          },
+        )),
+        targets: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }), {
+          description:
+            "CONFIRMED routing identity, never a guess: {type:\"cluster\", cluster_binding} | " +
+            "{type:\"host\", host} | {type:\"k8s_resource\", cluster_binding, kind, name, namespace?}. " +
+            "Canonical binding names only — no aliases. An IP is not a target; it goes in observations.",
+        })),
+        constraints: Type.Optional(Type.Object({
+          time_window: Type.Optional(Type.Object({
+            from: Type.Optional(Type.String()), to: Type.Optional(Type.String()), timezone: Type.Optional(Type.String()),
+          }, { description: "The window the user asked about." })),
+          user_requirements: Type.Optional(Type.Array(Type.String(), {
+            description:
+              "The user's own words. Especially the NEGATIVE ones — \"don't restart anything\", \"if " +
+              "you can't find it say so rather than guessing\" — and anything you were told not to do. " +
+              "These are what the specialist cannot obtain any other way.",
+          })),
+        }, { additionalProperties: false })),
+        observations: Type.Optional(Type.Array(Type.Object({
+          text: Type.String(),
+          source: Type.Union([
+            Type.Literal("user"), Type.Literal("peer_report"),
+            Type.Literal("knowledge_base"), Type.Literal("coordinator_tool"),
+          ], { description: "Where this came from. Required — it is what keeps a candidate from being read as a fact." }),
+          observed_at: Type.Optional(Type.String()),
+          session_id: Type.Optional(Type.String({ description: "For source=peer_report: the peer session it came from." })),
+        }, { additionalProperties: false }), {
+          description:
+            "LEADS, not facts. You do no hands-on work, so anything you hold about live state is " +
+            "second-hand or already stale; the specialist re-checks whatever it relies on. Put " +
+            "candidate cluster names here, not in targets.",
+        })),
+        execution_policy: Type.Optional(Type.Object({
+          requested_access_mode: Type.Optional(Type.Union([Type.Literal("read_only"), Type.Literal("normal")], {
+            description:
+              "Set \"read_only\" only when the USER asked for a read-only investigation. Named " +
+              "REQUESTED because it is not yet enforced — do not tell the user it is a guarantee.",
+          })),
+        }, { additionalProperties: false })),
+      }, { additionalProperties: false })),
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as DelegateParams;
@@ -123,7 +185,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       const continueSessionId = params.session_id?.trim() || undefined;
       // toolCallId travels with the request so the peer's turn can nest under THIS tool span and be
       // correlated with THIS tool row — a coordinator may have several delegations in flight.
-      const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId, toolCallId }, onProgress, signal)
+      const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId, toolCallId, requestContext: params.request_context }, onProgress, signal)
         .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
 
       // Stopped by the coordinator (turn aborted): the relay was torn down and

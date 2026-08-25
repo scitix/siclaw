@@ -196,6 +196,100 @@ describe("handleDelegate — parentSessionId identity binding (P1)", () => {
   });
 });
 
+describe("handleDelegate — the v1 request context", () => {
+  const ctx = (over: Record<string, unknown> = {}) => ({
+    schema_version: 1, mode: "snapshot", scope: "exact",
+    targets: [{ type: "cluster", cluster_binding: "sh-1" }],
+    ...over,
+  });
+  // The fixture roster member covers no clusters, so coverage tests need one that does.
+  const withCoverage = (deps: any, clusters: string[], hosts: string[] = []) => {
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters, hosts }] };
+      if (method === "chat.resolveSession") return { found: true, user_id: "u", agent_id: COORD };
+      if (method === "chat.recentDelegationSessions") return { ids: [] };
+      if (method === "delegation.resolveRoute") return { local: true, sourceRuntimeId: "rt1", targetRuntimeId: "rt1" };
+      return {};
+    });
+    return deps;
+  };
+
+  it("renders the context into labelled blocks APPENDED to the task", async () => {
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "why is coredns unhealthy", parentSessionId: "own-sess",
+      requestContext: ctx({
+        constraints: { user_requirements: ["do not restart anything"] },
+        observations: [{ text: "cetus is only a candidate", source: "coordinator_tool" }],
+      }),
+    }), makeRes() as any, identity, deps);
+
+    const sent = promptMock.mock.calls[0][0].text as string;
+    // The objective in the user's own words still LEADS; the structure supports it.
+    expect(sent.indexOf("why is coredns unhealthy")).toBe(0);
+    expect(sent).toContain("[AUTHORITATIVE TARGETS]");
+    expect(sent).toContain("[USER CONSTRAINTS]");
+    expect(sent).toContain("do not restart anything");
+    expect(sent).toContain("[UNVERIFIED OBSERVATIONS]");
+    expect(sent).toContain("These are LEADS, not facts");
+  });
+
+  it("persists the RAW structure, not only the rendered text", async () => {
+    // Rendered prose cannot answer "was a target dropped in transit", which is one of the
+    // acceptance questions this contract is judged on.
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess", requestContext: ctx(),
+    }), makeRes() as any, identity, deps);
+
+    expect(appendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      role: "user",
+      metadata: expect.objectContaining({ request_context: expect.objectContaining({ scope: "exact" }) }),
+    }));
+  });
+
+  it("rejects a target the peer does not cover — BEFORE any peer session or box exists", async () => {
+    // The roster check authorizes the PEER, not the resource: today a delegation naming cluster A
+    // can be handed to an agent bound only to B and nothing refuses it.
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["other-cluster"]);
+    const res = makeRes();
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess", requestContext: ctx(),
+    }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(400);
+    expect((res.jsonBody as any)?.rejected_by).toBe("target_not_covered");
+    // Nothing started: no box, no prompt, no session row.
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(ensureChatSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed context with a machine-readable reason", async () => {
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    const res = makeRes();
+    // scope=discovery carrying targets: a guess presented as confirmed identity.
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess",
+      requestContext: ctx({ scope: "discovery" }),
+    }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(400);
+    // Assert the CODE, never the prose — a pinned sentence breaks on rewording and proves nothing.
+    expect((res.jsonBody as any)?.rejected_by).toBe("scope_targets");
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves an older caller completely unaffected", async () => {
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), []);
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "just the task", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(200);
+    // No blocks appended, and no coverage check performed — absent means the pre-contract behaviour.
+    expect(promptMock.mock.calls[0][0].text).toBe("just the task");
+  });
+});
+
 describe("handleDelegate — the v1 result contract (C1 producer)", () => {
   it("a plan-only turn is completed + unknown — neither done nor failed", async () => {
     // The peer ended normally and called no protocol tool, so completeness is genuinely unknown.

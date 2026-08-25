@@ -385,6 +385,13 @@ export type DelegateToAgentExecutor = (
      * exact tool row that dispatched it. Concurrent delegations make session ids insufficient here.
      */
     toolCallId?: string;
+    /**
+     * Structured request context (delegation contract §1). Typed `unknown` here on purpose: the
+     * tool layer forwards what the model produced and the GATEWAY validates it, before the peer
+     * starts. Validating in the box would put the check on the far side of the boundary it is
+     * meant to protect.
+     */
+    requestContext?: unknown;
   },
   onProgress?: (p: DelegateProgress) => void,
   /** Aborts the delegation when the coordinator's turn is stopped: closes the
