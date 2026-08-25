@@ -36,7 +36,7 @@ import type {
 import { DELEGATION_RESULT_SCHEMA_VERSION } from "../shared/agent-delegate.js";
 import { applyResultBudget } from "../shared/delegation-result-budget.js";
 import {
-  validateRequestContext, renderRequestContext, MAX_EXPANDED_TARGETS,
+  validateRequestContext, renderRequestContext, readOnlyFromRequestContext, MAX_EXPANDED_TARGETS,
   type DelegationRequestContextV1,
 } from "../shared/delegation-request-context.js";
 
@@ -569,6 +569,9 @@ export async function handleDelegate(
   // Deterministic rendering, done HERE rather than by having the coordinator assemble prose:
   // structure that arrives as a paragraph has bought validation and nothing else. Appended, so the
   // objective in the user's own words still leads and the blocks support it.
+  // ONE derivation for both dispatch paths. Two would be two implementations of a permission, and
+  // a permission that differs by path is one that depends on where the peer was scheduled.
+  const delegationReadOnly = readOnlyFromRequestContext(requestContext);
   const renderedContext = requestContext ? renderRequestContext(requestContext) : "";
   const promptText = renderedContext ? `${text}\n\n${renderedContext}` : text;
 
@@ -755,6 +758,14 @@ export async function handleDelegate(
         coordinatorAgentId,
         peerAgentId,
         sessionId: peerSessionId,
+        // A REQUEST parameter, never a prompt field. The router rebuilds prompt.delegation from
+        // trusted state exactly so nothing inside the caller's opaque payload can decide
+        // permissions, and it DERIVES readOnly from this — a value we put in the prompt would be
+        // discarded, silently.
+        //
+        // Sent only when read-only: an absent field means `normal` on the receiving side, so the
+        // normal path stays byte-identical for a router that predates this.
+        ...(delegationReadOnly ? { access_mode: "read_only" } : {}),
         prompt: {
           sessionId: peerSessionId,
           userId: ownerUserId,
@@ -780,7 +791,11 @@ export async function handleDelegate(
             delegationId,
             parentSessionId: body.parentSessionId,
             parentAgentId: coordinatorAgentId,
-            readOnly: false,
+            // The router REBUILDS this object and derives readOnly from the request parameter
+            // above, so this value is not what takes effect cross-Runtime. Kept equal to the
+            // derivation anyway: a mismatch between the two is then a bug rather than a design,
+            // and a same-Runtime-fallback reader gets the right answer.
+            readOnly: delegationReadOnly,
           },
         },
       });
@@ -865,13 +880,13 @@ export async function handleDelegate(
         delegationId,
         parentSessionId: body.parentSessionId,
         parentAgentId: coordinatorAgentId,
-        // The coordinator does NOT constrain the peer: a delegated agent runs
-        // under ITS OWN configuration (capabilities, persona, model) — the two
-        // agents manage their own permissions independently. The marker exists
-        // for the result-artifact contract, anti-recursion, and audit, not to
-        // downgrade the peer. (An explicit read-only delegation tier is a future
-        // opt-in; it is not imposed here.)
-        readOnly: false,
+        // A delegated agent normally runs under ITS OWN configuration — the coordinator does not
+        // constrain it, and the marker exists for the result-artifact contract, anti-recursion and
+        // audit. The ONE exception is an explicit read-only request, which is now an opt-in tier
+        // rather than a future one: it filters the peer's toolset to read-only-delegable tools and
+        // gates its MCPs. Default false, because the cautious-looking inverse would strip write
+        // tools from every existing remediation delegation.
+        readOnly: delegationReadOnly,
       },
     });
 

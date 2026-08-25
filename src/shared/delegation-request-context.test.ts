@@ -136,19 +136,31 @@ describe("observations carry provenance or they are refused", () => {
   });
 });
 
-describe("the access-mode field is named for what it currently is", () => {
-  it("refuses `access_mode` while the permission is not derived on both paths", () => {
-    // A field that reads as an enforcement while being a hint is worse than no field, and worst
-    // exactly where it matters. The rename to access_mode is the visible half of landing it.
-    expect(validateRequestContext(snapshot({
-      execution_policy: { access_mode: "read_only" } as never,
-    }))?.rejected_by).toBe("access_mode_not_wired");
+describe("access_mode is enforced, so the name and the checks are strict", () => {
+  it("accepts the two legal values", () => {
+    expect(validateRequestContext(snapshot({ execution_policy: { access_mode: "read_only" } }))).toBeNull();
+    expect(validateRequestContext(snapshot({ execution_policy: { access_mode: "normal" } }))).toBeNull();
+    // Absent means normal: the cautious-looking inverse would strip write tools from every
+    // existing remediation delegation.
+    expect(validateRequestContext(snapshot({ execution_policy: {} }))).toBeNull();
   });
 
-  it("accepts requested_access_mode, and validates its value", () => {
-    expect(validateRequestContext(snapshot({ execution_policy: { requested_access_mode: "read_only" } }))).toBeNull();
-    expect(validateRequestContext(snapshot({ execution_policy: { requested_access_mode: "readonly" } as never }))
-      ?.rejected_by).toBe("requested_access_mode");
+  it("refuses an unrecognised value rather than defaulting it", () => {
+    // Same reason the receiving router refuses one: a typo silently downgraded to `normal` hands a
+    // peer write tools the caller believed it had withheld, and nothing says so.
+    expect(validateRequestContext(snapshot({ execution_policy: { access_mode: "readonly" } as never }))
+      ?.rejected_by).toBe("access_mode");
+    expect(validateRequestContext(snapshot({ execution_policy: { access_mode: "" } as never }))
+      ?.rejected_by).toBe("access_mode");
+  });
+
+  it("refuses the RETIRED name rather than honouring it as a synonym", () => {
+    // A caller still sending requested_access_mode believes the field only advises; it now
+    // enforces. Silently honouring it would give a peer fewer tools than the caller thinks it
+    // asked for — a surprise in the safe direction is still a surprise about a permission.
+    expect(validateRequestContext(snapshot({
+      execution_policy: { requested_access_mode: "read_only" } as never,
+    }))?.rejected_by).toBe("requested_access_mode_retired");
   });
 });
 

@@ -59,17 +59,19 @@ export interface DelegationRequestContextV1 {
   observations?: DelegationObservation[];
   execution_policy?: {
     /**
-     * ⚠️ NAMED `requested_access_mode`, NOT `access_mode`, and the name is the contract (§7).
+     * NOW ENFORCED, on BOTH delegation paths, which is why it carries the real name.
      *
-     * The enforcement exists — `delegation.readOnly` filters the peer's toolset — but it is not
-     * wired to this field yet, and it cannot be wired on one path only: a permission that holds
-     * for a same-Runtime peer and not for a cross-Runtime one is a permission that depends on
-     * scheduling. Until both paths derive it, a field called `access_mode` would read as an
-     * enforcement while being a hint, which is worse than no field precisely where it matters.
+     * It was `requested_access_mode` while the derivation existed on neither side: a field called
+     * `access_mode` that only advises would read as an enforcement, and that is worse than no
+     * field exactly where it matters. It could not be renamed one path at a time either — a
+     * permission that holds for a same-Runtime peer and not a cross-Runtime one is a permission
+     * that depends on scheduling.
      *
-     * Renaming it to `access_mode` is the visible half of landing the mapping.
+     * `read_only` maps to `delegation.readOnly`, which filters the peer's toolset down to
+     * read-only-delegable tools and gates its MCPs. ABSENT means `normal`: the cautious-looking
+     * inverse would strip write tools from every existing remediation delegation.
      */
-    requested_access_mode?: "read_only" | "normal";
+    access_mode?: "read_only" | "normal";
   };
 }
 
@@ -285,18 +287,24 @@ export function validateRequestContext(raw: unknown): RequestContextRejection | 
     if (!policy || typeof policy !== "object") {
       return { rejected_by: "execution_policy", message: "execution_policy must be an object" };
     }
-    if ("access_mode" in policy) {
+    // The transitional name is refused rather than accepted-as-a-synonym: a caller still sending
+    // it believes the field only advises, and it now enforces. Silently honouring it would give a
+    // peer fewer tools than the caller thinks it asked for.
+    if ("requested_access_mode" in policy) {
       return {
-        rejected_by: "access_mode_not_wired",
-        message: "the field is named requested_access_mode until the permission is derived on BOTH " +
-          "delegation paths; a field called access_mode would read as an enforcement while being a hint",
+        rejected_by: "requested_access_mode_retired",
+        message: "the field is now `access_mode` and it is ENFORCED — read_only removes the peer's " +
+          "write tools. Rename it, having checked that is what you meant",
       };
     }
-    const mode = policy.requested_access_mode;
+    const mode = policy.access_mode;
+    // Present-but-invalid is refused rather than defaulted, and the reason is the same one the
+    // receiving router states: a typo silently downgraded to `normal` hands a peer write tools the
+    // caller believed it had withheld, and nothing says so.
     if (mode !== undefined && mode !== "read_only" && mode !== "normal") {
       return {
-        rejected_by: "requested_access_mode",
-        message: 'requested_access_mode must be "read_only" or "normal"',
+        rejected_by: "access_mode",
+        message: 'access_mode must be "read_only" or "normal"',
       };
     }
   }
@@ -313,6 +321,17 @@ export function validateRequestContext(raw: unknown): RequestContextRejection | 
   }
 
   return null;
+}
+
+/**
+ * `delegation.readOnly` for this request.
+ *
+ * One function, read by BOTH dispatch paths, because the alternative is two implementations of a
+ * PERMISSION — and a permission that differs by path is one that depends on where the peer happened
+ * to be scheduled. Absent context, or absent policy, means `normal`.
+ */
+export function readOnlyFromRequestContext(ctx: DelegationRequestContextV1 | undefined): boolean {
+  return ctx?.execution_policy?.access_mode === "read_only";
 }
 
 /**

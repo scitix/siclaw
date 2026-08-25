@@ -136,10 +136,12 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
             "candidate cluster names here, not in targets.",
         })),
         execution_policy: Type.Optional(Type.Object({
-          requested_access_mode: Type.Optional(Type.Union([Type.Literal("read_only"), Type.Literal("normal")], {
+          access_mode: Type.Optional(Type.Union([Type.Literal("read_only"), Type.Literal("normal")], {
             description:
-              "Set \"read_only\" only when the USER asked for a read-only investigation. Named " +
-              "REQUESTED because it is not yet enforced — do not tell the user it is a guarantee.",
+              "Set \"read_only\" ONLY when the user asked for a read-only investigation. It is " +
+              "ENFORCED: the specialist loses every write, exec and script tool, so it cannot " +
+              "remediate anything — if the user might want a fix applied, leave this alone. " +
+              "Omitted means normal.",
           })),
         }, { additionalProperties: false })),
       }, { additionalProperties: false })),

@@ -279,6 +279,71 @@ describe("handleDelegate — the v1 request context", () => {
     expect(promptMock).not.toHaveBeenCalled();
   });
 
+  // Contract §7 requires a read-only test on BOTH paths. A single-path test is exactly what let the
+  // topology hole survive a green suite: the permission held for a same-Runtime peer and not for a
+  // cross-Runtime one, so whether it applied depended on where the peer happened to be scheduled.
+  it("LOCAL path: access_mode=read_only sets delegation.readOnly", async () => {
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess",
+      requestContext: ctx({ execution_policy: { access_mode: "read_only" } }),
+    }), makeRes() as any, identity, deps);
+
+    expect(promptMock.mock.calls[0][0].delegation.readOnly).toBe(true);
+  });
+
+  it("REMOTE path: access_mode travels as a REQUEST parameter, not a prompt field", async () => {
+    // The router rebuilds prompt.delegation from trusted state precisely so nothing in the
+    // caller's opaque payload can decide permissions — a value placed there is discarded silently.
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: ["sh-1"], hosts: [] }] };
+      if (method === "chat.resolveSession") return { found: true, user_id: "u", agent_id: COORD };
+      if (method === "chat.recentDelegationSessions") return { ids: [] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "rt1", targetRuntimeId: "rt2" };
+      return {};
+    });
+    // Not awaited: the cross-Runtime path then waits on the remote turn, which is not the subject.
+    // What is under test is the SHAPE of the dispatch, so poll for the call and stop there.
+    void handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess",
+      requestContext: ctx({ execution_policy: { access_mode: "read_only" } }),
+    }), makeRes() as any, identity, deps).catch(() => { /* the remote turn itself is not the subject */ });
+
+    const findStart = () => deps.frontendClient.request.mock.calls.find((c: any[]) => c[0] === "delegation.start");
+    for (let i = 0; i < 200 && !findStart(); i += 1) await new Promise((r) => setTimeout(r, 5));
+    const start = findStart();
+    expect(start?.[1].access_mode).toBe("read_only");
+    // Kept equal to the derivation so a mismatch between the two would be a bug, not a design.
+    expect(start?.[1].prompt.delegation.readOnly).toBe(true);
+  });
+
+  it("omits access_mode entirely on the normal path — an older router sees no new field", async () => {
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess", requestContext: ctx(),
+    }), makeRes() as any, identity, deps);
+    // Default is normal: the cautious-looking inverse would strip write tools from every existing
+    // remediation delegation.
+    expect(promptMock.mock.calls[0][0].delegation.readOnly).toBe(false);
+  });
+
+  it("refuses the retired field name rather than honouring it as a synonym", async () => {
+    // A caller still sending requested_access_mode believes the field only advises; it now
+    // enforces. Silently honouring it would give a peer fewer tools than the caller thinks it
+    // asked for.
+    const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), ["sh-1"]);
+    const res = makeRes();
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess",
+      requestContext: ctx({ execution_policy: { requested_access_mode: "read_only" } }),
+    }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(400);
+    expect((res.jsonBody as any)?.rejected_by).toBe("requested_access_mode_retired");
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
   it("leaves an older caller completely unaffected", async () => {
     const deps = withCoverage(makeDeps({ found: true, user_id: "u", agent_id: COORD }), []);
     const res = makeRes();
