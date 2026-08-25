@@ -18,6 +18,36 @@ export interface DelegateArtifact {
   findings: string;
   actions_taken: string;
   residual_state: string;
+  /**
+   * SUBMITTED by the peer, never inferred here. An artifact proves the peer REPORTED; it does not
+   * prove it FINISHED, and only the peer knows which. Optional on the wire so an older peer's
+   * artifact still parses — absent is read as `partial`, the cautious direction.
+   */
+  task_status?: "complete" | "partial";
+}
+
+/** Result-side contract generation. Integer ≥ 1; see the delegation contract §8. */
+export const DELEGATION_RESULT_SCHEMA_VERSION = 1;
+
+/** Whether this turn ENDED normally — transport state, independent of what the work achieved. */
+export type DelegateTurnStatus = "completed" | "failed" | "interrupted";
+
+/** What the WORK achieved. `unknown` is a normal, common outcome, not an anomaly. */
+export type DelegateTaskStatus = "complete" | "partial" | "blocked" | "unknown";
+
+/** What shape the result carries — orthogonal to whether the task finished. */
+export type DelegatePayloadKind = "artifact" | "narrative" | "none";
+
+/**
+ * Reported ONLY when something was cut, and at the TOP LEVEL rather than inside the field it
+ * describes: a per-field marker would have to edit the very text whose integrity is in question,
+ * and a reader could not tell a real count from one the peer wrote itself.
+ */
+export interface DelegateTruncation {
+  original_bytes: number;
+  omitted_bytes: number;
+  /** Fields cut, in the order the algorithm reached them. */
+  fields: string[];
 }
 
 /**
@@ -77,6 +107,35 @@ export interface DelegateRequest {
 
 /** gateway → box: outcome of a delegated task. */
 export interface DelegateResponse {
+  /**
+   * The contract generation, TOP LEVEL beside `status`. A producer that speaks v1 speaks it
+   * ALWAYS — falling back to the old shape for an awkward turn would make this field unreliable
+   * as the branch key, which is the one property a reader depends on.
+   *
+   * Optional in the TYPE only so an older producer's payload still satisfies it. A reader accepts
+   * it as a contract only when it is an integer ≥ 1, and treats anything else exactly as absent.
+   */
+  schema_version?: number;
+  /**
+   * Did the turn END normally? Transport state, and it is deliberately independent of what the
+   * work achieved: `completed` + `task_status: "unknown"` is the plan-only turn — common, and
+   * neither a success nor a failure.
+   */
+  turn_status?: DelegateTurnStatus;
+  /**
+   * What the WORK achieved. Submitted by `report_findings`, never inferred from the presence of an
+   * artifact. `unknown` means no protocol tool was called, so completeness is genuinely unknown.
+   */
+  task_status?: DelegateTaskStatus;
+  /** What the payload IS, orthogonal to whether the task finished. */
+  payload_kind?: DelegatePayloadKind;
+  /**
+   * NEW in v1 — it does not exist on the pre-v1 wire, which carries only `inputQuestion`. Derived
+   * from `task_status === "blocked"` so the two cannot disagree.
+   */
+  next_action?: "ask_user";
+  /** Present only when the budget cut something. See the contract §8a. */
+  truncation?: DelegateTruncation;
   ok: boolean;
   peerAgentId: string;
   peerName?: string;

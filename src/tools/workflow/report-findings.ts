@@ -25,6 +25,7 @@ interface ReportFindingsParams {
   findings?: string;
   actions_taken?: string;
   residual_state?: string;
+  task_status?: "complete" | "partial";
 }
 
 function result(text: string, delivered: boolean) {
@@ -58,6 +59,16 @@ export function createReportFindingsTool(refs: ToolRefs): ToolDefinition {
       residual_state: Type.Optional(Type.String({
         description: "Anything left unresolved / needing follow-up / that the coordinator should decide.",
       })),
+      // SUBMITTED, never inferred. Calling this tool proves you REPORTED; it does not prove you
+      // FINISHED, and only you know which. Inferring "complete" from the presence of an artifact is
+      // the plan-as-done reading the delegation result contract exists to remove.
+      task_status: Type.Optional(Type.Union([Type.Literal("complete"), Type.Literal("partial")], {
+        description:
+          "Did you FINISH the task? \"complete\" = the whole task is done. \"partial\" = you are " +
+          "reporting what you found but something remains (you ran out of scope, hit a blocker you " +
+          "worked around, or covered some targets and not others). Say which in `residual_state`. " +
+          "Omitted is read as \"partial\": only you can claim completeness.",
+      })),
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as ReportFindingsParams;
@@ -76,6 +87,12 @@ export function createReportFindingsTool(refs: ToolRefs): ToolDefinition {
         // coordinator's structured artifact.
         actions_taken: params.actions_taken?.trim() || "not reported",
         residual_state: params.residual_state?.trim() || "",
+        // Absent ⇒ "partial", deliberately the CAUTIOUS reading. Defaulting to "complete" would
+        // make every peer that ignores the field claim a finished task, which is the exact
+        // over-claim the field exists to stop; "partial" merely understates a finished one, and
+        // the coordinator's response to partial (ask for the rest) is harmless when it was
+        // actually complete.
+        task_status: params.task_status === "complete" ? "complete" : "partial",
       });
       return result("Findings reported to the coordinator.", true);
     },

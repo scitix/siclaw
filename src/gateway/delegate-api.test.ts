@@ -196,6 +196,70 @@ describe("handleDelegate — parentSessionId identity binding (P1)", () => {
   });
 });
 
+describe("handleDelegate — the v1 result contract (C1 producer)", () => {
+  it("a plan-only turn is completed + unknown — neither done nor failed", async () => {
+    // The peer ended normally and called no protocol tool, so completeness is genuinely unknown.
+    // This is the single most common thing the contract makes visible, and reading it as either
+    // extreme restores the ambiguity being removed. Legacy `status` stays "done" for old readers —
+    // which is exactly why it was never sufficient on its own.
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    const res = makeRes();
+    // finalText accumulates from the peer's EVENTS, not from the consumer's return value.
+    consumeEvents = [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "I'll start by checking the pods" }] } }];
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    const r = delegateResult(res);
+    expect(r.schema_version).toBe(1);
+    expect(r.turn_status).toBe("completed");
+    expect(r.task_status).toBe("unknown");
+    expect(r.payload_kind).toBe("narrative");
+    expect(r.status).toBe("done");
+  });
+
+  it("carries the peer's SUBMITTED task_status through, never inferring it from the artifact", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    const res = makeRes();
+    // The peer reported but said it did not finish. An artifact proves it REPORTED, not that it
+    // FINISHED — inferring "complete" here is the defect the field exists to remove.
+    consumeEvents = [{ type: "delegation_artifact", findings: "f", actions_taken: "none", residual_state: "half the clusters unchecked", task_status: "partial" }];
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    const r = delegateResult(res);
+    expect(r.task_status).toBe("partial");
+    expect(r.payload_kind).toBe("artifact");
+    // Legacy status is lossy on purpose: it says "done" for a partial result too.
+    expect(r.status).toBe("done");
+  });
+
+  it("request_input is blocked + ask_user, and the turn still COMPLETED", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    const res = makeRes();
+    consumeEvents = [{ type: "input_required", question: "which cluster?" }];
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    const r = delegateResult(res);
+    expect(r.turn_status).toBe("completed"); // blocking is a TASK state, not a transport failure
+    expect(r.task_status).toBe("blocked");
+    expect(r.next_action).toBe("ask_user");
+    expect(r.inputQuestion).toBe("which cluster?");
+  });
+
+  it("emits v1 on the failure paths too — a v1 producer speaks v1 always", async () => {
+    // Falling back to the old shape for an awkward turn would make schema_version unreliable as
+    // the branch key, which is the one property the reader table depends on.
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    const res = makeRes();
+    consumeReturn = { resultText: "", taskReportText: "", errorMessage: "model exploded", eventCount: 1, durationMs: 1 };
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    const r = delegateResult(res);
+    expect(r.schema_version).toBe(1);
+    expect(r.turn_status).toBe("failed");
+    expect(r.task_status).toBe("unknown"); // nobody reported, so the work's state is unknown
+    expect(r.ok).toBe(false);
+  });
+});
+
 describe("handleDelegate — trace context forwarding (C3)", () => {
   const TRACE = "0123456789abcdef0123456789abcdef";
   const SPAN = "0123456789abcdef";

@@ -50,8 +50,32 @@ describe("report_findings tool", () => {
       findings: "kube-system CoreDNS pod OOMKilled x3",
       actions_taken: "not reported",
       residual_state: "needs memory-limit bump decision",
+      // Omitted task_status is "partial", the CAUTIOUS reading. Defaulting to "complete" would
+      // make every peer that ignores the field claim a finished task — the over-claim the field
+      // exists to stop. Understating a finished one costs a follow-up question and nothing else.
+      task_status: "partial",
     });
     expect((r.details as any).delivered).toBe(true);
+  });
+
+  it("task_status is SUBMITTED, and only an explicit \"complete\" claims completeness", async () => {
+    // Calling this tool proves the peer REPORTED; it does not prove it FINISHED, and only the peer
+    // knows which. Inferring completeness from the presence of an artifact is the plan-as-done
+    // reading the delegation result contract exists to remove.
+    const emitter = vi.fn();
+    const tool = createReportFindingsTool(
+      makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter }),
+    );
+
+    await tool.execute("c1", { findings: "f", task_status: "complete" });
+    expect(emitter.mock.calls.at(-1)?.[0]).toMatchObject({ task_status: "complete" });
+
+    await tool.execute("c2", { findings: "f", task_status: "partial" });
+    expect(emitter.mock.calls.at(-1)?.[0]).toMatchObject({ task_status: "partial" });
+
+    // Anything unrecognised falls to partial rather than being trusted as a completeness claim.
+    await tool.execute("c3", { findings: "f", task_status: "done" as never });
+    expect(emitter.mock.calls.at(-1)?.[0]).toMatchObject({ task_status: "partial" });
   });
 
   it("rejects empty findings before emitting", async () => {

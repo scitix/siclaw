@@ -33,6 +33,8 @@ import { parsePositiveIntEnv } from "../core/subagent-registry.js";
 import type {
   DelegateRequest, DelegateResponse, DelegateArtifact, DelegatesResponse, DelegateRosterMember,
 } from "../shared/agent-delegate.js";
+import { DELEGATION_RESULT_SCHEMA_VERSION } from "../shared/agent-delegate.js";
+import { applyResultBudget } from "../shared/delegation-result-budget.js";
 
 /**
  * How many of the coordinator conversation's most-recent delegations to a given
@@ -572,6 +574,11 @@ export async function handleDelegate(
         findings: String(e.findings ?? ""),
         actions_taken: String(e.actions_taken ?? ""),
         residual_state: String(e.residual_state ?? ""),
+        // The peer's OWN claim about completeness, carried through verbatim. Anything other than
+        // an explicit "complete" is read as `partial`: a peer too old to send the field, or one
+        // that sent something unrecognisable, must not have completeness inferred for it — that
+        // inference is the plan-as-done reading this contract removes.
+        task_status: e.task_status === "complete" ? "complete" : "partial",
       };
       return;
     }
@@ -839,7 +846,7 @@ export async function handleDelegate(
       finished = true;
       writeFrame({
         type: "delegate_result",
-        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: "Runtime is shutting down; delegation was not started" } satisfies DelegateResponse,
+        result: { schema_version: DELEGATION_RESULT_SCHEMA_VERSION, turn_status: "failed", task_status: "unknown", payload_kind: "none", ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: "Runtime is shutting down; delegation was not started" } satisfies DelegateResponse,
       });
       res.end();
       return;
@@ -865,7 +872,7 @@ export async function handleDelegate(
       console.error(`[delegate-api] delegation to ${peerAgentId} failed: ${outcome.error}`);
       writeFrame({
         type: "delegate_result",
-        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: outcome.error } satisfies DelegateResponse,
+        result: { schema_version: DELEGATION_RESULT_SCHEMA_VERSION, turn_status: "failed", task_status: "unknown", payload_kind: "none", ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: outcome.error } satisfies DelegateResponse,
       });
       res.end();
       return;
@@ -877,7 +884,7 @@ export async function handleDelegate(
     if (peerAbort.signal.aborted) {
       writeFrame({
         type: "delegate_result",
-        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: "delegation stopped" } satisfies DelegateResponse,
+        result: { schema_version: DELEGATION_RESULT_SCHEMA_VERSION, turn_status: "interrupted", task_status: "unknown", payload_kind: "none", ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: "delegation stopped" } satisfies DelegateResponse,
       });
       res.end();
       return;
@@ -885,7 +892,7 @@ export async function handleDelegate(
     console.error(`[delegate-api] delegation to ${peerAgentId} failed:`, err);
     writeFrame({
       type: "delegate_result",
-      result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: err instanceof Error ? err.message : String(err) } satisfies DelegateResponse,
+      result: { schema_version: DELEGATION_RESULT_SCHEMA_VERSION, turn_status: "failed", task_status: "unknown", payload_kind: "none", ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: err instanceof Error ? err.message : String(err) } satisfies DelegateResponse,
     });
     res.end();
     return;
@@ -903,8 +910,14 @@ export async function handleDelegate(
   finished = true;
   // Keep the TAIL of the accumulated narrative so the report + conclusion survive
   // (they come last); drop only very early intermediate reasoning if over budget.
-  const MAX_FINAL_TEXT = 12000;
-  const finalTextCapped = finalText.length > MAX_FINAL_TEXT ? `…\n${finalText.slice(-MAX_FINAL_TEXT)}` : finalText;
+  // ONE budget across every result-bearing field, replacing the old per-field character cap.
+  // Two things changed and both are observable: the unit is UTF-8 BYTES (the old `.length` cap
+  // counted UTF-16 units and let a Chinese narrative run ~3x over), and the cut is reported rather
+  // than silent — see the contract §8a for the field order and why it is that order.
+  const budgeted = applyResultBudget({
+    artifact, finalText: finalText || undefined, inputQuestion: inputQuestion || undefined, steps,
+  });
+
   // The peer asked a human clarification (request_input) and ended its turn — report
   // it as a distinct status so the coordinator relays the question and delivers the
   // answer by continuing THIS peerSessionId, rather than treating an often-empty turn
@@ -913,18 +926,39 @@ export async function handleDelegate(
     writeFrame({
       type: "delegate_result",
       result: {
+        schema_version: DELEGATION_RESULT_SCHEMA_VERSION,
+        // The turn ENDED normally; blocking is a task state, not a transport state.
+        turn_status: "completed",
+        task_status: "blocked",
+        payload_kind: "none",
+        // Derived from task_status so the two cannot disagree. New in v1 — the pre-v1 wire
+        // carried only inputQuestion.
+        next_action: "ask_user",
         ok: true, peerAgentId, peerName: member.name, status: "input_required",
-        inputQuestion, steps, finalText: finalTextCapped || undefined, peerSessionId,
+        inputQuestion: budgeted.inputQuestion, steps: budgeted.steps,
+        finalText: budgeted.finalText, peerSessionId,
+        ...(budgeted.truncation ? { truncation: budgeted.truncation } : {}),
       } satisfies DelegateResponse,
     });
     res.end();
     return;
   }
+  // task_status is SUBMITTED by the peer through report_findings, never inferred from the
+  // presence of an artifact: an artifact proves the peer REPORTED, not that it FINISHED. With no
+  // artifact at all, no protocol tool was called and completeness is genuinely `unknown` — the
+  // plan-only turn, which is a normal outcome and deliberately neither done nor failed.
+  const artifactStatus = budgeted.artifact?.task_status;
   writeFrame({
     type: "delegate_result",
     result: {
-      ok: true, peerAgentId, peerName: member.name, status: "done", artifact, steps,
-      finalText: finalTextCapped || undefined, peerSessionId,
+      schema_version: DELEGATION_RESULT_SCHEMA_VERSION,
+      turn_status: "completed",
+      task_status: budgeted.artifact ? (artifactStatus === "complete" ? "complete" : "partial") : "unknown",
+      payload_kind: budgeted.artifact ? "artifact" : budgeted.finalText ? "narrative" : "none",
+      ok: true, peerAgentId, peerName: member.name, status: "done",
+      artifact: budgeted.artifact, steps: budgeted.steps,
+      finalText: budgeted.finalText, peerSessionId,
+      ...(budgeted.truncation ? { truncation: budgeted.truncation } : {}),
     } satisfies DelegateResponse,
   });
   res.end();
