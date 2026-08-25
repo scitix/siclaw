@@ -569,6 +569,25 @@ export async function handleDelegate(
   // Deterministic rendering, done HERE rather than by having the coordinator assemble prose:
   // structure that arrives as a paragraph has bought validation and nothing else. Appended, so the
   // objective in the user's own words still leads and the blocks support it.
+  // ⚠️ A DELTA IS ONLY MEANINGFUL AGAINST A SESSION THAT WAS ACTUALLY REUSED.
+  //
+  // Session reuse is deliberately non-fatal: an unowned or stale `peerSessionId` falls back to a
+  // FRESH peer session rather than rejecting the delegation. But a delta says "here is what
+  // changed" — and against a fresh peer there is nothing for it to have changed FROM. The peer
+  // would receive a fragment (one new constraint, no targets) as if it already held the rest, and
+  // its context would be missing exactly the parts the caller believed it could omit.
+  //
+  // Checked HERE rather than in the validator because only this scope knows whether reuse
+  // succeeded: `peerSessionId` was reassigned above only on a verified hit.
+  if (requestContext?.mode === "delta" && peerSessionId !== body.peerSessionId) {
+    sendJson(res, 400, {
+      error: "mode=delta requires the peer session to be reused, and this one was not " +
+        "(unknown, unowned, or older than the recent-delegation window). Send mode=snapshot.",
+      rejected_by: "delta_without_reuse",
+    });
+    return;
+  }
+
   // ONE derivation for both dispatch paths. Two would be two implementations of a permission, and
   // a permission that differs by path is one that depends on where the peer was scheduled.
   const delegationReadOnly = readOnlyFromRequestContext(requestContext);

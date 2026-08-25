@@ -244,6 +244,38 @@ export function validateRequestContext(raw: unknown): RequestContextRejection | 
     if (bad) return bad;
   }
 
+  // A malformed `constraints` passed validation and then threw a TypeError during RENDERING —
+  // `user_requirements: "do not restart"` is a string, and `.filter` on it is not a function. A
+  // validator that admits something the renderer cannot handle has moved the failure from a clean
+  // 400 to a 500 after the peer session already exists.
+  const constraints = ctx.constraints;
+  if (constraints !== undefined) {
+    if (!constraints || typeof constraints !== "object" || Array.isArray(constraints)) {
+      return { rejected_by: "constraints", message: "constraints must be an object" };
+    }
+    const c = constraints as Record<string, unknown>;
+    if (c.user_requirements !== undefined) {
+      if (!Array.isArray(c.user_requirements) || c.user_requirements.some((r) => typeof r !== "string")) {
+        return {
+          rejected_by: "user_requirements",
+          message: "constraints.user_requirements must be an array of strings — a bare string is the " +
+            "commonest shape a model produces here, and it renders as nothing",
+        };
+      }
+    }
+    if (c.time_window !== undefined) {
+      if (!c.time_window || typeof c.time_window !== "object" || Array.isArray(c.time_window)) {
+        return { rejected_by: "time_window", message: "constraints.time_window must be an object" };
+      }
+      for (const key of ["from", "to", "timezone"]) {
+        const v = (c.time_window as Record<string, unknown>)[key];
+        if (v !== undefined && typeof v !== "string") {
+          return { rejected_by: "time_window", message: `constraints.time_window.${key} must be a string` };
+        }
+      }
+    }
+  }
+
   const observations = ctx.observations;
   if (observations !== undefined) {
     if (!Array.isArray(observations)) {
@@ -281,6 +313,9 @@ export function validateRequestContext(raw: unknown): RequestContextRejection | 
       }
     }
   }
+
+  const deltaPolicy = requiresExplicitPolicyOnDelta(ctx as unknown as DelegationRequestContextV1);
+  if (deltaPolicy) return deltaPolicy;
 
   const policy = ctx.execution_policy as Record<string, unknown> | undefined;
   if (policy !== undefined) {
@@ -332,6 +367,33 @@ export function validateRequestContext(raw: unknown): RequestContextRejection | 
  */
 export function readOnlyFromRequestContext(ctx: DelegationRequestContextV1 | undefined): boolean {
   return ctx?.execution_policy?.access_mode === "read_only";
+}
+
+/**
+ * A delta may NOT leave `execution_policy` out.
+ *
+ * ⚠️ This closes a contradiction between two of this contract's own rules. Rule 5 says an omitted
+ * field in a delta means UNCHANGED; the permission derivation above reads an omitted
+ * `access_mode` as `normal`. Both are defensible alone, and together they silently upgrade a
+ * read-only investigation to read-write on its second turn — the caller changed one constraint,
+ * omitted everything it did not mean to touch, and got write tools back.
+ *
+ * The fix is required-on-delta rather than inherit-from-somewhere, because inheriting needs a
+ * persisted effective context the gateway deliberately does not keep (rule 5's own reasoning). So a
+ * permission must be restated on every request that carries a context at all. Verbose, and the
+ * verbosity is the point: a permission that can be dropped by omission is not a permission.
+ */
+export function requiresExplicitPolicyOnDelta(ctx: DelegationRequestContextV1): RequestContextRejection | null {
+  if (ctx.mode !== "delta") return null;
+  if (ctx.execution_policy?.access_mode === undefined) {
+    return {
+      rejected_by: "delta_policy_required",
+      message: "a delta must restate execution_policy.access_mode — the gateway keeps no effective " +
+        "context to inherit it from, and treating omission as \"normal\" would silently return " +
+        "write tools to a read-only investigation",
+    };
+  }
+  return null;
 }
 
 /**

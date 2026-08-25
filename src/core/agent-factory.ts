@@ -507,9 +507,32 @@ export async function createSiclawSession(
   // MCP availability is governed by an orthogonal axis — the `agent_mcp_servers`
   // binding — so a capability group selection must not gate them. (Dynamic MCP
   // tool names can't be statically enumerated into a capability group anyway.)
-  // The whole `mcpTools` array is MCP by construction, so an unconditional push
-  // is simpler than and equivalent to skipping by an `mcp__` name prefix.
-  customTools.push(...mcpTools);
+  //
+  // ⚠️ THAT EXEMPTION IS NOT A READ-ONLY EXEMPTION, and conflating the two was a hole.
+  //
+  // A read-only delegated turn exists to remove the peer's ability to change anything. The
+  // registry's `readOnlyDelegable` filter drops every exec/script/mutation tool, and the file-tool
+  // gate below drops Edit/Write — but MCP tools were pushed here UNCONDITIONALLY, before either.
+  // So a mutating MCP (a ticketing write, a chat post, a cloud API call) stayed reachable on a turn
+  // whose whole point was that nothing could be mutated, and `access_mode: read_only` promised a
+  // guarantee this bypassed.
+  //
+  // FAIL CLOSED: nothing in the current pipeline carries an MCP tool's read-only annotation this
+  // far — `mcpTools` is a plain ToolDefinition[] with no `annotations` — so there is no way to keep
+  // the safe ones and drop the rest. Dropping all of them on a read-only turn is the only choice
+  // that does not silently over-grant. The cost is real and one-directional: a read-only
+  // investigation loses read-only MCP lookups too. That is the right way round — a peer that cannot
+  // read a ticket is inconvenient, a peer that can close one was a false promise.
+  //
+  // To restore the read-only ones, plumb the MCP `readOnlyHint` annotation through to here and admit
+  // exactly the tools that positively assert it. Absent annotation must keep meaning "drop".
+  if (opts?.delegation?.readOnly === true) {
+    if (mcpTools.length > 0) {
+      console.log(`[agent-factory] read-only delegated turn: withholding ${mcpTools.length} MCP tool(s)`);
+    }
+  } else {
+    customTools.push(...mcpTools);
+  }
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)

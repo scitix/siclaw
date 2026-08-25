@@ -57,6 +57,9 @@ describe("delta mode: scope and targets are ATOMIC", () => {
     expect(validateRequestContext({
       schema_version: 1, mode: "delta",
       constraints: { user_requirements: ["read only"] },
+      // Restated because a delta must: see the policy test below for why omission cannot mean
+      // "unchanged" for a permission.
+      execution_policy: { access_mode: "normal" },
     })).toBeNull();
   });
 
@@ -64,7 +67,36 @@ describe("delta mode: scope and targets are ATOMIC", () => {
     expect(validateRequestContext({
       schema_version: 1, mode: "delta", scope: "exact",
       targets: [{ type: "cluster", cluster_binding: "c" }],
+      execution_policy: { access_mode: "normal" },
     })).toBeNull();
+  });
+
+  it("REQUIRES the policy to be restated — omission would silently return write tools", () => {
+    // Two of this contract's own rules contradicted each other: a delta's omitted field means
+    // UNCHANGED, while an omitted access_mode derives as `normal`. Together they upgraded a
+    // read-only investigation to read-write on its second turn — the caller changed one constraint,
+    // omitted what it did not mean to touch, and got write tools back. Inheriting is not available:
+    // the gateway keeps no effective context to inherit from, by this contract's own design.
+    expect(validateRequestContext({
+      schema_version: 1, mode: "delta", constraints: { user_requirements: ["x"] },
+    })?.rejected_by).toBe("delta_policy_required");
+    // A snapshot needs no such rule: it always carries the whole context.
+    expect(validateRequestContext(snapshot())).toBeNull();
+  });
+
+  it("refuses a malformed constraints shape rather than throwing at render time", () => {
+    // `user_requirements: "do not restart"` is the commonest shape a model produces here, and it
+    // passed validation and then threw a TypeError during rendering — moving a clean 400 into a 500
+    // that happens AFTER the peer session already exists.
+    expect(validateRequestContext(snapshot({ constraints: { user_requirements: "do not restart" } as never }))
+      ?.rejected_by).toBe("user_requirements");
+    expect(validateRequestContext(snapshot({ constraints: { user_requirements: [1, 2] } as never }))
+      ?.rejected_by).toBe("user_requirements");
+    expect(validateRequestContext(snapshot({ constraints: "read only" as never }))?.rejected_by).toBe("constraints");
+    expect(validateRequestContext(snapshot({ constraints: { time_window: "yesterday" } as never }))
+      ?.rejected_by).toBe("time_window");
+    expect(validateRequestContext(snapshot({ constraints: { time_window: { from: 5 } } as never }))
+      ?.rejected_by).toBe("time_window");
   });
 
   it("refuses one without the other — the merge it would require is undefined", () => {

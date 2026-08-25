@@ -49,6 +49,37 @@ function resolveTarget(roster: DelegateRosterMember[], idOrName: string): Delega
   return roster.find((m) => m.id.toLowerCase() === t) ?? roster.find((m) => m.name.toLowerCase() === t);
 }
 
+/**
+ * The result's state, in the MODEL-VISIBLE text.
+ *
+ * ⚠️ `details` DOES NOT REACH THE MODEL — it is stripped before a tool result is shown (see the
+ * exit-classification contract in CLAUDE.md, which states the same rule for a different field:
+ * "the class must be in the TEXT"). So the v1 fields sitting in `details` serve the card and the
+ * analysis layer, and the coordinator — the reader this contract exists for — could not see them
+ * at all. C1's entire purpose is letting a coordinator tell a plan from a finished result, and that
+ * decision is made by the model, from the text.
+ *
+ * Written as one short line rather than a dump: it has to compete for attention with the findings
+ * themselves, and a paragraph of metadata would be skimmed. `unknown` is spelled out with its
+ * consequence attached, because that is the case the coordinator has been getting wrong.
+ */
+function statusLine(resp: DelegateResponse): string {
+  if (resp.task_status === undefined) return "";
+  switch (resp.task_status) {
+    case "complete":
+      return "[Task status: COMPLETE — the peer reported this as finished.]\n";
+    case "partial":
+      return "[Task status: PARTIAL — the peer reported findings but says work remains. " +
+        "See residual state before treating this as done.]\n";
+    case "blocked":
+      return "[Task status: BLOCKED — the peer is waiting on the user. Relay its question; " +
+        "do not answer on the user's behalf.]\n";
+    case "unknown":
+      return "[Task status: UNKNOWN — the peer ended its turn WITHOUT reporting a result, so this " +
+        "text is narration, not findings. It may be a plan rather than an answer.]\n";
+  }
+}
+
 export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
   const roster = refs.delegationRoster ?? [];
   const rosterMd = roster.map(rosterLine).join("\n");
@@ -199,18 +230,6 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
           steps: [], peerSessionId: undefined, error: err instanceof Error ? err.message : String(err),
         }));
 
-      // Stopped by the coordinator (turn aborted): the relay was torn down and
-      // the peer turn cancelled. Report a clean stop, not a scary error.
-      if (signal?.aborted) {
-        const msg = `Delegation to ${member.name} was stopped.`;
-        return { content: [{ type: "text" as const, text: msg }], details: { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, status: "stopped", summary: msg, ...(resp.turn_status ? { turn_status: resp.turn_status } : {}), ...(resp.task_status ? { task_status: resp.task_status } : {}), ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) } };
-      }
-
-      // Card-facing shape (portal-web AgentWorkCard reads target from args and
-      // status/summary/tool_calls/steps from result details). Carry the accumulated
-      // live steps into the FINAL result so the card keeps them after completion.
-      // session_id (=peer session) lets the card OPEN the full peer session and lets
-      // the model pass it back to continue this peer thread.
       // The v1 result contract, copied onto the TOOL's details.
       //
       // This is not duplication for its own sake: the gateway's HTTP response and the tool's
@@ -230,6 +249,26 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
         ...(resp.truncation ? { truncation: resp.truncation } : {}),
       };
       const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...v1, ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) };
+
+      // Stopped by the coordinator (turn aborted): the relay was torn down and
+      // the peer turn cancelled. Report a clean stop, not a scary error.
+      //
+      // Uses cardBase like every other exit. It used to hand-roll its own details object here, and
+      // that copy carried turn_status/task_status WITHOUT schema_version — which by this contract's
+      // own rule (absent version = pre-v1 producer) makes both fields invisible to a v1 reader.
+      // Harmless while legacy `status: "stopped"` carries the meaning, but it was a duplicate of
+      // cardBase placed before cardBase existed, and duplicates of that shape drift. This work
+      // already hit "two paths that were supposed to carry the same fields" once.
+      if (signal?.aborted) {
+        const msg = `Delegation to ${member.name} was stopped.`;
+        return { content: [{ type: "text" as const, text: msg }], details: { ...cardBase, status: "stopped", summary: msg } };
+      }
+
+      // Card-facing shape (portal-web AgentWorkCard reads target from args and
+      // status/summary/tool_calls/steps from result details). Carry the accumulated
+      // live steps into the FINAL result so the card keeps them after completion.
+      // session_id (=peer session) lets the card OPEN the full peer session and lets
+      // the model pass it back to continue this peer thread.
 
       if (!resp.ok || resp.status === "failed") {
         const msg = `Delegation to ${member.name} failed: ${resp.error ?? "unknown error"}`;
@@ -256,7 +295,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // pass it back as session_id to continue this peer thread on a follow-up.
       const cont = resp.peerSessionId ? `\n\n(To continue with ${member.name}, delegate again with session_id="${resp.peerSessionId}".)` : "";
       return {
-        content: [{ type: "text" as const, text: `Result from ${member.name}:\n${full}${cont}` }],
+        content: [{ type: "text" as const, text: `Result from ${member.name}:\n${statusLine(resp)}${full}${cont}` }],
         details: { ...cardBase, status: "done", summary, full_summary: full },
       };
     },

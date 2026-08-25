@@ -280,7 +280,14 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     ).rejects.toThrow(/different user/);
   });
 
-  it("uses the delegated read-only persona exclusively", async () => {
+  // ⚠️ INVERTED from "uses the delegated read-only persona exclusively", which pinned a real
+  // decision rather than a gap — read the reasoning on DELEGATION_PROTOCOL_PERSONA before changing
+  // it back. Exclusive use threw away the specialist's DOMAIN identity: a network specialist became
+  // a generic read-only worker exactly when the user had asked for a careful read-only
+  // investigation. The old justification (composing would tell the model to use tools the gate
+  // removed) applied to the old persona's tool inventory, and the addendum now states the removal
+  // explicitly instead.
+  it("COMPOSES identity + protocol + read-only addendum, rather than replacing", async () => {
     const mgr = new AgentBoxSessionManager();
     mgr.agentTypeState = "sre";
     await mgr.getOrCreate(
@@ -291,10 +298,39 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
       { delegationId: "d1", readOnly: true },
     );
 
-    const opts = lastCreateSiclawSession.calls.at(-1);
-    expect(opts.systemPromptAppend).toMatch(/read-only/i);
-    expect(opts.systemPromptAppend).not.toContain("custom prompt that says to remediate");
-    expect(opts.systemPromptAppend).not.toContain("Take the task end to end");
+    const appended = lastCreateSiclawSession.calls.at(-1).systemPromptAppend as string;
+    // The operator's identity survives — that is the point of the change.
+    expect(appended).toContain("custom prompt that says to remediate");
+    // The protocol is present on every delegated turn, and it is what explains the rendered blocks.
+    expect(appended).toContain("[AUTHORITATIVE TARGETS]");
+    expect(appended).toContain("[UNVERIFIED OBSERVATIONS]");
+    expect(appended).toContain("task_status");
+    // The read-only tier is an ADDENDUM stating what was removed.
+    expect(appended).toMatch(/READ-ONLY/);
+    expect(appended).toContain("have been REMOVED");
+  });
+
+  it("injects the protocol on a NORMAL delegation too, without the read-only addendum", async () => {
+    // The protocol is not a read-only concern: a read-write peer receives the same rendered blocks
+    // and needs the same explanation of what they mean.
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentTypeState = "sre";
+    await mgr.getOrCreate("sess-rw", "web", "domain identity", "normal", { delegationId: "d2", readOnly: false });
+
+    const appended = lastCreateSiclawSession.calls.at(-1).systemPromptAppend as string;
+    expect(appended).toContain("domain identity");
+    expect(appended).toContain("[AUTHORITATIVE TARGETS]");
+    expect(appended).not.toContain("have been REMOVED");
+  });
+
+  it("injects NO protocol on a non-delegated turn", async () => {
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentTypeState = "sre";
+    await mgr.getOrCreate("sess-plain", "web", "domain identity", "normal", undefined);
+
+    const appended = lastCreateSiclawSession.calls.at(-1).systemPromptAppend as string;
+    expect(appended).toContain("domain identity");
+    expect(appended).not.toContain("[AUTHORITATIVE TARGETS]");
   });
 
   it("defaults mode to 'web' when none supplied", async () => {

@@ -125,14 +125,22 @@ export interface BudgetedResult extends ResultPayload {
  * can be done about it.
  */
 function payloadBytes(p: ResultPayload): number {
-  let total = 0;
-  if (p.artifact) {
-    total += utf8Bytes(p.artifact.findings) + utf8Bytes(p.artifact.actions_taken) + utf8Bytes(p.artifact.residual_state);
-  }
-  if (p.finalText) total += utf8Bytes(p.finalText);
-  if (p.inputQuestion) total += utf8Bytes(p.inputQuestion);
-  for (const step of p.steps) total += utf8Bytes(step);
-  return total;
+  // ⚠️ MEASURES THE SERIALIZED FORM, not the sum of the raw strings.
+  //
+  // Summing raw strings understates the wire by roughly 2x: JSON escaping doubles every quote,
+  // backslash and newline (and a log excerpt is mostly those), and the keys, braces, commas and
+  // quotes are themselves payload. Measured: content whose raw strings totalled 32760 bytes
+  // serialized to 65563 — so a "32 KiB budget" admitted a 64 KiB result.
+  //
+  // The spec says "UTF-8 bytes of the serialized value", and this is the only measurement that
+  // matches it. It costs one JSON.stringify per iteration of the trim loop, which is a few passes
+  // over at most a few tens of KiB — irrelevant next to the turn that produced the payload.
+  return utf8Bytes(JSON.stringify({
+    artifact: p.artifact ?? undefined,
+    finalText: p.finalText,
+    inputQuestion: p.inputQuestion,
+    steps: p.steps,
+  }));
 }
 
 /**
@@ -187,6 +195,16 @@ export function applyResultBudget(payload: ResultPayload, budgetBytes = RESULT_B
     if (target >= utf8Bytes(current)) continue;
     out.artifact = { ...out.artifact, [key]: clipTail(current, target) };
     cut.push(`artifact.${key}`);
+  }
+
+  // inputQuestion is cut LAST and only if the budget is still exceeded with everything else at its
+  // floor. Cutting a question is bad — half a question cannot be relayed to a user — but silently
+  // emitting a result twice the declared budget is worse, and an unbounded field makes the budget a
+  // suggestion rather than a bound. Kept whole in every case where anything else could still give.
+  if (payloadBytes(out) > budgetBytes && out.inputQuestion) {
+    const over = payloadBytes(out) - budgetBytes;
+    out.inputQuestion = clipTail(out.inputQuestion, Math.max(0, utf8Bytes(out.inputQuestion) - over));
+    cut.push("inputQuestion");
   }
 
   const finalBytes = payloadBytes(out);

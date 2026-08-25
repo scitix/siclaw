@@ -596,10 +596,28 @@ export class ToolRegistry {
       return def;
     });
 
-    // 3. allowedTools whitelist (sole availability axis; no exemptions)
+    // 3. allowedTools whitelist — the sole availability axis, with ONE exemption, added
+    //    deliberately and narrowly.
+    //
+    // The comment here used to read "no exemptions", and that was a real invariant worth having.
+    // What broke it: the delegation result contract makes `report_findings` and `request_input` the
+    // ONLY way a peer can state what its work achieved. An agent whose capability selection omits
+    // the session-output group loses both, and then every single one of its delegated turns reports
+    // `task_status: unknown` — not occasionally, structurally and forever. The contract would be
+    // implemented and permanently uninformative for that agent.
+    //
+    // The exemption is scoped as tightly as the problem: only on a DELEGATED turn (`refs.delegation`
+    // set), and only these two tools, which report and ask rather than act. Both are already
+    // `readOnlyDelegable`, so this grants no reach a read-only peer did not have — it restores the
+    // ability to SAY something, not to DO something.
+    //
+    // It is genuinely a change to a stated invariant, not a detail. Anything wider than these two
+    // names belongs in a capability group, not here.
+    const PROTOCOL_TOOLS = new Set(["report_findings", "request_input"]);
     if (Array.isArray(allowedTools)) {
       const allowed = new Set(allowedTools);
-      return tools.filter((d) => allowed.has(d.name));
+      const onDelegatedTurn = Boolean(refs.delegation);
+      return tools.filter((d) => allowed.has(d.name) || (onDelegatedTurn && PROTOCOL_TOOLS.has(d.name)));
     }
 
     return tools;

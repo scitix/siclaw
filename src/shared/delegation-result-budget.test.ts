@@ -112,22 +112,48 @@ describe("applyResultBudget — the order is the reverse of how much the coordin
     );
   });
 
-  it("never cuts inputQuestion — half a question cannot be relayed to a user", () => {
-    const question = "WHICH-CLUSTER-" + ASCII.repeat(RESULT_BUDGET_BYTES);
-    const out = applyResultBudget({ inputQuestion: question, steps: [ASCII.repeat(4096)] });
+  it("keeps inputQuestion whole whenever anything else can still give", () => {
+    // Cutting a question is bad — half a question cannot be relayed to a user — so it goes last.
+    const question = "WHICH-CLUSTER-" + ASCII.repeat(1024);
+    const out = applyResultBudget({ inputQuestion: question, steps: Array.from({ length: 40 }, () => ASCII.repeat(2048)) });
     expect(out.inputQuestion).toBe(question);
-    // And the accounting stays honest: it reports what it could not achieve rather than implying
-    // everything fit.
-    expect(out.truncation).toBeDefined();
-    expect(out.truncation!.omitted_bytes).toBeGreaterThan(0);
+    expect(out.truncation!.fields).toContain("steps");
+    expect(out.truncation!.fields).not.toContain("inputQuestion");
   });
 
-  it("reports original_bytes and omitted_bytes over the fields the budget governs", () => {
+  it("cuts inputQuestion as a LAST resort rather than blowing the budget", () => {
+    // It used to be exempt unconditionally, which made the budget a suggestion: a single huge
+    // question emitted a result far past the declared bound with nothing able to bring it down.
+    const question = "WHICH-CLUSTER-" + ASCII.repeat(RESULT_BUDGET_BYTES * 2);
+    const out = applyResultBudget({ inputQuestion: question, steps: [] });
+    expect(out.truncation!.fields).toContain("inputQuestion");
+    expect(utf8Bytes(JSON.stringify({ inputQuestion: out.inputQuestion, steps: out.steps })))
+      .toBeLessThanOrEqual(RESULT_BUDGET_BYTES + 64);
+  });
+
+  it("measures the SERIALIZED payload, not the sum of the raw strings", () => {
+    // Summing raw strings understates the wire by roughly 2x — JSON escaping doubles every quote,
+    // backslash and newline (and a log excerpt is mostly those), and keys/braces/commas are payload
+    // too. Measured before the fix: raw strings totalling 32760 bytes serialized to 65563, so a
+    // "32 KiB budget" admitted a 64 KiB result.
     const steps = Array.from({ length: 20 }, () => ASCII.repeat(2048));
     const out = applyResultBudget({ artifact: bigArtifact(512), steps });
-    expect(out.truncation!.original_bytes).toBe(20 * 2048 + 512 + 1024 + 1024);
+    // Strictly greater than the raw sum, because the structure itself counts.
+    expect(out.truncation!.original_bytes).toBeGreaterThan(20 * 2048 + 512 + 1024 + 1024);
     expect(out.truncation!.omitted_bytes).toBeGreaterThan(0);
-    expect(out.truncation!.original_bytes - out.truncation!.omitted_bytes).toBeLessThanOrEqual(RESULT_BUDGET_BYTES);
+    // And what is left actually fits, measured the same way.
+    const kept = utf8Bytes(JSON.stringify({
+      artifact: out.artifact, finalText: out.finalText, inputQuestion: out.inputQuestion, steps: out.steps,
+    }));
+    expect(kept).toBeLessThanOrEqual(RESULT_BUDGET_BYTES);
+  });
+
+  it("escaping counts: a payload of quotes and newlines is bounded on the WIRE", () => {
+    // The case the raw-sum measurement got most wrong. Every character here doubles when escaped.
+    const nasty = '"\n'.repeat(RESULT_BUDGET_BYTES / 2);
+    const out = applyResultBudget({ finalText: nasty, steps: [] });
+    const kept = utf8Bytes(JSON.stringify({ finalText: out.finalText, steps: out.steps }));
+    expect(kept).toBeLessThanOrEqual(RESULT_BUDGET_BYTES);
   });
 
   it("matches §8a's worked example", () => {
