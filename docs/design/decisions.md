@@ -577,15 +577,18 @@ allows stale or unrelated Release notifications to report success.
 **Decision**:
 Release application is identity-bound and happens at a turn boundary:
 
-- A release reload carries the expected `releaseId` and `modelFingerprint`.
-- Runtime resolves the current binding from the management server and rejects a
-  notification whose observed identity does not match the expected identity.
+- Identity-bound callers send the expected `releaseId` and `modelFingerprint`.
+  Runtime resolves the current binding from the management server and rejects a
+  notification whose prepared identity does not match either supplied value.
+  Legacy callers may omit the expected identity; that compatibility path reports
+  what was prepared but cannot reject a stale notification.
 - `model` is a reload type whose AgentBox action invalidates warm sessions. The
   existing invalidation fence lets an in-flight turn finish and rebuilds the
   session before its next prompt.
 - The next prompt remains the only carrier of provider credentials and model
   configuration. Reload notifications carry identity, never secrets.
-- Runtime reports the observed Release identity and number of reached boxes.
+- The reload response reports the prepared Release identity and number of
+  reached boxes as `preparedReleaseId` and `preparedModelFingerprint`.
   Zero boxes means cold-start convergence, not runtime model verification.
 - A reload ACK proves preparation only. AgentBox records an observed release
   and model fingerprint after a real turn completes successfully; only that
@@ -601,8 +604,12 @@ Release application is identity-bound and happens at a turn boundary:
 - ⚠️ "Prepared for next turn" and "successfully ran a turn" are distinct
   states; promotion gates consume only the latter.
 - ⚠️ Management servers predating this contract must keep model deliveries
-  pending while an older Runtime is deployed; rolling upgrades should deploy
-  Runtime support before relying on verified model delivery.
+  pending while an older Runtime is deployed. Roll out Runtime support first,
+  then publish an AgentBox image containing observed-model reporting, update
+  `SICLAW_AGENTBOX_IMAGE`, and recycle existing AgentBox Pods before enabling
+  verified model delivery. Subsequent Release model changes use the turn-boundary
+  session fence and do not require another Pod restart.
 
 **Files**: `src/shared/gateway-sync.ts`, `src/gateway/server.ts`,
-`src/gateway/agent-model-binding.ts`, `src/agentbox/sync-handlers.ts`
+`src/gateway/agent-model-binding.ts`, `src/agentbox/sync-handlers.ts`,
+`src/agentbox/http-server.ts`

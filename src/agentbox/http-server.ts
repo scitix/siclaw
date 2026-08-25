@@ -1221,7 +1221,8 @@ export function createHttpServer(
         const intendedCandidate = body.modelProvider && body.modelId
           ? candidateKey({ provider: body.modelProvider, modelId: body.modelId })
           : undefined;
-        const ranIntendedModel = !result?.activeCandidateKey || result.activeCandidateKey === intendedCandidate;
+        const ranIntendedModel = intendedCandidate !== undefined
+          && result?.activeCandidateKey === intendedCandidate;
         if (ranIntendedModel && body.releaseId && body.modelFingerprint) {
           observedModel = {
             releaseId: body.releaseId,

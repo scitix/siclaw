@@ -61,9 +61,11 @@ describe("agent.reload release model identity", () => {
     expect(reloadCalls).toEqual(["model"]);
     expect(result).toMatchObject({
       ok: true, boxes: 1,
-      observedReleaseId: "release-2",
-      observedModelFingerprint: "fingerprint-2",
+      preparedReleaseId: "release-2",
+      preparedModelFingerprint: "fingerprint-2",
     });
+    expect(result).not.toHaveProperty("observedReleaseId");
+    expect(result).not.toHaveProperty("observedModelFingerprint");
   });
 
   it("rejects a stale delivery before touching a box", async () => {
@@ -81,7 +83,7 @@ describe("agent.reload release model identity", () => {
       agentId: "agent-1", resources: ["model"],
       releaseId: "release-2", modelFingerprint: "fingerprint-2",
     }) as any;
-    expect(result).toMatchObject({ boxes: 0, observedReleaseId: "release-2" });
+    expect(result).toMatchObject({ boxes: 0, preparedReleaseId: "release-2" });
     expect(reloadCalls).toEqual([]);
   });
 });

@@ -426,6 +426,22 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
     expect((await getJson(port, "/api/sync-status")).data.model).toBeNull();
   });
 
+  it("does not verify the release model when the successful turn has no observed candidate", async () => {
+    const session = await sm.getOrCreate("unidentified-model");
+    session.brain.getModel.mockReturnValue(undefined);
+
+    const prompt = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "unidentified-model",
+      releaseId: "release-2",
+      modelFingerprint: "fingerprint-2",
+    });
+    expect(prompt.status).toBe(200);
+    await flushAsync();
+
+    expect((await getJson(port, "/api/sync-status")).data.model).toBeNull();
+  });
+
   it("GET /api/internal/box-status reports drained when the box holds nothing", async () => {
     // The Runtime routes on this: `drained` must come FROM the box, because a session can
     // have no in-flight turn while a background sub-agent still runs under it.

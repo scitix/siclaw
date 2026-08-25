@@ -2060,7 +2060,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       console.log(`[rpc] agent.reload: no active boxes for agent=${agentId}, skipping`);
       return {
         ok: true, reloaded: [], skipped: resourceTypes, boxes: 0,
-        observedReleaseId: preparedReleaseId, observedModelFingerprint: preparedModelFingerprint,
+        preparedReleaseId, preparedModelFingerprint,
       };
     }
 
@@ -2091,7 +2091,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
     return {
       ok: true, reloaded, failed, boxes: targets.length,
-      observedReleaseId: preparedReleaseId, observedModelFingerprint: preparedModelFingerprint,
+      preparedReleaseId, preparedModelFingerprint,
     };
   });
 
