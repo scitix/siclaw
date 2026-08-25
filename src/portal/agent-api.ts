@@ -22,7 +22,7 @@ import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
 import {
   canonicalTierConfig,
   encodeSubagentModelsForDb,
-  type SubagentTierConfigEntry,
+  normalizeSubagentTierConfig,
 } from "../core/subagent-models.js";
 import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
@@ -107,9 +107,21 @@ function normalizedToolCapabilities(value: unknown): string {
  * "different revision" means downstream.
  */
 function normalizedSubagentModels(value: unknown): string {
-  const parsed = safeParseJson<SubagentTierConfigEntry[]>(value, [] as SubagentTierConfigEntry[]);
-  if (!Array.isArray(parsed) || parsed.length === 0) return "";
-  return canonicalTierConfig(parsed);
+  // Goes through the non-throwing validator, and an INVALID stored value compares
+  // as "no tiers" rather than raising.
+  //
+  // This reads the row's CURRENT value to decide whether an update changed it, so
+  // throwing here would be self-defeating: a row corrupted by any means could
+  // never be repaired through the API, because every PUT — including one that
+  // clears the field — has to read the old value first. The one operation that
+  // fixes the problem would be the one guaranteed to fail.
+  //
+  // Comparing invalid-as-empty is also the right answer for the reload decision:
+  // an unusable config was already producing no tiers, so replacing it with a
+  // usable one IS a change and must invalidate warm sessions.
+  const parsed = normalizeSubagentTierConfig(safeParseJson<unknown>(value, null));
+  if (!parsed.ok || parsed.value.length === 0) return "";
+  return canonicalTierConfig(parsed.value);
 }
 
 

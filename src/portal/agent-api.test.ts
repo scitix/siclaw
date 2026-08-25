@@ -557,6 +557,59 @@ describe("registerAgentRoutes", () => {
       });
     });
 
+    it("can REPAIR a corrupted tier config instead of being blocked by it", async () => {
+      // A PUT reads the current value to decide whether anything changed, so a
+      // comparison that throws on a corrupted row makes that row permanently
+      // unfixable — the one operation that repairs it is the one guaranteed to
+      // fail. `[null]` is the shape that used to throw: it parses, passes
+      // Array.isArray, then dies on field access.
+      query
+        .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: "[null]",
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          subagent_models: [
+            { tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" },
+          ],
+        },
+      }));
+
+      expect(status).toBe(200);
+      // An unusable config was already producing no tiers, so replacing it with a
+      // usable one IS a change and must invalidate warm sessions.
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("can CLEAR a corrupted tier config", async () => {
+      // The other half of repairable: setting it back to null must work too.
+      query
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: '[{"tier":"fast"}]',
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { subagent_models: null },
+      }));
+
+      expect(status).toBe(200);
+    });
+
     it("does not reload tools when the tier list is resubmitted unchanged", async () => {
       // Compared through the same canonical form the revision uses, so a no-op
       // save does not kick warm sessions.

@@ -167,6 +167,17 @@ function readWhenToUse(entry: Record<string, unknown>): unknown {
   return entry.whenToUse ?? entry.when_to_use;
 }
 
+/**
+ * ⚠️ Order is deliberate: TRIM first, then reject control characters.
+ *
+ * So leading/trailing whitespace — including newlines and tabs, which *are*
+ * control characters — is silently removed, while any control character in the
+ * INTERIOR is refused. That is not an inconsistency with "control characters are
+ * rejected", it is the useful reading of it: surrounding whitespace is an artifact
+ * of how the value was entered and carries no meaning, whereas an interior newline
+ * changes what the model reads. Rejecting a pasted value for a trailing newline
+ * would fail configurations that are perfectly fine, and for no gain.
+ */
 function normalizeWhenToUse(raw: unknown): string | undefined {
   const trimmed = normalizeRequiredString(raw);
   if (trimmed === undefined) return undefined;
@@ -513,6 +524,37 @@ export interface SubagentTierPlan {
      */
     params?: { reasoningEffort?: string };
   } | null;
+}
+
+/**
+ * The persistable projection of a {@link ChildModelOutcome}: identifiers and
+ * reasons, never credentials.
+ *
+ * A terminal delegation event is stored and replayed, and for a BACKGROUND group
+ * it is the only surviving record — the tool call returned `launched` before any
+ * of this was known. So the outcome has to be persisted, and persisting it means
+ * being explicit about what may be written rather than spreading the whole object
+ * and hoping it never grows a credential-bearing field.
+ */
+export interface PersistedTierOutcome {
+  requestedTier?: string;
+  resolvedTier?: string;
+  source: TierSelectionSource;
+  provider?: string;
+  modelId?: string;
+  fallbackReason?: TierFallbackReason;
+}
+
+/** Project an outcome down to what is safe and useful to store. */
+export function persistableTierOutcome(outcome: ChildModelOutcome): PersistedTierOutcome {
+  return {
+    ...(outcome.requestedTier ? { requestedTier: outcome.requestedTier } : {}),
+    ...(outcome.resolvedTier ? { resolvedTier: outcome.resolvedTier } : {}),
+    source: outcome.source,
+    ...(outcome.provider ? { provider: outcome.provider } : {}),
+    ...(outcome.modelId ? { modelId: outcome.modelId } : {}),
+    ...(outcome.fallbackReason ? { fallbackReason: outcome.fallbackReason } : {}),
+  };
 }
 
 /** What actually happened when a child was put on a model. Feeds the per-item report. */

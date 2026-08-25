@@ -7,6 +7,7 @@ import {
   normalizeSubagentTierCandidates,
   normalizeSubagentTierConfig,
   normalizeSubagentTierMenu,
+  persistableTierOutcome,
   renderTierMenuForDescription,
   resolveTierSelection,
   type SubagentTierCandidates,
@@ -300,6 +301,42 @@ describe("normalizeSubagentTierConfig (read paths must never throw)", () => {
     ]);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value[0]).toEqual({ tier: "fast", provider: "p", modelId: "m", whenToUse: WHY });
+  });
+});
+
+describe("persistableTierOutcome", () => {
+  it("keeps identifiers and reasons, and carries no credentials", () => {
+    // This projection is what a terminal delegation event stores, and for a
+    // BACKGROUND run it is the ONLY surviving record — the tool call returned
+    // `launched` before any of it was known. Explicit field-by-field rather than
+    // a spread, so the shape cannot quietly grow a credential-bearing field.
+    const projected = persistableTierOutcome({
+      requestedTier: "fast",
+      resolvedTier: null,
+      source: "request",
+      fallbackReason: "candidate_missing",
+      provider: "p",
+      modelId: "m",
+      detail: "some internal detail",
+    });
+
+    expect(projected).toEqual({
+      requestedTier: "fast",
+      source: "request",
+      fallbackReason: "candidate_missing",
+      provider: "p",
+      modelId: "m",
+    });
+    expect(JSON.stringify(projected)).not.toContain("apiKey");
+  });
+
+  it("omits empty fields rather than storing nulls", () => {
+    const projected = persistableTierOutcome({
+      requestedTier: null,
+      resolvedTier: "deep",
+      source: "type_default",
+    });
+    expect(projected).toEqual({ resolvedTier: "deep", source: "type_default" });
   });
 });
 

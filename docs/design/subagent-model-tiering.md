@@ -405,9 +405,16 @@ Two shared functions, applied at the Runtime boundary to whatever arrives. They 
 | Duplicate `(provider, modelId)` | N/A | Rejected — two names for one model make the report ambiguous |
 
 Length is counted in **Unicode code points, not UTF-16 units**, so a `whenToUse`
-written in CJK is not penalised for it. Control characters are rejected outright
-rather than stripped: the value lands in a tool description, and silently editing
-prose that an operator wrote is worse than telling them it was refused.
+written in CJK is not penalised for it.
+
+`whenToUse` is **trimmed first, then checked for control characters** — so leading
+and trailing whitespace (newlines and tabs included, which *are* control
+characters) is removed silently, while any control character in the interior is
+refused. Surrounding whitespace is an artifact of how the value was entered and
+carries no meaning; an interior newline changes what the model reads. Rejecting a
+pasted value over a trailing newline would fail perfectly good configurations for
+no gain, and silently rewriting the *interior* would make the model read something
+nobody wrote.
 
 **Rejection is scoped to the channel that was malformed**, because the two have
 different lifetimes:

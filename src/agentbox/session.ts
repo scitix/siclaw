@@ -87,8 +87,10 @@ import {
 } from "../core/model-routing.js";
 import { resolveRequestedTier } from "../core/subagent-registry.js";
 import {
+  persistableTierOutcome,
   resolveTierSelection,
   type ChildModelOutcome,
+  type PersistedTierOutcome,
   type SubagentTierCandidates,
   type SubagentTierMenu,
   type SubagentTierPlan,
@@ -1453,7 +1455,16 @@ export class AgentBoxSessionManager {
       capsule,
       summaryTruncated: reduceTruncated,
       reduceChildSessionId,
-      itemStatuses: itemResults.map((r, i) => ({ index: i, status: r.status })),
+      // Tier outcome rides the terminal event because for a BACKGROUND group it is
+      // the only place a result survives: the tool call returned `launched` long
+      // before any of this was known, so nothing else ever carries which model ran
+      // or why it fell back. Identifiers only — `modelConfig` never leaves the
+      // candidate payload, and this record is persisted.
+      itemStatuses: itemResults.map((r, i) => ({
+        index: i,
+        status: r.status,
+        ...(r.tierOutcome ? { tier: persistableTierOutcome(r.tierOutcome) } : {}),
+      })),
       durationMs,
       traceId: traceCtx?.mainTraceId,
     });
@@ -1477,7 +1488,7 @@ export class AgentBoxSessionManager {
       capsule: string;
       summaryTruncated: boolean;
       reduceChildSessionId?: string;
-      itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
+      itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
       durationMs: number;
       traceId?: string;
     },
@@ -2927,6 +2938,10 @@ export class AgentBoxSessionManager {
             durationMs,
             interruptedTool,
             traceId: mainTraceId,
+            // Same reason as the group's terminal event: a DETACHED single spawn
+            // returned `launched` long before this, so without it here nothing
+            // records which model ran or why it fell back. Identifiers only.
+            ...(tierOutcome ? { tier: persistableTierOutcome(tierOutcome) } : {}),
           });
         } catch (err) {
           console.warn(`[agentbox-session] terminal delegation event persist failed for ${childSessionId}:`, err);

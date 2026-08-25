@@ -1,0 +1,65 @@
+{
+  "$comment": [
+    "GOLDEN FIXTURE for the sub-agent model tier wire contract.",
+    "",
+    "This file is the contract between two independent implementations of",
+    "config.getAgent. Each side asserts against it, so a rename, a spelling",
+    "change, a revision-format change or a different empty-value convention",
+    "fails a test on BOTH sides instead of only surfacing at runtime on a",
+    "deployment nobody tested.",
+    "",
+    "That is not hypothetical: an earlier revision of this feature shipped with",
+    "the Gateway accepting only the config-array shape while the other side sent",
+    "an already-projected menu. The projection returned null, no menu reached the",
+    "tool description, the model_tier parameter never appeared, and tiering was",
+    "silently absent — with every test in both repositories green, because each",
+    "one fed itself the shape it produced.",
+    "",
+    "CHANGING THIS FILE IS A CONTRACT CHANGE. Both sides have to agree, and the",
+    "deploy-order note in docs/design/subagent-model-tiering.md applies.",
+    "",
+    "Copy this file into the other repository verbatim rather than transcribing",
+    "it — a transcription is exactly the step where a spelling drifts."
+  ],
+
+  "projectedMenu": {
+    "$comment": "Preferred shape: the producer projects, so provider/modelId never reach the menu channel. snake_case matches every other field on that RPC.",
+    "revision": "b3f1000000000000000000000000000000000000000000000000000000000000",
+    "items": [
+      { "tier": "fast", "when_to_use": "read logs, grep code, check config — retrieval and summary" },
+      { "tier": "deep", "when_to_use": "cross-source causal reasoning, or a conclusion a human reads" }
+    ]
+  },
+
+  "configArray": {
+    "$comment": "Legacy/Standalone shape: raw config, camelCase, provider and modelId present. Still accepted; the Gateway projects and hashes it locally.",
+    "value": [
+      { "tier": "fast", "provider": "p-a", "modelId": "m-1", "whenToUse": "read logs, grep code, check config" },
+      { "tier": "deep", "provider": "p-b", "modelId": "m-2", "whenToUse": "cross-source causal reasoning" }
+    ]
+  },
+
+  "candidates": {
+    "$comment": "The credential-bearing half, carried on the model binding. Must share a revision with the menu describing the same configuration. modelConfig is abridged here; only its presence is contractual.",
+    "revision": "b3f1000000000000000000000000000000000000000000000000000000000000",
+    "candidates": [
+      { "tier": "fast", "provider": "p-a", "modelId": "m-1", "modelConfig": { "name": "p-a", "apiKey": "REDACTED", "models": [] } },
+      { "tier": "deep", "provider": "p-b", "modelId": "m-2", "modelConfig": { "name": "p-b", "apiKey": "REDACTED", "models": [] } }
+    ]
+  },
+
+  "rules": {
+    "$comment": "Assertions both sides must satisfy. Stated as data so neither side can quietly relax one.",
+    "tierPattern": "^[a-z][a-z0-9_-]{0,31}$",
+    "maxTiers": 5,
+    "revisionPattern": "^[0-9a-f]{64}$",
+    "whenToUseMinCodePoints": 8,
+    "whenToUseMaxCodePoints": 256,
+    "whenToUseAcceptedKeys": ["whenToUse", "when_to_use"],
+    "menuMustNotContain": ["provider", "modelId", "model_id", "modelConfig"],
+    "candidatesMustNotRequire": ["whenToUse", "when_to_use"],
+    "clearSignal": null,
+    "emptyItemsIsMalformed": true,
+    "revisionIsOverFullConfig": true
+  }
+}

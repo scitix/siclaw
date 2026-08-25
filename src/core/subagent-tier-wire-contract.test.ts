@@ -15,7 +15,12 @@
  */
 import { describe, it, expect } from "vitest";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import url from "node:url";
 import {
+  MAX_SUBAGENT_TIERS,
+  WHEN_TO_USE_MAX_CHARS,
   canonicalTierConfig,
   normalizeSubagentTierMenu,
   projectTierMenuFromConfig,
@@ -23,26 +28,26 @@ import {
 } from "./subagent-models.js";
 
 const sha256Hex = (input: string) => crypto.createHash("sha256").update(input).digest("hex");
-const REV = "b3f1".padEnd(64, "0");
 
 /**
- * Upstream mode: the control plane projects the menu itself and sends
- * `{revision, items}` with snake_case field names — the convention every other
- * field on this RPC uses (`tool_capabilities`, `agent_type`, `model_provider`).
+ * Loaded from the GOLDEN FIXTURE rather than written inline, so the other
+ * implementation can assert against the same bytes instead of a transcription —
+ * transcribing is exactly the step where a spelling drifts, which is the failure
+ * this file exists to prevent.
  */
-const UPSTREAM_PROJECTED_MENU = {
-  revision: REV,
-  items: [
-    { tier: "fast", when_to_use: "read logs, grep code, check config — retrieval and summary" },
-    { tier: "deep", when_to_use: "cross-source causal reasoning, or a conclusion a human reads" },
-  ],
-};
+const golden = JSON.parse(
+  fs.readFileSync(
+    path.join(path.dirname(url.fileURLToPath(import.meta.url)), "__fixtures__/subagent-tier-wire.golden.json"),
+    "utf-8",
+  ),
+);
+
+/** Upstream mode: the producer projects, and uses this RPC's snake_case convention. */
+const UPSTREAM_PROJECTED_MENU = golden.projectedMenu;
+const REV: string = golden.projectedMenu.revision;
 
 /** Standalone: the raw config array, camelCase, with provider/modelId present. */
-const STANDALONE_CONFIG = [
-  { tier: "fast", provider: "p-a", modelId: "m-1", whenToUse: "read logs, grep code, check config" },
-  { tier: "deep", provider: "p-b", modelId: "m-2", whenToUse: "cross-source causal reasoning" },
-];
+const STANDALONE_CONFIG = golden.configArray.value;
 
 describe("tier menu wire contract", () => {
   it("accepts an already-projected menu from a control plane", () => {
@@ -110,5 +115,45 @@ describe("tier menu wire contract", () => {
     expect(projectTierMenuFromConfig(null, sha256Hex)).toBeNull();
     expect(projectTierMenuFromConfig(undefined, sha256Hex)).toBeNull();
     expect(projectTierMenuFromConfig({ revision: REV, items: [] }, sha256Hex)).toBeNull();
+  });
+});
+
+describe("the golden fixture matches what this implementation enforces", () => {
+  // The fixture states the rules as DATA so neither implementation can quietly
+  // relax one. If a constant here moves, this fails and the fixture (and the
+  // other repository) has to be updated deliberately.
+  const rules = golden.rules;
+
+  it("agrees on the tier pattern, the cap and the whenToUse bounds", () => {
+    expect(rules.maxTiers).toBe(MAX_SUBAGENT_TIERS);
+    expect(rules.whenToUseMaxCodePoints).toBe(WHEN_TO_USE_MAX_CHARS);
+
+    // A tier at the pattern's limits is accepted; one past them is not.
+    const at = "a".repeat(32);
+    const past = "a".repeat(33);
+    expect(new RegExp(rules.tierPattern).test(at)).toBe(true);
+    expect(new RegExp(rules.tierPattern).test(past)).toBe(false);
+  });
+
+  it("agrees that both whenToUse spellings are accepted", () => {
+    for (const key of rules.whenToUseAcceptedKeys) {
+      const menu = projectTierMenuFromConfig(
+        { revision: REV, items: [{ tier: "fast", [key]: "read logs and summarise findings" }] },
+        sha256Hex,
+      );
+      expect(menu, `key ${key}`).not.toBeNull();
+    }
+  });
+
+  it("agrees that the menu never carries the candidate-only fields", () => {
+    const serialized = JSON.stringify(projectTierMenuFromConfig(STANDALONE_CONFIG, sha256Hex));
+    for (const forbidden of rules.menuMustNotContain) {
+      expect(serialized, `menu must not contain ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it("agrees that an empty items array is malformed rather than a clear", () => {
+    expect(rules.emptyItemsIsMalformed).toBe(true);
+    expect(normalizeSubagentTierMenu({ revision: REV, items: [] }).ok).toBe(false);
   });
 });
