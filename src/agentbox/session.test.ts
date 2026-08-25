@@ -167,6 +167,72 @@ afterEach(() => {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+describe("AgentBoxSessionManager — placing a child on its model", () => {
+  /** Minimal brain that records what was done to it, in order. */
+  function fakeBrain() {
+    const calls: string[] = [];
+    const applied: Array<Record<string, unknown>> = [];
+    return {
+      calls,
+      applied,
+      registerProvider: (name: string) => { calls.push(`register:${name}`); },
+      findModel: (provider: string, modelId: string) =>
+        ({ id: modelId, provider, contextWindow: 100_000, maxTokens: 4096, reasoning: true }),
+      setModel: async (m: { id: string }) => { calls.push(`setModel:${m.id}`); },
+      applyModelParams: (params: Record<string, unknown>) => {
+        calls.push("applyParams");
+        applied.push(params);
+      },
+      checkContextFitForModelPrompt: () => ({ ok: true, compacted: false }),
+    };
+  }
+
+  const candidate = {
+    provider: "p",
+    modelId: "m",
+    modelConfig: { apiKey: "k", models: [], params: { reasoning_effort: "high" } },
+  };
+
+  it("does NOT touch runtime params when no tier was involved", async () => {
+    // Compatibility contract: before tiering, a child was placed with
+    // registerProvider + setModel and nothing else. Applying the parent
+    // candidate's params here would start honouring a reasoning_effort that every
+    // child has ignored, changing behaviour for deployments with no tiers at all.
+    const mgr = new AgentBoxSessionManager();
+    const brain = fakeBrain();
+
+    await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", false, false);
+
+    expect(brain.calls).toEqual(["register:p", "setModel:m"]);
+    expect(brain.applied).toHaveLength(0);
+  });
+
+  it("applies the candidate's params once a tier is in play", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const brain = fakeBrain();
+
+    await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", true, true);
+
+    expect(brain.calls).toContain("applyParams");
+    expect(brain.applied[0]).toEqual({ reasoningEffort: "high" });
+  });
+
+  it("restores the parent's params BEFORE the candidate's, so an explicit setting wins", async () => {
+    // Order matters: the restore undoes a rejected tier's level, and the
+    // candidate's own params are the parent's actual intent on top of it.
+    const mgr = new AgentBoxSessionManager();
+    const brain = fakeBrain();
+
+    await (mgr as any).putBrainOnCandidate(
+      brain, candidate, "briefing", false, true, { reasoningEffort: "low" },
+    );
+
+    expect(brain.applied).toEqual([{ reasoningEffort: "low" }, { reasoningEffort: "high" }]);
+    // And both land after the model switch, which is what re-clamps to the target.
+    expect(brain.calls.indexOf("setModel:m")).toBeLessThan(brain.calls.indexOf("applyParams"));
+  });
+});
+
 describe("AgentBoxSessionManager — getOrCreate", () => {
   it("creates a new session on first call and caches it", async () => {
     const mgr = new AgentBoxSessionManager();

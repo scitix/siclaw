@@ -2150,11 +2150,19 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // capabilities and an immutable behavior contract; system_prompt stores
       // only the optional Agent-owned Addendum.
       agent_type: agent.agent_type,
-      // Sub-agent model tiers in CONFIG form ({tier, provider, modelId,
-      // whenToUse}). The Gateway projects the credential-free half of this into
-      // the tools payload as the tier menu; the candidates travel separately on
-      // the binding. Same defensive JSON parse as tool_capabilities.
-      subagent_model_tiers: safeParseJson<unknown[] | null>(agent.subagent_models, null),
+      // Sub-agent tier MENU, already projected — credential-free {tier, whenToUse}
+      // plus the revision.
+      //
+      // Resolved through the SAME entry point the candidates use, deliberately.
+      // Handing over the raw config instead left the two channels resolving
+      // independently: the candidate side dropped entries whose model no longer
+      // existed (and returned nothing when none did), while the menu was projected
+      // straight from the config and kept advertising every tier. The revisions
+      // then disagreed and tiering failed for the healthy tiers too.
+      //
+      // Projecting here also discloses less: the Gateway never needs provider or
+      // modelId to build a menu, so it should not receive them.
+      subagent_model_tiers: (await resolveAgentSubagentTiers(agent.subagent_models)).menu,
     };
   });
 

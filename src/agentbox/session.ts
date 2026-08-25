@@ -586,23 +586,26 @@ export class AgentBoxSessionManager {
         // whatever the factory gave it.
         return { requestedTier: requested, resolvedTier: null, source, fallbackReason: reason };
       }
-      // Restore params ONLY when a tier was actually attempted and rejected —
-      // `reason` is undefined on the plain inherit path.
+      // `reason` is undefined on the plain inherit path and set on every fallback.
+      // That distinction decides whether the child's tunables are touched AT ALL.
       //
-      // On inherit nothing has touched the child's tunables, so restoring anything
-      // would CHANGE behaviour rather than preserve it: pi's own `setModel`
-      // consults `supportsThinking()` on the model it is switching away from, and
-      // gives the deployment default when that model is non-reasoning. Writing a
-      // captured value over that would override the default with a clamped
-      // artifact — breaking "no tiers configured ⇒ behaviour identical to today"
-      // for every deployment that never configured a tier.
+      // Inherit must leave them alone. Before tiering a child was placed on its
+      // model with registerProvider + setModel and nothing else, so both applying
+      // the parent candidate's own params and writing back a captured level would
+      // be new behaviour — and contract 1 says a deployment with no tiers behaves
+      // exactly as it did. Note pi's setModel consults supportsThinking() on the
+      // model being switched AWAY from and hands out the deployment default when
+      // that model is non-reasoning; writing anything over that would replace the
+      // default with a clamped artifact.
       //
-      // On fallback the tier HAS moved the level and neither `setModel` nor
-      // `applyModelParams` can lower it, so the parent's own captured params are
-      // the restore target.
+      // Fallback is the opposite case: the tier has already moved the level, and
+      // neither setModel nor applyModelParams can lower it, so the parent's real
+      // params are the restore target.
+      const isFallback = reason !== undefined;
       const applied = await this.putBrainOnCandidate(
         child.brain, parentCandidate, briefing, false,
-        reason ? plan?.effectiveParent?.params : undefined,
+        isFallback,
+        isFallback ? plan?.effectiveParent?.params : undefined,
       );
       if (!applied.ok) {
         return {
@@ -633,7 +636,8 @@ export class AgentBoxSessionManager {
       modelId: selection.candidate.modelId,
       modelConfig: selection.candidate.modelConfig,
     };
-    const applied = await this.putBrainOnCandidate(child.brain, tierCandidate, briefing, true);
+    // A tier IS an explicit request to run differently, so its params apply.
+    const applied = await this.putBrainOnCandidate(child.brain, tierCandidate, briefing, true, true);
     if (!applied.ok) {
       // The tier could not be used. The brain may already have been moved part of
       // the way onto it, so restoring the parent re-runs the whole sequence.
@@ -663,8 +667,22 @@ export class AgentBoxSessionManager {
     briefing: string,
     checkFit: boolean,
     /**
-     * Tunables to restore when the candidate carries none of its own. Supplied on
-     * the FALLBACK path, where a rejected tier may have left the level raised and
+     * Whether to touch the brain's runtime tunables at all.
+     *
+     * FALSE on the plain inherit path, and that is a compatibility requirement
+     * rather than an optimisation: before tiering, a child was placed on its model
+     * with `registerProvider` + `setModel` and nothing else. Applying the parent
+     * candidate's `params` here would start honouring a `reasoning_effort` that
+     * every child has ignored until now — a behaviour change for deployments that
+     * configured no tiers, which contract 1 forbids.
+     *
+     * TRUE once a tier has been attempted: the brain's level has already been
+     * moved, so leaving it alone is no longer the neutral option.
+     */
+    applyParams: boolean,
+    /**
+     * Tunables to restore before the candidate's own are applied. Supplied on the
+     * FALLBACK path, where a rejected tier may have left the level raised and
      * neither `setModel` nor `applyModelParams` will lower it.
      */
     restoreParams?: BrainModelParams,
@@ -687,13 +705,15 @@ export class AgentBoxSessionManager {
       // re-clamps the level to the target model's capabilities.
       await brain.setModel(model);
 
-      // Restore the pre-tier baseline BEFORE applying the candidate's own params,
-      // so an explicit setting still wins. `setModel` does not do this for us: pi
-      // carries the current thinking level across a switch whenever the target
-      // supports thinking, so a rejected `xhigh` tier would otherwise leave the
-      // parent model running at `xhigh`.
-      if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
-      applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
+      if (applyParams) {
+        // Restore the parent's real params BEFORE applying the candidate's own, so
+        // an explicit setting still wins. `setModel` does not do this for us: pi
+        // carries the current thinking level across a switch whenever the target
+        // supports thinking, so a rejected `xhigh` tier would otherwise leave the
+        // parent model running at `xhigh`.
+        if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
+        applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
+      }
 
       if (checkFit && brain.checkContextFitForModelPrompt) {
         const fit = brain.checkContextFitForModelPrompt(model, briefing);

@@ -298,7 +298,7 @@ contract, not an implementation detail.
 
 | Carrier | Field | Shape | Contains credentials |
 |---|---|---|---|
-| Agent config read (`config.getAgent`) | `subagent_model_tiers` | **Either** the config form (tier + provider + modelId + whenToUse) **or** an already-projected `SubagentTierMenu` — see below | No |
+| Agent config read (`config.getAgent`) | `subagent_model_tiers` | An already-projected `SubagentTierMenu`. The raw config form is still accepted for compatibility — see below | No |
 | tools sync payload (`ToolsPayload`, `sync-handlers.ts:647`) | `subagentTierMenu` | `SubagentTierMenu` | No |
 | Model binding (`config.getModelBinding` → `binding`) | `subagentTiers` | `SubagentTierCandidates` | **Yes** |
 | AgentBox prompt body | `subagentTiers` | `SubagentTierCandidates` | **Yes** |
@@ -337,13 +337,23 @@ field:
 appear only in `SubagentTierCandidates`** — anything that puts a `modelConfig` on
 the menu channel is a bug, not a convenience.
 
-#### `config.getAgent` accepts two shapes, and a control plane should send the projected one
+#### `config.getAgent` sends the projected menu; both sides resolve through one entry point
 
-The Gateway accepts either the raw config array or an already-projected
-`SubagentTierMenu`. **Projecting on the producer side is preferable**: the menu
-channel has no business seeing `provider` / `modelId`, so a control plane that
-projects before answering discloses strictly less than one that hands over its
-whole config for the Gateway to trim.
+**Every producer projects before answering, and projects through the same resolver
+the candidates come from.** Two reasons, and the second is not optional:
+
+- The menu channel has no business seeing `provider` / `modelId`, so projecting on
+  the producer side discloses strictly less than handing the Gateway a whole config
+  to trim.
+- **The two channels must not resolve independently.** They did at first: the
+  candidate side dropped entries whose model no longer existed while the menu was
+  projected straight from the config and kept advertising every tier. The revisions
+  then disagreed and tiering failed — including for the tiers that were still
+  perfectly healthy. Resolving both from one function is what keeps "which tiers
+  exist" a single answer.
+
+The Gateway still accepts a raw config array, for compatibility with a producer
+that has not moved yet. That path projects locally and hashes the config itself.
 
 The two differ in where the revision comes from. A config array is hashed by the
 Gateway over the canonical form; a projected menu **keeps the producer's
@@ -612,7 +622,11 @@ state — that is the contract in action, not an exception to it.
 
 ## 10. Contracts
 
-1. No tier state ⇒ behaviour byte-for-byte identical to today.
+1. No tier state ⇒ behaviour byte-for-byte identical to today. Concretely: a child
+   is placed with `registerProvider` + `setModel` and **nothing else**. Its runtime
+   tunables are not touched on that path — not the parent candidate's `params`, not
+   a captured level. Only a child that actually attempted a tier has had its level
+   moved, and only that child gets it restored.
 2. The lead cannot use a model outside the menu it was shown, whatever the prompt
    contains.
 3. Every pre-prompt resolution failure is a fallback to the effective parent; every
