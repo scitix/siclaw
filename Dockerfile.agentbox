@@ -57,10 +57,30 @@ FROM node:22.19-slim
 # `latest` means the same source commit builds a different, unreviewed executable every time.
 ARG YQ_VERSION=v4.53.3
 ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
+# User & group setup (dual-user isolation) — BEFORE the packages, so anything that needs a
+# non-root owner can be created with it rather than re-owned afterwards. Ownership and mode changes
+# are what cost size here: overlayfs copies a whole file into the new layer to record a metadata
+# change, so `chgrp` on a 57 MB binary in a later layer stores that binary twice.
+# node:22-slim has UID 1000 (node user) — remove it first to avoid conflicts.
+RUN userdel -r node 2>/dev/null || true \
+    && groupadd --gid 1002 kubecred \
+    && groupadd --gid 1003 hostcred \
+    && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred agentbox \
+    && useradd --uid 1001 -M -s /bin/false sandbox
+# NOTE: the sudoers drop-in is written in the apt layer below, not here — /etc/sudoers.d/ is
+# created by the `sudo` package, so writing it before the install fails on a missing directory.
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils \
     && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
-    && chmod +x kubectl && mv kubectl /usr/local/bin/ \
+    && mv kubectl /usr/local/bin/ \
+    # setgid kubecred (ADR-010) applied HERE, in the layer that creates the binary. Done in a later
+    # layer it re-stored all 57 MB of it for a group-and-mode change.
+    && chgrp kubecred /usr/local/bin/kubectl \
+    && chmod 2755 /usr/local/bin/kubectl \
+    # Written here rather than with the users above: /etc/sudoers.d/ ships with the `sudo` package.
+    && echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
+    && chmod 440 /etc/sudoers.d/sandbox-exec \
     && rm -rf /var/lib/apt/lists/*
 
 # yq: real binary under a name the command whitelist does not admit, reached only through a wrapper
@@ -79,23 +99,21 @@ RUN curl -fsSL -o /usr/local/lib/yq-real "https://github.com/mikefarah/yq/releas
        > /usr/local/bin/yq \
     && chmod 0755 /usr/local/bin/yq
 
-# User & group setup (dual-user isolation) — single layer
-# node:22-slim has UID 1000 (node user) — remove it first to avoid conflicts
-RUN userdel -r node 2>/dev/null || true \
-    && groupadd --gid 1002 kubecred \
-    && groupadd --gid 1003 hostcred \
-    && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred agentbox \
-    && useradd --uid 1001 -M -s /bin/false sandbox \
-    && echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
-    && chmod 440 /etc/sudoers.d/sandbox-exec \
-    && chgrp kubecred /usr/local/bin/kubectl \
-    && chmod 2755 /usr/local/bin/kubectl
-
 WORKDIR /app
 
-# Production deps (cached unless package*.json changes)
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Production deps (cached unless package*.json changes).
+#
+# Ownership, mode and pruning all happen in THIS layer, where the files are created. Doing any of
+# them later re-stores the whole tree: `chown -R .` on a 500 MB node_modules used to add ~358 MB of
+# byte-identical duplicate to the image, for a metadata change.
+COPY --chown=agentbox:agentbox package*.json ./
+RUN npm ci --omit=dev \
+    # Type declarations and source maps are never executed. `--omit=dev` cannot remove them — it
+    # prunes by dependency KIND, not by file kind — so a production image ships ~176 MB of files
+    # that exist for compiling and debugging, neither of which happens here.
+    && find node_modules -type f \( -name '*.d.ts' -o -name '*.map' \) -delete \
+    && chown -R agentbox:agentbox node_modules \
+    && chmod -R o+rX node_modules
 
 # Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)
 COPY --from=builder /app/dist/ ./dist/
@@ -140,7 +158,11 @@ RUN set -eu \
 # Directory structure, permissions, SUID/SGID cleanup — single layer
 RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
     && mkdir -p ./.siclaw/skills ./.siclaw/credentials/clusters ./.siclaw/credentials/hosts ./.siclaw/config ./.siclaw/user-data \
-    && chown -R agentbox:agentbox . \
+    # Everything under /app EXCEPT node_modules, which was already owned and moded in the layer
+    # that created it. Recursing into it here is what stored the whole tree a second time; the
+    # remaining entries (dist, skills, package.json, .siclaw) total ~4 MB, so their copy-up is free.
+    && chown agentbox:agentbox . \
+    && find . -maxdepth 1 -mindepth 1 ! -name node_modules -exec chown -R agentbox:agentbox {} + \
     && chown agentbox:agentbox ./.siclaw/credentials \
     && chmod 0750 ./.siclaw/credentials \
     && chown agentbox:kubecred ./.siclaw/credentials/clusters \
@@ -150,7 +172,7 @@ RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
     && chmod 0700 ./.siclaw/config \
     && chmod 0755 ./.siclaw/skills \
     && chmod 0777 ./.siclaw/user-data \
-    && chmod -R o+rX ./dist/ ./skills/ ./node_modules/ \
+    && chmod -R o+rX ./dist/ ./skills/ \
     && find / -perm /4000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
          case "$f" in /usr/bin/sudo) ;; *) chmod u-s "$f" ;; esac; done \
     && find / -perm /2000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
