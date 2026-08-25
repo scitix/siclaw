@@ -143,10 +143,21 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
  * regardless of which path produced them. That agreement is the whole point:
  * `resolveTierSelection` refuses to honour a tier whose two channels disagree.
  *
- * Returns `{menu: null, candidates: null}` when the agent has no tiers, or when a
- * tier names a provider this deployment cannot resolve — a partially-resolvable
- * list is not shipped half-applied, because a menu entry with no candidate behind
- * it reads to the lead as an offer it cannot fulfil.
+ * A tier that cannot be resolved is SKIPPED, and the rest still ship. Collapsing
+ * the whole list on the first bad entry took every healthy tier down with it, and
+ * asymmetrically: the menu is projected from the same config on its own path, so
+ * the candidate side went empty while the menu still advertised everything, the
+ * revisions disagreed, and even the working tiers failed with revision_mismatch.
+ * A skipped tier reports `candidate_missing` instead, which is the case §5 defines
+ * that reason for.
+ *
+ * Returns `{menu: null, candidates: null}` only when the agent has no tiers at
+ * all, when the stored config is malformed, or when NOTHING resolves — a menu
+ * backed by no candidates would offer the lead choices that can never be honoured.
+ *
+ * The revision is always computed over the FULL config, never the surviving
+ * subset: the menu side hashes the same thing, and a revision over survivors would
+ * reintroduce the mismatch from the other direction.
  */
 export async function resolveAgentSubagentTiers(raw: unknown): Promise<{
   menu: SubagentTierMenu | null;

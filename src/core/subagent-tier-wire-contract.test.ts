@@ -22,6 +22,8 @@ import {
   MAX_SUBAGENT_TIERS,
   WHEN_TO_USE_MAX_CHARS,
   canonicalTierConfig,
+  normalizeSubagentTierCandidates,
+  normalizeSubagentTierConfig,
   normalizeSubagentTierMenu,
   projectTierMenuFromConfig,
   renderTierMenuForDescription,
@@ -42,12 +44,26 @@ const golden = JSON.parse(
   ),
 );
 
-/** Upstream mode: the producer projects, and uses this RPC's snake_case convention. */
-const UPSTREAM_PROJECTED_MENU = golden.projectedMenu;
-const REV: string = golden.projectedMenu.revision;
+/**
+ * Upstream mode: the producer projects the menu and sends it under the snake_case
+ * FIELD of a snake_case RPC, while the payload inside is camelCase. Read from the
+ * producer's own envelope shape so a structural change on that side fails here.
+ */
+const UPSTREAM_PROJECTED_MENU = golden.config_getAgent.subagent_model_tiers;
+const REV: string = UPSTREAM_PROJECTED_MENU.revision;
 
-/** Standalone: the raw config array, camelCase, with provider/modelId present. */
-const STANDALONE_CONFIG = golden.configArray.value;
+/** The credential-bearing half, for the confidentiality assertions. */
+const UPSTREAM_CANDIDATES = golden.config_getModelBinding.binding.subagentTiers;
+
+/**
+ * Standalone: the raw config array this repo writes itself. Not in the shared
+ * fixture — it is not part of the cross-repo contract, only of the compatibility
+ * path that accepts it.
+ */
+const STANDALONE_CONFIG = [
+  { tier: "fast", provider: "p-a", modelId: "m-1", whenToUse: "read logs, grep code, check config" },
+  { tier: "deep", provider: "p-b", modelId: "m-2", whenToUse: "cross-source causal reasoning" },
+];
 
 describe("tier menu wire contract", () => {
   it("accepts an already-projected menu from a control plane", () => {
@@ -67,9 +83,13 @@ describe("tier menu wire contract", () => {
   });
 
   it("reads the CANONICAL camelCase key the producer actually emits", () => {
+    // The casing split is deliberate: the RPC FIELD is snake_case
+    // (subagent_model_tiers), the PAYLOAD inside it is camelCase (whenToUse).
+    // Reading the key straight off the producer's envelope means a rename there
+    // fails here.
+    expect(Object.keys(UPSTREAM_PROJECTED_MENU.items[0])).toContain("whenToUse");
     const menu = projectTierMenuFromConfig(UPSTREAM_PROJECTED_MENU, sha256Hex);
-    expect(menu!.items[0].whenToUse).toContain("read logs");
-    expect(golden.rules.whenToUseCanonicalKey).toBe("whenToUse");
+    expect(menu!.items[0].whenToUse.length).toBeGreaterThan(0);
   });
 
   it("also tolerates the snake_case alias, but that is tolerance and not the contract", () => {
@@ -143,7 +163,7 @@ describe("the golden fixture is byte-pinned so cross-repo drift is detectable", 
    * Update this value in the same commit that changes the fixture, and say in the
    * commit message that the other side needs the same bytes.
    */
-  const EXPECTED_SHA256 = "8cc4d0dfe1c5f356e6841763caa3b09ac257ea8b54366b73869910f3a1952fd8";
+  const EXPECTED_SHA256 = "e5c5036522196719d977c2dc119f937ab644801ee7968bba3fa3fb1108837722";
 
   it("has not drifted without the digest being updated", () => {
     const bytes = fs.readFileSync(
@@ -165,42 +185,69 @@ describe("the golden fixture is byte-pinned so cross-repo drift is detectable", 
   });
 });
 
-describe("the golden fixture matches what this implementation enforces", () => {
-  // The fixture states the rules as DATA so neither implementation can quietly
-  // relax one. If a constant here moves, this fails and the fixture (and the
-  // other repository) has to be updated deliberately.
-  const rules = golden.rules;
+describe("the shared rules hold on this side", () => {
+  // The producer's copy states the rules as PROSE in `_rules`. Asserting against
+  // prose is not possible, so these check the behaviours it describes — the point
+  // being that a rule changed on that side should fail something here rather than
+  // only surfacing in production.
 
-  it("agrees on the tier pattern, the cap and the whenToUse bounds", () => {
-    expect(rules.maxTiers).toBe(MAX_SUBAGENT_TIERS);
-    expect(rules.whenToUseMaxCodePoints).toBe(WHEN_TO_USE_MAX_CHARS);
-
-    // A tier at the pattern's limits is accepted; one past them is not.
+  it("enforces the tier pattern and the cap it declares", () => {
     const at = "a".repeat(32);
     const past = "a".repeat(33);
-    expect(new RegExp(rules.tierPattern).test(at)).toBe(true);
-    expect(new RegExp(rules.tierPattern).test(past)).toBe(false);
+    expect(normalizeSubagentTierConfig([
+      { tier: at, provider: "p", modelId: "m", whenToUse: "read logs and summarise" },
+    ]).ok).toBe(true);
+    expect(normalizeSubagentTierConfig([
+      { tier: past, provider: "p", modelId: "m", whenToUse: "read logs and summarise" },
+    ]).ok).toBe(false);
+
+    const overCap = Array.from({ length: MAX_SUBAGENT_TIERS + 1 }, (_, i) => ({
+      tier: `t${i}`, provider: "p", modelId: `m${i}`, whenToUse: "read logs and summarise",
+    }));
+    expect(normalizeSubagentTierConfig(overCap).ok).toBe(false);
   });
 
-  it("agrees that both whenToUse spellings are accepted", () => {
-    for (const key of rules.whenToUseAcceptedKeys) {
-      const menu = projectTierMenuFromConfig(
-        { revision: REV, items: [{ tier: "fast", [key]: "read logs and summarise findings" }] },
-        sha256Hex,
-      );
-      expect(menu, `key ${key}`).not.toBeNull();
-    }
+  it("enforces the whenToUse ceiling it declares", () => {
+    const tooLong = "x".repeat(WHEN_TO_USE_MAX_CHARS + 1);
+    expect(normalizeSubagentTierMenu({
+      revision: REV,
+      items: [{ tier: "fast", whenToUse: tooLong }],
+    }).ok).toBe(false);
   });
 
-  it("agrees that the menu never carries the candidate-only fields", () => {
+  it("keeps the menu free of every field the rules forbid on it", () => {
+    // "The menu never carries provider, modelId, modelConfig or any credential —
+    // it is rendered into a tool description, i.e. into a prompt."
     const serialized = JSON.stringify(projectTierMenuFromConfig(STANDALONE_CONFIG, sha256Hex));
-    for (const forbidden of rules.menuMustNotContain) {
+    for (const forbidden of ["provider", "modelId", "modelConfig", "apiKey", "p-a", "m-1"]) {
       expect(serialized, `menu must not contain ${forbidden}`).not.toContain(forbidden);
     }
   });
 
-  it("agrees that an empty items array is malformed rather than a clear", () => {
-    expect(rules.emptyItemsIsMalformed).toBe(true);
+  it("treats an empty envelope as malformed, not as a clear", () => {
+    // "No tiers is expressed by OMITTING the field, never by an envelope with an
+    // empty list."
     expect(normalizeSubagentTierMenu({ revision: REV, items: [] }).ok).toBe(false);
+    expect(projectTierMenuFromConfig(undefined, sha256Hex)).toBeNull();
+  });
+
+  it("never requires whenToUse on the candidate half", () => {
+    // "The candidates never carry whenToUse."
+    expect(JSON.stringify(UPSTREAM_CANDIDATES)).not.toContain("whenToUse");
+    expect(normalizeSubagentTierCandidates(UPSTREAM_CANDIDATES).ok).toBe(true);
+  });
+
+  it("treats provider as opaque — it is never parsed or pattern-matched", () => {
+    // Which is what makes neutral sample values in this repo's copy cost nothing.
+    const odd = {
+      revision: REV,
+      candidates: [{
+        tier: "fast",
+        provider: "!!! not a normal name @@@",
+        modelId: "m",
+        modelConfig: { apiKey: "k", models: [] },
+      }],
+    };
+    expect(normalizeSubagentTierCandidates(odd).ok).toBe(true);
   });
 });

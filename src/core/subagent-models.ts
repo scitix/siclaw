@@ -583,34 +583,75 @@ const PERSISTED_TIER_KEYS = [
  * added upstream is then dropped by default instead of being persisted until
  * someone remembers to exclude it.
  */
+/** Closed sets, so a sanitized value actually IS its declared type. */
+const TIER_SELECTION_SOURCES: readonly TierSelectionSource[] = [
+  "env", "request", "type_default", "inherit",
+];
+const TIER_FALLBACK_REASONS: readonly TierFallbackReason[] = [
+  "revision_mismatch", "candidate_missing", "unknown_tier",
+  "model_not_found", "context_overflow", "model_setup_failed", "parent_fallback_failed",
+];
+const GROUP_ITEM_STATUSES = ["done", "partial", "failed", "timed_out", "skipped"] as const;
+/**
+ * Structurally identical to `GroupItemStatus` in tool-registry, declared locally
+ * because this module stays dependency-free (tool-registry imports IT, so importing
+ * back would be a cycle). If the two ever diverge, the call sites that pass one
+ * where the other is expected stop compiling.
+ */
+type SanitizedItemStatus = (typeof GROUP_ITEM_STATUSES)[number];
+
 export function sanitizeWireTierOutcome(raw: unknown): PersistedTierOutcome | undefined {
   if (!isRecord(raw)) return undefined;
-  const out: Record<string, string> = {};
-  for (const key of PERSISTED_TIER_KEYS) {
-    const value = raw[key];
-    // Strings only: these are identifiers and enum-ish reasons, so a nested object
-    // here is either a mistake or an attempt to smuggle structure through.
-    if (typeof value === "string" && value !== "") out[key] = value;
-  }
-  if (out.source === undefined) return undefined;
-  return out as unknown as PersistedTierOutcome;
+
+  // `source` is what makes the record meaningful, and it is an ENUM — an
+  // unrecognised value is not a value, so the whole record goes.
+  const source = TIER_SELECTION_SOURCES.find((s) => s === raw.source);
+  if (!source) return undefined;
+
+  const out: PersistedTierOutcome = { source };
+
+  // Tier names are validated against the same pattern the config path enforces.
+  // Accepting "any non-empty string" here would let a name the write path refuses
+  // appear in a stored record, which then reads as a tier that never existed.
+  const requestedTier = normalizeTier(raw.requestedTier);
+  if (requestedTier) out.requestedTier = requestedTier;
+  const resolvedTier = normalizeTier(raw.resolvedTier);
+  if (resolvedTier) out.resolvedTier = resolvedTier;
+
+  // Free-form identifiers — no pattern to check, but still strings only.
+  const provider = normalizeRequiredString(raw.provider);
+  if (provider) out.provider = provider;
+  const modelId = normalizeRequiredString(raw.modelId);
+  if (modelId) out.modelId = modelId;
+
+  // Also an enum. An unknown reason is dropped rather than stored: a reader
+  // switching on it would otherwise hit a case that does not exist.
+  const fallbackReason = TIER_FALLBACK_REASONS.find((r) => r === raw.fallbackReason);
+  if (fallbackReason) out.fallbackReason = fallbackReason;
+
+  return out;
 }
 
 /**
  * Sanitize a group's per-item snapshot, including each item's tier outcome.
  *
- * `index` and `status` pass through as-is (numbers/strings the UI needs); the tier
- * half goes through the same allow-list as a single child's.
+ * `status` is a closed set and `index` must be a non-negative safe integer — this
+ * record is read back to render a UI, so a `-1` or a `1.5` index, or a status like
+ * `"running"` that is never terminal, produces a view nothing can explain.
  */
 export function sanitizeWireItemStatuses(
   raw: unknown,
-): Array<{ index: number; status: string; tier?: PersistedTierOutcome }> | undefined {
+): Array<{ index: number; status: SanitizedItemStatus; tier?: PersistedTierOutcome }> | undefined {
   if (!Array.isArray(raw)) return undefined;
-  const out: Array<{ index: number; status: string; tier?: PersistedTierOutcome }> = [];
+  const out: Array<{ index: number; status: SanitizedItemStatus; tier?: PersistedTierOutcome }> = [];
   for (const entry of raw) {
     if (!isRecord(entry)) continue;
-    const index = typeof entry.index === "number" ? entry.index : undefined;
-    const status = typeof entry.status === "string" ? entry.status : undefined;
+    const index = typeof entry.index === "number"
+      && Number.isSafeInteger(entry.index)
+      && entry.index >= 0
+      ? entry.index
+      : undefined;
+    const status = GROUP_ITEM_STATUSES.find((s) => s === entry.status);
     if (index === undefined || status === undefined) continue;
     const tier = sanitizeWireTierOutcome(entry.tier);
     out.push({ index, status, ...(tier ? { tier } : {}) });

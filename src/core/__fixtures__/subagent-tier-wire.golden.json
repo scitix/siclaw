@@ -1,80 +1,112 @@
 {
-  "$comment": [
-    "GOLDEN FIXTURE for the sub-agent model tier wire contract.",
+  "_comment": [
+    "CROSS-REPO WIRE CONTRACT for sub-agent model tiering. The management plane",
+    "PRODUCES these two payloads; this runtime CONSUMES them.",
     "",
-    "This file is the contract between two independent implementations of",
-    "config.getAgent. Each side asserts against it, so a rename, a spelling",
-    "change, a revision-format change or a different empty-value convention",
-    "fails a test on BOTH sides instead of only surfacing at runtime on a",
-    "deployment nobody tested.",
+    "STRUCTURE IS NOW ALIGNED with the producer's copy: same top-level",
+    "{config_getAgent, config_getModelBinding} envelopes, same casing split, same",
+    "already-projected menu. The contract test here reads this structure.",
     "",
-    "That is not hypothetical: an earlier revision of this feature shipped with",
-    "the Gateway accepting only the config-array shape while the other side sent",
-    "an already-projected menu. The projection returned null, no menu reached the",
-    "tool description, the model_tier parameter never appeared, and tiering was",
-    "silently absent — with every test in both repositories green, because each",
-    "one fed itself the shape it produced.",
+    "BYTES ARE NOT YET IDENTICAL, and the remaining difference is not an oversight.",
+    "The producer's copy uses generated provider names that carry internal",
+    "deployment identifiers, and this repository is public — it must not contain",
+    "them. So `provider` values here keep the SHAPE of a generated name",
+    "(<runtime>-<type>-<qualifier>) with neutral tokens.",
     "",
-    "CHANGING THIS FILE IS A CONTRACT CHANGE. Both sides have to agree, and the",
-    "deploy-order note in docs/design/subagent-model-tiering.md applies.",
+    "That leaves the two files un-`cmp`-able, which is the one thing a shared",
+    "fixture exists to prevent. Resolving it needs a decision on the producer side,",
+    "not a workaround here:",
+    "  - neutralise the provider names in the canonical copy (they are sample",
+    "    values, not contract — the contract is that `provider` is an opaque",
+    "    string), after which this file can be a byte-for-byte copy; or",
+    "  - keep the canonical copy internal and treat THIS file as the public",
+    "    projection, with the producer asserting both.",
+    "Until then: structure drift is caught, byte drift is not.",
     "",
-    "Copy this file into the other repository verbatim rather than transcribing",
-    "it — a transcription is exactly the step where a spelling drifts.",
+    "The hash lives OUTSIDE this file — writing it in here would change the bytes",
+    "it describes. It is pinned in subagent-tier-wire-contract.test.ts.",
     "",
-    "VERIFYING A COPY: hash the whole file (sha256) and compare against",
-    "EXPECTED_SHA256 in subagent-tier-wire-contract.test.ts. That constant is",
-    "byte-pinned by a test here, so this file cannot change without someone",
-    "updating the digest — which is the moment to propagate the new bytes.",
-    "The digest is not stored in this file: a hash over the whole file cannot",
-    "live inside it.",
+    "NOTE THE CASING SPLIT, deliberate and not a mistake to 'fix':",
+    "  - the config.getAgent FIELD is snake_case (subagent_model_tiers), matching",
+    "    every other field of that RPC;",
+    "  - the menu PAYLOAD inside it is camelCase (whenToUse), matching the",
+    "    candidate channel and what this runtime parses.",
     "",
-    "As of this writing the two repositories hold DIFFERENT fixtures with",
-    "different top-level structure. Runtime happens to work because the consumer",
-    "tolerates both spellings, but nothing prevents future drift. Picking one",
-    "authoritative copy is a cross-repository decision that has not been made;",
-    "this file is a candidate, not a declaration that it won."
+    "The menu is ALREADY PROJECTED — {revision, items}, not the raw config array.",
+    "revision is computed from the stored tier mapping, which only the producer",
+    "holds; a second implementation of 'hash the config' would drift into a",
+    "permanent false revision_mismatch. This runtime therefore accepts BOTH shapes",
+    "on config.getAgent: its own standalone config array, and this envelope.",
+    "",
+    "Every drift here is SILENT. A renamed key errors on neither side: the",
+    "normalizer yields nothing, the tool description carries no tiers, `model_tier`",
+    "never appears on spawn_subagent, and both suites stay green. That is exactly",
+    "how the first integration attempt failed."
   ],
 
-  "projectedMenu": {
-    "$comment": "CANONICAL shape: the producer projects, so provider/modelId never reach the menu channel. camelCase whenToUse — this is what the producer actually emits and what its own wire test requires. An earlier revision of this fixture declared snake_case canonical, which was a stale observation and left the two sides disagreeing about their own contract even while runtime worked (the consumer tolerates both).",
-    "revision": "b3f1000000000000000000000000000000000000000000000000000000000000",
-    "items": [
-      { "tier": "fast", "whenToUse": "read logs, grep code, check config — retrieval and summary" },
-      { "tier": "deep", "whenToUse": "cross-source causal reasoning, or a conclusion a human reads" }
-    ]
+  "config_getAgent": {
+    "subagent_model_tiers": {
+      "revision": "0000000000000000000000000000000000000000000000000000000000000000",
+      "items": [
+        { "tier": "fast", "whenToUse": "查日志、读代码、翻配置这类只需要检索和摘要的活" },
+        { "tier": "deep", "whenToUse": "需要跨多个证据源做因果推断、或结论要直接给人看的活" }
+      ]
+    }
   },
 
-  "configArray": {
-    "$comment": "Legacy/Standalone shape: raw config, camelCase, provider and modelId present. Still accepted; the Gateway projects and hashes it locally.",
-    "value": [
-      { "tier": "fast", "provider": "p-a", "modelId": "m-1", "whenToUse": "read logs, grep code, check config" },
-      { "tier": "deep", "provider": "p-b", "modelId": "m-2", "whenToUse": "cross-source causal reasoning" }
-    ]
+  "config_getModelBinding": {
+    "binding": {
+      "subagentTiers": {
+        "revision": "0000000000000000000000000000000000000000000000000000000000000000",
+        "candidates": [
+          {
+            "tier": "fast",
+            "provider": "runtime-openai-llm-fast",
+            "modelId": "gpt-4o-mini",
+            "modelConfig": {
+              "name": "openai",
+              "baseUrl": "https://api.example/v1",
+              "apiKey": "REDACTED-IN-FIXTURE",
+              "api": "openai-completions",
+              "authHeader": true,
+              "models": [
+                {
+                  "id": "gpt-4o-mini",
+                  "name": "gpt-4o-mini",
+                  "reasoning": false,
+                  "input": ["text"],
+                  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                  "compat": {
+                    "maxTokensField": "max_tokens",
+                    "supportsDeveloperRole": false,
+                    "supportsUsageInStreaming": true
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
   },
 
-  "candidates": {
-    "$comment": "The credential-bearing half, carried on the model binding. Must share a revision with the menu describing the same configuration. modelConfig is abridged here; only its presence is contractual.",
-    "revision": "b3f1000000000000000000000000000000000000000000000000000000000000",
-    "candidates": [
-      { "tier": "fast", "provider": "p-a", "modelId": "m-1", "modelConfig": { "name": "p-a", "apiKey": "REDACTED", "models": [] } },
-      { "tier": "deep", "provider": "p-b", "modelId": "m-2", "modelConfig": { "name": "p-b", "apiKey": "REDACTED", "models": [] } }
-    ]
-  },
-
-  "rules": {
-    "$comment": "Assertions both sides must satisfy. Stated as data so neither side can quietly relax one.",
-    "tierPattern": "^[a-z][a-z0-9_-]{0,31}$",
-    "maxTiers": 5,
-    "revisionPattern": "^[0-9a-f]{64}$",
-    "whenToUseMinCodePoints": 8,
-    "whenToUseMaxCodePoints": 256,
-    "whenToUseCanonicalKey": "whenToUse",
-    "$comment_whenToUseAcceptedKeys": "The consumer ALSO tolerates snake_case, because that RPC is snake_case elsewhere and a producer emitting it is not wrong. Tolerance is not the contract though: emit the canonical key. A producer may reject the alias; a consumer must not.",
-    "whenToUseAcceptedKeys": ["whenToUse", "when_to_use"],
-    "menuMustNotContain": ["provider", "modelId", "model_id", "modelConfig"],
-    "candidatesMustNotRequire": ["whenToUse", "when_to_use"],
-    "clearSignal": null,
-    "emptyItemsIsMalformed": true,
-    "revisionIsOverFullConfig": true
-  }
+  "_rules": [
+    "revision is 64 lowercase hex characters (SHA-256), computed over the RAW tier",
+    "mapping sorted by tier — NOT over the hydrated candidates. Hashing the",
+    "candidates would let one unresolvable model change the revision, which this",
+    "runtime would read as a version skew instead of candidate_missing.",
+    "",
+    "Both channels publish the SAME revision for the same configuration.",
+    "",
+    "No tiers is expressed by OMITTING the field, never by an envelope with an",
+    "empty list: a revision on one channel with nothing to match on the other is",
+    "what the mismatch rule fires on.",
+    "",
+    "The menu never carries provider, modelId, modelConfig or any credential — it",
+    "is rendered into a tool description, i.e. into a prompt. The candidates never",
+    "carry whenToUse.",
+    "",
+    "`provider` is an OPAQUE string to the consumer. It never parses or pattern-",
+    "matches it, which is why neutral sample values here cost nothing semantically."
+  ]
 }
