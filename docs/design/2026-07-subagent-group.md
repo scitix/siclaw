@@ -167,6 +167,12 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 - **`skipped` items are never persisted as a child event** (never started; `skipped` is not in
   the delegation status enum) — they exist only in the aggregate report and the batch terminal
   event's item detail.
+- **User identity is request-scoped in a shared AgentBox.** K8s AgentBoxes are shared per agent and
+  commonly have no process-level `USER_ID`; `/api/prompt.userId` is therefore passed into
+  `getOrCreate`, bound to the managed session, and used when building both the parent and spawned
+  child tool contexts. Reusing one resident session with a different non-empty user id is rejected
+  instead of silently attributing child sessions to the wrong user. This keeps child transcript
+  ownership aligned with the parent session and makes the read-only child messages API usable.
 
 ### Job model & notification
 
@@ -182,11 +188,19 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 ### Progress (two paths that must not be confused)
 
 - **Foreground:** the tool's `onUpdate` carries either legacy per-child steps (collapse) or the
-  aggregate status array + phase (batch: map x/N → reduce). The executor emits a union of the two
-  progress shapes; the tool bridge and the frontend both dispatch by shape.
+  aggregate status array + phase (batch: map x/N → reduce). Batch updates use the same wire names
+  as background events: `child_session_id` and the latest `activity` per started item, plus
+  `reduce_child_session_id` once the reducer owns an execution slot. The executor emits a union of
+  the two progress shapes; the tool bridge and the frontend both dispatch by shape.
 - **Background:** `onUpdate` goes dead after `launched`, so live per-item progress rides a
   **`group_progress` chat event** (same `emit_chat_event` channel as `subagent_done`, throttled,
-  **live-only — never persisted**). It carries `job_id`, `phase`, and `[{index, status}]`.
+  **live-only — never persisted**). It carries `job_id`, `phase`, and
+  `[{index, status, child_session_id?, activity?}]` plus `reduce_child_session_id?` during the
+  reduce phase.
+  A child id is assigned only after the item acquires an execution slot, immediately before its
+  first `running` frame, and the same id is passed into `runSpawnedSubagent`; queued/skipped-never-
+  started items therefore expose no false drill-in. The reduce id follows the same rule and is
+  present from the first reduce frame.
   Correctness comes from the persisted per-child + terminal events: the card rebuilds from them
   on reload / refetch (per-child grouped by the `{groupId}#` prefix), so a dropped or coalesced
   progress frame costs immediacy, never correctness.
@@ -201,8 +215,10 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
   no-reduce call renders as the legacy **AgentWorkCard** (its collapse events are legacy-shaped,
   so this path is unchanged). The now-deleted `spawn_subagent_group` tool name is still
   recognised as the batch form so historical sessions keep rendering.
-- **Batch card:** progress bar + one status row per item (each row drills into its child
-  session) + the reduce summary + a drill-in to the reduce child. Children's `delegation_event`s
+- **Batch card:** progress bar + one expandable status row per item + an expandable reduce section.
+  Each expanded area reads its child session and renders the same inline execution component as a
+  single sub-agent (`SubagentSteps` + the shared tool card), refreshing persisted history while the
+  child runs. Children's `delegation_event`s
   are naturally hidden, so no per-child `AgentWorkCard`. It renders both a foreground batch's
   inline report (`item_results` in the tool result) and a background batch's folded metadata
   (`groupItems` from persisted events, `groupProgress` from the live event, `groupStatus`/reduce

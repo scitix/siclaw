@@ -6,6 +6,7 @@ import type {
   ToolRefs,
   SpawnSubagentGroupRequest,
   SpawnSubagentResult,
+  SubagentGroupProgress,
   SubagentGroupResult,
 } from "../../core/tool-registry.js";
 
@@ -274,6 +275,64 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     // details carries the full per-item drill-in data.
     expect((r.details as any).item_results[0].child_session_id).toBe("c1");
     expect((r.details as any).reduce_child_session_id).toBe("reduce-1");
+  });
+
+  it("forwards live foreground child session ids with the wire-format field names", async () => {
+    const executor = vi.fn(async (
+      _req: SpawnSubagentGroupRequest,
+      onProgress?: (progress: SubagentGroupProgress) => void,
+    ): Promise<SubagentGroupResult> => {
+      onProgress?.({
+        phase: "map",
+        items: [
+          { index: 0, status: "running", childSessionId: "child-0", activity: "Running kubectl…" },
+          { index: 1, status: "queued" },
+        ],
+      });
+      onProgress?.({
+        phase: "reduce",
+        items: [
+          { index: 0, status: "done", childSessionId: "child-0" },
+          { index: 1, status: "done", childSessionId: "child-1" },
+        ],
+        reduceChildSessionId: "reduce-1",
+      });
+      return {
+        status: "done",
+        durationMs: 10,
+        reduceSummary: "done",
+        reduceChildSessionId: "reduce-1",
+        itemResults: [
+          { item: "pod-a", status: "done", summary: "ok", childSessionId: "child-0" },
+          { item: "pod-b", status: "done", summary: "ok", childSessionId: "child-1" },
+        ],
+      };
+    });
+    const updates: any[] = [];
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+
+    await tool.execute(
+      "g-live",
+      { description: "x", items: ["pod-a", "pod-b"], reduce_prompt: "summarize", run_in_background: false },
+      undefined,
+      (update) => updates.push(update),
+    );
+
+    expect(updates[0].details).toEqual({
+      phase: "map",
+      items: [
+        { index: 0, status: "running", child_session_id: "child-0", activity: "Running kubectl…" },
+        { index: 1, status: "queued" },
+      ],
+    });
+    expect(updates[1].details).toEqual({
+      phase: "reduce",
+      items: [
+        { index: 0, status: "done", child_session_id: "child-0" },
+        { index: 1, status: "done", child_session_id: "child-1" },
+      ],
+      reduce_child_session_id: "reduce-1",
+    });
   });
 
   it("exposes per-item capsules to the model when there is NO reduce stage", async () => {

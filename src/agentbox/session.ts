@@ -92,6 +92,8 @@ type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanConte
 
 export interface ManagedSession {
   id: string;
+  /** User identity bound to this conversation's tools and child-session persistence. */
+  userId?: string;
   brain: BrainSession;
   session: AgentSession;  // backward compat — only guaranteed for pi-agent brain
   createdAt: Date;
@@ -806,14 +808,22 @@ export class AgentBoxSessionManager {
       status: "queued" | "running" | GroupItemStatus;
       summary: string;
       childSessionId: string;
+      activity?: string;
     };
     const states: ItemState[] = tasks.map(() => ({ status: "queued", summary: "", childSessionId: "" }));
+    let reduceChildSessionId: string | undefined;
     const breaker = new GroupCircuitBreaker();
 
     const emit = (phase: "map" | "reduce") =>
       onProgress?.({
         phase,
-        items: states.map((s, index) => ({ index, status: s.status })),
+        items: states.map((s, index) => ({
+          index,
+          status: s.status,
+          ...(s.childSessionId ? { childSessionId: s.childSessionId } : {}),
+          ...(s.activity ? { activity: s.activity } : {}),
+        })),
+        ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
       });
 
     const skipReason = (): string =>
@@ -860,16 +870,33 @@ export class AgentBoxSessionManager {
             return undefined;
           }
           // Mark `running` + emit only once the slot is acquired — an item still waiting for a
-          // limiter slot must stay `queued`, not report as running.
+          // limiter slot must stay `queued`, not report as running. Pre-assign the exact session
+          // id runSpawnedSubagent will persist so the live UI can open the child transcript from
+          // the first running frame instead of waiting for the terminal result.
+          const childSessionId = randomUUID();
+          state.childSessionId = childSessionId;
           state.status = "running";
           emit("map");
-          return this.runSpawnedSubagent(childReq, { ...traceCtx }, undefined, mapAbort.signal);
+          return this.runSpawnedSubagent(
+            childReq,
+            { ...traceCtx, childSessionId },
+            (progress) => {
+              const activity = progress.activity?.trim();
+              if (!activity || activity === state.activity) return;
+              state.activity = activity;
+              emit("map");
+            },
+            mapAbort.signal,
+          );
         })));
       } catch (err) {
         res = {
           status: "failed",
           summary: `Sub-agent errored: ${err instanceof Error ? err.message : String(err)}`,
-          childSessionId: "",
+          // The id was already exposed in the running frame and may already own
+          // persisted rows. Keep it stable even if an unexpected exception
+          // escapes runSpawnedSubagent before it can return its normal envelope.
+          childSessionId: state.childSessionId,
           toolCalls: 0,
           durationMs: 0,
         };
@@ -929,7 +956,6 @@ export class AgentBoxSessionManager {
     const usableCount = states.filter((s) => s.status === "done" || s.status === "partial").length;
 
     let reduceSummary: string | undefined;
-    let reduceChildSessionId: string | undefined;
     let reduceTruncated = false;
     let reduceError: string | undefined;    // reduce ran but did not complete → drives status + groupSummary (kept off the report as its own key)
     let reduceSkippedForCancel = false;      // reduce requested but skipped because the user cancelled
@@ -945,7 +971,6 @@ export class AgentBoxSessionManager {
       if (userAbort.signal.aborted) {
         reduceSkippedForCancel = true;
       } else if (doneCount > 0 && !breaker.tripped) {
-        emit("reduce");
         const outcomes: GroupItemOutcome[] = states.map((s, i) => ({
           item: tasks[i].item,
           status: s.status as GroupItemStatus,
@@ -963,9 +988,19 @@ export class AgentBoxSessionManager {
           spawnId: `${groupId}#reduce`,
         };
         try {
-          const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() =>
-            this.runSpawnedSubagent(reduceReq, { ...traceCtx }, undefined, userAbort.signal),
-          )));
+          const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() => {
+            // Match map-item semantics: advertise the reduce child only after it owns
+            // an execution slot. Until then the batch remains in its completed map
+            // state instead of exposing a session that has not started yet.
+            reduceChildSessionId = randomUUID();
+            emit("reduce");
+            return this.runSpawnedSubagent(
+              reduceReq,
+              { ...traceCtx, childSessionId: reduceChildSessionId },
+              undefined,
+              userAbort.signal,
+            );
+          })));
           if (reduceRes.status === "done") {
             // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
             // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
@@ -1227,10 +1262,24 @@ export class AgentBoxSessionManager {
       lastEmitAt = Date.now();
       const snapshot = latest;
       latest = null;
+      const items = snapshot.items.map(({ index, status, childSessionId, activity }) => ({
+        index,
+        status,
+        ...(childSessionId ? { child_session_id: childSessionId } : {}),
+        ...(activity ? { activity } : {}),
+      }));
       void this.persistDelegationEvent({
         type: "delegation.emit_chat_event",
         sessionId: parentSessionId,
-        event: { type: "group_progress", job_id: jobId, phase: snapshot.phase, items: snapshot.items },
+        event: {
+          type: "group_progress",
+          job_id: jobId,
+          phase: snapshot.phase,
+          items,
+          ...(snapshot.reduceChildSessionId
+            ? { reduce_child_session_id: snapshot.reduceChildSessionId }
+            : {}),
+        },
       }).catch((err) => {
         // Best-effort live update (never rethrow): correctness rebuilds from the persisted per-child
         // + terminal events on refetch. Log so a systematically failing progress channel is visible.
@@ -2175,7 +2224,7 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: "web",
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
-      userId: this.userId,
+      userId: request.userId,
       agentId,
       knowledgeDir: this.knowledgeDir,
       // A spawned sub-agent must never be broader than its parent: inherit the
@@ -2505,12 +2554,18 @@ export class AgentBoxSessionManager {
     systemPromptTemplate?: string,
     activeMode: AgentMode = "normal",
     delegation?: DelegationContext,
+    requestUserId?: string,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
+    const effectiveUserId = requestUserId?.trim() || this.userId;
 
     const existing = this.sessions.get(id);
     if (existing) {
       existing.lastActiveAt = new Date();
+      if (effectiveUserId && existing.userId && effectiveUserId !== existing.userId) {
+        throw new Error(`Session ${id} is already bound to a different user`);
+      }
+      const needsUserIdentityRebuild = Boolean(effectiveUserId && !existing.userId);
       // Config invalidation is stronger than the ordinary release timer:
       // even if the next message races the 0ms timer, an idle session must be
       // rebuilt so it cannot run one extra turn with stale prompt/tool state.
@@ -2563,11 +2618,15 @@ export class AgentBoxSessionManager {
           existing.delegation.parentSessionId = delegation.parentSessionId;
           existing.delegation.parentAgentId = delegation.parentAgentId;
         }
-        if ((existing.activeMode === activeMode && sameDelegation) || !existing._promptDone) {
+        if (
+          (existing.activeMode === activeMode && sameDelegation && !needsUserIdentityRebuild) ||
+          !existing._promptDone ||
+          existing._promptInflight
+        ) {
           return existing;
         }
         console.log(
-          `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode}/${delegationSignature(existing.delegation)} -> ${activeMode}/${delegationSignature(delegation)}`,
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/${effectiveUserId ?? "anonymous"}`,
         );
         await this.releaseForRebuild(id, existing);
       }
@@ -2738,7 +2797,7 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
-      userId: this.userId,
+      userId: effectiveUserId,
       agentId: this.agentId ?? null,
       knowledgeDir: this.knowledgeDir,
       // Per-agent tool capability whitelist. null = unrestricted (falls back to
@@ -2790,6 +2849,7 @@ export class AgentBoxSessionManager {
 
     const managed: ManagedSession = {
       id,
+      userId: effectiveUserId,
       brain: result.brain,
       session: result.session,
       createdAt: new Date(),
@@ -2844,7 +2904,7 @@ export class AgentBoxSessionManager {
     // routing, brain events + model_route_* events reach the recorder via
     // emitSessionExtraEvent → handleEvent instead.
     if (isTracingEnabled()) {
-      tracingRecorder.attach(id, result.brain, { userId: this.userId, agentId: this.agentId });
+      tracingRecorder.attach(id, result.brain, { userId: effectiveUserId, agentId: this.agentId });
       managed._tracingUnsub = result.brain.subscribe((event: any) => {
         if (managed._routeBrainEventsThroughExtra) return;
         tracingRecorder.handleEvent(id, event);
@@ -2887,7 +2947,7 @@ export class AgentBoxSessionManager {
           outcome: event.isError ? "error" : "success",
           // 0 used to mean both "instant" and "we could not pair this" — indistinguishable downstream.
           durationMs: entry ? Date.now() - entry.startMs : undefined,
-          userId: this.userId ?? "unknown",
+          userId: effectiveUserId ?? "unknown",
           agentId: this.agentId ?? null,
         });
       }
