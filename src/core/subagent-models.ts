@@ -271,7 +271,7 @@ export function normalizeSubagentTierCandidates(
     const modelId = normalizeRequiredString(entry.modelId);
     if (modelId === undefined) return reject(`candidate tier "${tier}" has no modelId`);
 
-    const modelKey = `${provider} ${modelId}`;
+    const modelKey = `${provider}\u0000${modelId}`;
     if (seenModels.has(modelKey)) {
       return reject(`candidates point two tiers at ${provider}/${modelId}`);
     }
@@ -312,45 +312,68 @@ export function isTierPayloadCleared(raw: unknown): boolean {
  * Existence of the referenced provider/model is NOT checked here — that needs a
  * db round-trip and belongs to the API layer. This function answers shape only.
  */
-export function encodeSubagentModelsForDb(value: unknown): string | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
+/**
+ * Validate the stored CONFIG form WITHOUT throwing.
+ *
+ * One rule set, shared by the write path (which turns a rejection into a 400) and
+ * by every READ path (which must degrade to "no tiers"). The rules used to live
+ * only inside the throwing encoder, so read paths had no way to apply them and
+ * simply trusted the column.
+ *
+ * A read path cannot afford that trust. `safeParseJson` is a type ASSERTION, not a
+ * validator: `'[null]'` parses fine, passes `Array.isArray`, and then throws a
+ * TypeError on the first field access. Since the same resolver now also feeds
+ * `config.getModelBinding`, one malformed row would take out an agent's entire
+ * model binding rather than just its tiers — turning bad config for an optional
+ * feature into a total outage for that agent.
+ *
+ * `null` / `undefined` / `[]` are not errors: they mean no tiers, which is the
+ * ordinary state of most agents.
+ */
+export function normalizeSubagentTierConfig(
+  value: unknown,
+): NormalizeResult<SubagentTierConfigEntry[]> {
+  if (value === null || value === undefined) return { ok: true, value: [] };
   if (!Array.isArray(value)) {
-    throw new Error("subagent_models must be null or an array of tier entries");
+    return reject("subagent_models must be null or an array of tier entries");
   }
-  if (value.length === 0) return null; // no tiers = inherit everywhere
+  if (value.length === 0) return { ok: true, value: [] };
   if (value.length > MAX_SUBAGENT_TIERS) {
-    throw new Error(`subagent_models allows at most ${MAX_SUBAGENT_TIERS} tiers`);
+    return reject(`subagent_models allows at most ${MAX_SUBAGENT_TIERS} tiers`);
   }
 
   const entries: SubagentTierConfigEntry[] = [];
   const seenTiers = new Set<string>();
   const seenModels = new Set<string>();
   for (const raw of value) {
-    if (!isRecord(raw)) throw new Error("each subagent_models entry must be an object");
+    // Catches null, arrays and primitives — the shapes that made a read path throw
+    // a TypeError on field access rather than report a bad configuration.
+    if (!isRecord(raw)) return reject("each subagent_models entry must be an object");
 
     const tier = normalizeTier(raw.tier);
     if (tier === undefined) {
-      throw new Error(`tier must match ${TIER_PATTERN.source} (lowercase, no whitespace)`);
+      return reject(`tier must match ${TIER_PATTERN.source} (lowercase, no whitespace)`);
     }
-    if (seenTiers.has(tier)) throw new Error(`duplicate tier "${tier}"`);
+    if (seenTiers.has(tier)) return reject(`duplicate tier "${tier}"`);
     seenTiers.add(tier);
 
-    const provider = normalizeRequiredString(raw.provider);
-    if (provider === undefined) throw new Error(`tier "${tier}" requires a provider`);
+    const provider = normalizeRequiredString(raw.provider ?? raw.model_provider);
+    if (provider === undefined) return reject(`tier "${tier}" requires a provider`);
 
-    const modelId = normalizeRequiredString(raw.modelId);
-    if (modelId === undefined) throw new Error(`tier "${tier}" requires a modelId`);
+    const modelId = normalizeRequiredString(raw.modelId ?? raw.model_id);
+    if (modelId === undefined) return reject(`tier "${tier}" requires a modelId`);
 
-    const modelKey = `${provider} ${modelId}`;
+    // Keyed as a JSON pair rather than by concatenation: no separator character can
+    // appear inside either half, so two distinct pairs cannot collide.
+    const modelKey = JSON.stringify([provider, modelId]);
     if (seenModels.has(modelKey)) {
-      throw new Error(`two tiers point at the same model ${provider}/${modelId}`);
+      return reject(`two tiers point at the same model ${provider}/${modelId}`);
     }
     seenModels.add(modelKey);
 
-    const whenToUse = normalizeWhenToUse(raw.whenToUse);
+    const whenToUse = normalizeWhenToUse(readWhenToUse(raw));
     if (whenToUse === undefined) {
-      throw new Error(
+      return reject(
         `tier "${tier}" requires whenToUse of ${WHEN_TO_USE_MIN_CHARS}-${WHEN_TO_USE_MAX_CHARS} code points without control characters`,
       );
     }
@@ -358,7 +381,22 @@ export function encodeSubagentModelsForDb(value: unknown): string | null | undef
     entries.push({ tier, provider, modelId, whenToUse });
   }
 
-  return JSON.stringify(entries);
+  return { ok: true, value: entries };
+}
+
+export function encodeSubagentModelsForDb(value: unknown): string | null | undefined {
+  // `undefined` = field absent, leave the column alone. Distinct from `null`,
+  // which clears it — and the normalizer collapses both to "no tiers", so this
+  // has to be decided before calling it.
+  if (value === undefined) return undefined;
+
+  const normalized = normalizeSubagentTierConfig(value);
+  // Throws HERE and only here: this is an API write path where the caller turns
+  // the message into a 400. Refusing a bad write is right; refusing to serve a
+  // turn — which is what a read path would be doing — is not.
+  if (!normalized.ok) throw new Error(normalized.reason);
+  if (normalized.value.length === 0) return null; // no tiers = inherit everywhere
+  return JSON.stringify(normalized.value);
 }
 
 // ── Resolution (§5 revision protocol + §7.2 fallback reasons) ────────────────
@@ -526,22 +564,16 @@ export function projectTierMenuFromConfig(
     return normalized.ok ? normalized.value : null;
   }
 
-  if (!Array.isArray(entries) || entries.length === 0) return null;
+  // Same rules as every other config reader — including the duplicate and cap
+  // checks this branch used to skip, which is how a config the write path would
+  // have refused could still produce a menu here.
+  const parsed = normalizeSubagentTierConfig(entries);
+  if (!parsed.ok || parsed.value.length === 0) return null;
 
-  const items: SubagentTierMenuItem[] = [];
-  const canonicalEntries: SubagentTierConfigEntry[] = [];
-  for (const raw of entries) {
-    if (!isRecord(raw)) return null;
-    const tier = normalizeTier(raw.tier);
-    const whenToUse = normalizeWhenToUse(readWhenToUse(raw));
-    const provider = normalizeRequiredString(raw.provider ?? raw.model_provider);
-    const modelId = normalizeRequiredString(raw.modelId ?? raw.model_id);
-    if (!tier || !whenToUse || !provider || !modelId) return null;
-    items.push({ tier, whenToUse });
-    canonicalEntries.push({ tier, provider, modelId, whenToUse });
-  }
-
-  return { revision: computeRevision(canonicalTierConfig(canonicalEntries)), items };
+  return {
+    revision: computeRevision(canonicalTierConfig(parsed.value)),
+    items: parsed.value.map((entry) => ({ tier: entry.tier, whenToUse: entry.whenToUse })),
+  };
 }
 
 /**

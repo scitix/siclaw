@@ -10,8 +10,8 @@ import {
 } from "../core/model-routing.js";
 import {
   canonicalTierConfig,
+  normalizeSubagentTierConfig,
   type SubagentTierCandidates,
-  type SubagentTierConfigEntry,
   type SubagentTierMenu,
 } from "../core/subagent-models.js";
 
@@ -152,8 +152,18 @@ export async function resolveAgentSubagentTiers(raw: unknown): Promise<{
   menu: SubagentTierMenu | null;
   candidates: SubagentTierCandidates | null;
 }> {
-  const entries = safeParseJson<SubagentTierConfigEntry[]>(raw, [] as SubagentTierConfigEntry[]);
-  if (!Array.isArray(entries) || entries.length === 0) return { menu: null, candidates: null };
+  // Validate before touching a single field. `safeParseJson` only ASSERTS the
+  // type: `'[null]'` parses, passes Array.isArray, and then throws on the first
+  // property access. This resolver feeds `config.getModelBinding` as well as the
+  // tools channel, so an unchecked throw here would take out the agent's whole
+  // model binding over a malformed optional feature — degrade to "no tiers".
+  const parsed = normalizeSubagentTierConfig(safeParseJson<unknown>(raw, null));
+  if (!parsed.ok) {
+    console.warn(`[model-routing-config] ignoring invalid subagent tier config: ${parsed.reason}`);
+    return { menu: null, candidates: null };
+  }
+  const entries = parsed.value;
+  if (entries.length === 0) return { menu: null, candidates: null };
 
   const configs = await loadProviderConfigs([...new Set(entries.map((e) => e.provider))]);
 

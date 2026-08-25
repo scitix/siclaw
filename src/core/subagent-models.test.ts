@@ -5,6 +5,7 @@ import {
   encodeSubagentModelsForDb,
   isTierPayloadCleared,
   normalizeSubagentTierCandidates,
+  normalizeSubagentTierConfig,
   normalizeSubagentTierMenu,
   renderTierMenuForDescription,
   resolveTierSelection,
@@ -247,6 +248,58 @@ describe("encodeSubagentModelsForDb", () => {
         Array.from({ length: MAX_SUBAGENT_TIERS + 1 }, (_, i) => ({ ...entry, tier: `t${i}`, modelId: `m${i}` })),
       ),
     ).toThrow(/at most/);
+  });
+});
+
+describe("normalizeSubagentTierConfig (read paths must never throw)", () => {
+  const good = { tier: "fast", provider: "p", modelId: "m", whenToUse: WHY };
+
+  it("rejects rather than throws on the shapes a stored column can actually hold", () => {
+    // safeParseJson is a type ASSERTION: '[null]' parses, passes Array.isArray,
+    // and then throws a TypeError on the first field access. Since this resolver
+    // also feeds config.getModelBinding, that throw would take out an agent's
+    // whole model binding over a malformed optional feature.
+    const hostile: unknown[] = [
+      [null],
+      [undefined],
+      ["fast"],
+      [42],
+      [[]],
+      [{}],
+      "not an array",
+      42,
+      { tier: "fast" },
+    ];
+    for (const raw of hostile) {
+      expect(() => normalizeSubagentTierConfig(raw)).not.toThrow();
+      expect(normalizeSubagentTierConfig(raw).ok, JSON.stringify(raw)).toBe(false);
+    }
+  });
+
+  it("treats null / undefined / [] as no tiers rather than as errors", () => {
+    // The ordinary state of most agents.
+    for (const raw of [null, undefined, []]) {
+      const result = normalizeSubagentTierConfig(raw);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.value).toEqual([]);
+    }
+  });
+
+  it("applies the same duplicate and cap rules the write path does", () => {
+    expect(normalizeSubagentTierConfig([good, good]).ok).toBe(false);
+    expect(normalizeSubagentTierConfig([good, { ...good, tier: "deep" }]).ok).toBe(false);
+    const overCap = Array.from({ length: MAX_SUBAGENT_TIERS + 1 }, (_, i) => ({
+      ...good, tier: `t${i}`, modelId: `m${i}`,
+    }));
+    expect(normalizeSubagentTierConfig(overCap).ok).toBe(false);
+  });
+
+  it("accepts snake_case field names, as a control plane may emit them", () => {
+    const result = normalizeSubagentTierConfig([
+      { tier: "fast", model_provider: "p", model_id: "m", when_to_use: WHY },
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value[0]).toEqual({ tier: "fast", provider: "p", modelId: "m", whenToUse: WHY });
   });
 });
 

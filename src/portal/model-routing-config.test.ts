@@ -104,6 +104,25 @@ describe("resolveAgentSubagentTiers", () => {
     expect(result).toEqual({ menu: null, candidates: null });
   });
 
+  it("degrades to no tiers on a malformed stored config instead of throwing", async () => {
+    // The crash path: `safeParseJson` only asserts the type, so `[null]` parses,
+    // passes Array.isArray, and used to throw a TypeError on `.provider`. This
+    // resolver also answers config.getModelBinding, so that throw took out the
+    // agent's entire model binding — a total outage caused by bad config for an
+    // optional feature.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    (getDb as any).mockReturnValue({ query: vi.fn(), getConnection: vi.fn() });
+
+    for (const stored of ['[null]', '["fast"]', '[42]', '[{}]', '"nope"', '[{"tier":"fast"}]']) {
+      await expect(resolveAgentSubagentTiers(stored)).resolves.toEqual({
+        menu: null,
+        candidates: null,
+      });
+    }
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("returns no tiers for absent or empty config", async () => {
     (getDb as any).mockReturnValue({ query: vi.fn(), getConnection: vi.fn() });
     expect(await resolveAgentSubagentTiers(null)).toEqual({ menu: null, candidates: null });
