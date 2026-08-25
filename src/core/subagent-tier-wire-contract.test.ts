@@ -21,6 +21,7 @@ import url from "node:url";
 import {
   MAX_SUBAGENT_TIERS,
   WHEN_TO_USE_MAX_CHARS,
+  canonicalFixturePayload,
   canonicalTierConfig,
   normalizeSubagentTierCandidates,
   normalizeSubagentTierConfig,
@@ -154,33 +155,49 @@ describe("tier menu wire contract", () => {
   });
 });
 
-describe("the golden fixture is byte-pinned so cross-repo drift is detectable", () => {
+describe("the fixture PAYLOAD is pinned, so cross-repo drift is detectable", () => {
   /**
-   * Digest of the fixture as it stands. Changing the fixture fails this, and the
-   * failure IS the reminder: the other implementation holds a copy, and a contract
-   * change has to be propagated deliberately rather than noticed in production.
+   * Digest of the canonicalized PAYLOAD — commentary excluded, keys sorted.
    *
-   * Update this value in the same commit that changes the fixture, and say in the
-   * commit message that the other side needs the same bytes.
+   * Whole-file digests were the wrong comparison and could never have worked: the
+   * two repositories carry the same payloads under different prose, each side
+   * documenting it for its own readers, so the files differ for reasons unrelated
+   * to the contract and each side ends up pinning a value only it can satisfy.
+   * That is two independent constants, not a shared contract.
+   *
+   * This value is CROSS-REPO COMPARABLE. Any implementation that canonicalizes the
+   * same way lands on the same string; in Go, unmarshalling into a map and
+   * re-marshalling sorts the keys for you.
    */
-  const EXPECTED_SHA256 = "e5c5036522196719d977c2dc119f937ab644801ee7968bba3fa3fb1108837722";
+  const EXPECTED_PAYLOAD_SHA256 = "de8aa805a00228e637f47d7480940f89361ba35de255ae9e8f76d6c2c31b7e4e";
 
   it("has not drifted without the digest being updated", () => {
-    const bytes = fs.readFileSync(
-      path.join(path.dirname(url.fileURLToPath(import.meta.url)), "__fixtures__/subagent-tier-wire.golden.json"),
-    );
-    const actual = crypto.createHash("sha256").update(bytes).digest("hex");
+    const actual = crypto.createHash("sha256")
+      .update(canonicalFixturePayload(golden))
+      .digest("hex");
     expect(
       actual,
-      "fixture changed — update EXPECTED_SHA256 and propagate the same bytes to the other implementation",
-    ).toBe(EXPECTED_SHA256);
+      "fixture payload changed — update EXPECTED_PAYLOAD_SHA256 and propagate the same payload to the other implementation",
+    ).toBe(EXPECTED_PAYLOAD_SHA256);
+  });
+
+  it("ignores commentary, so each side can document it in its own words", () => {
+    // The whole reason the previous whole-file pinning was useless. Prose is not
+    // contract; a differing header must not read as a differing contract.
+    const withOtherProse = { ...golden, _comment: ["entirely different wording"], _rules: [] };
+    expect(canonicalFixturePayload(withOtherProse)).toBe(canonicalFixturePayload(golden));
+  });
+
+  it("does NOT ignore a payload change", () => {
+    // The guard has to bite on the thing it exists for.
+    const tampered = JSON.parse(JSON.stringify(golden));
+    tampered.config_getAgent.subagent_model_tiers.items[0].tier = "renamed";
+    expect(canonicalFixturePayload(tampered)).not.toBe(canonicalFixturePayload(golden));
   });
 
   it("does not try to carry its own digest", () => {
-    // Deliberately absent: a digest over the whole file cannot live inside it —
-    // adding the field changes the bytes it is supposed to describe. The value is
-    // published HERE and in the fixture's header comment, and the other side
-    // verifies its copy by hashing the file and comparing against it.
+    // A digest over the file cannot live inside it. Published here and referenced
+    // from the fixture header; the other side computes it the same way.
     expect(Object.keys(golden).some((k) => k.toLowerCase().includes("sha"))).toBe(false);
   });
 });

@@ -721,6 +721,44 @@ export function projectTierMenuFromConfig(
 }
 
 /**
+ * Canonical serialization of a shared wire FIXTURE, for cross-repository
+ * comparison.
+ *
+ * Hashing the whole fixture file was the wrong comparison: the two repositories
+ * hold the same payloads under different prose (each side documents it for its own
+ * readers, in its own language), so whole-file digests differ for reasons that have
+ * nothing to do with the contract, and each side ends up pinning its own value —
+ * which detects nothing.
+ *
+ * This covers the PAYLOAD only:
+ *   1. drop every top-level key beginning with `_` (commentary)
+ *   2. sort object keys recursively
+ *   3. serialize with no insignificant whitespace
+ *
+ * Independently implementable on either side, and in Go it falls out almost for
+ * free: unmarshal into a map and `encoding/json` sorts map keys on the way back.
+ *
+ * Array order is PRESERVED — it is meaningful here (menu order is what the lead
+ * reads).
+ */
+export function canonicalFixturePayload(fixture: unknown): string {
+  const sortDeep = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sortDeep);
+    if (!isRecord(value)) return value;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) out[key] = sortDeep(value[key]);
+    return out;
+  };
+  if (!isRecord(fixture)) return JSON.stringify(fixture);
+  const payload: Record<string, unknown> = {};
+  for (const key of Object.keys(fixture).sort()) {
+    if (key.startsWith("_")) continue;
+    payload[key] = sortDeep(fixture[key]);
+  }
+  return JSON.stringify(payload);
+}
+
+/**
  * The canonical string a tier revision is computed over: sorted by tier, only the
  * fields that define the configuration.
  *
