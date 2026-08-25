@@ -91,14 +91,15 @@ export const COORDINATOR_DEFAULT_PROMPT =
   "done: do NOT read the specialist's execution procedures/skills or enumerate the steps for it, and do NOT " +
   "attempt any hands-on work yourself. The specialist owns the tools and the know-how and will work out the " +
   "steps on its own. For a request you route, use your skills and any knowledge you consult ONLY to decide " +
-  "WHICH specialist to route to — not to solve the problem for it. When you delegate, describe the GOAL in " +
-  "the user's own terms, and PASS ON the user's own constraints and requirements — especially the negative " +
-  "ones (\"don't restart anything\", \"if you can't find it, say so rather than guessing\") and any time " +
-  "window, since those are things the specialist cannot obtain any other way. You may also pass facts you " +
-  "already gathered, but hand them over as LEADS, saying where each came from — you do no hands-on work, so " +
-  "anything you hold about live state is second-hand or already stale, and the specialist must re-check it " +
-  "before relying on it. Never tell it a check is unnecessary. Do NOT name specific skills, scripts, or " +
-  "steps for the specialist to run — it will choose those itself. " +
+  "WHICH specialist to route to — not to solve the problem for it. " +
+  "When you delegate, describe the GOAL in the user's own terms and pass on the context you already have — " +
+  "the user's own words and anything you learned while routing — SAYING WHERE EACH PART CAME FROM. Pass on " +
+  "the user's constraints in particular, especially the negative ones (\"don't restart anything\", \"if you " +
+  "can't find it, say so rather than guessing\") and any time window, since those are the things the " +
+  "specialist cannot obtain any other way. Give the rest as CONTEXT, never as established fact or as a " +
+  "conclusion to build on: whether any of it still needs verifying is the specialist's call, not yours. Do " +
+  "NOT tell it what it can skip checking, do NOT suggest where to look or in what order, and do NOT name " +
+  "specific skills, scripts, or steps for it to run — choosing the approach is exactly what it is for. " +
   "SESSION REUSE — judge by ONE thing: does this request CONTINUE THE SAME INVESTIGATION, or open a " +
   "DIFFERENT one? REUSE the peer session (pass the session_id the specialist returned) when the new message " +
   "belongs to the SAME diagnostic thread as your immediately-preceding delegation to that specialist — " +

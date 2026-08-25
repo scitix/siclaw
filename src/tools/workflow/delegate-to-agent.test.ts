@@ -103,6 +103,39 @@ describe("delegate_to_agent tool", () => {
     expect(d.tool_calls).toBe(2);
   });
 
+  it("copies the v1 result fields into `details`, which is what the card reads", async () => {
+    // The gateway's HTTP response and the tool's `details` are two different readers. Emitting the
+    // contract on the response alone left it implemented and unreadable at the same time — the card
+    // renders from `details`, so nothing about task_status reached the UI. That is how "landed" and
+    // "in effect" come apart, and it is invisible from either side alone.
+    const exec = vi.fn(async () => ({
+      ...okResp(),
+      schema_version: 1, turn_status: "completed", task_status: "partial",
+      payload_kind: "artifact", truncation: { original_bytes: 100, omitted_bytes: 40, fields: ["steps"] },
+    }));
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const r = await tool.execute("c1", { agent_id: "agent-net", task: "t" });
+
+    const d = (r as any).details;
+    expect(d.schema_version).toBe(1);
+    expect(d.turn_status).toBe("completed");
+    expect(d.task_status).toBe("partial");
+    expect(d.payload_kind).toBe("artifact");
+    expect(d.truncation).toEqual({ original_bytes: 100, omitted_bytes: 40, fields: ["steps"] });
+    // Copied verbatim, never re-derived: a second implementation of task_status here would let the
+    // card disagree with the wire about whether a task completed, which is worse than showing
+    // nothing.
+    expect(d.task_status).toBe((await exec.mock.results[0].value).task_status);
+  });
+
+  it("omits the v1 fields when the wire did not carry them — an older gateway is unaffected", async () => {
+    const exec = vi.fn(async () => okResp());
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const d = (await tool.execute("c1", { agent_id: "agent-net", task: "t" }) as any).details;
+    expect("task_status" in d).toBe(false);
+    expect("truncation" in d).toBe(false);
+  });
+
   it("accepts a name in agent_id and still resolves", async () => {
     const exec = vi.fn(async () => okResp());
     const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));

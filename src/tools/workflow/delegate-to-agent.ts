@@ -24,7 +24,8 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
-import type { DelegateRosterMember } from "../../shared/agent-delegate.js";
+import type { DelegateRosterMember, DelegateResponse } from "../../shared/agent-delegate.js";
+import { DELEGATION_RESULT_SCHEMA_VERSION } from "../../shared/agent-delegate.js";
 
 interface DelegateParams {
   agent_id?: string;
@@ -188,13 +189,21 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // toolCallId travels with the request so the peer's turn can nest under THIS tool span and be
       // correlated with THIS tool row — a coordinator may have several delegations in flight.
       const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId, toolCallId, requestContext: params.request_context }, onProgress, signal)
-        .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
+        // The executor threw rather than answering, so there is no wire result to copy — this
+        // synthesizes one. It carries the v1 fields too: a card that shows nothing for a transport
+        // failure is the same blind spot as a card that shows nothing for a plan-only turn.
+        .catch((err): DelegateResponse => ({
+          schema_version: DELEGATION_RESULT_SCHEMA_VERSION,
+          turn_status: "failed", task_status: "unknown", payload_kind: "none",
+          ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const,
+          steps: [], peerSessionId: undefined, error: err instanceof Error ? err.message : String(err),
+        }));
 
       // Stopped by the coordinator (turn aborted): the relay was torn down and
       // the peer turn cancelled. Report a clean stop, not a scary error.
       if (signal?.aborted) {
         const msg = `Delegation to ${member.name} was stopped.`;
-        return { content: [{ type: "text" as const, text: msg }], details: { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, status: "stopped", summary: msg, ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) } };
+        return { content: [{ type: "text" as const, text: msg }], details: { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, status: "stopped", summary: msg, ...(resp.turn_status ? { turn_status: resp.turn_status } : {}), ...(resp.task_status ? { task_status: resp.task_status } : {}), ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) } };
       }
 
       // Card-facing shape (portal-web AgentWorkCard reads target from args and
@@ -202,7 +211,25 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // live steps into the FINAL result so the card keeps them after completion.
       // session_id (=peer session) lets the card OPEN the full peer session and lets
       // the model pass it back to continue this peer thread.
-      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) };
+      // The v1 result contract, copied onto the TOOL's details.
+      //
+      // This is not duplication for its own sake: the gateway's HTTP response and the tool's
+      // `details` are two different readers. The chat card renders from `details`, so fields that
+      // exist only on the response are invisible to it — the contract would be implemented and
+      // unreadable at the same time, which is how "landed" and "in effect" come apart.
+      //
+      // Copied verbatim rather than re-derived. Re-deriving would put a second implementation of
+      // task_status here, and a card disagreeing with the wire about whether a task completed is
+      // worse than a card that shows nothing.
+      const v1 = {
+        ...(resp.schema_version !== undefined ? { schema_version: resp.schema_version } : {}),
+        ...(resp.turn_status ? { turn_status: resp.turn_status } : {}),
+        ...(resp.task_status ? { task_status: resp.task_status } : {}),
+        ...(resp.payload_kind ? { payload_kind: resp.payload_kind } : {}),
+        ...(resp.next_action ? { next_action: resp.next_action } : {}),
+        ...(resp.truncation ? { truncation: resp.truncation } : {}),
+      };
+      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...v1, ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) };
 
       if (!resp.ok || resp.status === "failed") {
         const msg = `Delegation to ${member.name} failed: ${resp.error ?? "unknown error"}`;
