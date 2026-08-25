@@ -508,6 +508,22 @@ function rootContextForTrace(traceId?: string): Context {
 }
 
 export const tracingRecorder = {
+  /**
+   * Add attributes to this prompt's ROOT span, if one is open.
+   *
+   * For facts known at dispatch that do not belong in `startPrompt`'s signature — the delegating
+   * tool call id being the case this exists for. A no-op when tracing is off or no root is open,
+   * so callers never have to ask.
+   */
+  setRootAttributes(sessionId: string, attributes: Record<string, unknown>): void {
+    if (!isTracingEnabled()) return;
+    try {
+      traces.get(sessionId)?.root.setAttributes(flatAttrs(attributes));
+    } catch (err) {
+      console.warn("[tracing] setRootAttributes error:", err);
+    }
+  },
+
   /** Record the brain + identity for a session. Does not open any span. */
   attach(sessionId: string, brain: BrainSession, ctx: TraceAttachContext): void {
     if (!isTracingEnabled()) return;

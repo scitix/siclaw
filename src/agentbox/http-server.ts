@@ -1082,6 +1082,13 @@ export function createHttpServer(
       typeof body.traceId === "string" ? body.traceId : undefined,
       toSpanContext(body.parentSpanContext),
     );
+    // The dispatching tool call, recorded on the root so a delegated turn's span tree says WHICH
+    // delegate_to_agent commissioned it. The gateway makes the same correlation on the row side;
+    // both are needed because spans and rows are queried by different tools. Without this the field
+    // would be write-only — forwarded across two processes and read by nobody.
+    if (typeof body.delegationToolCallId === "string" && body.delegationToolCallId) {
+      tracingRecorder.setRootAttributes(managed.id, { "siclaw.delegation.tool_call_id": body.delegationToolCallId });
+    }
 
     const actuallyFinish = () => {
       managed._promptDone = true;

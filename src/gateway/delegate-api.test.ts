@@ -22,11 +22,14 @@ const consumeAgentSse = vi.fn(async (opts: any) => {
 vi.mock("./sse-consumer.js", () => ({ consumeAgentSse: (o: any) => consumeAgentSse(o) }));
 
 const ensureChatSession = vi.fn(async () => {});
-const appendMessage = vi.fn(async () => {});
+// Returns an id: delegate-api keeps it so the row can be bound to a trace id after the ack.
+const appendMessage = vi.fn(async () => "msg-user-1");
+const bindMessageTraceId = vi.fn(async () => {});
 const getMessages = vi.fn(async () => [] as any[]);
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: (...a: any[]) => ensureChatSession(...a),
   appendMessage: (...a: any[]) => appendMessage(...a),
+  bindMessageTraceId: (...a: any[]) => bindMessageTraceId(...a),
   getMessages: (...a: any[]) => getMessages(...a),
   incrementMessageCount: vi.fn(async () => {}),
   updateMessage: vi.fn(async () => {}),
@@ -215,6 +218,43 @@ describe("handleDelegate — trace context forwarding (C3)", () => {
     // is what stops a future refactor from "tidying" these into the delegation object.
     expect(sent.delegation.traceId).toBeUndefined();
     expect(sent.delegation.parentSpanContext).toBeUndefined();
+  });
+
+  it("stamps the peer's rows and the delegated user row with a trace id (the DB half)", async () => {
+    // Spans and rows are SEPARATE mechanisms. An earlier change propagated the span context and
+    // called the chain complete, but every persisted peer row still landed with trace_id NULL —
+    // and the delegation acceptance metrics (parent/child linkage, repeated identity resolution)
+    // are answered from rows, not spans. Every other prompt entry point already did this backfill.
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess", traceId: TRACE, toolCallId: "call-7",
+    }), makeRes() as any, identity, deps);
+
+    // The consumer stamps every row it persists.
+    expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: TRACE }));
+    // The opening user row is written BEFORE dispatch, so it is bound afterwards from the ack.
+    expect(bindMessageTraceId).toHaveBeenCalledWith(expect.any(String), expect.any(String), TRACE);
+    // Tool-call correlation is a DB join, so the id has to be on a row.
+    expect(appendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      role: "user",
+      metadata: { delegation_tool_call_id: "call-7" },
+    }));
+  });
+
+  it("prefers the box's OWN trace id from the ack over the one we sent", async () => {
+    // The box may not adopt what we sent (old build, tracing unattached), and its spans then carry
+    // an id we never saw. Stamping rows with OUR id would split rows from spans in exactly that
+    // case. Pinned separately because the previous test passes through the FALLBACK branch — the
+    // ack carries no traceId there, so it proves nothing about which one wins.
+    const BOX_TRACE = "fedcba9876543210fedcba9876543210";
+    promptMock.mockResolvedValueOnce({ ok: true, sessionId: "peer-sess", traceId: BOX_TRACE } as any);
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    await handleDelegate(makeReq({
+      peerAgentId: PEER, text: "t", parentSessionId: "own-sess", traceId: TRACE,
+    }), makeRes() as any, identity, deps);
+
+    expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: BOX_TRACE }));
+    expect(bindMessageTraceId).toHaveBeenCalledWith(expect.any(String), expect.any(String), BOX_TRACE);
   });
 
   it("omits them when the caller sent none — an older caller must still work", async () => {

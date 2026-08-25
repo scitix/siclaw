@@ -27,7 +27,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
-import { ensureChatSession, appendMessage, getMessages } from "./chat-repo.js";
+import { ensureChatSession, appendMessage, bindMessageTraceId, getMessages } from "./chat-repo.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import { parsePositiveIntEnv } from "../core/subagent-registry.js";
 import type {
@@ -466,6 +466,8 @@ export async function handleDelegate(
   // Link the parent ONLY when validated — never persist an unverified parent ref
   // (resolveReadableSession would otherwise grant the peer session to its owner).
   const trustedParent = parentTrusted ? body.parentSessionId ?? null : null;
+  /** The delegated opening user row, bound to a trace id once the peer's box reports one. */
+  let delegatedUserMessageId: string | undefined;
   try {
     await ensureChatSession(
       peerSessionId, coordinatorAgentId, ownerUserId,
@@ -474,7 +476,22 @@ export async function handleDelegate(
     );
     // Persist the delegated task as the opening user turn so the opened session
     // reads naturally (and a reuse turn appends its new task).
-    await appendMessage({ sessionId: peerSessionId, role: "user", content: text, parentSessionId: trustedParent, delegationId, targetAgentId: peerAgentId });
+    //
+    // The id is KEPT so the row can be bound to a trace id once one is known. It cannot be stamped
+    // here: this runs before dispatch, and the authoritative id is the one the peer's box actually
+    // used. Every other prompt entry point (web, channels) already does this backfill; delegation
+    // was the one that did not, which is why a delegated turn's rows never joined the coordinator's
+    // trace in the DB even after the span context started propagating.
+    delegatedUserMessageId = await appendMessage({
+      sessionId: peerSessionId, role: "user", content: text,
+      parentSessionId: trustedParent, delegationId, targetAgentId: peerAgentId,
+      // The coordinator tool call that commissioned this session. This is where the tool-row
+      // correlation is actually MADE — the join is a DB join, so the id has to be on a row, and
+      // this side already holds it. Concurrent delegations make session lineage insufficient on
+      // its own: several peer sessions can share one parent turn, and only this says which
+      // `delegate_to_agent` row each answers.
+      ...(body.toolCallId ? { metadata: { delegation_tool_call_id: body.toolCallId } } : {}),
+    });
   } catch (err) {
     if (cancelled()) return;
     console.warn("[delegate-api] failed to persist peer session:", err);
@@ -645,6 +662,17 @@ export async function handleDelegate(
           },
         },
       });
+      // Cross-Runtime: the target persists its own turn rows, so all this side can bind is the
+      // opening user row it wrote itself — and the only id available is the one we SENT, since no
+      // prompt ack comes back through this path. That is the right id anyway: the peer adopts it,
+      // so both ends land in the coordinator's trace. If the target is old enough not to adopt it,
+      // its rows carry a different id and the delegation is ungroupable — the same shortfall as
+      // before this change, not a new one.
+      if (delegatedUserMessageId && body.traceId) {
+        void bindMessageTraceId(delegatedUserMessageId, peerSessionId, body.traceId).catch((bindErr) => {
+          console.warn("[delegate-api] failed to bind trace id to the delegated user row:", bindErr);
+        });
+      }
       if (peerAbort.signal.aborted) {
         await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
         throw new Error("delegation stopped");
@@ -724,6 +752,17 @@ export async function handleDelegate(
       },
     });
 
+    // The box's own answer for this turn's root trace id — the id it ADOPTED from body.traceId, or
+    // one it generated when none was supplied or tracing could not attach. Prefer it over what we
+    // sent: it is what the peer's spans actually carry, so using it keeps rows and spans agreeing
+    // even against a box that did not adopt.
+    const peerTraceId = promptResult.traceId ?? body.traceId;
+    if (delegatedUserMessageId) {
+      void bindMessageTraceId(delegatedUserMessageId, promptResult.sessionId, peerTraceId).catch((bindErr) => {
+        console.warn("[delegate-api] failed to bind trace id to the delegated user row:", bindErr);
+      });
+    }
+
     const consumption = await consumeAgentSse({
       client,
       sessionId: promptResult.sessionId,
@@ -733,6 +772,11 @@ export async function handleDelegate(
       // Persist the peer session's rows so the coordinator can open its full
       // session and it survives for later analysis.
       persistMessages: true,
+      // Without this every persisted peer row lands with trace_id NULL, and the delegation is
+      // ungroupable in the DB no matter how well the span context propagates. Spans and rows are
+      // SEPARATE mechanisms: the acceptance metrics for delegation (parent/child linkage, whether a
+      // specialist re-resolves identity) are answered from rows, not from spans.
+      traceId: peerTraceId,
       onEvent: (evt: Record<string, unknown>) => observePeerEvent(evt, true),
     });
 
