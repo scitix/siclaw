@@ -646,6 +646,56 @@ describe("handleDelegationEvents", () => {
     expect(frontend.calls).toHaveLength(0);
   });
 
+  it("persists a single child's tier outcome all the way into chat.appendMessage metadata", async () => {
+    // The gap this covers: the AgentBox emitted `tier` on the terminal event and
+    // this projection did not copy it, so the field died at the Gateway. A group's
+    // outcome travels inside `item_statuses` and WAS copied, which made the
+    // single-child loss invisible — and asserting only that the AgentBox sent the
+    // field would not have caught it either. For a DETACHED single spawn this
+    // event is the only surviving record.
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.append_event",
+        event: {
+          parentSessionId: "sess-1",
+          parentAgentId: "agent-1",
+          userId: "u1",
+          delegationId: "spawn-1",
+          childSessionId: "child-1",
+          targetAgentId: "agent-1",
+          status: "done",
+          capsule: "found it",
+          tier: {
+            requestedTier: "fast",
+            resolvedTier: "fast",
+            source: "request",
+            provider: "p",
+            modelId: "m",
+          },
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const append = frontend.calls.find((c) => c.method === "chat.appendMessage");
+    expect(append).toBeDefined();
+    const metadata = JSON.parse((append!.params as { metadata: string }).metadata);
+    expect(metadata.tier).toEqual({
+      requestedTier: "fast",
+      resolvedTier: "fast",
+      source: "request",
+      provider: "p",
+      modelId: "m",
+    });
+    // Identifiers only — a credential must never reach a persisted record.
+    expect((append!.params as { metadata: string }).metadata).not.toContain("apiKey");
+  });
+
   it("delivers background assistant messages to a registered channel even when Portal has no chat session", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");

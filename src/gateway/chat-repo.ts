@@ -9,6 +9,7 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type { GroupItemStatus } from "../core/tool-registry.js";
+import type { PersistedTierOutcome } from "../core/subagent-models.js";
 
 export interface ChatSessionLineageInput {
   /** Parent chat session for delegated child sessions. Null/undefined for normal top-level chat. */
@@ -108,7 +109,12 @@ export interface AppendDelegationEventInput {
   partialSource?: "steered" | "runtime_fallback";
   interruptedTool?: string;
   /** Group terminal event per-item status snapshot (mirrors DelegationEventPayload.itemStatuses). */
-  itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
+  itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
+  /**
+   * Single-child terminal event: which model ran it and why (identifiers only).
+   * Mirrors `DelegationEventPayload.tier`.
+   */
+  tier?: PersistedTierOutcome;
 }
 
 /** Module-level FrontendWsClient reference, set via initChatRepo(). */
@@ -306,6 +312,10 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
     ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
     ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
     ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
+    // Second copy of the same projection (this one is the direct-DB path). A field
+    // added to only one of the two is persisted on some deployments and silently
+    // dropped on others.
+    ...(evt.tier ? { tier: evt.tier } : {}),
   };
 
   return appendMessage({

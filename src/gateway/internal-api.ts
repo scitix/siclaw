@@ -603,6 +603,15 @@ async function appendDelegationEvent(
     // Group terminal event: per-item status snapshot so the frontend can render never-persisted
     // (skipped) items on reload instead of the live-only "running" fallback.
     ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
+    // Single-child terminal event: which model ran it and why (identifiers only).
+    //
+    // ⚠️ Every field the AgentBox sends has to be copied HERE to survive. A group's
+    // tier outcome travels inside `item_statuses` and so was already persisted,
+    // which made the single-child gap invisible — the AgentBox was emitting the
+    // field and nothing downstream stored it. For a DETACHED single spawn this
+    // event is the only surviving record, so dropping it here loses the answer
+    // entirely.
+    ...(evt.tier ? { tier: evt.tier } : {}),
   };
 
   return appendDelegationMessage(frontendClient, {

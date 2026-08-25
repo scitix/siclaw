@@ -66,8 +66,24 @@ describe("tier menu wire contract", () => {
     expect(menu!.revision).toBe(REV);
   });
 
-  it("accepts snake_case when_to_use, since that RPC is snake_case throughout", () => {
+  it("reads the CANONICAL camelCase key the producer actually emits", () => {
     const menu = projectTierMenuFromConfig(UPSTREAM_PROJECTED_MENU, sha256Hex);
+    expect(menu!.items[0].whenToUse).toContain("read logs");
+    expect(golden.rules.whenToUseCanonicalKey).toBe("whenToUse");
+  });
+
+  it("also tolerates the snake_case alias, but that is tolerance and not the contract", () => {
+    // The consumer accepts it because that RPC is snake_case elsewhere and a
+    // producer emitting it is not wrong. The producer should still emit the
+    // canonical key, and may reject the alias — asymmetry is deliberate: a
+    // consumer that refuses a spelling turns a cosmetic difference into a silent
+    // outage, while a producer that emits one keeps the contract crisp.
+    const aliased = {
+      revision: REV,
+      items: [{ tier: "fast", when_to_use: "read logs and summarise findings" }],
+    };
+    const menu = projectTierMenuFromConfig(aliased, sha256Hex);
+    expect(menu).not.toBeNull();
     expect(menu!.items[0].whenToUse).toContain("read logs");
   });
 

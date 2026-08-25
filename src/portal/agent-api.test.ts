@@ -610,9 +610,17 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(200);
     });
 
-    it("does not reload tools when the tier list is resubmitted unchanged", async () => {
-      // Compared through the same canonical form the revision uses, so a no-op
-      // save does not kick warm sessions.
+    it("reloads tools whenever the tier list is SUPPLIED, even unchanged", async () => {
+      // Deliberately not a no-op-detecting comparison. The old value is read
+      // outside the UPDATE's transaction, so two concurrent saves can compare
+      // against the same snapshot: A writes A and reloads, B writes the old value
+      // back and concludes "unchanged", and if A's reload lands first the warm
+      // sessions cache A while the row holds B's value.
+      //
+      // The asymmetry decides it: a redundant reload costs one session rebuild,
+      // while a missed one leaves warm sessions advertising a menu the binding no
+      // longer matches — producing revision_mismatch on every spawn until those
+      // sessions happen to die.
       const tiers = [{ tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" }];
       query
         .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
@@ -627,6 +635,27 @@ describe("registerAgentRoutes", () => {
         url: "/api/v1/agents/a1",
         method: "PUT",
         body: { subagent_models: tiers },
+      }));
+
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("does not reload tools when the tier list is not supplied at all", async () => {
+      // The other half: an unrelated edit must not kick warm sessions.
+      query
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { description: "just a rename" },
       }));
 
       expect(connMap.notify).not.toHaveBeenCalledWith("a1", "agent.reload", expect.anything());

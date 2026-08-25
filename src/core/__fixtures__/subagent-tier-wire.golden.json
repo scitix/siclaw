@@ -23,11 +23,11 @@
   ],
 
   "projectedMenu": {
-    "$comment": "Preferred shape: the producer projects, so provider/modelId never reach the menu channel. snake_case matches every other field on that RPC.",
+    "$comment": "CANONICAL shape: the producer projects, so provider/modelId never reach the menu channel. camelCase whenToUse — this is what the producer actually emits and what its own wire test requires. An earlier revision of this fixture declared snake_case canonical, which was a stale observation and left the two sides disagreeing about their own contract even while runtime worked (the consumer tolerates both).",
     "revision": "b3f1000000000000000000000000000000000000000000000000000000000000",
     "items": [
-      { "tier": "fast", "when_to_use": "read logs, grep code, check config — retrieval and summary" },
-      { "tier": "deep", "when_to_use": "cross-source causal reasoning, or a conclusion a human reads" }
+      { "tier": "fast", "whenToUse": "read logs, grep code, check config — retrieval and summary" },
+      { "tier": "deep", "whenToUse": "cross-source causal reasoning, or a conclusion a human reads" }
     ]
   },
 
@@ -55,6 +55,8 @@
     "revisionPattern": "^[0-9a-f]{64}$",
     "whenToUseMinCodePoints": 8,
     "whenToUseMaxCodePoints": 256,
+    "whenToUseCanonicalKey": "whenToUse",
+    "$comment_whenToUseAcceptedKeys": "The consumer ALSO tolerates snake_case, because that RPC is snake_case elsewhere and a producer emitting it is not wrong. Tolerance is not the contract though: emit the canonical key. A producer may reject the alias; a consumer must not.",
     "whenToUseAcceptedKeys": ["whenToUse", "when_to_use"],
     "menuMustNotContain": ["provider", "modelId", "model_id", "modelConfig"],
     "candidatesMustNotRequire": ["whenToUse", "when_to_use"],

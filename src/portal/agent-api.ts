@@ -97,32 +97,6 @@ function normalizedToolCapabilities(value: unknown): string {
   return JSON.stringify([...new Set(parsed)].sort());
 }
 
-/**
- * Canonical comparison form for a stored tier list.
- *
- * NOT `normalizedToolCapabilities`: that one dedupes with a Set and sorts, which
- * is meaningless for objects — Set never collapses two equal-valued objects, and
- * the default sort compares them as "[object Object]". Reuses the same canonical
- * form the revision is computed over, so "changed" here means exactly what
- * "different revision" means downstream.
- */
-function normalizedSubagentModels(value: unknown): string {
-  // Goes through the non-throwing validator, and an INVALID stored value compares
-  // as "no tiers" rather than raising.
-  //
-  // This reads the row's CURRENT value to decide whether an update changed it, so
-  // throwing here would be self-defeating: a row corrupted by any means could
-  // never be repaired through the API, because every PUT — including one that
-  // clears the field — has to read the old value first. The one operation that
-  // fixes the problem would be the one guaranteed to fail.
-  //
-  // Comparing invalid-as-empty is also the right answer for the reload decision:
-  // an unusable config was already producing no tiers, so replacing it with a
-  // usable one IS a change and must invalidate warm sessions.
-  const parsed = normalizeSubagentTierConfig(safeParseJson<unknown>(value, null));
-  if (!parsed.ok || parsed.value.length === 0) return "";
-  return canonicalTierConfig(parsed.value);
-}
 
 
 export function registerAgentRoutes(
@@ -391,9 +365,17 @@ export function registerAgentRoutes(
     const toolCapabilitiesChanged =
       encodedToolCapabilities !== undefined &&
       normalizedToolCapabilities(encodedToolCapabilities) !== normalizedToolCapabilities(current?.tool_capabilities);
-    const subagentModelsChanged =
-      encodedSubagentModels !== undefined &&
-      normalizedSubagentModels(encodedSubagentModels) !== normalizedSubagentModels(current?.subagent_models);
+    // Refresh whenever the field is SUPPLIED, without comparing to the old value.
+    //
+    // The read happens outside the UPDATE's transaction, so two concurrent saves
+    // can compare against the same snapshot: A writes A and reloads, B writes the
+    // old value back and concludes "unchanged", and if A's reload lands first the
+    // warm sessions end up caching A while the row holds B's value. A locked
+    // read-compare-write would also fix it, but the asymmetry here makes the cheap
+    // option the right one — a redundant reload costs one session rebuild, while a
+    // missed one leaves warm sessions advertising a menu the binding no longer
+    // matches, producing revision_mismatch until those sessions happen to die.
+    const subagentModelsChanged = encodedSubagentModels !== undefined;
 
     // Capture the current idle window before the update — needed to detect the
     // resident(0) → finite transition, which (unlike every other transition)
