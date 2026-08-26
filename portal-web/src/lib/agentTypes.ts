@@ -26,7 +26,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "coordinator",
     label: "Coordinator Agent",
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
-    capabilities: ["inspect_infra", "read_files", "delegate_agents"],
+    capabilities: ["read_files", "delegate_agents"],
     defaultNoSkills: true,
   },
   {

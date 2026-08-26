@@ -251,6 +251,8 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(opts.mode).toBe("channel");
     expect(opts.systemPromptTemplate).toBeUndefined();
     expect(opts.systemPromptAppend).toBe("custom prompt");
+    expect(opts.agentType).toBe("custom");
+    expect(opts.harnessResolved).toBe(true);
     expect(opts.userId).toBe("alice");
     expect(opts.agentId).toBe("agent-a");
   });

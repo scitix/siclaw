@@ -269,12 +269,13 @@ describe("LocalSpawner — tool-capabilities injection", () => {
     expect(box.sessionManager.allowedToolsState).toBeNull();
   });
 
-  it("fails safe-open (null) when the DB lookup throws", async () => {
+  it("fails closed when the DB lookup throws", async () => {
     dbQueryImpl = async () => { throw new Error("db down"); };
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
-    expect(box.sessionManager.allowedToolsState).toBeNull();
+    expect(box.sessionManager.allowedToolsState).toEqual([]);
+    expect(box.sessionManager.harnessResolvedState).toBe(false);
   });
 });
 
@@ -297,6 +298,7 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     expect(box.sessionManager.allowedToolsState).toContain("delegate_to_agent");
     // Persona is driven by agentTypeState — must reflect the built-in type.
     expect(box.sessionManager.agentTypeState).toBe("coordinator");
+    expect(box.sessionManager.harnessResolvedState).toBe(true);
   });
 
   it("leaves a Custom agent's raw selection + custom persona untouched", async () => {

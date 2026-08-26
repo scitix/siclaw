@@ -1,15 +1,41 @@
 # Agent prompt lifecycle
 
 `system_prompt` is the Agent-owned identity and behaviour instruction. It has
-the same semantics for `sre`, `coordinator`, and `custom` agents:
+the same semantics for `sre`, `coordinator`, `knowledge_qa`, and `custom`
+agents:
 
 - an Agent type selects an initial default prompt;
 - a non-empty persisted `system_prompt` replaces that default;
 - the default is never appended behind a persisted prompt.
 
-The editable prompt does not replace Siclaw's platform assembly. Runtime
-safety/mode instructions, skill and knowledge context, MCP tool schemas, and
-delegated read-only constraints remain platform-owned.
+The editable prompt does not replace Siclaw's platform assembly. Every session
+entry point passes Agent type, resolved capabilities, mode, and delegation
+constraints to `compileAgentContext()`. The compiler produces two coupled
+outputs:
+
+- a role-neutral platform prompt plus only the type/capability sections the
+  harness can actually support;
+- an enforceable harness policy for built-in tools, MCP, memory, and skill
+  roots.
+
+Prompt text is descriptive, never the permission gate. The model-visible tool
+schemas and skill index are filtered from the same policy that selected their
+prompt guidance. In particular:
+
+- SRE, and Custom Agents that selected discovery tools, get infrastructure
+  guidance; QA/Coordinator do not;
+- planning and sub-agent guidance appear only when their tools are allowed;
+- QA knowledge catalog text asks for evidence synthesis and never suggests
+  shell checks;
+- QA/Coordinator do not inherit repo-bundled or user-global operational skills;
+- delegated read-only sessions suppress MCP, memory, writes, and operational
+  guidance;
+- an unresolved control-plane lookup exposes no tools, MCP, memory, or ambient
+  skills until a later successful sync.
+
+`custom` plus a successfully resolved null capability selection retains the
+legacy unrestricted behavior. This compatibility is explicit in the harness;
+an unresolved lookup never falls into it.
 
 The same contract applies in AgentBox sessions and the Portal-backed TUI.
 Persisted prompt fragments retain the legacy template conveniences:
@@ -27,6 +53,20 @@ all agent types.
 Delegated read-only work is an exclusive platform constraint. It replaces the
 Agent-owned identity for that delegated turn rather than composing potentially
 conflicting remediation or routing instructions with a read-only toolset.
+
+## Audit manifests
+
+Session creation emits an `agent-context/v1` manifest containing Agent type,
+resolution state, mode, policy flags, resource names, model-visible tool and
+skill names, and prompt hashes. It never logs prompt or user-message content.
+
+Provider payload hooks additionally emit a wire-level manifest for the final
+request envelope after provider transforms. It records only system-prompt
+length/hash, the full tool-schema hash, sorted tool names, and boolean markers
+for known SRE/infrastructure/memory/workflow prompt sections. This is the source
+of truth for answering "what prompt and tools did this model call actually
+receive?" and whether an unexpected platform section was present, without
+storing sensitive text.
 
 ## Hot application
 

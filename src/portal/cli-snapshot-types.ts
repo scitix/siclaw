@@ -8,6 +8,7 @@
 
 import type { SkillPackageFile } from "../shared/skill-package.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
+import type { AgentType } from "../core/agent-types.js";
 
 export interface CliSnapshotKnowledgeRepo {
   name: string;
@@ -65,6 +66,8 @@ export interface CliSnapshotAgentMeta {
 export interface CliSnapshotActiveAgent {
   name: string;
   description: string | null;
+  /** Drives the same locked harness policy AgentBox uses. */
+  agentType: AgentType;
   systemPrompt: string | null;
   modelProvider: string | null;
   modelId: string | null;

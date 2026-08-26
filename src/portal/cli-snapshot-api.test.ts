@@ -540,7 +540,30 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
 
     expect(status).toBe(200);
+    expect(body.activeAgent.agentType).toBe("coordinator");
     expect(body.activeAgent.systemPrompt).toBe(COORDINATOR_DEFAULT_PROMPT);
+    expect(body.activeAgent.allowedTools).not.toContain("cluster_list");
+    expect(body.activeAgent.allowedTools).toContain("delegate_to_agent");
+  });
+
+  it("locks Knowledge QA tools in Portal-backed TUI even when the row asks for command execution", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO agents (id, name, status, agent_type, tool_capabilities, is_production, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["qa-locked", "qa-locked", "active", "knowledge_qa", JSON.stringify(["run_commands"]), 1, "u"],
+    );
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot?agent=qa-locked", headers: authedHeaders() }),
+    );
+
+    expect(status).toBe(200);
+    expect(body.activeAgent.agentType).toBe("knowledge_qa");
+    expect(new Set(body.activeAgent.allowedTools)).toEqual(
+      new Set(["read", "grep", "find", "ls", "knowledge_cite"]),
+    );
+    expect(body.activeAgent.allowedTools).not.toContain("bash");
   });
 
   it("scopes skills / mcp / knowledge / clusters / hosts to the agent's junction rows", async () => {

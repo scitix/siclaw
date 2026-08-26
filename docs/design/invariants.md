@@ -111,7 +111,14 @@ The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the
 - `agent-factory.ts` picks up these paths via new `portalSkillsDir` / `portalKnowledgeDir` / `portalCredentialsDir` opts; when set, they override `config.paths.*` so the agent's Read tool, `local_script`, and kubectl use Portal content.
 
 **Skill filter** (`src/core/agent-factory.ts`):
-When a Portal snapshot is active, pi-coding-agent's `DefaultResourceLoader` auto-discovered user-global skills (e.g. `~/.pi/agent/skills/`) are filtered out — a `skillsOverride` keeps only skills whose path sits under the Portal-materialized dir or the repo's `skills/platform/`. This ensures the Portal operator's skill list is the single source of truth for what the agent can invoke.
+For any scoped Agent (Portal or Gateway materialization), pi-coding-agent's
+auto-discovered user-global skills (for example `~/.pi/agent/skills/`) are
+filtered out. `skillsOverride` keeps only roots selected by the compiled Agent
+harness: Portal/Gateway materialized bindings, repo-bundled operational skills
+when execution is permitted, and platform authoring skills when write/preview
+capabilities are permitted. QA, Coordinator, delegated read-only, and unresolved
+harnesses therefore cannot inherit ambient SRE skill context. Standalone,
+unscoped SRE TUI sessions retain the legacy repo/global skill fallback.
 
 **Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-first-run.ts`, `src/cli-main.ts`, `src/core/extensions/{ls,agent,setup}.ts`
 

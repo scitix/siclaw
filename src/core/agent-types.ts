@@ -142,7 +142,9 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   coordinator: {
     label: "Coordinator Agent",
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
-    capabilities: ["inspect_infra", "read_files", "delegate_agents"],
+    // Coverage comes from list_delegates. cluster_list/host_list describe the
+    // coordinator's own bindings and prime the wrong "bind a cluster" route.
+    capabilities: ["read_files", "delegate_agents"],
     defaultPrompt: COORDINATOR_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
@@ -183,7 +185,7 @@ export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilitie
  * compatibility/creation fallback for rows that have not materialized one yet.
  *
  * This is intentionally separate from the platform prompt assembled by
- * buildSreSystemPrompt(): runtime safety/mode instructions and dynamic
+ * buildSystemPrompt(): runtime safety/mode instructions and dynamic
  * skill/knowledge/MCP context remain platform-owned.
  */
 export function effectiveAgentPrompt(agentType: AgentType, storedPrompt: unknown): string | undefined {

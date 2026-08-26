@@ -570,15 +570,17 @@ former always-on tools (task/memory/schedule/spawn) for free — they are filter
 unless explicitly listed. The default global is `null`, so existing agents are
 unaffected; only a deployment that opted into a global whitelist must revisit it.
 
-**Initial-fetch failure is fail-open (reviewed policy)**: the per-pod
-tool-capabilities fetch (K8s `agentbox-main.ts`, awaited before `listen` with
-retries) and the spawn-time DB read (Local `local-spawner.ts`) both start the box
-**unrestricted** on unrecoverable error, with a loud warn. Rationale: a fresh box
-has no prior whitelist to preserve, and a failed fetch usually signals broader
-gateway unreachability (skills/MCP can't sync either), so failing open keeps the
-box serviceable rather than bricking it. The reload-PUSH path is *not* fail-open —
-it preserves the prior whitelist on failure. Fail-closed hardening (refuse first
-turn until resolved) is tracked as a separate follow-up.
+**Initial-fetch failure is fail-closed**: the per-pod tool-capabilities fetch
+(K8s `agentbox-main.ts`, awaited before `listen` with retries) and the spawn-time
+DB read (Local `local-spawner.ts`) initialize the harness as unresolved with an
+empty built-in whitelist. On unrecoverable error the Agent can still answer from
+its conversation and mounted knowledge, but receives no built-in tools, MCP,
+memory, or ambient skills. A later successful reload installs the resolved
+policy. The reload-PUSH path preserves the last resolved whitelist on failure.
+
+The only unrestricted per-Agent state is the explicit backward-compatible
+`custom` + successfully resolved null selection. A failed lookup cannot be
+mistaken for that state.
 
 ### Tools Not in Registry
 

@@ -174,39 +174,39 @@ describe("createToolsHandler", () => {
   });
 
   it("fetch uses the per-box client and hits /api/internal/tool-capabilities", async () => {
-    const boxClient = fakeClient({ allowedTools: ["read", "ls"] });
+    const boxClient = fakeClient({ allowedTools: ["read", "ls"], agentType: "knowledge_qa" });
     // Pass a DIFFERENT client into fetch() to prove the box client wins.
     const otherClient = fakeClient({ allowedTools: ["should_not_be_used"] });
     const handler = createToolsHandler({ allowedToolsState: null }, boxClient);
     const payload = await handler.fetch(otherClient);
-    expect(payload).toEqual({ allowedTools: ["read", "ls"] });
+    expect(payload).toEqual({ allowedTools: ["read", "ls"], agentType: "knowledge_qa" });
     expect(boxClient.calls).toEqual([["/api/internal/tool-capabilities", "GET"]]);
     expect(otherClient.calls).toEqual([]);
   });
 
   it("materialize writes a non-null list into the target state and returns its length", async () => {
-    const target = { allowedToolsState: null as string[] | null };
+    const target = { allowedToolsState: null as string[] | null, harnessResolvedState: false };
     const handler = createToolsHandler(target, null);
-    const count = await handler.materialize({ allowedTools: ["read", "ls", "grep"] });
+    const count = await handler.materialize({ allowedTools: ["read", "ls", "grep"], agentType: "knowledge_qa" });
     expect(count).toBe(3);
     expect(target.allowedToolsState).toEqual(["read", "ls", "grep"]);
+    expect(target.harnessResolvedState).toBe(true);
   });
 
   it("materialize treats null as 'no restriction' (whitelist off), returns 0", async () => {
     const target = { allowedToolsState: ["read"] as string[] | null };
     const handler = createToolsHandler(target, null);
-    const count = await handler.materialize({ allowedTools: null });
+    const count = await handler.materialize({ allowedTools: null, agentType: "custom" });
     expect(count).toBe(0);
     expect(target.allowedToolsState).toBeNull();
   });
 
-  it("materialize coerces a malformed (non-array) payload to null, not a crash", async () => {
+  it("rejects a malformed payload without changing the last resolved state", async () => {
     const target = { allowedToolsState: ["read"] as string[] | null };
     const handler = createToolsHandler(target, null);
-    // Simulate a skeleton/garbage response.
-    const count = await handler.materialize({ allowedTools: undefined } as any);
-    expect(count).toBe(0);
-    expect(target.allowedToolsState).toBeNull();
+    await expect(handler.materialize({ allowedTools: undefined } as any))
+      .rejects.toThrow("Invalid tool-capabilities payload");
+    expect(target.allowedToolsState).toEqual(["read"]);
   });
 
   it("postReload invalidates every session (mirrors mcpHandler)", async () => {
@@ -240,8 +240,8 @@ describe("createToolsHandler", () => {
     // process-global state is involved.
     const a = { allowedToolsState: null as string[] | null };
     const b = { allowedToolsState: null as string[] | null };
-    await createToolsHandler(a, null).materialize({ allowedTools: ["read"] });
-    await createToolsHandler(b, null).materialize({ allowedTools: ["bash"] });
+    await createToolsHandler(a, null).materialize({ allowedTools: ["read"], agentType: "knowledge_qa" });
+    await createToolsHandler(b, null).materialize({ allowedTools: ["bash"], agentType: "custom" });
     expect(a.allowedToolsState).toEqual(["read"]);
     expect(b.allowedToolsState).toEqual(["bash"]);
   });

@@ -497,19 +497,17 @@ This is a secondary path -- `local_script` is preferred.
 
 ### How the Agent Sees Skills
 
-`agent-factory.ts` loads skills from a single `resolved/` directory built by materialize (K8s)
-or syncSkills (local). The directory contains all skills flattened with priority:
-personal > skillset > global > builtin.
+`agent-factory.ts` first asks the compiled Agent harness which skill roots are
+valid for this session. A Gateway-managed Agent loads the single `resolved/`
+directory built by materialization; a Portal-backed TUI loads its
+`portalSkillsDir`. Repo-bundled operational skills are a fallback only when the
+harness has execution capability.
 
 ```typescript
-// Local mode: per-user resolved dir at {skillsBase}/user/{userId}/resolved/
-// K8s mode: {skillsBase}/resolved/
-const resolvedSkillsDir = opts?.userId
-  ? path.join(skillsBase, "user", opts.userId, "resolved")
-  : path.join(skillsBase, "resolved");
+const resolvedSkillsDir = path.join(skillsBase, "resolved");
 
-// Fallback: if resolved/ doesn't exist yet (first boot, TUI mode),
-// load builtin directories directly (skills/core/ + skills/extension/)
+// Standalone operational fallback only:
+// skills/core/ + skills/extension/
 ```
 
 The resolved directory is passed to `DefaultResourceLoader` via `additionalSkillPaths`.
@@ -517,17 +515,17 @@ The loader auto-discovers skills by scanning for `SKILL.md` files, parsing front
 and injecting descriptions into the system prompt. The agent then knows which skills are
 available and can invoke them via `local_script`.
 
-### TUI with Local Portal — skillsOverride Filter
+### Harness-scoped `skillsOverride` Filter
 
-When a TUI session has a local Portal snapshot active (`portalSkillsDir` set), the agent
-factory passes a `skillsOverride` to `DefaultResourceLoader` that **restricts** the visible
-skill set to paths rooted under either the Portal-materialized dir or the repo's
-`skills/platform/`. This filter removes user-global skills that the loader would otherwise
-auto-discover from `~/.pi/agent/skills/` or similar — they are invisible from the Portal
-operator's perspective and must not leak into the agent's tool inventory.
+For scoped Portal/Gateway Agents, the factory passes a `skillsOverride` that
+restricts the visible skill set to the roots selected above. This removes
+user-global skills that the loader would otherwise auto-discover from
+`~/.pi/agent/skills/` or similar. QA, Coordinator, delegated read-only, and
+unresolved sessions also disable the repo-bundled operational fallback.
 
-Without the override, the agent could invoke skills the Portal operator never opted into.
-See `docs/design/invariants.md` §1.4 for the enclosing Portal-as-SoT contract.
+Without the override, the prompt could advertise skills the Agent owner never
+bound and whose operational assumptions conflict with the Agent type. See
+`docs/design/invariants.md` §1.4 for the enclosing source-of-truth contract.
 
 ---
 

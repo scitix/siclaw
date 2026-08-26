@@ -375,7 +375,14 @@ export class AgentBoxSessionManager {
    */
   allowedToolsState: string[] | null = null;
 
-  /** Agent type (sre/coordinator/custom), fetched alongside allowedTools.
+  /**
+   * Whether the control plane successfully resolved this Agent's type and tool
+   * policy. K8s/Local startup set false before fetching; the compiler then
+   * exposes no built-in or MCP tools until a concrete policy lands.
+   */
+  harnessResolvedState = true;
+
+  /** Agent type (sre/coordinator/knowledge_qa/custom), fetched alongside allowedTools.
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
 
@@ -2227,6 +2234,8 @@ export class AgentBoxSessionManager {
       userId: request.userId,
       agentId,
       knowledgeDir: this.knowledgeDir,
+      agentType: normalizeAgentType(this.agentTypeState),
+      harnessResolved: this.harnessResolvedState,
       // A spawned sub-agent must never be broader than its parent: inherit the
       // parent's per-agent tool whitelist. Without this, a restricted agent that
       // has the `spawn_subagents` capability could escalate by spawning a child
@@ -2800,6 +2809,8 @@ export class AgentBoxSessionManager {
       userId: effectiveUserId,
       agentId: this.agentId ?? null,
       knowledgeDir: this.knowledgeDir,
+      agentType: normalizeAgentType(this.agentTypeState),
+      harnessResolved: this.harnessResolvedState,
       // Per-agent tool capability whitelist. null = unrestricted (falls back to
       // global config.allowedTools in agent-factory — today's behaviour for any
       // agent that never set tool_capabilities).

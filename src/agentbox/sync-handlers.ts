@@ -667,9 +667,11 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
  */
 interface ToolsPayload {
   allowedTools: string[] | null;
-  /** Agent type (sre/coordinator/custom) — drives capabilities and prompt fallback. */
-  agentType?: string;
+  /** Agent type (sre/coordinator/knowledge_qa/custom) — drives capabilities and prompt fallback. */
+  agentType: string;
 }
+
+const VALID_AGENT_TYPES = new Set(["sre", "coordinator", "knowledge_qa", "custom"]);
 
 /**
  * Minimal structural target the tools handler writes to. Deliberately NOT the
@@ -679,6 +681,7 @@ interface ToolsPayload {
  */
 export interface ToolsStateTarget {
   allowedToolsState: string[] | null;
+  harnessResolvedState?: boolean;
   /** Agent type resolved from the tool-capabilities payload. */
   agentTypeState?: string;
 }
@@ -710,15 +713,19 @@ export function createToolsHandler(
       const c = boxClient ?? client;
       if (!c) throw new Error("[tools] GatewaySyncClientLike required but missing");
       const data = await c.request(GATEWAY_SYNC_DESCRIPTORS.tools.gatewayPath, "GET");
-      return (data ?? { allowedTools: null }) as ToolsPayload;
+      return data as ToolsPayload;
     },
 
     async materialize(payload: ToolsPayload): Promise<number> {
-      // null / non-array → no restriction (whitelist off). Mirrors
-      // resolveCapabilities(null) === null and agent-factory's null=all-tools.
-      const allowed = Array.isArray(payload?.allowedTools) ? payload.allowedTools : null;
+      const allowed = payload?.allowedTools;
+      if ((allowed !== null &&
+          (!Array.isArray(allowed) || allowed.some((name) => typeof name !== "string"))) ||
+          !VALID_AGENT_TYPES.has(payload?.agentType)) {
+        throw new Error("[tools] Invalid tool-capabilities payload");
+      }
       target.allowedToolsState = allowed;
-      target.agentTypeState = typeof payload?.agentType === "string" ? payload.agentType : "custom";
+      target.agentTypeState = payload.agentType;
+      target.harnessResolvedState = true;
       return allowed ? allowed.length : 0;
     },
 

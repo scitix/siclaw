@@ -8,6 +8,7 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.coordinator.capabilities).toContain("delegate_agents");
+    expect(AGENT_TYPES.coordinator.capabilities).not.toContain("inspect_infra");
     expect(AGENT_TYPES.coordinator.capabilities).not.toContain("run_commands");
     expect(AGENT_TYPES.coordinator.defaultNoSkills).toBe(true);
     expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual(["read_files"]);

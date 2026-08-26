@@ -613,3 +613,49 @@ Release application is identity-bound and happens at a turn boundary:
 **Files**: `src/shared/gateway-sync.ts`, `src/gateway/server.ts`,
 `src/gateway/agent-model-binding.ts`, `src/agentbox/sync-handlers.ts`,
 `src/agentbox/http-server.ts`
+
+---
+
+## ADR-016: Compile Prompt and Runtime Harness from One Agent Context
+
+**Status**: Active
+
+**Context**:
+Siclaw assembled every session on top of an SRE-oriented default prompt and
+then appended an Agent type prompt. A Knowledge QA Agent therefore still saw
+cluster-binding, shell, workflow, memory, and ambient skill instructions even
+when its built-in tool whitelist was read-only. This made routing depend on
+conflicting prompt recency and made it difficult to prove the exact context a
+provider received. Initial capability lookup failures also shared the same null
+value as the legacy unrestricted Custom configuration.
+
+**Decision**:
+Introduce one Agent Context compiler at the session-factory boundary. Its input
+is Agent type, resolved tool policy, mode, memory configuration, and delegation
+constraint. Its outputs are:
+
+- a role-neutral system prompt with capability-derived infrastructure,
+  workflow, memory, skill-authoring, and operational-safety sections;
+- an enforceable harness for built-in tools, MCP, memory, and allowed skill
+  roots.
+
+All AgentBox and Portal-backed TUI entry points pass the locked Agent type and
+resolution state through this compiler. Unresolved startup is fail-closed.
+Custom plus a successfully resolved null selection remains the sole legacy
+unrestricted case. Session and final provider-envelope manifests record only
+hashes, lengths, and model-visible resource names, never prompt or user content.
+
+**Consequences**:
+
+- ✅ QA cold starts without SRE cluster-binding or shell guidance.
+- ✅ Prompt claims and model-visible tools/skills derive from one policy.
+- ✅ Capability-sync failure cannot silently become an unrestricted session.
+- ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
+- ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
+  skills; required skills must be explicitly bound.
+- ⚠️ Persisted full-template overrides remain compatible and therefore do not
+  receive bundled role sections; the hardcoded Safety/Language suffix remains.
+
+**Files**: `src/core/agent-context.ts`, `src/core/prompt.ts`,
+`src/core/agent-factory.ts`, `src/core/model-envelope.ts`,
+`src/agentbox-main.ts`, `src/gateway/agentbox/local-spawner.ts`

@@ -86,6 +86,8 @@ export class LocalSpawner implements BoxSpawner {
 
     const sessionManager = new AgentBoxSessionManager();
     sessionManager.agentId = agentId;
+    sessionManager.harnessResolvedState = false;
+    sessionManager.allowedToolsState = [];
     // Agent-scoped credentials directory — shared across callers of this agent.
     sessionManager.credentialsDir = path.resolve(
       process.cwd(),
@@ -103,14 +105,14 @@ export class LocalSpawner implements BoxSpawner {
     // syncAllResources never pulls it (and isn't even run in Local mode).
     // LocalSpawner lives inside the Gateway process with direct DB access, so it
     // resolves both here — before createHttpServer + the first session — so a
-    // restricted agent is restricted from its very first turn (not
-    // unrestricted-until-next-reload). This mirrors the K8s path
-    // (internal-api.ts handleToolCapabilities): a built-in type (sre/coordinator)
+    // restricted agent is restricted from its very first turn. This mirrors
+    // the K8s path
+    // (internal-api.ts handleToolCapabilities): a built-in type
     // LOCKS its capability set via effectiveCapabilityKeys and drives the locked
     // persona via agentTypeState — without this, a Coordinator with an empty raw
     // tool_capabilities would resolve to null (unrestricted) and keep the default
-    // custom persona in Local mode. custom with null/empty selection → null =
-    // unrestricted (today's behaviour).
+    // custom persona in Local mode. Custom with null/empty selection keeps that
+    // legacy compatibility only after this lookup resolves successfully.
     try {
       const db = getDb();
       const [rows] = await db.query(
@@ -123,13 +125,14 @@ export class LocalSpawner implements BoxSpawner {
       const agentType = normalizeAgentType(rows.length > 0 ? rows[0].agent_type : undefined);
       sessionManager.allowedToolsState = resolveCapabilities(effectiveCapabilityKeys(agentType, groupKeys));
       sessionManager.agentTypeState = agentType;
+      sessionManager.harnessResolvedState = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Fail safe-open: an agent that can't resolve its whitelist starts
-      // unrestricted rather than failing to spawn. The next reload push will
-      // correct it.
-      console.warn(`[local-spawner] tool-capabilities resolve failed for agent=${agentId} (starting unrestricted): ${msg}`);
-      sessionManager.allowedToolsState = null;
+      // Fail closed: without a proven type policy, do not expose built-in or
+      // MCP tools. The next successful reload can correct it.
+      console.warn(`[local-spawner] tool-capabilities resolve failed for agent=${agentId} (starting with no tools): ${msg}`);
+      sessionManager.allowedToolsState = [];
+      sessionManager.harnessResolvedState = false;
     }
 
     // disableIdleShutdown: LocalSpawner runs AgentBox in the same process as

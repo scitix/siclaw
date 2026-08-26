@@ -215,6 +215,8 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   // its platform prompt (safety, mode, skills/knowledge context) in every entry
   // point. Match AgentBox semantics instead of replacing the full TUI template.
   systemPromptAppend: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
+  agentType: portalSnapshot?.activeAgent?.agentType ?? "sre",
+  harnessResolved: true,
   // Per-agent tool whitelist (resolved from capability groups by the snapshot).
   // Absent/null = unrestricted → agent-factory falls back to config.allowedTools.
   allowedTools: portalSnapshot?.activeAgent?.allowedTools ?? null,
