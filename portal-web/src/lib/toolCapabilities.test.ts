@@ -101,17 +101,17 @@ describe("countToolsForSelection", () => {
   })
 
   it("counts a single group's tools", () => {
-    expect(countToolsForSelection(new Set(["read_files"]))).toBe(5)
+    expect(countToolsForSelection(new Set(["read_files"]))).toBe(6)
     expect(countToolsForSelection(new Set(["scheduling"]))).toBe(1)
   })
 
   it("counts the deduped union across multiple groups", () => {
-    // read_files (5) + search_memory (2), no shared tools → 7 distinct.
-    expect(countToolsForSelection(new Set(["read_files", "search_memory"]))).toBe(7)
+    // read_files (6) + search_memory (2), no shared tools → 8 distinct.
+    expect(countToolsForSelection(new Set(["read_files", "search_memory"]))).toBe(8)
   })
 
   it("ignores unknown keys in the selection", () => {
-    expect(countToolsForSelection(new Set(["read_files", "ghost"]))).toBe(5)
+    expect(countToolsForSelection(new Set(["read_files", "ghost"]))).toBe(6)
     expect(countToolsForSelection(new Set(["ghost"]))).toBe(0)
   })
 

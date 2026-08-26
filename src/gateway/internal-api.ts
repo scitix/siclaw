@@ -25,8 +25,8 @@ import {
   hasBackgroundChannelDelivery,
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
-import { resolveCapabilities } from "../core/tool-capabilities.js";
-import { normalizeAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
+import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import { requireAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -290,8 +290,11 @@ export async function handleToolCapabilities(
     // Built-in types (sre/coordinator/knowledge_qa) LOCK the capability set; custom uses the
     // agent's own tool_capabilities. resolveCapabilities(null/[]) === null keeps
     // the backward-compatible "unrestricted" default for custom with no selection.
-    const agentType = normalizeAgentType(agent?.agent_type);
-    const capsKeys = effectiveCapabilityKeys(agentType, (agent?.tool_capabilities ?? null) as string[] | null);
+    const agentType = requireAgentType(agent?.agent_type);
+    const capsKeys = effectiveCapabilityKeys(
+      agentType,
+      parseToolCapabilitiesAtBoundary(agent?.tool_capabilities),
+    );
     const allowedTools = resolveCapabilities(capsKeys);
     // agentType rides along for capabilities and legacy-row prompt fallback.
     sendJson(res, 200, { allowedTools, agentType });

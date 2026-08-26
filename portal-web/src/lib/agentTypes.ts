@@ -39,7 +39,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   {
     key: "custom",
     label: "Custom Agent",
-    description: "Free-form built-in capabilities in standalone Portal; integrations that omit a selection retain legacy unrestricted compatibility.",
+    description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
     capabilities: null,
     defaultNoSkills: false,
   },

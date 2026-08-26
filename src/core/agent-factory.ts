@@ -26,6 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
+import { createKnowledgeIndexer } from "../knowledge/indexer.js";
 import { ToolRegistry, type AgentMode } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -89,10 +90,14 @@ export interface CreateSiclawSessionOpts {
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
+  /** Pre-initialized hybrid index over this Agent's mounted knowledge pages. */
+  knowledgeIndexer?: MemoryIndexer;
   /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
   mcpManager?: McpClientManager;
   /** Pre-resolved MCP tools from shared mcpManager — avoids re-discovery */
   mcpTools?: ToolDefinition[];
+  /** Agent-scoped configured MCP servers. Empty is authoritative; undefined uses pod/standalone config. */
+  mcpServers?: Record<string, unknown>;
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
   /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
@@ -172,6 +177,7 @@ export interface SiclawSessionResult {
   /** MCP client manager — call shutdown() on session close */
   mcpManager?: McpClientManager;
   memoryIndexer?: MemoryIndexer;
+  knowledgeIndexer?: MemoryIndexer;
   /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
@@ -454,6 +460,28 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Memory disabled by Agent harness or SICLAW_MEMORY_ENABLED`);
   }
 
+  // Knowledge retrieval is independent from investigation memory. Its index is
+  // always available (FTS-only without embeddings) and is scoped by the exact
+  // mounted knowledgeDir. AgentBox passes a shared instance; standalone TUI
+  // owns this fallback instance for its single session.
+  let knowledgeIndexer = opts?.knowledgeIndexer;
+  if (!knowledgeIndexer) {
+    let candidate: MemoryIndexer | undefined;
+    try {
+      candidate = createKnowledgeIndexer(
+        knowledgeDir,
+        path.join(userDataDir, "knowledge-index"),
+        resolveEmbeddingConfig(),
+      );
+      await candidate.sync();
+      knowledgeIndexer = candidate;
+    } catch (err) {
+      try { candidate?.close(); } catch { /* ignore cleanup failure */ }
+      knowledgeIndexer = undefined;
+      console.warn("[agent-factory] Knowledge index init failed; Read/Grep/Find remain available:", err);
+    }
+  }
+
   // ── Tool Registry: declarative resolution ──
   const registry = new ToolRegistry();
   registry.register(...allToolEntries);
@@ -468,6 +496,7 @@ export async function createSiclawSession(
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
+      knowledgeIndexer,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       knowledgeCitationTool: citationSupport?.tool,
@@ -508,7 +537,7 @@ export async function createSiclawSession(
   let mcpManager: McpClientManager | undefined = exposeConfiguredMcp
     ? opts?.mcpManager
     : undefined;
-  const mcpServers = exposeConfiguredMcp ? config.mcpServers : {};
+  const mcpServers = exposeConfiguredMcp ? (opts?.mcpServers ?? config.mcpServers) : {};
   let mcpTools: ToolDefinition[] = [];
   if (mcpManager) {
     const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
@@ -864,5 +893,5 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef };
+  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer, sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef };
 }

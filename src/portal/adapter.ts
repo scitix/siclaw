@@ -19,6 +19,7 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
+import { parseToolCapabilitiesAtBoundary } from "../core/tool-capabilities.js";
 import type { TracingConfig } from "../core/config.js";
 import { assembleExporterHeaders, type ExporterAuth } from "./tracing-exporters.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
@@ -2141,10 +2142,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // restriction). Parsed defensively across the three JSON-column states
       // (legacy MySQL JSON, new MySQL TEXT, SQLite TEXT). The Gateway resolves
       // these group keys → concrete allowedTools at its boundary.
-      tool_capabilities: safeParseJson<string[] | null>(agent.tool_capabilities, null),
+      tool_capabilities: parseToolCapabilitiesAtBoundary(agent.tool_capabilities),
       // Agent type (sre/coordinator/knowledge_qa/custom). Built-in types lock capabilities;
       // system_prompt is the editable instruction for every type.
-      agent_type: agent.agent_type ?? "custom",
+      agent_type: agent.agent_type,
     };
   });
 

@@ -37,6 +37,10 @@ interface McpPayload {
   mcpServers: Record<string, unknown>;
 }
 
+export interface McpStateTarget {
+  mcpServersState?: Record<string, unknown>;
+}
+
 /** Apply the shared immutable-session invalidation contract consistently. */
 function invalidateSessions(context: ReloadContext): void {
   if (!context.sessions?.length) return;
@@ -82,6 +86,38 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
     invalidateSessions(context);
   },
 };
+
+/**
+ * Per-AgentBox MCP handler for multi-Agent LocalSpawner mode.
+ *
+ * The default mcpHandler persists pod-local settings, which is safe when one
+ * process serves one Agent. Local mode hosts many Agents in one process, so
+ * its configured MCP set must live on that Agent's SessionManager instead.
+ */
+export function createMcpHandler(
+  target: McpStateTarget,
+  boxClient: GatewaySyncClientLike | null,
+): AgentBoxSyncHandler<McpPayload> {
+  return {
+    type: "mcp",
+    async fetch(client): Promise<McpPayload> {
+      const c = boxClient ?? client;
+      if (!c) throw new Error("[mcp] GatewaySyncClientLike required but missing");
+      return await c.request(GATEWAY_SYNC_DESCRIPTORS.mcp.gatewayPath, "GET") as McpPayload;
+    },
+    async materialize(payload): Promise<number> {
+      const servers = payload?.mcpServers;
+      if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+        throw new Error("[mcp] Invalid MCP payload");
+      }
+      target.mcpServersState = { ...servers };
+      return Object.keys(servers).length;
+    },
+    async postReload(context): Promise<void> {
+      invalidateSessions(context);
+    },
+  };
+}
 
 // ── Prompt handler ───────────────────────────────────────────────────
 
@@ -186,19 +222,29 @@ interface SkillBundlePayload {
   }>;
 }
 
-export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
-  type: "skills",
+export function createSkillsHandler(
+  options: {
+    skillsDir?: string;
+    preserveExistingOnEmpty?: boolean;
+    boxClient?: GatewaySyncClientLike | null;
+  } = {},
+): AgentBoxSyncHandler<SkillBundlePayload> {
+  return {
+    type: "skills",
 
-  async fetch(client: GatewaySyncClientLike | null): Promise<SkillBundlePayload> {
-    if (!client) throw new Error("[skills] GatewaySyncClientLike required but missing");
-    const descriptor = GATEWAY_SYNC_DESCRIPTORS.skills;
-    const data = await client.request(descriptor.gatewayPath, "GET");
-    return data as SkillBundlePayload;
-  },
+    async fetch(client: GatewaySyncClientLike | null): Promise<SkillBundlePayload> {
+      const c = options.boxClient ?? client;
+      if (!c) throw new Error("[skills] GatewaySyncClientLike required but missing");
+      const descriptor = GATEWAY_SYNC_DESCRIPTORS.skills;
+      const data = await c.request(descriptor.gatewayPath, "GET");
+      return data as SkillBundlePayload;
+    },
 
-  async materialize(payload: SkillBundlePayload): Promise<number> {
-    const config = loadConfig();
-    const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
+    async materialize(payload: SkillBundlePayload): Promise<number> {
+      const config = loadConfig();
+      const skillsDir = options.skillsDir
+        ? path.resolve(options.skillsDir)
+        : path.resolve(process.cwd(), config.paths.skillsDir);
 
     // Build a flat unified "resolved/" directory with priority-based merging:
     //   global > builtin
@@ -213,7 +259,7 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
     // Legitimate "unbind-all" admin operations can force a fresh wipe by
     // restarting the pod — which is cheap and explicit.
     const incomingCount = Array.isArray(payload?.skills) ? payload.skills.length : 0;
-    if (incomingCount === 0 && fs.existsSync(resolvedDir)) {
+    if (options.preserveExistingOnEmpty !== false && incomingCount === 0 && fs.existsSync(resolvedDir)) {
       const existing = fs.readdirSync(resolvedDir).filter((name) => {
         try { return fs.statSync(path.join(resolvedDir, name)).isDirectory(); }
         catch { return false; }
@@ -267,22 +313,25 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
     }
 
     return seen.size;
-  },
+    },
 
-  async postReload(context: ReloadContext): Promise<void> {
-    if (!context.sessions?.length) return;
+    async postReload(context: ReloadContext): Promise<void> {
+      if (!context.sessions?.length) return;
 
-    for (const session of context.sessions) {
-      try {
-        await session.brain.reload();
-        console.log(`[resource-sync] Skills reloaded for session ${session.id}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[resource-sync] Failed to reload skills for session ${session.id}: ${msg}`);
+      for (const session of context.sessions) {
+        try {
+          await session.brain.reload();
+          console.log(`[resource-sync] Skills reloaded for session ${session.id}`);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[resource-sync] Failed to reload skills for session ${session.id}: ${msg}`);
+        }
       }
-    }
-  },
-};
+    },
+  };
+}
+
+export const skillsHandler = createSkillsHandler();
 
 // ── Knowledge handler ─────────────────────────────────────────────────
 
@@ -443,7 +492,11 @@ export function readBoxSyncStatus(
 }
 
 export function createKnowledgeHandler(
-  options: { knowledgeDir?: string } = {},
+  options: {
+    knowledgeDir?: string;
+    afterMaterialize?: () => void | Promise<void>;
+    boxClient?: GatewaySyncClientLike | null;
+  } = {},
 ): KnowledgeSyncHandler {
   let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
 
@@ -455,9 +508,10 @@ export function createKnowledgeHandler(
     },
 
     async fetch(client: GatewaySyncClientLike | null): Promise<KnowledgeBundlePayload> {
-      if (!client) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
+      const c = options.boxClient ?? client;
+      if (!c) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
       const descriptor = GATEWAY_SYNC_DESCRIPTORS.knowledge;
-      const data = await client.request(descriptor.gatewayPath, "GET");
+      const data = await c.request(descriptor.gatewayPath, "GET");
       return data as KnowledgeBundlePayload;
     },
 
@@ -481,6 +535,7 @@ export function createKnowledgeHandler(
         }
       }
       lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: 0, repos: [] };
+      await options.afterMaterialize?.();
       return 0;
     }
 
@@ -551,14 +606,10 @@ export function createKnowledgeHandler(
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
           citationRepos.push({ id: repo.id, root: `repos/${dirName}`, sources: repo.citationSources ?? [] });
-          // This line is the whole of what the agent knows about a library
-          // before deciding to open it: the catalog goes into the system prompt,
-          // there is no search tool, and everything else costs a Read of that
-          // library's own index. A name routes only when it happens to carry the
-          // field ("集群运维知识库"); "sre通用知识库" leaves the agent opening
-          // libraries one at a time to find out. The domain is what makes the
-          // line answerable — and the directory can't help, since an all-CJK
-          // name sanitizes to `repo--<hash>`.
+          // This line is the cheap routing surface injected into the prompt.
+          // knowledge_search can retrieve across every mounted page when the
+          // label is insufficient, while the domain still avoids unnecessary
+          // searches and library-by-library index reads.
           const displayName = catalogNameLine(repo.name);
           const domain = catalogDomainLine(repo.consumerDomain);
           indexLines.push(
@@ -586,6 +637,7 @@ export function createKnowledgeHandler(
         JSON.stringify({ version: 1, repos: citationRepos }, null, 2) + "\n");
       await replaceDirectoryContentsFromStaging(knowledgeDir, stagingDir);
       lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: syncedRepos.length, repos: syncedRepos };
+      await options.afterMaterialize?.();
       return repos.length;
     } catch (err) {
       fs.rmSync(stagingDir, { recursive: true, force: true });
@@ -720,7 +772,8 @@ export function createToolsHandler(
       const allowed = payload?.allowedTools;
       if ((allowed !== null &&
           (!Array.isArray(allowed) || allowed.some((name) => typeof name !== "string"))) ||
-          !VALID_AGENT_TYPES.has(payload?.agentType)) {
+          !VALID_AGENT_TYPES.has(payload?.agentType) ||
+          (allowed === null && payload?.agentType !== "custom")) {
         throw new Error("[tools] Invalid tool-capabilities payload");
       }
       target.allowedToolsState = allowed;

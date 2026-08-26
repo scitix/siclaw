@@ -25,8 +25,9 @@ prompt guidance. In particular:
 - SRE, and Custom Agents that selected discovery tools, get infrastructure
   guidance; QA/Coordinator do not;
 - planning and sub-agent guidance appear only when their tools are allowed;
-- QA knowledge catalog text asks for evidence synthesis and never suggests
-  shell checks;
+- QA uses the catalog for cheap routing, `knowledge_search` for hybrid
+  semantic/keyword retrieval, Grep/Find as exact-text fallback, Read for full
+  pages, and `knowledge_cite` for adopted sources; it never suggests shell checks;
 - QA/Coordinator do not inherit repo-bundled or user-global operational skills,
   but they still receive skills, knowledge, and MCP explicitly configured for
   that Agent;
@@ -41,13 +42,14 @@ The final model context has two independent availability axes:
 |---|---|---|
 | SRE | infrastructure, commands, scripts, files, memory, planning and sub-agents | skills, knowledge and MCP |
 | Coordinator | files and delegation; no own `cluster_list` / `host_list` | knowledge/skills for answering and routing, plus MCP for an attached resource-locator helper |
-| Knowledge QA | read-only file/search tools | knowledge, knowledge skills and query MCP |
-| Custom | standalone Portal selection, or legacy unrestricted built-ins when an integration supplies no selection | skills, knowledge and MCP |
+| Knowledge QA | `knowledge_search`, Grep/Find, Read and `knowledge_cite` | knowledge, explicitly bound skills and query/visual MCP |
+| Custom | standalone Portal selection, or legacy unrestricted built-ins only when type `custom` is explicitly resolved with no selection | skills, knowledge and MCP |
 
 `allowedTools` controls the first axis. It does not classify dynamic MCP tool
-names. In scoped AgentBox/Portal sessions, the MCP config already contains the
-Agent's resolved bindings; in standalone mode it is the user's explicit
-`settings.json` configuration. The current MCP payload carries neither a
+names. In scoped AgentBox/Portal sessions, the MCP config contains only the
+Agent's resolved bindings. LocalSpawner keeps it in per-Agent SessionManager
+state rather than process-global settings; in standalone mode it is the user's
+explicit `settings.json` configuration. The current MCP payload carries neither a
 trustworthy read/write classification nor binding-source provenance, so Siclaw
 must not guess from a server or tool name. An SRE MCP bound to a QA Agent would
 therefore still put its tool descriptions in model context; preventing that is
@@ -61,10 +63,9 @@ only one confirmed Siclaw binding may then be passed to `list_delegates` with
 `binding_name_confirmed=true`.
 
 `custom` plus a successfully resolved null capability selection retains the
-legacy unrestricted built-in behavior. Standalone Portal can persist an
-operator selection; integrated control planes that omit `tool_capabilities`
-use the compatibility path. This state is explicit in the harness, so an
-unresolved lookup never falls into it.
+legacy unrestricted built-in behavior. The permission boundary requires an
+explicit supported `agent_type`; a missing/unknown type, missing row, malformed
+capability value, or failed lookup stays unresolved and fail-closed.
 
 The same contract applies in AgentBox sessions and the Portal-backed TUI.
 Persisted prompt fragments retain the legacy template conveniences:

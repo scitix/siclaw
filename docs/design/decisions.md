@@ -55,8 +55,8 @@ LocalSpawner runs AgentBox HTTP servers in-process, one per user, on ports 4000+
 **Consequences**:
 - ✅ Fast spin-up (no process fork overhead)
 - ✅ Easy to debug (single process, single debugger session)
-- ✅ Shared memory allows direct in-process resource sync (no HTTP round-trips)
-- ⚠️ All users share the same filesystem — components designed for K8s pod isolation CANNOT be directly reused (e.g., `skillsHandler.materialize()`)
+- ✅ Per-Agent SessionManager state allows isolated MCP bindings without writing process-global settings
+- ⚠️ All Agents share the same filesystem — LocalSpawner uses Agent-scoped Knowledge/Skill targets and factory-bound handlers; process-global `skillsHandler.materialize()` remains forbidden
 - ⚠️ A crash in one user's session affects all users
 - ❌ Not a multi-tenant production model — use K8sSpawner for that
 
@@ -82,7 +82,7 @@ Bundles contain **only global + skillset (dev only) + personal skills**. Core sk
 - ✅ Bundle requests are small and fast (no large static skill content)
 - ✅ Core skills are versioned with the code, not the database
 - ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
-- ⚠️ In local mode, `materialize()` wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem — see ADR-002 for why local mode cannot safely call `materialize()`
+- ⚠️ In local mode, only the scoped `createSkillsHandler()` may materialize a bundle, under `.siclaw/skills/agents/<agentId>/`; the process-global handler remains unsafe
 - ⚠️ If a user disables a core skill, the `disabledBuiltins` list in the bundle tells AgentBox which core skills to skip
 - ⚠️ Skillset skills are dev-only — untested collaborative work cannot reach production without promotion to global
 
@@ -650,6 +650,12 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 - ✅ QA cold starts without SRE cluster-binding or shell guidance.
 - ✅ Prompt claims and model-visible tools/skills derive from one policy.
 - ✅ Capability-sync failure cannot silently become an unrestricted session.
+- ✅ Knowledge QA has a first-class hybrid search → exact fallback → full Read
+  → citation retrieval stack rather than depending only on catalog titles.
+- ✅ LocalSpawner materializes explicitly bound Skills and MCP per Agent before
+  the first prompt, without leaking process-global SRE resources into QA.
+- ✅ Domain-neutral state-change confirmation rules apply even when a QA or
+  Coordinator is explicitly bound to an effectful MCP.
 - ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
 - ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
   skills; required skills must be explicitly bound.

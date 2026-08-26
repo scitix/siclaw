@@ -50,6 +50,7 @@ import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
+import { createKnowledgeIndexer } from "../knowledge/indexer.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
@@ -157,6 +158,8 @@ export interface ManagedSession {
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
+  /** Knowledge indexer — shared at AgentBox level and scoped to this Agent's mount. */
+  knowledgeIndexer?: MemoryIndexer;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
   /**
@@ -359,6 +362,12 @@ export class AgentBoxSessionManager {
    */
   knowledgeDir?: string;
 
+  /** Agent-scoped skills base directory; LocalSpawner materializes into resolved/. */
+  skillsDir?: string;
+
+  /** Agent-scoped MCP bindings. Undefined keeps pod/standalone config compatibility. */
+  mcpServersState?: Record<string, unknown>;
+
   /**
    * Per-agent tool capability whitelist — the resolved `allowedTools` list for
    * this AgentBox's agent (see core/tool-capabilities.ts).
@@ -396,6 +405,7 @@ export class AgentBoxSessionManager {
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
+  private _sharedKnowledgeIndexer: MemoryIndexer | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
 
@@ -453,6 +463,24 @@ export class AgentBoxSessionManager {
     return indexer;
   }
 
+  private async createSharedKnowledgeIndexer(): Promise<MemoryIndexer> {
+    const config = loadConfig();
+    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
+    const knowledgeDir = this.knowledgeDir ?? path.resolve(process.cwd(), config.paths.knowledgeDir);
+    const indexer = createKnowledgeIndexer(
+      knowledgeDir,
+      path.join(userDataDir, "knowledge-index"),
+      getEmbeddingConfig() ?? undefined,
+    );
+    await indexer.sync();
+    return indexer;
+  }
+
+  /** Reconcile search immediately after an Agent knowledge bundle changes. */
+  async syncKnowledgeIndex(): Promise<void> {
+    await this._sharedKnowledgeIndexer?.sync();
+  }
+
   /**
    * Lazily initialize shared components (memory indexer, MCP manager).
    * Called on first getOrCreate(). Idempotent.
@@ -460,6 +488,14 @@ export class AgentBoxSessionManager {
   private async ensureSharedComponents(): Promise<void> {
     if (this._sharedInitialized) return;
     this._sharedInitialized = true;
+
+    try {
+      this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
+      console.log(`[agentbox-session] Shared knowledge indexer initialized`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Shared knowledge indexer init failed:`, err);
+      this._sharedKnowledgeIndexer = null;
+    }
 
     if (!isMemoryEnabled()) {
       this._sharedMemoryIndexer = null;
@@ -2231,9 +2267,12 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: "web",
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: request.userId,
       agentId,
       knowledgeDir: this.knowledgeDir,
+      portalSkillsDir: this.skillsDir ? path.join(this.skillsDir, "resolved") : undefined,
+      mcpServers: this.mcpServersState,
       agentType: normalizeAgentType(this.agentTypeState),
       harnessResolved: this.harnessResolvedState,
       // A spawned sub-agent must never be broader than its parent: inherit the
@@ -2806,9 +2845,12 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: effectiveUserId,
       agentId: this.agentId ?? null,
       knowledgeDir: this.knowledgeDir,
+      portalSkillsDir: this.skillsDir ? path.join(this.skillsDir, "resolved") : undefined,
+      mcpServers: this.mcpServersState,
       agentType: normalizeAgentType(this.agentTypeState),
       harnessResolved: this.harnessResolvedState,
       // Per-agent tool capability whitelist. null = unrestricted (falls back to
@@ -2882,6 +2924,7 @@ export class AgentBoxSessionManager {
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
+      knowledgeIndexer: result.knowledgeIndexer,
       dpStateRef: result.dpStateRef,
       turnRef: result.turnRef,
       _lastSavedMessageCount: 0,
@@ -3443,6 +3486,17 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] Shared memory indexer close error:`, err);
       }
       this._sharedMemoryIndexer = null;
+    }
+
+    if (this._sharedKnowledgeIndexer) {
+      try {
+        await this._sharedKnowledgeIndexer.sync();
+        this._sharedKnowledgeIndexer.close();
+        console.log(`[agentbox-session] Shared knowledge indexer closed`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared knowledge indexer close error:`, err);
+      }
+      this._sharedKnowledgeIndexer = null;
     }
 
     this._sharedInitialized = false;

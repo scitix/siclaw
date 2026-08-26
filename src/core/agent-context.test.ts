@@ -53,7 +53,7 @@ describe("compileAgentContext", () => {
   it("gives Knowledge QA a role-clean prompt with no SRE or memory guidance", () => {
     const context = compileAgentContext({
       agentType: "knowledge_qa",
-      allowedTools: ["read", "grep", "find", "ls", "knowledge_cite"],
+      allowedTools: ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"],
       memoryConfigured: true,
       mode: "channel",
     });
@@ -66,6 +66,7 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("task_create");
     expect(context.systemPrompt).not.toContain("spawn_subagent");
     expect(context.systemPrompt).not.toContain("delete/evict/cordon");
+    expect(context.systemPrompt).toContain("knowledge_search");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
     expect(context.harness.includeBundledSkills).toBe(false);
     expect(context.harness.mcpExposure).toBe("configured");

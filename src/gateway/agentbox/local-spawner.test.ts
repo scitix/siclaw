@@ -95,7 +95,7 @@ beforeEach(() => {
   syncResourceMock.mockClear();
   createHttpServerMock.mockReset().mockImplementation(createFakeHttpServer);
   // Default: agent has no tool_capabilities row value → unrestricted.
-  dbQueryImpl = async () => [[{ tool_capabilities: null }], undefined];
+  dbQueryImpl = async () => [[{ tool_capabilities: null, agent_type: "custom" }], undefined];
 
   origCwd = process.cwd();
   tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "local-spawner-")));
@@ -145,8 +145,9 @@ describe("LocalSpawner — spawn (happy path)", () => {
     expect(boxA.sessionManager.knowledgeDir).toBe(path.join(tmpDir, ".siclaw", "knowledge", "a1"));
     expect(boxB.sessionManager.knowledgeDir).toBe(path.join(tmpDir, ".siclaw", "knowledge", "a2"));
 
-    await vi.waitFor(() => expect(syncResourceMock).toHaveBeenCalledTimes(2));
-    const agentBHandler = syncResourceMock.mock.calls[1][2];
+    expect(syncResourceMock).toHaveBeenCalledTimes(6);
+    const knowledgeCalls = syncResourceMock.mock.calls.filter(([type]) => type === "knowledge");
+    const agentBHandler = knowledgeCalls[1][2];
 
     fs.mkdirSync(boxA.sessionManager.knowledgeDir, { recursive: true });
     fs.mkdirSync(boxB.sessionManager.knowledgeDir, { recursive: true });
@@ -162,8 +163,8 @@ describe("LocalSpawner — spawn (happy path)", () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     await spawner.spawn({ agentId: "a1" });
 
-    await vi.waitFor(() => expect(syncResourceMock).toHaveBeenCalledTimes(1));
-    const initialSyncHandler = syncResourceMock.mock.calls[0][2];
+    expect(syncResourceMock).toHaveBeenCalledTimes(3);
+    const initialSyncHandler = syncResourceMock.mock.calls.find(([type]) => type === "knowledge")![2];
     expect(createHttpServerMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -171,6 +172,26 @@ describe("LocalSpawner — spawn (happy path)", () => {
         knowledgeHandler: initialSyncHandler,
       }),
     );
+  });
+
+  it("scopes skills and MCP per Agent and wires the same handlers into reloads", async () => {
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    await spawner.spawn({ agentId: "a1" });
+    await spawner.spawn({ agentId: "a2" });
+
+    const boxA = (spawner as any).boxes.get("local-a1");
+    const boxB = (spawner as any).boxes.get("local-a2");
+    expect(boxA.sessionManager.skillsDir).toContain(path.join(".siclaw", "skills", "agents", "a1"));
+    expect(boxB.sessionManager.skillsDir).toContain(path.join(".siclaw", "skills", "agents", "a2"));
+    expect(boxA.sessionManager.skillsDir).not.toBe(boxB.sessionManager.skillsDir);
+    expect(boxA.sessionManager.mcpServersState).toEqual({});
+    expect(boxB.sessionManager.mcpServersState).toEqual({});
+
+    const aHttpOptions = createHttpServerMock.mock.calls[0][1];
+    const aSkillSync = syncResourceMock.mock.calls.find(([type]) => type === "skills")![2];
+    const aMcpSync = syncResourceMock.mock.calls.find(([type]) => type === "mcp")![2];
+    expect(aHttpOptions.skillsHandler).toBe(aSkillSync);
+    expect(aHttpOptions.mcpHandler).toBe(aMcpSync);
   });
 
   it("returns the existing handle on a second spawn for the same agent (idempotent)", async () => {
@@ -251,18 +272,18 @@ describe("LocalSpawner — tool-capabilities injection", () => {
   it("resolves a restricted agent's capabilities into allowedToolsState at spawn", async () => {
     dbQueryImpl = async (_sql, params) => {
       expect(params).toEqual(["a1"]);
-      return [[{ tool_capabilities: JSON.stringify(["read_files", "search_memory"]) }], undefined];
+      return [[{ tool_capabilities: JSON.stringify(["read_files", "search_memory"]), agent_type: "custom" }], undefined];
     };
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_cite", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
     );
   });
 
   it("leaves allowedToolsState null for an agent with no selection (unrestricted)", async () => {
-    dbQueryImpl = async () => [[{ tool_capabilities: null }], undefined];
+    dbQueryImpl = async () => [[{ tool_capabilities: null, agent_type: "custom" }], undefined];
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
@@ -271,6 +292,19 @@ describe("LocalSpawner — tool-capabilities injection", () => {
 
   it("fails closed when the DB lookup throws", async () => {
     dbQueryImpl = async () => { throw new Error("db down"); };
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    const handle = await spawner.spawn({ agentId: "a1" });
+    const box = (spawner as any).boxes.get(handle.boxId);
+    expect(box.sessionManager.allowedToolsState).toEqual([]);
+    expect(box.sessionManager.harnessResolvedState).toBe(false);
+  });
+
+  it.each([
+    ["the agent row is missing", []],
+    ["agent_type is unknown", [{ tool_capabilities: null, agent_type: "future_type" }]],
+    ["tool_capabilities JSON is malformed", [{ tool_capabilities: "not-json", agent_type: "custom" }]],
+  ])("fails closed when %s", async (_label, rows) => {
+    dbQueryImpl = async () => [rows, undefined] as any;
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
@@ -307,7 +341,7 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_cite"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]),
     );
     expect(box.sessionManager.agentTypeState).toBe("custom");
   });
@@ -324,7 +358,8 @@ describe("LocalSpawner — invariant §1: never calls skillsHandler.materialize"
     // The skillsHandler module itself isn't imported here either, but we
     // express the invariant in the narrowest form the guard cares about.
     expect(src).not.toMatch(/skillsHandler\s*\.\s*materialize/);
-    // Defense-in-depth: skillsHandler should not be imported at all.
-    expect(src).not.toMatch(/skillsHandler/);
+    // Defense-in-depth: the process-global singleton must not be imported.
+    expect(src).not.toMatch(/\bskillsHandler\b[^,}]*from\s+["'][^"']*sync-handlers/);
+    expect(src).toContain("createSkillsHandler");
   });
 });

@@ -21,11 +21,11 @@ import { registration as hostScript } from "./script-exec/host-script.js";
 import { registration as clusterList } from "./query/cluster-list.js";
 import { registration as k8sInspect } from "./query/k8s-inspect.js";
 import { registration as hostList } from "./query/host-list.js";
-// knowledge_search removed — replaced by LLM Wiki (Read tool + .siclaw/knowledge/)
 // resolve_pod_netns removed — node_exec/pod_exec/*_script auto-resolve pod→netns
 // internally via pod= (shared pod-netns-resolve.ts); the standalone tool was redundant.
 import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
+import { registration as knowledgeSearch } from "./query/knowledge-search.js";
 import { registration as knowledgeCite } from "./query/knowledge-cite.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
 // end_investigation removed as part of the DP state-machine teardown
@@ -54,7 +54,7 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
   clusterList, hostList, k8sInspect,
-  memorySearch, memoryGet, knowledgeCite,
+  memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, reportFindings, requestInput,

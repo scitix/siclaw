@@ -115,7 +115,8 @@ export const KNOWLEDGE_QA_DEFAULT_PROMPT =
   "an accurate, complete, and clear answer. Treat the bound knowledge bases as the primary source of truth " +
   "for factual claims. You may summarize, compare, and reason from their contents, but do not fill gaps with " +
   "unsupported model knowledge. Before answering, identify the relevant subject, entity, time, version, " +
-  "environment, and scope. Search with alternative terms, names, and versions when useful; do not stop at the " +
+  "environment, and scope. Use `knowledge_search` before answering from mounted knowledge, and search with " +
+  "alternative terms, names, and versions when useful; do not stop at the " +
   "first relevant result. Check for newer, superseding, deprecated, or differently scoped material. Prefer " +
   "sources that are authoritative, current, and applicable, while recognizing that newer material is not " +
   "automatically more applicable. If sources conflict, continue searching for version or scope differences; " +
@@ -159,7 +160,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   },
   custom: {
     label: "Custom Agent",
-    description: "Free-form built-in capabilities in standalone Portal; integrations that omit a selection retain legacy unrestricted compatibility.",
+    description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
     capabilities: null,
     defaultPrompt: null,
     defaultNoSkills: false,
@@ -169,6 +170,20 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
 /** Normalize an unknown stored value to a valid AgentType (default custom). */
 export function normalizeAgentType(v: unknown): AgentType {
   return v === "sre" || v === "coordinator" || v === "knowledge_qa" ? v : "custom";
+}
+
+/**
+ * Parse an agent type at an authorization boundary.
+ *
+ * Unlike normalizeAgentType(), this must never turn missing or future values
+ * into the legacy unrestricted Custom harness. Callers that decide which
+ * tools enter a model session must fail closed when provenance is absent.
+ */
+export function requireAgentType(v: unknown): AgentType {
+  if (v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "custom") {
+    return v;
+  }
+  throw new Error(`Invalid or missing agent_type: ${String(v)}`);
 }
 
 /**

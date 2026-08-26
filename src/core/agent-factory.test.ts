@@ -34,6 +34,7 @@ describe("agent-factory", () => {
   it("keeps configured MCP as a resolved resource axis, not a built-in capability name filter", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "agent-factory.ts"), "utf8");
     expect(source).toContain('compiledContext.harness.mcpExposure === "configured"');
+    expect(source).toMatch(/opts\?\.mcpServers\s*\?\?\s*config\.mcpServers/);
     expect(source).toContain("customTools.push(...mcpTools)");
     expect(source).not.toContain("appendAllowedTools(customTools, mcpTools");
   });

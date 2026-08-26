@@ -294,7 +294,10 @@ describe("buildKnowledgeWikiCatalog", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("there is no search tool");
+    expect(out).toContain("Use `knowledge_search` first");
+    expect(out).toContain("alternative terms");
+    expect(out).toContain("Grep/Find");
+    expect(out).not.toContain("there is no search tool");
     expect(out).toContain("[RoCE modes](network/roce-modes.md)");
     expect(out).toContain("[[gpu-xid]]");
     expect(out).toContain("relative to the current page's directory");

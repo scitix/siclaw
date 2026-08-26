@@ -30,9 +30,8 @@ import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
-import { safeParseJson } from "../gateway/dialect-helpers.js";
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
-import { resolveCapabilities } from "../core/tool-capabilities.js";
+import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
   CliSnapshotClusterCredential,
@@ -48,7 +47,7 @@ import { resolveSnapshotModelRouting } from "./model-routing-config.js";
 import {
   effectiveAgentPrompt,
   effectiveCapabilityKeys,
-  normalizeAgentType,
+  requireAgentType,
 } from "../core/agent-types.js";
 
 export type {
@@ -543,11 +542,11 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // boundary (the AgentBox/TUI stays oblivious to group keys). null/empty =
     // unrestricted; we only emit the field when non-null to keep the payload
     // compact (TUI treats absent as null).
-    const activeAgentType = activeAgent ? normalizeAgentType(activeAgent.agent_type) : null;
+    const activeAgentType = activeAgent ? requireAgentType(activeAgent.agent_type) : null;
     const allowedToolsOut = activeAgent && activeAgentType
       ? resolveCapabilities(effectiveCapabilityKeys(
           activeAgentType,
-          safeParseJson<string[] | null>(activeAgent.tool_capabilities, null),
+          parseToolCapabilitiesAtBoundary(activeAgent.tool_capabilities),
         ))
       : null;
 

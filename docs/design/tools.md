@@ -550,6 +550,7 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
+| `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
 
 ### allowedTools — Built-in and File-Tool Availability Axis
 
@@ -561,7 +562,9 @@ discovered dynamically and cannot be enumerated in static capability groups.
 
 **Per-agent source**: `allowedTools` is resolved from the agent's selected
 capability groups (`agents.tool_capabilities`) at the Gateway boundary
-(`resolveCapabilities`); null/empty selection → `null` = unrestricted. Every tool
+(`resolveCapabilities`). Built-in Agent types use locked groups. Only an
+explicitly resolved `custom` type with null/empty selection becomes `null` =
+unrestricted. Every tool
 in the registry must belong to some `CAPABILITY_GROUPS` entry, otherwise a
 restricted agent can never reach it — enforced by `tool-capabilities-coverage.test.ts`.
 
@@ -596,6 +599,23 @@ are intentionally different:
 - **File I/O tools** (read/edit/write/grep/find/ls) are framework tools with
   path-restricted operations injection. `appendAllowedTools()` applies the same
   name whitelist as `ToolRegistry.resolve()`.
+
+### Knowledge Q&A retrieval stack
+
+`read_files` is a retrieval capability group, not only filesystem access:
+
+1. `knowledge_search` queries an Agent-scoped `MemoryIndexer` over mounted
+   Markdown using hybrid semantic + FTS ranking. FTS-only remains functional
+   when embeddings are unavailable.
+2. `grep` / `find` provide exact-text and filename fallback for identifiers,
+   versions, aliases, and terms absent from embeddings.
+3. `read` loads the complete selected page before synthesis.
+4. `knowledge_cite` emits citations only for manifest-backed pages actually
+   read during the current turn.
+
+The injected catalog remains a cheap navigation hint; it is not the only
+recall surface. Knowledge materialization explicitly resyncs the index, and
+the index database lives outside the atomically replaced knowledge mount.
 
 MCP server descriptions become part of the corresponding model-visible tool
 descriptions. The current config contract has no read/write classification or

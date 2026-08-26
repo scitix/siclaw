@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { buildSreSystemPrompt, renderSystemPromptFragment } from "./prompt.js";
+import { buildSreSystemPrompt, buildSystemPrompt, renderSystemPromptFragment } from "./prompt.js";
 
 const ORIGINAL_MEMORY_ENABLED = process.env.SICLAW_MEMORY_ENABLED;
 
@@ -93,6 +93,35 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     expect(prompt).toContain("Do not force details from a previous incident into the new answer");
     expect(prompt).not.toContain("may render a fallback image");
     expect(prompt).not.toContain("readable fallback source");
+  });
+});
+
+describe("buildSystemPrompt safety composition", () => {
+  const neutralInput = {
+    mode: "web" as const,
+    memoryEnabled: false,
+    includeInfrastructureGuidance: false,
+    includeOperationalSafety: false,
+    includeSkillAuthoring: false,
+    includePlanningGuidance: false,
+    includeSubagentGuidance: false,
+  };
+
+  it("always includes domain-neutral safety for state-changing tools", () => {
+    const prompt = buildSystemPrompt(neutralInput);
+
+    expect(prompt).toContain("change external state only when the user explicitly asks");
+    expect(prompt).toContain("target, impact, and blast radius");
+    expect(prompt).toContain("explicit confirmation");
+    expect(prompt).not.toContain("delete/evict/cordon");
+  });
+
+  it("adds infrastructure-specific operational safety only when compiled for that harness", () => {
+    const neutral = buildSystemPrompt(neutralInput);
+    const operational = buildSystemPrompt({ ...neutralInput, includeOperationalSafety: true });
+
+    expect(neutral).not.toContain("delete/evict/cordon");
+    expect(operational).toContain("delete/evict/cordon");
   });
 });
 

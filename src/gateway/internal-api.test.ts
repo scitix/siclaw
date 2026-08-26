@@ -204,20 +204,20 @@ describe("handleMcpServers", () => {
 
 describe("handleToolCapabilities", () => {
   it("resolves the agent's capability groups to a concrete allowedTools list", async () => {
-    frontend.responses.set("config.getAgent", { tool_capabilities: ["read_files", "search_memory"] });
+    frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: ["read_files", "search_memory"] });
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(new Set(body.allowedTools)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_cite", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
     );
     // agentId comes from the cert identity, never the body.
     expect(frontend.calls[0]).toEqual({ method: "config.getAgent", params: { agentId: "agent-1" } });
   });
 
   it("returns allowedTools:null for an agent with no capability selection (backward compat)", async () => {
-    frontend.responses.set("config.getAgent", { tool_capabilities: null });
+    frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: null });
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(200);
@@ -225,7 +225,7 @@ describe("handleToolCapabilities", () => {
   });
 
   it("treats an empty selection as null (whitelist off)", async () => {
-    frontend.responses.set("config.getAgent", { tool_capabilities: [] });
+    frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: [] });
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
@@ -239,6 +239,18 @@ describe("handleToolCapabilities", () => {
     expect(res.statusCode).toBe(500);
     errSpy.mockRestore();
   });
+
+  it.each([undefined, "", "future_type"])(
+    "500 when agent_type is not an explicit supported type (%s)",
+    async (agentType) => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      frontend.responses.set("config.getAgent", { agent_type: agentType, tool_capabilities: null });
+      const res = new FakeRes();
+      await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+      expect(res.statusCode).toBe(500);
+      errSpy.mockRestore();
+    },
+  );
 });
 
 // ── handleSkillsBundle ────────────────────────────────────

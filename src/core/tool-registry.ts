@@ -408,6 +408,8 @@ export interface ToolRefs {
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
   memoryIndexer?: MemoryIndexer;
+  /** Hybrid index over the knowledge pages mounted for this Agent. */
+  knowledgeIndexer?: MemoryIndexer;
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;

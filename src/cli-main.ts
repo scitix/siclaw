@@ -230,7 +230,7 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   taskOutputReader: tuiBackgroundHost.createTaskOutputReader(),
 });
 
-const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
+const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, knowledgeIndexer, mcpManager } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
 tuiBackgroundHost.setSession(session);
 
@@ -430,4 +430,7 @@ if (mcpManager) {
 // Close memory indexer
 if (memoryIndexer) {
   try { memoryIndexer.close(); } catch { /* ignore */ }
+}
+if (knowledgeIndexer) {
+  try { knowledgeIndexer.close(); } catch { /* ignore */ }
 }

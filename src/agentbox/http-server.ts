@@ -26,6 +26,8 @@ import {
   createClusterHandler,
   createHostHandler,
   createKnowledgeHandler,
+  createMcpHandler,
+  createSkillsHandler,
   createToolsHandler,
   readBoxSyncStatus,
   type KnowledgeSyncHandler,
@@ -557,6 +559,10 @@ export interface CreateHttpServerOptions {
    */
   knowledgeHandler?: KnowledgeSyncHandler;
 
+  /** Per-Agent handlers supplied by LocalSpawner to avoid process-global MCP/Skill state. */
+  mcpHandler?: AgentBoxSyncHandler<any>;
+  skillsHandler?: AgentBoxSyncHandler<any>;
+
   /**
    * If true, skip the idle self-destruct entirely. Intended for LocalSpawner,
    * which runs AgentBox in-process with the Portal — shutting down from
@@ -625,10 +631,30 @@ export function createHttpServer(
   }
   const perServerKnowledgeHandler = sessionManager.knowledgeDir
     ? options.knowledgeHandler
-      ?? createKnowledgeHandler({ knowledgeDir: sessionManager.knowledgeDir })
+      ?? createKnowledgeHandler({
+        knowledgeDir: sessionManager.knowledgeDir,
+        afterMaterialize: () => sessionManager.syncKnowledgeIndex(),
+      })
     : undefined;
   if (perServerKnowledgeHandler) {
     perServerHandlers.knowledge = perServerKnowledgeHandler;
+  }
+  if (options.mcpHandler) {
+    perServerHandlers.mcp = options.mcpHandler;
+  } else if (sessionManager.mcpServersState !== undefined) {
+    perServerHandlers.mcp = createMcpHandler(
+      sessionManager,
+      sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+    );
+  }
+  if (options.skillsHandler) {
+    perServerHandlers.skills = options.skillsHandler;
+  } else if (sessionManager.skillsDir) {
+    perServerHandlers.skills = createSkillsHandler({
+      skillsDir: sessionManager.skillsDir,
+      preserveExistingOnEmpty: false,
+      boxClient: sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+    });
   }
   // tools handler — same per-box rationale as cluster/host. It writes the
   // resolved allowedTools into THIS box's sessionManager and fetches with THIS
