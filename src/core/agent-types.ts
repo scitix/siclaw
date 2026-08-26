@@ -15,8 +15,9 @@
  *                   No skills by default. Ships an editable default prompt.
  *   - knowledge_qa — researches bound knowledge bases and synthesizes sourced
  *                    answers. Read-only, no skills by default, and no delegation.
- *   - custom      — the legacy free-form agent: the operator picks capabilities
- *                   (tool_capabilities). Existing agents map here.
+ *   - custom      — the legacy free-form agent. Standalone Portal may persist
+ *                   an operator's tool_capabilities selection; integrations
+ *                   that omit it intentionally retain unrestricted built-ins.
  *
  * `capabilities` are CAPABILITY_GROUPS keys (src/core/tool-capabilities.ts);
  * null means "use the agent's own tool_capabilities" (custom). `defaultPrompt`
@@ -59,25 +60,26 @@ export const COORDINATOR_DEFAULT_PROMPT =
   "coordinator I do not do hands-on work\" — just give the answer. When you cannot deliver one, state the " +
   "OUTCOME the user needs (e.g. the specialist covering that cluster could not be reached, or which detail " +
   "you still need) rather than explaining your own rules. " +
-  "To ROUTE: (1) determine the TARGET resource (cluster / " +
-  "host / node) from the user's request; (2) call `list_delegates` first with query=<that target exactly as " +
-  "established> to find WHICH " +
-  "delegate is bound to it — this authoritative coverage lookup (NOT your own cluster_list, which is YOUR " +
-  "bindings) is how you confirm who covers the target. If it returns no exact binding match and the target " +
-  "may be a cluster alias, consult a routing-helper skill you were given, if any. Only when the helper confirms " +
-  "one canonical Siclaw binding name, retry `list_delegates` once with that name and " +
-  "`binding_name_confirmed=true`; do not guess from an ambiguous or unresolved result. If no helper is " +
-  "attached, it cannot confirm one name, or the confirmed retry also misses, tell the user that no authorized " +
-  "agent covers the name and that it may be an alias. (3) delegate to the matching agent via " +
-  "`delegate_to_agent`. If you CANNOT determine the target from the request — it is missing, ambiguous, or a " +
-  "node/pod is named without its cluster — ASK THE USER to supply the missing detail. Do NOT guess, do NOT " +
-  "browse the whole delegate list hoping to infer it, and do NOT pick the closest match. EXCEPTION — a " +
+  "To ROUTE: (1) establish one canonical Siclaw cluster or host binding. When the user already supplied a " +
+  "cluster or host name, call `list_delegates` first with query=<that target exactly as established>. When the " +
+  "user instead supplied a concrete Pod, Job, Node, reservation, entry ID, or IP without its cluster, use an " +
+  "explicitly attached resource-locator helper and its bound MCP tools, if available, to resolve exactly one " +
+  "canonical binding; the helper discovers identity but NEVER authorizes delegation. For a direct-name miss " +
+  "that may be an alias, the same helper may resolve it. (2) after a helper confirms exactly one binding, call " +
+  "`list_delegates` once with query=<confirmed binding> and `binding_name_confirmed=true`. This authoritative " +
+  "coverage lookup — NOT your own `cluster_list`, which describes your bindings — is how you confirm WHICH " +
+  "delegate covers the target. Never guess from an ambiguous or unresolved helper result, try candidates one " +
+  "by one, or browse the raw delegate list to infer coverage. If no helper is attached, resolution is ambiguous, " +
+  "or the confirmed lookup misses, ask only for the smallest missing detail or report that no authorized agent " +
+  "covers the confirmed binding. (3) delegate to the matching agent via `delegate_to_agent`. If you CANNOT " +
+  "establish a target because the request contains no concrete resource identifier, ask the user for it. " +
+  "EXCEPTION — a " +
   "follow-up WITHIN an investigation already in progress: INHERIT the target resource and the specialist from " +
   "the ongoing thread. A pronoun-only or elliptical follow-up that does not restate the target still refers " +
   "to the resource you already established — do NOT re-ask the user for it, and do NOT re-run `list_delegates` " +
   "discovery; carry forward what you already know and delegate straight to the same specialist. Re-determine " +
-  "the target and re-query `list_delegates` ONLY when the target is genuinely NEW or has CHANGED. If you " +
-  "queried and NO delegate covers the target, follow the one-retry alias flow above; never repeat it. " +
+  "the target and repeat the bounded resolution/coverage flow ONLY when the target is genuinely NEW or has " +
+  "CHANGED. Never repeat a failed lookup in the same routing attempt. " +
   "Forward the task at a HIGH LEVEL, essentially as the user phrased it. You do NOT decide HOW the task is " +
   "done: do NOT read the specialist's execution procedures/skills or enumerate the steps for it, and do NOT " +
   "attempt any hands-on work yourself. The specialist owns the tools and the know-how and will work out the " +
@@ -113,7 +115,8 @@ export const KNOWLEDGE_QA_DEFAULT_PROMPT =
   "an accurate, complete, and clear answer. Treat the bound knowledge bases as the primary source of truth " +
   "for factual claims. You may summarize, compare, and reason from their contents, but do not fill gaps with " +
   "unsupported model knowledge. Before answering, identify the relevant subject, entity, time, version, " +
-  "environment, and scope. Search with alternative terms, names, and versions when useful; do not stop at the " +
+  "environment, and scope. Use `knowledge_search` before answering from mounted knowledge, and search with " +
+  "alternative terms, names, and versions when useful; do not stop at the " +
   "first relevant result. Check for newer, superseding, deprecated, or differently scoped material. Prefer " +
   "sources that are authoritative, current, and applicable, while recognizing that newer material is not " +
   "automatically more applicable. If sources conflict, continue searching for version or scope differences; " +
@@ -142,7 +145,9 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   coordinator: {
     label: "Coordinator Agent",
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
-    capabilities: ["inspect_infra", "read_files", "delegate_agents"],
+    // Coverage comes from list_delegates. cluster_list/host_list describe the
+    // coordinator's own bindings and prime the wrong "bind a cluster" route.
+    capabilities: ["read_files", "delegate_agents"],
     defaultPrompt: COORDINATOR_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
@@ -155,7 +160,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   },
   custom: {
     label: "Custom Agent",
-    description: "Free-form capabilities with the same editable prompt field as every agent type.",
+    description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
     capabilities: null,
     defaultPrompt: null,
     defaultNoSkills: false,
@@ -165,6 +170,20 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
 /** Normalize an unknown stored value to a valid AgentType (default custom). */
 export function normalizeAgentType(v: unknown): AgentType {
   return v === "sre" || v === "coordinator" || v === "knowledge_qa" ? v : "custom";
+}
+
+/**
+ * Parse an agent type at an authorization boundary.
+ *
+ * Unlike normalizeAgentType(), this must never turn missing or future values
+ * into the legacy unrestricted Custom harness. Callers that decide which
+ * tools enter a model session must fail closed when provenance is absent.
+ */
+export function requireAgentType(v: unknown): AgentType {
+  if (v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "custom") {
+    return v;
+  }
+  throw new Error(`Invalid or missing agent_type: ${String(v)}`);
 }
 
 /**
@@ -183,7 +202,7 @@ export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilitie
  * compatibility/creation fallback for rows that have not materialized one yet.
  *
  * This is intentionally separate from the platform prompt assembled by
- * buildSreSystemPrompt(): runtime safety/mode instructions and dynamic
+ * buildSystemPrompt(): runtime safety/mode instructions and dynamic
  * skill/knowledge/MCP context remain platform-owned.
  */
 export function effectiveAgentPrompt(agentType: AgentType, storedPrompt: unknown): string | undefined {

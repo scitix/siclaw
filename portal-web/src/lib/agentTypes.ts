@@ -8,7 +8,7 @@ export interface AgentTypeOption {
   key: AgentTypeKey
   label: string
   description: string
-  /** Locked capability-group keys (read-only in the UI), or null for custom. */
+  /** Locked capability-group keys (read-only in the UI), or null for Custom compatibility. */
   capabilities: string[] | null
   /** True when this type starts with no skills bound. */
   defaultNoSkills: boolean
@@ -26,7 +26,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "coordinator",
     label: "Coordinator Agent",
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
-    capabilities: ["inspect_infra", "read_files", "delegate_agents"],
+    capabilities: ["read_files", "delegate_agents"],
     defaultNoSkills: true,
   },
   {
@@ -39,7 +39,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   {
     key: "custom",
     label: "Custom Agent",
-    description: "Free-form capabilities with the same editable prompt field as every agent type.",
+    description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
     capabilities: null,
     defaultNoSkills: false,
   },

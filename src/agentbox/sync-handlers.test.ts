@@ -7,6 +7,8 @@ import {
   createClusterHandler,
   createHostHandler,
   createKnowledgeHandler,
+  createMcpHandler,
+  createSkillsHandler,
   createToolsHandler,
   knowledgeHandler,
   mcpHandler,
@@ -18,6 +20,7 @@ import {
 import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
 import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
+import { resolveSkillDirectories } from "../core/skill-directories.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -174,39 +177,58 @@ describe("createToolsHandler", () => {
   });
 
   it("fetch uses the per-box client and hits /api/internal/tool-capabilities", async () => {
-    const boxClient = fakeClient({ allowedTools: ["read", "ls"] });
+    const boxClient = fakeClient({ allowedTools: ["read", "ls"], agentType: "knowledge_qa" });
     // Pass a DIFFERENT client into fetch() to prove the box client wins.
     const otherClient = fakeClient({ allowedTools: ["should_not_be_used"] });
     const handler = createToolsHandler({ allowedToolsState: null }, boxClient);
     const payload = await handler.fetch(otherClient);
-    expect(payload).toEqual({ allowedTools: ["read", "ls"] });
+    expect(payload).toEqual({ allowedTools: ["read", "ls"], agentType: "knowledge_qa" });
     expect(boxClient.calls).toEqual([["/api/internal/tool-capabilities", "GET"]]);
     expect(otherClient.calls).toEqual([]);
   });
 
   it("materialize writes a non-null list into the target state and returns its length", async () => {
-    const target = { allowedToolsState: null as string[] | null };
+    const target = { allowedToolsState: null as string[] | null, harnessResolvedState: false };
     const handler = createToolsHandler(target, null);
-    const count = await handler.materialize({ allowedTools: ["read", "ls", "grep"] });
+    const count = await handler.materialize({ allowedTools: ["read", "ls", "grep"], agentType: "knowledge_qa" });
     expect(count).toBe(3);
     expect(target.allowedToolsState).toEqual(["read", "ls", "grep"]);
+    expect(target.harnessResolvedState).toBe(true);
   });
 
   it("materialize treats null as 'no restriction' (whitelist off), returns 0", async () => {
     const target = { allowedToolsState: ["read"] as string[] | null };
     const handler = createToolsHandler(target, null);
-    const count = await handler.materialize({ allowedTools: null });
+    const count = await handler.materialize({ allowedTools: null, agentType: "custom" });
     expect(count).toBe(0);
     expect(target.allowedToolsState).toBeNull();
   });
 
-  it("materialize coerces a malformed (non-array) payload to null, not a crash", async () => {
+  it.each(["sre", "coordinator", "knowledge_qa"])(
+    "rejects unrestricted tools for built-in agent type %s",
+    async (agentType) => {
+      const target = {
+        allowedToolsState: ["read"] as string[] | null,
+        harnessResolvedState: true,
+        agentTypeState: "custom",
+      };
+      const handler = createToolsHandler(target, null);
+      await expect(handler.materialize({ allowedTools: null, agentType } as any))
+        .rejects.toThrow("Invalid tool-capabilities payload");
+      expect(target).toEqual({
+        allowedToolsState: ["read"],
+        harnessResolvedState: true,
+        agentTypeState: "custom",
+      });
+    },
+  );
+
+  it("rejects a malformed payload without changing the last resolved state", async () => {
     const target = { allowedToolsState: ["read"] as string[] | null };
     const handler = createToolsHandler(target, null);
-    // Simulate a skeleton/garbage response.
-    const count = await handler.materialize({ allowedTools: undefined } as any);
-    expect(count).toBe(0);
-    expect(target.allowedToolsState).toBeNull();
+    await expect(handler.materialize({ allowedTools: undefined } as any))
+      .rejects.toThrow("Invalid tool-capabilities payload");
+    expect(target.allowedToolsState).toEqual(["read"]);
   });
 
   it("postReload invalidates every session (mirrors mcpHandler)", async () => {
@@ -240,8 +262,8 @@ describe("createToolsHandler", () => {
     // process-global state is involved.
     const a = { allowedToolsState: null as string[] | null };
     const b = { allowedToolsState: null as string[] | null };
-    await createToolsHandler(a, null).materialize({ allowedTools: ["read"] });
-    await createToolsHandler(b, null).materialize({ allowedTools: ["bash"] });
+    await createToolsHandler(a, null).materialize({ allowedTools: ["read"], agentType: "knowledge_qa" });
+    await createToolsHandler(b, null).materialize({ allowedTools: ["bash"], agentType: "custom" });
     expect(a.allowedToolsState).toEqual(["read"]);
     expect(b.allowedToolsState).toEqual(["bash"]);
   });
@@ -279,6 +301,25 @@ describe("mcpHandler.postReload", () => {
     await expect(
       mcpHandler.postReload!({ sessions: [{ id: "s1", brain: dummyBrain }] }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("createMcpHandler", () => {
+  it("keeps configured MCP state isolated per AgentBox", async () => {
+    const a = { mcpServersState: {} as Record<string, unknown> };
+    const b = { mcpServersState: {} as Record<string, unknown> };
+
+    await createMcpHandler(a, null).materialize({ mcpServers: { knowledge: { command: "kb" } } });
+    await createMcpHandler(b, null).materialize({ mcpServers: { chart: { command: "chart" } } });
+
+    expect(a.mcpServersState).toEqual({ knowledge: { command: "kb" } });
+    expect(b.mcpServersState).toEqual({ chart: { command: "chart" } });
+  });
+
+  it("replaces prior MCP state with an authoritative empty binding", async () => {
+    const target = { mcpServersState: { sre: { command: "ops" } } as Record<string, unknown> };
+    await createMcpHandler(target, null).materialize({ mcpServers: {} });
+    expect(target.mcpServersState).toEqual({});
   });
 });
 
@@ -813,29 +854,44 @@ describe("skillsHandler", () => {
   });
 });
 
+describe("createSkillsHandler scoped materialization", () => {
+  it("isolates two Agents and allows authoritative unbind without cross-Agent deletion", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-skills-handler-"));
+    const aDir = path.join(root, "a");
+    const bDir = path.join(root, "b");
+    const a = createSkillsHandler({ skillsDir: aDir, preserveExistingOnEmpty: false });
+    const b = createSkillsHandler({ skillsDir: bDir, preserveExistingOnEmpty: false });
+    const skill = (dirName: string) => ({
+      version: "1",
+      skills: [{ dirName, scope: "global" as const, specs: `# ${dirName}`, scripts: [] }],
+    });
+
+    try {
+      await a.materialize(skill("alpha"));
+      await b.materialize(skill("beta"));
+      await b.materialize({ version: "2", skills: [] });
+
+      expect(fs.readFileSync(path.join(aDir, "resolved", "alpha", "SKILL.md"), "utf8")).toBe("# alpha");
+      expect(fs.existsSync(path.join(bDir, "resolved", "beta"))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 // =========================================================================
-// skill directory resolution — replicates the skillsDirs logic from
-// agent-factory.ts so the selection rules can be unit-tested in isolation.
+// skill directory resolution — exercises the same public selection policy used
+// by agent-factory.ts.
 // =========================================================================
 
 describe("skill directory resolution", () => {
-  // Replicate the skillsDirs logic from agent-factory.ts for testing
   function resolveSkillDirs(cwd: string, skillsBase: string): string[] {
-    const resolvedSkillsDir = path.join(skillsBase, "resolved");
-    const builtinPath = path.resolve(cwd, "skills", "core");
-    const extensionPath = path.resolve(cwd, "skills", "extension");
-    const platformPath = path.resolve(cwd, "skills", "platform");
-
-    const skillsDirs: string[] = [];
-    if (fs.existsSync(resolvedSkillsDir)) {
-      skillsDirs.push(resolvedSkillsDir);
-    } else {
-      for (const bDir of [builtinPath, extensionPath]) {
-        if (fs.existsSync(bDir)) skillsDirs.push(bDir);
-      }
-    }
-    if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
-    return skillsDirs;
+    return resolveSkillDirectories({
+      cwd,
+      skillsBase,
+      includeBundledSkills: true,
+      includePlatformSkills: true,
+    });
   }
 
   let tmpDir: string;
@@ -1038,6 +1094,28 @@ describe("knowledgeHandler empty-bundle wipe", () => {
   });
 });
 
+describe("createKnowledgeHandler per-box client", () => {
+  it("uses the bound AgentBox client instead of a process-global reload client", async () => {
+    const client = (body: unknown) => {
+      const calls: Array<[string, string]> = [];
+      return {
+        calls,
+        request: async (path: string, method: "GET" | "POST") => {
+          calls.push([path, method]);
+          return body;
+        },
+      };
+    };
+    const boxClient = client({ version: "1", repos: [] });
+    const wrongClient = client({ version: "wrong", repos: [{ id: "wrong" }] });
+    const handler = createKnowledgeHandler({ boxClient });
+
+    await expect(handler.fetch(wrongClient)).resolves.toEqual({ version: "1", repos: [] });
+    expect(boxClient.calls).toEqual([["/api/internal/knowledge/bundle", "GET"]]);
+    expect(wrongClient.calls).toEqual([]);
+  });
+});
+
 describe("knowledgeHandler multi-repo identity", () => {
   let knowledgeTmpDir: string;
 
@@ -1082,9 +1160,8 @@ describe("knowledgeHandler multi-repo identity", () => {
     expect(index).toContain(`[[repos/${businessDir}/index]] - 业务知识 v7`);
   });
 
-  // This catalog IS the routing surface: it goes into the system prompt, there
-  // is no search tool, and anything not on the line costs a Read of that
-  // library's own index. A name routes only when it happens to carry the field.
+  // This catalog is the cheap routing surface; the domain lets the agent pick a
+  // library before it needs hybrid search or another library index read.
   it("carries each library's domain into the catalog line", async () => {
     const repos = [
       { id: "repo-a", name: "sre通用知识库", version: 3, sizeBytes: 10,

@@ -26,7 +26,7 @@
  * added/renamed without changing stored selections.
  */
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
-  read_files:      ["read", "grep", "find", "ls", "knowledge_cite"],
+  read_files:      ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
   // `k8s_inspect` sits here rather than in `inspect_infra` on purpose. That group is REGISTRY metadata
@@ -43,6 +43,23 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   scheduling:      ["manage_schedule"],
   session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"],   // IM-channel-visible updates + delegation result artifact + clarification request
 };
+
+/** Strictly decode the stored/wire selection where null means intentional unrestricted. */
+export function parseToolCapabilitiesAtBoundary(value: unknown): string[] | null {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      throw new Error("Invalid tool_capabilities value");
+    }
+  }
+  if (parsed === null) return null;
+  if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+    return parsed;
+  }
+  throw new Error("Invalid tool_capabilities value");
+}
 
 /**
  * Resolve a set of capability group keys to a concrete `allowedTools` list.

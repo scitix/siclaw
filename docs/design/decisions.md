@@ -55,8 +55,8 @@ LocalSpawner runs AgentBox HTTP servers in-process, one per user, on ports 4000+
 **Consequences**:
 - ✅ Fast spin-up (no process fork overhead)
 - ✅ Easy to debug (single process, single debugger session)
-- ✅ Shared memory allows direct in-process resource sync (no HTTP round-trips)
-- ⚠️ All users share the same filesystem — components designed for K8s pod isolation CANNOT be directly reused (e.g., `skillsHandler.materialize()`)
+- ✅ Per-Agent SessionManager state allows isolated MCP bindings without writing process-global settings
+- ⚠️ All Agents share the same filesystem — LocalSpawner uses Agent-scoped Knowledge/Skill targets and factory-bound handlers; process-global `skillsHandler.materialize()` remains forbidden
 - ⚠️ A crash in one user's session affects all users
 - ❌ Not a multi-tenant production model — use K8sSpawner for that
 
@@ -82,7 +82,7 @@ Bundles contain **only global + skillset (dev only) + personal skills**. Core sk
 - ✅ Bundle requests are small and fast (no large static skill content)
 - ✅ Core skills are versioned with the code, not the database
 - ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
-- ⚠️ In local mode, `materialize()` wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem — see ADR-002 for why local mode cannot safely call `materialize()`
+- ⚠️ In local mode, only the scoped `createSkillsHandler()` may materialize a bundle, under `.siclaw/skills/agents/<agentId>/`; the process-global handler remains unsafe
 - ⚠️ If a user disables a core skill, the `disabledBuiltins` list in the bundle tells AgentBox which core skills to skip
 - ⚠️ Skillset skills are dev-only — untested collaborative work cannot reach production without promotion to global
 
@@ -613,3 +613,59 @@ Release application is identity-bound and happens at a turn boundary:
 **Files**: `src/shared/gateway-sync.ts`, `src/gateway/server.ts`,
 `src/gateway/agent-model-binding.ts`, `src/agentbox/sync-handlers.ts`,
 `src/agentbox/http-server.ts`
+
+---
+
+## ADR-016: Compile Prompt and Runtime Harness from One Agent Context
+
+**Status**: Active
+
+**Context**:
+Siclaw assembled every session on top of an SRE-oriented default prompt and
+then appended an Agent type prompt. A Knowledge QA Agent therefore still saw
+cluster-binding, shell, workflow, memory, and ambient skill instructions even
+when its built-in tool whitelist was read-only. This made routing depend on
+conflicting prompt recency and made it difficult to prove the exact context a
+provider received. Initial capability lookup failures also shared the same null
+value as the legacy unrestricted Custom configuration.
+
+**Decision**:
+Introduce one Agent Context compiler at the session-factory boundary. Its input
+is Agent type, resolved tool policy, mode, memory configuration, and delegation
+constraint. Its outputs are:
+
+- a role-neutral system prompt with capability-derived infrastructure,
+  workflow, memory, skill-authoring, and operational-safety sections;
+- an enforceable harness for built-in tools, configured MCP exposure, memory,
+  and allowed skill roots.
+
+All AgentBox and Portal-backed TUI entry points pass the locked Agent type and
+resolution state through this compiler. Unresolved startup is fail-closed.
+Custom plus a successfully resolved null selection remains the sole legacy
+unrestricted case. Session and final provider-envelope manifests record only
+hashes, lengths, and model-visible resource names, never prompt or user content.
+
+**Consequences**:
+
+- ✅ QA cold starts without SRE cluster-binding or shell guidance.
+- ✅ Prompt claims and model-visible tools/skills derive from one policy.
+- ✅ Capability-sync failure cannot silently become an unrestricted session.
+- ✅ Knowledge QA has a first-class hybrid search → exact fallback → full Read
+  → citation retrieval stack rather than depending only on catalog titles.
+- ✅ LocalSpawner materializes explicitly bound Skills and MCP per Agent before
+  the first prompt, without leaking process-global SRE resources into QA.
+- ✅ Domain-neutral state-change confirmation rules apply even when a QA or
+  Coordinator is explicitly bound to an effectful MCP.
+- ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
+- ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
+  skills; required skills must be explicitly bound.
+- ⚠️ Explicitly configured MCP remains orthogonal to built-in capability
+  groups. The current MCP wire payload has no effect classification or binding
+  provenance, so Agent-type-safe selection is enforced by the control plane,
+  not guessed from dynamic tool names in Siclaw.
+- ⚠️ Persisted full-template overrides remain compatible and therefore do not
+  receive bundled role sections; the hardcoded Safety/Language suffix remains.
+
+**Files**: `src/core/agent-context.ts`, `src/core/prompt.ts`,
+`src/core/agent-factory.ts`, `src/core/model-envelope.ts`,
+`src/agentbox-main.ts`, `src/gateway/agentbox/local-spawner.ts`

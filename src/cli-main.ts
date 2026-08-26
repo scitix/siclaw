@@ -215,8 +215,11 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   // its platform prompt (safety, mode, skills/knowledge context) in every entry
   // point. Match AgentBox semantics instead of replacing the full TUI template.
   systemPromptAppend: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
+  agentType: portalSnapshot?.activeAgent?.agentType ?? "sre",
+  harnessResolved: true,
   // Per-agent tool whitelist (resolved from capability groups by the snapshot).
-  // Absent/null = unrestricted → agent-factory falls back to config.allowedTools.
+  // Standalone SRE null expands to the locked SRE capability set; only explicit
+  // Custom null remains unrestricted.
   allowedTools: portalSnapshot?.activeAgent?.allowedTools ?? null,
   portalActiveAgent: portalSnapshot?.activeAgent ?? null,
   portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
@@ -228,7 +231,7 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   taskOutputReader: tuiBackgroundHost.createTaskOutputReader(),
 });
 
-const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
+const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, knowledgeIndexer, mcpManager } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
 tuiBackgroundHost.setSession(session);
 
@@ -428,4 +431,7 @@ if (mcpManager) {
 // Close memory indexer
 if (memoryIndexer) {
   try { memoryIndexer.close(); } catch { /* ignore */ }
+}
+if (knowledgeIndexer) {
+  try { knowledgeIndexer.close(); } catch { /* ignore */ }
 }

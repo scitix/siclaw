@@ -25,8 +25,8 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 | Filesystem | Shared (single user) | **ALL users share one filesystem** | Each pod has isolated filesystem |
 | Database | None (file-based) | SQLite via node:sqlite (default) or MySQL | MySQL (required) |
 | Auth | None (standalone) / JWT (with local Portal) | JWT | mTLS (cert per pod) + JWT |
-| Skills source | Local `./skills/` (standalone) / Portal snapshot (with local Portal) | DB → shared `./skills/` | DB → pod-local emptyDir |
-| MCP source | Local file (standalone) / Portal snapshot | DB merge + local file | DB merge |
+| Skills source | Local `./skills/` (standalone) / Portal snapshot (with local Portal) | DB → `.siclaw/skills/agents/<agentId>/resolved/` | DB → pod-local emptyDir |
+| MCP source | Local file (standalone) / Portal snapshot | DB → per-Agent SessionManager state | DB → pod-local config |
 
 TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired** (a `siclaw local` Portal is running and `.siclaw/local-secrets.json` exists). The second sub-mode is described in §1.4.
 
@@ -35,10 +35,10 @@ TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired
 **Invariant**: In local mode (`LocalSpawner`), every AgentBox instance runs in the same Node.js process as Gateway and shares the same working directory and filesystem.
 
 **Consequences**:
-- Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
-- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
-- Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (global + personal skills from the bundle are both written into the user's directory)
+- The process-global `skillsHandler.materialize()` is **NOT safe** in local mode because it replaces a shared `resolved/` tree. LocalSpawner uses a factory-bound handler whose target is `.siclaw/skills/agents/<agentId>/`; authoritative unbind may replace only that Agent's subtree.
+- LocalSpawner MCP sync writes only `sessionManager.mcpServersState`; it must never merge into process-global `settings.json`, or another Agent's tool descriptions can enter model context.
 - Knowledge sync in local mode must materialize and read from an agent-scoped directory (`.siclaw/knowledge/<agentId>/`). Empty and non-empty bundles both replace their target, so pointing the canonical handler at the shared knowledge root would let one agent erase another agent's libraries.
+- LocalSpawner awaits Knowledge, Skill, and MCP initial sync concurrently before accepting its first prompt. A failed MCP sync remains empty (never process-global); Knowledge/Skill may retain only that same Agent's last materialized snapshot and recover through the normal reload route. If the Agent-scoped Skill directory does not exist yet, the session starts with no bound skills and never falls back to process-shared `skills/resolved/`.
 - Local SQLite (via `node:sqlite`) uses WAL mode with a shared process — local mode is single-process by design; production K8s uses MySQL and has no such constraint
 
 **Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/sync-handlers.ts`, `src/agentbox/session.ts`, `src/core/agent-factory.ts`
@@ -111,7 +111,14 @@ The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the
 - `agent-factory.ts` picks up these paths via new `portalSkillsDir` / `portalKnowledgeDir` / `portalCredentialsDir` opts; when set, they override `config.paths.*` so the agent's Read tool, `local_script`, and kubectl use Portal content.
 
 **Skill filter** (`src/core/agent-factory.ts`):
-When a Portal snapshot is active, pi-coding-agent's `DefaultResourceLoader` auto-discovered user-global skills (e.g. `~/.pi/agent/skills/`) are filtered out — a `skillsOverride` keeps only skills whose path sits under the Portal-materialized dir or the repo's `skills/platform/`. This ensures the Portal operator's skill list is the single source of truth for what the agent can invoke.
+For any scoped Agent (Portal or Gateway materialization), pi-coding-agent's
+auto-discovered user-global skills (for example `~/.pi/agent/skills/`) are
+filtered out. `skillsOverride` keeps only roots selected by the compiled Agent
+harness: Portal/Gateway materialized bindings, repo-bundled operational skills
+when execution is permitted, and platform authoring skills when write/preview
+capabilities are permitted. QA, Coordinator, delegated read-only, and unresolved
+harnesses therefore cannot inherit ambient SRE skill context. Standalone,
+unscoped SRE TUI sessions retain the legacy repo/global skill fallback.
 
 **Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-first-run.ts`, `src/cli-main.ts`, `src/core/extensions/{ls,agent,setup}.ts`
 
@@ -316,11 +323,13 @@ postReload(context)  Notify active sessions to pick up changes
 
 | Handler | Safe in LocalSpawner? | Safe in K8s pod? | Notes |
 |---------|----------------------|------------------|-------|
-| `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
-| `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes `global/` + `skillset/` + `user/` subdirs (not `core/`) |
+| process-global `mcpHandler.materialize()` | ❌ No | ✅ Yes | Writes settings; Local uses `createMcpHandler()` and per-Agent memory |
+| process-global `skillsHandler.materialize()` | ❌ No | ✅ Yes | Replaces shared `resolved/`; Local uses `createSkillsHandler()` with an Agent-scoped target |
 | `knowledgeHandler.materialize()` | ✅ With agent-scoped target | ✅ Yes | Replaces its whole target; LocalSpawner binds `.siclaw/knowledge/<agentId>/` |
 
-For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Global and personal skills from the bundle are both placed under the user's directory.
+Local resource handlers are factory-bound to one AgentBox and reused for both
+initial sync and reload. Two-Agent isolation plus unbind/reload tests are part
+of the contract.
 
 ---
 

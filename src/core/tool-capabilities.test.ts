@@ -3,6 +3,7 @@ import {
   CAPABILITY_GROUPS,
   resolveCapabilities,
   encodeToolCapabilitiesForDb,
+  parseToolCapabilitiesAtBoundary,
 } from "./tool-capabilities.js";
 // Frontend catalog (the hand-maintained UI copy). Imported directly so the
 // drift guard below compares the live constants — refactor-safe and
@@ -23,13 +24,15 @@ describe("resolveCapabilities", () => {
   });
 
   it("a single group resolves to exactly that group's tools", () => {
-    expect(resolveCapabilities(["read_files"])).toEqual(["read", "grep", "find", "ls", "knowledge_cite"]);
+    expect(resolveCapabilities(["read_files"])).toEqual([
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+    ]);
   });
 
   it("multiple groups resolve to the union of their tools", () => {
     const result = resolveCapabilities(["read_files", "search_memory"]);
     expect(new Set(result)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_cite", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
     );
   });
 
@@ -37,14 +40,14 @@ describe("resolveCapabilities", () => {
     // Construct overlap synthetically would require shared tools; instead assert
     // no duplicates appear when the same group is listed twice.
     const result = resolveCapabilities(["read_files", "read_files"]);
-    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_cite"]);
+    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]);
     expect(result!.length).toBe(new Set(result).size);
   });
 
   it("unknown group keys are warned + ignored, valid subset is used", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = resolveCapabilities(["read_files", "does_not_exist"]);
-    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_cite"]);
+    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]);
     expect(warn).toHaveBeenCalledOnce();
     expect(warn.mock.calls[0][0]).toContain("does_not_exist");
   });
@@ -100,7 +103,7 @@ describe("encodeToolCapabilitiesForDb", () => {
     const encoded = encodeToolCapabilitiesForDb(["read_files"]);
     expect(encoded).not.toBeNull();
     const decoded = JSON.parse(encoded as string) as string[];
-    expect(resolveCapabilities(decoded)).toEqual(["read", "grep", "find", "ls", "knowledge_cite"]);
+    expect(resolveCapabilities(decoded)).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]);
   });
 
   it("rejects non-array, non-null/undefined values (HTTP 400 at the boundary)", () => {
@@ -108,6 +111,19 @@ describe("encodeToolCapabilitiesForDb", () => {
     expect(() => encodeToolCapabilitiesForDb({})).toThrow();
     expect(() => encodeToolCapabilitiesForDb(["read_files", 42])).toThrow();
   });
+});
+
+describe("parseToolCapabilitiesAtBoundary", () => {
+  it("accepts explicit null, a stored JSON string, or a parsed string array", () => {
+    expect(parseToolCapabilitiesAtBoundary(null)).toBeNull();
+    expect(parseToolCapabilitiesAtBoundary('["read_files"]')).toEqual(["read_files"]);
+    expect(parseToolCapabilitiesAtBoundary(["read_files"])).toEqual(["read_files"]);
+  });
+
+  it.each([undefined, "", "not-json", {}, ["read_files", 42]])(
+    "rejects malformed or absent provenance (%j)",
+    (value) => expect(() => parseToolCapabilitiesAtBoundary(value)).toThrow("Invalid tool_capabilities"),
+  );
 });
 
 /**

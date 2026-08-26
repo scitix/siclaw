@@ -61,6 +61,27 @@ still missing — rather than the internal rule that produced it.
   The roster remains the authorization source; a routing helper never grants
   coverage.
 
+## Concrete resource location
+
+A user may name a Pod, Job, Node, reservation, entry ID, or IP without knowing
+the owning cluster. That is still a concrete routing identifier; asking for the
+cluster immediately would discard a locator capability that was explicitly
+bound to the Coordinator.
+
+When a resource-locator skill is attached, the Coordinator follows that skill
+and its configured MCP tools to perform one bounded global lookup, then converts
+the result to exactly one current Siclaw binding name. The locator establishes
+identity only. It must not inspect health, logs, events, diagnosis, or other
+live-state detail, and it cannot authorize delegation.
+
+Only one unambiguous binding may proceed to
+`list_delegates(query=<binding>, binding_name_confirmed=true)`. No result asks
+for the smallest missing detail; multiple results ask for the smallest
+disambiguator; multiple binding candidates are a routing inconsistency and are
+never tried one by one. The Coordinator does not need its own `cluster_list` or
+`host_list` for this flow: those tools describe its direct infrastructure
+bindings, whereas configured MCP and skills are separate Agent resources.
+
 ## Optional alias resolution
 
 When the first lookup misses and the target may be a cluster alias, the

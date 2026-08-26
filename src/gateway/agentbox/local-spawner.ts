@@ -15,12 +15,15 @@ import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";
 import { syncResource } from "../../agentbox/resource-sync.js";
-import { createKnowledgeHandler } from "../../agentbox/sync-handlers.js";
+import {
+  createKnowledgeHandler,
+  createMcpHandler,
+  createSkillsHandler,
+} from "../../agentbox/sync-handlers.js";
 import type { CertificateManager } from "../security/cert-manager.js";
 import { getDb } from "../db.js";
-import { safeParseJson } from "../dialect-helpers.js";
-import { resolveCapabilities } from "../../core/tool-capabilities.js";
-import { normalizeAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
+import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../../core/tool-capabilities.js";
+import { requireAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveUnderDir } from "../../shared/path-utils.js";
 
@@ -86,6 +89,12 @@ export class LocalSpawner implements BoxSpawner {
 
     const sessionManager = new AgentBoxSessionManager();
     sessionManager.agentId = agentId;
+    sessionManager.gatewayClient = new GatewayClient({
+      gatewayUrl: this.gatewayInternalUrl,
+      certPath: certDir,
+    });
+    sessionManager.harnessResolvedState = false;
+    sessionManager.allowedToolsState = [];
     // Agent-scoped credentials directory — shared across callers of this agent.
     sessionManager.credentialsDir = path.resolve(
       process.cwd(),
@@ -94,42 +103,79 @@ export class LocalSpawner implements BoxSpawner {
     );
     const knowledgeRoot = path.resolve(process.cwd(), loadConfig().paths.knowledgeDir);
     sessionManager.knowledgeDir = resolveUnderDir(knowledgeRoot, agentId);
+    const skillsRoot = path.resolve(
+      process.cwd(),
+      loadConfig().paths.skillsDir ?? ".siclaw/skills",
+      "agents",
+    );
+    sessionManager.skillsDir = resolveUnderDir(skillsRoot, agentId);
+    // Empty is authoritative until the per-Agent Gateway response lands. This
+    // prevents Local mode from falling back to process-global settings.json.
+    sessionManager.mcpServersState = {};
+    const boxClient = sessionManager.gatewayClient.toClientLike();
     const knowledgeHandler = createKnowledgeHandler({
       knowledgeDir: sessionManager.knowledgeDir,
+      afterMaterialize: () => sessionManager.syncKnowledgeIndex?.(),
+      boxClient,
     });
+    const skillsHandler = createSkillsHandler({
+      skillsDir: sessionManager.skillsDir,
+      preserveExistingOnEmpty: false,
+      boxClient,
+    });
+    const mcpHandler = createMcpHandler(sessionManager, boxClient);
 
     // Inject the resolved tool whitelist AND the locked agent-type policy at spawn
     // time. The tools sync type is initialSync:false, so the framework's
     // syncAllResources never pulls it (and isn't even run in Local mode).
     // LocalSpawner lives inside the Gateway process with direct DB access, so it
     // resolves both here — before createHttpServer + the first session — so a
-    // restricted agent is restricted from its very first turn (not
-    // unrestricted-until-next-reload). This mirrors the K8s path
-    // (internal-api.ts handleToolCapabilities): a built-in type (sre/coordinator)
+    // restricted agent is restricted from its very first turn. This mirrors
+    // the K8s path
+    // (internal-api.ts handleToolCapabilities): a built-in type
     // LOCKS its capability set via effectiveCapabilityKeys and drives the locked
     // persona via agentTypeState — without this, a Coordinator with an empty raw
     // tool_capabilities would resolve to null (unrestricted) and keep the default
-    // custom persona in Local mode. custom with null/empty selection → null =
-    // unrestricted (today's behaviour).
+    // custom persona in Local mode. Custom with null/empty selection keeps that
+    // legacy compatibility only after this lookup resolves successfully.
     try {
       const db = getDb();
       const [rows] = await db.query(
         "SELECT tool_capabilities, agent_type FROM agents WHERE id = ?",
         [agentId],
       ) as [Array<{ tool_capabilities?: unknown; agent_type?: unknown }>, unknown];
-      const groupKeys = rows.length > 0
-        ? safeParseJson<string[] | null>(rows[0].tool_capabilities, null)
-        : null;
-      const agentType = normalizeAgentType(rows.length > 0 ? rows[0].agent_type : undefined);
+      if (rows.length !== 1) {
+        throw new Error(`Expected exactly one agent row, got ${rows.length}`);
+      }
+      const groupKeys = parseToolCapabilitiesAtBoundary(rows[0].tool_capabilities);
+      const agentType = requireAgentType(rows[0].agent_type);
       sessionManager.allowedToolsState = resolveCapabilities(effectiveCapabilityKeys(agentType, groupKeys));
       sessionManager.agentTypeState = agentType;
+      sessionManager.harnessResolvedState = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Fail safe-open: an agent that can't resolve its whitelist starts
-      // unrestricted rather than failing to spawn. The next reload push will
-      // correct it.
-      console.warn(`[local-spawner] tool-capabilities resolve failed for agent=${agentId} (starting unrestricted): ${msg}`);
-      sessionManager.allowedToolsState = null;
+      // Fail closed: without a proven type policy, do not expose built-in or
+      // MCP tools. The next successful reload can correct it.
+      console.warn(`[local-spawner] tool-capabilities resolve failed for agent=${agentId} (starting with no tools): ${msg}`);
+      sessionManager.allowedToolsState = [];
+      sessionManager.harnessResolvedState = false;
+    }
+
+    // Resolve all bound knowledge/skills/MCP before accepting the first prompt.
+    // These independent pulls run concurrently; each keeps syncResource's own
+    // bounded retry policy. A failed axis stays empty/fail-safe and can recover
+    // through its normal reload endpoint later.
+    const initialSyncs = await Promise.allSettled([
+      syncResource("knowledge", boxClient, knowledgeHandler),
+      syncResource("skills", boxClient, skillsHandler),
+      syncResource("mcp", boxClient, mcpHandler),
+    ]);
+    for (const [index, result] of initialSyncs.entries()) {
+      if (result.status === "rejected") {
+        const type = ["knowledge", "skills", "mcp"][index];
+        const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        console.warn(`[local-spawner] Initial ${type} sync failed for agent=${agentId}: ${msg}`);
+      }
     }
 
     // disableIdleShutdown: LocalSpawner runs AgentBox in the same process as
@@ -138,6 +184,8 @@ export class LocalSpawner implements BoxSpawner {
     const httpServer = createHttpServer(sessionManager, {
       disableIdleShutdown: true,
       knowledgeHandler,
+      skillsHandler,
+      mcpHandler,
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -147,28 +195,6 @@ export class LocalSpawner implements BoxSpawner {
       });
       httpServer.on("error", reject);
     });
-
-    // K8s mode pulls knowledge via syncAllResources() in agentbox-main.ts.
-    // LocalSpawner bypasses that entrypoint, so without this call the agent's
-    // bound knowledge repos never land in .siclaw/knowledge/. Skills and MCP
-    // are intentionally skipped: their handlers wipe a shared directory and
-    // would clobber other users' state (invariant #1 in CLAUDE.md).
-    //
-    // Fire-and-forget: spawn() must stay cheap — sync retries (up to 7s) run
-    // in the background while the caller proceeds. A slow first chat is
-    // better than a blocked spawn.
-    void (async () => {
-      try {
-        const gatewayClient = new GatewayClient({
-          gatewayUrl: this.gatewayInternalUrl,
-          certPath: certDir,
-        });
-        await syncResource("knowledge", gatewayClient.toClientLike(), knowledgeHandler);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[local-spawner] Initial knowledge sync failed for agent=${agentId}: ${msg}`);
-      }
-    })();
 
     const box: LocalBox = {
       agentId,

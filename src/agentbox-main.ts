@@ -196,27 +196,32 @@ async function main() {
   //
   // Awaited BEFORE server.listen (like syncAllResources above) so the box never
   // accepts a prompt before its whitelist lands — first-turn restriction is the
-  // whole point of a security-relevant tool gate. On failure (after retries) the
-  // agent starts unrestricted (allowedToolsState stays null) until the next
-  // reload push — the safe-open default.
+  // whole point of a security-relevant tool gate. On failure (after retries),
+  // the unresolved harness stays fail-closed until a later reload push.
   if (sessionManager.gatewayClient) {
+    // Until the first control-plane response proves the Agent type/capability
+    // policy, the shared context compiler must expose no built-in or MCP tools.
+    sessionManager.harnessResolvedState = false;
+    sessionManager.allowedToolsState = [];
     const boxClient = sessionManager.gatewayClient.toClientLike();
     try {
       // Reuse syncResource's exponential-backoff retry (descriptor.retry =
-      // 3 attempts, 1s base) to shrink the fail-open window from a transient
-      // gateway blip. Pass the per-box handler since `tools` is not in the
+      // 3 attempts, 1s base) to resolve the harness across a transient gateway
+      // blip. Pass the per-box handler since `tools` is not in the
       // module-level registry that syncResource would otherwise look up.
       const count = await withStartupDeadline("tool-capabilities sync", () =>
         syncResource("tools", boxClient, createToolsHandler(sessionManager, boxClient)));
       if (count !== undefined) {
-        console.log(`[agentbox] Initial tool-capabilities synced: ${count === 0 ? "unrestricted" : `${count} tools`}`);
+        const resolved = sessionManager.allowedToolsState;
+        console.log(
+          `[agentbox] Initial tool-capabilities synced: ${resolved === null ? "legacy unrestricted" : `${resolved.length} tools`}`,
+        );
       }
     } catch (err) {
-      // Fail-open after all retries: a fresh box has no prior whitelist to fall
-      // back to, and a failed fetch usually means broader gateway unreachability
-      // (MCP/skills can't sync either). Loud warn so the gap is observable.
+      // Fail closed after all retries. The box can still answer without tools,
+      // and a later reload push can install the resolved policy.
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[agentbox] Initial tool-capabilities sync failed after retries (starting unrestricted): ${msg}`);
+      console.warn(`[agentbox] Initial tool-capabilities sync failed after retries (starting with no tools): ${msg}`);
     }
   }
 

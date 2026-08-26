@@ -550,16 +550,21 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
+| `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
 
-### allowedTools — Sole Availability Axis
+### allowedTools — Built-in and File-Tool Availability Axis
 
-`allowedTools` is the only control over tool availability after mode/`available`
-filtering — there are no exemptions. A `null`/omitted `allowedTools` passes every
-tool through (the default); a non-null array passes only the tools it names.
+`allowedTools` is the control over registry tools and framework file tools after
+mode/`available` filtering. A `null`/omitted `allowedTools` passes every one of
+those tools (the default); a non-null array passes only the names it contains.
+Configured MCP is a separate resource-binding axis because its tool names are
+discovered dynamically and cannot be enumerated in static capability groups.
 
 **Per-agent source**: `allowedTools` is resolved from the agent's selected
 capability groups (`agents.tool_capabilities`) at the Gateway boundary
-(`resolveCapabilities`); null/empty selection → `null` = unrestricted. Every tool
+(`resolveCapabilities`). Built-in Agent types use locked groups. Only an
+explicitly resolved `custom` type with null/empty selection becomes `null` =
+unrestricted. Every tool
 in the registry must belong to some `CAPABILITY_GROUPS` entry, otherwise a
 restricted agent can never reach it — enforced by `tool-capabilities-coverage.test.ts`.
 
@@ -570,26 +575,53 @@ former always-on tools (task/memory/schedule/spawn) for free — they are filter
 unless explicitly listed. The default global is `null`, so existing agents are
 unaffected; only a deployment that opted into a global whitelist must revisit it.
 
-**Initial-fetch failure is fail-open (reviewed policy)**: the per-pod
-tool-capabilities fetch (K8s `agentbox-main.ts`, awaited before `listen` with
-retries) and the spawn-time DB read (Local `local-spawner.ts`) both start the box
-**unrestricted** on unrecoverable error, with a loud warn. Rationale: a fresh box
-has no prior whitelist to preserve, and a failed fetch usually signals broader
-gateway unreachability (skills/MCP can't sync either), so failing open keeps the
-box serviceable rather than bricking it. The reload-PUSH path is *not* fail-open —
-it preserves the prior whitelist on failure. Fail-closed hardening (refuse first
-turn until resolved) is tracked as a separate follow-up.
+**Initial-fetch failure is fail-closed**: the per-pod tool-capabilities fetch
+(K8s `agentbox-main.ts`, awaited before `listen` with retries) and the spawn-time
+DB read (Local `local-spawner.ts`) initialize the harness as unresolved with an
+empty built-in whitelist. On unrecoverable error the Agent can still answer from
+its conversation and mounted knowledge, but receives no built-in tools, MCP,
+memory, or ambient skills. A later successful reload installs the resolved
+policy. The reload-PUSH path preserves the last resolved whitelist on failure.
+
+The only unrestricted per-Agent state is the explicit backward-compatible
+`custom` + successfully resolved null selection. A failed lookup cannot be
+mistaken for that state.
 
 ### Tools Not in Registry
 
-Both categories are appended after `resolve()` but are still subject to the same
-`allowedTools` name-based whitelist (a non-null `allowedTools` filters them; `null`
-passes all). They carry no `mode`/`available` metadata, so `allowedTools` is their
-sole availability gate.
+Both categories are appended after `resolve()`, but their availability contracts
+are intentionally different:
 
-- **MCP tools**: dynamically discovered at runtime, appended after resolve
-- **File I/O tools** (read/edit/write/grep/find/ls): framework tools with
-  path-restricted operations injection, appended after resolve
+- **MCP tools** are dynamically discovered from the session's configured MCP
+  servers. They are exposed only for a resolved, non-delegated-read-only
+  harness, and are orthogonal to `allowedTools`. In scoped sessions the config
+  is already Agent-scoped; standalone sessions use explicit local config.
+- **File I/O tools** (read/edit/write/grep/find/ls) are framework tools with
+  path-restricted operations injection. `appendAllowedTools()` applies the same
+  name whitelist as `ToolRegistry.resolve()`.
+
+### Knowledge Q&A retrieval stack
+
+`read_files` is a retrieval capability group, not only filesystem access:
+
+1. `knowledge_search` queries an Agent-scoped `MemoryIndexer` over mounted
+   Markdown using hybrid semantic + FTS ranking. FTS-only remains functional
+   when embeddings are unavailable.
+2. `grep` / `find` provide exact-text and filename fallback for identifiers,
+   versions, aliases, and terms absent from embeddings.
+3. `read` loads the complete selected page before synthesis.
+4. `knowledge_cite` emits citations only for manifest-backed pages actually
+   read during the current turn.
+
+The injected catalog remains a cheap navigation hint; it is not the only
+recall surface. Knowledge materialization explicitly resyncs the index, and
+the index database lives outside the atomically replaced knowledge mount.
+
+MCP server descriptions become part of the corresponding model-visible tool
+descriptions. The current config contract has no read/write classification or
+binding-source provenance; do not infer either from names. Agent-type-safe MCP
+selection therefore belongs to the control-plane resource binding until that
+metadata exists end to end.
 
 Historical note: the DP refactor (Apr 2026) removed three extension tools
 (`propose_hypotheses`, `end_investigation`, `deep_search`) that used to land

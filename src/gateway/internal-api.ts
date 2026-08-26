@@ -25,8 +25,8 @@ import {
   hasBackgroundChannelDelivery,
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
-import { resolveCapabilities } from "../core/tool-capabilities.js";
-import { normalizeAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
+import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import { requireAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -272,8 +272,8 @@ export async function handleMcpServers(
  * the AgentBox stays oblivious to capability groups (mirrors ssh jump_host_id→
  * name and MCP boundary resolution).
  *
- * `{ allowedTools: null }` means "no restriction" — the agent never selected
- * any capability groups, so it keeps the global default tool set. The agentId
+ * `{ allowedTools: null }` means explicit legacy unrestricted Custom. Built-in
+ * types are expanded to their locked concrete tool lists. The agentId
  * comes from the mTLS cert identity (never the request body) so a box cannot
  * read another agent's whitelist.
  */
@@ -287,11 +287,14 @@ export async function handleToolCapabilities(
     const agent = await frontendClient.request("config.getAgent", {
       agentId: identity.agentId,
     });
-    // Built-in types (sre/coordinator) LOCK the capability set; custom uses the
+    // Built-in types (sre/coordinator/knowledge_qa) LOCK the capability set; custom uses the
     // agent's own tool_capabilities. resolveCapabilities(null/[]) === null keeps
     // the backward-compatible "unrestricted" default for custom with no selection.
-    const agentType = normalizeAgentType(agent?.agent_type);
-    const capsKeys = effectiveCapabilityKeys(agentType, (agent?.tool_capabilities ?? null) as string[] | null);
+    const agentType = requireAgentType(agent?.agent_type);
+    const capsKeys = effectiveCapabilityKeys(
+      agentType,
+      parseToolCapabilitiesAtBoundary(agent?.tool_capabilities),
+    );
     const allowedTools = resolveCapabilities(capsKeys);
     // agentType rides along for capabilities and legacy-row prompt fallback.
     sendJson(res, 200, { allowedTools, agentType });

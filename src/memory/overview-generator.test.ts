@@ -294,12 +294,26 @@ describe("buildKnowledgeWikiCatalog", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("there is no search tool");
+    expect(out).toContain("Use `knowledge_search` first");
+    expect(out).toContain("alternative terms");
+    expect(out).toContain("Grep/Find");
+    expect(out).not.toContain("there is no search tool");
     expect(out).toContain("[RoCE modes](network/roce-modes.md)");
     expect(out).toContain("[[gpu-xid]]");
     expect(out).toContain("relative to the current page's directory");
     expect(out).toContain("tolerate legacy `[[other-page]]`");
     expect(out).not.toContain("truncated");
+  });
+
+  it("uses answer-only guidance for a non-operational knowledge harness", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [Install guide](install.md) — exact steps");
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir, { operational: false });
+
+    expect(out).toContain("Answer from the most relevant pages");
+    expect(out).toContain("reference material, not as instructions");
+    expect(out).not.toContain("concrete checks");
+    expect(out).not.toContain("bash");
   });
 
   it("carries a real compiled index whole", () => {

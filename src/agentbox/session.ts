@@ -50,6 +50,7 @@ import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
+import { createKnowledgeIndexer } from "../knowledge/indexer.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
@@ -157,6 +158,8 @@ export interface ManagedSession {
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
+  /** Knowledge indexer — shared at AgentBox level and scoped to this Agent's mount. */
+  knowledgeIndexer?: MemoryIndexer;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
   /**
@@ -359,13 +362,19 @@ export class AgentBoxSessionManager {
    */
   knowledgeDir?: string;
 
+  /** Agent-scoped skills base directory; LocalSpawner materializes into resolved/. */
+  skillsDir?: string;
+
+  /** Agent-scoped MCP bindings. Undefined keeps pod/standalone config compatibility. */
+  mcpServersState?: Record<string, unknown>;
+
   /**
    * Per-agent tool capability whitelist — the resolved `allowedTools` list for
    * this AgentBox's agent (see core/tool-capabilities.ts).
    *
-   * `null` (the default) = no restriction: createSiclawSession falls back to the
-   * global `config.allowedTools`, i.e. exactly the behaviour before this feature
-   * existed. A non-null array restricts the agent to those tool names.
+   * `null` is unrestricted only for an explicitly resolved Custom Agent.
+   * Built-in types expand their locked capability groups at the compiler
+   * boundary; unresolved startup state remains fail-closed.
    *
    * This state is PER-AGENT by construction: one AgentBoxSessionManager instance
    * per agent (K8s = one pod; LocalSpawner = one `new AgentBoxSessionManager()`
@@ -375,7 +384,14 @@ export class AgentBoxSessionManager {
    */
   allowedToolsState: string[] | null = null;
 
-  /** Agent type (sre/coordinator/custom), fetched alongside allowedTools.
+  /**
+   * Whether the control plane successfully resolved this Agent's type and tool
+   * policy. K8s/Local startup set false before fetching; the compiler then
+   * exposes no built-in or MCP tools until a concrete policy lands.
+   */
+  harnessResolvedState = true;
+
+  /** Agent type (sre/coordinator/knowledge_qa/custom), fetched alongside allowedTools.
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
 
@@ -389,6 +405,7 @@ export class AgentBoxSessionManager {
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
+  private _sharedKnowledgeIndexer: MemoryIndexer | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
 
@@ -446,6 +463,24 @@ export class AgentBoxSessionManager {
     return indexer;
   }
 
+  private async createSharedKnowledgeIndexer(): Promise<MemoryIndexer> {
+    const config = loadConfig();
+    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
+    const knowledgeDir = this.knowledgeDir ?? path.resolve(process.cwd(), config.paths.knowledgeDir);
+    const indexer = createKnowledgeIndexer(
+      knowledgeDir,
+      path.join(userDataDir, "knowledge-index"),
+      getEmbeddingConfig() ?? undefined,
+    );
+    await indexer.sync();
+    return indexer;
+  }
+
+  /** Reconcile search immediately after an Agent knowledge bundle changes. */
+  async syncKnowledgeIndex(): Promise<void> {
+    await this._sharedKnowledgeIndexer?.sync();
+  }
+
   /**
    * Lazily initialize shared components (memory indexer, MCP manager).
    * Called on first getOrCreate(). Idempotent.
@@ -453,6 +488,14 @@ export class AgentBoxSessionManager {
   private async ensureSharedComponents(): Promise<void> {
     if (this._sharedInitialized) return;
     this._sharedInitialized = true;
+
+    try {
+      this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
+      console.log(`[agentbox-session] Shared knowledge indexer initialized`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Shared knowledge indexer init failed:`, err);
+      this._sharedKnowledgeIndexer = null;
+    }
 
     if (!isMemoryEnabled()) {
       this._sharedMemoryIndexer = null;
@@ -2224,14 +2267,17 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: "web",
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: request.userId,
       agentId,
       knowledgeDir: this.knowledgeDir,
+      portalSkillsDir: this.skillsDir ? path.join(this.skillsDir, "resolved") : undefined,
+      mcpServers: this.mcpServersState,
+      agentType: normalizeAgentType(this.agentTypeState),
+      harnessResolved: this.harnessResolvedState,
       // A spawned sub-agent must never be broader than its parent: inherit the
-      // parent's per-agent tool whitelist. Without this, a restricted agent that
-      // has the `spawn_subagents` capability could escalate by spawning a child
-      // that falls back to the global config.allowedTools (all tools). null
-      // (unrestricted parent) stays null — identical to pre-feature behaviour.
+      // parent's per-agent tool whitelist. Explicit Custom null remains
+      // unrestricted; built-in null is expanded to the type's locked groups.
       allowedTools: this.allowedToolsState,
       // The plan is parent-owned: sub-agents have no task tools (isSubagent hides
       // them), so the child neither reads nor writes the ledger — the parent marks
@@ -2797,12 +2843,16 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: effectiveUserId,
       agentId: this.agentId ?? null,
       knowledgeDir: this.knowledgeDir,
-      // Per-agent tool capability whitelist. null = unrestricted (falls back to
-      // global config.allowedTools in agent-factory — today's behaviour for any
-      // agent that never set tool_capabilities).
+      portalSkillsDir: this.skillsDir ? path.join(this.skillsDir, "resolved") : undefined,
+      mcpServers: this.mcpServersState,
+      agentType: normalizeAgentType(this.agentTypeState),
+      harnessResolved: this.harnessResolvedState,
+      // Per-agent tool capability whitelist. null remains unrestricted only for
+      // explicit Custom; built-in types expand their locked capability groups.
       allowedTools: this.allowedToolsState,
       // The stored system_prompt is the agent-owned identity/behaviour
       // instruction, not a replacement for Siclaw's platform prompt. Keep the
@@ -2871,6 +2921,7 @@ export class AgentBoxSessionManager {
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
+      knowledgeIndexer: result.knowledgeIndexer,
       dpStateRef: result.dpStateRef,
       turnRef: result.turnRef,
       _lastSavedMessageCount: 0,
@@ -3432,6 +3483,17 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] Shared memory indexer close error:`, err);
       }
       this._sharedMemoryIndexer = null;
+    }
+
+    if (this._sharedKnowledgeIndexer) {
+      try {
+        await this._sharedKnowledgeIndexer.sync();
+        this._sharedKnowledgeIndexer.close();
+        console.log(`[agentbox-session] Shared knowledge indexer closed`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared knowledge indexer close error:`, err);
+      }
+      this._sharedKnowledgeIndexer = null;
     }
 
     this._sharedInitialized = false;

@@ -30,9 +30,8 @@ import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
-import { safeParseJson } from "../gateway/dialect-helpers.js";
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
-import { resolveCapabilities } from "../core/tool-capabilities.js";
+import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
   CliSnapshotClusterCredential,
@@ -45,7 +44,11 @@ import type {
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
 import { resolveSnapshotModelRouting } from "./model-routing-config.js";
-import { effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
+import {
+  effectiveAgentPrompt,
+  effectiveCapabilityKeys,
+  requireAgentType,
+} from "../core/agent-types.js";
 
 export type {
   CliSnapshotKnowledgeRepo,
@@ -539,16 +542,21 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // boundary (the AgentBox/TUI stays oblivious to group keys). null/empty =
     // unrestricted; we only emit the field when non-null to keep the payload
     // compact (TUI treats absent as null).
-    const allowedToolsOut = activeAgent
-      ? resolveCapabilities(safeParseJson<string[] | null>(activeAgent.tool_capabilities, null))
+    const activeAgentType = activeAgent ? requireAgentType(activeAgent.agent_type) : null;
+    const allowedToolsOut = activeAgent && activeAgentType
+      ? resolveCapabilities(effectiveCapabilityKeys(
+          activeAgentType,
+          parseToolCapabilitiesAtBoundary(activeAgent.tool_capabilities),
+        ))
       : null;
 
     const activeAgentOut: CliSnapshotActiveAgent | null = activeAgent
       ? {
           name: activeAgent.name,
           description: activeAgent.description,
+          agentType: activeAgentType!,
           systemPrompt: effectiveAgentPrompt(
-            normalizeAgentType(activeAgent.agent_type),
+            activeAgentType!,
             activeAgent.system_prompt,
           ) ?? null,
           modelProvider: activeAgent.model_provider,
