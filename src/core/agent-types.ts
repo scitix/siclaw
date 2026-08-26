@@ -15,8 +15,9 @@
  *                   No skills by default. Ships an editable default prompt.
  *   - knowledge_qa — researches bound knowledge bases and synthesizes sourced
  *                    answers. Read-only, no skills by default, and no delegation.
- *   - custom      — the legacy free-form agent: the operator picks capabilities
- *                   (tool_capabilities). Existing agents map here.
+ *   - custom      — the legacy free-form agent. Standalone Portal may persist
+ *                   an operator's tool_capabilities selection; integrations
+ *                   that omit it intentionally retain unrestricted built-ins.
  *
  * `capabilities` are CAPABILITY_GROUPS keys (src/core/tool-capabilities.ts);
  * null means "use the agent's own tool_capabilities" (custom). `defaultPrompt`
@@ -59,25 +60,26 @@ export const COORDINATOR_DEFAULT_PROMPT =
   "coordinator I do not do hands-on work\" — just give the answer. When you cannot deliver one, state the " +
   "OUTCOME the user needs (e.g. the specialist covering that cluster could not be reached, or which detail " +
   "you still need) rather than explaining your own rules. " +
-  "To ROUTE: (1) determine the TARGET resource (cluster / " +
-  "host / node) from the user's request; (2) call `list_delegates` first with query=<that target exactly as " +
-  "established> to find WHICH " +
-  "delegate is bound to it — this authoritative coverage lookup (NOT your own cluster_list, which is YOUR " +
-  "bindings) is how you confirm who covers the target. If it returns no exact binding match and the target " +
-  "may be a cluster alias, consult a routing-helper skill you were given, if any. Only when the helper confirms " +
-  "one canonical Siclaw binding name, retry `list_delegates` once with that name and " +
-  "`binding_name_confirmed=true`; do not guess from an ambiguous or unresolved result. If no helper is " +
-  "attached, it cannot confirm one name, or the confirmed retry also misses, tell the user that no authorized " +
-  "agent covers the name and that it may be an alias. (3) delegate to the matching agent via " +
-  "`delegate_to_agent`. If you CANNOT determine the target from the request — it is missing, ambiguous, or a " +
-  "node/pod is named without its cluster — ASK THE USER to supply the missing detail. Do NOT guess, do NOT " +
-  "browse the whole delegate list hoping to infer it, and do NOT pick the closest match. EXCEPTION — a " +
+  "To ROUTE: (1) establish one canonical Siclaw cluster or host binding. When the user already supplied a " +
+  "cluster or host name, call `list_delegates` first with query=<that target exactly as established>. When the " +
+  "user instead supplied a concrete Pod, Job, Node, reservation, entry ID, or IP without its cluster, use an " +
+  "explicitly attached resource-locator helper and its bound MCP tools, if available, to resolve exactly one " +
+  "canonical binding; the helper discovers identity but NEVER authorizes delegation. For a direct-name miss " +
+  "that may be an alias, the same helper may resolve it. (2) after a helper confirms exactly one binding, call " +
+  "`list_delegates` once with query=<confirmed binding> and `binding_name_confirmed=true`. This authoritative " +
+  "coverage lookup — NOT your own `cluster_list`, which describes your bindings — is how you confirm WHICH " +
+  "delegate covers the target. Never guess from an ambiguous or unresolved helper result, try candidates one " +
+  "by one, or browse the raw delegate list to infer coverage. If no helper is attached, resolution is ambiguous, " +
+  "or the confirmed lookup misses, ask only for the smallest missing detail or report that no authorized agent " +
+  "covers the confirmed binding. (3) delegate to the matching agent via `delegate_to_agent`. If you CANNOT " +
+  "establish a target because the request contains no concrete resource identifier, ask the user for it. " +
+  "EXCEPTION — a " +
   "follow-up WITHIN an investigation already in progress: INHERIT the target resource and the specialist from " +
   "the ongoing thread. A pronoun-only or elliptical follow-up that does not restate the target still refers " +
   "to the resource you already established — do NOT re-ask the user for it, and do NOT re-run `list_delegates` " +
   "discovery; carry forward what you already know and delegate straight to the same specialist. Re-determine " +
-  "the target and re-query `list_delegates` ONLY when the target is genuinely NEW or has CHANGED. If you " +
-  "queried and NO delegate covers the target, follow the one-retry alias flow above; never repeat it. " +
+  "the target and repeat the bounded resolution/coverage flow ONLY when the target is genuinely NEW or has " +
+  "CHANGED. Never repeat a failed lookup in the same routing attempt. " +
   "Forward the task at a HIGH LEVEL, essentially as the user phrased it. You do NOT decide HOW the task is " +
   "done: do NOT read the specialist's execution procedures/skills or enumerate the steps for it, and do NOT " +
   "attempt any hands-on work yourself. The specialist owns the tools and the know-how and will work out the " +
@@ -157,7 +159,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   },
   custom: {
     label: "Custom Agent",
-    description: "Free-form capabilities with the same editable prompt field as every agent type.",
+    description: "Free-form built-in capabilities in standalone Portal; integrations that omit a selection retain legacy unrestricted compatibility.",
     capabilities: null,
     defaultPrompt: null,
     defaultNoSkills: false,

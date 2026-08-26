@@ -504,10 +504,11 @@ export async function createSiclawSession(
   }
 
   // -- MCP external tools (dynamic discovery, not in registry) --
-  let mcpManager: McpClientManager | undefined = compiledContext.harness.allowMcpTools
+  const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
+  let mcpManager: McpClientManager | undefined = exposeConfiguredMcp
     ? opts?.mcpManager
     : undefined;
-  const mcpServers = compiledContext.harness.allowMcpTools ? config.mcpServers : {};
+  const mcpServers = exposeConfiguredMcp ? config.mcpServers : {};
   let mcpTools: ToolDefinition[] = [];
   if (mcpManager) {
     const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
@@ -529,17 +530,17 @@ export async function createSiclawSession(
       console.warn(`[agent-factory] MCP initialization failed:`, err);
       mcpManager = undefined;
     }
-  } else if (compiledContext.harness.allowMcpTools) {
+  } else if (exposeConfiguredMcp) {
     console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
   } else {
-    console.log(`[agent-factory] MCP tools disabled by ${compiledContext.harness.resolution} harness`);
+    console.log(`[agent-factory] Configured MCP tools disabled by ${compiledContext.harness.resolution} harness`);
   }
-  // Bound MCP tools are orthogonal to the built-in `allowedTools` whitelist,
-  // but they are NOT exempt from the Agent harness: unresolved and delegated
-  // read-only contexts never initialize or append them.
-  // MCP availability is governed by an orthogonal axis — the `agent_mcp_servers`
-  // binding — so a capability group selection must not gate them. (Dynamic MCP
-  // tool names can't be statically enumerated into a capability group anyway.)
+  // Configured MCP tools are orthogonal to the built-in `allowedTools`
+  // whitelist, but they are NOT exempt from the Agent harness: unresolved and
+  // delegated-read-only contexts never initialize or append them. In a scoped
+  // AgentBox/Portal session the config already contains that Agent's resource
+  // bindings; standalone config is the user's explicit settings.json selection.
+  // Dynamic MCP tool names cannot be enumerated in static capability groups.
   // The whole `mcpTools` array is MCP by construction, so an unconditional push
   // is simpler than and equivalent to skipping by an `mcp__` name prefix.
   customTools.push(...mcpTools);

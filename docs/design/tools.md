@@ -551,11 +551,13 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 
-### allowedTools — Sole Availability Axis
+### allowedTools — Built-in and File-Tool Availability Axis
 
-`allowedTools` is the only control over tool availability after mode/`available`
-filtering — there are no exemptions. A `null`/omitted `allowedTools` passes every
-tool through (the default); a non-null array passes only the tools it names.
+`allowedTools` is the control over registry tools and framework file tools after
+mode/`available` filtering. A `null`/omitted `allowedTools` passes every one of
+those tools (the default); a non-null array passes only the names it contains.
+Configured MCP is a separate resource-binding axis because its tool names are
+discovered dynamically and cannot be enumerated in static capability groups.
 
 **Per-agent source**: `allowedTools` is resolved from the agent's selected
 capability groups (`agents.tool_capabilities`) at the Gateway boundary
@@ -584,14 +586,22 @@ mistaken for that state.
 
 ### Tools Not in Registry
 
-Both categories are appended after `resolve()` but are still subject to the same
-`allowedTools` name-based whitelist (a non-null `allowedTools` filters them; `null`
-passes all). They carry no `mode`/`available` metadata, so `allowedTools` is their
-sole availability gate.
+Both categories are appended after `resolve()`, but their availability contracts
+are intentionally different:
 
-- **MCP tools**: dynamically discovered at runtime, appended after resolve
-- **File I/O tools** (read/edit/write/grep/find/ls): framework tools with
-  path-restricted operations injection, appended after resolve
+- **MCP tools** are dynamically discovered from the session's configured MCP
+  servers. They are exposed only for a resolved, non-delegated-read-only
+  harness, and are orthogonal to `allowedTools`. In scoped sessions the config
+  is already Agent-scoped; standalone sessions use explicit local config.
+- **File I/O tools** (read/edit/write/grep/find/ls) are framework tools with
+  path-restricted operations injection. `appendAllowedTools()` applies the same
+  name whitelist as `ToolRegistry.resolve()`.
+
+MCP server descriptions become part of the corresponding model-visible tool
+descriptions. The current config contract has no read/write classification or
+binding-source provenance; do not infer either from names. Agent-type-safe MCP
+selection therefore belongs to the control-plane resource binding until that
+metadata exists end to end.
 
 Historical note: the DP refactor (Apr 2026) removed three extension tools
 (`propose_hypotheses`, `end_investigation`, `deep_search`) that used to land

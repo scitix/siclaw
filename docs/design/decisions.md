@@ -636,8 +636,8 @@ constraint. Its outputs are:
 
 - a role-neutral system prompt with capability-derived infrastructure,
   workflow, memory, skill-authoring, and operational-safety sections;
-- an enforceable harness for built-in tools, MCP, memory, and allowed skill
-  roots.
+- an enforceable harness for built-in tools, configured MCP exposure, memory,
+  and allowed skill roots.
 
 All AgentBox and Portal-backed TUI entry points pass the locked Agent type and
 resolution state through this compiler. Unresolved startup is fail-closed.
@@ -653,6 +653,10 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 - ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
 - ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
   skills; required skills must be explicitly bound.
+- ⚠️ Explicitly configured MCP remains orthogonal to built-in capability
+  groups. The current MCP wire payload has no effect classification or binding
+  provenance, so Agent-type-safe selection is enforced by the control plane,
+  not guessed from dynamic tool names in Siclaw.
 - ⚠️ Persisted full-template overrides remain compatible and therefore do not
   receive bundled role sections; the hardcoded Safety/Language suffix remains.
 

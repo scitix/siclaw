@@ -15,8 +15,8 @@ outputs:
 
 - a role-neutral platform prompt plus only the type/capability sections the
   harness can actually support;
-- an enforceable harness policy for built-in tools, MCP, memory, and skill
-  roots.
+- an enforceable harness policy for built-in tools, configured MCP exposure,
+  memory, and skill roots.
 
 Prompt text is descriptive, never the permission gate. The model-visible tool
 schemas and skill index are filtered from the same policy that selected their
@@ -27,15 +27,44 @@ prompt guidance. In particular:
 - planning and sub-agent guidance appear only when their tools are allowed;
 - QA knowledge catalog text asks for evidence synthesis and never suggests
   shell checks;
-- QA/Coordinator do not inherit repo-bundled or user-global operational skills;
+- QA/Coordinator do not inherit repo-bundled or user-global operational skills,
+  but they still receive skills, knowledge, and MCP explicitly configured for
+  that Agent;
 - delegated read-only sessions suppress MCP, memory, writes, and operational
   guidance;
 - an unresolved control-plane lookup exposes no tools, MCP, memory, or ambient
   skills until a later successful sync.
 
+The final model context has two independent availability axes:
+
+| Agent type | Built-in capability groups | Explicitly configured resources |
+|---|---|---|
+| SRE | infrastructure, commands, scripts, files, memory, planning and sub-agents | skills, knowledge and MCP |
+| Coordinator | files and delegation; no own `cluster_list` / `host_list` | knowledge/skills for answering and routing, plus MCP for an attached resource-locator helper |
+| Knowledge QA | read-only file/search tools | knowledge, knowledge skills and query MCP |
+| Custom | standalone Portal selection, or legacy unrestricted built-ins when an integration supplies no selection | skills, knowledge and MCP |
+
+`allowedTools` controls the first axis. It does not classify dynamic MCP tool
+names. In scoped AgentBox/Portal sessions, the MCP config already contains the
+Agent's resolved bindings; in standalone mode it is the user's explicit
+`settings.json` configuration. The current MCP payload carries neither a
+trustworthy read/write classification nor binding-source provenance, so Siclaw
+must not guess from a server or tool name. An SRE MCP bound to a QA Agent would
+therefore still put its tool descriptions in model context; preventing that is
+a control-plane resource-binding responsibility until the wire contract gains
+enforceable provenance/effect metadata.
+
+For Coordinator, `list_delegates` is the authorization/coverage check, not a
+resource search. A concrete Pod/Job/Node/reservation/entry ID/IP without its
+cluster may be resolved by an explicitly bound resource-locator skill and MCP;
+only one confirmed Siclaw binding may then be passed to `list_delegates` with
+`binding_name_confirmed=true`.
+
 `custom` plus a successfully resolved null capability selection retains the
-legacy unrestricted behavior. This compatibility is explicit in the harness;
-an unresolved lookup never falls into it.
+legacy unrestricted built-in behavior. Standalone Portal can persist an
+operator selection; integrated control planes that omit `tool_capabilities`
+use the compatibility path. This state is explicit in the harness, so an
+unresolved lookup never falls into it.
 
 The same contract applies in AgentBox sessions and the Portal-backed TUI.
 Persisted prompt fragments retain the legacy template conveniences:

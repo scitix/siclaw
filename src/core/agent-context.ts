@@ -8,6 +8,7 @@ import type { DelegationContext, SessionMode } from "./types.js";
 export const AGENT_CONTEXT_VERSION = "agent-context/v1" as const;
 
 export type HarnessResolution = "resolved" | "unresolved";
+export type McpExposure = "configured" | "none";
 
 export interface AgentHarnessPolicy {
   version: typeof AGENT_CONTEXT_VERSION;
@@ -15,7 +16,8 @@ export interface AgentHarnessPolicy {
   resolution: HarnessResolution;
   /** null is the explicit legacy Custom compatibility mode: all built-in tools. */
   allowedTools: string[] | null;
-  allowMcpTools: boolean;
+  /** MCP is a resource-binding axis, separate from built-in capability groups. */
+  mcpExposure: McpExposure;
   memoryEnabled: boolean;
   includeBundledSkills: boolean;
   includePlatformSkills: boolean;
@@ -47,7 +49,7 @@ export interface AgentContextManifest {
   tools: { names: string[]; sha256: string };
   skills: { names: string[]; sha256: string };
   resources: {
-    mcpEnabled: boolean;
+    mcpExposure: McpExposure;
     mcpServers: string[];
     knowledgeMounted: boolean;
     memoryEnabled: boolean;
@@ -95,10 +97,12 @@ export function resolveAgentHarness(input: Omit<CompileAgentContextInput, "mode"
     agentType,
     resolution,
     allowedTools,
-    // MCP does not currently carry an enforceable read-only classification.
-    // Explicit Agent bindings remain available normally, but an unresolved or
-    // delegated-read-only harness cannot safely expose them.
-    allowMcpTools: resolution === "resolved" && !delegatedReadOnly,
+    // MCP servers are already scoped by the runtime's resolved configuration.
+    // They are an explicit resource-binding axis, not names that can be placed
+    // in a static built-in capability group. Siclaw currently receives no
+    // trustworthy read/write or binding-source metadata with which to narrow
+    // this set further. Unresolved and delegated-read-only contexts fail closed.
+    mcpExposure: resolution === "resolved" && !delegatedReadOnly ? "configured" : "none",
     memoryEnabled:
       resolution === "resolved" &&
       input.memoryConfigured &&
@@ -183,7 +187,7 @@ export function createAgentContextManifest(input: {
     tools: { names: toolNames, sha256: sha256(JSON.stringify(toolNames)) },
     skills: { names: skillNames, sha256: sha256(JSON.stringify(skillNames)) },
     resources: {
-      mcpEnabled: harness.allowMcpTools,
+      mcpExposure: harness.mcpExposure,
       mcpServers: mcpServerNames,
       knowledgeMounted: input.knowledgeMounted,
       memoryEnabled: harness.memoryEnabled,

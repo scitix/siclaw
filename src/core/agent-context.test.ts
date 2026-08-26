@@ -17,7 +17,7 @@ describe("resolveAgentHarness", () => {
 
     expect(harness.resolution).toBe("unresolved");
     expect(harness.allowedTools).toEqual([]);
-    expect(harness.allowMcpTools).toBe(false);
+    expect(harness.mcpExposure).toBe("none");
     expect(harness.memoryEnabled).toBe(false);
     expect(harness.includeBundledSkills).toBe(false);
     expect(harness.includeInfrastructureGuidance).toBe(false);
@@ -43,7 +43,7 @@ describe("resolveAgentHarness", () => {
       delegation: { delegationId: "d1", readOnly: true },
     });
 
-    expect(harness.allowMcpTools).toBe(false);
+    expect(harness.mcpExposure).toBe("none");
     expect(harness.memoryEnabled).toBe(false);
     expect(harness.includeOperationalSafety).toBe(false);
   });
@@ -68,6 +68,7 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("delete/evict/cordon");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
     expect(context.harness.includeBundledSkills).toBe(false);
+    expect(context.harness.mcpExposure).toBe("configured");
   });
 
   it("retains SRE infrastructure, workflow, memory, and operational guidance", () => {
@@ -90,7 +91,7 @@ describe("compileAgentContext", () => {
     expect(context.harness.includeBundledSkills).toBe(true);
   });
 
-  it("does not give Coordinator its own cluster discovery instructions", () => {
+  it("gives Coordinator resource-locator routing without its own cluster discovery instructions", () => {
     const context = compileAgentContext({
       agentType: "coordinator",
       allowedTools: ["read", "list_delegates", "delegate_to_agent"],
@@ -99,8 +100,11 @@ describe("compileAgentContext", () => {
     });
 
     expect(context.systemPrompt).toContain("COORDINATOR");
+    expect(context.systemPrompt).toContain("resource-locator helper");
+    expect(context.systemPrompt).toContain("binding_name_confirmed=true");
     expect(context.systemPrompt).not.toContain("# Infrastructure Access");
     expect(context.systemPrompt).not.toContain("Settings → Clusters");
+    expect(context.harness.mcpExposure).toBe("configured");
   });
 });
 
@@ -117,12 +121,14 @@ describe("createAgentContextManifest", () => {
       mode: "web",
       tools: [{ name: "read" }, { name: "knowledge_cite" }],
       skillNames: ["research", "catalog"],
-      mcpServerNames: [],
+      mcpServerNames: ["knowledge-search"],
       knowledgeMounted: true,
     });
 
     expect(manifest.tools.names).toEqual(["knowledge_cite", "read"]);
     expect(manifest.skills.names).toEqual(["catalog", "research"]);
+    expect(manifest.resources.mcpExposure).toBe("configured");
+    expect(manifest.resources.mcpServers).toEqual(["knowledge-search"]);
     expect(manifest.prompt.chars).toBe(context.systemPrompt.length);
     expect(manifest.prompt.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(manifest)).not.toContain("question answering agent");
