@@ -1216,6 +1216,69 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     await Promise.all([first, second]);
   });
 
+  it("queues different participants in the same Topic behind one shared session", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionId: "shared-topic-session",
+      sessionKey: "lark_thread:mid-topic-root",
+      contextMode: "topic",
+    }));
+    let releaseFirst!: () => void;
+    promptMock
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseFirst = () => resolve({ sessionId: "shared-topic-session" });
+      }))
+      .mockResolvedValueOnce({ sessionId: "shared-topic-session" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const mgr = makeAgentBoxManager("a1");
+    const botOpenId = "ou_bot_self";
+    const config = { app_id: "x", app_secret: "y" } as const;
+
+    const first = handleLarkMessage(
+      makeTextEvent("@_user_1 first", {
+        message_id: "mid-topic-root",
+        chat_type: "group",
+        mentions: [{ key: "@_user_1", id: { open_id: botOpenId } }],
+      }, "ou_user_1"),
+      makeLarkClient(),
+      "lark",
+      mgr as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      botOpenId,
+    );
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+
+    const second = handleLarkMessage(
+      makeTextEvent("second", {
+        message_id: "mid-topic-followup",
+        chat_type: "group",
+        root_id: "mid-topic-root",
+        thread_id: "omt-topic-1",
+        mentions: [],
+      }, "ou_user_2"),
+      makeLarkClient(),
+      "lark",
+      mgr as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      botOpenId,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(promptMock).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(2));
+    await Promise.all([first, second]);
+    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual([
+      "shared-topic-session",
+      "shared-topic-session",
+    ]);
+  });
+
   it("replies with a queue-full notice when one binding already has 20 pending messages", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "full-session" }));
     let releaseFirst!: () => void;
