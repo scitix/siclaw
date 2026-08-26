@@ -2785,7 +2785,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, { ok: true });
   });
 
-  // Set a group binding's context mode (shared|per_user) — admin any, user own.
+  // Set a group binding's context mode (shared|per_user|topic) — admin any, user own.
   // The runtime picks up the change on its mode cache's TTL (or the next @-turn
   // resolve); the in-group /mode card is the low-latency path.
   router.put(`${P}/agents/:id/channel-bindings/:bindingId/context-mode`, async (req, res, params) => {
@@ -2793,8 +2793,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
     const body = await parseBody<{ mode?: string }>(req);
-    if (body.mode !== "shared" && body.mode !== "per_user") {
-      sendJson(res, 400, { error: "mode must be 'shared' or 'per_user'" });
+    if (body.mode !== "shared" && body.mode !== "per_user" && body.mode !== "topic") {
+      sendJson(res, 400, { error: "mode must be 'shared', 'per_user', or 'topic'" });
       return;
     }
 

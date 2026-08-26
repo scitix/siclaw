@@ -79,6 +79,10 @@ is no separate Topic switch or deployment setting.
   streaming card inside it. Follow-ups in that topic reuse that user's Agent
   session without another mention. Unrelated topics and another user's
   unmentioned replies do not create or inherit the private session.
+- **Topic (thread-shared)**: a root `@bot` message claims that Feishu Topic.
+  Every authorized participant can then continue inside it without another
+  mention, and all of them reuse the same Agent session. The main group and
+  every other unclaimed Topic remain silent and context-isolated.
 - **Team (shared)**: users continue to `@bot` in the main group and the bot
   replies on the existing main-group path. The whole group keeps one shared
   Agent session; Feishu topics do not split it into separate sessions.
@@ -100,7 +104,7 @@ Use these application-identity scopes for a complete Siclaw Agent test bot:
 | Send and reply to messages | `im:message` | Plain-text replies, CardKit card replies, topic replies, mode-switch announcements, and downloading images attached to received messages |
 | Receive direct messages | `im:message.p2p_msg:readonly` | Required separately even when `im:message` is enabled |
 | Receive group `@bot` messages | `im:message.group_at_msg:readonly` | Starts an investigation from a group root message |
-| Receive group messages without a mention | `im:message.group_msg` | Required for natural follow-ups inside an existing personal-mode bot topic and for passive shared-group discussion context; this is a sensitive permission, so restrict the app's availability for pilots |
+| Receive group messages without a mention | `im:message.group_msg` | Required for natural follow-ups inside an existing Personal- or Topic-mode bot Topic and for passive shared-group discussion context; this is a sensitive permission, so restrict the app's availability for pilots |
 | Read group metadata | `im:chat:readonly` | Resolves the group title shown in Siclaw |
 | Create and stream cards | `cardkit:card:write` | Creates the thinking card, streams milestones, finalizes the answer, and updates feedback controls |
 | Upload reply images and files | `im:resource` | Uploads charts and other Agent-generated message resources; received-message downloads are covered by `im:message` |
@@ -132,6 +136,12 @@ Acceptance should cover each permission unit independently:
   confirm the first reply opens a topic.
 - Personal-mode continuity: reply inside that topic without another mention and
   confirm the same Siclaw session is reused.
+- Topic-mode root: select **Topic**, send `@bot` with a unique text, and confirm
+  the first reply opens a Topic.
+- Topic-mode continuity: have another authorized member reply in that Topic
+  without another mention and confirm both turns reuse the same session.
+- Topic-mode isolation: reply without a mention in another Topic and confirm the
+  bot stays silent and creates no session there.
 - Team-mode root: select **Team**, send `@bot` with a unique text, and confirm
   the bot replies in the main group without opening a topic.
 - Team-mode continuity: have another member `@bot` and confirm both turns reuse

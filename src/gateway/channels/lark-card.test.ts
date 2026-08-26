@@ -512,9 +512,9 @@ describe("buildModeCard", () => {
     return cols.map((c: any) => c.elements[0]);
   }
 
-  it("renders two self-contained mode buttons and marks the current one primary", () => {
+  it("renders three self-contained mode buttons and marks the current one primary", () => {
     const card = buildModeCard("shared", "ch1", "oc_group1", "zh-CN") as any;
-    const [sharedBtn, perUserBtn] = buttons(card);
+    const [sharedBtn, perUserBtn, topicBtn] = buttons(card);
 
     expect(sharedBtn.behaviors[0].value).toEqual({
       kind: MODE_ACTION_KIND, channel_id: "ch1", route_key: "oc_group1", mode: "shared", locale: "zh-CN",
@@ -522,9 +522,13 @@ describe("buildModeCard", () => {
     expect(perUserBtn.behaviors[0].value).toEqual({
       kind: MODE_ACTION_KIND, channel_id: "ch1", route_key: "oc_group1", mode: "per_user", locale: "zh-CN",
     });
+    expect(topicBtn.behaviors[0].value).toEqual({
+      kind: MODE_ACTION_KIND, channel_id: "ch1", route_key: "oc_group1", mode: "topic", locale: "zh-CN",
+    });
     // Current mode (shared) is highlighted; the other is default.
     expect(sharedBtn.type).toBe("primary");
     expect(perUserBtn.type).toBe("default");
+    expect(topicBtn.type).toBe("default");
     expect(sharedBtn.text.content).toContain("✓");
   });
 
@@ -532,5 +536,12 @@ describe("buildModeCard", () => {
     const [sharedBtn, perUserBtn] = buttons(buildModeCard("per_user", "ch1", "g", "en-US") as any);
     expect(perUserBtn.type).toBe("primary");
     expect(sharedBtn.type).toBe("default");
+  });
+
+  it("highlights topic when it is the current mode", () => {
+    const [sharedBtn, perUserBtn, topicBtn] = buttons(buildModeCard("topic", "ch1", "g", "en-US") as any);
+    expect(topicBtn.type).toBe("primary");
+    expect(sharedBtn.type).toBe("default");
+    expect(perUserBtn.type).toBe("default");
   });
 });

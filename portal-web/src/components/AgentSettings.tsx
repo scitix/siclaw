@@ -1120,13 +1120,19 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
     } catch (err: any) { toast.error(err.message) }
   }
 
-  const handleSetContextMode = async (bindingId: string, mode: "shared" | "per_user") => {
+  const handleSetContextMode = async (bindingId: string, mode: "shared" | "per_user" | "topic") => {
     try {
       await api(`/siclaw/agents/${agentId}/channel-bindings/${bindingId}/context-mode`, {
         method: "PUT", body: { mode },
       })
       setBindings(prev => prev.map(b => (b.id === bindingId ? { ...b, context_mode: mode } : b)))
-      toast.success(mode === "shared" ? "Switched to Team (shared) mode" : "Switched to Personal (per-user) mode")
+      toast.success(
+        mode === "shared"
+          ? "Switched to Team (shared) mode"
+          : mode === "topic"
+            ? "Switched to Topic (thread-shared) mode"
+            : "Switched to Personal (per-user) mode",
+      )
     } catch (err: any) { toast.error(err.message) }
   }
 
@@ -1234,13 +1240,14 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
                 <div className="flex shrink-0 items-center gap-1.5">
                   {b.route_type === "group" && (
                     <select
-                      value={b.context_mode === "shared" ? "shared" : "per_user"}
-                      onChange={e => handleSetContextMode(b.id, e.target.value as "shared" | "per_user")}
-                      title="Context mode: Team shares one conversation; Personal gives each member their own"
+                      value={b.context_mode === "shared" ? "shared" : b.context_mode === "topic" ? "topic" : "per_user"}
+                      onChange={e => handleSetContextMode(b.id, e.target.value as "shared" | "per_user" | "topic")}
+                      title="Context mode: Team shares the group; Personal isolates members; Topic shares only a claimed thread"
                       className="rounded-md border border-border/50 bg-secondary/30 px-1.5 py-1 text-[10px] text-muted-foreground hover:bg-secondary/50 focus:outline-none"
                     >
                       <option value="shared">Team (shared)</option>
                       <option value="per_user">Personal (per-user)</option>
+                      <option value="topic">Topic (thread-shared)</option>
                     </select>
                   )}
                   <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">

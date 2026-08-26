@@ -49,17 +49,18 @@ interface ChannelBindingRow {
   channel_created_by?: string | null;
 }
 
-type ContextMode = "shared" | "per_user";
+type ContextMode = "shared" | "per_user" | "topic";
 
 /**
- * Only an explicit "shared" is shared; NULL / anything unrecognised
+ * Only explicit known values are preserved; NULL / anything unrecognised
  * grandfathers to "per_user". Existing group bindings pre-date this column and
  * behaved per-sender, so a NULL must NOT silently merge their contexts on
  * upgrade. New bindings are written "shared" at pair time (the product default
  * for a fresh group), so the NULL branch only ever hits legacy rows.
  */
 function normalizeContextMode(value: unknown): ContextMode {
-  return value === "shared" ? "shared" : "per_user";
+  if (value === "shared" || value === "topic") return value;
+  return "per_user";
 }
 
 interface ResolvedChannelBinding {
@@ -120,7 +121,8 @@ async function resolveChannelBinding(
   // queue, so this one choice drives shared-vs-isolated end to end):
   //   shared   → chat:{route_key}  — the whole group shares one session,
   //              overriding whatever per-sender key the runtime guessed.
-  //   per_user → the per-sender key the runtime passed (open_id:{sender}).
+  //   per_user → participant + Topic, keeping every sender isolated.
+  //   topic    → Topic root only, shared by authorized participants.
   // Non-group (1:1 user) routes ignore the mode — they are single-user by
   // nature — and keep the legacy passed-key-or-binding-session behavior.
   const effectiveSessionKey = routeType === "group"
@@ -159,6 +161,7 @@ function buildGroupSessionKey(
   if (contextMode === "shared") return `chat:${routeKey}`;
 
   const conversation = conversationKey?.trim();
+  if (contextMode === "topic" && conversation) return conversation;
   if (conversation) {
     if (!participant || participant === conversation || participant.endsWith(`:${conversation}`)) {
       return participant ?? conversation;
@@ -427,7 +430,7 @@ async function updateChannelName(
 /**
  * Set a group's context sharing mode. The generic switch endpoint behind both
  * the console selector and the in-group /mode card. Rejects anything but the
- * two known modes so a bad client can't write a value that NULL-defaults to
+ * known modes so a bad client can't write a value that NULL-defaults to
  * shared silently.
  */
 async function updateChannelBindingContextMode(
@@ -436,8 +439,8 @@ async function updateChannelBindingContextMode(
   routeKey: string,
   mode: unknown,
 ): Promise<{ success: boolean; mode?: ContextMode; error?: string }> {
-  if (mode !== "shared" && mode !== "per_user") {
-    return { success: false, error: "mode must be 'shared' or 'per_user'" };
+  if (mode !== "shared" && mode !== "per_user" && mode !== "topic") {
+    return { success: false, error: "mode must be 'shared', 'per_user', or 'topic'" };
   }
   const [result] = await db.query(
     "UPDATE channel_bindings SET context_mode = ? WHERE channel_id = ? AND route_key = ?",
