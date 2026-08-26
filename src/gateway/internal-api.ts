@@ -272,8 +272,8 @@ export async function handleMcpServers(
  * the AgentBox stays oblivious to capability groups (mirrors ssh jump_host_id→
  * name and MCP boundary resolution).
  *
- * `{ allowedTools: null }` means "no restriction" — the agent never selected
- * any capability groups, so it keeps the global default tool set. The agentId
+ * `{ allowedTools: null }` means explicit legacy unrestricted Custom. Built-in
+ * types are expanded to their locked concrete tool lists. The agentId
  * comes from the mTLS cert identity (never the request body) so a box cannot
  * read another agent's whitelist.
  */

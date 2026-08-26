@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
-import { effectiveAgentPrompt, normalizeAgentType, type AgentType } from "./agent-types.js";
+import {
+  effectiveAgentPrompt,
+  effectiveCapabilityKeys,
+  requireAgentType,
+  type AgentType,
+} from "./agent-types.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { resolveCapabilities } from "./tool-capabilities.js";
 import type { DelegationContext, SessionMode } from "./types.js";
 
 export const AGENT_CONTEXT_VERSION = "agent-context/v1" as const;
@@ -81,9 +87,16 @@ function hasAnyTool(allowedTools: string[] | null, names: readonly string[]): bo
  * Agent type/capabilities. Prompt wording is never used as a permission gate.
  */
 export function resolveAgentHarness(input: Omit<CompileAgentContextInput, "mode" | "agentPrompt" | "systemPromptTemplate">): AgentHarnessPolicy {
-  const agentType = normalizeAgentType(input.agentType);
+  const agentType = requireAgentType(input.agentType);
   const resolution: HarnessResolution = input.harnessResolved === false ? "unresolved" : "resolved";
-  const allowedTools = resolution === "resolved" ? input.allowedTools : [];
+  // null is unrestricted only for an explicit Custom Agent. Built-in types own
+  // locked capability groups, so direct/compiler callers that have not already
+  // expanded them still receive the type's concrete allow-list rather than all
+  // tools. This keeps the compiler boundary aligned with Gateway/LocalSpawner.
+  const resolvedTools = input.allowedTools === null && agentType !== "custom"
+    ? (resolveCapabilities(effectiveCapabilityKeys(agentType, null)) ?? [])
+    : input.allowedTools;
+  const allowedTools = resolution === "resolved" ? resolvedTools : [];
   const delegatedReadOnly = input.delegation?.readOnly === true;
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
 

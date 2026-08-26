@@ -35,6 +35,29 @@ describe("resolveAgentHarness", () => {
     expect(harness.includeOperationalSafety).toBe(true);
   });
 
+  it("expands null to the locked capability set for Knowledge QA", () => {
+    const harness = resolveAgentHarness({
+      agentType: "knowledge_qa",
+      allowedTools: null,
+      memoryConfigured: true,
+    });
+
+    expect(harness.allowedTools).toEqual([
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+    ]);
+    expect(harness.legacyUnrestrictedCustom).toBe(false);
+    expect(harness.includeBundledSkills).toBe(false);
+    expect(harness.includeInfrastructureGuidance).toBe(false);
+  });
+
+  it("rejects an unknown type instead of normalizing it to unrestricted Custom", () => {
+    expect(() => resolveAgentHarness({
+      agentType: "future_type",
+      allowedTools: null,
+      memoryConfigured: true,
+    })).toThrow("Invalid or missing agent_type");
+  });
+
   it("removes MCP and memory from delegated read-only work", () => {
     const harness = resolveAgentHarness({
       agentType: "sre",

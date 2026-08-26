@@ -372,9 +372,9 @@ export class AgentBoxSessionManager {
    * Per-agent tool capability whitelist — the resolved `allowedTools` list for
    * this AgentBox's agent (see core/tool-capabilities.ts).
    *
-   * `null` (the default) = no restriction: createSiclawSession falls back to the
-   * global `config.allowedTools`, i.e. exactly the behaviour before this feature
-   * existed. A non-null array restricts the agent to those tool names.
+   * `null` is unrestricted only for an explicitly resolved Custom Agent.
+   * Built-in types expand their locked capability groups at the compiler
+   * boundary; unresolved startup state remains fail-closed.
    *
    * This state is PER-AGENT by construction: one AgentBoxSessionManager instance
    * per agent (K8s = one pod; LocalSpawner = one `new AgentBoxSessionManager()`
@@ -2276,10 +2276,8 @@ export class AgentBoxSessionManager {
       agentType: normalizeAgentType(this.agentTypeState),
       harnessResolved: this.harnessResolvedState,
       // A spawned sub-agent must never be broader than its parent: inherit the
-      // parent's per-agent tool whitelist. Without this, a restricted agent that
-      // has the `spawn_subagents` capability could escalate by spawning a child
-      // that falls back to the global config.allowedTools (all tools). null
-      // (unrestricted parent) stays null — identical to pre-feature behaviour.
+      // parent's per-agent tool whitelist. Explicit Custom null remains
+      // unrestricted; built-in null is expanded to the type's locked groups.
       allowedTools: this.allowedToolsState,
       // The plan is parent-owned: sub-agents have no task tools (isSubagent hides
       // them), so the child neither reads nor writes the ledger — the parent marks
@@ -2853,9 +2851,8 @@ export class AgentBoxSessionManager {
       mcpServers: this.mcpServersState,
       agentType: normalizeAgentType(this.agentTypeState),
       harnessResolved: this.harnessResolvedState,
-      // Per-agent tool capability whitelist. null = unrestricted (falls back to
-      // global config.allowedTools in agent-factory — today's behaviour for any
-      // agent that never set tool_capabilities).
+      // Per-agent tool capability whitelist. null remains unrestricted only for
+      // explicit Custom; built-in types expand their locked capability groups.
       allowedTools: this.allowedToolsState,
       // The stored system_prompt is the agent-owned identity/behaviour
       // instruction, not a replacement for Siclaw's platform prompt. Keep the

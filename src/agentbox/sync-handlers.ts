@@ -715,7 +715,8 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
 
 /**
  * Payload shape returned by the Gateway's /api/internal/tool-capabilities:
- * the already-resolved concrete allowedTools list (null = no restriction).
+ * the already-resolved concrete allowedTools list (null = explicit legacy
+ * unrestricted Custom only).
  */
 interface ToolsPayload {
   allowedTools: string[] | null;

@@ -218,7 +218,8 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   agentType: portalSnapshot?.activeAgent?.agentType ?? "sre",
   harnessResolved: true,
   // Per-agent tool whitelist (resolved from capability groups by the snapshot).
-  // Absent/null = unrestricted → agent-factory falls back to config.allowedTools.
+  // Standalone SRE null expands to the locked SRE capability set; only explicit
+  // Custom null remains unrestricted.
   allowedTools: portalSnapshot?.activeAgent?.allowedTools ?? null,
   portalActiveAgent: portalSnapshot?.activeAgent ?? null,
   portalAvailableAgents: portalSnapshot?.availableAgents ?? [],

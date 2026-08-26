@@ -55,6 +55,7 @@ import {
   buildKnowledgeCitationSystemPrompt,
   createKnowledgeCitationSupport,
 } from "./knowledge-citation-tool.js";
+import { resolveSkillDirectories } from "./skill-directories.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
@@ -78,7 +79,7 @@ export interface CreateSiclawSessionOpts {
   delegationRoster?: import("./tool-registry.js").ToolRefs["delegationRoster"];
   /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
-  /** Agent tool allow-list: null = all tools, string[] = only these tools */
+  /** Agent tool allow-list: null is unrestricted only for explicit Custom; built-in types expand their locked groups. */
   allowedTools?: string[] | null;
   /** Agent kind used by the shared context compiler. Legacy standalone callers default to SRE. */
   agentType?: AgentType;
@@ -109,10 +110,9 @@ export interface CreateSiclawSessionOpts {
    */
   knowledgeDir?: string;
   /**
-   * Absolute path to a directory that a local Portal snapshot has materialized
-   * skills into. CLI mode only: when set, the agent session loads builtin
-   * skills from here INSTEAD of `./skills/`, making Portal the source of
-   * truth for skill content. Unset = legacy filesystem behaviour.
+   * Authoritative scoped resolved-skill directory. Portal-paired TUI and
+   * LocalSpawner pass this so the session never falls back to process-shared
+   * skills while the scoped sync is missing or pending.
    */
   portalSkillsDir?: string;
   /**
@@ -680,42 +680,18 @@ export async function createSiclawSession(
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
-  // Skill directory: single "resolved/" built by sync-handlers.ts materialize
-  // at {skillsBase}/resolved/. Contains every skill this agent is bound to,
-  // flattened (bundle from Gateway is already priority-merged: global > builtin).
-  //
-  // Note: there is intentionally no per-user segment here. Earlier drafts
-  // picked {skillsBase}/user/{userId}/resolved when userId was set, but no
-  // writer ever materialized to that path — materialize always writes the
-  // shared location — so agent-factory would miss every synced skill the
-  // moment mtls cert provided a userId. Both paths now align on the shared
-  // location; LocalSpawner's multi-tenant safety is handled upstream
-  // (materialize is gated in local mode per the invariants doc).
+  // K8s uses the pod-local shared resolved/ tree. LocalSpawner and Portal-paired
+  // TUI pass an authoritative scoped directory; if it does not exist yet, the
+  // session intentionally sees no bound skills instead of falling back to a
+  // process-shared tree.
   const resolvedSkillsDir = path.join(skillsBase, "resolved");
-
-  // Fallback: only operational harnesses may load repo-bundled skills when no
-  // control-plane materialization exists. QA/Coordinator should see only their
-  // explicitly bound skills, never ambient SRE skills from this checkout.
-  const builtinPath = path.resolve(cwd, "skills", "core");
-  const extensionPath = path.resolve(cwd, "skills", "extension");
-  const platformPath = path.resolve(cwd, "skills", "platform");
-
-  const skillsDirs: string[] = [];
-  if (opts?.portalSkillsDir && fs.existsSync(opts.portalSkillsDir)) {
-    // CLI mode with a live local Portal: skills already fetched + materialized
-    // by cli-main → prefer them over repo-local or gateway-synced sources.
-    skillsDirs.push(opts.portalSkillsDir);
-  } else if (fs.existsSync(resolvedSkillsDir)) {
-    skillsDirs.push(resolvedSkillsDir);
-  } else if (compiledContext.harness.includeBundledSkills) {
-    for (const bDir of [builtinPath, extensionPath]) {
-      if (fs.existsSync(bDir)) skillsDirs.push(bDir);
-    }
-  }
-  // Platform skills are always loaded (system-level, not user-managed)
-  if (compiledContext.harness.includePlatformSkills && fs.existsSync(platformPath)) {
-    skillsDirs.push(platformPath);
-  }
+  const skillsDirs = resolveSkillDirectories({
+    cwd,
+    skillsBase,
+    scopedSkillsDir: opts?.portalSkillsDir,
+    includeBundledSkills: compiledContext.harness.includeBundledSkills,
+    includePlatformSkills: compiledContext.harness.includePlatformSkills,
+  });
 
   // A scoped Agent must not inherit pi's ambient ~/.pi/agent/skills discovery.
   // Keep standalone SRE/TUI compatibility only when there is no Portal/Gateway

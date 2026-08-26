@@ -20,6 +20,7 @@ import {
 import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
 import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
+import { resolveSkillDirectories } from "../core/skill-directories.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -879,28 +880,18 @@ describe("createSkillsHandler scoped materialization", () => {
 });
 
 // =========================================================================
-// skill directory resolution — replicates the skillsDirs logic from
-// agent-factory.ts so the selection rules can be unit-tested in isolation.
+// skill directory resolution — exercises the same public selection policy used
+// by agent-factory.ts.
 // =========================================================================
 
 describe("skill directory resolution", () => {
-  // Replicate the skillsDirs logic from agent-factory.ts for testing
   function resolveSkillDirs(cwd: string, skillsBase: string): string[] {
-    const resolvedSkillsDir = path.join(skillsBase, "resolved");
-    const builtinPath = path.resolve(cwd, "skills", "core");
-    const extensionPath = path.resolve(cwd, "skills", "extension");
-    const platformPath = path.resolve(cwd, "skills", "platform");
-
-    const skillsDirs: string[] = [];
-    if (fs.existsSync(resolvedSkillsDir)) {
-      skillsDirs.push(resolvedSkillsDir);
-    } else {
-      for (const bDir of [builtinPath, extensionPath]) {
-        if (fs.existsSync(bDir)) skillsDirs.push(bDir);
-      }
-    }
-    if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
-    return skillsDirs;
+    return resolveSkillDirectories({
+      cwd,
+      skillsBase,
+      includeBundledSkills: true,
+      includePlatformSkills: true,
+    });
   }
 
   let tmpDir: string;
