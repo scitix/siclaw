@@ -1378,7 +1378,7 @@ function isBackgroundSpawn(message: PilotMessage): boolean {
   return stringValue(parsed?.status) === "launched"
 }
 
-function agentWorkSummary(message: PilotMessage): {
+export function agentWorkSummary(message: PilotMessage): {
   target: string
   targetLabel: string
   isSelfDelegation: boolean
@@ -1409,6 +1409,14 @@ function agentWorkSummary(message: PilotMessage): {
   const firstItem =
     (Array.isArray((result as Record<string, unknown>).item_results)
       ? ((result as Record<string, unknown>).item_results as unknown[])[0]
+      : undefined) as Record<string, unknown> | undefined
+  // The same slot on the DETAILS side. `result` above falls back to details only
+  // when the content is unparseable, so on the normal path these are two different
+  // objects: the model-visible one omits every field the model must not see, which
+  // is exactly where the tier outcome lives.
+  const detailsFirstItem =
+    (Array.isArray((details as Record<string, unknown>).item_results)
+      ? ((details as Record<string, unknown>).item_results as unknown[])[0]
       : undefined) as Record<string, unknown> | undefined
   const rawTarget =
     stringValue(args.agent_id) ??
@@ -1468,11 +1476,15 @@ function agentWorkSummary(message: PilotMessage): {
       stringValue(metadata.status) ??
       message.toolStatus ??
       "ready",
-    // Foreground: the collapse envelope's item_results[0] (already resolved above
-    // as firstItem). Background: only the persisted terminal event exists, which
-    // nests the outcome under metadata.tier — the launch returned before it was
-    // known.
-    tier: extractTierOutcome(firstItem, metadata),
+    // Foreground: the DETAILS item, not `firstItem`. Those differ and it matters —
+    // `result` prefers the parsed model-visible content, whose `item_results[]`
+    // carries only {item, status, summary} because the tier fields are deliberately
+    // NOT model-visible (they name a provider and a model). They exist only under
+    // toolDetails, so reading `firstItem` meant the single-task path — the common
+    // one — could never render a badge.
+    // Background: only the persisted terminal event exists, which nests the outcome
+    // under metadata.tier — the launch returned before it was known.
+    tier: extractTierOutcome(detailsFirstItem, metadata),
   }
 }
 
@@ -2437,7 +2449,7 @@ function groupItemLabel(raw: unknown): string {
  * from the live event, groupStatus/reduce from the terminal event). The launch args always carry the
  * original items, so item count + labels survive even before any child completes.
  */
-function groupWorkSummary(message: PilotMessage): {
+export function groupWorkSummary(message: PilotMessage): {
   title: string
   background: boolean
   overallStatus: string

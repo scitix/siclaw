@@ -760,7 +760,11 @@ function annotateExecJobCompletions(messages: PilotMessage[]): PilotMessage[] {
  * report. Refresh-safe — it's all chat history. (Sync spawn cards already fold via streaming.)
  */
 function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
-  const done = new Map<string, { status: string; summary?: string }>()
+  // `tier` is carried opaquely. A background single spawn's launch result returned
+  // `launched` before any tier was resolved, so the persisted terminal event is the
+  // ONLY record of which model ran it — reducing that event to {status, summary}
+  // meant the badge could never appear on this form, live or after a refresh.
+  const done = new Map<string, { status: string; summary?: string; tier?: unknown }>()
   for (const m of messages) {
     if (m.metadata?.kind !== "delegation_event") continue
     const id = messageDelegationId(m)
@@ -771,7 +775,11 @@ function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
     // truncated/timed-out background investigation as a clean green success).
     const status = normalizeCompletionStatus(messageString(m.metadata?.event_type) ?? messageString(m.metadata?.status))
     if (status === null) continue // not a terminal event
-    done.set(id, { status, summary: typeof m.content === "string" ? m.content : undefined })
+    done.set(id, {
+      status,
+      summary: typeof m.content === "string" ? m.content : undefined,
+      tier: (m.metadata as Record<string, unknown> | undefined)?.tier,
+    })
   }
   let changed = false
   const next = messages.map((m) => {
@@ -785,6 +793,10 @@ function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
         ...(m.metadata ?? {}),
         subBackground: true,
         ...(c ? { subBgStatus: c.status, subBgSummary: c.summary } : {}),
+        // Onto the LAUNCH row's metadata, which is what the card model reads
+        // (`extractTierOutcome(detailsFirstItem, metadata)`). Only when present, so
+        // a fold with no tier does not overwrite one already there.
+        ...(c?.tier ? { tier: c.tier } : {}),
       },
     }
   })
@@ -821,7 +833,15 @@ function hasActiveBackgroundSubagent(messages: PilotMessage[]): boolean {
 // event tagged `groupId`. annotateGroupCompletions folds all of those onto the launch card so it
 // rebuilds on reload; live per-item progress arrives via the group_progress chat event (SSE below).
 
-interface GroupItemFold { index: number; status: string; summary?: string; childSessionId?: string }
+/**
+ * `tier` rides along as an opaque object. The fold is the only place the persisted
+ * event's outcome can survive into the card model — every fold used to reduce these
+ * events to {index, status, summary}, so the tier was dropped for BOTH background
+ * forms, including after a refresh, while the foreground path worked. Kept unshaped
+ * here on purpose: `extractTierOutcome` owns the parsing, and a second reading of
+ * the same payload is how the two forms would drift.
+ */
+interface GroupItemFold { index: number; status: string; summary?: string; childSessionId?: string; tier?: unknown }
 
 /** A batch-form spawn_subagent (or legacy spawn_subagent_group) launched in the background — a
  *  multi-item batch defaults to background, so a "launched" result marks it; before the result lands
@@ -847,7 +867,7 @@ interface GroupTerminalFold {
   summary?: string
   childSessionId?: string
   /** Per-item status snapshot (index → status) — fills in items never persisted as their own child. */
-  itemStatuses?: Array<{ index: number; status: string }>
+  itemStatuses?: Array<{ index: number; status: string; tier?: unknown }>
 }
 
 /** True when the group metadata already on a launch row equals the freshly-computed fold, so the row
@@ -865,6 +885,11 @@ function groupMetaUnchanged(prev: Record<string, unknown> | undefined, next: Rec
   for (let i = 0; i < b.length; i++) {
     if (a[i]?.index !== b[i]?.index || a[i]?.status !== b[i]?.status
       || a[i]?.summary !== b[i]?.summary || a[i]?.childSessionId !== b[i]?.childSessionId) return false
+    // Compared too, or a re-annotate that only ADDS the tier would be judged
+    // unchanged, keep the row's object identity, and leave the memoized card
+    // rendering without a badge that is now available. Serialized because the value
+    // is an opaque object here — this fold deliberately does not parse it.
+    if (JSON.stringify(a[i]?.tier ?? null) !== JSON.stringify(b[i]?.tier ?? null)) return false
   }
   return true
 }
@@ -908,7 +933,7 @@ function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
       const index = Number(rest)
       if (!Number.isInteger(index)) continue
       const byIdx = itemsByGroup.get(groupId) ?? new Map<number, GroupItemFold>()
-      byIdx.set(index, { index, status, summary, childSessionId })
+      byIdx.set(index, { index, status, summary, childSessionId, tier: meta.tier })
       itemsByGroup.set(groupId, byIdx)
     } else if (groupIds.has(id)) {
       // Terminal event: parse the per-item status snapshot (index → status) when present, so items
@@ -916,7 +941,10 @@ function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
       const rawSnapshot = Array.isArray(meta.item_statuses) ? (meta.item_statuses as unknown[]) : undefined
       const itemStatuses = rawSnapshot
         ?.filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
-        .map((e) => ({ index: Number(e.index), status: String(e.status) }))
+        // `tier` carried through: the snapshot is the ONLY record for an item that
+        // never persisted its own child event, so dropping it here means those items
+        // can never show which model ran them, on reload or otherwise.
+        .map((e) => ({ index: Number(e.index), status: String(e.status), tier: e.tier }))
         .filter((e) => Number.isInteger(e.index))
       terminal.set(id, { status, summary, childSessionId, itemStatuses })
     }
@@ -935,7 +963,7 @@ function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
     // it correctly instead of the live-only "running" fallback (#3). A real child event always wins.
     const merged = new Map<number, GroupItemFold>(byIdx ? [...byIdx] : [])
     for (const s of term?.itemStatuses ?? []) {
-      if (!merged.has(s.index)) merged.set(s.index, { index: s.index, status: s.status })
+      if (!merged.has(s.index)) merged.set(s.index, { index: s.index, status: s.status, tier: s.tier })
     }
     const groupItems = merged.size > 0 ? [...merged.values()].sort((a, b) => a.index - b.index) : []
 
