@@ -19,6 +19,13 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
 
+  agentbox-build-graph:
+    name: AgentBox Build Graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --target builder -f Dockerfile.agentbox .
+
   test:
     name: Test
     runs-on: ubuntu-latest
