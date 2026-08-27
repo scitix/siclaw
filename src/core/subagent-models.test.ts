@@ -443,11 +443,27 @@ describe("resolveTierSelection", () => {
     expect(result).toEqual({ kind: "fallback", reason: "revision_mismatch" });
   });
 
-  it("reports revision_mismatch when only one side has state", () => {
+  it("reads a menu with NO candidates as candidate_missing, not as a version skew", () => {
+    // The state a producer reaches in normal operation: every configured tier
+    // resolved to no usable model, so the candidate channel omits its envelope
+    // (an empty one would itself read as a mismatch) while the menu — projected
+    // from the stored mapping, which does not know about model availability —
+    // still advertises the tier.
+    //
+    // Reporting a version skew here points the operator at config revisions when
+    // the cause is a model that was withdrawn, disabled or sits in another org.
+    // It also swallowed a real control-plane defect for a whole release: the
+    // binding path never attached candidates for release-pinned agents at all,
+    // and every spawn blamed a revision skew that did not exist.
     expect(resolveTierSelection(m, null, "fast")).toEqual({
       kind: "fallback",
-      reason: "revision_mismatch",
+      reason: "candidate_missing",
     });
+  });
+
+  it("still reports revision_mismatch for candidates with NO menu — the real skew signature", () => {
+    // The other direction is genuinely a skew: credentials arrived for tiers the
+    // lead was never offered, so the channels describe different configurations.
     expect(resolveTierSelection(null, c, "fast")).toEqual({
       kind: "fallback",
       reason: "revision_mismatch",

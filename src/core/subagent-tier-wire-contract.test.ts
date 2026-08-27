@@ -9,9 +9,13 @@
  * `model_tier`, and the whole feature was silently absent on those deployments —
  * with the entire suite green.
  *
- * The fixtures here are the payloads as another implementation actually emits
- * them. Treat them as frozen: changing one means the wire contract changed and
- * both sides have to agree, not that a test needs updating.
+ * The fixture is the SHAPE both sides agree on, not a capture of one producer's
+ * output: its sample values deliberately exercise more of the contract than any
+ * single deployment emits (two tiers, so the multi-item path is covered; one
+ * candidate, so the advertised-but-unbacked tier is too). A control plane may
+ * narrow within it — a one-name vocabulary with platform-owned wording is still
+ * this contract. Treat the shape as frozen: changing it means the wire contract
+ * changed and both sides have to agree, not that a test needs updating.
  */
 import { describe, it, expect } from "vitest";
 import crypto from "node:crypto";

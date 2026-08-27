@@ -469,8 +469,23 @@ export function resolveTierSelection(
   // override or a stale schema; either way inheritance is the honest answer.
   if (!menu && !candidates) return { kind: "inherit" };
 
-  // One-sided state means the two channels disagree about whether tiering exists.
-  if (!menu || !candidates) return { kind: "fallback", reason: "revision_mismatch" };
+  // One-sided state, classified BY DIRECTION — the two sides are not the same
+  // failure and reporting both as a version skew misdiagnoses the common one.
+  //
+  // Menu without candidates is what a producer emits when every configured tier
+  // resolved to no usable model: the menu is projected from the stored tier
+  // mapping, while the candidate channel omits its envelope entirely rather than
+  // send `{revision, candidates: []}`. That is `candidate_missing` — the tier was
+  // advertised and nothing backs it — and it is exactly the reading the two
+  // channels' shared revision was designed to make possible. Calling it
+  // `revision_mismatch` sends an operator to compare config versions when the
+  // actual cause is a model that was withdrawn, disabled or is in another org.
+  //
+  // Candidates without a menu is the genuine skew signature: credentials arrived
+  // for tiers the lead was never offered, so the two channels are describing
+  // different configurations.
+  if (!menu) return { kind: "fallback", reason: "revision_mismatch" };
+  if (!candidates) return { kind: "fallback", reason: "candidate_missing" };
 
   if (menu.revision !== candidates.revision) {
     return { kind: "fallback", reason: "revision_mismatch" };
