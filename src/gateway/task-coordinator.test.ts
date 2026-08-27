@@ -8,7 +8,10 @@ const appendCalls: any[] = [];
 const ensureCalls: any[] = [];
 let appendCounter = 0;
 
-vi.mock("./chat-repo.js", () => ({
+vi.mock("./chat-repo.js", async (importOriginal) => ({
+  warnTraceBindFailure: vi.fn(),
+  // The real validator: the coordinator gates the box ack through it.
+  validTraceId: (await importOriginal<typeof import("./chat-repo.js")>()).validTraceId,
   appendMessage: vi.fn(async (msg: any) => {
     appendCalls.push(msg);
     return `msg-${++appendCounter}`;

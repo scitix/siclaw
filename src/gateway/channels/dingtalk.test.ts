@@ -40,6 +40,8 @@ const ensureChatSessionMock = vi.fn();
 const appendMessageMock = vi.fn();
 const bindMessageTraceIdMock = vi.fn();
 vi.mock("../chat-repo.js", () => ({
+  validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
+  warnTraceBindFailure: vi.fn(),
   ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
   bindMessageTraceId: (...args: unknown[]) => bindMessageTraceIdMock(...args),

@@ -18,7 +18,7 @@ import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type AgentBoxTlsOptions, type PromptOptions } from "./agentbox/client.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
-import { appendMessage, ensureChatSession, incrementMessageCount } from "./chat-repo.js";
+import { appendMessage, ensureChatSession, incrementMessageCount, validTraceId } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
@@ -294,13 +294,17 @@ export class TaskCoordinator {
         systemPromptTemplate: binding.systemPrompt ?? undefined,
       };
       const promptResult = await client.prompt(promptOpts);
+      // Cross-process trace ids are gated at ingestion (see chat-repo.validTraceId):
+      // stamping rows with an id the bind/link boundaries would reject strands them
+      // under an id no reader references.
+      const ackTraceId = validTraceId(promptResult.traceId);
 
       // Seed chat_sessions + user message via RPC. `origin: "task"` is the
       // one signal that lets upstream's Metrics dashboard split scheduled cron
       // activity from interactive chat — without it every cron-triggered
       // session collapses into the default Interactive world.
       await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
-      await appendMessage({ sessionId, role: "user", content: prompt, traceId: promptResult.traceId });
+      await appendMessage({ sessionId, role: "user", content: prompt, traceId: ackTraceId });
       await incrementMessageCount(sessionId);
 
       const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig);
@@ -313,7 +317,7 @@ export class TaskCoordinator {
           client,
           sessionId,
           userId,
-          traceId: promptResult.traceId,
+          traceId: ackTraceId,
           persistMessages: true,
           redactionConfig,
           signal: abortCtrl.signal,

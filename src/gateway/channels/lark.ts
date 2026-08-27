@@ -34,7 +34,7 @@ import {
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
-import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback } from "../chat-repo.js";
+import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback, warnTraceBindFailure } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
@@ -1871,7 +1871,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
     const promptResult = await promptWithBusyRetry(client, promptOpts);
     void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
-      console.warn(`[lark] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
+      warnTraceBindFailure("lark prompt", promptResult.sessionId, promptMessageId, bindErr);
     });
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
       includeImages: true,

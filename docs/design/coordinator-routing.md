@@ -273,6 +273,43 @@ And a re-delivered terminal must be acknowledged, not rejected: its consumer is
 gone precisely because it consumed the original, and refusing it keeps a sender
 retrying — which keeps supervision alive over a turn that already ended.
 
+### The delegated leg is its own trace, linked — not folded — into the coordinator's
+
+A delegated turn runs under the peer's own authority (its persona, model,
+permissions), so its rows are persisted under the peer turn's OWN root trace id —
+the same rule every other cross-agent boundary follows — never under the
+coordinator's. What connects the two traces is an explicit link, written at three
+places:
+
+- **Row stamping.** The local route's consume stamps every persisted peer row with
+  the trace id from the box's prompt ack, exactly as the target Runtime's ordinary
+  `chat.send` path does for a remote peer — the two routes leave identical rows.
+  The opening user row is appended by the source before the trace exists and is
+  back-bound afterwards (`chat.bindMessageTraceId`, append-then-bind, the same
+  pattern `chat.send` uses for its prompt row).
+- **The terminal carries the id.** `chat.send` acks in milliseconds — before the
+  trace exists — and `chat.getMessages` does not project `trace_id`, so the
+  terminal event is the one channel the source can learn which trace a REMOTE
+  leg's rows were persisted under. Both terminal producers (the consumer paths and
+  the shutdown/box-roll supervisor) read the id from the delegated turn's ledger
+  entry, recorded at prompt ack, so they cannot disagree. A terminal that arrives
+  after its delegation settled (coordinator Stop, idle-timeout, source restart)
+  still salvages the opening-row bind — best-effort, memoized per delegation id.
+- **The tool row records the link.** `delegate_to_agent` returns
+  `child_trace_id` next to `child_session_id` in its result details, which persist
+  into the coordinator tool row's metadata: that is the machine-readable edge an
+  audit or analysis read walks to get from the coordinator's trace into the leg.
+  An early `delegate_trace` frame announces the id the moment the local ack names
+  it, so a stopped leg's tool row keeps the link even though the final
+  `delegate_result` frame dies with the destroyed socket.
+
+Trace ids cross process boundaries only through one gate (`validTraceId`,
+32 lowercase hex — the same contract the bind RPC enforces server-side): accepting
+a malformed id at one boundary and rejecting it at another is how rows end up
+persisted under an id no link references. Absent or malformed ids degrade to "no
+link", never to an error — an older peer Runtime simply produces the pre-feature
+behaviour.
+
 After the terminal event, the source always derives remote `finalText` from
 assistant rows after the current delegation boundary in durable session history.
 Recovery widens a window over the newest rows rather than walking a timestamp

@@ -40,7 +40,7 @@ import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "../agent-mod
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
-import { appendMessage, bindMessageTraceId, ensureChatSession } from "../chat-repo.js";
+import { appendMessage, bindMessageTraceId, ensureChatSession, warnTraceBindFailure } from "../chat-repo.js";
 import { collectChannelResponse } from "./lark.js";
 import type { RenderedReplyImage } from "./visual-image.js";
 import { deliverImages } from "./dingtalk-image.js";
@@ -375,7 +375,7 @@ export async function handleDingTalkMessage(
     const promptResult = await client.prompt(promptOpts);
     if (promptMessageId) {
       void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
-        console.warn(`[dingtalk] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
+        warnTraceBindFailure("dingtalk prompt", promptResult.sessionId, promptMessageId, bindErr);
       });
     }
     // Collect the reply with audit persistence (assistant + tool rows, when the

@@ -11,6 +11,8 @@ const updateCalls: any[] = [];
 let appendCounter = 0;
 
 vi.mock("./chat-repo.js", () => ({
+  validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
+  warnTraceBindFailure: vi.fn(),
   appendMessage: vi.fn(async (msg: any) => {
     appendCalls.push(msg);
     return `msg-${++appendCounter}`;

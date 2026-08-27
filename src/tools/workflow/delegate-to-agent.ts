@@ -111,21 +111,30 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       };
       const continueSessionId = params.session_id?.trim() || undefined;
       const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId }, onProgress, signal)
-        .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
-
-      // Stopped by the coordinator (turn aborted): the relay was torn down and
-      // the peer turn cancelled. Report a clean stop, not a scary error.
-      if (signal?.aborted) {
-        const msg = `Delegation to ${member.name} was stopped.`;
-        return { content: [{ type: "text" as const, text: msg }], details: { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, status: "stopped", summary: msg, ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) } };
-      }
+        .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, peerTraceId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
 
       // Card-facing shape (portal-web AgentWorkCard reads target from args and
       // status/summary/tool_calls/steps from result details). Carry the accumulated
       // live steps into the FINAL result so the card keeps them after completion.
       // session_id (=peer session) lets the card OPEN the full peer session and lets
       // the model pass it back to continue this peer thread.
-      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...(resp.peerSessionId ? { child_session_id: resp.peerSessionId } : {}) };
+      // child_trace_id is the leg's own trace: it persists into this tool row's
+      // metadata (next to child_session_id) as the machine-readable link that lets
+      // trace-keyed audit/analysis reads walk into the delegated leg.
+      // Built ABOVE the stopped branch so every outcome shares one literal.
+      // child_session_id falls back to the id the EARLY delegate_session frame
+      // announced: a mid-stream relay error (or a Stop) surfaces as an executor
+      // fallback with no peerSessionId, and the failed/stopped legs are exactly
+      // the ones a review needs to open.
+      const childSessionId = resp.peerSessionId ?? liveChildSessionId;
+      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
+
+      // Stopped by the coordinator (turn aborted): the relay was torn down and
+      // the peer turn cancelled. Report a clean stop, not a scary error.
+      if (signal?.aborted) {
+        const msg = `Delegation to ${member.name} was stopped.`;
+        return { content: [{ type: "text" as const, text: msg }], details: { ...cardBase, status: "stopped", summary: msg } };
+      }
 
       if (!resp.ok || resp.status === "failed") {
         const msg = `Delegation to ${member.name} failed: ${resp.error ?? "unknown error"}`;

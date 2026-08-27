@@ -22,12 +22,19 @@ const consumeAgentSse = vi.fn(async (opts: any) => {
 vi.mock("./sse-consumer.js", () => ({ consumeAgentSse: (o: any) => consumeAgentSse(o) }));
 
 const ensureChatSession = vi.fn(async () => {});
-const appendMessage = vi.fn(async () => {});
+const appendMessage = vi.fn(async () => "opening-row-1");
 const getMessages = vi.fn(async () => [] as any[]);
-vi.mock("./chat-repo.js", () => ({
+const bindMessageTraceId = vi.fn(async () => {});
+const warnTraceBindFailure = vi.fn();
+vi.mock("./chat-repo.js", async (importOriginal) => ({
   ensureChatSession: (...a: any[]) => ensureChatSession(...a),
   appendMessage: (...a: any[]) => appendMessage(...a),
   getMessages: (...a: any[]) => getMessages(...a),
+  bindMessageTraceId: (...a: any[]) => bindMessageTraceId(...a),
+  warnTraceBindFailure: (...a: any[]) => warnTraceBindFailure(...a),
+  // The real validator, not a stub: the code under test gates ingested ids
+  // through it, and the malformed-id test depends on the actual contract.
+  validTraceId: (await importOriginal<typeof import("./chat-repo.js")>()).validTraceId,
   incrementMessageCount: vi.fn(async () => {}),
   updateMessage: vi.fn(async () => {}),
 }));
@@ -52,7 +59,7 @@ vi.mock("./agentbox/client.js", () => ({
   },
 }));
 
-import { getRemoteDelegationIdleTimeoutMs, handleDelegate, isDelegationSettled } from "./delegate-api.js";
+import { getRemoteDelegationIdleTimeoutMs, handleDelegate, isDelegationSettled, salvageDelegationTraceBind } from "./delegate-api.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 
 // ── Fakes ─────────────────────────────────────────────────────────────
@@ -271,6 +278,149 @@ describe("handleDelegate — model-failure propagation (P1)", () => {
     const result = delegateResult(res);
     expect(result?.ok).toBe(true);
     expect(result?.status).toBe("done");
+  });
+});
+
+describe("handleDelegate — delegated-leg trace id (own trace + link)", () => {
+  const TRACE = "f".repeat(32);
+
+  it("stamps the local peer consume with the box-acked trace id, binds the opening row, and reports peerTraceId", async () => {
+    promptMock.mockResolvedValueOnce({ ok: true, sessionId: "peer-sess", traceId: TRACE } as any);
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    // Every row the local consume persists carries the leg's own trace id …
+    expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: TRACE }));
+    // … the opening user row (appended before the trace existed) is back-bound …
+    expect(bindMessageTraceId).toHaveBeenCalledWith("opening-row-1", expect.any(String), TRACE);
+    // … and the coordinator gets the id to persist as the cross-trace link.
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", peerTraceId: TRACE });
+    // The id is ALSO announced early, like delegate_session: a Stop destroys the
+    // client's socket before the final frame, so the early announcement is what a
+    // stopped leg's tool row gets to keep.
+    expect(res.frames).toContainEqual({ type: "delegate_trace", peerTraceId: TRACE });
+  });
+
+  it("leaves rows unstamped and omits peerTraceId when the box ack has no trace id (tracing off)", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: undefined }));
+    expect(bindMessageTraceId).not.toHaveBeenCalled();
+    expect(delegateResult(res)?.peerTraceId).toBeUndefined();
+  });
+
+  it("learns a remote leg's trace id from the terminal event, binds the opening row, and reports it", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "remote answer", delegationId: null, metadata: null },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done", traceId: TRACE },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", peerTraceId: TRACE });
+    expect(bindMessageTraceId).toHaveBeenCalledWith("opening-row-1", expect.any(String), TRACE);
+    // The remote path persists via the TARGET Runtime's own consume — the source
+    // must not stamp anything itself.
+    expect(consumeAgentSse).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed terminal trace id instead of persisting a link that matches nothing", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "remote answer", delegationId: null, metadata: null },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          // Uppercase hex: valid to a typeof-string check, invalid to the 32-lowercase-hex
+          // contract the bind RPC enforces — must be dropped at ingestion.
+          event: { type: "prompt_done", traceId: "F".repeat(32) },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)?.peerTraceId).toBeUndefined();
+    expect(bindMessageTraceId).not.toHaveBeenCalled();
+  });
+
+  it("salvages the opening-row bind from a terminal that arrived after the delegation settled", async () => {
+    getMessages.mockResolvedValueOnce([
+      { id: "row-user", role: "user", content: "inspect", delegationId: "d-late-1", metadata: null },
+      { id: "row-a", role: "assistant", content: "partial", delegationId: null, metadata: null },
+    ] as any);
+    await salvageDelegationTraceBind({ sessionId: "peer-s", delegationId: "d-late-1", event: { type: "prompt_done", aborted: true, traceId: TRACE } });
+    expect(bindMessageTraceId).toHaveBeenCalledWith("row-user", "peer-s", TRACE);
+  });
+
+  it("walks the history at most once per delegation id across terminal redeliveries", async () => {
+    getMessages.mockResolvedValueOnce([
+      { id: "row-user", role: "user", content: "inspect", delegationId: "d-late-memo", metadata: null },
+    ] as any);
+    const terminal = { sessionId: "peer-s", delegationId: "d-late-memo", event: { type: "prompt_done", traceId: TRACE } };
+    await salvageDelegationTraceBind(terminal);
+    await salvageDelegationTraceBind(terminal);
+    expect(getMessages).toHaveBeenCalledTimes(1);
+    expect(bindMessageTraceId).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a settled terminal whose trace id is missing or malformed", async () => {
+    await salvageDelegationTraceBind({ sessionId: "peer-s", delegationId: "d-late-2", event: { type: "prompt_done" } });
+    await salvageDelegationTraceBind({ sessionId: "peer-s", delegationId: "d-late-2", event: { type: "prompt_done", traceId: "F".repeat(32) } });
+    expect(getMessages).not.toHaveBeenCalled();
+    expect(bindMessageTraceId).not.toHaveBeenCalled();
+  });
+
+  it("tolerates a terminal without a trace id from an older target Runtime", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "remote answer", delegationId: null, metadata: null },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done" });
+    expect(delegateResult(res)?.peerTraceId).toBeUndefined();
+    expect(bindMessageTraceId).not.toHaveBeenCalled();
   });
 });
 
