@@ -2,31 +2,64 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { loadConfig } from "../../core/config.js";
 
-function skillsBase(): string {
+export interface SkillScriptResolverOptions {
+  /** Session-owned Skill root containing policy files and legacy scope dirs. */
+  skillsBaseDir?: string;
+  /** Exact materialized Skill directory. LocalSpawner passes <agent>/resolved. */
+  resolvedSkillsDir?: string;
+  /** Image Built-in roots. Primarily injectable for tests. */
+  builtinDirs?: string[];
+}
+
+export interface SkillScriptResolver {
+  resolveScript(params: { skill?: string; script: string }): ResolvedScript | { error: string };
+  resolveSkillScript(skill: string, script: string): ResolvedScript | null;
+  listSkillScripts(skill: string): string[];
+  listAllSkillsWithScripts(): Array<{ skill: string; scripts: string[] }>;
+  skillExistsInBundle(skillName: string): boolean;
+  skillExistsAsBuiltin(skillName: string): boolean;
+  readSkillMd(skill: string, maxChars?: number): string | null;
+  skillMdHint(skill: string): string;
+}
+
+function skillsBase(options: SkillScriptResolverOptions = {}): string {
+  if (options.skillsBaseDir) return path.resolve(options.skillsBaseDir);
   const config = loadConfig();
   return path.resolve(process.cwd(), config.paths.skillsDir);
+}
+
+function resolvedSkillsDir(options: SkillScriptResolverOptions = {}): string {
+  return path.resolve(options.resolvedSkillsDir ?? path.join(skillsBase(options), "resolved"));
 }
 
 /** Builtin skills directories (baked into Docker image at skills/core/ and skills/extension/) */
 const BUILTIN_TIERS = ["core", "extension"] as const;
 
-function builtinCoreDir(): string {
-  return path.resolve(process.cwd(), "skills", "core");
-}
-
-function builtinDirs(): string[] {
+function builtinDirs(options: SkillScriptResolverOptions = {}): string[] {
+  if (options.builtinDirs) return options.builtinDirs.map((dir) => path.resolve(dir));
   return BUILTIN_TIERS.map(t => path.resolve(process.cwd(), "skills", t));
 }
 
 /** Load disabled builtins list (written by agentbox startup from bundle API) */
-function loadDisabledBuiltins(): Set<string> {
+function loadDisabledBuiltins(options: SkillScriptResolverOptions = {}): Set<string> {
   try {
-    const filePath = path.join(skillsBase(), ".disabled-builtins.json");
+    const filePath = path.join(skillsBase(options), ".disabled-builtins.json");
     if (fs.existsSync(filePath)) {
       return new Set(JSON.parse(fs.readFileSync(filePath, "utf-8")) as string[]);
     }
   } catch { /* ignore malformed file */ }
   return new Set();
+}
+
+/** Default-on preview policy written beside the materialized Skill bundle. */
+function loadInheritBuiltins(options: SkillScriptResolverOptions = {}): boolean {
+  try {
+    const filePath = path.join(skillsBase(options), ".inherit-builtins.json");
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, "utf-8")) !== false;
+    }
+  } catch { /* keep the backward-compatible default */ }
+  return true;
 }
 
 /**
@@ -57,12 +90,14 @@ const SCOPE_MAP: Record<string, SkillScope> = {
  * 3. Scope subdirectories (extension > global > core)
  * 4. Builtin fallback (skills/core/) — unless disabled
  */
-function getSkillScriptDirs(skill: string): ScopeDir[] {
-  const base = skillsBase();
+function getSkillScriptDirs(skill: string, options: SkillScriptResolverOptions = {}): ScopeDir[] {
+  const base = skillsBase(options);
+  const inheritBuiltins = loadInheritBuiltins(options);
+  const disabled = loadDisabledBuiltins(options);
 
   // 1. Unified resolved/ directory (built by materialize with priority merging)
   // K8s mode: {base}/resolved/{skill}/scripts
-  const resolvedPath = path.join(base, "resolved", skill, "scripts");
+  const resolvedPath = path.join(resolvedSkillsDir(options), skill, "scripts");
   if (fs.existsSync(resolvedPath)) return [{ dir: resolvedPath, scope: "global" }];
 
   // 2. Legacy flat layout (bundle-materialized without scope subdirs)
@@ -72,15 +107,15 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
   // 3. Scope subdirectories (extension > global > core)
   const dirs: ScopeDir[] = [];
   for (const scopeName of SKILL_SCOPES) {
+    if (SCOPE_MAP[scopeName] === "builtin" && (!inheritBuiltins || disabled.has(skill))) continue;
     const dir = path.join(base, scopeName, skill, "scripts");
     if (fs.existsSync(dir)) dirs.push({ dir, scope: SCOPE_MAP[scopeName] });
   }
   if (dirs.length > 0) return dirs;
 
   // 4. Builtin fallback (skills/{core,extension}/) — for skills not in the bundle
-  const disabled = loadDisabledBuiltins();
-  if (!disabled.has(skill)) {
-    for (const bDir of builtinDirs()) {
+  if (inheritBuiltins && !disabled.has(skill)) {
+    for (const bDir of builtinDirs(options)) {
       const builtinPath = path.join(bDir, skill, "scripts");
       if (fs.existsSync(builtinPath)) return [{ dir: builtinPath, scope: "builtin" }];
     }
@@ -95,56 +130,63 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
  * Priority: global (bundle) > builtin (Docker image).
  * Uses seenSkills dedup in callers so first-wins = highest priority.
  */
-function getSkillBaseDirs(): string[] {
-  const base = skillsBase();
+function getSkillBaseDirs(options: SkillScriptResolverOptions = {}): string[] {
+  const base = skillsBase(options);
+  const inheritBuiltins = loadInheritBuiltins(options);
+  const resolvedDir = resolvedSkillsDir(options);
+
+  const dirs: string[] = [];
+  if (fs.existsSync(resolvedDir)) dirs.push(resolvedDir);
 
   // 1. Legacy flat layout (bundle-materialized without scope subdirs)
   const hasDirectSkills = fs.existsSync(base) && fs.readdirSync(base).some(
-    (entry) => !entry.startsWith(".") && !SKILL_SCOPES.includes(entry) &&
+    (entry) => entry !== path.basename(resolvedDir) && !entry.startsWith(".") && !SKILL_SCOPES.includes(entry) &&
       fs.statSync(path.join(base, entry)).isDirectory(),
   );
   if (hasDirectSkills) {
-    const dirs = [base];
-    for (const bDir of builtinDirs()) {
-      if (fs.existsSync(bDir)) dirs.push(bDir);
-    }
-    return dirs;
+    dirs.push(base);
   }
 
   // 2. Scope subdirectories (extension > global > core)
-  const dirs: string[] = [];
   for (const scope of SKILL_SCOPES) {
+    if (!inheritBuiltins && SCOPE_MAP[scope] === "builtin") continue;
     const dir = path.join(base, scope);
     if (fs.existsSync(dir)) dirs.push(dir);
   }
 
   // 3. Builtin fallback (skills/{core,extension}/ from Docker image)
-  for (const bDir of builtinDirs()) {
-    if (fs.existsSync(bDir) && !dirs.includes(bDir)) dirs.push(bDir);
+  if (inheritBuiltins) {
+    for (const bDir of builtinDirs(options)) {
+      if (fs.existsSync(bDir) && !dirs.includes(bDir)) dirs.push(bDir);
+    }
   }
 
   return dirs;
 }
 
 /** Check if a skill exists in the materialized bundle (global/builtin) */
-export function skillExistsInBundle(skillName: string): boolean {
-  const base = skillsBase();
+export function skillExistsInBundle(skillName: string, options: SkillScriptResolverOptions = {}): boolean {
+  const base = skillsBase(options);
+  const resolvedDir = path.join(resolvedSkillsDir(options), skillName);
+  if (fs.existsSync(resolvedDir) && fs.statSync(resolvedDir).isDirectory()) return true;
   // Legacy flat layout
   const directDir = path.join(base, skillName);
   if (fs.existsSync(directDir) && fs.statSync(directDir).isDirectory()) return true;
-  // Scope subdirectory layout
-  for (const scopeDir of ["extension", "global"]) {
-    const dir = path.join(base, scopeDir, skillName);
-    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
-  }
+  // Personal/global scope remains available when inherited resources are off.
+  const globalDir = path.join(base, "global", skillName);
+  if (fs.existsSync(globalDir) && fs.statSync(globalDir).isDirectory()) return true;
+  if (!loadInheritBuiltins(options) || loadDisabledBuiltins(options).has(skillName)) return false;
+  const extensionDir = path.join(base, "extension", skillName);
+  if (fs.existsSync(extensionDir) && fs.statSync(extensionDir).isDirectory()) return true;
   return false;
 }
 
 /** Check if a skill exists as a non-disabled builtin (skills/{core,extension}/) */
-export function skillExistsAsBuiltin(skillName: string): boolean {
-  const disabled = loadDisabledBuiltins();
+export function skillExistsAsBuiltin(skillName: string, options: SkillScriptResolverOptions = {}): boolean {
+  if (!loadInheritBuiltins(options)) return false;
+  const disabled = loadDisabledBuiltins(options);
   if (disabled.has(skillName)) return false;
-  for (const bDir of builtinDirs()) {
+  for (const bDir of builtinDirs(options)) {
     const dir = path.join(bDir, skillName);
     if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
   }
@@ -167,8 +209,9 @@ export interface ResolvedScript {
 export function resolveSkillScript(
   skill: string,
   script: string,
+  options: SkillScriptResolverOptions = {},
 ): ResolvedScript | null {
-  for (const { dir, scope } of getSkillScriptDirs(skill)) {
+  for (const { dir, scope } of getSkillScriptDirs(skill, options)) {
     const scriptPath = path.join(dir, script);
     if (fs.existsSync(scriptPath)) {
       return {
@@ -185,9 +228,9 @@ export function resolveSkillScript(
 /**
  * List available scripts for a given skill.
  */
-export function listSkillScripts(skill: string): string[] {
+export function listSkillScripts(skill: string, options: SkillScriptResolverOptions = {}): string[] {
   const scripts = new Set<string>();
-  for (const { dir } of getSkillScriptDirs(skill)) {
+  for (const { dir } of getSkillScriptDirs(skill, options)) {
     try {
       for (const f of fs.readdirSync(dir)) {
         if (f.endsWith(".sh") || f.endsWith(".py")) scripts.add(f);
@@ -202,16 +245,21 @@ export function listSkillScripts(skill: string): string[] {
 /**
  * List all skills that have scripts.
  */
-export function listAllSkillsWithScripts(): Array<{
+export function listAllSkillsWithScripts(options: SkillScriptResolverOptions = {}): Array<{
   skill: string;
   scripts: string[];
 }> {
   const result: Array<{ skill: string; scripts: string[] }> = [];
   const seen = new Set<string>();
-  const disabled = loadDisabledBuiltins();
-  const builtinSet = new Set(builtinDirs());
+  const disabled = loadDisabledBuiltins(options);
+  const base = skillsBase(options);
+  const builtinSet = new Set([
+    ...builtinDirs(options),
+    path.join(base, "extension"),
+    path.join(base, "core"),
+  ]);
 
-  for (const base of getSkillBaseDirs()) {
+  for (const base of getSkillBaseDirs(options)) {
     const isBuiltinDir = builtinSet.has(base);
     try {
       for (const d of fs.readdirSync(base, { withFileTypes: true })) {
@@ -254,8 +302,12 @@ export function listAllSkillsWithScripts(): Array<{
  * instructions — exact script names + usage — instead of letting it guess again.
  * Returns null when the skill has no readable SKILL.md.
  */
-export function readSkillMd(skill: string, maxChars = 6000): string | null {
-  for (const { dir } of getSkillScriptDirs(skill)) {
+export function readSkillMd(
+  skill: string,
+  maxChars = 6000,
+  options: SkillScriptResolverOptions = {},
+): string | null {
+  for (const { dir } of getSkillScriptDirs(skill, options)) {
     try {
       const md = fs.readFileSync(path.join(path.dirname(dir), "SKILL.md"), "utf-8");
       return md.length > maxChars ? `${md.slice(0, maxChars)}\n…[SKILL.md truncated]` : md;
@@ -267,8 +319,8 @@ export function readSkillMd(skill: string, maxChars = 6000): string | null {
 }
 
 /** Suffix appended to a "script not found" error: the skill's SKILL.md, if any. */
-export function skillMdHint(skill: string): string {
-  const md = readSkillMd(skill);
+export function skillMdHint(skill: string, options: SkillScriptResolverOptions = {}): string {
+  const md = readSkillMd(skill, 6000, options);
   return md
     ? `\n\n--- SKILL.md for "${skill}" (use the exact script name and usage from here, do not guess) ---\n${md}`
     : "";
@@ -281,7 +333,7 @@ export function skillMdHint(skill: string): string {
 export function resolveScript(params: {
   skill?: string;
   script: string;
-}): ResolvedScript | { error: string } {
+}, options: SkillScriptResolverOptions = {}): ResolvedScript | { error: string } {
   const script = params.script?.trim();
   if (!script) {
     return { error: "Script name is required." };
@@ -306,15 +358,15 @@ export function resolveScript(params: {
     };
   }
 
-  const resolved = resolveSkillScript(skill, script);
+  const resolved = resolveSkillScript(skill, script, options);
   if (!resolved) {
-    const available = listSkillScripts(skill);
+    const available = listSkillScripts(skill, options);
     if (available.length > 0) {
       return {
-        error: `Script "${script}" not found in skill "${skill}". Available: ${available.join(", ")}${skillMdHint(skill)}`,
+        error: `Script "${script}" not found in skill "${skill}". Available: ${available.join(", ")}${skillMdHint(skill, options)}`,
       };
     }
-    const allSkills = listAllSkillsWithScripts();
+    const allSkills = listAllSkillsWithScripts(options);
     let hint = `Skill "${skill}" has no scripts directory.`;
     if (allSkills.length > 0) {
       hint += `\nSkills with scripts: ${allSkills.map((s) => `${s.skill} (${s.scripts.join(", ")})`).join("; ")}`;
@@ -322,4 +374,18 @@ export function resolveScript(params: {
     return { error: hint };
   }
   return resolved;
+}
+
+/** Bind script lookup to one Session's materialized Skill and policy roots. */
+export function createSkillScriptResolver(options: SkillScriptResolverOptions = {}): SkillScriptResolver {
+  return {
+    resolveScript: (params) => resolveScript(params, options),
+    resolveSkillScript: (skill, script) => resolveSkillScript(skill, script, options),
+    listSkillScripts: (skill) => listSkillScripts(skill, options),
+    listAllSkillsWithScripts: () => listAllSkillsWithScripts(options),
+    skillExistsInBundle: (skillName) => skillExistsInBundle(skillName, options),
+    skillExistsAsBuiltin: (skillName) => skillExistsAsBuiltin(skillName, options),
+    readSkillMd: (skill, maxChars) => readSkillMd(skill, maxChars, options),
+    skillMdHint: (skill) => skillMdHint(skill, options),
+  };
 }

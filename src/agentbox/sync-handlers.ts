@@ -24,7 +24,11 @@ import type {
   ReloadContext,
 } from "../shared/gateway-sync.js";
 import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
-import type { BoxSyncStatus, ObservedKnowledgeRepo } from "../shared/agentbox-sync-status.js";
+import {
+  AGENT_SYNC_STATUS_SCHEMA_VERSION,
+  type BoxSyncStatus,
+  type ObservedKnowledgeRepo,
+} from "../shared/agentbox-sync-status.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { decodeSkillFileContent, normalizeSkillFiles, type SkillPackageFile } from "../shared/skill-package.js";
 
@@ -178,13 +182,23 @@ function writeSkillToDir(
   const skillDir = resolveUnderDir(resolvedDir, skill.dirName);
   fs.mkdirSync(skillDir, { recursive: true });
   if (Array.isArray(skill.files) && skill.files.length > 0) {
-    for (const file of normalizeSkillFiles(skill.files)) {
+    const files = normalizeSkillFiles(skill.files);
+    let packageHasSkillMd = false;
+    for (const file of files) {
       const filePath = resolveUnderDir(skillDir, file.path);
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       fs.writeFileSync(filePath, file.encoding === "base64" ? Buffer.from(file.content, "base64") : decodeSkillFileContent(file));
+      packageHasSkillMd ||= file.path === "SKILL.md";
       if (file.executable || /^scripts\/[^/]+\.(sh|py)$/.test(file.path)) {
         try { fs.chmodSync(filePath, 0o755); } catch { /* non-POSIX */ }
       }
+    }
+    // Personal Preview uploads carry SKILL.md in `specs` and only additional
+    // package files in `files[]`. Published bundles may instead include
+    // SKILL.md in the complete file list. Support both without overwriting a
+    // package-authored SKILL.md or dropping the Preview Skill entirely.
+    if (!packageHasSkillMd && skill.specs) {
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
     }
     return;
   }
@@ -212,8 +226,13 @@ function writeSkillToDir(
  */
 interface SkillBundlePayload {
   version: string;
+  /** Whether image Built-ins remain available to this preview instance. */
+  inheritBuiltins?: boolean;
+  /** Built-in image Skills explicitly masked by this preview instance. */
+  disabledBuiltins?: string[];
   skills: Array<{
     dirName: string;
+    /** "builtin" is accepted for legacy producers; image Built-ins are not bundled. */
     scope: "builtin" | "global";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
@@ -249,8 +268,36 @@ export function createSkillsHandler(
     // Build a flat unified "resolved/" directory with priority-based merging:
     //   global > builtin
     // First dirName written wins; later duplicates are skipped.
-    // All scopes come from the bundle payload (including builtin, synced to DB at startup).
+    // The control plane sends an effective non-image bundle. Legacy producers
+    // may still label an entry "builtin"; that label affects collision order
+    // only and is not an image-Built-in inheritance signal.
     const resolvedDir = path.join(skillsDir, "resolved");
+
+    // Keep the image-Built-in policy next to the effective bundle. Both the
+    // model-visible loader and the Session-scoped script resolver read it.
+    // Absence means an older control plane and preserves the current file;
+    // presence (including []) is an authoritative preview snapshot.
+    const hasExplicitBuiltinPolicy = typeof payload?.inheritBuiltins === "boolean";
+    const hasExplicitBuiltinMask = Array.isArray(payload?.disabledBuiltins);
+    if (hasExplicitBuiltinPolicy) {
+      fs.mkdirSync(skillsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillsDir, ".inherit-builtins.json"),
+        JSON.stringify(payload.inheritBuiltins),
+        { mode: 0o600 },
+      );
+    }
+    if (hasExplicitBuiltinMask) {
+      const disabled = [...new Set(payload.disabledBuiltins!
+        .map((name) => String(name).trim())
+        .filter(Boolean))].sort();
+      fs.mkdirSync(skillsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillsDir, ".disabled-builtins.json"),
+        JSON.stringify(disabled),
+        { mode: 0o600 },
+      );
+    }
 
     // Defense against empty-bundle erasure (belt-and-suspenders; the primary
     // fix is Gateway-side so empty-bundles only arrive when the agent is
@@ -259,7 +306,11 @@ export function createSkillsHandler(
     // Legitimate "unbind-all" admin operations can force a fresh wipe by
     // restarting the pod — which is cheap and explicit.
     const incomingCount = Array.isArray(payload?.skills) ? payload.skills.length : 0;
-    if (options.preserveExistingOnEmpty !== false && incomingCount === 0 && fs.existsSync(resolvedDir)) {
+    if (options.preserveExistingOnEmpty !== false
+        && !hasExplicitBuiltinPolicy
+        && !hasExplicitBuiltinMask
+        && incomingCount === 0
+        && fs.existsSync(resolvedDir)) {
       const existing = fs.readdirSync(resolvedDir).filter((name) => {
         try { return fs.statSync(path.join(resolvedDir, name)).isDirectory(); }
         catch { return false; }
@@ -485,6 +536,7 @@ export function readBoxSyncStatus(
       }
     : readKnowledgeInventoryFromDisk(knowledgeDir);
   return {
+    schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
     knowledge,
     skills: { names: listSkillNames(skillsDir) },
     mcp: { names: Object.keys(config.mcpServers ?? {}).sort() },

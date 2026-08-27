@@ -19,6 +19,7 @@ const clientCalls: Array<{ endpoint: string; timeoutMs: number; tlsOptions: unkn
 const getJsonCalls: Array<{ endpoint: string; path: string }> = [];
 const getJsonByEndpoint = new Map<string, () => Promise<unknown>>();
 const defaultSyncStatus = {
+  schemaVersion: 2,
   knowledge: {
     syncedAt: "2026-08-18T08:00:00.000Z",
     repos: [{ id: "kb-1", name: "硬件", version: 2, sha256: "abc" }],
@@ -96,10 +97,15 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
+      schemaVersion: 2,
       ok: true,
       available: false,
       reason: "no_running_box",
       boxes: 1,
+      runningBoxes: 0,
+      observedBoxes: 0,
+      consistent: false,
+      observations: [],
     });
     expect(getJsonCalls).toEqual([]);
   });
@@ -112,10 +118,15 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
+      schemaVersion: 2,
       ok: true,
       available: false,
       reason: "no_running_box",
       boxes: 0,
+      runningBoxes: 0,
+      observedBoxes: 0,
+      consistent: false,
+      observations: [],
     });
     expect(getJsonCalls).toEqual([]);
   });
@@ -129,15 +140,25 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
+      schemaVersion: 2,
       ok: true,
       available: true,
       boxes: 2,
+      runningBoxes: 1,
+      observedBoxes: 1,
+      consistent: true,
+      observations: [{
+        boxId: "b1",
+        available: true,
+        status: defaultSyncStatus,
+      }],
       knowledge: {
         syncedAt: "2026-08-18T08:00:00.000Z",
         repos: [{ id: "kb-1", name: "硬件", version: 2, sha256: "abc" }],
       },
       skills: { names: ["k8s-debug"] },
       mcp: { names: [] },
+      harness: null,
       model: null,
     });
     expect(getJsonCalls).toEqual([{ endpoint: "https://b1", path: "/api/sync-status" }]);
@@ -146,6 +167,142 @@ describe("agent.syncStatus RPC", () => {
       timeoutMs: 8_000,
       tlsOptions: server.agentBoxTlsOptions,
     }]);
+  });
+
+  it("returns a consistent observed Harness while ignoring evidence timestamps", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    const harness = {
+      agentType: "sre",
+      systemPromptTemplate: "personal prompt",
+      skillNames: ["personal-probe"],
+      skillDigests: { "personal-probe": "abc" },
+      toolNames: ["preview_echo"],
+    };
+    getJsonByEndpoint.set("https://b1", async () => ({
+      ...defaultSyncStatus,
+      harness: { ...harness, observedAt: "2026-08-26T08:00:00.000Z" },
+    }));
+    getJsonByEndpoint.set("https://b2", async () => ({
+      ...defaultSyncStatus,
+      harness: { ...harness, observedAt: "2026-08-26T08:01:00.000Z" },
+    }));
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+
+    await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toMatchObject({
+      available: true,
+      consistent: true,
+      harness: { ...harness, observedAt: "2026-08-26T08:00:00.000Z" },
+    });
+  });
+
+  it("normalizes a partial v1 wire payload without pretending it is v2", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://v1" },
+    ];
+    getJsonByEndpoint.set("https://v1", async () => ({
+      schemaVersion: 1,
+      knowledge: { repos: [] },
+    }));
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+
+    await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toMatchObject({
+      available: true,
+      consistent: true,
+      observations: [{
+        boxId: "b1",
+        available: true,
+        status: {
+          schemaVersion: 1,
+          knowledge: { syncedAt: null, repos: [] },
+          skills: { names: [] },
+          mcp: { names: [] },
+        },
+      }],
+    });
+  });
+
+  it("observes every running box and refuses a legacy model consensus when one box differs", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    getJsonByEndpoint.set("https://b1", async () => ({
+      ...defaultSyncStatus,
+      model: {
+        releaseId: "release-2",
+        modelFingerprint: "fingerprint-2",
+        observedAt: "2026-08-26T08:00:00.000Z",
+      },
+    }));
+    getJsonByEndpoint.set("https://b2", async () => ({
+      ...defaultSyncStatus,
+      model: {
+        releaseId: "release-1",
+        modelFingerprint: "fingerprint-1",
+        observedAt: "2026-08-26T08:01:00.000Z",
+      },
+    }));
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+
+    await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toMatchObject({
+      schemaVersion: 2,
+      available: true,
+      boxes: 2,
+      runningBoxes: 2,
+      observedBoxes: 2,
+      consistent: false,
+      model: null,
+      observations: [
+        {
+          boxId: "b1",
+          available: true,
+          status: { model: { releaseId: "release-2", modelFingerprint: "fingerprint-2" } },
+        },
+        {
+          boxId: "b2",
+          available: true,
+          status: { model: { releaseId: "release-1", modelFingerprint: "fingerprint-1" } },
+        },
+      ],
+    });
+    expect(getJsonCalls).toEqual([
+      { endpoint: "https://b1", path: "/api/sync-status" },
+      { endpoint: "https://b2", path: "/api/sync-status" },
+    ]);
+  });
+
+  it("returns partial per-box evidence without exposing transport errors", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://secret.internal" },
+    ];
+    getJsonByEndpoint.set("https://secret.internal", async () => {
+      throw new Error("connect ETIMEDOUT https://secret.internal?token=secret");
+    });
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+
+    const result = await syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(result).toMatchObject({
+      schemaVersion: 2,
+      available: true,
+      runningBoxes: 2,
+      observedBoxes: 1,
+      consistent: false,
+      model: null,
+      observations: [
+        { boxId: "b1", available: true },
+        { boxId: "b2", available: false, reason: "query_failed" },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("secret.internal");
+    expect(JSON.stringify(result)).not.toContain("token=secret");
   });
 
   it("marks an old box image as unsupported", async () => {
@@ -159,10 +316,15 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
+      schemaVersion: 2,
       ok: true,
       available: false,
       reason: "unsupported",
       boxes: 1,
+      runningBoxes: 1,
+      observedBoxes: 0,
+      consistent: false,
+      observations: [{ boxId: "b1", available: false, reason: "unsupported" }],
     });
   });
 
@@ -181,10 +343,18 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
+      schemaVersion: 2,
       ok: true,
       available: false,
       reason: "unsupported",
       boxes: 2,
+      runningBoxes: 2,
+      observedBoxes: 0,
+      consistent: false,
+      observations: [
+        { boxId: "b1", available: false, reason: "unsupported" },
+        { boxId: "b2", available: false, reason: "query_failed" },
+      ],
     });
     expect(getJsonCalls).toEqual([
       { endpoint: "https://old", path: "/api/sync-status" },

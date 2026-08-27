@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
-import { resolveScript } from "../infra/script-resolver.js";
+import { resolveScript, type SkillScriptResolver } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
@@ -46,8 +46,10 @@ const HOST_BG_MAX_TTL = 3600;
 export function createHostScriptTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
+  scriptResolver?: SkillScriptResolver,
 ): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
+  const scripts = scriptResolver ?? { resolveScript };
   return {
     name: "host_script",
     label: "Host Script",
@@ -138,7 +140,7 @@ Examples (pass the id from host_list; names shown here for readability):
         };
       }
 
-      const resolved = resolveScript({
+      const resolved = scripts.resolveScript({
         skill: params.skill,
         script: params.script,
       });
@@ -290,5 +292,5 @@ export const registration: ToolEntry = {
     createHostScriptTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,
       sessionIdRef: refs.sessionIdRef,
-    }),
+    }, refs.skillScriptResolver),
 };

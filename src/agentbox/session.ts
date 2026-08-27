@@ -97,6 +97,14 @@ export interface ManagedSession {
   userId?: string;
   brain: BrainSession;
   session: AgentSession;  // backward compat — only guaranteed for pi-agent brain
+  /** Exact function-schema names exposed when this in-memory brain was built. */
+  toolNames: string[];
+  /** Exact Skill names exposed after personal overlay and Built-in masks. */
+  skillNames: string[];
+  /** SHA-256 of the actual SKILL.md loaded for each visible Skill. */
+  skillDigests: Record<string, string>;
+  /** Re-read Skills after an in-session hot reload before recording evidence. */
+  getSkillSnapshot?: () => { skillNames: string[]; skillDigests: Record<string, string> };
   createdAt: Date;
   lastActiveAt: Date;
   /** Callbacks fired when the current prompt completes */
@@ -2902,6 +2910,10 @@ export class AgentBoxSessionManager {
       userId: effectiveUserId,
       brain: result.brain,
       session: result.session,
+      toolNames: (result.customTools ?? []).map((tool) => tool.name).sort(),
+      skillNames: [...(result.skillNames ?? [])].sort(),
+      skillDigests: { ...(result.skillDigests ?? {}) },
+      getSkillSnapshot: result.getSkillSnapshot,
       createdAt: new Date(),
       lastActiveAt: new Date(),
       _promptDoneCallbacks: new Set(),

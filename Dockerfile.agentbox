@@ -22,7 +22,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# Copy backend source only (AgentBox runtime graph: agentbox-main + core + tools).
+# Copy backend source only (AgentBox runtime graph: agentbox-main + core + tools + knowledge).
 # Gateway code (spawners, security, db) is intentionally NOT built here — the
 # agentbox image runs only agentbox-main.ts, which never imports src/gateway/*.
 # Those modules are compiled in the runtime/portal images instead.
@@ -31,6 +31,7 @@ COPY src/agentbox-main.ts ./src/
 COPY src/agentbox/ ./src/agentbox/
 COPY src/core/ ./src/core/
 COPY src/cron/ ./src/cron/
+COPY src/knowledge/ ./src/knowledge/
 COPY src/memory/ ./src/memory/
 COPY src/shared/ ./src/shared/
 COPY src/tools/ ./src/tools/

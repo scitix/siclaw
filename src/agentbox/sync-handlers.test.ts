@@ -454,6 +454,25 @@ describe("skillsHandler", () => {
     expect(fs.readFileSync(path.join(resolvedDir(), "packaged", "scripts", "run.sh"), "utf8")).toBe("echo ok");
   });
 
+  it("writes specs as SKILL.md when package files contain only Preview extras", async () => {
+    const specs = "---\nname: personal-preview\n---\n\n# Personal Preview\n";
+    await skillsHandler.materialize({
+      version: "preview-v1",
+      skills: [{
+        dirName: "personal-preview",
+        scope: "global" as const,
+        specs,
+        scripts: [],
+        files: [
+          { path: "evidence/version.txt", content: "V1\n", encoding: "utf8" as const, size: 3, sha256: "probe" },
+        ],
+      }],
+    });
+
+    expect(readResolved("personal-preview")).toBe(specs);
+    expect(fs.readFileSync(path.join(resolvedDir(), "personal-preview", "evidence", "version.txt"), "utf8")).toBe("V1\n");
+  });
+
   it("skips one invalid skill package instead of aborting the whole bundle", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -536,6 +555,31 @@ describe("skillsHandler", () => {
     expect(count).toBe(0);
     const entries = fs.readdirSync(resolvedDir());
     expect(entries).toEqual([]);
+  });
+
+  it("writes an authoritative Built-in mask and permits an explicit empty preview bundle", async () => {
+    await skillsHandler.materialize({
+      version: "v1",
+      inheritBuiltins: true,
+      disabledBuiltins: [],
+      skills: [{ dirName: "old", scope: "global", specs: "old", scripts: [] }],
+    });
+    expect(resolvedExists("old")).toBe(true);
+
+    const count = await skillsHandler.materialize({
+      version: "v2",
+      inheritBuiltins: false,
+      disabledBuiltins: ["manage-skill"],
+      skills: [],
+    });
+    expect(count).toBe(0);
+    expect(resolvedExists("old")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(skillsTmpDir, ".inherit-builtins.json"), "utf8",
+    ))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(skillsTmpDir, ".disabled-builtins.json"), "utf8",
+    ))).toEqual(["manage-skill"]);
   });
 
   // ── 5b. defense: empty payload does NOT wipe existing skills ─────
@@ -1304,6 +1348,7 @@ describe("readBoxSyncStatus", () => {
       knowledgeDir: knowledgeTmpDir,
       knowledgeHandler: syncStatusHandler,
     });
+    expect(status.schemaVersion).toBe(2);
     expect(status.knowledge.repos).toEqual([
       expect.objectContaining({ id: "repo-a", name: "硬件设施", version: 2 }),
     ]);

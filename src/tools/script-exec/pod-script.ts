@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
-import { resolveScript } from "../infra/script-resolver.js";
+import { resolveScript, type SkillScriptResolver } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
@@ -32,8 +32,10 @@ interface PodScriptParams {
 export function createPodScriptTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
+  scriptResolver?: SkillScriptResolver,
 ): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
+  const scripts = scriptResolver ?? { resolveScript };
   return {
     name: "pod_script",
     label: "Pod Script",
@@ -155,7 +157,7 @@ Examples:
       }
 
       // Resolve script
-      const resolved = resolveScript({
+      const resolved = scripts.resolveScript({
         skill: params.skill,
         script: params.script,
       });
@@ -267,5 +269,5 @@ export const registration: ToolEntry = {
     createPodScriptTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,
       sessionIdRef: refs.sessionIdRef,
-    }),
+    }, refs.skillScriptResolver),
 };
