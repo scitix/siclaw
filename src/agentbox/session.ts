@@ -506,29 +506,34 @@ export class AgentBoxSessionManager {
    * The parent's effective model as a routing candidate — the fallback target for
    * every tier miss, and what a sub-agent runs on when no tier applies.
    *
-   * Prefers what the routing runner published for the CURRENT turn
+   * Reads what the routing runner published for the CURRENT turn OF THIS SESSION
    * (`effectiveModelCandidate`): the parent may already have failed over, and
    * sending children at the configured primary would aim them at a model the
-   * parent just found broken. Falls back to the box's last binding, which is what
-   * every child used before tiering existed.
+   * parent just found broken.
+   *
+   * ⚠️ SESSION-OWNED ONLY — deliberately no box-level fallback. This used to fall
+   * back to `delegationModel*`, which is box-scoped: with more than one live
+   * session it holds whichever one most recently bound a model, so session A's
+   * children could be placed on session B's provider config, credentials included.
+   * That is precisely the isolation the two-channel split exists to preserve.
+   *
+   * Both prompt paths now publish (HTTP via its own `onAttemptReady`, synthetic via
+   * the one in `processSyntheticPrompt`), so nothing legitimate reached that
+   * fallback anyway. When a session genuinely has nothing published, `null` is the
+   * honest answer and `applyParent` already handles it: the child runs on whatever
+   * the factory gave it, which is the pre-tiering no-op path. Borrowing another
+   * session's binding is never the better answer.
    */
   private effectiveParentCandidate(
     parentSessionId: string,
   ): (ModelRouteCandidate & { params?: BrainModelParams }) | null {
     const parent = this.sessions.get(parentSessionId);
     const live = parent?.effectiveModelCandidate;
+    if (!live) return null;
     // Carry the parent's ACTUAL tunables alongside its model. Only meaningful
     // together: restoring one without the other puts the child on the right model
     // at the wrong level.
-    if (live) return { ...live, params: parent?.effectiveModelParams ?? undefined };
-    if (this.delegationModelProvider && this.delegationModelId) {
-      return {
-        provider: this.delegationModelProvider,
-        modelId: this.delegationModelId,
-        modelConfig: this.delegationModelConfig,
-      };
-    }
-    return null;
+    return { ...live, params: parent?.effectiveModelParams ?? undefined };
   }
 
   /**
@@ -2249,6 +2254,17 @@ export class AgentBoxSessionManager {
               // (turnMessages) and have no live viewer — buffer every attempt
               // so a failed primary can't leak into the persisted turn.
               optimisticPrimaryStream: false,
+              // Publish THIS session's running candidate, exactly as the HTTP path
+              // does. A synthetic turn can spawn sub-agents, so without this the
+              // tier plan had no session-owned answer for "what is the parent on"
+              // and fell through to box-level state — which, with more than one
+              // live session, is whichever session most recently bound a model.
+              // That would hand session A's children session B's provider config,
+              // credentials included.
+              onAttemptReady: (candidate) => {
+                managed.effectiveModelCandidate = candidate;
+                managed.effectiveModelParams = managed.brain.captureModelParams?.() ?? null;
+              },
             },
           );
         } catch (err) {
@@ -2664,7 +2680,30 @@ export class AgentBoxSessionManager {
     // (menu + candidates + effective parent), shared by every child of that call
     // and every later wave of a batch. Reading live state per child would let a
     // long batch straddle a configuration change and report both halves as one.
-    const tierOutcome = await this.applyChildModel(child, request.tierPlan, request.prompt);
+    // Redact the union of the parent's credentials and every tier candidate's: a
+    // tiered child may run on another provider entirely, and its own apiKey/baseUrl
+    // would otherwise pass through echoed tool output unmasked. Cheap and static,
+    // so it covers every candidate rather than only the one that resolved.
+    //
+    // Built BEFORE the outcome exists, because the outcome is the first thing that
+    // needs it — see the sanitize below.
+    const redactionConfig = buildRedactionConfigForModelConfig(
+      this.delegationModelConfig,
+      ...(request.tierPlan?.candidates?.candidates ?? []).map((c) => c.modelConfig),
+      request.tierPlan?.effectiveParent?.modelConfig,
+    );
+
+    const rawTierOutcome = await this.applyChildModel(child, request.tierPlan, request.prompt);
+    // `detail` is the raw `registerProvider` / `setModel` exception text, and such an
+    // exception routinely quotes the endpoint it dialled and sometimes the key it
+    // sent. Sanitized ONCE, here, rather than at each consumer: it is thrown at the
+    // prompt boundary, persisted onto the terminal event, and returned to the caller,
+    // and a fix applied per consumer leaves whichever one is added next unprotected.
+    // Redacting the summaries alone was not enough — the field itself still carried
+    // the key into the returned report.
+    const tierOutcome: ChildModelOutcome = rawTierOutcome.detail
+      ? { ...rawTierOutcome, detail: redactText(rawTierOutcome.detail, redactionConfig) }
+      : rawTierOutcome;
 
     // A `failed` outcome means not even the parent's effective model could be
     // applied, so there is nothing left to fall back to (§7.4). It is NOT handled
@@ -2711,15 +2750,6 @@ export class AgentBoxSessionManager {
     // ── Transcript persistence (design §13). Serialized via a promise queue so
     //    writes land in order; a write failure disables the trace but never the run. ──
     const delegationId = request.spawnId;
-    // Redact the union of the parent's credentials and every tier candidate's: a
-    // tiered child may run on another provider entirely, and its own apiKey/baseUrl
-    // would otherwise pass through echoed tool output unmasked. Cheap and static,
-    // so it covers every candidate rather than only the one that resolved.
-    const redactionConfig = buildRedactionConfigForModelConfig(
-      this.delegationModelConfig,
-      ...(request.tierPlan?.candidates?.candidates ?? []).map((c) => c.modelConfig),
-      request.tierPlan?.effectiveParent?.modelConfig,
-    );
     const lineage = { parentSessionId: request.parentSessionId, parentAgentId: agentId, delegationId, targetAgentId: agentId };
     // canPersist = is the trace persistable at all (config present). Constant — never
     // flipped. persistTrace is the per-write latch that disables further *non-terminal*
@@ -2855,6 +2885,14 @@ export class AgentBoxSessionManager {
       // persistence below, or the card sticks "Running" on reload and the child
       // leaks its connections.
       if (tierOutcome.failed) {
+        // REDACTED AT CONSTRUCTION, not just where it is rendered. `detail` is the
+        // raw `registerProvider` / `setModel` exception text, and a provider setup
+        // failure routinely quotes the baseUrl it dialled and sometimes the key it
+        // sent. From here the message becomes `finalText`, which is logged,
+        // persisted to the delegation transcript, shown in the UI, and returned to
+        // the PARENT MODEL as the tool result — so the moment it carries a secret
+        // it has carried it into a prompt. Redacting the thrown value means every
+        // one of those derives from sanitized text without each having to remember.
         throw new Error(
           `sub-agent could not be placed on a model${tierOutcome.detail ? `: ${tierOutcome.detail}` : ""}`,
         );
@@ -2878,8 +2916,18 @@ export class AgentBoxSessionManager {
           : `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms with no output.`;
       } else {
         status = "failed";
-        console.warn(`[agentbox-session] sub-agent ${childSessionId} failed:`, err);
-        finalText = finalText || `Sub-agent failed: ${err instanceof Error ? err.message : String(err)}`;
+        // Redact before BOTH uses. The union config covers the parent's credentials
+        // and every tier candidate's, because a tiered child may run on a different
+        // provider entirely — and an exception raised inside a model call is exactly
+        // the kind that quotes its endpoint back. Logging the raw `err` object was
+        // the remaining hole after the thrown message was sanitized above: a log
+        // line is no less of a disclosure than the tool result.
+        const failureText = redactText(
+          err instanceof Error ? err.message : String(err),
+          redactionConfig,
+        );
+        console.warn(`[agentbox-session] sub-agent ${childSessionId} failed: ${failureText}`);
+        finalText = finalText || `Sub-agent failed: ${failureText}`;
       }
     } finally {
       unsubscribe();
