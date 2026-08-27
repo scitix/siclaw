@@ -76,9 +76,21 @@ export interface PromptOptions {
   /**
    * Sub-agent model tier CANDIDATES for this turn (credentials included).
    * Passthrough — the AgentBox normalizes on arrival, since nothing validates it
-   * here. Absent means "no tiers this turn" and CLEARS any the session held.
+   * here. `undefined` means "no tiers this turn" and CLEARS any the session held.
+   *
+   * ⚠️ REQUIRED, alone among the optional fields on this interface, and not for
+   * symmetry: every field here is a field-by-field copy at each call site, and one
+   * that is merely optional lets a site compile while silently disabling tiering
+   * for that entire entry path. That is not hypothetical — `server.ts`, i.e. the
+   * `chat.send` path every control-plane turn takes, shipped without it. The menu
+   * arrives on a different channel, so the lead still advertised `model_tier` and
+   * every child fell back; nothing errored and the whole suite stayed green.
+   *
+   * Required makes each site STATE its answer. Write `undefined` where a path has
+   * no tiers to forward (the TUI, which builds no sub-agents at all) — that is a
+   * decision recorded, not a field forgotten.
    */
-  subagentTiers?: unknown;
+  subagentTiers: unknown;
   /** Image attachments (raw base64, no data: prefix) forwarded as vision input. */
   images?: Array<{ mimeType: string; data: string }>;
   /** File attachments forwarded as native model file input. */

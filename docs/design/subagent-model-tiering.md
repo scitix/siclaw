@@ -733,23 +733,28 @@ Referential decay is answered without cascading:
   leak through echoed tool output.
 - The resolution chain lands at `session.ts:2199`
 
-### 11.4 Propagation: 8 forwarding sites (+ the TUI snapshot) plus an invariant
+### 11.4 Propagation: 9 forwarding sites (+ the TUI snapshot) plus an invariant
 
 binding → prompt body is a **field-by-field copy everywhere, never a spread**.
 
-⚠️ **Correction to earlier drafts, which said 13.** That count came from grepping
-`modelRouting:` and treating every hit as a forwarding site. Three hits are not:
-`chat-gateway.ts` and `channels/lark.ts` each pass those fields to
-`modelOptionsSupportImageInput` (a vision-capability check that has no business
-carrying tier state), and `agent-api.ts:120` is a local variable declaration.
-Verified by implementation — adding the field to the check sites is a type error.
+⚠️ **This count was wrong twice, and the second time it cost the whole feature.**
+Earlier drafts said 13, from grepping `modelRouting:` and counting every hit; three
+of those are `modelOptionsSupportImageInput` (a vision-capability check that must
+not carry tier state) and one is a local declaration. The corrected figure of 8 was
+also wrong, and worse: it was derived from a **curated file list**, and the file it
+omitted — `gateway/server.ts`, the WS `chat.send` handler — is THE entry path under
+a control plane. It takes the binding fields off `params` and forwards them as
+shorthand properties, so neither the grep nor the file list saw it. Tiering was
+inert on that path while the menu still arrived over the tools channel, so the lead
+advertised `model_tier`, chose it, and every child fell back.
 
-The **8** real binding → prompt sites:
+The **9** real binding → prompt sites:
 
 | File | Sites |
 |---|---|
-| `chat-gateway.ts` | 3 |
+| `chat-gateway.ts` | 2 |
 | `delegate-api.ts` | 2 (remote `delegation.start` + local `client.prompt`) |
+| `gateway/server.ts` | 1 (**`chat.send`** — the control-plane entry path) |
 | `a2a-gateway.ts` | 1 |
 | `task-coordinator.ts` | 1 (cron) |
 | `channels/lark.ts` | 1 |
@@ -757,14 +762,27 @@ The **8** real binding → prompt sites:
 
 Plus the TUI, which is not a binding forward at all but a snapshot — see §11.6.
 
-Missing one means tiering silently does nothing on that entry path. **An invariant
-test pins both the field's presence and the site count**, following
-`model-api-invariants.test.ts`, which pins its own call-site count for the same
-reason. Note that the type system already catches part of this: `PromptOptions`
-declares the field, so a site that forwards it is checked, while a site that
-forgets it simply compiles — which is exactly why the count needs pinning.
+**The invariant test DISCOVERS these by walking the tree; it must never enumerate
+them.** A test that reads a list can only confirm what its author already knew,
+which is exactly how the 8 survived. Exclusions are allowed but each states its
+reason and is asserted to still exist.
 
-Collapsing the 13 into a `bindingToPromptFields()` helper is the more thorough fix,
+Two layers, and only one is checkable by the compiler:
+
+- **Runtime → AgentBox** is typed as `PromptOptions`, where `subagentTiers` is
+  **required** — alone among that interface's optional fields. A site that forgets
+  it does not build. Writing `undefined` is how a path with no tiers records the
+  decision.
+- **producer → Runtime** is an untyped RPC `params` object. Nothing but the scan
+  covers it.
+
+Missing one means tiering silently does nothing on that entry path, and "silently"
+is precise: falling back IS the documented behaviour for absent tier state, so
+latency and cost look normal and only the persisted `fallback_reason` distinguishes
+"no benefit" from "never ran". The first acceptance check for a rollout is therefore
+that `fallback_reason` is empty — not that the numbers improved.
+
+Collapsing the 9 into a `bindingToPromptFields()` helper is the more thorough fix,
 but the sites differ in detail (`delegate-api.ts:697` uses `systemPromptTemplate`
 where `:630` uses `systemPrompt`; the channel sites use optional chaining). Unifying
 them is a separate refactor and should not share a PR with a feature.
@@ -957,7 +975,10 @@ Tier configuration should be treated here the same way `model_routing` is.
    - env override — `off` inherits everywhere, an unknown name falls back without
      disabling, neither moves the reduce child
    - `migrate-sqlite.test.ts` — the column is created under both drivers
-   - invariant — 13 forwarding sites plus the count pin
+   - `subagent-tier-invariants.test.ts` — walks the tree for forwarding sites (9)
+     and names `gateway/server.ts` explicitly; every exclusion carries a reason
+   - `server-chat-subagent-tiers.test.ts` — `chat.send` relays the candidates, and
+     forwards `undefined` rather than inventing state when the caller sends none
    - `agent-api` clone — both the new column and `tool_capabilities` are carried
 11. End-to-end (real environment): a **cross-provider** two-entry list → fan out →
    verify the child's actual model, `llm.model_name` on the trace, that the child's

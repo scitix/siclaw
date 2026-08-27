@@ -755,6 +755,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
+    // Sub-agent tier CANDIDATES, relayed like every other binding field on this
+    // path. Omitting it was a hard blocker rather than a degradation: the menu
+    // travels on the tools channel and arrives, so the lead sees `model_tier`,
+    // picks a tier, and every child falls back — the one-sided state the runtime
+    // reports as candidate_missing. `chat.send` is THE entry path under a control
+    // plane, so the whole feature was inert there while every unit test passed.
+    const subagentTiers = params.subagentTiers;
     const images = params.images as PromptOptions["images"];
     const files = params.files as PromptOptions["files"];
     // One id for this turn, held from before the async ack until the turn settles.
@@ -802,6 +809,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       delegation,
       modelConfig,
       modelRouting,
+      subagentTiers,
       images,
       files,
     };
