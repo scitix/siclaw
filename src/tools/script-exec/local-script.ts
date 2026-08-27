@@ -14,10 +14,11 @@ import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-ku
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import { parseArgs } from "../infra/command-sets.js";
 import {
-  resolveSkillScript,
-  listSkillScripts,
   listAllSkillsWithScripts,
+  listSkillScripts,
+  resolveSkillScript,
   skillMdHint,
+  type SkillScriptResolver,
 } from "../infra/script-resolver.js";
 import { emitDiagnostic } from "../../shared/diagnostic-events.js";
 
@@ -36,8 +37,15 @@ export function createLocalScriptTool(
   userId?: string,
   agentId?: string | null,
   bg?: BackgroundExecWiring,
+  scriptResolver?: SkillScriptResolver,
 ): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
+  const scripts = scriptResolver ?? {
+    resolveSkillScript,
+    listSkillScripts,
+    listAllSkillsWithScripts,
+    skillMdHint,
+  };
   return {
     name: "local_script",
     label: "Local Script",
@@ -129,15 +137,15 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         };
       }
 
-      const resolved = resolveSkillScript(skill, script);
+      const resolved = scripts.resolveSkillScript(skill, script);
       if (!resolved) {
-        const available = listSkillScripts(skill);
+        const available = scripts.listSkillScripts(skill);
         let hint: string;
         if (available.length > 0) {
-          hint = `Available scripts for "${skill}": ${available.join(", ")}${skillMdHint(skill)}`;
+          hint = `Available scripts for "${skill}": ${available.join(", ")}${scripts.skillMdHint(skill)}`;
         } else {
           // List all skills that DO have scripts to help the LLM
-          const allSkillsWithScripts = listAllSkillsWithScripts();
+          const allSkillsWithScripts = scripts.listAllSkillsWithScripts();
           hint = `Skill "${skill}" has no scripts directory — follow its SKILL.md instructions using bash/other tools instead.`;
           if (allSkillsWithScripts.length > 0) {
             hint += `\n\nSkills with scripts: ${allSkillsWithScripts.map((s) => `${s.skill} (${s.scripts.join(", ")})`).join("; ")}`;
@@ -298,5 +306,5 @@ export const registration: ToolEntry = {
     createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef, refs.userId, refs.agentId, {
       executor: refs.backgroundExecExecutor,
       sessionIdRef: refs.sessionIdRef,
-    }),
+    }, refs.skillScriptResolver),
 };

@@ -72,7 +72,12 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
-import type { BoxSyncStatus } from "../shared/agentbox-sync-status.js";
+import {
+  AGENT_SYNC_STATUS_SCHEMA_VERSION,
+  normalizeBoxSyncStatus,
+  type BoxSyncObservation,
+  type BoxSyncStatus,
+} from "../shared/agentbox-sync-status.js";
 import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
@@ -2105,35 +2110,99 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentBoxes = boxes.filter((b) => b.agentId === agentId);
     const targets = agentBoxes.filter((b) => b.status === "running");
     if (targets.length === 0) {
-      return { ok: true, available: false, reason: "no_running_box", boxes: agentBoxes.length };
+      return {
+        schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
+        ok: true,
+        available: false,
+        reason: "no_running_box",
+        boxes: agentBoxes.length,
+        runningBoxes: 0,
+        observedBoxes: 0,
+        consistent: false,
+        observations: [] as BoxSyncObservation[],
+      };
     }
 
-    let sawUnsupported = false;
-    for (const box of targets) {
+    // Observe every running replica concurrently. Returning the first reachable
+    // box made a partially updated deployment look healthy whenever that box
+    // happened to be queried first.
+    const observations: BoxSyncObservation[] = await Promise.all(targets.map(async (box) => {
       try {
         const client = new AgentBoxClient(box.endpoint, 8_000, agentBoxTlsOptions);
-        const status = await client.getJson<BoxSyncStatus>("/api/sync-status");
-        return {
-          ok: true,
-          available: true,
-          boxes: agentBoxes.length,
-          knowledge: status.knowledge ?? { syncedAt: null, repos: [] },
-          skills: status.skills ?? { names: [] },
-          mcp: status.mcp ?? { names: [] },
-          model: status.model ?? null,
-        };
+        const status = normalizeBoxSyncStatus(await client.getJson<unknown>("/api/sync-status"));
+        return { boxId: box.boxId, available: true, status };
       } catch (err: any) {
         const message = String(err?.message ?? err);
-        console.warn(`[rpc] agent.syncStatus: box=${box.boxId} failed: ${message}`);
-        sawUnsupported ||= /\b404\b/.test(message) || /not found/i.test(message);
+        const reason = /\b404\b/.test(message) || /not found/i.test(message)
+          ? "unsupported"
+          : "query_failed";
+        console.warn(`[rpc] agent.syncStatus: box=${box.boxId} failed: ${reason}`);
+        // Do not return the transport error: endpoints and headers can contain
+        // credentials. The per-box reason is enough for the control plane.
+        return { boxId: box.boxId, available: false, reason };
       }
+    }));
+
+    const observed = observations.filter(
+      (item): item is Extract<BoxSyncObservation, { available: true }> => item.available,
+    );
+    if (observed.length === 0) {
+      return {
+        schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
+        ok: true,
+        available: false,
+        reason: observations.some((item) => !item.available && item.reason === "unsupported")
+          ? "unsupported"
+          : "query_failed",
+        boxes: agentBoxes.length,
+        runningBoxes: targets.length,
+        observedBoxes: 0,
+        consistent: false,
+        observations,
+      };
     }
 
+    // Timestamps are evidence freshness, not harness identity. Ignore them when
+    // deciding whether replicas agree, while retaining content/version fields.
+    const identity = (status: BoxSyncStatus): string => JSON.stringify({
+      schemaVersion: status.schemaVersion ?? 0,
+      knowledge: [...(status.knowledge?.repos ?? [])].sort((a, b) => a.id.localeCompare(b.id)),
+      skills: [...(status.skills?.names ?? [])].sort(),
+      mcp: [...(status.mcp?.names ?? [])].sort(),
+      harness: status.harness ? {
+        agentType: status.harness.agentType,
+        systemPromptTemplate: status.harness.systemPromptTemplate,
+        skillNames: [...(status.harness.skillNames ?? [])].sort(),
+        skillDigests: Object.fromEntries(Object.entries(status.harness.skillDigests ?? {}).sort(([a], [b]) => a.localeCompare(b))),
+        toolNames: [...(status.harness.toolNames ?? [])].sort(),
+      } : null,
+      model: status.model ? {
+        releaseId: status.model.releaseId,
+        modelFingerprint: status.model.modelFingerprint,
+      } : null,
+    });
+    const first = observed[0].status;
+    const firstIdentity = identity(first);
+    const consistent = observed.length === targets.length &&
+      observed.every((item) => identity(item.status) === firstIdentity);
+
     return {
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
-      available: false,
-      reason: sawUnsupported ? "unsupported" : "query_failed",
+      available: true,
       boxes: agentBoxes.length,
+      runningBoxes: targets.length,
+      observedBoxes: observed.length,
+      consistent,
+      observations,
+      // Keep the legacy aggregate while old Sicore versions roll forward. A
+      // model is proof only when every running box agrees; otherwise null keeps
+      // the old verifier in sync_pending rather than producing a false success.
+      knowledge: first.knowledge ?? { syncedAt: null, repos: [] },
+      skills: first.skills ?? { names: [] },
+      mcp: first.mcp ?? { names: [] },
+      harness: consistent ? (first.harness ?? null) : null,
+      model: consistent ? (first.model ?? null) : null,
     };
   });
 

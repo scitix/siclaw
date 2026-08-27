@@ -6,7 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
-import { resolveScript } from "../infra/script-resolver.js";
+import { resolveScript, type SkillScriptResolver } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
@@ -46,8 +46,10 @@ export function createNodeScriptTool(
   kubeconfigRef?: KubeconfigRef,
   userId?: string,
   bg?: BackgroundExecWiring,
+  scriptResolver?: SkillScriptResolver,
 ): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
+  const scripts = scriptResolver ?? { resolveScript };
   return {
     name: "node_script",
     label: "Node Script",
@@ -209,7 +211,7 @@ Examples:
       }
 
       // Resolve script
-      const resolved = resolveScript({
+      const resolved = scripts.resolveScript({
         skill: params.skill,
         script: params.script,
       });
@@ -353,5 +355,5 @@ export const registration: ToolEntry = {
     createNodeScriptTool(refs.kubeconfigRef, refs.userId, {
       executor: refs.backgroundExecExecutor,
       sessionIdRef: refs.sessionIdRef,
-    }),
+    }, refs.skillScriptResolver),
 };

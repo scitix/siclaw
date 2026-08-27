@@ -625,6 +625,15 @@ export function createHttpServer(
   // next turn is prepared; this state is the stronger evidence that a box has
   // actually run with the published model binding.
   let observedModel: { releaseId: string; modelFingerprint: string; observedAt: string } | null = null;
+  let observedHarness: {
+    agentType: string;
+    /** Request-scoped Agent prompt; the resource loader adds platform instructions. */
+    systemPromptTemplate: string | null;
+    skillNames: string[];
+    skillDigests: Record<string, string>;
+    toolNames: string[];
+    observedAt: string;
+  } | null = null;
   if (sessionManager.credentialBroker) {
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
@@ -784,6 +793,7 @@ export function createHttpServer(
         knowledgeHandler: perServerKnowledgeHandler,
       }),
       model: observedModel,
+      harness: observedHarness,
     });
   });
 
@@ -1244,6 +1254,21 @@ export function createHttpServer(
       } else {
         console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
         promptOutcome = "completed";
+        const latestSkills = managed.getSkillSnapshot?.();
+        if (latestSkills) {
+          managed.skillNames = [...latestSkills.skillNames].sort();
+          managed.skillDigests = { ...latestSkills.skillDigests };
+        }
+        observedHarness = {
+          agentType: sessionManager.agentTypeState,
+          // Preserve the configured Agent prompt that completed this turn. This
+          // is deliberately not labelled as the final compiled system prompt.
+          systemPromptTemplate: body.systemPromptTemplate ?? null,
+          skillNames: [...managed.skillNames],
+          skillDigests: { ...managed.skillDigests },
+          toolNames: [...managed.toolNames],
+          observedAt: new Date().toISOString(),
+        };
         const intendedCandidate = body.modelProvider && body.modelId
           ? candidateKey({ provider: body.modelProvider, modelId: body.modelId })
           : undefined;

@@ -44,4 +44,28 @@ describe("createLocalScriptTool", () => {
     const text = (result.content as any)[0].text;
     expect(text).toContain("path separator");
   });
+
+  it("uses the Session-scoped script resolver instead of process-global Skills", async () => {
+    const isolatedTool = createLocalScriptTool(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        resolveSkillScript: () => null,
+        listSkillScripts: () => ["agent-only.sh"],
+        listAllSkillsWithScripts: () => [],
+        skillMdHint: () => "",
+      } as any,
+    );
+
+    const result = await isolatedTool.execute(
+      "test-id",
+      { skill: "personal", script: "missing.sh" },
+      undefined,
+      {} as any,
+    );
+    expect((result.content as any)[0].text).toContain("agent-only.sh");
+  });
 });

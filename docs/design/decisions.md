@@ -83,7 +83,9 @@ Bundles contain **only global + skillset (dev only) + personal skills**. Core sk
 - ✅ Core skills are versioned with the code, not the database
 - ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
 - ⚠️ In local mode, only the scoped `createSkillsHandler()` may materialize a bundle, under `.siclaw/skills/agents/<agentId>/`; the process-global handler remains unsafe
-- ⚠️ If a user disables a core skill, the `disabledBuiltins` list in the bundle tells AgentBox which core skills to skip
+- ⚠️ The control plane resolves Agent Type inheritance, masks, and personal overlays before returning the effective bundle; materialized entries therefore remain available independently of the image-Built-in switch
+- ⚠️ A personal Preview can set `inheritBuiltins=false` to skip every image Built-in, or use `disabledBuiltins` to skip individual image-Built-in names; AgentBox applies that policy to both model-visible Skills and Skill scripts
+- ⚠️ LocalSpawner must inject the Agent-scoped Skill root into script tools; process-global script lookup would cross Agent boundaries even if model-visible Skills were filtered correctly
 - ⚠️ Skillset skills are dev-only — untested collaborative work cannot reach production without promotion to global
 
 ---

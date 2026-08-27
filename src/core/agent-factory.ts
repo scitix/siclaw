@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { buildKnowledgeOverview, buildKnowledgeWikiCatalog } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
@@ -50,12 +50,14 @@ import { inspectModelEnvelope, type ModelEnvelopeManifest } from "./model-envelo
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
+import { filterHarnessSkills } from "./skill-overlay.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 import {
   buildKnowledgeCitationSystemPrompt,
   createKnowledgeCitationSupport,
 } from "./knowledge-citation-tool.js";
 import { resolveSkillDirectories } from "./skill-directories.js";
+import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
@@ -170,6 +172,12 @@ export interface SiclawSessionResult {
   extensionsResult: LoadExtensionsResult;
   modelFallbackMessage?: string;
   customTools: ToolDefinition[];
+  /** Exact Skill names exposed by the resource loader after overlay/mask resolution. */
+  skillNames?: string[];
+  /** SHA-256 of each loaded SKILL.md, keyed by Skill name. */
+  skillDigests?: Record<string, string>;
+  /** Re-read the resource loader after a hot Skill reload. */
+  getSkillSnapshot?: () => { skillNames: string[]; skillDigests: Record<string, string> };
   kubeconfigRef: KubeconfigRef;
   /** Mutable skill dirs array — update contents + call session.reload() to switch */
   skillsDirs: string[];
@@ -404,6 +412,14 @@ export async function createSiclawSession(
   // Paths from settings.json (needed early for memoryIndexer init and tool resolution)
   const cwd = process.cwd();
   const skillsBase = path.resolve(cwd, config.paths.skillsDir);
+  const scriptSkillsBase = opts?.portalSkillsDir
+    ? path.dirname(path.resolve(opts.portalSkillsDir))
+    : skillsBase;
+  const scriptResolvedSkillsDir = path.resolve(opts?.portalSkillsDir ?? path.join(skillsBase, "resolved"));
+  const skillScriptResolver = createSkillScriptResolver({
+    skillsBaseDir: scriptSkillsBase,
+    resolvedSkillsDir: scriptResolvedSkillsDir,
+  });
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
   const knowledgeDir = opts?.knowledgeDir
@@ -468,13 +484,14 @@ export async function createSiclawSession(
   if (!knowledgeIndexer) {
     let candidate: MemoryIndexer | undefined;
     try {
-      candidate = createKnowledgeIndexer(
+      const created = createKnowledgeIndexer(
         knowledgeDir,
         path.join(userDataDir, "knowledge-index"),
         resolveEmbeddingConfig(),
       );
-      await candidate.sync();
-      knowledgeIndexer = candidate;
+      candidate = created;
+      await created.sync();
+      knowledgeIndexer = created;
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
       knowledgeIndexer = undefined;
@@ -497,6 +514,7 @@ export async function createSiclawSession(
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       knowledgeIndexer,
+      skillScriptResolver,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       knowledgeCitationTool: citationSupport?.tool,
@@ -693,6 +711,9 @@ export async function createSiclawSession(
     includePlatformSkills: compiledContext.harness.includePlatformSkills,
   });
 
+  const builtinPath = path.resolve(cwd, "skills", "core");
+  const extensionPath = path.resolve(cwd, "skills", "extension");
+  const platformPath = path.resolve(cwd, "skills", "platform");
   // A scoped Agent must not inherit pi's ambient ~/.pi/agent/skills discovery.
   // Keep standalone SRE/TUI compatibility only when there is no Portal/Gateway
   // scope and the harness explicitly permits bundled operational skills.
@@ -701,6 +722,12 @@ export async function createSiclawSession(
     fs.existsSync(resolvedSkillsDir) ||
     !compiledContext.harness.includeBundledSkills;
   const allowedSkillRoots = [...new Set(skillsDirs.map((dir) => path.resolve(dir)))];
+  // LocalSpawner materializes policy files beside its Agent-scoped resolved/
+  // tree; K8s keeps them in the process-wide skills root because one pod owns
+  // one Agent. Resolve both layouts from the authoritative directory above.
+  const overlayPolicyDir = opts?.portalSkillsDir
+    ? path.dirname(path.resolve(opts.portalSkillsDir))
+    : skillsBase;
 
   // Resolve credentials directory for tools and /setup extension
   // Credentials dir: Portal snapshot override > explicit kubeconfigRef > config default.
@@ -768,17 +795,27 @@ export async function createSiclawSession(
         (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
         ...cliOnlyFactories,
       ],
-      // Scoped Agent sessions only expose skill roots selected above. This
-      // filters pi-coding-agent's ambient ~/.pi/agent/skills auto-discovery and
-      // makes the harness, rather than the host filesystem, the authority.
-      skillsOverride: filterSkillsToHarness
-        ? (base) => ({
-            skills: base.skills.filter((skill) =>
+      // First enforce the context compiler's authoritative roots, then apply
+      // the personal Preview's Built-in master switch / per-name mask. Both
+      // filters are required: one prevents ambient host Skill discovery, while
+      // the other lets a developer intentionally test without image Built-ins.
+      skillsOverride: (base) => {
+        const harnessSkills = filterSkillsToHarness
+          ? base.skills.filter((skill) =>
               Boolean(skill.filePath) &&
-              allowedSkillRoots.some((root) => isPathInsideDir(skill.filePath!, root))),
-            diagnostics: base.diagnostics,
-          })
-        : undefined,
+              allowedSkillRoots.some((root) => isPathInsideDir(skill.filePath!, root)))
+          : base.skills;
+        return {
+          skills: filterHarnessSkills(harnessSkills, {
+            resolvedDir: path.resolve(opts?.portalSkillsDir ?? resolvedSkillsDir),
+            builtinDirs: [builtinPath, extensionPath, platformPath],
+            inheritFile: path.join(overlayPolicyDir, ".inherit-builtins.json"),
+            disabledFile: path.join(overlayPolicyDir, ".disabled-builtins.json"),
+            portalDir: opts?.portalSkillsDir,
+          }),
+          diagnostics: base.diagnostics,
+        };
+      },
       additionalSkillPaths: skillsDirs,
     },
   });
@@ -869,5 +906,26 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer, sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef };
+  const getSkillSnapshot = () => {
+    const currentSkills = loader.getSkills().skills;
+    const skillNames = currentSkills.map((skill) => skill.name).sort();
+    const skillDigests: Record<string, string> = {};
+    for (const skill of currentSkills) {
+      if (!skill.filePath) continue;
+      try {
+        skillDigests[skill.name] = createHash("sha256").update(fs.readFileSync(skill.filePath)).digest("hex");
+      } catch {
+        // The resource loader already emitted its own diagnostic. Keep the
+        // loaded name and omit only the unverifiable digest.
+      }
+    }
+    return { skillNames, skillDigests };
+  };
+  const { skillNames, skillDigests } = getSkillSnapshot();
+  return {
+    brain, session, services, extensionsResult, modelFallbackMessage, customTools,
+    skillNames, skillDigests, getSkillSnapshot,
+    kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
+    sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,
+  };
 }

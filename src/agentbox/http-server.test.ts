@@ -171,6 +171,10 @@ function makeFakeSession(id: string) {
   return {
     id,
     brain: makeFakeBrain(),
+    toolNames: ["bash", "preview_echo"],
+    skillNames: ["personal-probe", "skill-authoring"],
+    skillDigests: { "personal-probe": "abc", "skill-authoring": "def" },
+    getSkillSnapshot: undefined as (() => { skillNames: string[]; skillDigests: Record<string, string> }) | undefined,
     createdAt: new Date(),
     lastActiveAt: new Date(),
     _promptDoneCallbacks: new Set<() => void>(),
@@ -206,6 +210,7 @@ function makeFakeSessionManager() {
     getOrCreateCalls,
     userId: "u",
     agentId: "a",
+    agentTypeState: "sre",
     activeCount: () => sessions.size,
     // Resident is not the same as busy — box-status reports both.
     inFlightCount: () => Array.from(sessions.values()).filter((s) => !s._promptDone).length,
@@ -353,12 +358,14 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       const r = await getJson(port, "/api/sync-status");
       expect(r.status).toBe(200);
       expect(r.data).toEqual({
+        schemaVersion: 2,
         knowledge: {
           syncedAt: "2026-08-18T08:00:00.000Z",
           repos: [{ id: "kb-1", name: "hardware", version: 2, sha256: "abc", fileCount: 12 }],
         },
         skills: { names: ["k8s-debug"] },
         mcp: { names: ["incidents"] },
+        harness: null,
         model: null,
       });
     } finally {
@@ -371,6 +378,10 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
 
   it("reports a release model only after a successful turn completes", async () => {
     const session = await sm.getOrCreate("observed-model");
+    session.getSkillSnapshot = vi.fn(() => ({
+      skillNames: ["personal-probe-v2", "skill-authoring"],
+      skillDigests: { "personal-probe-v2": "v2", "skill-authoring": "def" },
+    }));
     session.brain.prompt.mockImplementation(async () => {
       session.brain.emitter.emit("event", {
         type: "message_end",
@@ -380,6 +391,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
 
     const before = await getJson(port, "/api/sync-status");
     expect(before.data.model).toBeNull();
+    expect(before.data.harness).toBeNull();
 
     const prompt = await getJson(port, "/api/prompt", "POST", {
       text: "hi",
@@ -388,6 +400,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       modelId: "gpt-4",
       releaseId: "release-2",
       modelFingerprint: "fingerprint-2",
+      systemPromptTemplate: "You are the personal preview.",
     });
     expect(prompt.status).toBe(200);
     await flushAsync();
@@ -398,6 +411,15 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       modelFingerprint: "fingerprint-2",
     });
     expect(new Date(after.data.model.observedAt).toString()).not.toBe("Invalid Date");
+    expect(after.data.harness).toMatchObject({
+      agentType: "sre",
+      systemPromptTemplate: "You are the personal preview.",
+      skillNames: ["personal-probe-v2", "skill-authoring"],
+      skillDigests: { "personal-probe-v2": "v2", "skill-authoring": "def" },
+      toolNames: ["bash", "preview_echo"],
+    });
+    expect(session.getSkillSnapshot).toHaveBeenCalledOnce();
+    expect(new Date(after.data.harness.observedAt).toString()).not.toBe("Invalid Date");
   });
 
   it("does not verify the release model when a fallback answered the turn", async () => {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  createSkillScriptResolver,
   resolveScript,
   resolveSkillScript,
   listSkillScripts,
@@ -84,6 +85,32 @@ describe("resolveScript — validation", () => {
 });
 
 describe("resolveSkillScript — path search precedence", () => {
+  it("isolates two Agent-scoped resolved trees and Built-in policies in one process", () => {
+    const sharedBuiltins = path.join(tmpRoot, "skills/core");
+    const agentA = path.join(tmpRoot, ".siclaw/skills/agents/agent-a");
+    const agentB = path.join(tmpRoot, ".siclaw/skills/agents/agent-b");
+    mkFile(path.join(sharedBuiltins, "builtin-probe/scripts/run.sh"), "builtin");
+    mkFile(path.join(agentA, "resolved/personal-probe/scripts/run.sh"), "agent-a");
+    mkFile(path.join(agentB, "resolved/personal-probe/scripts/run.sh"), "agent-b");
+    fs.writeFileSync(path.join(agentA, ".inherit-builtins.json"), "false");
+
+    const resolverA = createSkillScriptResolver({
+      skillsBaseDir: agentA,
+      resolvedSkillsDir: path.join(agentA, "resolved"),
+      builtinDirs: [sharedBuiltins],
+    });
+    const resolverB = createSkillScriptResolver({
+      skillsBaseDir: agentB,
+      resolvedSkillsDir: path.join(agentB, "resolved"),
+      builtinDirs: [sharedBuiltins],
+    });
+
+    expect(resolverA.resolveSkillScript("personal-probe", "run.sh")?.content).toBe("agent-a");
+    expect(resolverB.resolveSkillScript("personal-probe", "run.sh")?.content).toBe("agent-b");
+    expect(resolverA.resolveSkillScript("builtin-probe", "run.sh")).toBeNull();
+    expect(resolverB.resolveSkillScript("builtin-probe", "run.sh")?.content).toBe("builtin");
+  });
+
   it("finds script in scope subdirectory (global)", () => {
     mkFile(path.join(tmpRoot, ".siclaw/skills/global/my-skill/scripts/run.sh"), "echo run");
     const res = resolveSkillScript("my-skill", "run.sh");
@@ -131,6 +158,22 @@ describe("resolveSkillScript — path search precedence", () => {
     );
     const res = resolveSkillScript("disabled-one", "a.sh");
     expect(res).toBeNull();
+  });
+
+  it("inheritance off blocks every builtin script but keeps personal scripts", () => {
+    mkFile(path.join(tmpRoot, "skills/core/builtin-one/scripts/a.sh"), "builtin");
+    mkFile(path.join(tmpRoot, ".siclaw/skills/extension/builtin-two/scripts/b.sh"), "extension");
+    mkFile(path.join(tmpRoot, ".siclaw/skills/global/personal/scripts/p.sh"), "personal");
+    fs.writeFileSync(
+      path.join(tmpRoot, ".siclaw/skills/.inherit-builtins.json"),
+      JSON.stringify(false),
+    );
+
+    expect(resolveSkillScript("builtin-one", "a.sh")).toBeNull();
+    expect(resolveSkillScript("builtin-two", "b.sh")).toBeNull();
+    expect(resolveSkillScript("personal", "p.sh")?.content).toBe("personal");
+    expect(skillExistsAsBuiltin("builtin-one")).toBe(false);
+    expect(listAllSkillsWithScripts().map((item) => item.skill)).toEqual(["personal"]);
   });
 
   it("returns null for unknown skill", () => {
