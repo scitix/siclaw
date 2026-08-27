@@ -489,6 +489,19 @@ export class K8sSpawner implements BoxSpawner {
         // inside the box, so forwarding is what makes the runtime-level setting real.
         "SICLAW_SUBAGENT_CONCURRENCY",
         "SICLAW_SUBAGENT_POD_CONCURRENCY",
+        // Sub-agent model tiering, and the batch-group switch. Both are read inside
+        // the box (getSubagentModelTierOverride / isSubagentGroupEnabled) and both
+        // are documented as the OPS ROLLBACK lever for their feature — while neither
+        // was forwarded, so setting them on the Runtime deployment did nothing
+        // whatsoever in K8s mode. A switch that silently does nothing is worse than
+        // an absent one: the control plane deleted its own config-table kill switch
+        // on the strength of this env, leaving tiering with no working brake at all.
+        //
+        // Forwarding does not make either one INSTANT, and nothing here could: a live
+        // AgentBox keeps the env it was created with, so the new value reaches an
+        // existing session only when its pod is recycled or idles out.
+        "SICLAW_SUBAGENT_MODEL_TIER",
+        "SICLAW_SUBAGENT_GROUP_ENABLED",
         // Embedding endpoint for the memory indexer. The agentbox reads these via
         // loadConfig() env overrides (config.ts); set on the runtime deployment to
         // configure every normal AgentBox it spawns.

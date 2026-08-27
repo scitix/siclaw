@@ -257,6 +257,60 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
+  it("forwards the sub-agent OPS ROLLBACK knobs, which are read inside the box", async () => {
+    // Both are read in the AgentBox process (getSubagentModelTierOverride,
+    // isSubagentGroupEnabled) and both are documented as the way to turn their
+    // feature off during an incident. Neither was on the allowlist, so setting
+    // them on the Runtime deployment did nothing at all in K8s mode — a switch
+    // that silently does nothing, which is worse than an absent one.
+    process.env.SICLAW_SUBAGENT_MODEL_TIER = "off";
+    process.env.SICLAW_SUBAGENT_GROUP_ENABLED = "false";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.11", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    try {
+      await s.spawn({ agentId: "default" });
+      const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+      expect(env).toContainEqual({ name: "SICLAW_SUBAGENT_MODEL_TIER", value: "off" });
+      expect(env).toContainEqual({ name: "SICLAW_SUBAGENT_GROUP_ENABLED", value: "false" });
+    } finally {
+      delete process.env.SICLAW_SUBAGENT_MODEL_TIER;
+      delete process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
+    }
+  });
+
+  it("does not invent the sub-agent knobs when the runtime has not set them", async () => {
+    // The paired negative: without it the test above passes on a spawner that
+    // forwards the entire environment, which is a different (and unsafe) thing.
+    delete process.env.SICLAW_SUBAGENT_MODEL_TIER;
+    delete process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.11", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "default" });
+    const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+    expect(env.some((e: any) => e.name === "SICLAW_SUBAGENT_MODEL_TIER")).toBe(false);
+    expect(env.some((e: any) => e.name === "SICLAW_SUBAGENT_GROUP_ENABLED")).toBe(false);
+  });
+
   it("kb profile forwards KBC_* runtime env by prefix into the box pod, deduped, skipping empties", async () => {
     process.env.KBC_PK_MODE = "off";
     process.env.KBC_MEDIA_VERIFY = "on";
