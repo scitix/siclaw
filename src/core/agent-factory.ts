@@ -468,13 +468,14 @@ export async function createSiclawSession(
   if (!knowledgeIndexer) {
     let candidate: MemoryIndexer | undefined;
     try {
-      candidate = createKnowledgeIndexer(
+      const created = createKnowledgeIndexer(
         knowledgeDir,
         path.join(userDataDir, "knowledge-index"),
         resolveEmbeddingConfig(),
       );
-      await candidate.sync();
-      knowledgeIndexer = candidate;
+      candidate = created;
+      await created.sync();
+      knowledgeIndexer = created;
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
       knowledgeIndexer = undefined;

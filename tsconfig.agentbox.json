@@ -5,6 +5,7 @@
     "src/agentbox/**/*.ts",
     "src/core/**/*.ts",
     "src/cron/**/*.ts",
+    "src/knowledge/**/*.ts",
     "src/memory/**/*.ts",
     "src/shared/**/*.ts",
     "src/tools/**/*.ts"
