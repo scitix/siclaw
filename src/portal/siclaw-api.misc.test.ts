@@ -335,6 +335,35 @@ describe("siclaw-api misc routes", () => {
     });
   });
 
+  describe("PUT /api/v1/siclaw/agents/:id/channel-bindings/:bindingId/context-mode", () => {
+    it("accepts Topic mode and persists it on an owned binding", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "b1" }], []])
+        .mockResolvedValueOnce([{ affectedRows: 1 }, []]);
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/channel-bindings/b1/context-mode",
+        method: "PUT",
+        body: { mode: "topic" },
+      }));
+
+      expect(status).toBe(200);
+      expect(body).toEqual({ ok: true, mode: "topic" });
+      expect(query.mock.calls[1][1]).toEqual(["topic", "b1"]);
+    });
+
+    it("rejects an unknown mode before querying the database", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/channel-bindings/b1/context-mode",
+        method: "PUT",
+        body: { mode: "bogus" },
+      }));
+
+      expect(status).toBe(400);
+      expect(query).not.toHaveBeenCalled();
+    });
+  });
+
   // ── Diagnostics ──────────────────────────────────────────
   describe("GET /api/v1/siclaw/agents/:id/diagnostics", () => {
     it("returns diagnostics list", async () => {

@@ -1865,6 +1865,62 @@ describe("channel.resolveBinding", () => {
     expect(result.binding.sessionKey).toBe("open_id:ou_1:lark_thread:mid-root");
   });
 
+  it("topic mode shares the claimed Feishu Topic across participants", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "topic", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "shared-topic-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      {
+        channel_id: "ch1",
+        route_key: "group-123",
+        session_key: "open_id:ou_2",
+        conversation_key: "lark_thread:mid-root",
+      },
+      "a1",
+    );
+
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "lark_thread:mid-root",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual(expect.objectContaining({
+      sessionId: "shared-topic-session",
+      sessionKey: "lark_thread:mid-root",
+      contextMode: "topic",
+    }));
+  });
+
+  it("topic mode only reuses an already claimed Topic for an unmentioned follow-up", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "topic", created_by: "u1" }],
+      [{ session_id: "shared-topic-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      {
+        channel_id: "ch1",
+        route_key: "group-123",
+        session_key: "open_id:ou_2",
+        conversation_key: "lark_thread:mid-root",
+        conversation_existing_only: true,
+      },
+      "a1",
+    );
+
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(result.binding).toEqual(expect.objectContaining({
+      sessionId: "shared-topic-session",
+      sessionKey: "lark_thread:mid-root",
+      contextMode: "topic",
+    }));
+  });
+
   it("does not create a session for an unmentioned unrelated topic", async () => {
     const query = mockQuery(
       [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "shared", created_by: "u1" }],
@@ -2113,11 +2169,11 @@ describe("channel.setContextMode", () => {
     const query = mockQuery({ affectedRows: 1 } as any);
 
     const result = await getHandler("channel.setContextMode")(
-      { channel_id: "ch1", route_key: "group-1", mode: "per_user" }, "a1",
+      { channel_id: "ch1", route_key: "group-1", mode: "topic" }, "a1",
     );
-    expect(result).toEqual({ success: true, mode: "per_user" });
+    expect(result).toEqual({ success: true, mode: "topic" });
     expect(query.mock.calls[0][0]).toContain("UPDATE channel_bindings SET context_mode");
-    expect(query.mock.calls[0][1]).toEqual(["per_user", "ch1", "group-1"]);
+    expect(query.mock.calls[0][1]).toEqual(["topic", "ch1", "group-1"]);
   });
 
   it("rejects an unknown mode without touching the DB", async () => {

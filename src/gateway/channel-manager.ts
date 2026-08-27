@@ -42,8 +42,10 @@ export interface ResolvedChannelBinding {
   /**
    * Group context sharing mode, chosen server-side from the binding row.
    * `"shared"` → the whole group shares one session and non-@ chatter is
-   * buffered into it. `"per_user"` → each sender gets an isolated session and
-   * non-@ chatter is dropped. A NEW group defaults to `"shared"` (written at
+   * buffered into it. `"per_user"` → each sender gets an isolated Topic
+   * session. `"topic"` → everyone authorized for the bot shares one session
+   * inside a claimed Topic; unrelated Topics remain silent. A NEW group
+   * defaults to `"shared"` (written at
    * pair/auto-bind time), but the server resolves NULL/legacy rows to
    * `"per_user"` (grandfathering — never merges an existing group's contexts),
    * so an ABSENT field here is treated as `"per_user"` by the runtime: never
@@ -51,7 +53,7 @@ export interface ResolvedChannelBinding {
    * `sessionKey` as opaque; this field is the explicit signal for the non-@
    * ingestion gate — never infer the mode from the key shape.
    */
-  contextMode?: "shared" | "per_user";
+  contextMode?: "shared" | "per_user" | "topic";
 }
 
 /**
@@ -155,7 +157,7 @@ export async function resolveBinding(
 }
 
 /**
- * Set a group binding's context mode (shared|per_user) via the generic
+ * Set a group binding's context mode (shared|per_user|topic) via the generic
  * `channel.setContextMode` RPC. Backs the in-group /mode switch card; the
  * console selector calls the same RPC. Best-effort — returns the portal's
  * `{success}` shape, or a failure object if there is no frontend client.
@@ -163,7 +165,7 @@ export async function resolveBinding(
 export async function setChannelContextMode(
   channelId: string,
   routeKey: string,
-  mode: "shared" | "per_user",
+  mode: "shared" | "per_user" | "topic",
   frontendClient?: FrontendWsClient,
 ): Promise<{ success: boolean; mode?: string; error?: string }> {
   if (!frontendClient) return { success: false, error: "No frontend client for setContextMode" };

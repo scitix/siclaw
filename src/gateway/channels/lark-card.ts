@@ -212,7 +212,7 @@ export function resetFeedbackEchoForTest(): void {
 
 // ── Group context-mode switch card ───────────────────────────────
 
-export type GroupContextMode = "shared" | "per_user";
+export type GroupContextMode = "shared" | "per_user" | "topic";
 
 export const MODE_ACTION_KIND = "siclaw_ctx_mode";
 
@@ -231,22 +231,25 @@ const MODE_CARD_COPY: Record<LarkLocale, {
   hint: string;
   shared: string;
   perUser: string;
+  topic: string;
 }> = {
   "zh-CN": {
-    title: (m) => `**本群上下文模式:当前为「${m === "shared" ? "团队模式" : "个人模式"}」**`,
-    hint: "团队模式:全群共用一个对话,机器人跟进全群讨论(故障/支持群)。\n个人模式:每个人各自独立对话,互不影响(大群/混合群)。\n切换后是一段新对话。",
+    title: (m) => `**本群上下文模式:当前为「${m === "shared" ? "团队模式" : m === "topic" ? "话题模式" : "个人模式"}」**`,
+    hint: "团队模式:全群共用一个对话,机器人跟进全群讨论(故障/支持群)。\n个人模式:每个人各自独立对话,互不影响(大群/混合群)。\n话题模式:每个由机器人认领的话题单独闭环,话题内已授权成员共享上下文且无需再次 @。\n切换后是一段新对话。",
     shared: "团队模式",
     perUser: "个人模式",
+    topic: "话题模式",
   },
   "en-US": {
-    title: (m) => `**Group context mode: currently ${m === "shared" ? "Team (shared)" : "Personal (per-user)"}**`,
-    hint: "Team: everyone shares one conversation; the bot follows the whole group (incident / support rooms).\nPersonal: each person talks to the bot privately (large / mixed groups).\nSwitching starts a fresh conversation.",
+    title: (m) => `**Group context mode: currently ${m === "shared" ? "Team (shared)" : m === "topic" ? "Topic (thread-shared)" : "Personal (per-user)"}**`,
+    hint: "Team: everyone shares one conversation; the bot follows the whole group (incident / support rooms).\nPersonal: each person talks to the bot privately (large / mixed groups).\nTopic: each bot-claimed Topic is a closed conversation shared by its authorized participants; no repeated mention is needed inside it.\nSwitching starts a fresh conversation.",
     shared: "Team (shared)",
     perUser: "Personal (per-user)",
+    topic: "Topic (thread-shared)",
   },
 };
 
-/** Schema-2.0 card: current mode + two callback buttons (current one primary). */
+/** Schema-2.0 card: current mode + three callback buttons (current one primary). */
 export function buildModeCard(
   currentMode: GroupContextMode,
   channelId: string,
@@ -276,6 +279,7 @@ export function buildModeCard(
           columns: [
             { tag: "column", width: "auto", elements: [button("shared", copy.shared)] },
             { tag: "column", width: "auto", elements: [button("per_user", copy.perUser)] },
+            { tag: "column", width: "auto", elements: [button("topic", copy.topic)] },
           ],
         },
       ],

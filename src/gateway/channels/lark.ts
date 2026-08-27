@@ -558,17 +558,25 @@ function backfillBindingDisplayName(
 }
 
 const MODE_LABEL_BY_LOCALE: Record<LarkLocale, Record<GroupContextMode, string>> = {
-  "zh-CN": { shared: "团队模式(全群共享上下文)", per_user: "个人模式(各自独立上下文)" },
-  "en-US": { shared: "Team mode (shared context)", per_user: "Personal mode (per-user context)" },
+  "zh-CN": {
+    shared: "团队模式(全群共享上下文)",
+    per_user: "个人模式(各自独立上下文)",
+    topic: "话题模式(每个话题独立闭环)",
+  },
+  "en-US": {
+    shared: "Team mode (shared context)",
+    per_user: "Personal mode (per-user context)",
+    topic: "Topic mode (thread-shared context)",
+  },
 };
 
 const MODE_TOAST_BY_LOCALE: Record<LarkLocale, { ok: (m: GroupContextMode) => string; fail: string }> = {
   "zh-CN": {
-    ok: (m) => `已切换为${m === "shared" ? "团队模式" : "个人模式"}`,
+    ok: (m) => `已切换为${m === "shared" ? "团队模式" : m === "topic" ? "话题模式" : "个人模式"}`,
     fail: "切换失败,请重试。",
   },
   "en-US": {
-    ok: (m) => `Switched to ${m === "shared" ? "Team" : "Personal"} mode`,
+    ok: (m) => `Switched to ${m === "shared" ? "Team" : m === "topic" ? "Topic" : "Personal"} mode`,
     fail: "Couldn't switch mode. Please try again.",
   },
 };
@@ -577,11 +585,15 @@ const MODE_ANNOUNCE_BY_LOCALE: Record<LarkLocale, (m: GroupContextMode) => strin
   "zh-CN": (m) =>
     m === "shared"
       ? `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].shared};之后大家的消息按全群共享处理。`
-      : `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].per_user};之后每个人各自独立对话。`,
+      : m === "topic"
+        ? `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].topic};首次 @ 机器人会认领一个话题,之后已授权成员在该话题内无需再次 @,其他话题不受影响。`
+        : `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].per_user};之后每个人各自独立对话。`,
   "en-US": (m) =>
     m === "shared"
       ? `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].shared}; messages are handled as one shared conversation.`
-      : `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].per_user}; each person now talks to the bot separately.`,
+      : m === "topic"
+        ? `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].topic}; the first @bot message claims a Topic, then authorized participants can continue there without another mention while other Topics stay separate.`
+        : `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].per_user}; each person now talks to the bot separately.`,
 };
 
 const MODE_UNBOUND_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
@@ -700,7 +712,7 @@ function handleModeSwitchAction(
   const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
   const toasts = MODE_TOAST_BY_LOCALE[locale];
   const mode: GroupContextMode | null =
-    value.mode === "shared" ? "shared" : value.mode === "per_user" ? "per_user" : null;
+    value.mode === "shared" ? "shared" : value.mode === "per_user" ? "per_user" : value.mode === "topic" ? "topic" : null;
   if (!mode || !value.channel_id || !value.route_key) {
     console.warn(`[lark] Dropping malformed mode action channel=${value.channel_id ?? "?"} mode=${value.mode ?? "?"}`);
     return { toast: { type: "error", content: toasts.fail } };
@@ -843,7 +855,7 @@ function firstLocalePost(raw: any): any {
   return undefined;
 }
 
-// ── Group context mode (shared vs per_user) ──────────────────────
+// ── Group context mode (shared vs per_user vs topic) ─────────────
 //
 // The server (portal adapter) owns the shared-vs-isolated decision and encodes
 // it in the session key it returns; the runtime only needs the mode to decide
@@ -901,6 +913,16 @@ function cachedGroupMode(channelId: string, chatId: string): GroupContextMode | 
     return undefined;
   }
   return entry.mode;
+}
+
+/**
+ * Preserve every mode this runtime understands while keeping the historical
+ * fail-closed behavior for absent or future values: an unknown mode must never
+ * make unrelated group chatter enter a shared session.
+ */
+function normalizeGroupContextMode(value: unknown): GroupContextMode {
+  if (value === "shared" || value === "topic") return value;
+  return "per_user";
 }
 
 /** Drop cached mode + any buffered chatter for a group (used on a /mode switch). */
@@ -1016,8 +1038,9 @@ export async function handleLarkMessage(
   const senderType = getLarkSenderType(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
   // Every group message carries a provider-native Topic candidate. The
-  // server-authoritative contextMode decides the product behavior after binding
-  // resolution: per_user uses the Topic; shared stays on the main-group path.
+  // Server-authoritative contextMode decides the product behavior after binding
+  // resolution: personal and topic modes use the Topic; shared stays on the
+  // main-group path.
   const isGroupMessage = chatType === "group";
   const eventRootMessageId = typeof message.root_id === "string" && message.root_id.trim()
     ? message.root_id.trim()
@@ -1396,28 +1419,34 @@ export async function handleLarkMessage(
   // (thread follow-ups are allowed through) and reach the model as a prompt.
   // PAIR stays exempt: it carries its own one-time code.
   if (/^\/mode$/i.test(text.trim()) && (botMentioned || isThreadFollowup)) {
+    // A no-mention command inherits the same claim boundary as ordinary Topic
+    // follow-ups: it may reuse an established bot Topic but must never create
+    // state or answer inside an unrelated Topic.
+    const modeExistingOnly = isThreadFollowup && !botMentioned;
     const modeBinding = await resolveBinding(
       groupChannelId,
       chatId,
       frontendClient!,
       sessionKey,
       senderOpenId ?? undefined,
-      undefined,
-      false,
+      modeExistingOnly ? topicConversationKey : undefined,
+      modeExistingOnly,
       senderType ?? undefined,
     );
     if (isChannelAccessDenied(modeBinding)) {
+      if (modeExistingOnly) return;
       await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot)));
       return;
     }
     if (!modeBinding) {
+      if (modeExistingOnly) return;
       await replyToLark(larkClient, messageId, MODE_UNBOUND_NOTICE_BY_LOCALE[locale]);
       return;
     }
-    const current: GroupContextMode = modeBinding.contextMode === "shared" ? "shared" : "per_user";
+    const current = normalizeGroupContextMode(modeBinding.contextMode);
     // /mode changes the whole group. Keep a root invocation visible on the
     // main-group path; only retain the card inside an already-established Topic.
-    const modeReplyInThread = isThreadFollowup && current === "per_user";
+    const modeReplyInThread = isThreadFollowup && current !== "shared";
     rememberGroupMode(groupChannelId, chatId, current);
     const sent = await sendModeCard(larkClient, messageId, current, groupChannelId, chatId, locale, modeReplyInThread);
     if (!sent) {
@@ -1427,7 +1456,7 @@ export async function handleLarkMessage(
   }
 
   // Only respond when THIS bot is individually @-mentioned, except inside a
-  // topic that personal mode already scoped to a root message. Feishu also
+  // Topic that Personal or Topic mode already scoped to a root message. Feishu also
   // delivers "@所有人" to an @bot-scoped app (it mentions everyone, the bot
   // included), so an @所有人 announcement arrives looking just like a real
   // @bot — without this gate the bot replies to group-wide announcements that
@@ -1439,7 +1468,7 @@ export async function handleLarkMessage(
     // Non-@ group message. In a group KNOWN to be shared, retain it as passive
     // discussion context for the next @-turn — WITHOUT running the agent or
     // touching the AgentBox (idle pods must not be woken by group chatter).
-    // In a per_user group, or one whose mode we haven't confirmed shared,
+    // In a personal/topic group, or one whose mode we haven't confirmed shared,
     // drop it immediately: privacy discipline — only a confirmed-shared group
     // may retain chatter (the receive-all-messages scope is app-level, so the
     // bot sees chatter from groups it must not buffer).
@@ -1491,6 +1520,7 @@ export async function handleLarkMessage(
   //   - open group     → open_id:<sender>  (per-sender: concurrent + isolated)
   //   - authorized group → platform_user:<id> (per-user)
   //   - personal topic → <participant-key>:lark_thread:<root message>
+  //   - shared Topic → lark_thread:<root message>
   //   - shared group → chat:<route-key> (topic candidates are ignored)
   //   - legacy single binding session → "" (binding-level queue + /new reset)
   // /new then resets the right session, and same-session senders serialize.
@@ -1498,7 +1528,7 @@ export async function handleLarkMessage(
   // retain chatter without an RPC per message. Only an explicit "shared" is
   // shared; an absent field (e.g. an older portal) is treated as per_user so we
   // never buffer chatter for a group we can't confirm is shared (privacy-safe).
-  const contextMode: GroupContextMode = binding.contextMode === "shared" ? "shared" : "per_user";
+  const contextMode = normalizeGroupContextMode(binding.contextMode);
   // If the mode changed out of band (a console switch, or another actor) since
   // we last cached it, drop any buffered chatter — it belonged to the previous
   // mode and must not resurface (e.g. after a per_user detour back to shared).
@@ -1506,7 +1536,7 @@ export async function handleLarkMessage(
   if (cachedMode && cachedMode !== contextMode) forgetGroupState(groupChannelId, chatId);
   rememberGroupMode(groupChannelId, chatId, contextMode);
 
-  // A no-@ message inside a Feishu topic is a continuation only in personal
+  // A no-@ message inside a Feishu Topic is a continuation in Personal or Topic
   // mode. Team mode deliberately stays on the old main-group path; an
   // unrelated/manual topic must not wake the shared Agent session.
   if (isThreadFollowup && !botMentioned && contextMode === "shared") {
@@ -1517,9 +1547,9 @@ export async function handleLarkMessage(
     return;
   }
 
-  const personalTopicMode = isGroupMessage && contextMode === "per_user";
-  const conversationKey = personalTopicMode ? topicConversationKey : undefined;
-  const replyInThread = personalTopicMode;
+  const topicScopedMode = isGroupMessage && contextMode !== "shared";
+  const conversationKey = topicScopedMode ? topicConversationKey : undefined;
+  const replyInThread = topicScopedMode;
   const effectiveSessionKey = binding.sessionKey ?? "";
   const queueKey = `${binding.bindingId}:${binding.sessionKey ?? "__binding__"}`;
   const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
@@ -1563,7 +1593,8 @@ interface QueuedLarkMessageContext {
   channelId: string;
   route: "group" | "personal";
   /** Group route only: "shared" drains the discussion buffer into the prompt
-   *  and attributes the asker; absent/"per_user" behaves as an isolated chat. */
+   * and attributes the asker. `per_user` isolates each participant within a
+   * Topic; `topic` shares the claimed Topic among authorized participants. */
   contextMode?: GroupContextMode;
   /** Provider-native conversation scope. For Feishu topics this is rooted at
    *  the root message id and remains stable before/after thread_id exists. */
@@ -1608,7 +1639,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   if (/^\/new$/i.test(text)) {
     // A shared group has ONE group-level session, so a single member's /new
     // would clear everyone's context — reject it instead of resetting. (A
-    // confirmation-gated "reset the whole room" is deferred.) per_user groups
+    // confirmation-gated "reset the whole room" is deferred.) Topic-scoped groups
     // and personal chats reset the caller's own session as before.
     if (contextMode === "shared" && !conversationKey) {
       await replyToLark(larkClient, messageId, SHARED_NEW_REJECTED_NOTICE_BY_LOCALE[locale], replyInThread);
