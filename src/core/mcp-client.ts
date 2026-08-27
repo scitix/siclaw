@@ -9,6 +9,7 @@
 
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ResolvedToolDefinition } from "./tool-registry.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -311,7 +312,7 @@ export class McpClientManager {
     serverDescription: string | undefined,
     mcpTool: { name: string; description?: string; inputSchema?: any },
     client: any,
-  ): ToolDefinition {
+  ): ResolvedToolDefinition {
     const fullName = buildMcpToolName(serverName, mcpTool.name);
     const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
     // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
@@ -336,6 +337,7 @@ export class McpClientManager {
 
     return {
       name: fullName,
+      toolset: `mcp:${serverName}`,
       label: `${serverName}/${mcpTool.name}`,
       description: serverContext + toolDescription,
       parameters,

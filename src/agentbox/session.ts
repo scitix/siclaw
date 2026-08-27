@@ -2399,7 +2399,7 @@ export class AgentBoxSessionManager {
     let finalText = "";
     let toolCalls = 0;
     let status: SpawnSubagentStatus = "done";
-    const pendingTools = new Map<string, { startMs: number; toolName: string; toolInput?: string }>();
+    const pendingTools = new Map<string, { startMs: number; toolName: string; toolset?: string; toolInput?: string }>();
     // Ordered steps (assistant reasoning + tool calls) streamed to the parent UI so the
     // card shows the sub-agent's execution live, like a mini main-agent run.
     const liveSteps: SubagentStep[] = [];
@@ -2417,6 +2417,7 @@ export class AgentBoxSessionManager {
         pendingTools.set(id, {
           startMs: Date.now(),
           toolName,
+          ...(typeof event.toolset === "string" && event.toolset.length > 0 ? { toolset: event.toolset } : {}),
           toolInput: event.args ? redactText(JSON.stringify(event.args), redactionConfig) : undefined,
         });
         emitProgress(`Running ${toolName}…`);
@@ -2437,6 +2438,7 @@ export class AgentBoxSessionManager {
             role: "tool",
             content: resultText,
             toolName,
+            toolset: pending?.toolset ?? (typeof event.toolset === "string" ? event.toolset : null),
             toolInput: pending?.toolInput,
             outcome,
             durationMs,
