@@ -202,6 +202,51 @@ export async function bindMessageTraceId(
 }
 
 /**
+ * OTel trace ids are 32 lowercase hex characters — the contract the bind RPC above
+ * enforces server-side. Exported so every place that INGESTS a trace id from another
+ * process (the box's prompt ack, a delegation terminal event) applies the same gate:
+ * accepting a malformed id at one boundary and rejecting it at another is how rows
+ * get persisted under an id no link references.
+ */
+const TRACE_ID_RE = /^[0-9a-f]{32}$/;
+export function validTraceId(value: unknown): string | undefined {
+  return typeof value === "string" && TRACE_ID_RE.test(value) ? value : undefined;
+}
+
+/**
+ * Report a failed trace bind — but only once per process when the upstream simply does
+ * not implement the method.
+ *
+ * Binding a message to its trace is best-effort and optional: an upstream that has no
+ * trace consumer yet answers "unknown method" to every prompt and every steer, and a
+ * conversation steered a dozen times buries a real failure under a dozen identical lines.
+ * Any OTHER failure is a genuine one-off and keeps its own line.
+ *
+ * Lives here, next to bindMessageTraceId, because its dedup only works if every bind
+ * caller shares one reporter — server.ts (prompt/steer rows), delegate-api.ts
+ * (delegated opening rows) and the lark/dingtalk channels all report through it.
+ */
+const unsupportedUpstreamMethodsReported = new Set<string>();
+export function warnTraceBindFailure(kind: string, sessionId: string, messageId: string, err: unknown): void {
+  const message = String((err as Error)?.message ?? err);
+  if (/unknown method|not implemented|method not found/i.test(message)) {
+    // Keyed by the method the upstream is missing, not by a single global flag: one
+    // absent method must not silence the next one. The match runs on a bounded HEAD
+    // of the message with a non-backtracking shape (\w+(\.\w+)+ is linear; the old
+    // unanchored [\w.]+\.[\w]+ was measured quadratic — ~87s on a 400k-char error
+    // echoed by an upstream) so a huge error payload cannot stall the event loop
+    // from a fire-and-forget warn path.
+    const head = message.slice(0, 256);
+    const method = head.match(/\w+(?:\.\w+)+/)?.[0] ?? head;
+    if (unsupportedUpstreamMethodsReported.has(method)) return;
+    unsupportedUpstreamMethodsReported.add(method);
+    console.warn(`[runtime] upstream does not implement ${method}; that capability is off for this process (${message.slice(0, 2000)})`);
+    return;
+  }
+  console.warn(`[runtime] failed to bind ${kind} trace session=${sessionId} message=${messageId}:`, err);
+}
+
+/**
  * Record (or re-vote) end-user feedback on a channel reply. `messageRef` is a
  * channel-level reply reference (Feishu CardKit card_id), not a chat_messages
  * id — see the message_feedback DDL comment. One vote per (reply, person);

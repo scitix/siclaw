@@ -63,6 +63,14 @@ export interface DelegateResponse {
    * it back as DelegateRequest.peerSessionId to continue the same peer thread.
    */
   peerSessionId?: string;
+  /**
+   * The peer turn's OWN root trace id (32-hex). A delegated turn is its own
+   * trace — the peer runs under its own authority — so the coordinator persists
+   * this as the cross-trace link (tool details `child_trace_id`) that lets the
+   * audit/analysis side walk from the coordinator's trace into the delegated
+   * leg. Absent when the peer runtime has tracing off or predates the field.
+   */
+  peerTraceId?: string;
   error?: string;
 }
 

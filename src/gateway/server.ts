@@ -93,9 +93,9 @@ import {
   handleDelegationEvents,
   handleMetricsFlush,
 } from "./internal-api.js";
-import { handleDelegate, handleDelegates, isDelegationSettled } from "./delegate-api.js";
+import { handleDelegate, handleDelegates, isDelegationSettled, salvageDelegationTraceBind } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
-import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage } from "./chat-repo.js";
+import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -154,29 +154,9 @@ export interface StartRuntimeOptions {
  * seconds. Long enough to cover that; short enough that a genuinely missing session fails
  * while the user is still looking at the screen.
  */
-/**
- * Report a failed trace bind — but only once per process when the upstream simply does
- * not implement the method.
- *
- * Binding a message to its trace is best-effort and optional: an upstream that has no
- * trace consumer yet answers "unknown method" to every prompt and every steer, and a
- * conversation steered a dozen times buries a real failure under a dozen identical lines.
- * Any OTHER failure is a genuine one-off and keeps its own line.
- */
-const unsupportedUpstreamMethodsReported = new Set<string>();
-function warnTraceBindFailure(kind: string, sessionId: string, messageId: string, err: unknown): void {
-  const message = String((err as Error)?.message ?? err);
-  if (/unknown method|not implemented|method not found/i.test(message)) {
-    // Keyed by the method the upstream is missing, not by a single global flag: one
-    // absent method must not silence the next one.
-    const method = message.match(/[\w.]+\.[\w]+/)?.[0] ?? message;
-    if (unsupportedUpstreamMethodsReported.has(method)) return;
-    unsupportedUpstreamMethodsReported.add(method);
-    console.warn(`[runtime] upstream does not implement ${method}; that capability is off for this process (${message})`);
-    return;
-  }
-  console.warn(`[runtime] failed to bind ${kind} trace session=${sessionId} message=${messageId}:`, err);
-}
+// warnTraceBindFailure moved to chat-repo.ts, next to bindMessageTraceId: the
+// delegation transport (delegate-api.ts) now binds opening rows too, and the
+// once-per-process dedup only works if every bind caller shares one reporter.
 
 const STEER_SESSION_WAIT_MS = 3_000;
 
@@ -358,7 +338,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * turn's own reporting (see supervisorEndedTurns), which is exactly why they
    * needed their own route to it.
    */
-  const delegatedTurns = new Map<string, { delegationId: string; sessionId: string }>();
+  // traceId is the delegated turn's own root trace id, recorded the moment the box's
+  // prompt ack names it. It lives HERE — on the turn's ledger entry — rather than in
+  // the chat.send closure, so both terminal producers (the consumer paths in the
+  // handler and the shutdown/box-roll supervisor above) report the same trace and an
+  // interrupted leg keeps its cross-trace link. (A delegated send that degrades into
+  // a steer of an already-running turn produces no terminal at all — a pre-existing
+  // gap that ends in the source's relay idle-timeout, not a divergent trace.)
+  const delegatedTurns = new Map<string, { delegationId: string; sessionId: string; traceId?: string }>();
   /**
    * Work that outlives the turn it belongs to and that shutdown must still flush.
    *
@@ -611,6 +598,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           type: "prompt_done",
           aborted: true,
           reason,
+          // The interrupted leg's rows were already persisted under this trace by the
+          // consume that just got cut short — an aborted terminal without it would
+          // leave exactly the legs a review drills into unlinked.
+          ...(delegated.traceId ? { traceId: delegated.traceId } : {}),
         });
         started.push(trackForShutdown(delivery));
       }
@@ -779,11 +770,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
      * makes it safe: the supervisor will not also report it, so a shutdown during
      * the retries cannot turn a finished turn into an interrupted one.
      */
+    // Riding the trace id on the terminal event is what hands it to the SOURCE
+    // Runtime: chat.send acks in milliseconds (before the trace exists) and
+    // chat.getMessages does not project trace_id, so the terminal is the one channel
+    // the coordinator side can learn which trace this leg's rows were persisted
+    // under — the value it stores as the tool row's `child_trace_id` link. The id is
+    // read from the delegatedTurns ledger entry (recorded at prompt ack), the same
+    // place the supervisor path reads it, so the two producers cannot disagree.
     const reportTerminal = (event: Record<string, unknown>): void => {
       const delegationId = delegation?.delegationId;
       if (!delegationId) return;
+      const traceId = delegatedTurns.get(turnId)?.traceId;
       delegatedTurns.delete(turnId);
-      void trackForShutdown(deliverDelegationTerminal(delegationId, sessionId, turnId, event));
+      const terminal = traceId ? { ...event, traceId } : event;
+      void trackForShutdown(deliverDelegationTerminal(delegationId, sessionId, turnId, terminal));
     };
     const promptOpts: PromptOptions = {
       sessionId,
@@ -886,7 +886,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             if (promptMessageId) await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
               .catch((e) => console.warn(`[runtime] failed to mark steer message session=${sessionId}:`, e));
-            if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch(() => {});
+            if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch((bindErr) => {
+              warnTraceBindFailure("busy-degrade steer", sessionId, promptMessageId!, bindErr);
+            });
             return; // the running turn owns the stream and will emit its own prompt_done
           }
           // No steer target, or the turn ended between the rejection and the steer. Ask
@@ -923,8 +925,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         throwIfStoppedBeforePrompt();
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
+        let ackTraceId: string | undefined;
         try {
           promptResult = await client.prompt(promptOpts);
+          // The ack's trace id is gated ONCE and every consumer of it below — the
+          // delegated-turn ledger, the prompt-row bind, the consume's row stamp —
+          // uses the gated value: stamping rows with a malformed id one boundary
+          // accepts and another rejects is how a turn ends up persisted under an id
+          // no link references.
+          ackTraceId = validTraceId(promptResult.traceId);
+          // Record the delegated turn's trace id on its ledger entry IMMEDIATELY —
+          // before any Stop/abort handling below — so a turn interrupted between the
+          // ack and the consume still reports the trace its rows were persisted under.
+          const delegated = delegatedTurns.get(turnId);
+          if (delegated) delegated.traceId = ackTraceId;
           // The box now has the session: a steer racing this call can stop waiting, and
           // this row is in line to be processed (see pending-user-rows.ts).
           sessionTurnLocks.markPromptAccepted(sessionId);
@@ -1005,7 +1019,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           throw err;
         }
 
-        if (promptMessageId) void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+        if (promptMessageId) void bindMessageTraceId(promptMessageId, promptResult.sessionId, ackTraceId).catch((bindErr) => {
           warnTraceBindFailure("prompt", promptResult.sessionId, promptMessageId!, bindErr);
         });
 
@@ -1035,7 +1049,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             client,
             sessionId: promptResult.sessionId,
             userId,
-            traceId: promptResult.traceId,
+            traceId: ackTraceId,
             persistMessages: true,
             // The box has started consuming a user message: give that row its place in
             // the conversation now, which is the only moment processing order is visible.
@@ -2252,6 +2266,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // which keeps the sender's relay alive; a relay that later expires aborts by
     // (agent, session) and would kill a NEW turn reusing that peer session.
     const delegationId = typeof params?.delegationId === "string" ? params.delegationId : "";
+    // A terminal that outlived its consumer (Stop, idle-timeout — or a source
+    // restart that emptied the settled set) still carries the leg's trace id —
+    // salvage the opening-row bind, or the interrupted legs a review drills into
+    // stay unlinked. Fire-and-forget on BOTH branches: the ack (or the retry-driving
+    // throw below) must not wait on a best-effort bind, and the salvage's own memo
+    // keeps redelivery retries from repeating the history walk.
+    if (delegationId) {
+      void salvageDelegationTraceBind(params as Record<string, unknown>).catch((err) => {
+        console.warn(`[runtime] settled-delegation trace salvage failed for ${delegationId}:`, err);
+      });
+    }
     if (delegationId && isDelegationSettled(delegationId)) {
       return { ok: true, alreadySettled: true };
     }

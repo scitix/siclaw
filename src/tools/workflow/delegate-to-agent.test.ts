@@ -107,3 +107,48 @@ describe("delegate_to_agent tool", () => {
     expect((r.details as any).status).toBe("failed");
   });
 });
+
+/**
+ * The delegated leg runs as its OWN trace (the peer answers to its own config),
+ * so the coordinator's tool row is where the cross-trace link lives: details
+ * carry `child_trace_id` next to `child_session_id`, and the sse-consumer
+ * persists details into the tool row's metadata. These tests pin the link's
+ * presence/absence contract; the transport side is covered in
+ * delegate-api.test.ts.
+ */
+describe("delegate_to_agent tool — child trace link", () => {
+  const TRACE = "a".repeat(32);
+
+  it("persists child_trace_id next to child_session_id when the leg reported its trace", async () => {
+    const exec = vi.fn(async () => okResp({ peerSessionId: "child-sess", peerTraceId: TRACE }));
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const r = await tool.execute("c1", { agent_id: "agent-net", task: "x" });
+    expect(r.details as any).toMatchObject({
+      status: "done",
+      child_session_id: "child-sess",
+      child_trace_id: TRACE,
+    });
+  });
+
+  it("omits child_trace_id when the leg has none (tracing off / older runtime)", async () => {
+    const exec = vi.fn(async () => okResp({ peerSessionId: "child-sess" }));
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const r = await tool.execute("c1", { agent_id: "agent-net", task: "x" });
+    expect((r.details as any).child_session_id).toBe("child-sess");
+    expect(r.details as any).not.toHaveProperty("child_trace_id");
+  });
+
+  it("keeps the link on a failed leg — failed legs are exactly what a review drills into", async () => {
+    const exec = vi.fn(async () => okResp({
+      ok: false, status: "failed", artifact: null, error: "kubectl timed out",
+      peerSessionId: "child-sess", peerTraceId: TRACE,
+    }));
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const r = await tool.execute("c1", { agent_id: "agent-net", task: "x" });
+    expect(r.details as any).toMatchObject({
+      status: "failed",
+      child_session_id: "child-sess",
+      child_trace_id: TRACE,
+    });
+  });
+});

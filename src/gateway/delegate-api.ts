@@ -27,7 +27,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
-import { ensureChatSession, appendMessage, getMessages } from "./chat-repo.js";
+import { ensureChatSession, appendMessage, getMessages, bindMessageTraceId, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import { parsePositiveIntEnv } from "../core/subagent-registry.js";
 import type {
@@ -52,6 +52,12 @@ const DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
  */
 const REMOTE_RESULT_WINDOW_START = 200;
 const REMOTE_RESULT_WINDOW_MAX = 20_000;
+
+// Trace ids from another process (the box's prompt ack, a remote terminal event) are
+// gated through chat-repo's validTraceId at ingestion: a malformed id from a buggy or
+// differently-versioned peer would otherwise be persisted verbatim as the tool row's
+// child_trace_id (a link that matches nothing) while the opening-row bind for the same
+// value fails on the server's stricter check — a half-written link.
 
 /**
  * The control plane keeps its own relay lease and tears the relay down when it
@@ -184,47 +190,52 @@ type DurableRemoteResult =
  * guarantees that later rows up to prompt_done belong to this turn even when a
  * peer session is reused.
  */
+/**
+ * The widening-window walk both durable readers share: find the CURRENT turn's
+ * opening user row (the durable boundary marker — delegationId is minted per
+ * delegate call, so the reverse scan is unique). A fixed window would make the
+ * search a function of how chatty the turn was: tool rows are messages too, so
+ * one tool-heavy investigation can bury its own opening row.
+ *
+ * Returns the window and the boundary index, or undefined when the whole session
+ * was read without finding the row. Throws what getMessages throws — each caller
+ * reports that in its own vocabulary.
+ */
+async function findTurnBoundary(
+  peerSessionId: string,
+  delegationId: string,
+): Promise<{ window: Awaited<ReturnType<typeof getMessages>>; boundary: number } | undefined> {
+  // The update clause doubles AND clamps in one expression (min(2l, MAX)):
+  // doubling blindly would overshoot the stated ceiling on the last step
+  // (12800 → 25600) and request more rows than the cap admits.
+  for (let limit = REMOTE_RESULT_WINDOW_START; ; limit = Math.min(limit * 2, REMOTE_RESULT_WINDOW_MAX)) {
+    const window = await getMessages(peerSessionId, { limit });
+    for (let i = window.length - 1; i >= 0; i -= 1) {
+      if (window[i].role === "user" && window[i].delegationId === delegationId) {
+        return { window, boundary: i };
+      }
+    }
+    // A window that came back short IS the whole session: widening cannot reveal
+    // a boundary row that is not there.
+    if (window.length < limit || limit >= REMOTE_RESULT_WINDOW_MAX) return undefined;
+  }
+}
+
 async function recoverRemoteResult(
   peerSessionId: string,
   delegationId: string,
 ): Promise<DurableRemoteResult> {
-  // Widen the window until this turn's opening row is inside it. A fixed window
-  // would make recovery a function of how chatty the turn was: tool rows are
-  // messages too, so one tool-heavy investigation can bury its own opening row and
-  // have its finished answer reported as unrecoverable.
-  let turnMessages: Awaited<ReturnType<typeof getMessages>> = [];
-  let boundaryFound = false;
-  for (let limit = REMOTE_RESULT_WINDOW_START; !boundaryFound; limit *= 2) {
-    let window: Awaited<ReturnType<typeof getMessages>>;
-    try {
-      window = await getMessages(peerSessionId, { limit });
-    } catch (err) {
-      console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
-      return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
-    }
-
-    let boundary = -1;
-    for (let i = window.length - 1; i >= 0; i -= 1) {
-      if (window[i].role === "user" && window[i].delegationId === delegationId) {
-        boundary = i;
-        break;
-      }
-    }
-    if (boundary >= 0) {
-      turnMessages = window.slice(boundary + 1);
-      boundaryFound = true;
-      break;
-    }
-    // A window that came back short IS the whole session: widening cannot reveal
-    // a boundary row that is not there.
-    if (window.length < limit || limit >= REMOTE_RESULT_WINDOW_MAX) break;
-    // Doubling blindly would overshoot the stated ceiling on the last step
-    // (12800 → 25600); land exactly on it instead.
-    limit = Math.min(limit, REMOTE_RESULT_WINDOW_MAX / 2);
+  let found: Awaited<ReturnType<typeof findTurnBoundary>>;
+  try {
+    found = await findTurnBoundary(peerSessionId, delegationId);
+  } catch (err) {
+    console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
+    return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
   }
-  if (!boundaryFound) {
+  if (!found) {
     return { status: "failed", error: "Remote delegation completed, but its durable turn boundary was not found" };
   }
+  const turnMessages = found.window.slice(found.boundary + 1);
 
   const persistedError = [...turnMessages].reverse().find((message) =>
     message.role === "assistant" &&
@@ -244,6 +255,52 @@ async function recoverRemoteResult(
   if (assistantText) return { status: "found", finalText: assistantText };
 
   return { status: "empty" };
+}
+
+/**
+ * Salvage the trace link from a terminal that arrived AFTER its delegation's
+ * live subscriber was gone (coordinator Stop, relay idle-timeout, or a source
+ * restart that emptied the settled set): the target kept retrying delivery and
+ * the id is right here in-process. Binding the opening user row makes the leg's
+ * trace complete, so the leg stays reachable from the tool row's
+ * child_session_id even though that row's own child_trace_id was already
+ * persisted without it.
+ *
+ * Best-effort by design: the boundary walk is the shared findTurnBoundary (the
+ * current turn's opening row is the durable marker), and the bind RPC is
+ * NULL-to-value idempotent, so a re-delivered terminal repeating this is
+ * harmless. The memo below keeps a redelivery storm from re-walking the history
+ * — terminal retries back off for ~63s per delegation, so one walk per
+ * delegation id is all a correct sender ever needs.
+ */
+const salvagedDelegations = new Set<string>();
+const SALVAGED_DELEGATIONS_CAP = 512;
+export async function salvageDelegationTraceBind(params: Record<string, unknown>): Promise<void> {
+  const sessionId = typeof params?.sessionId === "string" ? params.sessionId : "";
+  const delegationId = typeof params?.delegationId === "string" ? params.delegationId : "";
+  const event = params?.event as Record<string, unknown> | undefined;
+  const traceId = validTraceId(event?.traceId);
+  if (!sessionId || !delegationId || !traceId) return;
+  if (salvagedDelegations.has(delegationId)) return;
+  salvagedDelegations.add(delegationId);
+  if (salvagedDelegations.size > SALVAGED_DELEGATIONS_CAP) {
+    // FIFO eviction, same shape as the settled-delegations bound: Set iteration
+    // order is insertion order.
+    const oldest = salvagedDelegations.values().next().value;
+    if (oldest !== undefined) salvagedDelegations.delete(oldest);
+  }
+  const found = await findTurnBoundary(sessionId, delegationId);
+  if (!found) {
+    // Loud, not silent: a salvage that found no opening row (the append failed at
+    // delegation time) is the one outcome an operator cannot distinguish from
+    // success without this line.
+    console.warn(`[delegate-api] settled-delegation trace salvage found no opening row for delegation=${delegationId} session=${sessionId}`);
+    return;
+  }
+  const row = found.window[found.boundary];
+  await bindMessageTraceId(row.id, sessionId, traceId).catch((err) => {
+    warnTraceBindFailure("settled delegation", sessionId, row.id, err);
+  });
 }
 
 /** GET /api/internal/delegates — the calling coordinator's roster. */
@@ -298,6 +355,27 @@ export async function handleDelegate(
   let delegationId = "";
   let peerSessionId = "";
   let remoteStartRequested = false;
+  // The peer turn's own root trace id, once the runtime serving it reports one
+  // (local: the box's prompt ack; remote: the terminal event). A delegated turn
+  // is its OWN trace, so this is what the delegate_result carries back for the
+  // coordinator to persist as the cross-trace link — and what the opening user
+  // row below is bound to, since that row is appended before the trace exists.
+  let peerTraceId: string | undefined;
+  // The opening user row's id, kept so peerTraceId can be bound to it later.
+  let openingMessageId = "";
+  const bindOpeningRowTrace = (traceId: string | undefined) => {
+    if (!traceId || !openingMessageId) return;
+    // openingMessageId is deliberately NOT cleared here: it is a per-request local
+    // (a reused peer session's next turn is a NEW handleDelegate call with its own
+    // opening row), and the bind RPC is value-idempotent server-side — so a
+    // re-delivered remote terminal retrying the bind is harmless, while clearing
+    // before the fire-and-forget settles would let one transient RPC failure
+    // permanently strand the opening row at trace_id NULL.
+    const messageId = openingMessageId;
+    void bindMessageTraceId(messageId, peerSessionId, traceId).catch((err) => {
+      warnTraceBindFailure("delegated prompt", peerSessionId, messageId, err);
+    });
+  };
   /**
    * Wind this delegation down, RETURNING the abort it issues — once.
    *
@@ -473,8 +551,10 @@ export async function handleDelegate(
       { parentSessionId: trustedParent, parentAgentId: coordinatorAgentId, delegationId, targetAgentId: peerAgentId },
     );
     // Persist the delegated task as the opening user turn so the opened session
-    // reads naturally (and a reuse turn appends its new task).
-    await appendMessage({ sessionId: peerSessionId, role: "user", content: text, parentSessionId: trustedParent, delegationId, targetAgentId: peerAgentId });
+    // reads naturally (and a reuse turn appends its new task). The row is written
+    // BEFORE the peer turn exists, so its trace id is bound later (bindOpeningRowTrace)
+    // — the same append-then-bind pattern chat.send uses for its prompt row.
+    openingMessageId = await appendMessage({ sessionId: peerSessionId, role: "user", content: text, parentSessionId: trustedParent, delegationId, targetAgentId: peerAgentId });
   } catch (err) {
     if (cancelled()) return;
     console.warn("[delegate-api] failed to persist peer session:", err);
@@ -596,6 +676,24 @@ export async function handleDelegate(
       observePeerEvent(envelope.event, false);
       const type = String((envelope.event as any)?.type ?? "");
       if (type === "prompt_done" || type === "done") {
+        // The target Runtime reports the peer turn's own trace id on the terminal
+        // (its rows were already persisted under it by that Runtime's chat.send
+        // consume). Absent or malformed from an older/foreign target — the link
+        // then simply stays unwritten, which is exactly the pre-fix behaviour.
+        //
+        // KNOWN GAP: a coordinator Stop or relay idle-timeout tears this
+        // subscription down before any terminal arrives, so THOSE remote legs'
+        // delegate_result carries no peerTraceId (the local route keeps it on the
+        // same paths — captured at prompt ack) and the tool row loses its
+        // child_trace_id. The opening-row bind is NOT lost: the target retries the
+        // terminal, and the settled branch of delegation.control salvages it via
+        // salvageDelegationTraceBind — the leg then stays reachable through the
+        // tool row's child_session_id → session trace listing.
+        const eventTraceId = validTraceId((envelope.event as any).traceId);
+        if (eventTraceId) {
+          peerTraceId = eventTraceId;
+          bindOpeningRowTrace(eventTraceId);
+        }
         if ((envelope.event as any).aborted === true) {
           const reason = typeof (envelope.event as any).reason === "string"
             ? (envelope.event as any).reason.trim()
@@ -713,10 +811,25 @@ export async function handleDelegate(
       },
     });
 
+    // The box's prompt ack names the peer turn's own root trace id. Stamp it on
+    // every row this consume persists and bind it to the opening user row —
+    // exactly what the target Runtime's chat.send path does for a REMOTE peer,
+    // so the two routes leave identical rows behind. Before this, the local
+    // route persisted the whole delegated leg with trace_id NULL, which is what
+    // made delegation legs invisible to trace-keyed audit and analysis reads.
+    peerTraceId = validTraceId(promptResult.traceId);
+    bindOpeningRowTrace(peerTraceId);
+    // Announce the leg's trace EARLY, the way delegate_session announces the
+    // session: a coordinator Stop destroys the client's socket before the final
+    // delegate_result frame is written, so whatever the client learned early is
+    // all a stopped leg's tool row gets to keep.
+    if (peerTraceId) writeFrame({ type: "delegate_trace", peerTraceId });
+
     const consumption = await consumeAgentSse({
       client,
       sessionId: promptResult.sessionId,
       userId: ownerUserId,
+      traceId: peerTraceId,
       // Stop propagation: break the drain loop the moment the coordinator aborts.
       signal: peerAbort.signal,
       // Persist the peer session's rows so the coordinator can open its full
@@ -779,7 +892,9 @@ export async function handleDelegate(
       console.error(`[delegate-api] delegation to ${peerAgentId} failed: ${outcome.error}`);
       writeFrame({
         type: "delegate_result",
-        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: outcome.error } satisfies DelegateResponse,
+        // peerTraceId rides failure frames too: a failed leg still persisted rows
+        // under its trace, and failed legs are exactly what a review drills into.
+        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, peerTraceId, error: outcome.error } satisfies DelegateResponse,
       });
       res.end();
       return;
@@ -791,7 +906,7 @@ export async function handleDelegate(
     if (peerAbort.signal.aborted) {
       writeFrame({
         type: "delegate_result",
-        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: "delegation stopped" } satisfies DelegateResponse,
+        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, peerTraceId, error: "delegation stopped" } satisfies DelegateResponse,
       });
       res.end();
       return;
@@ -799,7 +914,7 @@ export async function handleDelegate(
     console.error(`[delegate-api] delegation to ${peerAgentId} failed:`, err);
     writeFrame({
       type: "delegate_result",
-      result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: err instanceof Error ? err.message : String(err) } satisfies DelegateResponse,
+      result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, peerTraceId, error: err instanceof Error ? err.message : String(err) } satisfies DelegateResponse,
     });
     res.end();
     return;
@@ -828,7 +943,7 @@ export async function handleDelegate(
       type: "delegate_result",
       result: {
         ok: true, peerAgentId, peerName: member.name, status: "input_required",
-        inputQuestion, steps, finalText: finalTextCapped || undefined, peerSessionId,
+        inputQuestion, steps, finalText: finalTextCapped || undefined, peerSessionId, peerTraceId,
       } satisfies DelegateResponse,
     });
     res.end();
@@ -838,7 +953,7 @@ export async function handleDelegate(
     type: "delegate_result",
     result: {
       ok: true, peerAgentId, peerName: member.name, status: "done", artifact, steps,
-      finalText: finalTextCapped || undefined, peerSessionId,
+      finalText: finalTextCapped || undefined, peerSessionId, peerTraceId,
     } satisfies DelegateResponse,
   });
   res.end();

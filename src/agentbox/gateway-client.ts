@@ -186,6 +186,13 @@ export class GatewayClient {
       };
       const client = isHttps ? https : http;
       let result: DelegateResponse | undefined;
+      // The peer session and trace ids from the EARLY delegate_session /
+      // delegate_trace frames. Kept so the fallbacks below (Stop, stream ended
+      // without a result) still name the leg: the gateway's own stopped/failed
+      // frame is written into a socket this side has already destroyed, so
+      // whatever arrived early is all there is.
+      let announcedPeerSessionId: string | undefined;
+      let announcedPeerTraceId: string | undefined;
       const request = client.request(requestOptions, (res: any) => {
         // Decode the stream as UTF-8 here, once, so Node's own StringDecoder holds
         // the partial bytes of a character split across two chunks. `chunk.toString()`
@@ -220,14 +227,18 @@ export class GatewayClient {
             } else if (frame?.type === "delegate_session" && frame.peerSessionId) {
               // Early frame: peer session id, known at delegation start. Forward as a
               // synthetic event so the translator can surface it to the card live.
+              announcedPeerSessionId = String(frame.peerSessionId);
               try { onPeerEvent({ type: "delegate_session", peerSessionId: frame.peerSessionId }); } catch { /* best-effort */ }
+            } else if (frame?.type === "delegate_trace" && frame.peerTraceId) {
+              // Early frame: the leg's own trace id, known at the peer's prompt ack.
+              announcedPeerTraceId = String(frame.peerTraceId);
             } else if (frame?.type === "delegate_result" && frame.result) {
               result = frame.result as DelegateResponse;
             }
           }
         });
         res.on("end", () => {
-          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error: "delegation stream ended without a result" });
+          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], peerSessionId: announcedPeerSessionId, peerTraceId: announcedPeerTraceId, error: "delegation stream ended without a result" });
         });
       });
       request.on("error", (err: Error) => reject(new Error(`Delegate request failed: ${err.message}`)));
@@ -243,7 +254,7 @@ export class GatewayClient {
       if (signal) {
         signal.addEventListener("abort", () => {
           try { request.destroy(); } catch { /* already gone */ }
-          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error: "delegation stopped" });
+          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], peerSessionId: announcedPeerSessionId, peerTraceId: announcedPeerTraceId, error: "delegation stopped" });
         }, { once: true });
       }
       request.write(JSON.stringify(req));

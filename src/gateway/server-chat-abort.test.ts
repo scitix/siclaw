@@ -15,12 +15,16 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 const bindMessageTraceIdMock = vi.hoisted(() => vi.fn(async () => {}));
 const updateMessageMock = vi.hoisted(() => vi.fn(async () => {}));
 
-vi.mock("./chat-repo.js", () => ({
+vi.mock("./chat-repo.js", async (importOriginal) => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
   bindMessageTraceId: bindMessageTraceIdMock,
   updateMessage: updateMessageMock,
   incrementMessageCount: vi.fn(async () => {}),
+  warnTraceBindFailure: vi.fn(),
+  // The real validator: the delegated-turn ledger gates the box ack through it.
+  validTraceId: (await importOriginal<typeof import("./chat-repo.js")>()).validTraceId,
+  getMessages: vi.fn(async () => []),
 }));
 
 vi.mock("./output-redactor.js", () => ({
@@ -353,6 +357,34 @@ describe("startRuntime — chat.abort wiring", () => {
     });
   });
 
+  it("carries the delegated turn's own trace id on its terminal event", async () => {
+    // The terminal is the ONE channel the coordinator Runtime can learn which
+    // trace this leg's rows were persisted under: chat.send acks before the
+    // trace exists and chat.getMessages does not project trace_id. The source
+    // stores it as the tool row's child_trace_id — the cross-trace link.
+    const frontendClient = fakeFrontendClient();
+    frontendClient.request = vi.fn(async (method: string) =>
+      method === "delegation.terminal" ? { ok: true } : { found: false });
+
+    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({
+      agentId: "a", userId: "u", text: "inspect", sessionId: "delegated",
+      delegation: { delegationId: "d2", parentAgentId: "coord", readOnly: false },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => settleConsumer !== undefined);
+    settleConsumer!(); // the turn finishes normally
+
+    await waitFor(() =>
+      frontendClient.request.mock.calls.some(([method]: any[]) => method === "delegation.terminal"));
+    const call = frontendClient.request.mock.calls.find(([method]: any[]) => method === "delegation.terminal");
+    expect(call?.[1]).toMatchObject({
+      delegationId: "d2",
+      event: { type: "prompt_done", traceId: "0123456789abcdef0123456789abcdef" },
+    });
+  });
+
   it("does not ask for an acknowledgement on an ordinary turn", async () => {
     const frontendClient = fakeFrontendClient();
     server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
@@ -441,7 +473,10 @@ describe("startRuntime — chat.abort wiring", () => {
       delegationId: "d9",
       sessionId: "interrupted",
       turnId: ack.turnId,
-      event: { type: "prompt_done", aborted: true, reason: "runtime_restart" },
+      // The interrupted leg's rows were persisted under the trace the prompt ack
+      // named; the supervisor terminal must carry it (from the delegatedTurns ledger
+      // entry) or exactly the legs a review drills into lose their link.
+      event: { type: "prompt_done", aborted: true, reason: "runtime_restart", traceId: "0123456789abcdef0123456789abcdef" },
     });
     expect(frontendClient.close).toHaveBeenCalled();
     expect(frontendClient.request.mock.invocationCallOrder[0])

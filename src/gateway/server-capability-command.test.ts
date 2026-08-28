@@ -11,6 +11,8 @@ const streamState = vi.hoisted(() => ({
 }));
 
 vi.mock("./chat-repo.js", () => ({
+  validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
+  warnTraceBindFailure: vi.fn(),
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
   bindMessageTraceId: vi.fn(async () => {}),
