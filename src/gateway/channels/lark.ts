@@ -264,6 +264,8 @@ const PERSONAL_DENIAL_MESSAGE_MAX_CHARS = 1000;
 // to keep memory flat if an agent over-emits.
 const MILESTONE_CAP = 20;
 const MAX_LARK_BINDING_QUEUE = 20;
+const TOPIC_PARTICIPANT_PAGE_SIZE = 50;
+const TOPIC_PARTICIPANT_MAX_PAGES = 100;
 
 interface QueuedLarkTask {
   run: () => Promise<void>;
@@ -486,9 +488,10 @@ function getLarkSenderOpenId(data: any): string | null {
  * control the vocabulary, and a value we have not seen before must reach the
  * Portal intact instead of being flattened into "not a user".
  *
- * Nothing in this file branches on it. It exists so the Portal can tell a bot
- * from a person at all — until now it received only an open_id, which an app
- * sender may not even have, leaving "a bot wrote this" and "we could not
+ * No-mention Topic activation additionally requires the exact value "user";
+ * missing or unknown values fail closed. Other routes pass the value through
+ * so the Portal can distinguish a bot from a person — an app sender may not
+ * even have an open_id, otherwise leaving "a bot wrote this" and "we could not
  * identify the writer" indistinguishable.
  */
 function getLarkSenderType(data: any): string | null {
@@ -517,6 +520,100 @@ async function fetchLarkChatName(larkClient: any, chatId: string): Promise<strin
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[lark] Could not fetch chat name for chat=${chatId}: ${msg}`);
     return null;
+  }
+}
+
+/**
+ * Verify the participants of one Feishu Topic, not the roster of its parent
+ * group. An established Topic may omit @ only while its complete history shows
+ * one human sender and no app other than this Siclaw app. The current event is
+ * added explicitly because the history API can be briefly eventually
+ * consistent immediately after delivery.
+ *
+ * Every malformed, incomplete, overlong, or failed lookup requires @. The
+ * positive result is deliberately not cached: a second participant must take
+ * effect on the very next turn.
+ */
+async function topicHasOneHumanAndThisBot(
+  larkClient: any,
+  threadId: string,
+  rootMessageId: string,
+  currentSenderOpenId: string,
+  siclawAppId: string,
+): Promise<boolean> {
+  const humanIds = new Set<string>([currentSenderOpenId]);
+  const appIds = new Set<string>();
+  let pageToken: string | undefined;
+  const seenPageTokens = new Set<string>();
+
+  try {
+    const addSender = (item: any): boolean => {
+      const senderId = item?.sender?.id;
+      const senderType = item?.sender?.sender_type;
+      if (typeof senderId !== "string" || !senderId.trim()
+        || typeof senderType !== "string" || !senderType.trim()) {
+        throw new Error("message sender identity unavailable");
+      }
+      if (senderType === "user") humanIds.add(senderId);
+      else if (senderType === "app") appIds.add(senderId);
+      else throw new Error(`unsupported sender_type=${senderType}`);
+      return humanIds.size <= 1 && [...appIds].every((id) => id === siclawAppId);
+    };
+
+    // Feishu's thread container contains replies only. Fetch the root message
+    // separately or a Topic started by user A and first answered by user B
+    // would look like a one-human Topic and be incorrectly activated.
+    const rootResp: any = await larkClient.im.message.get({
+      path: { message_id: rootMessageId },
+    });
+    if (typeof rootResp?.code === "number" && rootResp.code !== 0) {
+      throw new Error(`Feishu root code=${rootResp.code} msg=${rootResp?.msg ?? "unknown"}`);
+    }
+    const rootItems = rootResp?.data?.items;
+    if (!Array.isArray(rootItems) || rootItems.length !== 1) {
+      throw new Error("root message unavailable");
+    }
+    if (!addSender(rootItems[0])) {
+      console.log(`[lark] Topic participant gate requires @bot thread=${threadId} humans=${humanIds.size} apps=${appIds.size}`);
+      return false;
+    }
+
+    for (let page = 0; page < TOPIC_PARTICIPANT_MAX_PAGES; page += 1) {
+      const resp: any = await larkClient.im.message.list({
+        params: {
+          container_id_type: "thread",
+          container_id: threadId,
+          sort_type: "ByCreateTimeAsc",
+          page_size: TOPIC_PARTICIPANT_PAGE_SIZE,
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+      if (typeof resp?.code === "number" && resp.code !== 0) {
+        throw new Error(`Feishu code=${resp.code} msg=${resp?.msg ?? "unknown"}`);
+      }
+      const items = resp?.data?.items;
+      if (!Array.isArray(items)) throw new Error("missing data.items");
+
+      for (const item of items) {
+        if (!addSender(item)) {
+          console.log(`[lark] Topic participant gate requires @bot thread=${threadId} humans=${humanIds.size} apps=${appIds.size}`);
+          return false;
+        }
+      }
+
+      if (!resp?.data?.has_more) return humanIds.size === 1;
+      const next = resp?.data?.page_token;
+      if (typeof next !== "string" || !next.trim() || seenPageTokens.has(next)) {
+        throw new Error("invalid pagination state");
+      }
+      seenPageTokens.add(next);
+      pageToken = next;
+    }
+    throw new Error(`topic history exceeds ${TOPIC_PARTICIPANT_MAX_PAGES} pages`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[lark] Could not verify Topic participants thread=${threadId}; requiring @bot: ${msg}`);
+    return false;
   }
 }
 
@@ -586,13 +683,13 @@ const MODE_ANNOUNCE_BY_LOCALE: Record<LarkLocale, (m: GroupContextMode) => strin
     m === "shared"
       ? `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].shared};之后大家的消息按全群共享处理。`
       : m === "topic"
-        ? `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].topic};首次 @ 机器人会认领一个话题,之后已授权成员在该话题内无需再次 @,其他话题不受影响。`
+        ? `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].topic};首次 @ 机器人会认领一个话题。该话题仅有一名真人和本机器人时可直接续聊;出现其他真人或机器人后,每次调用都需要 @。`
         : `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].per_user};之后每个人各自独立对话。`,
   "en-US": (m) =>
     m === "shared"
       ? `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].shared}; messages are handled as one shared conversation.`
       : m === "topic"
-        ? `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].topic}; the first @bot message claims a Topic, then authorized participants can continue there without another mention while other Topics stay separate.`
+        ? `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].topic}; the first @bot message claims a Topic. Follow-ups may omit @ only while that Topic contains one human and this bot; once another human or bot participates, every Agent turn requires @.`
         : `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].per_user}; each person now talks to the bot separately.`,
 };
 
@@ -790,7 +887,8 @@ const IMAGE_ONLY_PLACEHOLDER = "[image]";
  *   - text  → `content.text`
  *   - image → `content.image_key`
  *   - post  → rich text whose `content` is a `Node[][]` (array of paragraphs of
- *             nodes); flatten and split by `tag`: img → image_key, text → text.
+ *             nodes); flatten and split by `tag`: img → image_key,
+ *             text/link/markdown/code block → text.
  *
  * Unknown types yield empty text + no refs (caller drops them).
  */
@@ -826,7 +924,9 @@ export function extractInbound(message: any): { text: string; imageRefs: LarkIma
     for (const node of paragraphs.flat()) {
       if (node?.tag === "img" && typeof node?.image_key === "string") {
         imageRefs.push({ imageKey: node.image_key });
-      } else if ((node?.tag === "text" || node?.tag === "a") && typeof node?.text === "string") {
+      } else if ((node?.tag === "text" || node?.tag === "a"
+        || node?.tag === "md" || node?.tag === "code_block")
+        && typeof node?.text === "string") {
         textParts.push(node.text);
       }
       // A hyperlink's href may itself be an image URL — surface it so the unified
@@ -1407,22 +1507,20 @@ export async function handleLarkMessage(
   const isThreadFollowup = isGroupMessage && threadId !== null && rootMessageId !== messageId;
 
   // /mode — summon the context-mode switch card. Command words are exact, and
-  // the bot must be @-mentioned: this switches the mode for the WHOLE group, and
-  // nothing in the pipeline checks who the sender is (Feishu reports app senders
-  // the same way it reports people, sometimes without any id at all). Handling it
-  // before the @-gate meant any group member — or any other BOT in the room —
-  // could reconfigure the group by typing two words at nobody in particular.
-  // Requiring that costs the sender four characters and makes the change an act
-  // aimed at us. A follow-up inside a topic WE opened counts too — it is already
-  // scoped to a conversation the bot owns, and inside a topic people rightly stop
-  // @-ing. Without that second arm, `/mode` in a topic would fall past the @-gate
-  // (thread follow-ups are allowed through) and reach the model as a prompt.
+  // the message must pass the same explicit-mention/two-party Topic gate as an
+  // ordinary turn: this switches the mode for the WHOLE group and must not be
+  // triggered by ambient discussion. Handling it before mention gating meant
+  // any group member — or any other BOT in the room — could reconfigure the
+  // group by typing two words at nobody in particular. Only a follow-up inside
+  // an already-claimed Topic with one human and this app may omit @.
   // PAIR stays exempt: it carries its own one-time code.
-  if (/^\/mode$/i.test(text.trim()) && (botMentioned || isThreadFollowup)) {
+  if (/^\/mode$/i.test(text.trim())) {
+    if (!botMentioned && (!isThreadFollowup || senderType !== "user"
+      || !senderOpenId || !threadId || !channelConfig?.app_id)) return;
     // A no-mention command inherits the same claim boundary as ordinary Topic
     // follow-ups: it may reuse an established bot Topic but must never create
     // state or answer inside an unrelated Topic.
-    const modeExistingOnly = isThreadFollowup && !botMentioned;
+    const modeExistingOnly = !botMentioned;
     const modeBinding = await resolveBinding(
       groupChannelId,
       chatId,
@@ -1444,6 +1542,14 @@ export async function handleLarkMessage(
       return;
     }
     const current = normalizeGroupContextMode(modeBinding.contextMode);
+    if (!botMentioned && current !== "topic") return;
+    if (!botMentioned && !await topicHasOneHumanAndThisBot(
+      larkClient,
+      threadId!,
+      rootMessageId,
+      senderOpenId!,
+      channelConfig!.app_id,
+    )) return;
     // /mode changes the whole group. Keep a root invocation visible on the
     // main-group path; only retain the card inside an already-established Topic.
     const modeReplyInThread = isThreadFollowup && current !== "shared";
@@ -1455,16 +1561,17 @@ export async function handleLarkMessage(
     return;
   }
 
-  // Only respond when THIS bot is individually @-mentioned, except inside a
-  // Topic that Personal or Topic mode already scoped to a root message. Feishu also
-  // delivers "@所有人" to an @bot-scoped app (it mentions everyone, the bot
-  // included), so an @所有人 announcement arrives looking just like a real
-  // @bot — without this gate the bot replies to group-wide announcements that
-  // were never aimed at it. Skips "@所有人" and "@someone-else"; PAIR above is
-  // exempt (explicit command). Gated on chat_type==="group" so the binding/
-  // access checks below stay reachable only for messages aimed at the bot.
-  const conversationExistingOnly = isThreadFollowup && !botMentioned;
-  if (chatType === "group" && !botMentioned) {
+  // Only Topic mode may omit @, and only when Feishu currently proves the
+  // Topic history consists of one human plus this app. The containing GROUP's
+  // roster is irrelevant: a large group can still have a two-party Topic.
+  // Personal/Team modes still require @ to run the agent. Larger/unknown Topics
+  // require @ on every turn.
+  // Feishu also delivers "@所有人" to an @bot-scoped app, so the individual-
+  // mention check remains necessary. PAIR above stays exempt.
+  const unmentionedGroupMessage = chatType === "group" && !botMentioned;
+  const conversationExistingOnly = unmentionedGroupMessage && isThreadFollowup;
+  let binding: ResolvedChannelBinding | ChannelAccessDenied | null | undefined;
+  if (unmentionedGroupMessage) {
     // Non-@ group message. In a group KNOWN to be shared, retain it as passive
     // discussion context for the next @-turn — WITHOUT running the agent or
     // touching the AgentBox (idle pods must not be woken by group chatter).
@@ -1477,15 +1584,51 @@ export async function handleLarkMessage(
       console.log(`[lark] Buffered non-@ discussion for shared group chat=${chatId}`);
       return;
     }
-    if (!isThreadFollowup) {
-      console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+    // No-@ activation is strictly a human follow-up in a real Feishu Topic.
+    // Root messages, quote replies (root_id without thread_id), app senders,
+    // and events with missing identities stay silent.
+    if (!isThreadFollowup || senderType !== "user" || !senderOpenId
+      || !threadId || !channelConfig?.app_id) {
+      console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@ required outside a claimed two-party Topic)`);
       return;
     }
+
+    // Resolve BEFORE reading Topic history. The server-authoritative binding
+    // proves that this provider Topic was already claimed by the bot and that
+    // its current mode is Topic; unrelated Topics remain silent and incur no
+    // history scan beyond this existing-only lookup.
+    binding = await resolveBinding(
+      groupChannelId,
+      chatId,
+      frontendClient!,
+      sessionKey,
+      senderOpenId ?? undefined,
+      topicConversationKey,
+      conversationExistingOnly,
+      senderType ?? undefined,
+    );
+    if (isChannelAccessDenied(binding) || !binding) return;
+    const candidateMode = normalizeGroupContextMode(binding.contextMode);
+    if (candidateMode !== "topic") {
+      rememberGroupMode(groupChannelId, chatId, candidateMode);
+      if (candidateMode === "shared" && text.length > 0) {
+        appendDiscussion(groupChannelId, chatId, senderLabel(senderOpenId), text);
+        console.log(`[lark] Buffered non-@ discussion after resolving shared group chat=${chatId}`);
+      }
+      return;
+    }
+    if (!await topicHasOneHumanAndThisBot(
+      larkClient,
+      threadId,
+      rootMessageId,
+      senderOpenId,
+      channelConfig.app_id,
+    )) return;
   }
 
   // Look up binding for this chat. Pass sender_open_id so the Portal can
   // auto-bind / per-sender resolve group bots and pick the session key.
-  const binding = await resolveBinding(
+  binding ??= await resolveBinding(
     groupChannelId,
     chatId,
     frontendClient!,
@@ -1499,7 +1642,7 @@ export async function handleLarkMessage(
     // A no-@ Topic/quote follow-up is never an authorization prompt. If the
     // server cannot reuse an existing authorized topic session, stay silent;
     // explicit @ messages still receive the normal access hint.
-    if (conversationExistingOnly) return;
+    if (unmentionedGroupMessage) return;
     // Gated group: this sender isn't allowed. The message is either an explicit @ or a follow-up
     // in a previously established bot topic, so a single short hint is appropriate.
     await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, dmCanResolveAccess(personalBot)));
@@ -1535,17 +1678,6 @@ export async function handleLarkMessage(
   const cachedMode = cachedGroupMode(groupChannelId, chatId);
   if (cachedMode && cachedMode !== contextMode) forgetGroupState(groupChannelId, chatId);
   rememberGroupMode(groupChannelId, chatId, contextMode);
-
-  // A no-@ message inside a Feishu Topic is a continuation in Personal or Topic
-  // mode. Team mode deliberately stays on the old main-group path; an
-  // unrelated/manual topic must not wake the shared Agent session.
-  if (isThreadFollowup && !botMentioned && contextMode === "shared") {
-    if (text.length > 0) {
-      appendDiscussion(groupChannelId, chatId, senderLabel(senderOpenId), text);
-      console.log(`[lark] Buffered no-@ topic discussion after resolving shared group chat=${chatId}`);
-    }
-    return;
-  }
 
   const topicScopedMode = isGroupMessage && contextMode !== "shared";
   const conversationKey = topicScopedMode ? topicConversationKey : undefined;

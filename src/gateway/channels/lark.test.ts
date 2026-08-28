@@ -119,14 +119,47 @@ describe("createLarkHandler — fallback when SDK is missing", () => {
  * message, otherwise the original "Feishu silent drop" bug comes back.
  */
 
-function makeLarkClient() {
-  return {
+function makeLarkClient(
+  threadMessages?: any[],
+  rootMessage?: any,
+) {
+  const client: any = {
     im: {
       message: {
         reply: vi.fn().mockResolvedValue({}),
+        ...(rootMessage ? {
+          get: vi.fn().mockResolvedValue({
+            data: { items: [rootMessage] },
+          }),
+        } : {}),
+        ...(threadMessages ? {
+          list: vi.fn().mockResolvedValue({
+            data: { items: threadMessages, has_more: false },
+          }),
+        } : {}),
       },
     },
   };
+  return client;
+}
+
+function makeTopicLarkClient(
+  humanIds: string[] = ["ou_user_1"],
+  appIds: string[] = ["x"],
+) {
+  return makeLarkClient([
+    ...humanIds.slice(1).map((id, index) => ({
+      message_id: `mid-human-reply-${index}`,
+      sender: { id, sender_type: "user" },
+    })),
+    ...appIds.map((id, index) => ({
+      message_id: `mid-app-${index}`,
+      sender: { id, sender_type: "app" },
+    })),
+  ], {
+    message_id: "mid-root",
+    sender: { id: humanIds[0], sender_type: "user" },
+  });
 }
 
 function makeAgentBoxManager(agentId = "agent-7") {
@@ -139,13 +172,19 @@ function makeAgentBoxManager(agentId = "agent-7") {
   };
 }
 
-function makeTextEvent(text: string, overrides: Record<string, unknown> = {}, senderOpenId = "ou_user_1") {
+function makeTextEvent(
+  text: string,
+  overrides: Record<string, unknown> = {},
+  senderOpenId = "ou_user_1",
+  senderType?: string,
+) {
   return {
     // EventDispatcher has already spread event.* onto the top level here.
     sender: {
       sender_id: {
         open_id: senderOpenId,
       },
+      ...(senderType ? { sender_type: senderType } : {}),
     },
     message: {
       message_id: "mid-1",
@@ -1256,8 +1295,8 @@ describe("handleLarkMessage — routing to AgentBox", () => {
         chat_type: "group",
         root_id: "mid-topic-root",
         thread_id: "omt-topic-1",
-        mentions: [],
-      }, "ou_user_2"),
+        mentions: [{ key: "@_user_1", id: { open_id: botOpenId } }],
+      }, "ou_user_2", "user"),
       makeLarkClient(),
       "lark",
       mgr as any,
@@ -1481,8 +1520,9 @@ describe("handleLarkCardAction — /mode context switch", () => {
     await flush();
     expect(setChannelContextModeMock).toHaveBeenCalledWith("ch1", "oc_group1", "topic", expect.anything());
     const announce = JSON.parse(client.im.message.create.mock.calls[0][0].data.content).text;
-    expect(announce).toContain("话题内");
-    expect(announce).toContain("无需再次 @");
+    expect(announce).toContain("该话题");
+    expect(announce).toContain("仅有一名真人");
+    expect(announce).toContain("每次调用都需要 @");
   });
 });
 
@@ -1504,11 +1544,11 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
   });
 
   // ── @-ed BY ANOTHER BOT ────────────────────────────────────────────
-  // Nothing in the pipeline inspects sender_type, so an app-sent message takes
-  // the same path as a human's. What differs is the SENDER IDENTITY: Feishu
-  // describes an app sender as sender_type:"app", and when it carries no
-  // sender_id.open_id every downstream identity decision sees an empty sender.
-  // These pin what we actually do in both payload shapes.
+  // An explicit @ mention does not use sender_type as an activation gate, so an
+  // app-sent message takes the same route as a human's. What differs is the
+  // SENDER IDENTITY: Feishu describes an app sender as sender_type:"app", and
+  // when it carries no sender_id.open_id every downstream identity decision
+  // sees an empty sender. These pin what we do in both payload shapes.
 
   /** App/bot sender WITHOUT sender_id.open_id — the shape that loses identity. */
   function botSenderEvent(text: string, mentions: any[]) {
@@ -1592,19 +1632,16 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(resolveBindingMock).not.toHaveBeenCalled();
   });
 
-  it("/mode inside an established topic works without a mention, and never reaches the model", async () => {
-    // Inside a topic people stop @-ing, and thread follow-ups are let through the
-    // @-gate — so requiring a mention here would not merely ignore /mode, it
-    // would forward the literal text to the model as a prompt.
-    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "per_user" }));
+  it("/mode inside an established one-human/one-bot Topic works without a mention, and never reaches the model", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
     const data = makeTextEvent("/mode", {
       message_id: "mid-topic-mode",
       chat_type: "group",
       mentions: [],
       root_id: "mid-root",
       thread_id: "omt-1",
-    });
-    const lark = makeLarkClient();
+    }, "ou_user_1", "user");
+    const lark = makeTopicLarkClient();
     await handleLarkMessage(
       data, lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any,
       "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
@@ -1612,6 +1649,28 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(resolveBindingMock).toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();   // handled as a command, not a prompt
     expect(lark.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+  });
+
+  it("/mode inside a two-human/one-bot Topic requires a mention", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const data = makeTextEvent("/mode", {
+      message_id: "mid-topic-mode-large-group",
+      chat_type: "group",
+      mentions: [],
+      root_id: "mid-root",
+      thread_id: "omt-1",
+    }, "ou_user_1", "user");
+    const lark = makeTopicLarkClient(["ou_user_1", "ou_user_2"]);
+
+    await handleLarkMessage(
+      data, lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(resolveBindingMock).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.list).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
   });
 
   it("/mode inside an unclaimed Topic stays silent and cannot claim it", async () => {
@@ -1622,7 +1681,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       mentions: [],
       root_id: "mid-unclaimed-root",
       thread_id: "omt-unclaimed",
-    });
+    }, "ou_user_1", "user");
     const lark = makeLarkClient();
 
     await handleLarkMessage(
@@ -1638,7 +1697,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "ou_user_1",
       "lark_thread:mid-unclaimed-root",
       true,
-      undefined,
+      "user",
     );
     expect(lark.im.message.reply).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
@@ -1688,6 +1747,321 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(resolveBindingMock).not.toHaveBeenCalled();
   });
 
+  it("does not treat an unmentioned group root as a two-party Topic", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      contextMode: "topic",
+      sessionKey: "lark_thread:mid-1",
+    }));
+    const lark = makeTopicLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("你好", { chat_type: "group", mentions: [] }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+    expect(lark.im.message.list).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("routes a one-human/one-bot Topic follow-up even when the containing group has many members", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      contextMode: "topic",
+      sessionKey: "lark_thread:mid-live-root",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    // Live Feishu shape from the failing 12:15 Topic: the group roster is not
+    // usable, while the Topic history contains exactly the asker and this app.
+    const lark = makeLarkClient([
+      { message_id: "mid-bot-card", sender: { id: "cli_siclaw", sender_type: "app" } },
+      { message_id: "mid-live-followup", sender: { id: "ou_user_1", sender_type: "user" } },
+    ], {
+      message_id: "mid-live-root",
+      sender: { id: "ou_user_1", sender_type: "user" },
+    });
+
+    await handleLarkMessage(
+      makeTextEvent("你好", {
+        message_id: "mid-live-followup",
+        chat_type: "group",
+        mentions: [],
+        root_id: "mid-live-root",
+        thread_id: "omt-live-topic",
+      }, "ou_user_1", "user"),
+      lark,
+      "lark",
+      makeAgentBoxManager() as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      { app_id: "cli_siclaw", app_secret: "secret" },
+      BOT,
+    );
+
+    expect(lark.im.message.list).toHaveBeenCalledWith({
+      params: expect.objectContaining({
+        container_id_type: "thread",
+        container_id: "omt-live-topic",
+      }),
+    });
+    expect(lark.im.message.get).toHaveBeenCalledWith({
+      path: { message_id: "mid-live-root" },
+    });
+    expect(promptMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats @all in a claimed one-human/one-bot Topic as an unmentioned human follow-up", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      contextMode: "topic",
+      sessionKey: "lark_thread:mid-root",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const lark = makeTopicLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("@_all 继续", {
+        message_id: "mid-topic-at-all",
+        chat_type: "group",
+        mentions: [{ key: "@_all", id: {} }],
+        root_id: "mid-root",
+        thread_id: "omt-topic",
+      }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(lark.im.message.get).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.list).toHaveBeenCalledTimes(1);
+    expect(promptMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates Topic participants before every unmentioned turn", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      contextMode: "topic",
+      sessionKey: "lark_thread:mid-1",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const lark = makeTopicLarkClient();
+    lark.im.message.list
+      .mockResolvedValueOnce({ data: { items: [
+        { sender: { id: "ou_user_1", sender_type: "user" } },
+        { sender: { id: "x", sender_type: "app" } },
+      ], has_more: false } })
+      .mockResolvedValueOnce({ data: { items: [
+        { sender: { id: "ou_user_1", sender_type: "user" } },
+        { sender: { id: "ou_user_2", sender_type: "user" } },
+        { sender: { id: "x", sender_type: "app" } },
+      ], has_more: false } });
+
+    await handleLarkMessage(
+      makeTextEvent("第一条", {
+        message_id: "mid-followup-1", chat_type: "group", mentions: [],
+        root_id: "mid-1", thread_id: "omt-topic-1",
+      }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+    await handleLarkMessage(
+      makeTextEvent("第二个人加入后的下一条", {
+        message_id: "mid-followup-2", chat_type: "group", mentions: [],
+        root_id: "mid-1", thread_id: "omt-topic-1",
+      }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(lark.im.message.list).toHaveBeenCalledTimes(2);
+    expect(promptMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when Topic history is unavailable", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("你好", {
+        message_id: "mid-followup", chat_type: "group", mentions: [],
+        root_id: "mid-root", thread_id: "omt-topic",
+      }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(resolveBindingMock).toHaveBeenCalledTimes(1);
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps Personal mode mention-gated inside a one-human/one-bot Topic", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "per_user" }));
+    const manager = makeAgentBoxManager();
+    const data = makeTextEvent("你好", {
+      message_id: "mid-followup",
+      chat_type: "group",
+      mentions: [],
+      root_id: "mid-root",
+      thread_id: "omt-topic",
+    }, "ou_user_1", "user");
+    const lark = makeTopicLarkClient();
+
+    await handleLarkMessage(data, lark, "lark", manager as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT);
+
+    expect(resolveBindingMock).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.list).not.toHaveBeenCalled();
+    expect(manager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps Team mode passive inside a one-human/one-bot Topic", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "shared" }));
+    const manager = makeAgentBoxManager();
+    const data = makeTextEvent("你好", {
+      message_id: "mid-followup",
+      chat_type: "group",
+      mentions: [],
+      root_id: "mid-root",
+      thread_id: "omt-topic",
+    }, "ou_user_1", "user");
+    const lark = makeTopicLarkClient();
+
+    await handleLarkMessage(data, lark, "lark", manager as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT);
+
+    expect(resolveBindingMock).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.list).not.toHaveBeenCalled();
+    expect(manager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("requires @ when Topic history contains two humans and this bot", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const data = makeTextEvent("继续", {
+      message_id: "mid-topic-followup",
+      chat_type: "group",
+      root_id: "mid-root",
+      thread_id: "omt-topic",
+      mentions: [],
+    }, "ou_user_1", "user");
+
+    const lark = makeTopicLarkClient(["ou_user_1", "ou_user_2"]);
+    await handleLarkMessage(data, lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT);
+
+    expect(resolveBindingMock).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.list).toHaveBeenCalledTimes(1);
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("requires @ on the first reply from a second human even though thread history omits the root", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const lark = makeTopicLarkClient(["ou_user_1"]);
+
+    await handleLarkMessage(
+      makeTextEvent("我也问一句", {
+        message_id: "mid-user-2", chat_type: "group", mentions: [],
+        root_id: "mid-root", thread_id: "omt-topic",
+      }, "ou_user_2", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(lark.im.message.get).toHaveBeenCalledTimes(1);
+    // currentSenderOpenId + root sender already proves two humans, so no reply
+    // page is needed to fail closed.
+    expect(lark.im.message.list).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("requires @ when another app has participated in the Topic", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const lark = makeTopicLarkClient(["ou_user_1"], ["x", "cli_other_bot"]);
+
+    await handleLarkMessage(
+      makeTextEvent("继续", {
+        message_id: "mid-followup", chat_type: "group", mentions: [],
+        root_id: "mid-root", thread_id: "omt-topic",
+      }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(lark.im.message.list).toHaveBeenCalledTimes(1);
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("scans every Topic-history page before allowing a no-mention turn", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const lark = makeTopicLarkClient();
+    lark.im.message.list
+      .mockResolvedValueOnce({ data: {
+        items: [{ sender: { id: "x", sender_type: "app" } }],
+        has_more: true,
+        page_token: "page-2",
+      } })
+      .mockResolvedValueOnce({ data: {
+        items: [{ sender: { id: "ou_user_2", sender_type: "user" } }],
+        has_more: false,
+      } });
+
+    await handleLarkMessage(
+      makeTextEvent("继续", {
+        message_id: "mid-followup", chat_type: "group", mentions: [],
+        root_id: "mid-root", thread_id: "omt-topic",
+      }, "ou_user_1", "user"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(lark.im.message.list).toHaveBeenCalledTimes(2);
+    expect(lark.im.message.list.mock.calls[1][0].params.page_token).toBe("page-2");
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("never lets an unmentioned app sender wake the Topic agent", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const lark = makeTopicLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("bot chatter", {
+        message_id: "mid-other-app", chat_type: "group", mentions: [],
+        root_id: "mid-root", thread_id: "omt-topic",
+      }, "ou_other_bot", "app"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+    expect(lark.im.message.get).not.toHaveBeenCalled();
+    expect(lark.im.message.list).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("requires @ when an unmentioned Topic event omits sender_type", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "topic" }));
+    const lark = makeTopicLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("继续", {
+        message_id: "mid-missing-sender-type",
+        chat_type: "group",
+        mentions: [],
+        root_id: "mid-root",
+        thread_id: "omt-topic",
+      }, "ou_user_1"),
+      lark, "lark", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
+    );
+
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+    expect(lark.im.message.get).not.toHaveBeenCalled();
+    expect(lark.im.message.list).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
   it("/mode resolves only the group mode and does not allocate a topic session", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({
       sessionId: "shared-session",
@@ -1720,7 +2094,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     );
   });
 
-  it("personal mode always creates a topic reply and accepts an unmentioned follow-up in the same root", async () => {
+  it("Personal mode creates a Topic reply but still requires @ on follow-ups", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({
       sessionId: "thread-session",
       sessionKey: "open_id:ou_user_1:lark_thread:mid-1",
@@ -1756,7 +2130,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
         root_id: "mid-1",
         thread_id: "omt-topic-1",
         mentions: [],
-      }),
+      }, "ou_user_1", "user"),
       followupClient,
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -1767,12 +2141,8 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       BOT,
     );
 
-    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual([
-      "thread-session",
-      "thread-session",
-    ]);
+    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual(["thread-session"]);
     expect(resolveBindingMock.mock.calls.map((call) => call[5])).toEqual([
-      "lark_thread:mid-1",
       "lark_thread:mid-1",
       "lark_thread:mid-1",
       "lark_thread:mid-1",
@@ -1781,19 +2151,13 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       false,
       false,
       true,
-      true,
     ]);
     expect(rootClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
-    expect(followupClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+    expect(followupClient.im.message.reply).not.toHaveBeenCalled();
     expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
       metadata: expect.objectContaining({
         conversationKey: "lark_thread:mid-1",
         rootMessageId: "mid-1",
-      }),
-    }));
-    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({
-        threadId: "omt-topic-1",
       }),
     }));
   });
@@ -1844,8 +2208,8 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
         chat_type: "group",
         root_id: "mid-1",
         thread_id: "omt-topic-1",
-        mentions: [],
-      }, "ou_user_2"),
+        mentions: [{ key: "@_user_1", id: { open_id: BOT } }],
+      }, "ou_user_2", "user"),
       followupClient,
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -1864,7 +2228,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
         root_id: "mid-other",
         thread_id: "omt-topic-other",
         mentions: [],
-      }, "ou_user_2"),
+      }, "ou_user_2", "user"),
       unrelatedClient,
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -1886,8 +2250,8 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "open_id:ou_user_2",
       "ou_user_2",
       "lark_thread:mid-1",
-      true,
-      undefined,
+      false,
+      "user",
     );
     expect(resolveBindingMock).toHaveBeenCalledWith(
       "lark",
@@ -1897,7 +2261,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "ou_user_2",
       "lark_thread:mid-other",
       true,
-      undefined,
+      "user",
     );
     expect(rootClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
     expect(followupClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
@@ -2066,7 +2430,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
         root_id: "mid-unrelated-root",
         thread_id: "omt-unrelated",
         mentions: [],
-      }),
+      }, "ou_user_1", "user"),
       lark,
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -2085,7 +2449,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "ou_user_1",
       "lark_thread:mid-unrelated-root",
       true,
-      undefined,   // sender_type — absent on a plain user event
+      "user",
     );
     expect(promptMock).not.toHaveBeenCalled();
     expect(lark.im.message.reply).not.toHaveBeenCalled();
@@ -3735,6 +4099,26 @@ describe("handleLarkMessage — inbound images", () => {
 });
 
 describe("extractInbound — post receive shapes", () => {
+  it("parses a Feishu code_block post instead of silently dropping the turn", () => {
+    const message = {
+      message_type: "post",
+      content: JSON.stringify({
+        content: [[{ tag: "code_block", language: "PLAIN_TEXT", text: "你好-验收-adba021f\n" }]],
+      }),
+    };
+    const { text, imageRefs } = extractInbound(message);
+    expect(text).toBe("你好-验收-adba021f");
+    expect(imageRefs).toEqual([]);
+  });
+
+  it("parses a standalone md node in a Feishu post", () => {
+    const message = {
+      message_type: "post",
+      content: JSON.stringify({ content: [[{ tag: "md", text: "**hello**" }]] }),
+    };
+    expect(extractInbound(message).text).toBe("**hello**");
+  });
+
   it("parses locale-nested post content instead of silently dropping it", () => {
     const message = {
       message_type: "post",
