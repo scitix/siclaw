@@ -166,7 +166,11 @@ def _validate_attestation_sidecar(files: list[tuple[str, bytes]], markdown_pages
         doc = okf_attestation.parse_attestation(sidecar)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise OKFPackageError(f"{okf_attestation.ATTESTATION_SIDECAR} is invalid JSON: {error}") from error
-    violations = okf_attestation.attestation_violations(doc, concept_pages=concept_pages)
+    violations = okf_attestation.attestation_violations(
+        doc,
+        concept_pages=concept_pages,
+        payload_sha256=okf_attestation.payload_manifest_sha256(files),
+    )
     if violations:
         raise OKFPackageError(
             f"{okf_attestation.ATTESTATION_SIDECAR} would be rejected by the importer: "

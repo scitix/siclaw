@@ -45,12 +45,16 @@ def test_attaches_receipts_and_reports_tier() -> None:
             coverage_path=None,
             input_revision="sha256:feedbeef",
         )
-        assert receipt["attestation_tier"] == "attested"
+        assert receipt["attestation_tier"] == "self_attested"
+        # The caller's wiki directory is input only — the sidecar lives in the
+        # staging copy and the archive, never in the source tree.
+        assert not (wiki / ".okf-attestation.json").exists()
         with tarfile.open(output, "r:gz") as archive:
             body = archive.extractfile(".okf-attestation.json").read()
         doc = json.loads(body)
         assert doc["producer"] == {"name": "siclaw-kbc-local", "version": "0.1.0"}
         assert doc["concept_pages"] == 1
+        assert len(doc["payload_manifest_sha256"]) == 64
         assert doc["signature"] is None
 
 
@@ -70,6 +74,41 @@ def test_failing_checks_still_package_but_report_unattested() -> None:
             input_revision=None,
         )
         assert receipt["attestation_tier"] == "unattested"
+
+
+def test_existing_output_requires_explicit_overwrite() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        wiki = base / "wiki"
+        _write(wiki, "index.md", INDEX)
+        _write(wiki, "page.md", PAGE)
+        _write(base, "checks.json", [{"name": "kb_eval", "status": "pass"}])
+        output = base / "out.tar.gz"
+        output.write_bytes(b"pre-existing")
+        try:
+            tool.attach_attestation(
+                wiki, output,
+                producer="siclaw-kbc-local",
+                producer_version=None,
+                checks_path=base / "checks.json",
+                coverage_path=None,
+                input_revision=None,
+            )
+        except Exception as error:  # OKFPackageError from the packer
+            assert "already exists" in str(error)
+        else:
+            raise AssertionError("tool overwrote an existing archive without --overwrite")
+        assert output.read_bytes() == b"pre-existing"
+        receipt = tool.attach_attestation(
+            wiki, output,
+            producer="siclaw-kbc-local",
+            producer_version=None,
+            checks_path=base / "checks.json",
+            coverage_path=None,
+            input_revision=None,
+            overwrite=True,
+        )
+        assert receipt["attestation_tier"] == "self_attested"
 
 
 def test_invalid_checks_refuse_to_build() -> None:
@@ -97,5 +136,6 @@ def test_invalid_checks_refuse_to_build() -> None:
 if __name__ == "__main__":
     test_attaches_receipts_and_reports_tier()
     test_failing_checks_still_package_but_report_unattested()
+    test_existing_output_requires_explicit_overwrite()
     test_invalid_checks_refuse_to_build()
     print("OK  OKF package attestation attach")

@@ -1,0 +1,210 @@
+{
+  "comment": "Shared OKF attestation conformance cases. This file must stay byte-identical between sicore internal/siclaw/knowledge/testdata/okf-attestation/conformance.json and siclaw kbc/platform/pod/fixtures/okf-attestation/conformance.json; each side's test pins its sha256. The bundle block is the ground truth the importer derives from the package itself; every case is validated against it.",
+  "bundle": {
+    "concept_pages": 2,
+    "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab"
+  },
+  "cases": [
+    {
+      "name": "clean_receipts_bound_to_payload",
+      "expect": "self_attested",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc", "version": "0.9.0"},
+        "input_revision": "sha256:a1b2c3",
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "coverage": {"closed": true, "cited": 4, "excluded": 1, "auto_attached": 0, "derived": 0, "unaccounted": 0, "dangling": 0},
+        "checks": [
+          {"name": "selfcheck", "status": "pass"},
+          {"name": "redblue", "status": "pass", "detail": "16/16 questions"}
+        ],
+        "signature": null
+      }
+    },
+    {
+      "name": "no_coverage_block_is_still_self_attested",
+      "expect": "self_attested",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "honest_check_failure_stays_unattested",
+      "expect": "unattested",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "fail", "detail": "2 pages unconverged"}]
+      }
+    },
+    {
+      "name": "open_coverage_honestly_reported_stays_unattested",
+      "expect": "unattested",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "coverage": {"closed": false, "cited": 4, "excluded": 1, "auto_attached": 0, "derived": 0, "unaccounted": 3, "dangling": 0},
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "coverage_closed_only_must_reject_not_zero_fill",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "coverage": {"closed": true},
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "coverage_missing_one_counter_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "coverage": {"closed": true, "cited": 4, "excluded": 1, "auto_attached": 0, "derived": 0, "unaccounted": 0},
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "payload_digest_mismatch_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "missing_payload_manifest_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "concept_pages_mismatch_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 37,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "closed_contradicting_counters_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "coverage": {"closed": true, "cited": 4, "excluded": 1, "auto_attached": 0, "derived": 0, "unaccounted": 5, "dangling": 0},
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "non_null_signature_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "pass"}],
+        "signature": "sig-bytes"
+      }
+    },
+    {
+      "name": "unknown_field_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "pass"}],
+        "extra": true
+      }
+    },
+    {
+      "name": "duplicate_check_names_reject",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [
+          {"name": "selfcheck", "status": "pass"},
+          {"name": "selfcheck", "status": "pass"}
+        ]
+      }
+    },
+    {
+      "name": "invalid_check_status_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "maybe"}]
+      }
+    },
+    {
+      "name": "empty_checks_reject",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": []
+      }
+    },
+    {
+      "name": "invalid_producer_name_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 1,
+        "producer": {"name": " "},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    },
+    {
+      "name": "unsupported_schema_version_rejects",
+      "expect": "reject",
+      "attestation": {
+        "schema_version": 9,
+        "producer": {"name": "siclaw-kbc"},
+        "concept_pages": 2,
+        "payload_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+        "checks": [{"name": "selfcheck", "status": "pass"}]
+      }
+    }
+  ]
+}

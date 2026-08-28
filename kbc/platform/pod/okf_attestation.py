@@ -2,11 +2,18 @@
 
 The sidecar makes compile-time verification receipts travel with the bundle:
 producer identity, the frozen input revision, the coverage ledger's summary,
-and named deterministic check results. The import side (sicore
-internal/siclaw/knowledge/okf_attestation.go) classifies bundles into
-"attested"/"unattested" from it and rejects receipts that contradict the
-bundle — this module mirrors that validation so a lying sidecar fails at
-packaging time, before an upload ever happens.
+and named deterministic check results. The mandatory payload_manifest_sha256
+binds the receipts to the exact bytes being packaged, so a receipt cannot be
+replayed onto edited content. The producer identity itself is NOT verified
+(signature is a reserved v2 slot) — which is why the resulting tier is called
+"self_attested" and must never gate trust, authorization, or publication on
+its own.
+
+The import side (sicore internal/siclaw/knowledge/okf_attestation.go) mirrors
+this validation and rejects receipts that contradict the bundle; this module
+applies the same rules at packaging time, before an upload ever happens. The
+two implementations are pinned together by the shared conformance fixture
+(fixtures/okf-attestation/conformance.json, sha256-pinned on both sides).
 
 Attestation is written by deterministic code about deterministic checks.
 The compile agent never authors it, for the same reason it may not write
@@ -17,6 +24,7 @@ Pure stdlib on purpose, like selfcheck.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -25,23 +33,44 @@ ATTESTATION_SCHEMA_VERSION = 1
 MAX_ATTESTATION_CHECKS = 32
 
 TIER_UNATTESTED = "unattested"
-TIER_ATTESTED = "attested"
+TIER_SELF_ATTESTED = "self_attested"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _CHECK_STATUSES = ("pass", "warn", "fail")
 _COVERAGE_FIELDS = ("cited", "excluded", "auto_attached", "derived", "unaccounted", "dangling")
 _ALLOWED_KEYS = {
     "schema_version", "producer", "input_revision", "concept_pages",
-    "coverage", "checks", "signature",
+    "payload_manifest_sha256", "coverage", "checks", "signature",
 }
+
+
+def payload_manifest_sha256(files) -> str:
+    """Digest of the canonical payload manifest.
+
+    files: iterable of (relative posix path, bytes); the attestation sidecar
+    itself is skipped. One record per file, sorted by path byte order:
+    "{sha256} {size} {path}\\n". The record format is a cross-repo contract
+    with sicore payloadManifestSHA256 (okf_attestation.go) — change both
+    together.
+    """
+    records = sorted(
+        (rel, data) for rel, data in files if rel != ATTESTATION_SIDECAR
+    )
+    digest = hashlib.sha256()
+    for rel, data in records:
+        digest.update(
+            f"{hashlib.sha256(data).hexdigest()} {len(data)} {rel}\n".encode("utf-8")
+        )
+    return digest.hexdigest()
 
 
 def _violation(kind: str, detail: str) -> dict:
     return {"kind": kind, "detail": detail}
 
 
-def attestation_violations(doc: object, *, concept_pages: int) -> list[dict]:
+def attestation_violations(doc: object, *, concept_pages: int, payload_sha256: str) -> list[dict]:
     """Mirror the importer's checks; [] means the sidecar would be accepted."""
     if not isinstance(doc, dict):
         return [_violation("attestation_shape", "attestation must be a JSON object")]
@@ -84,6 +113,18 @@ def attestation_violations(doc: object, *, concept_pages: int) -> list[dict]:
         violations.append(_violation(
             "attestation_concept_pages",
             f"concept_pages {declared_pages} does not match the bundle's {concept_pages} concept pages"))
+
+    declared_digest = doc.get("payload_manifest_sha256")
+    if not isinstance(declared_digest, str) or not _DIGEST_RE.match(declared_digest):
+        violations.append(_violation(
+            "attestation_payload_manifest",
+            "payload_manifest_sha256 must be 64 lowercase hex characters"))
+    elif declared_digest != payload_sha256:
+        # The receipts describe a different tree than the one being packaged —
+        # a replayed or stale attestation, never something to ship.
+        violations.append(_violation(
+            "attestation_payload_manifest",
+            "payload_manifest_sha256 does not match the bundle's payload manifest"))
 
     checks = doc.get("checks")
     if not isinstance(checks, list) or not 1 <= len(checks) <= MAX_ATTESTATION_CHECKS:
@@ -146,7 +187,7 @@ def classify_tier(doc: dict) -> str:
     coverage = doc.get("coverage")
     coverage_closed = coverage is None or bool(coverage.get("closed"))
     if not failing and coverage_closed:
-        return TIER_ATTESTED
+        return TIER_SELF_ATTESTED
     return TIER_UNATTESTED
 
 
@@ -154,6 +195,7 @@ def build_attestation(
     *,
     producer_name: str,
     concept_pages: int,
+    payload_sha256: str,
     checks: list[dict],
     producer_version: str | None = None,
     coverage: dict | None = None,
@@ -167,6 +209,7 @@ def build_attestation(
         "schema_version": ATTESTATION_SCHEMA_VERSION,
         "producer": producer,
         "concept_pages": concept_pages,
+        "payload_manifest_sha256": payload_sha256,
         "checks": checks,
         "signature": None,
     }
@@ -174,7 +217,8 @@ def build_attestation(
         doc["input_revision"] = input_revision
     if coverage is not None:
         doc["coverage"] = coverage
-    violations = attestation_violations(doc, concept_pages=concept_pages)
+    violations = attestation_violations(
+        doc, concept_pages=concept_pages, payload_sha256=payload_sha256)
     if violations:
         raise ValueError(
             "refusing to build an invalid attestation: "

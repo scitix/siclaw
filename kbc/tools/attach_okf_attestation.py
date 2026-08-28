@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from posixpath import basename
 
@@ -19,7 +21,7 @@ POD_DIR = Path(__file__).resolve().parents[1] / "platform" / "pod"
 sys.path.insert(0, str(POD_DIR))
 
 import okf_attestation  # noqa: E402
-from okf_package import OKFPackageError, write_import_archive  # noqa: E402
+from okf_package import OKFPackageError, collect_import_files, write_import_archive  # noqa: E402
 
 
 class AttestationError(ValueError):
@@ -46,14 +48,6 @@ def load_coverage(path: Path) -> dict:
     return payload
 
 
-def count_concept_pages(wiki: Path) -> int:
-    return sum(
-        1
-        for page in wiki.rglob("*.md")
-        if basename(page.relative_to(wiki).as_posix()) not in ("index.md", "log.md")
-    )
-
-
 def attach_attestation(
     wiki: Path,
     output_path: Path,
@@ -63,24 +57,41 @@ def attach_attestation(
     checks_path: Path,
     coverage_path: Path | None,
     input_revision: str | None,
+    overwrite: bool = False,
 ) -> dict:
     if not wiki.is_dir():
         raise AttestationError(f"wiki directory does not exist: {wiki}")
     coverage = load_coverage(coverage_path) if coverage_path is not None else None
-    try:
-        doc = okf_attestation.build_attestation(
-            producer_name=producer,
-            producer_version=producer_version,
-            concept_pages=count_concept_pages(wiki),
-            checks=load_checks(checks_path),
-            coverage=coverage,
-            input_revision=input_revision,
+    checks = load_checks(checks_path)
+    # Work on a staging copy: the caller's wiki directory is input, never
+    # mutated, and a failure at any step leaves nothing behind.
+    with tempfile.TemporaryDirectory(prefix="okf-attestation-attach-") as raw:
+        staging = Path(raw) / "wiki"
+        shutil.copytree(wiki, staging)
+        (staging / okf_attestation.ATTESTATION_SIDECAR).unlink(missing_ok=True)
+        # collect_import_files is the packer's own canonical, validated file
+        # set — computing pages and digest from it guarantees the receipt
+        # describes exactly what write_import_archive will ship.
+        files = collect_import_files(staging)
+        concept_pages = sum(
+            1 for rel, _ in files
+            if rel.lower().endswith(".md") and basename(rel) not in ("index.md", "log.md")
         )
-    except ValueError as error:
-        raise AttestationError(str(error)) from error
-    sidecar = wiki / okf_attestation.ATTESTATION_SIDECAR
-    sidecar.write_text(okf_attestation.render_attestation(doc), encoding="utf-8")
-    receipt = write_import_archive(wiki, output_path, overwrite=True)
+        try:
+            doc = okf_attestation.build_attestation(
+                producer_name=producer,
+                producer_version=producer_version,
+                concept_pages=concept_pages,
+                payload_sha256=okf_attestation.payload_manifest_sha256(files),
+                checks=checks,
+                coverage=coverage,
+                input_revision=input_revision,
+            )
+        except ValueError as error:
+            raise AttestationError(str(error)) from error
+        sidecar = staging / okf_attestation.ATTESTATION_SIDECAR
+        sidecar.write_text(okf_attestation.render_attestation(doc), encoding="utf-8")
+        receipt = write_import_archive(staging, output_path, overwrite=overwrite)
     return {**receipt, "attestation_tier": okf_attestation.classify_tier(doc)}
 
 
@@ -100,6 +111,7 @@ def main() -> int:
              "({closed, cited, excluded, auto_attached, derived, unaccounted, dangling})",
     )
     parser.add_argument("--input-revision", help="Frozen source manifest revision the compile ran from")
+    parser.add_argument("--overwrite", action="store_true", help="Replace an existing output archive")
     args = parser.parse_args()
     try:
         receipt = attach_attestation(
@@ -110,6 +122,7 @@ def main() -> int:
             checks_path=args.checks,
             coverage_path=args.coverage,
             input_revision=args.input_revision,
+            overwrite=args.overwrite,
         )
     except (AttestationError, OKFPackageError, OSError) as error:
         parser.exit(2, f"attach_okf_attestation: {error}\n")
