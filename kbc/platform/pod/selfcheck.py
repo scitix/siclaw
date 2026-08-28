@@ -60,6 +60,10 @@ MEDIA_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
 SUPPORTED_OKF_VERSION = "0.2"
+_EVIDENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_EVIDENCE_MARKER_RE = re.compile(r"<!--[ \t]*okf:evidence[ \t]+(\{[^\r\n]*\})[ \t]*-->")
+_EVIDENCE_MARKER_START_RE = re.compile(r"<!--[ \t]*okf:evidence\b")
+_MAX_EVIDENCE_SOURCES = 8
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -826,6 +830,8 @@ def _okf_v02_metadata_violations(rel: str, fm: dict, body: str) -> list[dict]:
         violations.append({"page": rel, "kind": "okf_usage_window",
                            "detail": "usage_window 必须包含合法且有序的 YYYY-MM-DD from/to 日期"})
 
+    violations.extend(_okf_evidence_violations(rel, fm, body))
+
     if "generated" in fm:
         generated = fm.get("generated")
         if not isinstance(generated, dict) or not _valid_okf_actor(generated.get("by")):
@@ -883,6 +889,73 @@ def _okf_v02_metadata_violations(rel: str, fm: dict, body: str) -> list[dict]:
         if "attester" in fm and not _valid_resource_mapping(fm.get("attester")):
             violations.append({"page": rel, "kind": "okf_attested_computation",
                                "detail": "attester 必须包含非空 resource"})
+    return violations
+
+
+def _okf_evidence_violations(rel: str, fm: dict, body: str) -> list[dict]:
+    """Evidence markers bind one answerable section to declared source ids.
+
+    The marker is single-line JSON so both the compiler and Runtime can parse
+    the same deterministic shape without interpreting surrounding prose.
+    """
+    violations: list[dict] = []
+    declared = {
+        source.get("id").strip()
+        for source in fm.get("sources", [])
+        if isinstance(source, dict)
+        and isinstance(source.get("id"), str)
+        and source.get("id").strip()
+    }
+    scan = _markdown_prose(body)
+    matches = list(_EVIDENCE_MARKER_RE.finditer(scan))
+    if len(matches) != len(_EVIDENCE_MARKER_START_RE.findall(scan)):
+        violations.append({
+            "page": rel,
+            "kind": "okf_evidence",
+            "detail": "okf:evidence 必须是单行 JSON: {\"id\":...,\"sources\":[...]}",
+        })
+    seen: set[str] = set()
+    for match in matches:
+        try:
+            marker = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            violations.append({"page": rel, "kind": "okf_evidence",
+                               "detail": f"okf:evidence JSON 无效: {exc}"})
+            continue
+        if not isinstance(marker, dict) or set(marker) != {"id", "sources"}:
+            violations.append({"page": rel, "kind": "okf_evidence",
+                               "detail": "okf:evidence 只允许 id 与 sources"})
+            continue
+        evidence_id = marker.get("id")
+        if not isinstance(evidence_id, str) or not _EVIDENCE_ID_RE.fullmatch(evidence_id.strip()):
+            violations.append({"page": rel, "kind": "okf_evidence",
+                               "detail": f"evidence id 无效: {evidence_id!r}"})
+            continue
+        evidence_id = evidence_id.strip()
+        if evidence_id in seen:
+            violations.append({"page": rel, "kind": "okf_evidence",
+                               "detail": f"evidence id 重复: {evidence_id}"})
+        seen.add(evidence_id)
+        source_ids = marker.get("sources")
+        if (not isinstance(source_ids, list) or not source_ids
+                or len(source_ids) > _MAX_EVIDENCE_SOURCES):
+            violations.append({"page": rel, "kind": "okf_evidence",
+                               "detail": f"evidence {evidence_id} 必须声明 1-{_MAX_EVIDENCE_SOURCES} 个 sources"})
+            continue
+        marker_seen: set[str] = set()
+        for source_id in source_ids:
+            if not isinstance(source_id, str) or not _EVIDENCE_ID_RE.fullmatch(source_id.strip()):
+                violations.append({"page": rel, "kind": "okf_evidence",
+                                   "detail": f"evidence {evidence_id} source id 无效: {source_id!r}"})
+                continue
+            source_id = source_id.strip()
+            if source_id in marker_seen:
+                violations.append({"page": rel, "kind": "okf_evidence",
+                                   "detail": f"evidence {evidence_id} source 重复: {source_id}"})
+            marker_seen.add(source_id)
+            if source_id not in declared:
+                violations.append({"page": rel, "kind": "okf_evidence",
+                                   "detail": f"evidence {evidence_id} 引用了未在页面 sources 声明的 {source_id}"})
     return violations
 
 

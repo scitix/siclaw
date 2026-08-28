@@ -1,0 +1,72 @@
+{
+  "pattern": "<!--[ \\t]*okf:evidence[ \\t]+(\\{[^\\r\\n]*\\})[ \\t]*-->",
+  "start_pattern": "<!--[ \\t]*okf:evidence\\b",
+  "max_sources": 8,
+  "cases": [
+    {
+      "id": "canonical-single-line",
+      "body": "<!-- okf:evidence {\"id\":\"e1\",\"sources\":[\"src-1\"]} -->",
+      "recognized": true
+    },
+    {
+      "id": "leading-trailing-spaces",
+      "body": "<!--  okf:evidence {\"id\":\"e1\",\"sources\":[\"src-1\"]}  -->",
+      "recognized": true
+    },
+    {
+      "id": "tab-separated",
+      "body": "<!--\tokf:evidence\t{\"id\":\"e1\",\"sources\":[\"src-1\"]}\t-->",
+      "recognized": true
+    },
+    {
+      "id": "pretty-printed-multiline",
+      "body": "<!--\nokf:evidence {\"id\":\"e1\",\"sources\":[\"src-1\"]}\n-->",
+      "recognized": false
+    },
+    {
+      "id": "newline-after-open",
+      "body": "<!--\nokf:evidence NOT-JSON -->",
+      "recognized": false
+    },
+    {
+      "id": "nbsp-before-name",
+      "body": "<!-- okf:evidence {\"id\":\"e1\",\"sources\":[\"src-1\"]} -->",
+      "recognized": false
+    },
+    {
+      "id": "fenced-code-example",
+      "body": "```\n<!-- okf:evidence {\"id\":\"e1\",\"sources\":[\"src-1\"]} -->\n```",
+      "recognized": false
+    },
+    {
+      "id": "language-tagged-fence-then-prose",
+      "body": "```markdown\n<!-- okf:evidence {\"id\":\"hidden\",\"sources\":[\"src-1\"]} -->\n```\n<!-- okf:evidence {\"id\":\"visible\",\"sources\":[\"src-1\"]} -->",
+      "recognized": true
+    },
+    {
+      "id": "tilde-fence-then-prose",
+      "body": "~~~markdown\n<!-- okf:evidence {\"id\":\"hidden\",\"sources\":[\"src-1\"]} -->\n~~~\n<!-- okf:evidence {\"id\":\"visible\",\"sources\":[\"src-1\"]} -->",
+      "recognized": true
+    },
+    {
+      "id": "four-backtick-short-run-not-close",
+      "body": "````markdown\n```\n<!-- okf:evidence {\"id\":\"hidden\",\"sources\":[\"src-1\"]} -->\n````\n<!-- okf:evidence {\"id\":\"visible\",\"sources\":[\"src-1\"]} -->",
+      "recognized": true
+    },
+    {
+      "id": "three-space-indented-fence-then-prose",
+      "body": "   ```text\n<!-- okf:evidence {\"id\":\"hidden\",\"sources\":[\"src-1\"]} -->\n   ```\n<!-- okf:evidence {\"id\":\"visible\",\"sources\":[\"src-1\"]} -->",
+      "recognized": true
+    },
+    {
+      "id": "unclosed-fence-to-eof",
+      "body": "```text\n<!-- okf:evidence {\"id\":\"hidden\",\"sources\":[\"src-1\"]} -->",
+      "recognized": false
+    },
+    {
+      "id": "multi-backtick-inline-then-prose",
+      "body": "Example: ``<!-- okf:evidence {\"id\":\"hidden\",\"sources\":[\"src-1\"]} -->``\n<!-- okf:evidence {\"id\":\"visible\",\"sources\":[\"src-1\"]} -->",
+      "recognized": true
+    }
+  ]
+}

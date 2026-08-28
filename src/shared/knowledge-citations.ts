@@ -2,10 +2,21 @@ export interface KnowledgeSourceCitation {
   title: string;
   url: string;
   resource?: string;
+  sourceId?: string;
   page?: string;
+  evidence?: string;
 }
 
-export const MAX_KNOWLEDGE_CITATIONS = 3;
+// Shared ceiling for one knowledge_cite result, the tool's evidence_refs /
+// pages maxItems, and the rendered references list (including Feishu cards).
+// The raise from 3 to 8 is intentional for both evidence and legacy paths:
+// a multi-source answer must not lose the fourth original after the runtime
+// already validated it. This is not the per-marker source cap — that is
+// MAX_EVIDENCE_SOURCES_PER_MARKER, mirrored by Python `_MAX_EVIDENCE_SOURCES`.
+export const MAX_KNOWLEDGE_CITATIONS = 8;
+
+/** Max `sources` inside one `okf:evidence` marker. Keep equal to selfcheck.py. */
+export const MAX_EVIDENCE_SOURCES_PER_MARKER = 8;
 
 export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSourceCitation[] {
   if (!Array.isArray(value)) return [];
@@ -25,7 +36,9 @@ export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSour
       title,
       url: parsed.href,
       resource: typeof row.resource === "string" ? row.resource : undefined,
+      sourceId: typeof row.sourceId === "string" ? row.sourceId : undefined,
       page: typeof row.page === "string" ? row.page : undefined,
+      evidence: typeof row.evidence === "string" ? row.evidence : undefined,
     });
     if (out.length >= MAX_KNOWLEDGE_CITATIONS) break;
   }

@@ -29,4 +29,14 @@ describe("knowledge source citation rendering", () => {
       "- [Title](https://ok.example/%29[Login]%28https://evil.example/)",
     );
   });
+
+  it("does not silently discard a fourth resolved evidence source", () => {
+    const sources = Array.from({ length: 4 }, (_, index) => ({
+      title: `Source ${index + 1}`,
+      url: `https://docs.feishu.cn/wiki/source${index + 1}`,
+    }));
+
+    expect(normalizeKnowledgeSourceCitations(sources)).toHaveLength(4);
+    expect(appendKnowledgeSourceCitations("answer", sources)).toContain("Source 4");
+  });
 });
