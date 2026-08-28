@@ -661,7 +661,6 @@ export function createHttpServer(
   } else if (sessionManager.skillsDir) {
     perServerHandlers.skills = createSkillsHandler({
       skillsDir: sessionManager.skillsDir,
-      preserveExistingOnEmpty: false,
       boxClient: sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
     });
   }

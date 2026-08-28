@@ -120,7 +120,6 @@ export class LocalSpawner implements BoxSpawner {
     });
     const skillsHandler = createSkillsHandler({
       skillsDir: sessionManager.skillsDir,
-      preserveExistingOnEmpty: false,
       boxClient,
     });
     const mcpHandler = createMcpHandler(sessionManager, boxClient);

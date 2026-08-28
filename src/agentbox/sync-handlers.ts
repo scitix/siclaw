@@ -250,7 +250,6 @@ interface SkillBundlePayload {
 export function createSkillsHandler(
   options: {
     skillsDir?: string;
-    preserveExistingOnEmpty?: boolean;
     boxClient?: GatewaySyncClientLike | null;
   } = {},
 ): AgentBoxSyncHandler<SkillBundlePayload> {
@@ -313,8 +312,7 @@ export function createSkillsHandler(
     const isAuthoritativeEmpty = payload?.skillsAuthoritative === true
       || hasExplicitBuiltinPolicy
       || hasExplicitBuiltinMask;
-    if (options.preserveExistingOnEmpty !== false
-        && !isAuthoritativeEmpty
+    if (!isAuthoritativeEmpty
         && incomingCount === 0
         && fs.existsSync(resolvedDir)) {
       const existing = fs.readdirSync(resolvedDir).filter((name) => {
