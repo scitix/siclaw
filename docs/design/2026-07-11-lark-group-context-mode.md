@@ -71,6 +71,18 @@ no user-facing choice, and non-@ group messages are dropped unconditionally
    messages never arrive; `shared` degrades to "shared @-turns only" (multiple
    senders share one session but the agent doesn't hear the chatter). This is
    functional, not an error.
+8. **No-mention activation is a two-party Topic exception**: the parent group
+   roster does not define Topic participation. Only `topic` mode may invoke the
+   agent without `@bot`, and only inside an already-claimed Topic whose root
+   message plus every paginated reply contain exactly one human sender and this
+   Siclaw app. The current event sender is added explicitly to cover Feishu
+   history-list eventual consistency. Two humans or another app in that Topic
+   require an explicit mention on every Agent turn, including turns from the
+   original asker. Personal and Team modes never run the Agent from an
+   unmentioned message. Missing/malformed root/history data, incomplete or
+   cyclic pagination, unknown sender identities, and lookup failures all fail
+   closed to "mention required". The positive result is revalidated before
+   every unmentioned turn so a new participant takes effect immediately.
 
 ## Feishu permission matrix
 
@@ -91,20 +103,27 @@ group message arrives
  ├─ @bot        → resolveBinding (existing path) → enqueue agent turn on the
  │                returned sessionKey; in shared mode, prepend the drained
  │                discussion buffer to the prompt
- └─ no mention  → look up the group's context_mode (short-TTL cache, no RPC
-                  per message)
-                   ├─ shared   → append {sender, text, ts} to the session's
-                   │             discussion buffer; no agent run
-                   └─ per_user → drop immediately (today's behavior)
+ └─ no mention  → known shared → append passive discussion
+                   otherwise require a real thread_id and human sender
+                   → resolveBinding(existing Topic only)
+                     ├─ topic → fetch root + paginate Topic replies
+                     │          ├─ one human + this app → enqueue Agent turn
+                     │          └─ other / unknown → drop immediately
+                     ├─ shared → append passive discussion
+                     └─ per_user / unclaimed → drop immediately
 ```
 
 Feishu Topic placement is derived directly from the resolved group mode; it is
 not a separate runtime or deployment setting:
 
-- `per_user`: each root `@bot` message starts a Topic-scoped session, and
-  follow-ups in that Topic reuse it without another mention.
+- `per_user`: each explicitly mentioned root message starts a Topic-scoped
+  session, and explicitly mentioned follow-ups in that Topic reuse it.
 - `shared`: replies and the shared session stay on the main-group path; provider
   Topic identifiers never split the group session.
+- `topic`: each accepted root claims a Topic-scoped session shared by its
+  authorized participants. Only a one-human/this-bot Topic may omit mentions;
+  the containing group may be large, but once another human or app participates
+  in that Topic, every Agent turn requires `@bot`.
 - Existing pre-Topic `per_user` session history is not migrated into a new
   Topic root. Each new root intentionally starts its own scoped conversation.
 

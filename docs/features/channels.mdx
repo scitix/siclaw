@@ -75,20 +75,33 @@ Create a Lark bot app, enable message event subscriptions, then configure it in 
 The existing group context selector determines Topic behavior directly; there
 is no separate Topic switch or deployment setting.
 
-- **Personal (per-user)**: a root `@bot` message opens a Feishu topic with the
-  streaming card inside it. Follow-ups in that topic reuse that user's Agent
-  session without another mention. Unrelated topics and another user's
-  unmentioned replies do not create or inherit the private session.
-- **Topic (thread-shared)**: a root `@bot` message claims that Feishu Topic.
-  Every authorized participant can then continue inside it without another
-  mention, and all of them reuse the same Agent session. The main group and
-  every other unclaimed Topic remain silent and context-isolated.
-- **Team (shared)**: users continue to `@bot` in the main group and the bot
-  replies on the existing main-group path. The whole group keeps one shared
-  Agent session; Feishu topics do not split it into separate sessions.
+The mention rule is intentionally narrow:
 
-No additional Topic switch is required in the UI. Follow-ups without another
-`@bot` require the app's group-message event permission.
+- Only **Topic** mode may omit `@bot`, and only inside an already-claimed Topic
+  whose complete message history contains exactly one human and this Siclaw
+  app. The parent group's roster is irrelevant: a large group can still have a
+  two-party Topic.
+- The Runtime reads the Topic root separately and paginates every Topic reply,
+  up to 100 pages of 50 replies. A longer Topic fails closed and requires
+  `@bot`. A second human or another app also makes every Agent turn require
+  `@bot`, including turns from the original asker, so human-to-human discussion
+  cannot wake the Agent.
+- Personal and Team modes never run the Agent from an unmentioned message.
+  Missing/malformed root or Topic history, pagination anomalies, unknown sender
+  identities, and lookup failures all require `@bot`.
+
+- **Personal (per-user)**: each accepted root message opens a Feishu topic with
+  the streaming card inside it. Accepted follow-ups reuse that user's Agent
+  session, but this mode never gets the no-mention exception.
+- **Topic (thread-shared)**: an accepted root message claims that Feishu Topic.
+  Every authorized participant then reuses the same Agent session inside it.
+  The main group and every other unclaimed Topic remain context-isolated.
+- **Team (shared)**: accepted turns use the existing main-group reply path and
+  the whole group keeps one shared Agent session; Feishu topics do not split it
+  into separate sessions.
+
+No additional Topic switch is required in the UI. The one-human/one-bot Topic
+path without `@bot` requires the app's group-message event permission.
 
 ### Feishu test-bot capability checklist
 
@@ -101,11 +114,11 @@ Use these application-identity scopes for a complete Siclaw Agent test bot:
 
 | Capability unit | Scope | Why Siclaw needs it |
 |---|---|---|
-| Send and reply to messages | `im:message` | Plain-text replies, CardKit card replies, topic replies, mode-switch announcements, and downloading images attached to received messages |
+| Send, reply, and read messages | `im:message` | Plain-text replies, CardKit card replies, topic replies, mode-switch announcements, reading the Topic root/history for the mention gate, and downloading images attached to received messages |
 | Receive direct messages | `im:message.p2p_msg:readonly` | Required separately even when `im:message` is enabled |
 | Receive group `@bot` messages | `im:message.group_at_msg:readonly` | Starts an investigation from a group root message |
-| Receive group messages without a mention | `im:message.group_msg` | Required for natural follow-ups inside an existing Personal- or Topic-mode bot Topic and for passive shared-group discussion context; this is a sensitive permission, so restrict the app's availability for pilots |
-| Read group metadata | `im:chat:readonly` | Resolves the group title shown in Siclaw |
+| Receive group messages without a mention | `im:message.group_msg` | Required for the one-human/one-bot Topic path and for passive shared-group discussion context; this is a sensitive permission, so restrict the app's availability for pilots |
+| Read group metadata | `im:chat:readonly` | Resolves the group title shown for the binding; group roster counts are not used by the Topic mention gate |
 | Create and stream cards | `cardkit:card:write` | Creates the thinking card, streams milestones, finalizes the answer, and updates feedback controls |
 | Upload reply images and files | `im:resource` | Uploads charts and other Agent-generated message resources; received-message downloads are covered by `im:message` |
 | Read bot metadata (recommended) | `application:bot.basic_info:read` | Keeps the bot name and identity lookup explicit in the app configuration |
@@ -132,14 +145,19 @@ The matching platform configuration is:
 Acceptance should cover each permission unit independently:
 
 - Direct message: send a unique text and confirm the bot replies.
-- Personal-mode root: select **Personal**, send `@bot` with a unique text, and
+- Topic mention gate: in **Topic** mode, send a unique root with `@bot`, then a
+  follow-up without `@bot`; confirm both reply even if the parent group has many
+  members. Add a second human to that Topic and confirm every unmentioned
+  follow-up stays silent; the same turns should work when `@bot` is explicit.
+- Personal-mode root: select **Personal**, send an accepted unique message, and
   confirm the first reply opens a topic.
-- Personal-mode continuity: reply inside that topic without another mention and
-  confirm the same Siclaw session is reused.
-- Topic-mode root: select **Topic**, send `@bot` with a unique text, and confirm
-  the first reply opens a Topic.
-- Topic-mode continuity: have another authorized member reply in that Topic
-  without another mention and confirm both turns reuse the same session.
+- Personal-mode gate: even with one human and one bot, omit `@bot` and confirm
+  the Agent stays silent; then mention it and confirm the same user's session
+  is reused.
+- Topic-mode root: select **Topic**, send an accepted unique message, and
+  confirm the first reply opens a Topic.
+- Topic-mode continuity: have another authorized member explicitly `@bot` in
+  that Topic and confirm both turns reuse the same session.
 - Topic-mode isolation: reply without a mention in another Topic and confirm the
   bot stays silent and creates no session there.
 - Team-mode root: select **Team**, send `@bot` with a unique text, and confirm
