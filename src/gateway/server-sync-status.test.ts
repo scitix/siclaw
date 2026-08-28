@@ -5,6 +5,9 @@
  * running box so the developer console can show what actually landed.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
+// The envelope carries the RUNTIME's version, so assert against the constant:
+// pinning a literal makes every deliberate bump look like 7 regressions.
+import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
 import type { BoxSyncStatus } from "../shared/agentbox-sync-status.js";
 
 vi.mock("./chat-repo.js", () => ({
@@ -99,7 +102,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "no_running_box",
@@ -120,7 +123,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "no_running_box",
@@ -142,7 +145,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: true,
       boxes: 2,
@@ -253,7 +256,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       available: true,
       boxes: 2,
       runningBoxes: 2,
@@ -292,7 +295,7 @@ describe("agent.syncStatus RPC", () => {
 
     const result = await syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
     expect(result).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       available: true,
       runningBoxes: 2,
       observedBoxes: 1,
@@ -318,7 +321,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "unsupported",
@@ -345,7 +348,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "unsupported",

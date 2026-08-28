@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -370,7 +371,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       const r = await getJson(port, "/api/sync-status");
       expect(r.status).toBe(200);
       expect(r.data).toEqual({
-        schemaVersion: 2,
+        schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
         knowledge: {
           syncedAt: "2026-08-18T08:00:00.000Z",
           repos: [{ id: "kb-1", name: "hardware", version: 2, sha256: "abc", fileCount: 12 }],
@@ -379,6 +380,10 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
         mcp: { names: ["incidents"] },
         harness: null,
         model: null,
+        // null = no successful turn observed yet, which is NOT the same as a turn
+        // that ran without tiers ({menuRevision: null, candidatesRevision: null}).
+        // Same convention as harness/model above.
+        tiers: null,
       });
     } finally {
       mockConfigState.knowledgeDir = "knowledge";
@@ -519,6 +524,60 @@ describe("http-server — sub-agent tier turn state", () => {
     expect(managed).toBeDefined();
     expect(managed!.subagentTierCandidates).toBeNull();
     expect(managed!.effectiveModelCandidate).toBeNull();
+  });
+
+  /** A turn that actually SUCCEEDS: the routing runner reports failure on an
+   *  empty response, and the observation block only runs on success. */
+  async function succeedingSession(id: string) {
+    const session = await sm.getOrCreate(id);
+    session.brain.prompt.mockImplementation(async () => {
+      session.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+    return session;
+  }
+
+  it("reports the turn's tier revisions on /api/sync-status, recorded before the clear", async () => {
+    // The box implements tiering entirely on the turn path; without this field it
+    // ran correctly while being unable to state that it had, and every way the
+    // two channels fail to pair is silent.
+    //
+    // The ordering is the whole risk: `actuallyFinish` nulls the candidates at the
+    // end of every turn, so an observation taken after it would report
+    // `candidatesRevision: null` always — a self-report that permanently claims
+    // the feature is broken is worse than no self-report.
+    await succeedingSession("tier-obs");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "hi", sessionId: "tier-obs", subagentTiers: tiers,
+      modelProvider: "openai", modelId: "gpt-4",
+    });
+    await flushAsync();
+
+    const status = await getJson(port, "/api/sync-status");
+    expect(status.data.tiers).toMatchObject({ candidatesRevision: REV });
+    // ...and the turn state really was cleared afterwards. The report is a record
+    // of what ran, not the credential-bearing state staying alive to be read.
+    expect(sm.sessions.get("tier-obs")!.subagentTierCandidates).toBeNull();
+    expect(JSON.stringify(status.data)).not.toContain("tier-secret");
+  });
+
+  it("still reports the object when a turn carried no tiers at all", async () => {
+    // Emitted with both revisions null rather than omitted. A field that appeared
+    // only when tiering worked would make a box that LOST its tiers look identical
+    // to one released before this field existed — the exact ambiguity it exists to
+    // remove, and the reason a consumer cannot use "validate if present, skip if
+    // absent".
+    await succeedingSession("tier-none");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "hi", sessionId: "tier-none", modelProvider: "openai", modelId: "gpt-4",
+    });
+    await flushAsync();
+
+    const status = await getJson(port, "/api/sync-status");
+    expect(status.data.tiers).toMatchObject({ menuRevision: null, candidatesRevision: null });
+    expect(typeof status.data.tiers.observedAt).toBe("string");
   });
 
   it("clears them on a turn that never carried any", async () => {

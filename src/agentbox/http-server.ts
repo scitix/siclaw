@@ -642,6 +642,15 @@ export function createHttpServer(
     toolNames: string[];
     observedAt: string;
   } | null = null;
+  /**
+   * Sub-agent tiering as the last successful turn actually held it. See
+   * `BoxSyncStatus.tiers` for what each combination of the two revisions means.
+   */
+  let observedTiers: {
+    menuRevision: string | null;
+    candidatesRevision: string | null;
+    observedAt: string;
+  } | null = null;
   if (sessionManager.credentialBroker) {
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
@@ -801,6 +810,7 @@ export function createHttpServer(
       }),
       model: observedModel,
       harness: observedHarness,
+      tiers: observedTiers,
     });
   });
 
@@ -1309,6 +1319,21 @@ export function createHttpServer(
           skillNames: [...managed.skillNames],
           skillDigests: { ...managed.skillDigests },
           toolNames: [...managed.toolNames],
+          observedAt: new Date().toISOString(),
+        };
+        // Read BEFORE onPromptFinish below: that funnels into `actuallyFinish`,
+        // which calls `clearTurnTierState` and nulls the candidates. Recording
+        // after it would report `candidatesRevision: null` on every turn — a field
+        // that always says the feature is broken is worse than no field.
+        //
+        // Recorded unconditionally, unlike `model` just below, which only records
+        // when the box confirms it ran the INTENDED model. There is no equivalent
+        // intent to check here: "this turn carried no tiers" is a real and useful
+        // observation, and suppressing it is what makes a box that lost its tiers
+        // look like a box too old to report.
+        observedTiers = {
+          menuRevision: managed.subagentTierMenu?.revision ?? null,
+          candidatesRevision: managed.subagentTierCandidates?.revision ?? null,
           observedAt: new Date().toISOString(),
         };
         const intendedCandidate = body.modelProvider && body.modelId
