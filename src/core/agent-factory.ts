@@ -618,8 +618,11 @@ export async function createSiclawSession(
       operations: {
         readFile: async (p) => {
           assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir);
+          const start = citationSupport?.captureMount();
           const content = await fsReadFile(p);
-          citationSupport?.noteRead(p);
+          if (citationSupport && start !== undefined) {
+            citationSupport.noteRead(p, typeof content === "string" ? content : content.toString("utf8"), start);
+          }
           return content;
         },
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK); },

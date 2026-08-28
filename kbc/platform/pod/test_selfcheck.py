@@ -189,6 +189,68 @@ def test_okf_v02_conformance():
     print("OK  OKF v0.2 core conformance + Siclaw portable-output profile")
 
 
+def test_okf_evidence_markers_bind_only_declared_source_ids():
+    valid = {"gb300.md": {
+        "text": '''---
+type: Concept
+sources:
+  - id: src-asus-sales-kit
+    resource: raw/specs/asus.md
+---
+<!-- okf:evidence {"id":"ev.gb300.asus.power","sources":["src-asus-sales-kit"]} -->
+# GB300
+''',
+    }}
+    assert selfcheck.okf_v02_violations(valid) == []
+
+    unmapped = {"gb300.md": {
+        "text": '''---
+type: Concept
+sources:
+  - id: src-asus-sales-kit
+    resource: raw/specs/asus.md
+---
+<!-- okf:evidence {"id":"ev.gb300.asus.power","sources":["src-other"]} -->
+# GB300
+''',
+    }}
+    violations = selfcheck.okf_v02_violations(unmapped)
+    assert any(v["kind"] == "okf_evidence" and "src-other" in v["detail"] for v in violations), violations
+
+    malformed = {"gb300.md": {
+        "text": '''---
+type: Concept
+sources:
+  - id: src-asus-sales-kit
+    resource: raw/specs/asus.md
+---
+<!-- okf:evidence not-json -->
+# GB300
+''',
+    }}
+    assert any(v["kind"] == "okf_evidence" for v in selfcheck.okf_v02_violations(malformed))
+    print("OK  OKF evidence markers bind declared source ids")
+
+
+def test_okf_evidence_marker_grammar_matches_runtime_fixtures():
+    """Compiler and runtime must agree on which comments are markers."""
+    fixtures_path = Path(__file__).resolve().parents[3] / "docs/design/okf-evidence-marker-fixtures.json"
+    fixtures = json.loads(fixtures_path.read_text(encoding="utf-8"))
+    assert selfcheck._EVIDENCE_MARKER_RE.pattern == fixtures["pattern"]
+    assert selfcheck._EVIDENCE_MARKER_START_RE.pattern == fixtures["start_pattern"]
+    assert selfcheck._MAX_EVIDENCE_SOURCES == fixtures["max_sources"]
+    for case in fixtures["cases"]:
+        scan = selfcheck._markdown_prose(case["body"])
+        start = len(selfcheck._EVIDENCE_MARKER_START_RE.findall(scan))
+        full = len(selfcheck._EVIDENCE_MARKER_RE.findall(scan))
+        expected = 1 if case["recognized"] else 0
+        assert start == expected == full, (case["id"], start, full)
+        if not case["recognized"]:
+            page = {"page.md": {"text": f"---\ntype: Concept\nsources:\n  - id: src-1\n    resource: raw/a.md\n---\n{case['body']}\n"}}
+            assert not any(v["kind"] == "okf_evidence" for v in selfcheck.okf_v02_violations(page)), case["id"]
+    print("OK  OKF evidence marker grammar matches runtime fixtures")
+
+
 def test_okf_import_profile():
     """Direct import validates structure without rewriting external semantics."""
     external = {
@@ -2503,6 +2565,8 @@ def main():
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
     test_parse_okf_sources()
     test_okf_v02_conformance()
+    test_okf_evidence_markers_bind_only_declared_source_ids()
+    test_okf_evidence_marker_grammar_matches_runtime_fixtures()
     test_okf_import_profile()
     test_stamp_siclaw_generated_metadata()
     test_frontmatter_delimiters_and_stamp_preserve_yaml_scalar_and_comments()

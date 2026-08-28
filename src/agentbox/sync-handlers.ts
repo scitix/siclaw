@@ -403,7 +403,7 @@ interface KnowledgeBundlePayload {
     sha256?: string | null;
     sizeBytes: number;
     fileCount?: number | null;
-    citationSources?: Array<{ resource: string; title: string; url: string }>;
+    citationSources?: Array<{ sourceId?: string; resource: string; title: string; url: string }>;
     dataBase64: string;
   }>;
 }

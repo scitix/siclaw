@@ -1227,7 +1227,7 @@ describe("knowledgeHandler multi-repo identity", () => {
   it("materializes server-owned citation metadata beside the exact repo roots", async () => {
     const repos = [
       { id: "repo-a", name: "A", version: 1, sizeBytes: 10, dataBase64: packageBase64("a"),
-        citationSources: [{ resource: "feishu/a.md", title: "A 原文", url: "https://docs.feishu.cn/wiki/a" }] },
+        citationSources: [{ sourceId: "source-a", resource: "feishu/a.md", title: "A 原文", url: "https://docs.feishu.cn/wiki/a" }] },
       { id: "repo-b", name: "B", version: 1, sizeBytes: 10, dataBase64: packageBase64("b"), citationSources: [] },
     ];
     await knowledgeHandler.materialize({ version: "v1", repos });

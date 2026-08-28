@@ -29,6 +29,8 @@ describe("agent-factory", () => {
     expect(source).toMatch(/const knowledgeDir = opts\?\.knowledgeDir\s*\?\?/);
     expect(source).toMatch(/createKnowledgeCitationSupport\(\{\s*knowledgeDir,/);
     expect(source).toContain("buildKnowledgeCitationSystemPrompt(knowledgeDir)");
+    expect(source).toMatch(/captureMount\(\)[\s\S]*?fsReadFile\(p\)[\s\S]*?noteRead\(p,/);
+    expect(source).not.toMatch(/citationSupport\?\.noteRead\(p\);/);
   });
 
   it("keeps configured MCP as a resolved resource axis, not a built-in capability name filter", () => {
