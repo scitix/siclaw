@@ -10,12 +10,15 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import json
 import os
 import stat
 import tarfile
 import tempfile
 from pathlib import Path
+from posixpath import basename
 
+import okf_attestation
 import selfcheck
 
 MAX_ARCHIVE_BYTES = 25 * 1024 * 1024
@@ -143,7 +146,32 @@ def collect_import_files(wiki_dir: str | Path) -> list[tuple[str, bytes]]:
     violations = selfcheck.okf_import_violations(markdown_pages)
     if violations:
         raise OKFPackageError("Wiki is not importable OKF v0.2: " + _format_violations(violations))
+    _validate_attestation_sidecar(files, markdown_pages)
     return files
+
+
+def _validate_attestation_sidecar(files: list[tuple[str, bytes]], markdown_pages: dict[str, dict]) -> None:
+    """A lying compiler receipt must fail at packaging, not at the importer."""
+    sidecar = next(
+        (data for rel, data in files if rel == okf_attestation.ATTESTATION_SIDECAR), None,
+    )
+    if sidecar is None:
+        return
+    # Mirrors the importer's concept-page definition: every .md except the
+    # reserved index/log pages (sicore isOKFReservedPath).
+    concept_pages = sum(
+        1 for rel in markdown_pages if basename(rel) not in ("index.md", "log.md")
+    )
+    try:
+        doc = okf_attestation.parse_attestation(sidecar)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise OKFPackageError(f"{okf_attestation.ATTESTATION_SIDECAR} is invalid JSON: {error}") from error
+    violations = okf_attestation.attestation_violations(doc, concept_pages=concept_pages)
+    if violations:
+        raise OKFPackageError(
+            f"{okf_attestation.ATTESTATION_SIDECAR} would be rejected by the importer: "
+            + "; ".join(item["detail"] for item in violations[:10])
+        )
 
 
 def write_import_archive(
