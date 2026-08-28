@@ -230,6 +230,12 @@ interface SkillBundlePayload {
   inheritBuiltins?: boolean;
   /** Built-in image Skills explicitly masked by this preview instance. */
   disabledBuiltins?: string[];
+  /**
+   * Successful control-plane resolve of the full Skill set. Presence
+   * (including skills: []) replaces resolved/. Failed fetches never
+   * reach materialize, so they keep the last copy.
+   */
+  skillsAuthoritative?: boolean;
   skills: Array<{
     dirName: string;
     /** "builtin" is accepted for legacy producers; image Built-ins are not bundled. */
@@ -299,16 +305,16 @@ export function createSkillsHandler(
       );
     }
 
-    // Defense against empty-bundle erasure (belt-and-suspenders; the primary
-    // fix is Gateway-side so empty-bundles only arrive when the agent is
-    // genuinely unbound). If an empty payload arrives but we already have
-    // skills materialized, keep what we have and let the next reload retry.
-    // Legitimate "unbind-all" admin operations can force a fresh wipe by
-    // restarting the pod — which is cheap and explicit.
+    // Defense against empty-bundle erasure. A successful control-plane
+    // resolve sets skillsAuthoritative (or a preview builtin policy). Those
+    // empty lists replace resolved/. An unmarked empty payload is treated as
+    // a transient/legacy miss and keeps the last copy.
     const incomingCount = Array.isArray(payload?.skills) ? payload.skills.length : 0;
+    const isAuthoritativeEmpty = payload?.skillsAuthoritative === true
+      || hasExplicitBuiltinPolicy
+      || hasExplicitBuiltinMask;
     if (options.preserveExistingOnEmpty !== false
-        && !hasExplicitBuiltinPolicy
-        && !hasExplicitBuiltinMask
+        && !isAuthoritativeEmpty
         && incomingCount === 0
         && fs.existsSync(resolvedDir)) {
       const existing = fs.readdirSync(resolvedDir).filter((name) => {

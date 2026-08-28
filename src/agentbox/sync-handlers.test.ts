@@ -605,6 +605,27 @@ describe("skillsHandler", () => {
     warnSpy.mockRestore();
   });
 
+  it("clears resolved/ when an authoritative empty bundle arrives", async () => {
+    await skillsHandler.materialize({
+      version: "v1",
+      skills: [
+        { dirName: "skill-a", scope: "global" as const, specs: "---\nname: a\n---\n", scripts: [] },
+        { dirName: "skill-b", scope: "global" as const, specs: "---\nname: b\n---\n", scripts: [] },
+      ],
+    });
+    expect(resolvedExists("skill-a")).toBe(true);
+    expect(resolvedExists("skill-b")).toBe(true);
+
+    const count = await skillsHandler.materialize({
+      version: "v2",
+      skillsAuthoritative: true,
+      skills: [],
+    });
+    expect(count).toBe(0);
+    expect(resolvedExists("skill-a")).toBe(false);
+    expect(resolvedExists("skill-b")).toBe(false);
+  });
+
   // ── 6. multiple skills, different names ───────────────────────────
   it("materializes multiple skills with different dirNames", async () => {
     const payload = {
