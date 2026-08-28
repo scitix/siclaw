@@ -7,9 +7,11 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 import source_snapshot
+from source_inspector import SourceInspector
 
 
 def make_bundle(files: dict[str, bytes]) -> bytes:
@@ -22,7 +24,9 @@ def make_bundle(files: dict[str, bytes]) -> bytes:
     return stream.getvalue()
 
 
-def make_snapshot(groups: list[dict[str, bytes]]) -> tuple[dict, list[bytes]]:
+def make_snapshot(
+    groups: list[dict[str, bytes]], *, version: int = 2, source_revision: Optional[dict] = None,
+) -> tuple[dict, list[bytes]]:
     parts = []
     bundles = []
     all_files = []
@@ -46,13 +50,16 @@ def make_snapshot(groups: list[dict[str, bytes]]) -> tuple[dict, list[bytes]]:
             "file_count": len(descriptors),
             "files": descriptors,
         })
-    return {
-        "version": 2,
+    snapshot = {
+        "version": version,
         "manifest_sha256": hashlib.sha256(source_snapshot.canonical_file_manifest(all_files)).hexdigest(),
         "total_bytes": sum(item["size_bytes"] for item in all_files),
         "file_count": len(all_files),
         "parts": parts,
-    }, bundles
+    }
+    if source_revision is not None:
+        snapshot["source_revision"] = source_revision
+    return snapshot, bundles
 
 
 def deterministic_directory_bundle(root: Path, files: list[dict]) -> bytes:
@@ -70,6 +77,54 @@ def deterministic_directory_bundle(root: Path, files: list[dict]) -> bytes:
 
 
 class SourceSnapshotTest(unittest.TestCase):
+    def test_v3_repository_tree_is_preserved_and_uniformly_readable(self):
+        files = {
+            "docs.json": b'{"navigation":[{"pages":["guide/index"]}]}\n',
+            "guide/index.mdx": b'import { Card } from "@/components"\n\n# Guide\n\n<Card>Visible body</Card>\n',
+            "guide/media/used.png": b"\x89PNG-used",
+            "guide/media/standalone.png": b"\x89PNG-standalone",
+        }
+        revision = {
+            "origin": "git_archive",
+            "revision": "a" * 40,
+        }
+        snapshot, bundles = make_snapshot([files], version=3, source_revision=revision)
+        with tempfile.TemporaryDirectory() as directory:
+            source_snapshot.begin_snapshot(directory, "repo-run", "repo-revision", snapshot)
+            source_snapshot.install_part(
+                directory, "repo-run", "repo-revision", "part-000001", bundles[0],
+            )
+            result = source_snapshot.commit_snapshot(directory, "repo-run", "repo-revision")
+
+            raw = Path(directory) / "raw"
+            self.assertEqual((raw / "guide/index.mdx").read_bytes(), files["guide/index.mdx"])
+            self.assertEqual((raw / "docs.json").read_bytes(), files["docs.json"])
+            self.assertEqual((raw / "guide/media/standalone.png").read_bytes(), files["guide/media/standalone.png"])
+            self.assertEqual(result["source_revision"], revision)
+
+            inspector = SourceInspector(directory)
+            inventory = json.loads(inspector.inventory())
+            self.assertEqual(
+                {item["path"] for item in inventory["sources"]},
+                {f"raw/{path}" for path in files},
+            )
+            mdx = json.loads(inspector.read(path="guide/index.mdx"))
+            self.assertIn("Visible body", mdx["content"])
+            search = json.loads(inspector.search(query="navigation", pattern="docs.json"))
+            self.assertEqual(search["matches"][0]["path"], "raw/docs.json")
+
+    def test_v3_requires_canonical_revision_evidence(self):
+        snapshot, _ = make_snapshot([{"index.mdx": b"# Docs\n"}], version=3)
+        with self.assertRaisesRegex(ValueError, "source_revision"):
+            source_snapshot.validate_snapshot(snapshot)
+
+        snapshot["source_revision"] = {
+            "origin": "git_archive",
+            "revision": "",
+        }
+        with self.assertRaisesRegex(ValueError, "revision"):
+            source_snapshot.validate_snapshot(snapshot)
+
     def test_default_part_envelope_accepts_200_mib_source_transport(self):
         file_size = 200 * 1024 * 1024
         bundle_size = file_size + 1024 * 1024

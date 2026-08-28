@@ -149,6 +149,40 @@ describe("materializeCapabilityInputs", () => {
     expect(posts.find((post) => post.path === "/sources/commit")?.timeoutMs).toBe(900_000);
   });
 
+  it("forwards Source Snapshot v3 revision evidence to the box", async () => {
+    const snapshot = {
+      version: 3 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 3,
+      file_count: 1,
+      parts: [{
+        part_id: "part-000001",
+        sha256: "a".repeat(64),
+        bundle_size_bytes: 10,
+        unpacked_size_bytes: 3,
+        file_count: 1,
+        files: [{ path: "website/a.mdx", size_bytes: 3, sha256: "1".repeat(64) }],
+      }],
+      source_revision: {
+        origin: "git_archive",
+        revision: "0123456789abcdef0123456789abcdef01234567",
+      },
+    };
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-v3" },
+      parts: { "part-000001": { bundle_base64: "UDI=", input_revision: "manifest-v3" } },
+      missingParts: ["part-000001"],
+    });
+
+    await materializeCapabilityInputs({ client, backend, runId: "r3" });
+
+    const begin = posts.find((post) => post.path === "/sources/begin");
+    expect(begin?.body).toMatchObject({
+      input_revision: "manifest-v3",
+      snapshot: { version: 3, source_revision: snapshot.source_revision },
+    });
+  });
+
   it("Source Snapshot v2 rejects a part from another revision before upload", async () => {
     const snapshot = {
       version: 2 as const,

@@ -504,11 +504,16 @@ export interface CapabilitySourceSnapshotPart {
  * accepting an install, while each compressed part is verified separately.
  */
 export interface CapabilitySourceSnapshot {
-  version: 2;
+  version: 2 | 3;
   manifest_sha256: string;
   total_bytes: number;
   file_count: number;
   parts: CapabilitySourceSnapshotPart[];
+  /** v3 pins external repository provenance without interpreting its format. */
+  source_revision?: {
+    origin: string;
+    revision: string;
+  };
 }
 
 /**
@@ -548,7 +553,7 @@ export interface CapabilityLlmConfig {
 export interface CapabilityFetchInputResponse {
   bundle_base64?: string;
   bundle_sha256?: string;
-  /** Present instead of bundle_base64 for resumable Source Snapshot v2 delivery. */
+  /** Present instead of bundle_base64 for resumable Source Snapshot v2/v3 delivery. */
   source_snapshot?: CapabilitySourceSnapshot;
   /** Immutable consumer input revision represented by the source bundle. */
   input_revision?: string;

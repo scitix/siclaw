@@ -28,7 +28,7 @@
     "total_sources": 19,
     "cited": 6,
     "excluded": 2,
-    "auto_attached": 9,
+    "auto_attached": 10,
     "auto_attached_sample": [
       {
         "asset": "assets/hero.png",
@@ -37,6 +37,10 @@
       {
         "asset": "assets/inherited.png",
         "via": "excluded-doc.md"
+      },
+      {
+        "asset": "assets/orphan.png",
+        "via": "<source-tree>"
       },
       {
         "asset": "assets/q.png",
@@ -74,8 +78,7 @@
     "office_renders": 0,
     "office_renders_sample": [],
     "unaccounted": [
-      "archive.md",
-      "assets/orphan.png"
+      "archive.md"
     ],
     "dangling_citations": [],
     "noop_exclusions": [],
