@@ -1951,3 +1951,11 @@ describe("resolveDelegation (worker autonomy — readOnly is explicit opt-in)", 
     expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "api")?.readOnly).toBe(true);
   });
 });
+
+describe("http-server — Skill handler wiring", () => {
+  it("does not disable empty-bundle preservation on the K8s/hot-reload path", () => {
+    const src = fs.readFileSync(path.resolve(__dirname, "http-server.ts"), "utf8");
+    expect(src).toContain("createSkillsHandler");
+    expect(src).not.toContain("preserveExistingOnEmpty");
+  });
+});

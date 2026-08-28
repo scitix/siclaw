@@ -468,6 +468,7 @@ describe("config.getSkillBundle", () => {
     const result = await getHandler("config.getSkillBundle")({ skill_ids: [] }, "a1");
     expect(result.skills).toEqual([]);
     expect(result.version).toBeDefined();
+    expect(result.skillsAuthoritative).toBe(true);
   });
 
   it("uses approved version query in production mode", async () => {

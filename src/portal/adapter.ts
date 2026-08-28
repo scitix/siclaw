@@ -2384,7 +2384,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const skillIds = params.skill_ids ?? [];
     const isProduction = params.is_production ?? true;
     if (skillIds.length === 0) {
-      return { version: new Date().toISOString(), skills: [] };
+      return { version: new Date().toISOString(), skills: [], skillsAuthoritative: true };
     }
     const db = getDb();
     let rows: any[];
@@ -2411,7 +2411,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       rows = result;
     }
     const skills = rows.map(skillBundleEntry);
-    return { version: new Date().toISOString(), skills };
+    return { version: new Date().toISOString(), skills, skillsAuthoritative: true };
   });
 
   handlers.set("config.getKnowledgeBundle", async (params) => {

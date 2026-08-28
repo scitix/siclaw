@@ -21,6 +21,7 @@ import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
 import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { resolveSkillDirectories } from "../core/skill-directories.js";
+import { syncResource } from "./resource-sync.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -605,6 +606,27 @@ describe("skillsHandler", () => {
     warnSpy.mockRestore();
   });
 
+  it("clears resolved/ when an authoritative empty bundle arrives", async () => {
+    await skillsHandler.materialize({
+      version: "v1",
+      skills: [
+        { dirName: "skill-a", scope: "global" as const, specs: "---\nname: a\n---\n", scripts: [] },
+        { dirName: "skill-b", scope: "global" as const, specs: "---\nname: b\n---\n", scripts: [] },
+      ],
+    });
+    expect(resolvedExists("skill-a")).toBe(true);
+    expect(resolvedExists("skill-b")).toBe(true);
+
+    const count = await skillsHandler.materialize({
+      version: "v2",
+      skillsAuthoritative: true,
+      skills: [],
+    });
+    expect(count).toBe(0);
+    expect(resolvedExists("skill-a")).toBe(false);
+    expect(resolvedExists("skill-b")).toBe(false);
+  });
+
   // ── 6. multiple skills, different names ───────────────────────────
   it("materializes multiple skills with different dirNames", async () => {
     const payload = {
@@ -903,8 +925,8 @@ describe("createSkillsHandler scoped materialization", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-skills-handler-"));
     const aDir = path.join(root, "a");
     const bDir = path.join(root, "b");
-    const a = createSkillsHandler({ skillsDir: aDir, preserveExistingOnEmpty: false });
-    const b = createSkillsHandler({ skillsDir: bDir, preserveExistingOnEmpty: false });
+    const a = createSkillsHandler({ skillsDir: aDir });
+    const b = createSkillsHandler({ skillsDir: bDir });
     const skill = (dirName: string) => ({
       version: "1",
       skills: [{ dirName, scope: "global" as const, specs: `# ${dirName}`, scripts: [] }],
@@ -913,11 +935,55 @@ describe("createSkillsHandler scoped materialization", () => {
     try {
       await a.materialize(skill("alpha"));
       await b.materialize(skill("beta"));
-      await b.materialize({ version: "2", skills: [] });
+      await b.materialize({ version: "2", skillsAuthoritative: true, skills: [] });
 
       expect(fs.readFileSync(path.join(aDir, "resolved", "alpha", "SKILL.md"), "utf8")).toBe("# alpha");
       expect(fs.existsSync(path.join(bDir, "resolved", "beta"))).toBe(false);
     } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the production constructor: unmarked empty keeps, authoritative empty clears, fetch failure skips materialize", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "prod-skills-handler-"));
+    const handler = createSkillsHandler({ skillsDir: root });
+    const existing = {
+      version: "1",
+      skills: [{ dirName: "keep-me", scope: "global" as const, specs: "# keep-me", scripts: [] }],
+    };
+
+    try {
+      await handler.materialize(existing);
+      expect(fs.existsSync(path.join(root, "resolved", "keep-me"))).toBe(true);
+
+      const preserved = await handler.materialize({ version: "2", skills: [] });
+      expect(preserved).toBe(1);
+      expect(fs.existsSync(path.join(root, "resolved", "keep-me"))).toBe(true);
+
+      const cleared = await handler.materialize({
+        version: "3",
+        skillsAuthoritative: true,
+        skills: [],
+      });
+      expect(cleared).toBe(0);
+      expect(fs.existsSync(path.join(root, "resolved", "keep-me"))).toBe(false);
+
+      await handler.materialize(existing);
+      const failingClient: GatewaySyncClientLike = {
+        request: async () => {
+          throw new Error("bundle fetch failed");
+        },
+      };
+      vi.useFakeTimers();
+      const failed = syncResource("skills", failingClient, handler).catch((err) => err);
+      await vi.runAllTimersAsync();
+      const result = await failed;
+      vi.useRealTimers();
+      expect(result).toBeInstanceOf(Error);
+      expect((result as Error).message).toContain("bundle fetch failed");
+      expect(fs.existsSync(path.join(root, "resolved", "keep-me"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

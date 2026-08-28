@@ -361,5 +361,6 @@ describe("LocalSpawner — invariant §1: never calls skillsHandler.materialize"
     // Defense-in-depth: the process-global singleton must not be imported.
     expect(src).not.toMatch(/\bskillsHandler\b[^,}]*from\s+["'][^"']*sync-handlers/);
     expect(src).toContain("createSkillsHandler");
+    expect(src).not.toContain("preserveExistingOnEmpty");
   });
 });
