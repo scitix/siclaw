@@ -105,6 +105,7 @@ import { sessionRegistry } from "./session-registry.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 import { pendingUserRows } from "./pending-user-rows.js";
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
+import { summarizeDispatchError } from "../shared/dispatch-observability.js";
 
 function stablePayloadDigest(value: unknown): string {
   const canonicalize = (input: unknown): unknown => {
@@ -918,6 +919,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // (registered in startRuntime), not from per-request params — so every
         // entry point lands the same mode for the same agent.
         const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+        const selectedBoxId = handle.boxId ?? "unknown";
+        console.log(`[runtime] chat.send selected agentId=${agentId} sessionId=${sessionId} turnId=${turnId} boxId=${selectedBoxId}`);
         // Which box this turn went to. Placement reads it back as a hint while the turn
         // runs; it is dropped on release, so it can never become a stale binding.
         sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
@@ -926,8 +929,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
         let ackTraceId: string | undefined;
+        const promptStartedAt = Date.now();
         try {
           promptResult = await client.prompt(promptOpts);
+          console.log(`[runtime] AgentBox prompt result agentId=${agentId} sessionId=${sessionId} turnId=${turnId} boxId=${selectedBoxId} status=200 ok=true durationMs=${Date.now() - promptStartedAt} traceIdPresent=${Boolean(promptResult.traceId)}`);
           // The ack's trace id is gated ONCE and every consumer of it below — the
           // delegated-turn ledger, the prompt-row bind, the consume's row stamp —
           // uses the gated value: stamping rows with a malformed id one boundary
@@ -971,6 +976,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
           if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
         } catch (err) {
+          const summary = summarizeDispatchError(err);
+          const resultLog = summary.status === 409 || summary.message.includes("Session is already running")
+            ? console.warn
+            : console.error;
+          resultLog(`[runtime] AgentBox prompt result agentId=${agentId} sessionId=${sessionId} turnId=${turnId} boxId=${selectedBoxId} status=${summary.status ?? 0} ok=false code=${summary.code} retriable=${summary.retriable} durationMs=${Date.now() - promptStartedAt} error=${JSON.stringify(summary.message)}`);
           // Concurrent send: agentbox returns 409 "Session is already
           // running. Use the steer endpoint to add input to the active
           // prompt." when the user double-taps send before the previous
@@ -1105,11 +1115,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // stream_error so the frontend renders an inline bubble instead of
         // hanging on the spawning state forever.
         if (!turnAbort.signal.aborted) {
-          console.error(`[runtime] chat.send background failure for session=${sessionId}:`, err);
-          const detail = wrapError(err, {
-            code: ErrorCodes.INTERNAL,
-            retriable: true,
-          });
+          const detail = summarizeDispatchError(err);
+          console.error(`[runtime] chat.send background failure agentId=${agentId} sessionId=${sessionId} turnId=${turnId} status=${detail.status ?? 0} code=${detail.code} retriable=${detail.retriable} error=${JSON.stringify(detail.message)}`);
           context.sendEvent("chat.event", {
             sessionId,
             turnId,

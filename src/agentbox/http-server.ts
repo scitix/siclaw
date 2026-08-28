@@ -54,6 +54,7 @@ import {
 } from "../core/model-routing.js";
 import { withResolvedModelCompat } from "../core/model-compat.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
+import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -851,10 +852,16 @@ export function createHttpServer(
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
+    const promptStartedAt = Date.now();
     const body = (await parseJsonBody(req)) as PromptRequestBody;
+    const logPromptResponse = (status: number, outcome: string, message?: unknown, sessionId = body.sessionId): void => {
+      const suffix = message === undefined ? "" : ` error=${JSON.stringify(compactDispatchLogMessage(message))}`;
+      console.log(`[agentbox-http] /api/prompt result boxId=${process.env.SICLAW_POD_NAME ?? "unknown"} sessionId=${sessionId ?? "pending"} turnId=${body.turnId ?? "unknown"} status=${status} outcome=${outcome} durationMs=${Date.now() - promptStartedAt}${suffix}`);
+    };
 
     const promptMediaValidation = validatePromptMedia(body.images, body.files);
     if (promptMediaValidation.error) {
+      logPromptResponse(400, "rejected", promptMediaValidation.error);
       sendJson(res, 400, { error: promptMediaValidation.error });
       return;
     }
@@ -863,6 +870,7 @@ export function createHttpServer(
     // Media-only messages are valid; reject only when there is neither text nor
     // usable image/PDF media after validation.
     if (!body.text && !promptMedia) {
+      logPromptResponse(400, "rejected", "Missing 'text' field");
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
@@ -884,6 +892,7 @@ export function createHttpServer(
       // be holding the brain even when _promptDone has already flipped
       // back to true momentarily during synth setup. Both must be clear
       // before a fresh HTTP /prompt can claim brain.prompt().
+      logPromptResponse(409, "busy", "Session is already running", managed.id);
       sendJson(res, 409, {
         error: "Session is already running. Use the steer endpoint to add input to the active prompt.",
         sessionId: managed.id,
@@ -979,6 +988,7 @@ export function createHttpServer(
       // Release the brain.prompt mutex so a follow-up prompt isn't blocked.
       managed._promptInflight = null;
       releasePromptInflight();
+      logPromptResponse(500, "setup_failed", err, managed.id);
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
     };
 
@@ -1196,6 +1206,7 @@ export function createHttpServer(
       // wait forever if isAgentActive/isCompacting/isRetrying were left stale-true by a prior
       // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
       actuallyFinish();
+      logPromptResponse(200, "aborted_before_start", undefined, managed.id);
       sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, aborted: true });
       return;
     }
@@ -1288,6 +1299,7 @@ export function createHttpServer(
       onPromptFinish();
     });
 
+    logPromptResponse(200, "accepted", undefined, managed.id);
     sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, traceId: tracingRecorder.getRootTraceId(managed.id) });
   });
 
