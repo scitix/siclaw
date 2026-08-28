@@ -340,6 +340,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     role VARCHAR(20) NOT NULL,
     content TEXT,
     tool_name VARCHAR(100),
+    toolset VARCHAR(255) DEFAULT NULL,
     tool_input MEDIUMTEXT,
     outcome VARCHAR(16),
     duration_ms INT,
@@ -730,6 +731,9 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "trace_id", "CHAR(32) DEFAULT NULL");
+  // Runtime-resolved invocation source. Historical rows intentionally remain NULL: deriving
+  // this from a tool name would invent lineage that was never recorded at call time.
+  await safeAlterTable(db, "chat_messages", "toolset", "VARCHAR(255) DEFAULT NULL");
   // Conversation order. `created_at` cannot carry it: the column is second-granular (a
   // fractional type would break the SQLite half of this DDL), and the tiebreaker `id` is a
   // UUID — so two messages written in the same second came back in an order decided by

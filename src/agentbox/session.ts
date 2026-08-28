@@ -82,6 +82,7 @@ import {
   type ModelRouteState,
 } from "../core/model-routing.js";
 import type { GatewayClient } from "./gateway-client.js";
+import { extractToolResultId } from "../core/message-utils.js";
 // topic-consolidator import removed — consolidation disabled
 
 /**
@@ -1822,6 +1823,9 @@ export class AgentBoxSessionManager {
         // persist at turn end, conditionally — a reaction with NO tool call is a pure
         // acknowledgement and is dropped (no bubble); see the finally block.
         const turnMessages: any[] = [];
+        // Synthetic turns have no gateway SSE consumer to pair lifecycle events with their
+        // persisted tool-result rows. Retain the invocation label until message_end arrives.
+        const toolsetsByCallId = new Map<string, string>();
         let turnHadTool = false;
         const routePolicy = managed.modelRoutePolicy;
         // Single entry: every synthetic turn runs through the routing runner —
@@ -1866,10 +1870,25 @@ export class AgentBoxSessionManager {
         };
         const handleBrainEvent = (event: any): void => {
           if (!managed._promptDone) managed._eventBuffer.push(event);
+          if (
+            event?.type === "tool_execution_start" || event?.type === "tool_start" ||
+            event?.type === "tool_execution_end" || event?.type === "tool_end"
+          ) {
+            const callId = event.toolCallId ?? event.toolUseID;
+            if (callId != null && typeof event.toolset === "string" && event.toolset.length > 0) {
+              toolsetsByCallId.set(String(callId), event.toolset);
+            }
+          }
           if (event?.type === "tool_execution_start") turnHadTool = true;
           if (event?.type === "message_end" && event.message) {
             if (event.message.role === "toolResult") turnHadTool = true;
-            turnMessages.push(event.message);
+            if (event.message.role === "toolResult" && event.message.toolset == null) {
+              const callId = extractToolResultId(event.message);
+              const toolset = callId ? toolsetsByCallId.get(callId) : undefined;
+              turnMessages.push(toolset ? { ...event.message, toolset } : event.message);
+            } else {
+              turnMessages.push(event.message);
+            }
           }
         };
         const brainUnsub = managed.brain.subscribe((event: any) => {
@@ -2006,6 +2025,7 @@ export class AgentBoxSessionManager {
       role,
       content,
       toolName: message.toolName ?? null,
+      toolset: message.toolset ?? null,
       metadata: isNotification
         ? { kind: "task_notification" }
         : role === "assistant" && modelRouteMetadata
