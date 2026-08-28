@@ -105,7 +105,7 @@ import { sessionRegistry } from "./session-registry.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 import { pendingUserRows } from "./pending-user-rows.js";
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
-import { summarizeDispatchError } from "../shared/dispatch-observability.js";
+import { summarizeDispatchError } from "./dispatch-observability.js";
 
 function stablePayloadDigest(value: unknown): string {
   const canonicalize = (input: unknown): unknown => {
