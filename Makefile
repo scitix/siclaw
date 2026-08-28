@@ -25,10 +25,6 @@ AGENTBOX_IMAGE = $(REGISTRY)/siclaw-agentbox:$(TAG)
 PORTAL_IMAGE   = $(REGISTRY)/siclaw-portal:$(TAG)
 OCR_IMAGE      = $(REGISTRY)/siclaw-ocr:$(TAG)
 KBC_IMAGE      = $(REGISTRY)/siclaw-kbc-box:$(TAG)
-# Transition alias (remove next release): the KB compile box's former name. The
-# push-kbc target double-pushes this same digest so runtimes still pinned to the
-# old name keep resolving during the rename window.
-KBC_LEGACY_IMAGE = $(REGISTRY)/kbc-compile-box:$(TAG)
 
 # ── OCI labels injected into every image ──
 DOCKER_LABELS = \
@@ -108,14 +104,8 @@ push-portal: ## Push portal image
 push-ocr: ## Push OCR backend image
 	docker push $(OCR_IMAGE)
 
-push-kbc: ## Push KB compile-box image siclaw-kbc-box (+ transition legacy alias)
+push-kbc: ## Push KB compile-box image siclaw-kbc-box
 	docker push $(KBC_IMAGE)
-	# Transition double-push (remove next release): republish the SAME digest under
-	# the legacy name kbc-compile-box so a runtime pinned to it during the rename
-	# window still resolves. Drop these two lines once all runtimes ship on the
-	# siclaw-kbc-box name.
-	docker tag $(KBC_IMAGE) $(KBC_LEGACY_IMAGE)
-	docker push $(KBC_LEGACY_IMAGE)
 
 # ==================== Test ====================
 ##@ Test
@@ -142,7 +132,6 @@ info: ## Print build variables
 	@echo "PORTAL:      $(PORTAL_IMAGE)"
 	@echo "OCR:         $(OCR_IMAGE)"
 	@echo "KBC:         $(KBC_IMAGE)"
-	@echo "KBC(legacy): $(KBC_LEGACY_IMAGE)"
 
 logs: ## View recent logs (all components)
 	@echo "=== Runtime ===" && \

@@ -15,7 +15,7 @@ Renamed the KB compile box so operators can tell it apart from chat agentboxes a
 - **Image rename**: `kbc-compile-box` → `siclaw-kbc-box` (Makefile build/push targets, helm `siclaw.compileBoxImage` derivation, Dockerfile/README/docs). `agentbox.compileBoxImage` explicit-override semantics are unchanged.
 - **Pod-name prefix**: compile boxes now spawn as `kbc-box-<id>` instead of `agentbox-<id>`, declared on the BoxProfile (`podNamePrefix`) for the `kb-compile` / `kb-compile-codex` profiles. Derived resources (cert Secret, hostname) follow the prefix. Chat agentboxes and the read-only `kb-test` box keep the `agentbox-` prefix.
 - **Upgrade behavior**: on the first compile spawn after upgrade, the spawner reaps any pod left under the old `agentbox-<id>` name for that agent (guarded to compile boxes only — a chat box under the same name is never touched), so the old and new pods do not coexist.
-- **Transition double-push**: `make push-kbc` republishes the same image digest under the legacy name `kbc-compile-box` for one release cycle so runtimes still pinned to the old name keep resolving. Remove the legacy tag/push next release.
+- **Legacy alias removed**: the one-release compatibility window has ended, so `make push-kbc` now publishes only `siclaw-kbc-box`. Runtimes and deployment overrides must no longer reference `kbc-compile-box`.
 - **DevOps action required**: the internal registry replication rule must gain an entry for `siclaw-kbc-box` (the old `kbc-compile-box` was not in the rule and had to be pushed manually). Until the rule is added, push `siclaw-kbc-box` to the production registry manually.
 
 ### Added
