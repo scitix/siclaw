@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { setColumnDefault } from "./migrate-compat.js";
+import { safeAlterTable, setColumnDefault } from "./migrate-compat.js";
 import type { Db } from "../gateway/db.js";
 
 /**
@@ -72,5 +72,26 @@ describe("setColumnDefault", () => {
     } as unknown as Db;
     await setColumnDefault(db, "model_entries", "max_tokens", "INT NOT NULL DEFAULT 16384", "16384");
     expect(queries).toEqual([]);
+  });
+});
+
+describe("safeAlterTable", () => {
+  it("adds the nullable toolset column on an existing MySQL chat_messages table", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const db = {
+      driver: "mysql",
+      query: async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params });
+        if (sql.includes("information_schema.COLUMNS")) return [[], undefined];
+        return [[], undefined];
+      },
+    } as unknown as Db;
+
+    await expect(safeAlterTable(db, "chat_messages", "toolset", "VARCHAR(255) DEFAULT NULL"))
+      .resolves.toBe(true);
+    expect(queries).toEqual([
+      expect.objectContaining({ params: ["chat_messages", "toolset"] }),
+      { sql: "ALTER TABLE `chat_messages` ADD COLUMN `toolset` VARCHAR(255) DEFAULT NULL", params: undefined },
+    ]);
   });
 });

@@ -934,9 +934,9 @@ describe("consumeAgentSse — tool execution", () => {
     // the first-completed result into the first-STARTED row — the audit/live
     // card then showed one command with another call's output.
     const events = [
-      { type: "tool_execution_start", toolCallId: "c1", toolName: "navix", args: { cmd: "nodes" } },
-      { type: "tool_execution_start", toolCallId: "c2", toolName: "navix", args: { cmd: "workloads" } },
-      { type: "tool_execution_start", toolCallId: "c3", toolName: "navix", args: { cmd: "diagnoses" } },
+      { type: "tool_execution_start", toolCallId: "c1", toolName: "navix", toolset: "mcp:cluster-a", args: { cmd: "nodes" } },
+      { type: "tool_execution_start", toolCallId: "c2", toolName: "navix", toolset: "mcp:cluster-b", args: { cmd: "workloads" } },
+      { type: "tool_execution_start", toolCallId: "c3", toolName: "navix", toolset: "mcp:cluster-c", args: { cmd: "diagnoses" } },
       // Completion order ≠ start order.
       { type: "tool_execution_end", toolCallId: "c3", toolName: "navix",
         result: { content: [{ type: "text", text: "diagnoses output" }] } },
@@ -958,13 +958,26 @@ describe("consumeAgentSse — tool execution", () => {
     const byRow = Object.fromEntries(updateCalls.map((u) => [u.messageId, u]));
     expect(byRow["msg-1"].toolInput).toContain("nodes");
     expect(byRow["msg-1"].content).toBe("nodes output");
+    expect(byRow["msg-1"].toolset).toBe("mcp:cluster-a");
     expect(byRow["msg-2"].toolInput).toContain("workloads");
     expect(byRow["msg-2"].content).toBe("workloads output");
+    expect(byRow["msg-2"].toolset).toBe("mcp:cluster-b");
     expect(byRow["msg-3"].toolInput).toContain("diagnoses");
     expect(byRow["msg-3"].content).toBe("diagnoses output");
+    expect(byRow["msg-3"].toolset).toBe("mcp:cluster-c");
     // The relayed live event must carry the row its result was written to, so the
     // frontend (which prefers dbMessageId) attaches it to the right card.
     expect(relayedEndRowIds).toEqual(["msg-3", "msg-1", "msg-2"]);
+  });
+
+  it("does not invent a toolset when the runtime event is untagged", async () => {
+    const events = [
+      { type: "tool_execution_start", toolCallId: "x", toolName: "unknown_tool", args: {} },
+      { type: "tool_execution_end", toolCallId: "x", toolName: "unknown_tool", result: { content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(appendCalls.find((row) => row.role === "tool")?.toolset).toBeNull();
+    expect(updateCalls[0].toolset).toBeNull();
   });
 });
 

@@ -1294,7 +1294,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     const body = await parseBody<{
       session_id: string; role: string; content: string;
-      tool_name?: string; tool_input?: string; metadata?: any;
+      tool_name?: string; toolset?: string | null; tool_input?: string; metadata?: any;
       outcome?: string; duration_ms?: number;
       from_agent_id?: string | null; parent_session_id?: string | null;
       delegation_id?: string | null; target_agent_id?: string | null;
@@ -1302,10 +1302,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const id = crypto.randomUUID();
     const db = getDb();
     await db.query(
-      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, toolset, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, body.session_id, body.role, body.content,
-       body.tool_name || null, body.tool_input || null,
+       body.tool_name || null, body.toolset ?? null, body.tool_input || null,
        jsonParam(body.metadata),
        body.outcome || null, body.duration_ms ?? null,
        body.from_agent_id ?? null, body.parent_session_id ?? null,
@@ -2813,10 +2813,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     // where a message that was never processed belongs.
     const seq = params.defer_sequence === true ? null : await nextMessageSeq(String(params.session_id));
     await db.query(
-      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id, trace_id, seq)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, toolset, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id, trace_id, seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, params.session_id, params.role, params.content,
-       params.tool_name || null, params.tool_input || null,
+       params.tool_name || null, params.toolset ?? null, params.tool_input || null,
        jsonParam(params.metadata),
        params.outcome || null, params.duration_ms ?? null,
        params.from_agent_id ?? null, params.parent_session_id ?? null,
@@ -2890,12 +2890,13 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     await db.query(
       `UPDATE chat_messages
-       SET content = ?, tool_name = ?, tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?,
+       SET content = ?, tool_name = ?, toolset = COALESCE(?, toolset), tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?,
            delegation_id = COALESCE(?, delegation_id)
        WHERE id = ? AND session_id = ?`,
       [
         params.content ?? "",
         params.tool_name || null,
+        params.toolset ?? null,
         params.tool_input || null,
         jsonParam(params.metadata),
         params.outcome || null,
@@ -2946,7 +2947,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     sqlParams.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms,
+      `SELECT id, session_id, role, content, tool_name, toolset, tool_input, metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, seq DESC, id DESC LIMIT ?`,
       sqlParams,

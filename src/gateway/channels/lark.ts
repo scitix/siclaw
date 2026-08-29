@@ -3084,14 +3084,15 @@ export async function collectChannelResponse(
   const persist = options.persist;
   const redaction = persist ? buildRedactionConfigForModelConfig(persist.modelConfig) : null;
   const redact = (s: string): string => (redaction ? redactText(s, redaction) : s);
-  // FIFO per-tool queues to pair start↔end (same approach as sse-consumer's
-  // pendingTool* maps). Caveat inherited from there: multiple *concurrent*
-  // same-name calls finishing out of order can mispair, skewing that row's
-  // durationMs. Only affects the audit metric, never the reply; acceptable.
+  // Invocation-id queues pair parallel start↔end events. Older runtimes without
+  // toolCallId fall back to per-name FIFO for backward compatibility.
   const toolInputs = new Map<string, string[]>();
   const toolStarts = new Map<string, number[]>();
+  const toolsets = new Map<string, Array<string | undefined>>();
   const pushQ = <T,>(m: Map<string, T[]>, k: string, v: T): void => { const a = m.get(k) ?? []; a.push(v); m.set(k, a); };
   const shiftQ = <T,>(m: Map<string, T[]>, k: string): T | undefined => m.get(k)?.shift();
+  const toolKey = (ev: Record<string, any>, name: string): string =>
+    ev.toolCallId != null ? `id:${String(ev.toolCallId)}` : `name:${name}`;
   const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<string | null> => {
     try { return await appendMessage({ ...msg, traceId: persist?.traceId ?? msg.traceId }); }
     catch (err) {
@@ -3146,8 +3147,10 @@ export async function collectChannelResponse(
       // Capture tool input + start time for the matching tool_execution_end.
       if (persist && (ev.type === "tool_execution_start" || ev.type === "tool_start")) {
         const name = (ev.toolName as string) || (ev.name as string) || "tool";
-        pushQ(toolInputs, name, ev.args ? JSON.stringify(ev.args) : "");
-        pushQ(toolStarts, name, Date.now());
+        const key = toolKey(ev, name);
+        pushQ(toolInputs, key, ev.args ? JSON.stringify(ev.args) : "");
+        pushQ(toolStarts, key, Date.now());
+        pushQ(toolsets, key, typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
@@ -3160,13 +3163,17 @@ export async function collectChannelResponse(
           let outcome: "success" | "error" | "blocked" = "success";
           if (ev.result?.details?.blocked) outcome = "blocked";
           else if (ev.result?.details?.error) outcome = "error";
-          const input = shiftQ(toolInputs, name) || "";
-          const startedAt = shiftQ(toolStarts, name);
+          const key = toolKey(ev, name);
+          const input = shiftQ(toolInputs, key) || "";
+          const startedAt = shiftQ(toolStarts, key);
+          const toolset = shiftQ(toolsets, key) ??
+            (typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
           await persistRow({
             sessionId,
             role: "tool",
             content: redact(resultText),
             toolName: name,
+            toolset: toolset ?? null,
             toolInput: input ? redact(input) : null,
             outcome,
             durationMs: startedAt != null ? Date.now() - startedAt : null,

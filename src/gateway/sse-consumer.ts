@@ -323,6 +323,8 @@ function shiftPending<T>(map: Map<string, T[]>, key: string): T | undefined {
  *  (and the abort finalizer) needs to complete the row. */
 interface PendingToolCall {
   toolName: string;
+  /** Toolset captured at start; stable even when parallel calls end out of order. */
+  toolset?: string;
   /** Raw JSON of the call args (unredacted — redacted at write time). */
   input: string;
   startMs: number;
@@ -622,7 +624,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       }
 
       // ── DB persistence: tool_execution_end ──────────
-      if (eventType === "tool_execution_end") {
+      if (eventType === "tool_execution_end" || eventType === "tool_end") {
         const toolResult = evt.result as {
           content?: Array<{ type: string; text?: string }>;
           details?: Record<string, unknown>;
@@ -639,6 +641,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         else if (toolResult?.details?.error) outcome = "error";
 
         const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
+        const eventToolset = typeof evt.toolset === "string" && evt.toolset.length > 0
+          ? evt.toolset
+          : undefined;
+        const toolset = pendingCall?.toolset ?? eventToolset;
+        if (toolset) evt.toolset = toolset;
         const durationMs = pendingCall ? Date.now() - pendingCall.startMs : undefined;
         const preThinkingMs = pendingCall?.preThinkingMs;
         // Surface duration + pre-thinking on the live event for frontend.
@@ -668,6 +675,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             sessionId,
             content: redactText(text, redactionConfig),
             toolName,
+            toolset: toolset ?? null,
             toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,
             outcome,
             durationMs: durationMs ?? null,
@@ -776,6 +784,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const preThinkingMs = nonNegative(nowAtStart - lastBoundaryTime);
         const pendingCall: PendingToolCall = {
           toolName: startToolName,
+          ...(typeof evt.toolset === "string" && evt.toolset.length > 0 ? { toolset: evt.toolset } : {}),
           input: rawToolInput,
           startMs: nowAtStart,
         };
@@ -807,6 +816,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             role: "tool",
             content: "",
             toolName: startToolName,
+            toolset: pendingCall.toolset ?? null,
             toolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
             outcome: null,
             durationMs: null,
@@ -1063,6 +1073,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             sessionId,
             content: "",
             toolName: pendingCall.toolName,
+            toolset: pendingCall.toolset ?? null,
             toolInput: pendingCall.input ? redactText(pendingCall.input, redactionConfig) : null,
             outcome: null,
             metadata: stoppedMeta,

@@ -26,6 +26,8 @@ export interface AppendMessageInput {
   role: "user" | "assistant" | "tool";
   content: string;
   toolName?: string | null;
+  /** Runtime-resolved invocation source (registry category, filesystem, or mcp:<server>). */
+  toolset?: string | null;
   toolInput?: string | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
@@ -51,6 +53,7 @@ export interface UpdateMessageInput {
   sessionId: string;
   content: string;
   toolName?: string | null;
+  toolset?: string | null;
   toolInput?: string | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
@@ -74,6 +77,7 @@ export interface StoredMessage {
   role: string;
   content: string;
   toolName: string | null;
+  toolset: string | null;
   toolInput: string | null;
   metadata: Record<string, unknown> | null;
   outcome: string | null;
@@ -166,6 +170,7 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
     role: msg.role,
     content,
     tool_name: msg.toolName ?? null,
+    toolset: msg.toolset ?? null,
     tool_input: msg.toolInput ?? null,
     metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
     outcome: msg.outcome ?? null,
@@ -321,6 +326,7 @@ export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
     session_id: msg.sessionId,
     content: msg.content,
     tool_name: msg.toolName ?? null,
+    toolset: msg.toolset ?? null,
     tool_input: msg.toolInput ?? null,
     metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
     outcome: msg.outcome ?? null,
@@ -395,6 +401,7 @@ export async function getMessages(
     return {
       id: r.id as string, sessionId: r.session_id as string, role: r.role as string,
       content: (r.content as string | null) ?? "", toolName: (r.tool_name as string | null) ?? null,
+      toolset: (r.toolset as string | null) ?? null,
       toolInput: (r.tool_input as string | null) ?? null, metadata,
       outcome: (r.outcome as string | null) ?? null, durationMs: (r.duration_ms as number | null) ?? null,
       fromAgentId: (r.from_agent_id as string | null) ?? null,

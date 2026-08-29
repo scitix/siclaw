@@ -15,6 +15,7 @@ export interface DelegationAppendMessagePayload {
   role: "user" | "assistant" | "tool";
   content: string;
   toolName?: string | null;
+  toolset?: string | null;
   toolInput?: string | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
@@ -32,6 +33,7 @@ export interface DelegationUpdateMessagePayload {
   sessionId: string;
   content: string;
   toolName?: string | null;
+  toolset?: string | null;
   toolInput?: string | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
