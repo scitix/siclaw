@@ -152,22 +152,13 @@ def code_component(source: str) -> str:
 
 
 def is_media_asset(rel: str) -> bool:
-    """A raw source is a media ASSET — a document attachment, auto-accountable in
-    coverage v2 — when some path SEGMENT is `assets` (or the legacy `*.assets`
-    export form) AND its extension is a known image type (case-insensitive).
+    """Whether a Raw path is an image attachment.
 
-    Deliberately NARROW: sheet placeholders at `assets/sheets/*.md` and every
-    other `.md`/`.json` are content files (their extension is not an image type),
-    so they stay first-class sources that must be cited or excluded. Auto-attaching
-    a sheet placeholder would launder 'the table data was never compiled' into
-    'covered' — the exact fail-open §4.1 forbids."""
-    ext = posixpath.splitext(rel)[1].lower()
-    if ext not in MEDIA_ASSET_EXTS:
-        return False
-    # Segment match is case-INSENSITIVE, matching the control-plane ledger mirror (an
-    # `Assets/` dir counts too); the platform always writes lowercase `assets/`,
-    # so this only matters for hand-authored trees, but the two repos must agree.
-    return has_assets_segment(rel)
+    Repository authors may use ``assets/``, ``media/``, ``images/`` or sibling
+    files. Directory naming is presentation data and must not decide whether a
+    real image remains part of the knowledge source.
+    """
+    return posixpath.splitext(rel)[1].lower() in MEDIA_ASSET_EXTS
 
 
 def has_assets_segment(rel: str) -> bool:
@@ -2188,21 +2179,14 @@ def detect_over_broad_exclusions(workdir: str, exclusions: list[dict]) -> list[d
 
 
 def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> dict:
-    """The ledger (coverage v2): raw inventory − sources[].resource union − exclusions
-    − auto-attached media = unaccounted.
+    """The Raw ledger with repository media treated as retained attachments.
 
-    v2 adds ONE accounting path (monotonic — it can only SHRINK unaccounted, so
-    every v1-green library stays green): a media asset (image under `assets/`,
-    see is_media_asset) embedded in the body of a document that is ITSELF
-    accounted (cited or excluded) is auto-attached to that document and counts as
-    accounted. Media assets are the document's attachments, not first-class
-    sources — so `sources` no longer needs a row per image and the
-    exclusion ledger no longer needs a row per image. Two things deliberately do
-    NOT auto-attach: an ORPHAN asset embedded by no accounted document (upload
-    residue — it stays unaccounted and must be excluded with a reason, so a human
-    still sees it), and `assets/sheets/*.md` placeholders (content files, not
-    media — is_media_asset excludes them, so they remain first-class sources). A
-    directly-cited asset still counts as cited (v1 compatibility)."""
+    Candidate pages cite the documents they learned from. Image files remain
+    immutable, readable evidence in the same Raw tree, whether their relation is
+    expressed by Markdown, MDX components, a product config, or only directory
+    structure. Exact link parsing may enrich the receipt but never decides
+    whether media survives or whether the ledger can close.
+    """
     sources = source_inventory(workdir)
     source_set = set(sources)
     cited: set[str] = set()
@@ -2219,12 +2203,10 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     # glob) — surfaced as a warning so the owner fixes it, but non-blocking (a
     # stale exclusion for an already-removed file shouldn't wedge the gate).
     noop_exclusions = sorted({e["pattern"] for e in exclusions} - hit)
-    # v2 auto-attach. Edges come from the raw tree (each document's body image
-    # links), so both repos compute the SAME accounting from the SAME frozen
-    # source set. `auto` is the NET-NEW set — media assets accounted ONLY via an
-    # embedding accounted document (not already cited/excluded); the subtraction
-    # below is identical either way, but reporting the net-new set keeps cited /
-    # excluded / auto_attached a disjoint, auditable decomposition of accounted.
+    # A parsed link supplies a useful `via` receipt when available. Every other
+    # retained media file uses the repository tree itself as its owner. This is
+    # intentionally monotonic and format-neutral: a new MDX syntax cannot turn
+    # a real Raw asset into deletion/exclusion residue.
     # An Office original and its pre-rendered sibling are one source in two
     # forms: accounting either accounts both. Reported as its own bucket for the
     # same reason auto-attach is — an accounting path nobody can see is a
@@ -2249,12 +2231,18 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     media_assets = {s for s in source_set if is_media_asset(s)}
     accounted_docs = cited | excluded | derived
     edges = asset_attribution_edges(workdir, sources)
-    auto_edges = sorted(
+    linked_auto_edges = sorted(
         (asset, doc)
         for doc, assets in edges.items() if doc in accounted_docs
         for asset in assets
         if asset in media_assets and asset not in cited and asset not in excluded
     )
+    linked_auto = {asset for asset, _ in linked_auto_edges}
+    tree_auto_edges = sorted(
+        (asset, "<source-tree>")
+        for asset in media_assets - cited - excluded - linked_auto
+    )
+    auto_edges = sorted(linked_auto_edges + tree_auto_edges)
     auto = {asset for asset, _ in auto_edges}
     accounted = cited | excluded | auto | derived
     unaccounted = sorted(source_set - accounted)

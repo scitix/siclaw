@@ -1,4 +1,4 @@
-"""Resumable, verified Source Snapshot v2 installation for the compile box.
+"""Resumable, verified Source Snapshot v2/v3 installation for the compile box.
 
 Each part is independently staged and survives a container restart. Only a
 complete snapshot is assembled and atomically swapped into ``workdir/raw``;
@@ -95,9 +95,23 @@ def canonical_file_manifest(files: list[dict]) -> bytes:
     return payload.encode("utf-8")
 
 
+def _validate_source_revision(value: object) -> dict:
+    """Validate v3 provenance without interpreting a documentation product."""
+    if not isinstance(value, dict):
+        raise ValueError("source snapshot v3 must declare source_revision")
+    origin = str(value.get("origin") or "").strip()
+    revision = str(value.get("revision") or "").strip()
+    if not origin or len(origin) > 64:
+        raise ValueError("source_revision origin must be between 1 and 64 characters")
+    if not revision or len(revision) > 256:
+        raise ValueError("source_revision revision must be between 1 and 256 characters")
+    return {"origin": origin, "revision": revision}
+
+
 def validate_snapshot(snapshot: object) -> dict:
-    if not isinstance(snapshot, dict) or snapshot.get("version") != 2:
-        raise ValueError("source snapshot version must be 2")
+    if not isinstance(snapshot, dict) or snapshot.get("version") not in {2, 3}:
+        raise ValueError("source snapshot version must be 2 or 3")
+    version = snapshot["version"]
     parts = snapshot.get("parts")
     if not isinstance(parts, list) or not parts:
         raise ValueError("source snapshot must contain at least one part")
@@ -179,13 +193,16 @@ def validate_snapshot(snapshot: object) -> dict:
     actual_manifest_sha = hashlib.sha256(canonical_file_manifest(all_files)).hexdigest()
     if manifest_sha != actual_manifest_sha:
         raise ValueError(f"source snapshot manifest sha256 mismatch: expected {manifest_sha}, got {actual_manifest_sha}")
-    return {
-        "version": 2,
+    normalized = {
+        "version": version,
         "manifest_sha256": manifest_sha,
         "total_bytes": total_bytes,
         "file_count": file_count,
         "parts": normalized_parts,
     }
+    if version == 3:
+        normalized["source_revision"] = _validate_source_revision(snapshot.get("source_revision"))
+    return normalized
 
 
 def _canonical_json(value: object) -> bytes:
@@ -461,6 +478,8 @@ def commit_snapshot(
             "file_count": snapshot["file_count"],
             "total_bytes": snapshot["total_bytes"],
         }
+        if snapshot["version"] == 3:
+            committed["source_revision"] = snapshot["source_revision"]
         _swap_raw(
             wd,
             staging,
@@ -476,4 +495,5 @@ def commit_snapshot(
         "bytes": snapshot["total_bytes"],
         "parts": len(snapshot["parts"]),
         "office_converted": len(office_converted),
+        **({"source_revision": snapshot["source_revision"]} if snapshot["version"] == 3 else {}),
     }

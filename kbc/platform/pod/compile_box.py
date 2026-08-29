@@ -14,10 +14,10 @@ structured signals:
 
 Surface (driven by the runtime):
   POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install the frozen raw bundle → workdir/raw
-  POST /sources/begin      {run_id, input_revision, snapshot} begin/resume a Source Snapshot v2 install
-  POST /sources/state      {run_id, input_revision} report missing Source Snapshot v2 parts
+  POST /sources/begin      {run_id, input_revision, snapshot} begin/resume a Source Snapshot v2/v3 install
+  POST /sources/state      {run_id, input_revision} report missing Source Snapshot v2/v3 parts
   POST /sources/part       {run_id, input_revision, part_id, bundle_base64} verify and persist one part
-  POST /sources/commit     {run_id, input_revision} atomically install a complete v2 snapshot → workdir/raw
+  POST /sources/commit     {run_id, input_revision} atomically install a complete snapshot → workdir/raw
   POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install authoring/candidate/eval/release assets → workdir/
   POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?, llm?, settings?} start the run's persistent conversational session (waits for the first /message); idempotent
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
@@ -4835,26 +4835,11 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
         resuming = _batch_plan_resumable(plan)
-        # Orphan media assets (standalone wiki file nodes no document embeds)
-        # can never satisfy the accounting gate — pre-exclude them with a
-        # machine reason BEFORE planning/resuming so no batch ever carries one.
         inventory_paths = [i["path"] for i in inventory]
-        orphans = selfcheck.orphan_media_assets(run.workdir, inventory_paths)
-        if orphans:
-            added, aerr = selfcheck.append_exclusions(run.workdir, [
-                {"pattern": selfcheck.glob_escape_path(p),
-                 "reason": "auto-excluded: media asset not embedded by any document (sync residue)"}
-                for p in orphans])
-            if aerr:
-                await run.emit({"type": "summary", "text": _loc(run,
-                    f"Machine exclusions could not be written: {aerr}",
-                    f"机器豁免写入失败:{aerr}")})
-            if added:
-                await run.emit({"type": "summary", "text": _loc(run,
-                    f"{len(added)} standalone media asset(s) are embedded by no document — "
-                    f"auto-excluded from accounting (visible in the exclusion ledger).",
-                    f"{len(added)} 个未被任何文档引用的独立媒体资产已自动豁免记账"
-                    f"(豁免清单可见)。")})
+        # Repository media is first-class Raw evidence. Never delete or
+        # auto-exclude it merely because a Markdown parser cannot prove an
+        # embedding edge (MDX components and product configs may carry those
+        # relationships outside ordinary Markdown syntax).
         exclusions_now, _ = selfcheck.load_exclusions(run.workdir)
         plannable = {
             p for p in inventory_paths
@@ -4874,8 +4859,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         else:
             # The pinned plan predates this run; a source deleted from raw/ in
             # between would leave a batch directive pointing at a missing file,
-            # and a source excluded since (orphan assets above included) no
-            # longer needs a batch seat. (Added sources are caught later by the
+            # and a source excluded since no longer needs a batch seat. (Added sources are caught later by the
             # coverage ledger.)
             dropped = batching.prune_missing_sources(plan, plannable)
             if dropped:

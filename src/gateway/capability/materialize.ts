@@ -97,9 +97,9 @@ function hasSourceInput(src: CapabilityFetchInputResponse | null | undefined): b
   return Boolean(src?.bundle_base64 || src?.source_snapshot);
 }
 
-function requireV2Revision(src: CapabilityFetchInputResponse): string {
+function requireSnapshotRevision(src: CapabilityFetchInputResponse): string {
   const revision = typeof src.input_revision === "string" ? src.input_revision.trim() : "";
-  if (!revision) throw new Error("Source Snapshot v2 requires input_revision");
+  if (!revision) throw new Error("Source Snapshot v2/v3 requires input_revision");
   return revision;
 }
 
@@ -111,7 +111,7 @@ async function installSourceSnapshot(opts: {
   snapshot: CapabilitySourceSnapshot;
 }): Promise<void> {
   const { client, backend, runId, src, snapshot } = opts;
-  const revision = requireV2Revision(src);
+  const revision = requireSnapshotRevision(src);
   const begin = await client.postJson<{ missing_parts?: string[] }>("/sources/begin", {
     run_id: runId,
     input_revision: revision,

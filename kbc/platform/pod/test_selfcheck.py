@@ -591,12 +591,16 @@ def test_media_ledger_and_new_lint():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/chart.png")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p1](p1.md)")
-        # body cites the image but sources[].resource omits it → body_source_uncited;
-        # the image itself is unaccounted (media is in the ledger now)
+        # Body cites the image but sources[].resource omits it →
+        # body_source_uncited. The immutable repository image still remains a
+        # retained attachment in the Raw ledger.
         _mk(base, "candidate/p1.md",
             "---\ntype: Topic\ntitle: 监控\nsources:\n  - resource: s/a.md\n---\n利用率 94%。(source: chart.png)")
         report = selfcheck.run_layer1(td)
-        assert report["coverage"]["unaccounted"] == ["s/chart.png"], report["coverage"]
+        assert report["coverage"]["unaccounted"] == [], report["coverage"]
+        assert report["coverage"]["auto_attached_sample"] == [
+            {"asset": "s/chart.png", "via": "<source-tree>"},
+        ], report["coverage"]
         kinds = sorted(v["kind"] for v in report["lint"]["violations"])
         assert kinds == ["body_source_uncited"], kinds
         # (来源: 内部访谈) / locators must NOT false-positive
@@ -2305,19 +2309,17 @@ def test_content_hash_shared_formula():
 
 
 def test_is_media_asset():
-    """Media-asset predicate (coverage v2 §4.1): an assets/ (or legacy *.assets)
-    segment AND an image extension; sheet placeholders and non-images are not."""
+    """Image semantics are independent of repository directory conventions."""
     yes = ["assets/a.png", "guide/assets/b.JPG", "report.assets/c.png",
            "x/assets/y/d.webp", "assets/photo.tiff",
+           "docs/x.png", "guide/media/diagram.svg",
+           "assetsx/y.png", "my.assets.bak/y.png",
            # case-INSENSITIVE segment (locked here, not in the fixture: an
            # uppercase dir is not portable on a case-insensitive filesystem).
            "Assets/e.png", "report.ASSETS/f.png", "guide/AsSeTs/g.png"]
-    no = ["docs/x.png",              # no assets segment
-          "assets/sheets/t.md",      # sheet placeholder = content file
+    no = ["assets/sheets/t.md",      # sheet placeholder = content file
           "assets/data.json",        # json is not an image
-          "assets/notes.pdf",        # pdf is not a media asset
-          "assetsx/y.png",           # segment is not exactly `assets`
-          "my.assets.bak/y.png"]     # segment ends with .bak, not .assets
+          "assets/notes.pdf"]        # pdf is not an image attachment
     for p in yes:
         assert selfcheck.is_media_asset(p), p
     for p in no:
@@ -2325,7 +2327,7 @@ def test_is_media_asset():
     assert ".tiff" in selfcheck.MEDIA_ASSET_EXTS
     assert ".tiff" in selfcheck.MEDIA_SOURCE_EXTS
     assert ".tiff" not in selfcheck.IMAGE_SOURCE_EXTS
-    print("OK  is_media_asset (assets/ + *.assets, case-insensitive seg + image ext; sheet/.json/.pdf excluded)")
+    print("OK  is_media_asset (image semantics independent of producer directory)")
 
 
 def test_document_link_targets():
@@ -2359,8 +2361,8 @@ def test_coverage_v2_auto_attach():
     """Coverage v2 auto-attach semantics, each in isolation."""
     okf_index = "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)\n"
 
-    # A. image embedded by a cited doc → auto; orphan image → unaccounted; a
-    # sheet placeholder is a content file, not media (cited, not auto).
+    # A. linked and standalone repository images are both retained attachments;
+    # a sheet placeholder is a content file, not media (cited, not auto).
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/d.md", "# D\n![x](assets/a.png)\n")
@@ -2370,11 +2372,14 @@ def test_coverage_v2_auto_attach():
         _mk(base, "candidate/p.md",
             "---\ntype: Topic\nsources:\n  - resource: d.md\n  - resource: assets/sheets/t.md\n---\nok")
         cov = selfcheck.run_layer1(td)["coverage"]
-        assert cov["unaccounted"] == ["assets/orphan.png"], cov
-        assert cov["auto_attached"] == 1, cov
-        assert cov["auto_attached_sample"] == [{"asset": "assets/a.png", "via": "d.md"}], cov
+        assert cov["unaccounted"] == [], cov
+        assert cov["auto_attached"] == 2, cov
+        assert cov["auto_attached_sample"] == [
+            {"asset": "assets/a.png", "via": "d.md"},
+            {"asset": "assets/orphan.png", "via": "<source-tree>"},
+        ], cov
         assert not selfcheck.is_media_asset("assets/sheets/t.md")
-        assert not cov["closed"]
+        assert cov["closed"]
 
     # B. v1 compatibility + no double count: a directly-cited asset stays cited,
     # an explicitly-excluded asset stays excluded, and neither shows up as auto.
@@ -2418,7 +2423,7 @@ def test_coverage_v2_auto_attach():
         assert cov["unaccounted"] == ["loose.md"], cov
         assert cov["auto_attached"] == 1, cov
         assert cov["auto_attached_sample"] == [{"asset": "assets/s.png", "via": "cited.md"}], cov
-    print("OK  coverage v2 auto-attach (embed/orphan/sheet, v1 compat, exclusion inherit, shared-any-cited)")
+    print("OK  coverage v2 media retention (linked/standalone/sheet, v1 compat, exclusion inherit)")
 
 
 def test_media_citing_pages_via_attribution_edge():
@@ -2440,8 +2445,7 @@ def test_media_citing_pages_via_attribution_edge():
 
 
 def test_asset_provenance_fixture():
-    """The shared two-repo fixture: edges + coverage v2 must equal expected.json
-    byte-for-byte (control-plane's adoption ledger asserts the SAME expected.json)."""
+    """Local attribution receipts and Raw coverage match the fixture."""
     fx = Path(__file__).resolve().parent / "fixtures" / "asset-provenance"
     expected = json.loads((fx / "expected.json").read_text(encoding="utf-8"))
     edges = selfcheck.asset_attribution_edges(str(fx))
@@ -2451,7 +2455,7 @@ def test_asset_provenance_fixture():
     assert errors == [], errors
     cov = selfcheck.coverage(str(fx), pages, exclusions)
     assert cov == expected["coverage"], cov
-    print("OK  asset-provenance fixture (edges + coverage v2 == expected.json)")
+    print("OK  asset-provenance fixture (local receipts + Raw coverage == expected.json)")
 
 
 def test_office_original_and_its_render_account_together():
@@ -2547,15 +2551,15 @@ def test_deck_images_attach_through_the_render_the_original_paired_in():
         assert cov["auto_attached"] == 2, cov
         assert cov["closed"], cov
 
-        # Still fail-closed: an unread deck orphans its pictures rather than
-        # laundering them into "covered".
+        # Still fail-closed on the unread document itself. Its repository
+        # images remain retained attachments and do not need parser-derived
+        # per-file exclusions.
         cov = selfcheck.coverage(td, {}, [])
         assert cov["unaccounted"] == [
             "1-Roadmap/GPU架构.pptx",
-            "1-Roadmap/GPU架构.pptx.assets/s1.png",
-            "1-Roadmap/GPU架构.pptx.assets/s2.png",
             "1-Roadmap/GPU架构.pptx.md",
         ], cov["unaccounted"]
+        assert cov["auto_attached"] == 2, cov
         assert not cov["closed"]
     print("OK  a deck's images attach through the render its original paired in")
 

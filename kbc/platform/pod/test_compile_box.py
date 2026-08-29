@@ -4064,12 +4064,13 @@ async def test_exclusion_tools_cover_the_full_lifecycle():
     print("✓ exclusion tools: add / correct-reason / remove (incl. legacy pattern) all have a tool path")
 
 
-async def test_batch_orphan_assets_pre_excluded_and_pruned():
-    """2026-07-24 robustness mandate: a standalone media asset no document
-    embeds (a synced wiki file node) must never occupy a batch seat or wedge
-    the accounting gate. Reproduces the live incident: a pinned plan whose
-    batch carries an orphan PNG — plan-time pre-exclusion writes the ledger
-    row and the resume prune drops it from the pending batch."""
+async def test_batch_standalone_media_is_retained():
+    """A repository asset is Raw evidence even without a Markdown edge.
+
+    MDX components and product configs can reference media in syntax the batch
+    layer does not understand, so a pinned plan must keep the asset and must not
+    manufacture an exclusion row.
+    """
     import batching
     import selfcheck
 
@@ -4086,13 +4087,13 @@ async def test_batch_orphan_assets_pre_excluded_and_pruned():
         os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
         os.environ["KBC_BATCH_PLANNER"] = "code"
 
-        # The live shape: a PINNED plan already carries the orphan asset.
+        # A pinned plan carries every repository file, including standalone media.
         inventory = batching.scan_sources(raw)
         plan = batching.build_plan(
             inventory, batching.pack_batches(inventory), planner="code")
         assert any(
             any("orphan.png" in s for s in b["sources"]) for b in plan["batches"]
-        ), plan  # the pinned plan really carries the orphan, like the incident
+        ), plan
         compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
 
         async def fake_drive(run_, directive, label, pdf_page_ranges=None,
@@ -4111,14 +4112,10 @@ async def test_batch_orphan_assets_pre_excluded_and_pruned():
 
         exclusions, errs = selfcheck.load_exclusions(str(wd))
         assert not errs, errs
-        reasons = {e["pattern"]: e["reason"] for e in exclusions}
-        orphan_rows = [p for p in reasons if "orphan.png" in p]
-        assert orphan_rows and "not embedded by any document" in reasons[orphan_rows[0]], exclusions
-        assert not any("linked.png" in p for p in reasons), exclusions
+        assert not [e for e in exclusions if "orphan.png" in e["pattern"]], exclusions
         plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
-        for b in plan["batches"]:
-            assert not any("orphan.png" in s for s in b["sources"]), b
-            assert b["status"] == "done", b
+        assert any(any("orphan.png" in s for s in b["sources"]) for b in plan["batches"]), plan
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
         events = []
         while not run.events.empty():
             events.append(run.events.get_nowait())
@@ -4126,7 +4123,7 @@ async def test_batch_orphan_assets_pre_excluded_and_pruned():
         assert [e for e in events if e["type"] == "turn_done"], events
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
-    print("✓ batch orphan assets: pre-excluded with reason, pruned from pinned plan, train completes")
+    print("✓ batch standalone media: retained in Raw plan without parser-derived exclusion")
 
 
 async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
@@ -6940,7 +6937,7 @@ async def main():
     await test_batch_orchestrator_routing_and_resume()
     await test_exclude_source_tool_owns_the_ledger()
     await test_exclusion_tools_cover_the_full_lifecycle()
-    await test_batch_orphan_assets_pre_excluded_and_pruned()
+    await test_batch_standalone_media_is_retained()
     await test_batch_unaccounted_gets_corrective_then_auto_excluded()
     await test_batch_content_fault_skips_batch_but_stall_interrupts()
     await test_batch_zero_progress_second_run_auto_excludes()
