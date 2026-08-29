@@ -61,3 +61,5 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_emit.py
         working-directory: kbc/tools
+      - name: Build and start the KBC image as its default non-root user
+        run: sh kbc/platform/pod/test_image_permissions.sh

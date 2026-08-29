@@ -38,6 +38,12 @@ COPY platform/pod/*.py /app/
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
 
+# Docker preserves build-context modes for copied files. Normalize the whole
+# application tree so a checkout created under a restrictive umask cannot make
+# the root-owned sources unreadable after the image switches to USER kbc.
+# Keep the tree root-owned and non-writable by the runtime user.
+RUN chmod -R u=rwX,go=rX /app
+
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 # The proxy/Bedrock path rejects the `context_management` request field (HTTP 400).
