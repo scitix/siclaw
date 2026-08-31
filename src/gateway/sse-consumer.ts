@@ -16,6 +16,7 @@ import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
 import { appendKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
+import { redactToolset, ToolsetCapture, type ToolsetEnvelope } from "../shared/toolset-capture.js";
 
 // ── Public types ────────────────────────────────────
 
@@ -323,14 +324,16 @@ function shiftPending<T>(map: Map<string, T[]>, key: string): T | undefined {
  *  (and the abort finalizer) needs to complete the row. */
 interface PendingToolCall {
   toolName: string;
-  /** Toolset captured at start; stable even when parallel calls end out of order. */
-  toolset?: string;
   /** Raw JSON of the call args (unredacted — redacted at write time). */
   input: string;
   startMs: number;
   /** DB row id of the eagerly-persisted "running" placeholder (persist mode only). */
   messageId?: string;
   preThinkingMs?: number;
+  toolCallId?: string;
+  llmRound?: number;
+  /** Redacted JSON envelope shared by every call in one model dispatch. */
+  toolset?: ToolsetEnvelope;
 }
 
 /** Pairing key for a tool_execution_start/end pair: the invocation-unique
@@ -454,6 +457,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // wrong dbMessageId on the relayed event, so the live card cross-attaches
   // too). Events lacking a toolCallId fall back to a per-toolName FIFO queue.
   const pendingToolCalls = new Map<string, PendingToolCall[]>();
+  const toolsetCapture = new ToolsetCapture();
 
   let eventCount = 0;
   const startTime = Date.now();
@@ -509,6 +513,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // undefined would throw and kill the whole SSE stream (STREAM_INTERRUPTED).
       const eventType = (evt.type as string | undefined) ?? "";
       eventCount++;
+      toolsetCapture.observe(evt as Record<string, any>);
 
       if (eventType === "knowledge_sources") {
         pendingKnowledgeSources = (evt as Record<string, unknown>).sources;
@@ -624,7 +629,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       }
 
       // ── DB persistence: tool_execution_end ──────────
-      if (eventType === "tool_execution_end" || eventType === "tool_end") {
+      if (eventType === "tool_execution_end") {
         const toolResult = evt.result as {
           content?: Array<{ type: string; text?: string }>;
           details?: Record<string, unknown>;
@@ -641,11 +646,6 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         else if (toolResult?.details?.error) outcome = "error";
 
         const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
-        const eventToolset = typeof evt.toolset === "string" && evt.toolset.length > 0
-          ? evt.toolset
-          : undefined;
-        const toolset = pendingCall?.toolset ?? eventToolset;
-        if (toolset) evt.toolset = toolset;
         const durationMs = pendingCall ? Date.now() - pendingCall.startMs : undefined;
         const preThinkingMs = pendingCall?.preThinkingMs;
         // Surface duration + pre-thinking on the live event for frontend.
@@ -675,12 +675,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             sessionId,
             content: redactText(text, redactionConfig),
             toolName,
-            toolset: toolset ?? null,
             toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,
             outcome,
             durationMs: durationMs ?? null,
             metadata: metadataWithRoute,
             delegationId,
+            toolCallId: pendingCall?.toolCallId ?? null,
+            llmRound: pendingCall?.llmRound ?? null,
+            toolset: pendingCall?.toolset ?? null,
           };
           if (existingMessageId) {
             await updateMessage({ ...payload, messageId: existingMessageId });
@@ -699,6 +701,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         // Bump the model-input boundary: the model now has the tool result and
         // any subsequent thinking/text/tool-use is computed from this point.
         lastBoundaryTime = Date.now();
+        if (pendingCall?.toolCallId) toolsetCapture.finish(pendingCall.toolCallId);
       }
 
       // ── DB persistence: message_update (accumulate assistant text) ──
@@ -775,6 +778,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const startToolName = (evt.toolName as string) || (evt.name as string) || "tool";
         const args = evt.args as Record<string, unknown> | undefined;
         const rawToolInput = args ? JSON.stringify(args) : "";
+        const capturedTool = toolsetCapture.match(evt as Record<string, any>);
         // Pre-tool thinking: gap between the previous model-input boundary
         // (turn start, or the previous tool_execution_end) and this tool's
         // start. This is the model's "I just got new info, deciding what to
@@ -784,9 +788,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const preThinkingMs = nonNegative(nowAtStart - lastBoundaryTime);
         const pendingCall: PendingToolCall = {
           toolName: startToolName,
-          ...(typeof evt.toolset === "string" && evt.toolset.length > 0 ? { toolset: evt.toolset } : {}),
           input: rawToolInput,
           startMs: nowAtStart,
+          toolCallId: capturedTool?.toolCallId,
+          llmRound: capturedTool?.toolset.llm_round,
+          toolset: capturedTool
+            ? redactToolset(capturedTool.toolset, (value) => redactText(value, redactionConfig))
+            : undefined,
         };
         if (preThinkingMs !== undefined) pendingCall.preThinkingMs = preThinkingMs;
         pushPending(pendingToolCalls, toolCallKey(evt, startToolName), pendingCall);
@@ -816,11 +824,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             role: "tool",
             content: "",
             toolName: startToolName,
-            toolset: pendingCall.toolset ?? null,
             toolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
             outcome: null,
             durationMs: null,
             metadata: startMetadataWithRoute,
+            toolCallId: pendingCall.toolCallId ?? null,
+            llmRound: pendingCall.llmRound ?? null,
+            toolset: pendingCall.toolset ?? null,
           });
           pendingCall.messageId = dbMessageId;
           await incrementMessageCount(sessionId);
@@ -1073,10 +1083,12 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             sessionId,
             content: "",
             toolName: pendingCall.toolName,
-            toolset: pendingCall.toolset ?? null,
             toolInput: pendingCall.input ? redactText(pendingCall.input, redactionConfig) : null,
             outcome: null,
             metadata: stoppedMeta,
+            toolCallId: pendingCall.toolCallId ?? null,
+            llmRound: pendingCall.llmRound ?? null,
+            toolset: pendingCall.toolset ?? null,
           });
         } catch (err) {
           console.warn(`[sse-consumer] ${userId}: failed to finalize aborted tool row ${pendingCall.messageId}:`, err);

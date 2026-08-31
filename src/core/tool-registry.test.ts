@@ -36,20 +36,6 @@ describe("ToolRegistry", () => {
     expect(tools.map((t) => t.name)).toEqual(["a", "b"]);
   });
 
-  it("uses each registry entry category as its invocation toolset", () => {
-    const reg = new ToolRegistry();
-    reg.register(
-      { category: "query", create: () => stubToolDef("lookup") },
-      { category: "workflow", create: () => stubToolDef("delegate") },
-    );
-
-    const tools = reg.resolve({ mode: "web", refs: stubRefs() });
-    expect(tools.map((t) => [t.name, t.toolset])).toEqual([
-      ["lookup", "query"],
-      ["delegate", "workflow"],
-    ]);
-  });
-
   it("mode filter excludes tools not allowed for the session mode", () => {
     const reg = new ToolRegistry();
     reg.register(

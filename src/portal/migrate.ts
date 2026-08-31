@@ -340,8 +340,8 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     role VARCHAR(20) NOT NULL,
     content TEXT,
     tool_name VARCHAR(100),
-    toolset VARCHAR(255) DEFAULT NULL,
     tool_input MEDIUMTEXT,
+    toolset MEDIUMTEXT DEFAULT NULL,
     outcome VARCHAR(16),
     duration_ms INT,
     metadata TEXT,
@@ -731,9 +731,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "trace_id", "CHAR(32) DEFAULT NULL");
-  // Runtime-resolved invocation source. Historical rows intentionally remain NULL: deriving
-  // this from a tool name would invent lineage that was never recorded at call time.
-  await safeAlterTable(db, "chat_messages", "toolset", "VARCHAR(255) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "toolset", "MEDIUMTEXT DEFAULT NULL");
   // Conversation order. `created_at` cannot carry it: the column is second-granular (a
   // fractional type would break the SQLite half of this DDL), and the tiebreaker `id` is a
   // UUID — so two messages written in the same second came back in an order decided by
@@ -751,6 +749,10 @@ export async function runPortalMigrations(): Promise<void> {
   // above only ADDs missing columns; widenColumn MODIFYs the existing type (idempotent, MySQL-only).
   await widenColumn(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await widenColumn(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  // The dispatch envelope includes every raw tool call from one LLM round and can exceed
+  // the legacy semantic label's VARCHAR(255). Existing installs need an explicit MODIFY:
+  // safeAlterTable above only adds a missing column and deliberately does not change types.
+  await widenColumn(db, "chat_messages", "toolset", "MEDIUMTEXT DEFAULT NULL");
 
   // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
   // indexes added later). Safe to run now that all referenced columns exist.

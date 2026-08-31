@@ -60,6 +60,7 @@ import type { SpanContext } from "@opentelemetry/api";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
+import { redactToolset, ToolsetCapture, type ToolsetEnvelope } from "../shared/toolset-capture.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -82,7 +83,6 @@ import {
   type ModelRouteState,
 } from "../core/model-routing.js";
 import type { GatewayClient } from "./gateway-client.js";
-import { extractToolResultId } from "../core/message-utils.js";
 // topic-consolidator import removed — consolidation disabled
 
 /**
@@ -1823,9 +1823,6 @@ export class AgentBoxSessionManager {
         // persist at turn end, conditionally — a reaction with NO tool call is a pure
         // acknowledgement and is dropped (no bubble); see the finally block.
         const turnMessages: any[] = [];
-        // Synthetic turns have no gateway SSE consumer to pair lifecycle events with their
-        // persisted tool-result rows. Retain the invocation label until message_end arrives.
-        const toolsetsByCallId = new Map<string, string>();
         let turnHadTool = false;
         const routePolicy = managed.modelRoutePolicy;
         // Single entry: every synthetic turn runs through the routing runner —
@@ -1870,25 +1867,10 @@ export class AgentBoxSessionManager {
         };
         const handleBrainEvent = (event: any): void => {
           if (!managed._promptDone) managed._eventBuffer.push(event);
-          if (
-            event?.type === "tool_execution_start" || event?.type === "tool_start" ||
-            event?.type === "tool_execution_end" || event?.type === "tool_end"
-          ) {
-            const callId = event.toolCallId ?? event.toolUseID;
-            if (callId != null && typeof event.toolset === "string" && event.toolset.length > 0) {
-              toolsetsByCallId.set(String(callId), event.toolset);
-            }
-          }
           if (event?.type === "tool_execution_start") turnHadTool = true;
           if (event?.type === "message_end" && event.message) {
             if (event.message.role === "toolResult") turnHadTool = true;
-            if (event.message.role === "toolResult" && event.message.toolset == null) {
-              const callId = extractToolResultId(event.message);
-              const toolset = callId ? toolsetsByCallId.get(callId) : undefined;
-              turnMessages.push(toolset ? { ...event.message, toolset } : event.message);
-            } else {
-              turnMessages.push(event.message);
-            }
+            turnMessages.push(event.message);
           }
         };
         const brainUnsub = managed.brain.subscribe((event: any) => {
@@ -2025,7 +2007,6 @@ export class AgentBoxSessionManager {
       role,
       content,
       toolName: message.toolName ?? null,
-      toolset: message.toolset ?? null,
       metadata: isNotification
         ? { kind: "task_notification" }
         : role === "assistant" && modelRouteMetadata
@@ -2419,7 +2400,15 @@ export class AgentBoxSessionManager {
     let finalText = "";
     let toolCalls = 0;
     let status: SpawnSubagentStatus = "done";
-    const pendingTools = new Map<string, { startMs: number; toolName: string; toolset?: string; toolInput?: string }>();
+    const pendingTools = new Map<string, {
+      startMs: number;
+      toolName: string;
+      toolInput?: string;
+      toolCallId?: string;
+      llmRound?: number;
+      toolset?: ToolsetEnvelope;
+    }>();
+    const toolsetCapture = new ToolsetCapture();
     // Ordered steps (assistant reasoning + tool calls) streamed to the parent UI so the
     // card shows the sub-agent's execution live, like a mini main-agent run.
     const liveSteps: SubagentStep[] = [];
@@ -2427,6 +2416,7 @@ export class AgentBoxSessionManager {
       onProgress?.({ status: "running", toolCalls, steps: liveSteps.map((s) => ({ ...s })), activity });
 
     const unsubscribe = child.brain.subscribe((event: any) => {
+      toolsetCapture.observe(event);
       // Feed the recorder FIRST, unconditionally (gated on tracing state), so the child's
       // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
       if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
@@ -2434,11 +2424,16 @@ export class AgentBoxSessionManager {
         toolCalls++;
         const toolName = (event.toolName as string) || (event.name as string) || "tool";
         const id = String(event.toolCallId ?? event.toolUseID ?? `${toolName}-${toolCalls}`);
+        const capturedTool = toolsetCapture.match(event);
         pendingTools.set(id, {
           startMs: Date.now(),
           toolName,
-          ...(typeof event.toolset === "string" && event.toolset.length > 0 ? { toolset: event.toolset } : {}),
           toolInput: event.args ? redactText(JSON.stringify(event.args), redactionConfig) : undefined,
+          toolCallId: capturedTool?.toolCallId,
+          llmRound: capturedTool?.toolset.llm_round,
+          toolset: capturedTool
+            ? redactToolset(capturedTool.toolset, (value) => redactText(value, redactionConfig))
+            : undefined,
         });
         emitProgress(`Running ${toolName}…`);
       }
@@ -2446,6 +2441,7 @@ export class AgentBoxSessionManager {
         const id = String(event.toolCallId ?? event.toolUseID ?? "");
         const pending = pendingTools.get(id);
         pendingTools.delete(id);
+        if (pending?.toolCallId) toolsetCapture.finish(pending.toolCallId);
         const toolName = (event.toolName as string) || (event.name as string) || pending?.toolName || "tool";
         const durationMs = pending ? Date.now() - pending.startMs : null;
         const outcome: "success" | "error" = event.isError ? "error" : "success";
@@ -2458,8 +2454,10 @@ export class AgentBoxSessionManager {
             role: "tool",
             content: resultText,
             toolName,
-            toolset: pending?.toolset ?? (typeof event.toolset === "string" ? event.toolset : null),
             toolInput: pending?.toolInput,
+            toolCallId: pending?.toolCallId,
+            llmRound: pending?.llmRound,
+            toolset: pending?.toolset,
             outcome,
             durationMs,
             fromAgentId: agentId,

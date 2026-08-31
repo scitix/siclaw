@@ -125,8 +125,9 @@ describe("appendMessage", () => {
       role: "user",
       content: "hello",
       tool_name: null,
-      toolset: null,
       tool_input: null,
+      tool_call_id: null,
+      toolset: null,
       metadata: null,
       outcome: null,
       duration_ms: null,
@@ -135,6 +136,7 @@ describe("appendMessage", () => {
       delegation_id: null,
       target_agent_id: null,
       trace_id: null,
+      defer_sequence: undefined,
     });
   });
 
@@ -145,7 +147,6 @@ describe("appendMessage", () => {
       role: "tool",
       content: "result",
       toolName: "kube",
-      toolset: "mcp:kubernetes",
       toolInput: "get pods",
       metadata: { a: 1 },
       outcome: "success",
@@ -158,8 +159,9 @@ describe("appendMessage", () => {
       role: "tool",
       content: "result",
       tool_name: "kube",
-      toolset: "mcp:kubernetes",
       tool_input: "get pods",
+      tool_call_id: null,
+      toolset: null,
       metadata: "{\"a\":1}",
       outcome: "success",
       duration_ms: 42,
@@ -168,6 +170,7 @@ describe("appendMessage", () => {
       delegation_id: null,
       target_agent_id: null,
       trace_id: null,
+      defer_sequence: undefined,
     });
   });
 
@@ -271,7 +274,6 @@ describe("updateMessage", () => {
       sessionId: "sid",
       content: "done",
       toolName: "delegate_to_agent",
-      toolset: "workflow",
       toolInput: "{\"scope\":\"check\"}",
       metadata: { summary: "ok" },
       outcome: "success",
@@ -285,8 +287,9 @@ describe("updateMessage", () => {
         session_id: "sid",
         content: "done",
         tool_name: "delegate_to_agent",
-        toolset: "workflow",
         tool_input: "{\"scope\":\"check\"}",
+        tool_call_id: null,
+        toolset: null,
         metadata: "{\"summary\":\"ok\"}",
         outcome: "success",
         duration_ms: 17,
@@ -358,6 +361,48 @@ describe("getMessages", () => {
     expect(out[0].metadata).toEqual({ foo: "bar" });
     expect(out[0].outcome).toBe("success");
     expect(out[0].durationMs).toBe(5);
+  });
+
+  it("parses the dispatch envelope and ignores retired semantic toolset strings", async () => {
+    const envelope = {
+      version: 1 as const,
+      llm_round: 3,
+      tool_calls: [{ tool_call_id: "c1", position: 0, tool_name: "bash", tool_input: "{}" }],
+    };
+    fake.responses.set("chat.getMessages", {
+      messages: [
+        { id: "legacy", session_id: "sid", role: "tool", content: "", toolset: "query", created_at: "2026-04-16T11:01:00Z" },
+        { id: "current", session_id: "sid", role: "tool", content: "", toolset: JSON.stringify(envelope), metadata: { tool_dispatch: { tool_call_id: "c1" } }, created_at: "2026-04-16T11:00:00Z" },
+      ],
+    });
+    const out = await getMessages("sid");
+    expect(out.find((m) => m.id === "current")?.toolset).toEqual(envelope);
+    expect(out.find((m) => m.id === "current")?.toolCallId).toBe("c1");
+    expect(out.find((m) => m.id === "current")?.llmRound).toBe(3);
+    expect(out.find((m) => m.id === "legacy")?.toolset).toBeNull();
+  });
+
+  it("stores the current invocation id in metadata while keeping the round inside the envelope", async () => {
+    fake.responses.set("chat.appendMessage", { id: "m1" });
+    await appendMessage({
+      sessionId: "sid",
+      role: "tool",
+      content: "",
+      toolCallId: "call-1",
+      llmRound: 8,
+      toolset: {
+        version: 1,
+        llm_round: 8,
+        tool_calls: [{ tool_call_id: "call-1", position: 0, tool_name: "bash", tool_input: "{}" }],
+      },
+      metadata: { existing: true },
+    });
+    const params = fake.calls[0].params;
+    expect(params).not.toHaveProperty("llm_round");
+    expect(JSON.parse(params.metadata as string)).toEqual({
+      existing: true,
+      tool_dispatch: { tool_call_id: "call-1" },
+    });
   });
 
   it("defaults nullish content/tool_name to safe values", async () => {

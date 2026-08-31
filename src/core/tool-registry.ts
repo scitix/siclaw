@@ -27,12 +27,6 @@ export type { SessionMode };
 export type ResolvedToolDefinition = ToolDefinition & {
   /** When true, runtime must obtain explicit user approval before execution. */
   requiresUserApproval?: boolean;
-  /**
-   * Stable invocation classification emitted with tool lifecycle events.
-   * Registry tools use their declarative category; tools created outside the
-   * registry set this at their own source boundary (filesystem / mcp:<server>).
-   */
-  toolset?: string;
 };
 
 // ── one spawned child (design §6) — the INTERNAL per-child contract. ──
@@ -584,7 +578,6 @@ export class ToolRegistry {
     // 2. Instantiate only applicable tools
     const tools = applicable.map((e) => {
       const def = e.create(refs) as ResolvedToolDefinition;
-      def.toolset = e.category;
       if (e.requiresUserApproval) {
         def.requiresUserApproval = true;
       }

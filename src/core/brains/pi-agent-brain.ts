@@ -62,24 +62,7 @@ export class PiAgentBrain implements BrainSession {
    *  firing a fresh (un-aborted) re-prompt when Stop lands during the backoff sleep. */
   private aborted = false;
 
-  constructor(
-    readonly session: AgentSession,
-    private readonly toolsetsByName: ReadonlyMap<string, string> = new Map(),
-  ) {}
-
-  private enrichToolEvent(event: any): any {
-    if (!event || typeof event !== "object" || event.toolset != null) return event;
-    if (
-      event.type !== "tool_execution_start" && event.type !== "tool_start" &&
-      event.type !== "tool_execution_end" && event.type !== "tool_end"
-    ) return event;
-    const toolName = typeof event.toolName === "string"
-      ? event.toolName
-      : typeof event.name === "string" ? event.name : undefined;
-    if (!toolName) return event;
-    const toolset = this.toolsetsByName.get(toolName);
-    return toolset ? { ...event, toolset } : event;
-  }
+  constructor(readonly session: AgentSession) {}
 
   private static readonly MAX_EMPTY_RETRIES = 2;
 
@@ -228,7 +211,7 @@ export class PiAgentBrain implements BrainSession {
   subscribe(listener: (event: any) => void): () => void {
     // Subscribe to both pi-agent events AND our own retry events
     this.extraListeners.add(listener);
-    const unsubSession = this.session.subscribe((event: any) => listener(this.enrichToolEvent(event)));
+    const unsubSession = this.session.subscribe(listener);
     return () => {
       this.extraListeners.delete(listener);
       unsubSession();

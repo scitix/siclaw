@@ -57,23 +57,8 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     const listener = vi.fn();
     const unsub = brain.subscribe(listener);
-    expect(session.subscribe).toHaveBeenCalledWith(expect.any(Function));
+    expect(session.subscribe).toHaveBeenCalledWith(listener);
     unsub();
-  });
-
-  it("adds the resolved toolset to tool start/end events and leaves unknown tools untagged", () => {
-    const session = makeFakeSession();
-    const brain = new PiAgentBrain(session, new Map([["bash", "cmd-exec"]]));
-    const events: any[] = [];
-    brain.subscribe((event) => events.push(event));
-
-    session.__emit({ type: "tool_execution_start", toolCallId: "a", toolName: "bash", args: {} });
-    session.__emit({ type: "tool_execution_end", toolCallId: "a", toolName: "bash", result: {} });
-    session.__emit({ type: "tool_execution_start", toolCallId: "b", toolName: "external", args: {} });
-
-    expect(events[0].toolset).toBe("cmd-exec");
-    expect(events[1].toolset).toBe("cmd-exec");
-    expect(events[2]).not.toHaveProperty("toolset");
   });
 
   it("prompt delegates to session.prompt for non-empty content", async () => {

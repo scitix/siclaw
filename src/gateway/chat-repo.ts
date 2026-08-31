@@ -9,6 +9,7 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type { GroupItemStatus } from "../core/tool-registry.js";
+import type { ToolsetEnvelope } from "../shared/toolset-capture.js";
 
 export interface ChatSessionLineageInput {
   /** Parent chat session for delegated child sessions. Null/undefined for normal top-level chat. */
@@ -26,9 +27,12 @@ export interface AppendMessageInput {
   role: "user" | "assistant" | "tool";
   content: string;
   toolName?: string | null;
-  /** Runtime-resolved invocation source (registry category, filesystem, or mcp:<server>). */
-  toolset?: string | null;
   toolInput?: string | null;
+  /** Invocation id from the model's toolCall block. */
+  toolCallId?: string | null;
+  llmRound?: number | null;
+  /** Every tool call emitted by one LLM round; serialized only at the RPC boundary. */
+  toolset?: ToolsetEnvelope | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
@@ -53,8 +57,10 @@ export interface UpdateMessageInput {
   sessionId: string;
   content: string;
   toolName?: string | null;
-  toolset?: string | null;
   toolInput?: string | null;
+  toolCallId?: string | null;
+  llmRound?: number | null;
+  toolset?: ToolsetEnvelope | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
@@ -77,8 +83,10 @@ export interface StoredMessage {
   role: string;
   content: string;
   toolName: string | null;
-  toolset: string | null;
   toolInput: string | null;
+  toolCallId: string | null;
+  llmRound: number | null;
+  toolset: ToolsetEnvelope | null;
   metadata: Record<string, unknown> | null;
   outcome: string | null;
   durationMs: number | null;
@@ -124,6 +132,40 @@ function getClient(): FrontendWsClient {
   return _client;
 }
 
+function parseToolsetEnvelope(raw: unknown): ToolsetEnvelope | null {
+  try {
+    const value = (typeof raw === "string" ? JSON.parse(raw) : raw) as Partial<ToolsetEnvelope> | null;
+    return value?.version === 1 && Number.isInteger(value.llm_round) && Array.isArray(value.tool_calls)
+      ? value as ToolsetEnvelope
+      : null;
+  } catch {
+    // Rolling deploys can still return the retired semantic string values.
+    return null;
+  }
+}
+
+function metadataWithToolCallId(
+  metadata: Record<string, unknown> | null | undefined,
+  toolCallId: string | null | undefined,
+): Record<string, unknown> | null {
+  if (!toolCallId) return metadata ?? null;
+  const current = metadata?.tool_dispatch;
+  const toolDispatch = current && typeof current === "object" && !Array.isArray(current)
+    ? current as Record<string, unknown>
+    : {};
+  return {
+    ...(metadata ?? {}),
+    tool_dispatch: { ...toolDispatch, tool_call_id: toolCallId },
+  };
+}
+
+function toolCallIdFromMetadata(metadata: Record<string, unknown> | null): string | null {
+  const toolDispatch = metadata?.tool_dispatch;
+  if (!toolDispatch || typeof toolDispatch !== "object" || Array.isArray(toolDispatch)) return null;
+  const value = (toolDispatch as Record<string, unknown>).tool_call_id;
+  return typeof value === "string" ? value : null;
+}
+
 /**
  * Ensure a chat_sessions row exists (upsert via RPC).
  */
@@ -165,14 +207,16 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
   // gateway path already stores the original text, so this is a no-op there, but it
   // guards any caller that hands us a brain-recorded user turn.
   const content = msg.role === "user" ? stripLanguageDirective(msg.content) : msg.content;
+  const metadata = metadataWithToolCallId(msg.metadata, msg.toolCallId);
   const result = await getClient().request("chat.appendMessage", {
     session_id: msg.sessionId,
     role: msg.role,
     content,
     tool_name: msg.toolName ?? null,
-    toolset: msg.toolset ?? null,
     tool_input: msg.toolInput ?? null,
-    metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
+    tool_call_id: msg.toolCallId ?? null,
+    toolset: msg.toolset != null ? JSON.stringify(msg.toolset) : null,
+    metadata: metadata != null ? JSON.stringify(metadata) : null,
     outcome: msg.outcome ?? null,
     duration_ms: msg.durationMs ?? null,
     from_agent_id: msg.fromAgentId ?? null,
@@ -321,14 +365,16 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
 
 /** Update an existing persisted message row. Used to turn running tool rows into completed rows. */
 export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
+  const metadata = metadataWithToolCallId(msg.metadata, msg.toolCallId);
   await getClient().request("chat.updateMessage", {
     id: msg.messageId,
     session_id: msg.sessionId,
     content: msg.content,
     tool_name: msg.toolName ?? null,
-    toolset: msg.toolset ?? null,
     tool_input: msg.toolInput ?? null,
-    metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
+    tool_call_id: msg.toolCallId ?? null,
+    toolset: msg.toolset != null ? JSON.stringify(msg.toolset) : null,
+    metadata: metadata != null ? JSON.stringify(metadata) : null,
     outcome: msg.outcome ?? null,
     duration_ms: msg.durationMs ?? null,
     delegation_id: msg.delegationId ?? null,
@@ -398,11 +444,14 @@ export async function getMessages(
     const metadata = rawMeta == null ? null
       : typeof rawMeta === "string" ? JSON.parse(rawMeta) as Record<string, unknown>
       : rawMeta as Record<string, unknown>;
+    const toolset = parseToolsetEnvelope(r.toolset);
     return {
       id: r.id as string, sessionId: r.session_id as string, role: r.role as string,
       content: (r.content as string | null) ?? "", toolName: (r.tool_name as string | null) ?? null,
-      toolset: (r.toolset as string | null) ?? null,
       toolInput: (r.tool_input as string | null) ?? null, metadata,
+      toolCallId: toolCallIdFromMetadata(metadata),
+      llmRound: toolset?.llm_round ?? null,
+      toolset,
       outcome: (r.outcome as string | null) ?? null, durationMs: (r.duration_ms as number | null) ?? null,
       fromAgentId: (r.from_agent_id as string | null) ?? null,
       parentSessionId: (r.parent_session_id as string | null) ?? null,

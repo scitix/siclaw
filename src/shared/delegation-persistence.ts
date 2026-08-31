@@ -2,6 +2,7 @@
 // and tool-registry does not import shared → no cycle). Keeps the group item-status snapshot
 // precisely typed on the wire.
 import type { GroupItemStatus } from "../core/tool-registry.js";
+import type { ToolsetEnvelope } from "./toolset-capture.js";
 
 export interface DelegationLineagePayload {
   parentSessionId?: string | null;
@@ -15,8 +16,10 @@ export interface DelegationAppendMessagePayload {
   role: "user" | "assistant" | "tool";
   content: string;
   toolName?: string | null;
-  toolset?: string | null;
   toolInput?: string | null;
+  toolCallId?: string | null;
+  llmRound?: number | null;
+  toolset?: ToolsetEnvelope | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
@@ -33,8 +36,10 @@ export interface DelegationUpdateMessagePayload {
   sessionId: string;
   content: string;
   toolName?: string | null;
-  toolset?: string | null;
   toolInput?: string | null;
+  toolCallId?: string | null;
+  llmRound?: number | null;
+  toolset?: ToolsetEnvelope | null;
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
