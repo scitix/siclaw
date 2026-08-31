@@ -77,6 +77,43 @@ describe("knowledge_search", () => {
     expect(payload.mode).toBe("hybrid");
   });
 
+  it("returns the GSP leaf page instead of treating a matching index as answer evidence", async () => {
+    fs.mkdirSync(path.join(knowledgeDir, "运维"), { recursive: true });
+    fs.writeFileSync(
+      path.join(knowledgeDir, "运维", "_index.md"),
+      "# 运维索引\n\nGSP GSP GSP GPU 固件关闭方法：参见 [GSP 禁用方法](GSP禁用方法.md)。",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "运维", "GSP禁用方法.md"),
+      "# NVIDIA GSP 固件禁用方法\n\n宿主机设置 NVreg_EnableGpuFirmware=0，然后更新 initramfs 并重启。",
+    );
+    await indexer.sync();
+
+    const tool = createKnowledgeSearchTool(indexer);
+    const result = await tool.execute("call-gsp", { query: "关掉 GSP 怎么操作", topK: 5 });
+    const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(payload.results.map((row: { file: string }) => row.file)).toContain("运维/GSP禁用方法.md");
+    expect(payload.results.map((row: { file: string }) => row.file)).not.toContain("运维/_index.md");
+    expect(payload.navigationResults).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: "运维/_index.md" }),
+    ]));
+    expect(payload.navigationNotice).toContain("routing hints only");
+  });
+
+  it("reports navigation-only matches without returning them as answer candidates", async () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "# Index\n\nunique-navigation-token");
+    await indexer.sync();
+
+    const tool = createKnowledgeSearchTool(indexer);
+    const result = await tool.execute("call-navigation", { query: "unique-navigation-token" });
+    const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(payload.results).toEqual([]);
+    expect(payload.navigationResults[0].file).toBe("index.md");
+    expect(payload.message).toContain("Only navigation pages matched");
+  });
+
   it("returns an explicit empty result instead of inventing a page", async () => {
     fs.writeFileSync(path.join(knowledgeDir, "network.md"), "# Network\n\nRoCE configuration.");
     await indexer.sync();

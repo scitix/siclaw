@@ -334,14 +334,19 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("[[component-59]]");
   });
 
-  it("truncates an oversized index and points to the full file", () => {
+  it("omits an oversized index instead of presenting a misleading prefix", () => {
     const big = Array.from({ length: 500 }, (_, i) => `- [[page-${i}]] — description number ${i} with some padding text`).join("\n");
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), big);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("Catalog truncated");
+    expect(out).toContain("Catalog not embedded");
+    expect(out).toContain("Partial catalogs are misleading");
+    expect(out).toContain("Use `knowledge_search` for discovery");
+    expect(out).toContain("Do not infer that a page is absent");
     expect(out).toContain(".siclaw/knowledge/index.md");
-    // Budgeted: well under the full size.
+    expect(out).not.toContain("[[page-0]]");
+    expect(out).not.toContain("[[page-499]]");
+    // Budgeted: well under the full size, without an arbitrary visible prefix.
     expect(out.length).toBeLessThan(big.length);
   });
 });

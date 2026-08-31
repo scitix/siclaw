@@ -3,6 +3,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 import type { ToolEntry } from "../../core/tool-registry.js";
+import { isKnowledgeNavigationPath } from "../../knowledge/page-kind.js";
 import type { MemoryIndexer } from "../../memory/index.js";
 import { renderTextResult } from "../infra/tool-render.js";
 
@@ -37,7 +38,8 @@ export function createKnowledgeSearchTool(indexer: MemoryIndexer): ToolDefinitio
       "Search the knowledge pages bound to this Agent using hybrid semantic and keyword retrieval. " +
       "Use it before answering from mounted knowledge, including when the user does not know the document title. " +
       "Try alternative product names, aliases, versions, and task terms when the first query is incomplete. " +
-      "The results are candidate snippets: Read the complete relevant pages before answering, then use knowledge_cite only for pages actually used.",
+      "The results are candidate snippets: Read the complete relevant leaf pages before answering, then use knowledge_cite only for pages actually used. " +
+      "Navigation results are routing hints and cannot be answer evidence.",
     parameters: Type.Object({
       query: Type.String({ description: "Natural-language query, document alias, version, or exact term to retrieve." }),
       topK: Type.Optional(Type.Number({ description: "Maximum candidate chunks to return (default 8, maximum 20)." })),
@@ -55,8 +57,15 @@ export function createKnowledgeSearchTool(indexer: MemoryIndexer): ToolDefinitio
 
       const topK = Math.min(20, Math.max(1, Math.floor(params.topK ?? 8)));
       try {
-        const result = await indexer.search(query, topK, params.minScore ?? 0);
-        const results = result.chunks.map((chunk, index) => ({
+        // Navigation pages often repeat every document title and can outrank the
+        // actual answer page. Retrieve a wider pool, then expose only leaf pages
+        // as answer candidates. Navigation hits remain routing hints, never
+        // evidence-bearing snippets.
+        const candidateK = Math.min(80, topK * 4);
+        const result = await indexer.search(query, candidateK, params.minScore ?? 0);
+        const leafChunks = result.chunks.filter((chunk) => !isKnowledgeNavigationPath(chunk.file));
+        const navigationChunks = result.chunks.filter((chunk) => isKnowledgeNavigationPath(chunk.file));
+        const results = leafChunks.slice(0, topK).map((chunk, index) => ({
           rank: index + 1,
           file: chunk.file,
           heading: chunk.heading,
@@ -65,13 +74,26 @@ export function createKnowledgeSearchTool(indexer: MemoryIndexer): ToolDefinitio
           score: Math.round((chunk.score ?? 0) * 1000) / 1000,
           content: truncateUtf16Safe(chunk.content, 700),
         }));
+        const navigationResults = [...new Map(navigationChunks.map((chunk) => [chunk.file, {
+          file: chunk.file,
+          heading: chunk.heading,
+          score: Math.round((chunk.score ?? 0) * 1000) / 1000,
+        }])).values()].slice(0, 5);
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
               mode: "hybrid",
               results,
-              ...(results.length === 0 ? { message: "No matching knowledge pages found." } : {}),
+              ...(navigationResults.length > 0 ? {
+                navigationResults,
+                navigationNotice: "Navigation pages are routing hints only. Read and cite the linked leaf page that supports the answer.",
+              } : {}),
+              ...(results.length === 0 ? {
+                message: navigationResults.length > 0
+                  ? "Only navigation pages matched. Read their linked leaf pages or retry with alternative terms; do not cite the navigation page."
+                  : "No matching knowledge pages found.",
+              } : {}),
               totalFiles: result.totalFiles,
               totalChunks: result.totalChunks,
             }, null, 2),

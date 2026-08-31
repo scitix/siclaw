@@ -82,16 +82,14 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 }
 
 /**
- * Max chars of the knowledge wiki index injected into the prompt before
- * truncation.
+ * Max chars of the knowledge wiki index injected into the prompt.
  *
  * Sized against real compiled indexes rather than a round number: three
  * measured 7453, 6651 and 2668 characters, so 4000 cut roughly half the page
- * list of the single-library case — which is the common one, since one library
- * unpacks its own index at the root. A truncated catalog reads exactly like a
- * complete one; the agent finds no page for the task and concludes the wiki has
- * nothing, and the "read index.md for the full list" footer only helps an agent
- * that already suspects something is missing.
+ * list of the single-library case. An oversized catalog is omitted instead of
+ * prefix-truncated: a partial catalog looks complete and creates false absence.
+ * knowledge_search is the scalable discovery path; the full file remains a
+ * deterministic Grep/Read fallback.
  */
 const KNOWLEDGE_WIKI_BUDGET = 8000;
 
@@ -106,7 +104,7 @@ const KNOWLEDGE_WIKI_BUDGET = 8000;
  * specific page(s) it needs on demand.
  *
  * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
- * truncated with a pointer to read the full file.
+ * represented by an explicit retrieval/fallback notice, never a partial prefix.
  */
 export function buildKnowledgeWikiCatalog(
   knowledgeDir?: string,
@@ -122,15 +120,12 @@ export function buildKnowledgeWikiCatalog(
   }
   if (!index) return "";
 
-  let catalog = index;
-  let truncated = false;
-  if (catalog.length > KNOWLEDGE_WIKI_BUDGET) {
-    catalog = catalog.slice(0, KNOWLEDGE_WIKI_BUDGET);
-    // Drop a trailing partial line so the catalog ends cleanly.
-    const lastNl = catalog.lastIndexOf("\n");
-    if (lastNl > 0) catalog = catalog.slice(0, lastNl);
-    truncated = true;
-  }
+  const oversized = index.length > KNOWLEDGE_WIKI_BUDGET;
+  const catalog = oversized
+    ? `_(Catalog not embedded: ${index.length} characters. Partial catalogs are misleading. ` +
+      "Use `knowledge_search` for discovery. If retrieval is unavailable or incomplete, Grep/Read " +
+      "`.siclaw/knowledge/index.md` directly. Do not infer that a page is absent from this overview.)_"
+    : index;
 
   return [
     "# Knowledge Wiki",
@@ -148,9 +143,6 @@ export function buildKnowledgeWikiCatalog(
       : "Pages are semantic — translate what you learn into concrete checks using the tools and skills available to you."),
     "",
     catalog,
-    ...(truncated
-      ? ["", "_(Catalog truncated — read `.siclaw/knowledge/index.md` for the complete list.)_"]
-      : []),
   ].join("\n");
 }
 

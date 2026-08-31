@@ -5,6 +5,7 @@ import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../tools/infra/tool-render.js";
+import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
 import type { SessionEventEmitter } from "./tool-registry.js";
 import {
   MAX_EVIDENCE_SOURCES_PER_MARKER,
@@ -208,7 +209,7 @@ Trusted original-source metadata is not available for this knowledge mount. Do n
     return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass those as \`pages\` in the same call. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass those as \`pages\` in the same call. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
   }
   return `
 ## Knowledge source citations
@@ -317,6 +318,7 @@ export function createKnowledgeCitationSupport(opts: {
       const citations: KnowledgeSourceCitation[] = [];
       const seenURLs = new Set<string>();
       const unresolved: string[] = [];
+      const navigationRefs: string[] = [];
 
       for (const ref of refs) {
         const hash = ref.lastIndexOf("#");
@@ -333,6 +335,10 @@ export function createKnowledgeCitationSupport(opts: {
           continue;
         }
         const rel = path.relative(opts.knowledgeDir, page).replaceAll(path.sep, "/");
+        if (isKnowledgeNavigationPage(rel, snapshot)) {
+          navigationRefs.push(ref);
+          continue;
+        }
         const repo = findCitationRepo(manifest, rel);
         const provenance = pageProvenanceFromBody(snapshot);
         const evidence = provenance?.evidence.get(evidenceId);
@@ -376,6 +382,13 @@ export function createKnowledgeCitationSupport(opts: {
           citations.push(citation);
         }
       }
+      if (navigationRefs.length > 0) {
+        return result(
+          `Cannot cite navigation pages: ${navigationRefs.join(", ")}. Read and cite the leaf content page that materially supports the answer.`,
+          0,
+          navigationRefs,
+        );
+      }
       if (unresolved.length > 0 || citations.length > MAX_KNOWLEDGE_CITATIONS) {
         const failed = unresolved.length > 0 ? unresolved : refs;
         return result(
@@ -394,6 +407,19 @@ export function createKnowledgeCitationSupport(opts: {
         });
         const unread = selected.find((page) => !readPages.has(page));
         if (unread) return result(`Cannot cite unread knowledge page: ${unread}`, 0);
+        const navigationPage = selected.find((page) => {
+          const snapshot = readPages.get(page);
+          const rel = path.relative(opts.knowledgeDir, page).replaceAll(path.sep, "/");
+          return snapshot !== undefined && isKnowledgeNavigationPage(rel, snapshot);
+        });
+        if (navigationPage) {
+          const rel = path.relative(opts.knowledgeDir, navigationPage).replaceAll(path.sep, "/");
+          return result(
+            `Cannot cite navigation page: ${rel}. Read and cite the leaf content page that materially supports the answer.`,
+            0,
+            [rel],
+          );
+        }
         for (const page of selected) {
           const snapshot = readPages.get(page);
           if (!snapshot) return result(`Cannot cite unread knowledge page: ${page}`, 0);

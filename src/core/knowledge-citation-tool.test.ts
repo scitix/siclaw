@@ -63,6 +63,75 @@ describe("knowledge_cite", () => {
     expect(events).toHaveLength(1);
   });
 
+  it.each([
+    { rel: "index.md", body: "# Root index\n" },
+    { rel: "运维/_index.md", body: "# Operations index\n" },
+    { rel: "catalog.md", body: "---\ntype: index\n---\n# Catalog\n" },
+  ])("rejects navigation page citations for $rel", async ({ rel, body }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-navigation-"));
+    dirs.push(dir);
+    const page = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(page), { recursive: true });
+    fs.writeFileSync(page, `---\nsources:\n  - resource: raw/runbook.md\n${body.startsWith("---") ? "" : "---\n"}${body}`);
+    // catalog.md needs one valid frontmatter block, not nested frontmatter.
+    if (rel === "catalog.md") {
+      fs.writeFileSync(page, "---\ntype: index\nsources:\n  - resource: raw/runbook.md\n---\n# Catalog\n");
+    }
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({
+      version: 1,
+      repos: [{ id: "repo", root: "", sources: [{
+        resource: "runbook.md", title: "Runbook", url: "https://docs.feishu.cn/wiki/runbook",
+      }] }],
+    }));
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    const output = await support.tool.execute("call", { pages: [rel] } as never);
+    expect((output.content[0] as { text: string }).text).toContain("Cannot cite navigation page");
+    expect(output.details).toMatchObject({ cited: 0 });
+    expect(events).toEqual([]);
+  });
+
+  it("rejects evidence refs on navigation pages before emitting any source", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-navigation-evidence-"));
+    dirs.push(dir);
+    const page = path.join(dir, "_index.md");
+    fs.writeFileSync(page, `---
+sources:
+  - id: src-runbook
+    resource: raw/runbook.md
+---
+<!-- okf:evidence {"id":"entry","sources":["src-runbook"]} -->
+# Index
+`);
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({
+      version: 1,
+      repos: [{ id: "repo", root: "", sources: [{
+        sourceId: "src-runbook",
+        resource: "runbook.md",
+        title: "Runbook",
+        url: "https://docs.feishu.cn/wiki/runbook",
+      }] }],
+    }));
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    const output = await support.tool.execute("call", { evidence_refs: ["_index.md#entry"] } as never);
+    expect((output.content[0] as { text: string }).text).toContain("Cannot cite navigation pages");
+    expect(output.details).toMatchObject({ cited: 0, unresolved: ["_index.md#entry"] });
+    expect(events).toEqual([]);
+  });
+
   it("resolves evidence refs to the exact source used instead of the first page source", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-evidence-"));
     dirs.push(dir);

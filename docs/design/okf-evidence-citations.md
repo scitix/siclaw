@@ -6,6 +6,9 @@ description: "Canonical marker grammar and fail-closed source binding for knowle
 
 # OKF Evidence Citations
 
+For the end-to-end retrieval boundary and leaf-page citation contract, see
+[Knowledge Retrieval and Citation Architecture](knowledge-retrieval-and-citations.md).
+
 Compiled wiki pages may bind one answerable section to declared source ids.
 `knowledge_cite` then re-derives the original URL from the frozen citation
 manifest. The marker is input; the manifest is authority.
