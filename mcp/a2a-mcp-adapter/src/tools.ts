@@ -41,7 +41,7 @@ export function buildToolDefinitions(router: AgentRouter) {
     {
       name: "siclaw_investigate",
       description:
-        "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous ControlPlane A2A task. Reuse context_id to continue the same investigation. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The A2A key selected by \"agent\" fixes which Siclaw agent is used."
+        "Delegate an operational problem to the configured Siclaw SRE agent. Pass a self-contained brief with the caller's relevant background, known facts, prior checks and results, unresolved question, and explicit user constraints. Do not prescribe the investigation plan: Siclaw chooses the data sources, query scope, tools, evidence chain, execution order, and stopping conditions. This creates an asynchronous ControlPlane A2A task. Reuse context_id to continue the same investigation. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The A2A key selected by \"agent\" fixes which Siclaw agent is used."
         + ` ${hint}${requireAgent}`,
       inputSchema: {
         type: "object",
@@ -49,7 +49,7 @@ export function buildToolDefinitions(router: AgentRouter) {
           question: {
             type: "string",
             minLength: 1,
-            description: "The concrete operational question for Siclaw, including relevant target names and time window when known.",
+            description: "A self-contained delegation brief for Siclaw: the user's goal, observed symptoms, known facts and target identifiers, relevant time facts, checks already performed and their results, the unresolved question, and explicit user constraints. Clearly separate facts from assumptions or uncertain context. Do not add data-source choices, query ranges, tool calls, hypotheses, investigation steps, or execution order that the user did not explicitly require; Siclaw plans and conducts the investigation.",
           },
           agent,
           context_id: {
