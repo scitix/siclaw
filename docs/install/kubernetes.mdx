@@ -159,3 +159,22 @@ runtime:
   re-adopt live capability runs. Cluster-wide box deletion remains an explicit
   cleanup operation, not a process-shutdown side effect.
 - If you deploy monitoring resources from the chart, do not also apply duplicate monitor manifests manually.
+
+## Post-rollout Chat Acceptance
+
+After a production Runtime or AgentBox rollout reports Ready, verify cold-session
+dispatch before declaring the release complete:
+
+1. Create at least five new chat sessions. Do not reuse an existing session or
+   retry a failed first message.
+2. Send one first-turn prompt in each session, sequentially. All five must reach
+   assistant output and `prompt_done` without a `stream_error` or manual retry.
+3. For every turn, correlate `sessionId` and `turnId` across the control-plane,
+   Runtime, and AgentBox logs. Confirm the selected Runtime and AgentBox, and a
+   `/api/prompt` result with `status=200` and `outcome=accepted`.
+4. Treat any first-turn failure, missing terminal event, or unexplained
+   Runtime/AgentBox selection as a failed release acceptance. Preserve the
+   correlated log lines before retrying or rolling again.
+
+This check validates observed post-rollout behavior. Pod readiness and a
+successful image rollout alone do not satisfy chat acceptance.
