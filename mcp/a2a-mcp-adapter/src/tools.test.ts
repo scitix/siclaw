@@ -68,6 +68,18 @@ describe("tool contract", () => {
     expect(list.description).toMatch(/aggregates tasks from every configured agent/);
   });
 
+  it("delegates investigation planning to Siclaw and asks callers for a factual brief", () => {
+    const defs = buildToolDefinitions(singleRouter());
+    const investigate = defs.find((tool) => tool.name === "siclaw_investigate")!;
+    expect(investigate.description).toContain("Do not prescribe the investigation plan");
+    expect(investigate.description).toContain("Siclaw chooses");
+
+    const question = investigate.inputSchema.properties.question as { description: string };
+    expect(question.description).toContain("checks already performed and their results");
+    expect(question.description).toContain("Clearly separate facts from assumptions");
+    expect(question.description).toContain("Siclaw plans and conducts the investigation");
+  });
+
   it("submits and waits for a bounded investigation and tags the agent", async () => {
     const api = fakeApi();
     const handle = createToolHandler(singleRouter(api));
