@@ -44,16 +44,23 @@ import { sessionTurnLocks } from "../session-turn-lock.js";
 import { appendMessage, bindMessageTraceId, ensureChatSession, warnTraceBindFailure } from "../chat-repo.js";
 import { collectChannelResponse } from "./lark.js";
 import type { RenderedReplyImage } from "./visual-image.js";
+import { uploadImageMedia } from "./dingtalk-api.js";
 import { deliverImages } from "./dingtalk-image.js";
 import {
   buildMarkdownMessage,
   buildTextMessage,
+  createDingTalkCardTimeline,
   sanitizeMarkdownForDingTalk,
   DEFAULT_PLACEHOLDER,
   EMPTY_RESULT_NOTICE,
   AGENT_ERROR_NOTICE,
 } from "./dingtalk-card.js";
-import { openTypingCard, streamCardContent, finalizeTypingCard } from "./dingtalk-card-api.js";
+import {
+  openTypingCard,
+  streamCardContent,
+  updateCardBlockList,
+  finalizeTypingCard,
+} from "./dingtalk-card-api.js";
 import { createDingTalkCardStreamController } from "./dingtalk-card-stream.js";
 
 /** Robot-message callback topic (see SDK `constants`). */
@@ -101,6 +108,26 @@ export interface DingTalkChannelConfig {
 function resolveCardStreamInterval(config: DingTalkChannelConfig): number {
   const value = Number(config.card_stream_interval_ms);
   return Number.isFinite(value) && value > 0 ? value : DEFAULT_CARD_STREAM_INTERVAL_MS;
+}
+
+function buildCardStatusLine(modelId: string | undefined, agentId: string, startedAt: number): string {
+  const identity = [modelId, agentId].filter(Boolean).join(" | ");
+  const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1_000));
+  return identity ? `${identity}\n${elapsedSeconds}s` : `${elapsedSeconds}s`;
+}
+
+async function embedCardImages(
+  config: DingTalkChannelConfig,
+  images: RenderedReplyImage[],
+  timeline: ReturnType<typeof createDingTalkCardTimeline>,
+): Promise<RenderedReplyImage[]> {
+  const notEmbedded: RenderedReplyImage[] = [];
+  for (const image of images) {
+    const mediaId = await uploadImageMedia(config, image.image, image.mimeType);
+    if (mediaId) timeline.addImage(mediaId);
+    else notEmbedded.push(image);
+  }
+  return notEmbedded;
 }
 
 /**
@@ -326,8 +353,12 @@ export async function handleDingTalkMessage(
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
-  // Declared out here because the card is finalized after the turn lock is
-  // released, on both the busy-notice and the normal reply path.
+  // Declared out here because the card is finalized — and its timeline read for
+  // image embedding — after the turn lock is released, on both the busy-notice
+  // and the normal reply path.
+  const cardStartedAt = Date.now();
+  const cardTimeline = createDingTalkCardTimeline();
+  const quoteContent = routeType === "group" ? text.slice(0, 500) : "";
   let cardController: ReturnType<typeof createDingTalkCardStreamController> | null = null;
   // Acquired INSIDE the try so a busy session surfaces through the SAME path the
   // AgentBox's 409 already used — the friendly "still working" notice. Outside it the
@@ -400,6 +431,8 @@ export async function handleDingTalkMessage(
       routeType,
       conversationId,
       senderStaffId: message.senderStaffId,
+      quoteContent,
+      statusLine: buildCardStatusLine(modelBinding?.modelId, agentId, cardStartedAt),
     }, DEFAULT_PLACEHOLDER);
     if (card) {
       cardController = createDingTalkCardStreamController({
@@ -409,14 +442,28 @@ export async function handleDingTalkMessage(
           card,
           sanitizeMarkdownForDingTalk(snapshot),
         ),
-        finalizeCard: (finalText) => finalizeTypingCard(
+        updateCardBlocks: (blockListJson) => updateCardBlockList(
           config,
           card,
-          sanitizeMarkdownForDingTalk(finalText),
+          blockListJson,
         ),
+        finalizeCard: (finalText) => {
+          const content = sanitizeMarkdownForDingTalk(finalText);
+          return finalizeTypingCard(config, card, {
+            content,
+            blockList: cardTimeline.render(content),
+            quoteContent,
+            statusLine: buildCardStatusLine(modelBinding?.modelId, agentId, cardStartedAt),
+          });
+        },
       });
     }
   }
+
+  const updateStructuredBlocks = (): void => {
+    if (!cardController) return;
+    cardController.updateBlocks(JSON.stringify(cardTimeline.render("")));
+  };
 
   try {
     const promptResult = await client.prompt(promptOpts);
@@ -426,11 +473,21 @@ export async function handleDingTalkMessage(
       });
     }
     // Collect the reply with audit persistence (assistant + tool rows, when the
-    // session row exists), image artifacts, and optional non-blocking text
-    // snapshots for the AI card controller.
+    // session row exists), image artifacts, and optional non-blocking card
+    // callbacks. Only high-level progress and tool lifecycle metadata enter the
+    // card; raw tool arguments/results remain in the sanitized audit domain.
     const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
       includeImages: true,
       onTextSnapshot: cardController ? (snapshot) => cardController?.update(snapshot) : undefined,
+      onMilestone: cardController ? (milestone) => {
+        cardTimeline.addProgress(milestone);
+        updateStructuredBlocks();
+      } : undefined,
+      onToolActivity: cardController ? (activity) => {
+        if (activity.phase === "start") cardTimeline.startTool(activity.name);
+        else cardTimeline.finishTool(activity.name, activity.outcome ?? "success");
+        updateStructuredBlocks();
+      } : undefined,
       persist: auditable ? { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId } : undefined,
     });
     resultText = collected.text;
@@ -461,6 +518,14 @@ export async function handleDingTalkMessage(
     ? AGENT_ERROR_NOTICE
     : (resultText || EMPTY_RESULT_NOTICE);
 
+  // Upload images before finalization so successful uploads become type=3
+  // blocks in the same card. Keep the original list until card finalization is
+  // confirmed; if it fails, every image still falls back to separate messages.
+  let imagesNotEmbedded = replyImages;
+  if (!agentError && config && cardController && replyImages.length > 0) {
+    imagesNotEmbedded = await embedCardImages(config, replyImages, cardTimeline);
+  }
+
   // Prefer completing the already-visible AI card. If creation was unavailable
   // or the terminal update failed, preserve the original webhook transport so
   // the answer is never lost (at the cost of a possible duplicate after an
@@ -468,7 +533,9 @@ export async function handleDingTalkMessage(
   const deliveredByCard = cardController
     ? await cardController.finalize(finalBody)
     : false;
-  if (!deliveredByCard) {
+  if (deliveredByCard) {
+    replyImages = imagesNotEmbedded;
+  } else {
     const body = agentError
       ? buildTextMessage(finalBody)
       : (resultText ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));

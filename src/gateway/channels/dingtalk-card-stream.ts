@@ -1,30 +1,35 @@
 /**
  * 钉钉 AI 卡片的单飞、latest-wins 流式更新器。
  *
- * 模型 token 到达速度远高于钉钉卡片 API 的合理更新频率。该控制器确保：
- * 1. 任意时刻最多一个更新请求在途；
- * 2. 在途期间只保留最新快照；
- * 3. 两次请求之间满足节流间隔；
- * 4. finalize 等待在途请求结束，避免旧更新覆盖最终内容。
+ * 正文和结构化 blockList 使用独立的单飞通道：正文走 streaming API，
+ * blockList 走 instances API。finalize 会等待两个通道完成，避免旧快照
+ * 覆盖最终原子提交。
  */
 export interface DingTalkCardStreamController {
   update(content: string): void;
+  updateBlocks(blockListJson: string): void;
   finalize(content: string): Promise<boolean>;
   hasFailed(): boolean;
 }
 
-export function createDingTalkCardStreamController(options: {
+interface LatestWinsSender {
+  update(value: string): void;
+  close(): Promise<void>;
+  hasFailed(): boolean;
+}
+
+function createLatestWinsSender(options: {
   intervalMs: number;
-  updateCard: (content: string) => Promise<boolean>;
-  finalizeCard: (content: string) => Promise<boolean>;
-}): DingTalkCardStreamController {
+  label: string;
+  send: (value: string) => Promise<boolean>;
+  isClosing: () => boolean;
+}): LatestWinsSender {
   const intervalMs = Math.max(250, Math.min(options.intervalMs, 10_000));
-  let pendingContent: string | null = null;
-  let lastSentContent = "";
+  let pendingValue: string | null = null;
+  let lastSentValue = "";
   let lastSentAt = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let inFlight: Promise<void> | null = null;
-  let closing = false;
   let failed = false;
 
   const clearTimer = (): void => {
@@ -33,7 +38,7 @@ export function createDingTalkCardStreamController(options: {
   };
 
   const schedule = (): void => {
-    if (closing || failed || timer || inFlight || pendingContent === null) return;
+    if (options.isClosing() || failed || timer || inFlight || pendingValue === null) return;
     const delay = Math.max(0, intervalMs - (Date.now() - lastSentAt));
     timer = setTimeout(() => {
       timer = null;
@@ -42,31 +47,31 @@ export function createDingTalkCardStreamController(options: {
   };
 
   const flush = async (): Promise<void> => {
-    if (closing || failed || inFlight || pendingContent === null) return;
-    const content = pendingContent;
-    pendingContent = null;
-    if (!content.trim() || content === lastSentContent) {
+    if (options.isClosing() || failed || inFlight || pendingValue === null) return;
+    const value = pendingValue;
+    pendingValue = null;
+    if (!value.trim() || value === lastSentValue) {
       schedule();
       return;
     }
 
     const current = (async () => {
       try {
-        const ok = await options.updateCard(content);
+        const ok = await options.send(value);
         if (!ok) {
           failed = true;
-          pendingContent = null;
+          pendingValue = null;
           clearTimer();
           return;
         }
-        lastSentContent = content;
+        lastSentValue = value;
         lastSentAt = Date.now();
       } catch (err) {
         failed = true;
-        pendingContent = null;
+        pendingValue = null;
         clearTimer();
         const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[dingtalk-card] streaming update stopped after error: ${message}`);
+        console.warn(`[dingtalk-card] ${options.label} updates stopped after error: ${message}`);
       }
     })().finally(() => {
       if (inFlight === current) inFlight = null;
@@ -77,17 +82,56 @@ export function createDingTalkCardStreamController(options: {
   };
 
   return {
-    update(content: string): void {
-      if (closing || failed || !content.trim() || content === lastSentContent) return;
-      pendingContent = content;
+    update(value: string): void {
+      if (options.isClosing() || failed || !value.trim() || value === lastSentValue) return;
+      pendingValue = value;
       schedule();
+    },
+
+    async close(): Promise<void> {
+      pendingValue = null;
+      clearTimer();
+      if (inFlight) await inFlight;
+    },
+
+    hasFailed(): boolean {
+      return failed;
+    },
+  };
+}
+
+export function createDingTalkCardStreamController(options: {
+  intervalMs: number;
+  updateCard: (content: string) => Promise<boolean>;
+  updateCardBlocks?: (blockListJson: string) => Promise<boolean>;
+  finalizeCard: (content: string) => Promise<boolean>;
+}): DingTalkCardStreamController {
+  let closing = false;
+  const contentSender = createLatestWinsSender({
+    intervalMs: options.intervalMs,
+    label: "streaming content",
+    send: options.updateCard,
+    isClosing: () => closing,
+  });
+  const blockSender = createLatestWinsSender({
+    intervalMs: options.intervalMs,
+    label: "structured blockList",
+    send: options.updateCardBlocks ?? (async () => true),
+    isClosing: () => closing,
+  });
+
+  return {
+    update(content: string): void {
+      contentSender.update(content);
+    },
+
+    updateBlocks(blockListJson: string): void {
+      if (options.updateCardBlocks) blockSender.update(blockListJson);
     },
 
     async finalize(content: string): Promise<boolean> {
       closing = true;
-      pendingContent = null;
-      clearTimer();
-      if (inFlight) await inFlight;
+      await Promise.all([contentSender.close(), blockSender.close()]);
       try {
         return await options.finalizeCard(content);
       } catch (err) {
@@ -98,7 +142,7 @@ export function createDingTalkCardStreamController(options: {
     },
 
     hasFailed(): boolean {
-      return failed;
+      return contentSender.hasFailed();
     },
   };
 }

@@ -37,6 +37,127 @@ export const DEFAULT_PLACEHOLDER = PLACEHOLDER_BY_LOCALE["zh-CN"];
 export const EMPTY_RESULT_NOTICE = EMPTY_RESULT_NOTICE_BY_LOCALE["zh-CN"];
 export const AGENT_ERROR_NOTICE = AGENT_ERROR_NOTICE_BY_LOCALE["zh-CN"];
 
+/** Structured content contract consumed by the DingTalk AI Card v2 template. */
+export type DingTalkCardBlock =
+  | { type: 0; markdown: string }
+  | { type: 1; markdown: string }
+  | { type: 2; markdown: string }
+  | { type: 3; mediaId: string; text?: string };
+
+export type DingTalkToolOutcome = "success" | "error" | "blocked";
+
+interface DingTalkCardTimelineEntry {
+  kind: "progress" | "tool" | "image";
+  text: string;
+  mediaId?: string;
+}
+
+export interface DingTalkCardTimeline {
+  addProgress(text: string): void;
+  startTool(name: string): void;
+  finishTool(name: string, outcome: DingTalkToolOutcome): void;
+  addImage(mediaId: string, text?: string): void;
+  render(answer: string): DingTalkCardBlock[];
+}
+
+const PROCESS_BLOCK_FONT_SIZE_TOKEN = "common_footnote_text_style__font_size";
+const PROCESS_BLOCK_FONT_COLOR_TOKEN = "common_level2_base_color";
+const MAX_PROCESS_BLOCK_CHARS = 500;
+
+function normalizeProcessBlockText(text: string): string {
+  return text
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .trim()
+    .slice(0, MAX_PROCESS_BLOCK_CHARS);
+}
+
+function renderProcessBlock(text: string): string {
+  return normalizeProcessBlockText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `> <font sizeToken=${PROCESS_BLOCK_FONT_SIZE_TOKEN} colorTokenV2=${PROCESS_BLOCK_FONT_COLOR_TOKEN}>${line}</font>`)
+    .join("\n");
+}
+
+/**
+ * Build a safe card timeline from user-visible progress, tool lifecycle events,
+ * the final answer, and images already uploaded to DingTalk. Tool inputs and
+ * results are deliberately excluded because they may contain credentials or
+ * verbose infrastructure output.
+ */
+export function createDingTalkCardTimeline(): DingTalkCardTimeline {
+  const entries: DingTalkCardTimelineEntry[] = [];
+  const pendingTools = new Map<string, number[]>();
+
+  const safeToolName = (name: string): string => normalizeProcessBlockText(name || "tool").slice(0, 80) || "tool";
+
+  return {
+    addProgress(text: string): void {
+      const normalized = normalizeProcessBlockText(text);
+      if (!normalized) return;
+      const previous = entries.at(-1);
+      if (previous?.kind === "progress" && previous.text === normalized) return;
+      entries.push({ kind: "progress", text: normalized });
+    },
+
+    startTool(name: string): void {
+      const normalizedName = safeToolName(name);
+      const index = entries.push({ kind: "tool", text: `正在执行 ${normalizedName}` }) - 1;
+      const queue = pendingTools.get(normalizedName) ?? [];
+      queue.push(index);
+      pendingTools.set(normalizedName, queue);
+    },
+
+    finishTool(name: string, outcome: DingTalkToolOutcome): void {
+      const normalizedName = safeToolName(name);
+      const queue = pendingTools.get(normalizedName);
+      const index = queue?.shift();
+      if (queue?.length === 0) pendingTools.delete(normalizedName);
+      const label = outcome === "success"
+        ? `已完成 ${normalizedName}`
+        : outcome === "blocked"
+          ? `已阻止 ${normalizedName}`
+          : `执行失败 ${normalizedName}`;
+      if (index !== undefined && entries[index]?.kind === "tool") {
+        entries[index] = { kind: "tool", text: label };
+      } else {
+        entries.push({ kind: "tool", text: label });
+      }
+    },
+
+    addImage(mediaId: string, text?: string): void {
+      const normalizedMediaId = mediaId.trim();
+      if (!normalizedMediaId) return;
+      entries.push({
+        kind: "image",
+        mediaId: normalizedMediaId,
+        text: text ? normalizeProcessBlockText(text).slice(0, 120) : "",
+      });
+    },
+
+    render(answer: string): DingTalkCardBlock[] {
+      const blocks: DingTalkCardBlock[] = [];
+      const images: DingTalkCardBlock[] = [];
+      for (const entry of entries) {
+        if (entry.kind === "image") {
+          if (entry.mediaId) {
+            images.push({ type: 3, mediaId: entry.mediaId, ...(entry.text ? { text: entry.text } : {}) });
+          }
+          continue;
+        }
+        const markdown = renderProcessBlock(entry.text);
+        if (!markdown) continue;
+        blocks.push({ type: entry.kind === "progress" ? 1 : 2, markdown });
+      }
+      if (answer.trim()) blocks.push({ type: 0, markdown: answer });
+      return [...blocks, ...images];
+    },
+  };
+}
+
 /**
  * Normalise markdown for DingTalk's `markdown` message renderer.
  *

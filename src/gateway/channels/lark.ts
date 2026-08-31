@@ -3060,6 +3060,12 @@ export interface ChannelPersistContext {
   traceId?: string;
 }
 
+export interface ChannelToolActivity {
+  phase: "start" | "end";
+  name: string;
+  outcome?: "success" | "error" | "blocked";
+}
+
 export async function collectChannelResponse(
   client: AgentBoxClient,
   sessionId: string,
@@ -3069,6 +3075,8 @@ export async function collectChannelResponse(
     onMilestone?: (text: string) => void;
     /** Full streamed-text snapshot. Callbacks must stay non-blocking. */
     onTextSnapshot?: (text: string) => void;
+    /** Sanitized tool lifecycle only; raw inputs and results are never exposed. */
+    onToolActivity?: (activity: ChannelToolActivity) => void;
     persist?: ChannelPersistContext;
     locale?: LarkLocale;
   } = {},
@@ -3090,6 +3098,12 @@ export async function collectChannelResponse(
     if (!options.onTextSnapshot || !streamedText) return;
     try { options.onTextSnapshot(streamedText); }
     catch (err) { console.warn(`[${logPrefix}] text snapshot callback failed session=${sessionId}:`, err); }
+  };
+
+  const emitToolActivity = (activity: ChannelToolActivity): void => {
+    if (!options.onToolActivity) return;
+    try { options.onToolActivity(activity); }
+    catch (err) { console.warn(`[${logPrefix}] tool activity callback failed session=${sessionId}:`, err); }
   };
 
   // ── Audit persistence (opt-in) ──────────────────────────────────────────
@@ -3192,25 +3206,31 @@ export async function collectChannelResponse(
         emitTextSnapshot();
       }
 
-      // Capture tool input + start time for the matching tool_execution_end.
-      if (persist && (ev.type === "tool_execution_start" || ev.type === "tool_start")) {
+      if (ev.type === "tool_execution_start" || ev.type === "tool_start") {
         const name = (ev.toolName as string) || (ev.name as string) || "tool";
-        const key = toolKey(ev, name);
-        pushQ(toolInputs, key, ev.args ? JSON.stringify(ev.args) : "");
-        pushQ(toolStarts, key, Date.now());
-        pushQ(toolsets, key, typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
+        emitToolActivity({ phase: "start", name });
+        // Capture tool input + start time for the matching tool_execution_end.
+        // Only when persisting: the queues are drained on the persist path, so
+        // filling them without it would grow unbounded.
+        if (persist) {
+          const key = toolKey(ev, name);
+          pushQ(toolInputs, key, ev.args ? JSON.stringify(ev.args) : "");
+          pushQ(toolStarts, key, Date.now());
+          pushQ(toolsets, key, typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
+        }
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
         if (options.includeImages) collectImageAttachments(ev.result?.content, images, seenImageKeys);
+        const name = (ev.toolName as string) || (ev.name as string) || "tool";
+        let outcome: "success" | "error" | "blocked" = "success";
+        if (ev.result?.details?.blocked) outcome = "blocked";
+        else if (ev.result?.details?.error) outcome = "error";
+        emitToolActivity({ phase: "end", name, outcome });
         if (persist) {
-          const name = (ev.toolName as string) || (ev.name as string) || "tool";
           const resultText = Array.isArray(ev.result?.content)
             ? ev.result.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("")
             : "";
-          let outcome: "success" | "error" | "blocked" = "success";
-          if (ev.result?.details?.blocked) outcome = "blocked";
-          else if (ev.result?.details?.error) outcome = "error";
           const key = toolKey(ev, name);
           const input = shiftQ(toolInputs, key) || "";
           const startedAt = shiftQ(toolStarts, key);

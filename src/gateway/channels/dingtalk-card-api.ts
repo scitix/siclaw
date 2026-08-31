@@ -1,17 +1,27 @@
 import crypto from "node:crypto";
 import type { DingTalkChannelConfig } from "./dingtalk.js";
-import type { DingTalkStreamingCard } from "./dingtalk-card.js";
+import type { DingTalkCardBlock, DingTalkStreamingCard } from "./dingtalk-card.js";
 import { fetchWithTimeout, getAccessToken, redactSecrets } from "./dingtalk-api.js";
 
 const CARD_CREATE_AND_DELIVER_URL = "https://api.dingtalk.com/v1.0/card/instances/createAndDeliver";
 const CARD_STREAMING_URL = "https://api.dingtalk.com/v1.0/card/streaming";
 const CARD_INSTANCES_URL = "https://api.dingtalk.com/v1.0/card/instances";
 const CARD_CONTENT_KEY = "content";
+const CARD_BLOCK_LIST_KEY = "blockList";
 
 export interface DingTalkCardTarget {
   routeType: "user" | "group";
   conversationId: string;
   senderStaffId?: string;
+  quoteContent?: string;
+  statusLine?: string;
+}
+
+export interface DingTalkCardFinalPayload {
+  content: string;
+  blockList: DingTalkCardBlock[];
+  quoteContent?: string;
+  statusLine?: string;
 }
 
 interface CardApiResult {
@@ -93,6 +103,10 @@ export async function openTypingCard(
     cardData: {
       cardParamMap: {
         [CARD_CONTENT_KEY]: placeholder,
+        [CARD_BLOCK_LIST_KEY]: JSON.stringify([]),
+        copy_content: "",
+        quoteContent: target.quoteContent?.trim() ?? "",
+        statusLine: target.statusLine?.trim() ?? "",
         flowStatus: "2",
         config: JSON.stringify({ autoLayout: true, enableForward: true }),
       },
@@ -148,17 +162,38 @@ export async function streamCardContent(
   return result.ok;
 }
 
+/** Update the structured timeline through the instances API. */
+export async function updateCardBlockList(
+  config: DingTalkChannelConfig,
+  card: DingTalkStreamingCard,
+  blockListJson: string,
+): Promise<boolean> {
+  const token = await getAccessToken(config);
+  if (!token) return false;
+  const result = await callCardApi("instances.blocks", CARD_INSTANCES_URL, token, "PUT", {
+    outTrackId: card.outTrackId,
+    cardData: {
+      cardParamMap: {
+        [CARD_BLOCK_LIST_KEY]: blockListJson,
+      },
+    },
+    cardUpdateOptions: { updateCardDataByKey: true },
+  });
+  return result.ok;
+}
+
 /**
- * 使用最终正文关闭流式生命周期，再通过 instances API 写入完成状态。
+ * 使用最终正文关闭流式生命周期，再通过 instances API 原子写入结构化内容和完成状态。
  * instances 更新成功即视为完成；流式关闭失败只记录日志，不阻止最终提交。
  */
 export async function finalizeTypingCard(
   config: DingTalkChannelConfig,
   card: DingTalkStreamingCard,
-  content: string,
+  payload: DingTalkCardFinalPayload,
 ): Promise<boolean> {
   const token = await getAccessToken(config);
   if (!token) return false;
+  const content = payload.content;
 
   const streamResult = await callCardApi("stream.finalize", CARD_STREAMING_URL, token, "PUT", {
     outTrackId: card.outTrackId,
@@ -178,6 +213,10 @@ export async function finalizeTypingCard(
     cardData: {
       cardParamMap: {
         [CARD_CONTENT_KEY]: content,
+        [CARD_BLOCK_LIST_KEY]: JSON.stringify(payload.blockList),
+        copy_content: content,
+        ...(payload.quoteContent?.trim() ? { quoteContent: payload.quoteContent.trim() } : {}),
+        ...(payload.statusLine?.trim() ? { statusLine: payload.statusLine.trim() } : {}),
         flowStatus: "3",
       },
     },
