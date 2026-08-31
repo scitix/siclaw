@@ -94,6 +94,7 @@ export async function openTypingCard(
       cardParamMap: {
         [CARD_CONTENT_KEY]: placeholder,
         flowStatus: "2",
+        config: JSON.stringify({ autoLayout: true, enableForward: true }),
       },
     },
     callbackType: "STREAM",
@@ -148,7 +149,7 @@ export async function streamCardContent(
 }
 
 /**
- * 关闭流式生命周期，并通过 instances API 原子写入最终正文和完成状态。
+ * 使用最终正文关闭流式生命周期，再通过 instances API 写入完成状态。
  * instances 更新成功即视为完成；流式关闭失败只记录日志，不阻止最终提交。
  */
 export async function finalizeTypingCard(
@@ -163,7 +164,7 @@ export async function finalizeTypingCard(
     outTrackId: card.outTrackId,
     guid: crypto.randomUUID(),
     key: CARD_CONTENT_KEY,
-    content: "",
+    content,
     isFull: true,
     isFinalize: true,
     isError: false,
