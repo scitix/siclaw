@@ -73,14 +73,6 @@ function extractUpdateStatements(src: string): Array<{ table: string; body: stri
 }
 
 describe("schema invariants: updated_at must be set on every UPDATE", () => {
-  it("fresh MySQL/SQLite chat_messages DDL includes nullable toolset", () => {
-    const chatMessages = PORTAL_SCHEMA_SQLS.find((sql) =>
-      /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+chat_messages/i.test(sql),
-    );
-    expect(chatMessages).toBeDefined();
-    expect(chatMessages).toMatch(/\btoolset\s+VARCHAR\(255\)\s+DEFAULT\s+NULL\b/i);
-  });
-
   it("every UPDATE to an ON UPDATE table explicitly sets updated_at", () => {
     const violations: Array<{ file: string; table: string; body: string }> = [];
 

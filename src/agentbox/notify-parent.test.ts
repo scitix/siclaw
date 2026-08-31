@@ -502,8 +502,8 @@ describe("notifyParent", () => {
       followUp: vi.fn(async () => {}),
       subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
       prompt: vi.fn(async () => {
-        cb?.({ type: "tool_execution_start", toolCallId: "call-read", toolName: "read", toolset: "filesystem" }); // turnHadTool → the turn persists
-        cb?.({ type: "message_end", message: { role: "toolResult", toolCallId: "call-read", toolName: "read", content: [{ type: "text", text: "PING … 0.264 ms" }] } });
+        cb?.({ type: "tool_execution_start", name: "read" }); // turnHadTool → the turn persists
+        cb?.({ type: "message_end", message: { role: "toolResult", toolName: "read", content: [{ type: "text", text: "PING … 0.264 ms" }] } });
         cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "gateway ok" }] } });
       }),
     };
@@ -521,7 +521,6 @@ describe("notifyParent", () => {
       .find((e: any) => e.message?.role === "tool");
     expect(toolRow).toBeTruthy();
     expect(toolRow.message.outcome).toBe("success"); // terminal → card renders done, NOT a forever-spinner
-    expect(toolRow.message.toolset).toBe("filesystem");
   });
 });
 

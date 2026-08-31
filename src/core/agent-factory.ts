@@ -27,7 +27,7 @@ import {
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { createKnowledgeIndexer } from "../knowledge/indexer.js";
-import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
+import { ToolRegistry, type AgentMode } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
 import {
@@ -670,7 +670,7 @@ export async function createSiclawSession(
         },
       },
     }),
-  ].map((tool) => Object.assign(tool, { toolset: "filesystem" }) as ResolvedToolDefinition);
+  ];
   // Push into customTools so they override framework defaults via extension mechanism.
   // Subject to allowedTools (same chokepoint as MCP append above): file tools are
   // created outside the registry, so the shared name-based whitelist is applied here.
@@ -908,13 +908,7 @@ export async function createSiclawSession(
   const guardRegistry = createGuardRegistry(contextWindow);
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
-  const toolsetsByName = new Map(
-    customTools.flatMap((tool) => {
-      const toolset = (tool as ResolvedToolDefinition).toolset;
-      return toolset ? [[tool.name, toolset] as const] : [];
-    }),
-  );
-  const brain: BrainSession = new PiAgentBrain(session, toolsetsByName);
+  const brain: BrainSession = new PiAgentBrain(session);
   const getSkillSnapshot = () => {
     const currentSkills = loader.getSkills().skills;
     const skillNames = currentSkills.map((skill) => skill.name).sort();

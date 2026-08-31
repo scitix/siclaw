@@ -1197,16 +1197,6 @@ describe("chat.appendMessage", () => {
       expect.arrayContaining(["0123456789abcdef0123456789abcdef"]),
     );
   });
-
-  it("writes the invocation toolset into the INSERT", async () => {
-    const query = mockQuery([{ next_seq: 1 }], [], []);
-    await getHandler("chat.appendMessage")(
-      { session_id: "sess1", role: "tool", content: "ok", tool_name: "read", toolset: "filesystem" },
-      "a1",
-    );
-    expect(query.mock.calls[1][0]).toContain("toolset");
-    expect(query.mock.calls[1][1]).toEqual(expect.arrayContaining(["filesystem"]));
-  });
 });
 
 describe("chat.bindMessageTraceId", () => {
@@ -1345,10 +1335,10 @@ describe("chat.updateMessage", () => {
     expect(query).toHaveBeenCalledTimes(2);
     expect(query.mock.calls[0][0]).toContain("UPDATE chat_messages");
     expect(query.mock.calls[0][1]).toEqual([
-        "Done",
-        "delegate_to_agent",
-        null,
-        "{\"scope\":\"check\"}",
+      "Done",
+      "delegate_to_agent",
+      "{\"scope\":\"check\"}",
+      null,
       "{\"summary\":\"ok\"}",
       "success",
       123,
@@ -1359,14 +1349,21 @@ describe("chat.updateMessage", () => {
     expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
   });
 
-  it("updates a recorded invocation toolset without clearing it when the field is omitted", async () => {
-    const query = mockQuery([], []);
-    await getHandler("chat.updateMessage")(
-      { id: "msg-1", session_id: "sess1", content: "Done", toolset: "mcp:ops" },
-      "a1",
-    );
-    expect(query.mock.calls[0][0]).toContain("toolset = COALESCE(?, toolset)");
-    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining(["mcp:ops"]));
+  it("stores a wire tool_call_id under metadata without requiring a column", async () => {
+    const query = mockQuery([{ next_seq: 1 }], [], []);
+    await getHandler("chat.appendMessage")({
+      session_id: "sess1",
+      role: "tool",
+      content: "ok",
+      tool_call_id: "call-1",
+      metadata: "{\"existing\":true}",
+    }, "a1");
+    const sql = String(query.mock.calls[1][0]);
+    expect(sql).not.toContain("tool_call_id");
+    expect(sql).not.toContain("llm_round");
+    expect(query.mock.calls[1][1]).toEqual(expect.arrayContaining([
+      "{\"existing\":true,\"tool_dispatch\":{\"tool_call_id\":\"call-1\"}}",
+    ]));
   });
 });
 
@@ -1435,15 +1432,6 @@ describe("chat.getMessages", () => {
     );
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].id).toBe("m1");
-  });
-
-  it("selects and returns the persisted invocation toolset", async () => {
-    const query = mockQuery([
-      { id: "m1", session_id: "sess1", role: "tool", content: "ok", tool_name: "read", toolset: "filesystem", metadata: null },
-    ]);
-    const result = await getHandler("chat.getMessages")({ session_id: "sess1" }, "a1");
-    expect(query.mock.calls[0][0]).toContain("toolset");
-    expect(result.messages[0].toolset).toBe("filesystem");
   });
 
   it("applies before filter and custom limit", async () => {

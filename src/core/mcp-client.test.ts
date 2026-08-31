@@ -158,10 +158,6 @@ describe("createToolDefinition server description", () => {
     expect(def.description).toBe('[Server "grafana" context: Monitoring tenant ID: t-123]\nRun a PromQL query');
   });
 
-  it("tags a dynamic MCP invocation with its exact server", () => {
-    expect(makeDef(undefined, "Run a query").toolset).toBe("mcp:grafana");
-  });
-
   it("keeps the plain tool description when no server description is set", () => {
     expect(makeDef(undefined, "Run a PromQL query").description).toBe("Run a PromQL query");
     expect(makeDef("   ", "Run a PromQL query").description).toBe("Run a PromQL query");

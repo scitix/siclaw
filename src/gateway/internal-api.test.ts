@@ -525,59 +525,6 @@ describe("handleDelegationEvents", () => {
     });
   });
 
-  it("forwards toolset through the AgentBox persistence append/update bridge", async () => {
-    sessionRegistry.remember("child-1", "user-1", "agent-1");
-    sessionRegistry.remember("parent-1", "user-1", "agent-1");
-
-    const appendRes = new FakeRes();
-    await handleDelegationEvents(
-      asReq(new FakeReq(JSON.stringify({
-        type: "delegation.append_message",
-        message: {
-          sessionId: "child-1",
-          parentSessionId: "parent-1",
-          role: "tool",
-          content: "",
-          toolName: "read",
-          toolset: "filesystem",
-          fromAgentId: "agent-1",
-          targetAgentId: "agent-1",
-        },
-      }))),
-      asRes(appendRes),
-      identity,
-      frontend as unknown as FrontendWsClient,
-    );
-
-    const updateRes = new FakeRes();
-    await handleDelegationEvents(
-      asReq(new FakeReq(JSON.stringify({
-        type: "delegation.update_message",
-        message: {
-          messageId: "msg-1",
-          sessionId: "child-1",
-          content: "done",
-          toolName: "read",
-          toolset: "filesystem",
-        },
-      }))),
-      asRes(updateRes),
-      identity,
-      frontend as unknown as FrontendWsClient,
-    );
-
-    expect(appendRes.statusCode).toBe(200);
-    expect(updateRes.statusCode).toBe(200);
-    expect(frontend.calls[0]).toMatchObject({
-      method: "chat.appendMessage",
-      params: { tool_name: "read", toolset: "filesystem" },
-    });
-    expect(frontend.calls[1]).toMatchObject({
-      method: "chat.updateMessage",
-      params: { tool_name: "read", toolset: "filesystem" },
-    });
-  });
-
   it("rejects delegated session creation without an explicit userId", async () => {
     const res = new FakeRes();
     await handleDelegationEvents(

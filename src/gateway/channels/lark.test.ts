@@ -3910,19 +3910,6 @@ describe("collectChannelResponse — audit persistence", () => {
     expect(toolRows.map((m) => m.outcome)).toEqual(["error", "blocked"]);
   });
 
-  it("keeps invocation toolsets stable for out-of-order same-name calls", async () => {
-    const events = [
-      { type: "tool_execution_start", toolCallId: "a", toolName: "query", toolset: "mcp:cluster-a", args: { q: "a" } },
-      { type: "tool_execution_start", toolCallId: "b", toolName: "query", toolset: "mcp:cluster-b", args: { q: "b" } },
-      { type: "tool_execution_end", toolCallId: "b", toolName: "query", result: { content: [], details: {} } },
-      { type: "tool_execution_end", toolCallId: "a", toolName: "query", result: { content: [], details: {} } },
-    ];
-    await collectChannelResponse(fakeClient(events), "s-toolsets", "lark", { persist: { agentId: "a1" } });
-    const rows = appendMessageMock.mock.calls.map((c) => c[0] as any).filter((m) => m.role === "tool");
-    expect(rows.map((m) => m.toolset)).toEqual(["mcp:cluster-b", "mcp:cluster-a"]);
-    expect(rows.map((m) => m.toolInput)).toEqual(['{"q":"b"}', '{"q":"a"}']);
-  });
-
   it("a persist failure does not break the reply (best-effort)", async () => {
     appendMessageMock.mockRejectedValueOnce(new Error("db down"));
     const events = [

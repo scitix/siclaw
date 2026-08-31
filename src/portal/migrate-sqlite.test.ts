@@ -210,26 +210,6 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(rows.every((r) => r.seq > 0)).toBe(true);
   });
 
-  it("adds nullable chat_messages.toolset on upgrade without guessing historical values", async () => {
-    const db = getDb();
-    await runPortalMigrations();
-    await db.query("INSERT INTO siclaw_users (id, username, password_hash, role) VALUES ('u1','u','x','user')");
-    await db.query("INSERT INTO agents (id, name) VALUES ('a1','agent')");
-    await db.query("INSERT INTO chat_sessions (id, agent_id, user_id, title) VALUES ('s1','a1','u1','t')");
-    await db.query("INSERT INTO chat_messages (id, session_id, role, content) VALUES ('m1','s1','tool','legacy')");
-
-    // Recreate the pre-upgrade shape while retaining the historical row.
-    await db.query("ALTER TABLE chat_messages DROP COLUMN toolset");
-    await runPortalMigrations();
-
-    const [cols] = await db.query<Array<{ name: string }>>("PRAGMA table_info(chat_messages)");
-    expect(cols.map((c) => c.name)).toContain("toolset");
-    const [rows] = await db.query<Array<{ toolset: string | null }>>(
-      "SELECT toolset FROM chat_messages WHERE id = 'm1'",
-    );
-    expect(rows[0].toolset).toBeNull();
-  });
-
   it("model_entries.api_type is required on a fresh install", () => {
     // Protocol is a per-model attribute — one endpoint serves several — so
     // there is no meaningful provider-wide answer to inherit.

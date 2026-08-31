@@ -106,24 +106,6 @@ describe("registerAdapterRoutes — auth + routing", () => {
     expect(status).toBe(401);
   });
 
-  it("POST chat/append-message carries toolset through the standalone HTTP path", async () => {
-    query.mockResolvedValueOnce([undefined, []]).mockResolvedValueOnce([undefined, []]);
-    const { status } = await runRoute(router, fakeReq({
-      url: "/api/internal/siclaw/chat/append-message",
-      method: "POST",
-      body: {
-        session_id: "s1",
-        role: "tool",
-        content: "ok",
-        tool_name: "read",
-        toolset: "filesystem",
-      },
-    }));
-    expect(status).toBe(200);
-    expect(query.mock.calls[0][0]).toContain("toolset");
-    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining(["filesystem"]));
-  });
-
   // ── Representative happy/404 paths per domain ───────────────────────
 
   it("GET agent returns 404 when missing", async () => {
