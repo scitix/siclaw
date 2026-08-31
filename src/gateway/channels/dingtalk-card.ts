@@ -1,17 +1,9 @@
 /**
  * DingTalk (钉钉) reply-formatting helpers.
  *
- * Phase 1 (current): the DingTalk handler replies via the temporary
- * `sessionWebhook` URL with a `markdown` message once the agent finishes.
- * This module owns the locale strings and the light markdown normalisation
- * applied before sending. It mirrors `lark-card.ts` in spirit but is much
- * smaller because DingTalk's markdown renderer is close to standard GFM.
- *
- * Phase 2 (future, not implemented): DingTalk AI streaming cards give a
- * Feishu-CardKit-like "typing" experience but require a card template
- * (`cardTemplateId`) registered in the DingTalk developer console plus the
- * AI-card update OpenAPI. The `DingTalkStreamingCard` interface below is the
- * reserved seam for that work — see the TODO at the bottom.
+ * Markdown helpers remain the fallback reply path. AI card network operations
+ * live in `dingtalk-card-api.ts`, while this module owns shared locale strings,
+ * markdown normalization, and the card lifecycle handle.
  */
 
 /**
@@ -128,22 +120,15 @@ export function buildTextMessage(content: string): Record<string, unknown> {
   return { msgtype: "text", text: { content } };
 }
 
-// ── Phase 2 reserved seam (NOT implemented) ───────────────────────────
+// ── AI card lifecycle handle ──────────────────────────────────────────
 //
-// DingTalk AI streaming cards would replace the single markdown reply with a
-// live "typing" card, matching the Feishu CardKit UX. Implementing it requires:
-//   1. A card template registered in the DingTalk developer console; the
-//      resulting `cardTemplateId` would become a per-channel config field.
-//   2. Creating a card instance and delivering it to the conversation
-//      (`/v1.0/card/instances` + `.../deliver`).
-//   3. Streaming updates via the AI-card update OpenAPI as agent output
-//      arrives, then a terminal "finished" update.
-//
-// When implemented, `openTypingCard`/`finalizeCard` here would mirror the
-// lark-card contract: return `null`/`false` on failure so the handler can
-// fall back to `buildMarkdownMessage` over `sessionWebhook` (the Phase 1 path).
+// Network operations live in `dingtalk-card-api.ts`; this module remains the
+// owner of card-facing text formatting and the shared lifecycle handle.
 export interface DingTalkStreamingCard {
-  cardInstanceId: string;
-  /** Monotonic counter for ordering streamed updates, as the API requires. */
-  sequence: number;
+  /** Stable caller-generated identifier used by all card update APIs. */
+  outTrackId: string;
+  /** Platform card instance id, when returned by createAndDeliver. */
+  cardInstanceId?: string;
+  /** Delivery tracking key used for future recall/quote support. */
+  processQueryKey?: string;
 }

@@ -5,9 +5,10 @@
  * Routes messages dynamically via channel_bindings (not a hardcoded agent).
  * Supports the PAIR command for binding chat groups to agents.
  *
- * Reply path (Phase 1): once the agent finishes, we POST a markdown message
- * to the message's temporary `sessionWebhook` URL. The streaming "typing card"
- * UX is a reserved Phase 2 seam (see `dingtalk-card.ts`).
+ * Reply path: Markdown over the temporary `sessionWebhook` remains the default.
+ * Channels configured with `reply_mode=ai_card` create a DingTalk AI card,
+ * stream throttled answer snapshots into it, and fall back to the webhook path
+ * if card creation or finalization fails.
  *
  * Delivery ACK: DingTalk's Stream gateway redelivers any callback it does not
  * get a response for within a short window, and the SDK's `onCallback` does
@@ -47,12 +48,17 @@ import { deliverImages } from "./dingtalk-image.js";
 import {
   buildMarkdownMessage,
   buildTextMessage,
+  sanitizeMarkdownForDingTalk,
+  DEFAULT_PLACEHOLDER,
   EMPTY_RESULT_NOTICE,
   AGENT_ERROR_NOTICE,
 } from "./dingtalk-card.js";
+import { openTypingCard, streamCardContent, finalizeTypingCard } from "./dingtalk-card-api.js";
+import { createDingTalkCardStreamController } from "./dingtalk-card-stream.js";
 
 /** Robot-message callback topic (see SDK `constants`). */
 const TOPIC_ROBOT = "/v1.0/im/bot/messages/get";
+const DEFAULT_CARD_STREAM_INTERVAL_MS = 1_000;
 
 /**
  * Hosts we are willing to POST agent output to. DingTalk hands us a temporary
@@ -84,6 +90,17 @@ export interface DingTalkChannelConfig {
   client_id: string;
   /** ClientSecret — AppSecret from the DingTalk developer console. */
   client_secret: string;
+  /** Reply transport. Markdown remains the backward-compatible default. */
+  reply_mode?: "markdown" | "ai_card";
+  /** AI card template registered in the DingTalk developer console. */
+  card_template_id?: string;
+  /** Minimum interval between streaming card updates. Portal values arrive as strings. */
+  card_stream_interval_ms?: number | string;
+}
+
+function resolveCardStreamInterval(config: DingTalkChannelConfig): number {
+  const value = Number(config.card_stream_interval_ms);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_CARD_STREAM_INTERVAL_MS;
 }
 
 /**
@@ -309,6 +326,9 @@ export async function handleDingTalkMessage(
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
+  // Declared out here because the card is finalized after the turn lock is
+  // released, on both the busy-notice and the normal reply path.
+  let cardController: ReturnType<typeof createDingTalkCardStreamController> | null = null;
   // Acquired INSIDE the try so a busy session surfaces through the SAME path the
   // AgentBox's 409 already used — the friendly "still working" notice. Outside it the
   // rejection escaped every handler and the user got nothing at all.
@@ -371,6 +391,33 @@ export async function handleDingTalkMessage(
     modelRouting: modelBinding?.modelRouting,
     systemPromptTemplate,
   };
+
+  // AI cards are opt-in. Open the visible placeholder immediately before the
+  // AgentBox run; any create failure leaves cardController null and preserves
+  // the existing sessionWebhook reply path.
+  if (config?.reply_mode === "ai_card") {
+    const card = await openTypingCard(config, {
+      routeType,
+      conversationId,
+      senderStaffId: message.senderStaffId,
+    }, DEFAULT_PLACEHOLDER);
+    if (card) {
+      cardController = createDingTalkCardStreamController({
+        intervalMs: resolveCardStreamInterval(config),
+        updateCard: (snapshot) => streamCardContent(
+          config,
+          card,
+          sanitizeMarkdownForDingTalk(snapshot),
+        ),
+        finalizeCard: (finalText) => finalizeTypingCard(
+          config,
+          card,
+          sanitizeMarkdownForDingTalk(finalText),
+        ),
+      });
+    }
+  }
+
   try {
     const promptResult = await client.prompt(promptOpts);
     if (promptMessageId) {
@@ -379,9 +426,11 @@ export async function handleDingTalkMessage(
       });
     }
     // Collect the reply with audit persistence (assistant + tool rows, when the
-    // session row exists) AND image artifacts for channel delivery.
+    // session row exists), image artifacts, and optional non-blocking text
+    // snapshots for the AI card controller.
     const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
       includeImages: true,
+      onTextSnapshot: cardController ? (snapshot) => cardController?.update(snapshot) : undefined,
       persist: auditable ? { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId } : undefined,
     });
     resultText = collected.text;
@@ -399,7 +448,9 @@ export async function handleDingTalkMessage(
   // ("Session is already running") — surface a friendly "still working" notice
   // rather than a scary error, and DON'T clobber the in-flight session.
   if (agentError && isSessionBusyError(agentError)) {
-    await replyToDingTalk(sessionWebhook, buildTextMessage("\u23F3 上一条消息还在处理中，请稍候再发。"));
+    const busyNotice = "\u23F3 上一条消息还在处理中，请稍候再发。";
+    if (cardController && await cardController.finalize(busyNotice)) return;
+    await replyToDingTalk(sessionWebhook, buildTextMessage(busyNotice));
     return;
   }
 
@@ -410,12 +461,19 @@ export async function handleDingTalkMessage(
     ? AGENT_ERROR_NOTICE
     : (resultText || EMPTY_RESULT_NOTICE);
 
-  // Errors and the empty-result notice go out as plain text; real answers as
-  // markdown so formatting (code blocks, lists, bold) renders.
-  const body = agentError
-    ? buildTextMessage(finalBody)
-    : (resultText ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));
-  await replyToDingTalk(sessionWebhook, body);
+  // Prefer completing the already-visible AI card. If creation was unavailable
+  // or the terminal update failed, preserve the original webhook transport so
+  // the answer is never lost (at the cost of a possible duplicate after an
+  // ambiguous network failure).
+  const deliveredByCard = cardController
+    ? await cardController.finalize(finalBody)
+    : false;
+  if (!deliveredByCard) {
+    const body = agentError
+      ? buildTextMessage(finalBody)
+      : (resultText ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));
+    await replyToDingTalk(sessionWebhook, body);
+  }
 
   // Deliver any agent-produced images as separate robot messages (mirrors
   // Lark's replyVisualImages). Best-effort and post-text: image delivery needs
