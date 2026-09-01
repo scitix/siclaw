@@ -639,6 +639,26 @@ describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
     expect(spawner.spawnCalls).toHaveLength(1);
   });
 
+  /**
+   * 🔴 The SINGLE-BOX path reads its box through spawner.get(), not through a listing, and
+   * that projection used to omit certExpiresAt — so this check silently passed on "unknown
+   * is usable" and the certificate fix did nothing for every one-box agent. The spawner side
+   * is pinned in k8s-spawner.test.ts; this is the manager side of the same contract.
+   */
+  it("recreates a single box whose certificate expired, as reported through get()", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", {
+      ...runningPod("ca-v2"),
+      certExpiresAt: new Date(Date.now() - 1000),
+    });
+
+    await mgr.getOrCreate("agent-a");
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
   it("reuses a running pod that carries no expiry at all (pre-label pod)", async () => {
     // Unknown is not expired. The CA-fingerprint version of this check once read a missing
     // label as stale and drained every box on sight.
@@ -1689,6 +1709,59 @@ describe("AgentBoxManager — a pool that is at size but not up yet", () => {
     await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
 
     expect(spawner.spawnCalls.map((c) => c.instance)).toContain(0);
+  });
+
+  /**
+   * 🔴 `starting` was too narrow. missingInstances counts capacity as every pod that is not
+   * `stopped`, which also covers `error` — what a Failed/Unknown phase, or a pod with no
+   * phase yet, maps to — plus `stopping` and a running box with a dead certificate. Matching
+   * only `starting` left all of those falling through to freeInstances; measured by review,
+   * five requests pushed the highest index to 6.
+   */
+  for (const status of ["error", "stopping"] as const) {
+    it(`rebuilds a ${status} slot in place instead of allocating past the pool`, async () => {
+      const spawner = new PoolSpawner("k8s");
+      spawner.pool = [
+        poolBox("agentbox-agent-a-0", 0, { status, endpoint: "" }),
+        poolBox("agentbox-agent-a-1", 1, { status, endpoint: "" }),
+      ];
+      const mgr = pooledManager(spawner, 2);
+
+      for (let i = 0; i < 5; i++) {
+        await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+      }
+
+      const indices = spawner.spawnCalls.map((c) => c.instance ?? -1);
+      expect(Math.max(...indices)).toBeLessThan(2);
+    });
+  }
+
+  /**
+   * A running box with a dead certificate takes a DIFFERENT route, and the distinction is
+   * worth pinning: markStaleBoxesDraining judges it urgent and drains it, so it stops
+   * counting as capacity and `missing` is non-empty — the replacement legitimately takes an
+   * index above `replicas`, because the draining box still owns its name until it is reaped
+   * ("indices need not be contiguous; the pool converges").
+   *
+   * What must NOT happen is a fresh index PER REQUEST. The bound is the number of distinct
+   * slots, not their numeric value.
+   */
+  it("replaces expired boxes on a bounded set of slots, not one per request", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const expired = { caFingerprint: "ca-v1", certExpiresAt: new Date(Date.now() - 1000) };
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, expired),
+      poolBox("agentbox-agent-a-1", 1, expired),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    for (let i = 0; i < 5; i++) {
+      await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+    }
+
+    const distinct = new Set(spawner.spawnCalls.map((c) => c.instance ?? -1));
+    expect(distinct.size).toBeLessThanOrEqual(2); // the pool's width, however they are numbered
   });
 });
 

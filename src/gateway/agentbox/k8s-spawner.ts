@@ -1214,24 +1214,18 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const pod = await this.coreApi.readNamespacedPod({ name: boxId, namespace });
 
-      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
-      const status = this.mapPodStatus(pod);
-      const podIP = pod.status?.podIP;
-
-      return {
-        boxId,
-        agentId,
-        status,
-        exitedUnexpectedly: this.exitedUnexpectedly(pod),
-        endpoint: podIP ? `https://${podIP}:3000` : "",
-        createdAt: pod.metadata?.creationTimestamp
-          ? new Date(pod.metadata.creationTimestamp)
-          : new Date(),
-        lastActiveAt: new Date(),
-        caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
-        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
-        ...this.replicaFields(pod),
-      };
+      // 🔴 THROUGH toBoxInfo, never hand-rolled. This function used to build the same shape
+      // field by field, and the copy fell behind: it never carried `certExpiresAt`, so the
+      // SINGLE-BOX acquisition path (getOrCreateK8s reads a box through get()) saw "expiry
+      // unknown", read that as usable — correctly, that is the fail-open rule — and went on
+      // returning an endpoint mTLS could no longer complete. The certificate fix was
+      // therefore inert for exactly the agents that run one box.
+      //
+      // This is the SECOND time a second projection caused that class of bug; the first cost
+      // a spawn loop when list() omitted the CA fingerprint, which is why toBoxInfo says
+      // ONE mapper on purpose. `boxId` stays the argument rather than the pod's name so the
+      // lookup answers about the name it was asked about.
+      return { ...this.toBoxInfo(pod), boxId };
     } catch (err: any) {
       if (err.code === 404 || err.statusCode === 404) {
         return null;

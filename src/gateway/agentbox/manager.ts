@@ -558,16 +558,28 @@ export class AgentBoxManager {
       // while the pool was never actually short. This is the other half of the observed
       // index climb.
       //
-      // So when the pool is at size and simply not up yet, WAIT for a slot that is already
-      // starting instead of adding one. Passing its index to spawnInstances joins the
-      // in-flight spawn when there is one, and otherwise finds the existing pod and waits
-      // for it to become ready — which is exactly what this turn needs.
-      const startingSlots = pool
-        .filter((b) => b.status === "starting" && !this.draining.has(b.boxId))
+      // So when the pool is at size, act on a slot it ALREADY OCCUPIES instead of adding
+      // one. The set has to be "occupied but not placeable", NOT just `starting`: capacity
+      // in missingInstances is every pod that is not `stopped`, which also covers `error`
+      // (what a `Failed`/`Unknown` phase, or a pod with no phase yet, maps to), `stopping`,
+      // and a `running` box whose certificate died. Matching only `starting` left every one
+      // of those falling through to freeInstances — measured by review: five requests
+      // pushed the highest index to 6.
+      //
+      // Passing an occupied index to spawnInstances does the right thing in each case: it
+      // joins an in-flight spawn, waits out a pod that is merely slow, or deletes and
+      // recreates one that is Failed/Unknown or holding a dead certificate. Draining slots
+      // are excluded — the roll owns those, and a pool with nothing but draining boxes has a
+      // non-empty `missing` anyway, since missingInstances counts only non-draining boxes as
+      // capacity.
+      const occupiedUnusable = pool
+        .filter((b) => b.status !== "stopped"
+          && !this.draining.has(b.boxId)
+          && !this.isPlaceable(b, wantProfile))
         .map((b) => b.instance ?? 0)
         .sort((a, b) => a - b);
       const target = missing.length > 0 ? missing
-        : startingSlots.length > 0 ? startingSlots
+        : occupiedUnusable.length > 0 ? occupiedUnusable
         : this.freeInstances(pool, 1);
       const [first, ...rest] = target;
       // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that

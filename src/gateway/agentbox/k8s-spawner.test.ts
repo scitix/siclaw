@@ -1649,6 +1649,76 @@ describe("K8sSpawner — a cert Secret is stale when the LEAF expires, not only 
   });
 });
 
+describe("K8sSpawner — get() and the listings must report the SAME shape", () => {
+  const g = globalThis as any;
+
+  /**
+   * 🔴 ONE MAPPER, and this is the test that enforces it rather than the comment saying so.
+   *
+   * Two projections of a pod have now caused the same class of bug twice. First list()
+   * omitted the CA fingerprint, so the reaper read every fresh box as signed by a CA it no
+   * longer trusted and replaced it — a spawn loop. Then get() omitted the certificate
+   * expiry, so the SINGLE-BOX acquisition path (getOrCreateK8s reads through get()) saw
+   * "unknown", read that as usable, and kept handing out an endpoint mTLS could not
+   * complete — making the certificate fix inert for every one-box agent.
+   *
+   * Comparing KEY SETS rather than named fields is deliberate: a test that lists the fields
+   * it knows about cannot fail for the field somebody forgets next.
+   */
+  const podWithEverything = (name: string) => ({
+    metadata: {
+      name,
+      creationTimestamp: new Date("2026-09-01T00:00:00Z"),
+      labels: {
+        "siclaw.io/app": "agentbox",
+        "siclaw.io/agent": "agent-x",
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-exp": String(Math.floor(daysFromNow(20).getTime() / 1000)),
+        "siclaw.io/boxType": "agent",
+        "siclaw.io/instance": "0",
+      },
+    },
+    status: { phase: "Running", podIP: "10.0.0.5", conditions: [{ type: "Ready", status: "True" }] },
+    spec: { containers: [{ image: "img:v1" }] },
+  });
+
+  it("reports the certificate expiry through get(), not only through the listings", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    g.__k8sImpls.readNamespacedPod = async () => podWithEverything("agentbox-agent-x-0");
+
+    const info = await s.get("agentbox-agent-x-0");
+
+    expect(info?.certExpiresAt).toBeInstanceOf(Date);
+    expect(info?.caFingerprint).toBe(FAKE_CA_FP);
+  });
+
+  it("returns the same fields from get() as from listForAgent()", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    const pod = podWithEverything("agentbox-agent-x-0");
+    g.__k8sImpls.readNamespacedPod = async () => pod;
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [pod] });
+
+    const viaGet = await s.get("agentbox-agent-x-0");
+    const [viaList] = await s.listForAgent("agent-x");
+
+    expect(Object.keys(viaGet ?? {}).sort()).toEqual(Object.keys(viaList ?? {}).sort());
+  });
+
+  it("keeps get() answering about the name it was asked for", async () => {
+    // The pod's own metadata.name is authoritative for the listings; a lookup by name must
+    // still describe the name the caller used.
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    g.__k8sImpls.readNamespacedPod = async () => podWithEverything("something-else");
+
+    const info = await s.get("agentbox-agent-x-0");
+
+    expect(info?.boxId).toBe("agentbox-agent-x-0");
+  });
+});
+
 describe("K8sSpawner — waitForPodReady", () => {
   const g = globalThis as any;
 
