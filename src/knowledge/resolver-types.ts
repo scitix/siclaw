@@ -13,6 +13,11 @@ export interface KnowledgeEvidenceSection {
   content: string;
 }
 
+export interface KnowledgePageCitationCapability {
+  citationMode: "evidence" | "page" | "none";
+  evidenceRefs?: string[];
+}
+
 export interface KnowledgeEvidencePage {
   rank: number;
   file: string;
@@ -92,6 +97,9 @@ export interface CreateKnowledgeResolverOptions {
   readPage: (absolutePath: string) => Promise<string>;
   /** Read-only preview that does not register the page as answer evidence. */
   inspectPage?: (absolutePath: string) => Promise<string>;
+  /** Resolve citation capability from the same registered page snapshot and
+   * frozen repository manifest used by knowledge_cite. */
+  resolveCitation?: (absolutePath: string, content: string) => KnowledgePageCitationCapability;
   evidenceBudgetCharsRef: { current: number };
   maxCandidates?: number;
   rerankCandidates?: number;

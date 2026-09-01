@@ -171,22 +171,6 @@ function resultId(file: string, body: string): string {
   return createHash("sha256").update(file).update("\0").update(body).digest("hex");
 }
 
-function extractEvidenceRefs(file: string, content: string): string[] {
-  const refs: string[] = [];
-  const marker = /<!--[ \t]*okf:evidence[ \t]+(\{[^\r\n]*\})[ \t]*-->/g;
-  for (const match of content.matchAll(marker)) {
-    try {
-      const payload = JSON.parse(match[1]) as { id?: unknown };
-      if (typeof payload.id === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(payload.id)) {
-        refs.push(`${file}#${payload.id}`);
-      }
-    } catch {
-      // Invalid markers are intentionally not advertised as citable evidence.
-    }
-  }
-  return [...new Set(refs)];
-}
-
 function groupLeafCandidates(chunks: MemoryChunk[]): PageCandidate[] {
   const byFile = new Map<string, PageCandidate>();
   for (const chunk of chunks) {
@@ -467,9 +451,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
         endLine: Math.max(1, body.split(/\r?\n/).length),
         content: body,
       }];
-      const selectedContent = sections.map((section) => section.content).join("\n");
-      const evidenceRefs = extractEvidenceRefs(directCandidate.file, selectedContent);
-      const pageHasEvidenceMarkers = /<!--[ \t]*okf:evidence\b/.test(body);
+      const citation = options.resolveCitation?.(absolutePath, body) ?? { citationMode: "none" as const };
       const result: KnowledgeEvidencePage = {
         rank: 1,
         file: directCandidate.file,
@@ -484,8 +466,8 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
         ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
         readMode: "full_page",
         truncated: false,
-        citationMode: evidenceRefs.length > 0 ? "evidence" : pageHasEvidenceMarkers ? "none" : "page",
-        ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
+        citationMode: citation.citationMode,
+        ...(citation.evidenceRefs?.length ? { evidenceRefs: citation.evidenceRefs } : {}),
         sections,
       };
 

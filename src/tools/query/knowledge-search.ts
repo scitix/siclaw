@@ -38,6 +38,7 @@ export function createKnowledgeSearchTool(
       "Optional accelerator for a concrete knowledge question that likely has one direct page answer. " +
       "Use it at most once per user turn with the question as asked; do not repeatedly rewrite or search. " +
       "A direct_hit contains one page snapshot, but similarity is not proof: validate subject, task, version, environment, and scope before using it, then cite only material actually used. " +
+      "For a direct_hit, follow citationMode exactly: use returned evidenceRefs for evidence, pass the page for page, and do not call knowledge_cite for none. " +
       "An explore result contains unverified page hints, not evidence. Continue with Find/Grep/Read using the returned indexPath, readPath hints, and linked pages for broad, novel, ambiguous, comparative, weak-match, or cross-page questions. " +
       "Unavailable also means use Wiki exploration; neither status means the knowledge is absent. Bound Skills supplement domain reasoning and must not replace it.",
     parameters: Type.Object({

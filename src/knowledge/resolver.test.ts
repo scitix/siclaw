@@ -30,11 +30,13 @@ describe("KnowledgeResolver", () => {
     };
     const inspectPage = pageReader(pages);
     const readPage = pageReader(pages);
+    const resolveCitation = vi.fn(() => ({ citationMode: "none" as const }));
     const resolver = createKnowledgeResolver({
       indexer,
       knowledgeDir,
       inspectPage,
       readPage,
+      resolveCitation,
       evidenceBudgetCharsRef: { current: 8_000 },
     });
 
@@ -54,6 +56,7 @@ describe("KnowledgeResolver", () => {
       metadataScore: 1,
       readMode: "full_page",
       truncated: false,
+      citationMode: "none",
       metadata: { tags: ["B200", "Ubuntu", "driver", "upgrade"] },
     });
     expect(result.results[0].resultId).toMatch(/^[a-f0-9]{64}$/);
@@ -62,6 +65,36 @@ describe("KnowledgeResolver", () => {
     expect(inspectPage).toHaveBeenCalledTimes(2);
     expect(readPage).toHaveBeenCalledOnce();
     expect(readPage).toHaveBeenCalledWith(path.join(knowledgeDir, "b200.md"));
+    expect(resolveCitation).toHaveBeenCalledWith(path.join(knowledgeDir, "b200.md"), pages["b200.md"]);
+  });
+
+  it("returns only citation capability resolved from the registered page snapshot", async () => {
+    const indexer = indexReturning([
+      { file: "gpu.md", heading: "GPU driver upgrade", content: "GPU driver upgrade", startLine: 1, endLine: 8, score: 0.95 },
+    ]);
+    const body = "---\ntitle: GPU driver upgrade\ndescription: GPU driver upgrade\n---\n# GPU driver upgrade\n";
+    const resolver = createKnowledgeResolver({
+      indexer,
+      knowledgeDir,
+      inspectPage: vi.fn(async () => body),
+      readPage: vi.fn(async () => body),
+      resolveCitation: vi.fn(() => ({
+        citationMode: "evidence",
+        evidenceRefs: ["gpu.md#ev.upgrade"],
+      })),
+      evidenceBudgetCharsRef: { current: 8_000 },
+    });
+
+    const result = await resolver.lookup("GPU driver upgrade");
+
+    expect(result).toMatchObject({
+      status: "direct_hit",
+      results: [{
+        file: "gpu.md",
+        citationMode: "evidence",
+        evidenceRefs: ["gpu.md#ev.upgrade"],
+      }],
+    });
   });
 
   it("uses navigation pages only as exploration context", async () => {

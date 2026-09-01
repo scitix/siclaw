@@ -6,6 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../tools/infra/tool-render.js";
 import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
+import type { KnowledgePageCitationCapability } from "../knowledge/resolver-types.js";
 import type { SessionEventEmitter } from "./tool-registry.js";
 import {
   MAX_EVIDENCE_SOURCES_PER_MARKER,
@@ -209,12 +210,12 @@ Trusted original-source metadata is not available for this knowledge mount. Do n
     return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass those as \`pages\` in the same call. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass those as \`pages\` in the same call. For a \`knowledge_search\` direct hit, follow its \`citationMode\` exactly and do not call \`knowledge_cite\` for that page when the mode is \`none\`. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
   }
   return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-${MAX_KNOWLEDGE_CITATIONS} knowledge pages you successfully Read this turn and actually used. Do not register an index, catalog, or a page you merely inspected. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-${MAX_KNOWLEDGE_CITATIONS} knowledge pages you successfully Read this turn and actually used. For a \`knowledge_search\` direct hit, follow its \`citationMode\` exactly and do not call \`knowledge_cite\` for that page when the mode is \`none\`. Do not register an index, catalog, or a page you merely inspected. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`;
 }
 
 function findCitationRepo(manifest: CitationManifest, rel: string): CitationManifestRepo | undefined {
@@ -230,6 +231,72 @@ function findCitationRepo(manifest: CitationManifest, rel: string): CitationMani
   return best;
 }
 
+function resolveEvidenceSources(
+  provenance: PageProvenance,
+  repo: CitationManifestRepo,
+  evidence: PageEvidence,
+): Array<{ sourceId: string; source: CitationManifestSource }> | null {
+  const pageSourceById = new Map(
+    provenance.sources.filter((source) => source.sourceId).map((source) => [source.sourceId!, source]),
+  );
+  const manifestSourceById = new Map(
+    repo.sources.filter((source) => source.sourceId).map((source) => [source.sourceId!, source]),
+  );
+  const resolved: Array<{ sourceId: string; source: CitationManifestSource }> = [];
+  for (const sourceId of evidence.sourceIds) {
+    const pageSource = pageSourceById.get(sourceId);
+    const source = manifestSourceById.get(sourceId);
+    if (!pageSource || !source || normalizedResource(source.resource) !== pageSource.resource) {
+      return null;
+    }
+    resolved.push({ sourceId, source });
+  }
+  return resolved;
+}
+
+function resolvePageSources(
+  provenance: PageProvenance,
+  repo: CitationManifestRepo,
+): CitationManifestSource[] {
+  const sourceByResource = new Map(repo.sources.map((source) => [normalizedResource(source.resource), source]));
+  return provenance.sources.flatMap((pageSource) => {
+    const source = sourceByResource.get(pageSource.resource);
+    return source ? [source] : [];
+  });
+}
+
+function pageCitationCapability(
+  manifest: CitationManifest | null,
+  knowledgeDir: string,
+  pagePath: string,
+  body: string,
+): KnowledgePageCitationCapability {
+  if (!manifest) return { citationMode: "none" };
+  const page = path.resolve(pagePath);
+  const root = path.resolve(knowledgeDir);
+  if (!page.endsWith(".md") || !(page === root || page.startsWith(root + path.sep))) {
+    return { citationMode: "none" };
+  }
+  const rel = path.relative(root, page).replaceAll(path.sep, "/");
+  if (isKnowledgeNavigationPage(rel, body)) return { citationMode: "none" };
+  const repo = findCitationRepo(manifest, rel);
+  const provenance = pageProvenanceFromBody(body);
+  if (!repo || !provenance) return { citationMode: "none" };
+
+  if (provenance.evidence.size > 0) {
+    const evidenceRefs = [...provenance.evidence.values()]
+      .filter((evidence) => resolveEvidenceSources(provenance, repo, evidence) !== null)
+      .map((evidence) => `${rel}#${evidence.id}`);
+    return evidenceRefs.length > 0
+      ? { citationMode: "evidence", evidenceRefs }
+      : { citationMode: "none" };
+  }
+
+  return resolvePageSources(provenance, repo).length > 0
+    ? { citationMode: "page" }
+    : { citationMode: "none" };
+}
+
 export function createKnowledgeCitationSupport(opts: {
   knowledgeDir: string;
   turnRef: { current: number };
@@ -237,6 +304,7 @@ export function createKnowledgeCitationSupport(opts: {
 }): {
   captureMount: () => KnowledgeMountReceipt;
   noteRead: (pagePath: string, content: string, start: KnowledgeMountReceipt) => void;
+  citationForRead: (pagePath: string, content: string) => KnowledgePageCitationCapability;
   tool: ToolDefinition;
 } {
   let turn = -1;
@@ -279,6 +347,12 @@ export function createKnowledgeCitationSupport(opts: {
       pinnedManifest = current;
     }
     readPages.set(absolute, content);
+  };
+  const citationForRead = (pagePath: string, content: string): KnowledgePageCitationCapability => {
+    resetForTurn();
+    const absolute = path.resolve(pagePath);
+    if (readPages.get(absolute) !== content) return { citationMode: "none" };
+    return pageCitationCapability(pinnedManifest ?? null, opts.knowledgeDir, absolute, content);
   };
 
   const tool: ToolDefinition = {
@@ -346,22 +420,14 @@ export function createKnowledgeCitationSupport(opts: {
           unresolved.push(ref);
           continue;
         }
-        const pageSourceById = new Map(
-          provenance.sources.filter((source) => source.sourceId).map((source) => [source.sourceId!, source]),
-        );
-        const manifestSourceById = new Map(
-          repo.sources.filter((source) => source.sourceId).map((source) => [source.sourceId!, source]),
-        );
-        let refResolved = true;
+        const resolvedSources = resolveEvidenceSources(provenance, repo, evidence);
+        if (!resolvedSources) {
+          unresolved.push(ref);
+          continue;
+        }
         const refCitations: KnowledgeSourceCitation[] = [];
         const refSeen = new Set<string>();
-        for (const sourceId of evidence.sourceIds) {
-          const pageSource = pageSourceById.get(sourceId);
-          const source = manifestSourceById.get(sourceId);
-          if (!pageSource || !source || normalizedResource(source.resource) !== pageSource.resource) {
-            refResolved = false;
-            break;
-          }
+        for (const { sourceId, source } of resolvedSources) {
           if (seenURLs.has(source.url) || refSeen.has(source.url)) continue;
           refSeen.add(source.url);
           refCitations.push({
@@ -372,10 +438,6 @@ export function createKnowledgeCitationSupport(opts: {
             page: rel,
             evidence: evidenceId,
           });
-        }
-        if (!refResolved) {
-          unresolved.push(ref);
-          continue;
         }
         for (const citation of refCitations) {
           seenURLs.add(citation.url);
@@ -433,10 +495,9 @@ export function createKnowledgeCitationSupport(opts: {
           }
           const repo = findCitationRepo(manifest, rel);
           if (!repo) continue;
-          const sourceByResource = new Map(repo.sources.map((source) => [normalizedResource(source.resource), source]));
-          for (const resource of provenance?.sources.map((source) => source.resource) ?? []) {
-            const source = sourceByResource.get(resource);
-            if (!source || seenURLs.has(source.url)) continue;
+          if (!provenance) continue;
+          for (const source of resolvePageSources(provenance, repo)) {
+            if (seenURLs.has(source.url)) continue;
             seenURLs.add(source.url);
             citations.push({ title: source.title, url: source.url, resource: source.resource, page: rel });
           }
@@ -464,5 +525,5 @@ export function createKnowledgeCitationSupport(opts: {
       );
     },
   };
-  return { captureMount, noteRead, tool };
+  return { captureMount, noteRead, citationForRead, tool };
 }

@@ -517,6 +517,8 @@ export async function createSiclawSession(
           }
           return body;
         },
+        resolveCitation: (absolutePath, body) =>
+          citationSupport?.citationForRead(absolutePath, body) ?? { citationMode: "none" },
       })
     : undefined;
 

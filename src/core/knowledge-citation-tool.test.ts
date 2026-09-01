@@ -45,6 +45,41 @@ describe("knowledge_cite", () => {
     return { dir, page };
   }
 
+  it("reports citation capability per repository in a mixed knowledge mount", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-mixed-"));
+    dirs.push(dir);
+    const hardwarePage = path.join(dir, "repos", "hardware", "catcher.md");
+    const sopPage = path.join(dir, "repos", "sop", "xstor.md");
+    fs.mkdirSync(path.dirname(hardwarePage), { recursive: true });
+    fs.mkdirSync(path.dirname(sopPage), { recursive: true });
+    const hardwareBody = "---\nsources:\n  - resource: raw/catcher.md\n---\n# Catcher\n";
+    const sopBody = "---\nsources:\n  - resource: raw/xstor.md\n---\n# XStor\n";
+    fs.writeFileSync(hardwarePage, hardwareBody);
+    fs.writeFileSync(sopPage, sopBody);
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({
+      version: 1,
+      repos: [
+        { id: "hardware", root: "repos/hardware", sources: [{
+          resource: "catcher.md",
+          title: "Catcher",
+          url: "https://docs.feishu.cn/wiki/catcher",
+        }] },
+        { id: "sop", root: "repos/sop", sources: [] },
+      ],
+    }));
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: () => {},
+    });
+
+    readPage(support, hardwarePage, hardwareBody);
+    readPage(support, sopPage, sopBody);
+
+    expect(support.citationForRead(hardwarePage, hardwareBody)).toEqual({ citationMode: "page" });
+    expect(support.citationForRead(sopPage, sopBody)).toEqual({ citationMode: "none" });
+  });
+
   it("emits only sources from pages successfully read in the current turn", async () => {
     const { dir, page } = fixture();
     const events: Record<string, unknown>[] = [];
@@ -176,6 +211,10 @@ The rack power budget and port inventory come from the ASUS sales kit.
       sessionEventEmitter: (event) => events.push(event),
     });
     readPage(support, page);
+    expect(support.citationForRead(page, fs.readFileSync(page, "utf8"))).toEqual({
+      citationMode: "evidence",
+      evidenceRefs: ["entities/GB-supernode.md#ev.gb300.asus.rack-power-ports"],
+    });
 
     await expect(support.tool.execute("call", {
       evidence_refs: ["entities/GB-supernode.md#ev.gb300.asus.rack-power-ports"],
@@ -215,6 +254,7 @@ sources:
       sessionEventEmitter: (event) => events.push(event),
     });
     readPage(support, page);
+    expect(support.citationForRead(page, fs.readFileSync(page, "utf8"))).toEqual({ citationMode: "none" });
 
     await expect(support.tool.execute("call", {
       evidence_refs: ["guide.md#ev.missing"],
