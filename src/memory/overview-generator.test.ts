@@ -294,6 +294,8 @@ describe("buildKnowledgeWikiCatalog", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
+    expect(out).toContain(`under \`${knowledgeDir}\``);
+    expect(out).toContain(`catalog is \`${path.join(knowledgeDir, "index.md")}\``);
     expect(out).toContain("complete page catalog");
     expect(out).toContain("typed page labels only");
     expect(out).toContain("navigation metadata, not answer evidence");
