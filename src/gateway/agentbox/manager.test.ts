@@ -1701,6 +1701,48 @@ describe("AgentBoxManager — a pool that is at size but not up yet", () => {
     expect(Math.max(...indices)).toBeLessThan(2);
   });
 
+  /**
+   * 🔴 PRIORITY IS NOT ABANDONMENT. A starting slot is the right thing to WAIT on — cheaper
+   * than deleting and recreating a pod — but the rebuildable slots still have to be dealt
+   * with, because nothing else deals with them: healCrashedBoxes collects `stopped` boxes
+   * only, so an `error` slot (a Failed/Unknown phase, or a pod with no phase yet) is
+   * invisible to the reaper. Review measured a pool of starting(0) + error(1) where every
+   * request went to instance 0 and instance 1 was never touched again — permanently broken
+   * capacity if the starting pod stayed Pending.
+   */
+  it("does not strand an error slot while waiting on a starting one", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20)); // the stranded rebuild goes to the background
+
+    const touched = new Set(spawner.spawnCalls.map((c) => c.instance));
+    expect(touched.has(0)).toBe(true); // waited on
+    expect(touched.has(1)).toBe(true); // and not forgotten
+  });
+
+  it("still fuses the stranded rebuild — the background path is not a way around the budget", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+    while ((mgr as any).spendDrainBudget("agent-a")) { /* exhaust, whatever its size */ }
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20));
+
+    const touched = new Set(spawner.spawnCalls.map((c) => c.instance));
+    expect(touched.has(0)).toBe(true);  // waiting is never fused
+    expect(touched.has(1)).toBe(false); // the rebuild is
+  });
+
   it("still allocates a free index when the pool is genuinely empty", async () => {
     const spawner = new PoolSpawner("k8s");
     spawner.pool = [];

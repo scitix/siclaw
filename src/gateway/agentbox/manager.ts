@@ -622,16 +622,33 @@ export class AgentBoxManager {
       //
       // So the fuse is handed to spawnInstances as an `admit` gate, which consults it only
       // for a slot it is actually creating. Nothing is charged here.
-      const rebuildGate = (): boolean => this.spendDrainBudget(agentId);
+      // The fuse applies PER SLOT, judged by whether that slot is a rebuild — not per
+      // branch. Deciding it by branch made the priority below silently change whether the
+      // fuse existed at all, which is how the starvation right underneath went unnoticed.
+      const rebuildSet = new Set(rebuildable);
+      const admit = (instance: number): boolean =>
+        !rebuildSet.has(instance) || this.spendDrainBudget(agentId);
+
+      // What this turn WAITS on: whichever set can produce a usable box soonest. A starting
+      // slot beats a rebuild, because waiting out a pod that is already coming up is cheaper
+      // than deleting and recreating one.
       const target = missing.length > 0 ? missing
         : awaitable.length > 0 ? awaitable
         : rebuildable.length > 0 ? rebuildable
         : this.freeInstances(pool, 1);
-      // Only the rebuild set is fused; waiting on a starting slot and filling a genuinely
-      // short pool both create nothing that the drain budget exists to bound.
-      const admit = (missing.length === 0 && awaitable.length === 0 && rebuildable.length > 0)
-        ? rebuildGate
-        : undefined;
+
+      // 🔴 …but priority must not mean ABANDONMENT. Whatever the turn waits on, every
+      // rebuildable slot still needs dealing with, because nothing else will: the reaper
+      // collects `stopped` boxes only, so an `error` slot (a Failed/Unknown phase, or a pod
+      // with no phase yet) is invisible to it. With a `starting` slot present the priority
+      // above sent every request to that one slot, and if it stayed Pending the `error` slot
+      // was never touched again — measured by review: a pool of starting(0) + error(1) only
+      // ever called instance 0.
+      //
+      // So the rebuilds the wait did not claim go to the background, still fused, still
+      // subject to the retry cooldown.
+      const awaited = new Set(target);
+      const strandedRebuilds = rebuildable.filter((i) => !awaited.has(i));
 
       if (target.length > 0) {
         const [first, ...rest] = target;
@@ -639,7 +656,7 @@ export class AgentBoxManager {
         // failed a moment ago is still worth one more try. The background remainder does
         // respect it.
         const [handle] = await this.spawnInstances(agentId, config, [first], true, admit);
-        const fillable = rest.filter((i) => this.mayFillInstance(agentId, i));
+        const fillable = [...rest, ...strandedRebuilds].filter((i) => this.mayFillInstance(agentId, i));
         if (fillable.length > 0) {
           void this.spawnInstances(agentId, config, fillable, true, admit).catch((err) =>
             console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
