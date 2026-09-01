@@ -3,6 +3,8 @@ import { AgentBoxManager } from "./manager.js";
 import { getBoxProfile } from "./box-profile.js";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
+// The same deadline the manager bounds its patience by — asserted against, not restated.
+import { POD_READY_TIMEOUT_MS } from "./k8s-spawner.js";
 
 /**
  * Tests for AgentBoxManager — agent-scoped pod identity (see 2026-04-18 spec).
@@ -1643,11 +1645,16 @@ describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
    */
   it("still tries the awaited spawn when there is nothing to serve from", async () => {
     const spawner = new PoolSpawner("k8s");
-    let attempts = 0;
+    // Failure keyed on the SLOT, not on call order: the background fill for the remaining
+    // indices is now launched before the awaited one, so "the first call" is no longer the
+    // one this test is about.
+    let slotZeroFailed = false;
     spawner.spawn = async (config: AgentBoxConfig) => {
       spawner.spawnCalls.push(config);
-      attempts++;
-      if (attempts === 1) throw new Error("no capacity");
+      if ((config.instance ?? 0) === 0 && !slotZeroFailed) {
+        slotZeroFailed = true;
+        throw new Error("no capacity");
+      }
       return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
     };
     const mgr = pooledManager(spawner, 2);
@@ -1724,6 +1731,75 @@ describe("AgentBoxManager — a pool that is at size but not up yet", () => {
     const touched = new Set(spawner.spawnCalls.map((c) => c.instance));
     expect(touched.has(0)).toBe(true); // waited on
     expect(touched.has(1)).toBe(true); // and not forgotten
+  });
+
+  /**
+   * 🔴 `void` makes the call concurrent with the CALLER, not with the line above it. Placed
+   * after the await, the "background" rebuild does not begin until the awaited slot resolves
+   * — up to POD_READY_TIMEOUT_MS on the real path. So a stuck starting slot left the
+   * stranded error slots idle for three minutes and then failed the turn anyway. Review
+   * measured spawnCalls holding only [0] until instance 0 was released.
+   */
+  it("starts the stranded rebuild WHILE waiting, not after", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if ((config.instance ?? 0) === 0) await gate; // the awaited slot stays stuck
+      return { boxId: `agentbox-agent-a-${config.instance}`, endpoint: "http://10.0.0.9:3000", agentId: config.agentId };
+    };
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    const inflight = (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20));
+
+    // BEFORE the awaited slot resolves, the rebuild must already be under way.
+    expect(spawner.spawnCalls.map((c) => c.instance)).toContain(1);
+
+    release!();
+    await inflight;
+  });
+
+  /**
+   * 🔴 A `starting` slot is worth waiting on only while it is plausibly still coming up. Past
+   * the deadline the spawner itself gives up on, a pod still `starting` is stuck — typically
+   * unschedulable, which is the storm's own signature. Waiting on it forever means every
+   * request burns POD_READY_TIMEOUT_MS and fails, in a loop, while the slot is never rebuilt:
+   * healCrashedBoxes collects `stopped` boxes only, so nothing else would ever touch it.
+   */
+  it("rebuilds a starting slot that is past the readiness deadline instead of waiting again", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const longStuck = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    longStuck.createdAt = new Date(Date.now() - POD_READY_TIMEOUT_MS - 60_000);
+    spawner.pool = [longStuck];
+    const mgr = pooledManager(spawner, 1);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]); // same slot, rebuilt
+    expect(after - before).toBe(1); // and charged, because a rebuild destroys a pod
+  });
+
+  it("keeps waiting on a starting slot that is still within the deadline", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const fresh = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    fresh.createdAt = new Date(Date.now() - 5_000);
+    spawner.pool = [fresh];
+    const mgr = pooledManager(spawner, 1);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]);
+    expect(after - before).toBe(0); // waiting destroys nothing, so nothing is charged
   });
 
   it("still fuses the stranded rebuild — the background path is not a way around the budget", async () => {

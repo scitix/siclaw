@@ -15,6 +15,11 @@ import { getBoxProfile } from "./box-profile.js";
 import { BoxBindings } from "./box-bindings.js";
 import { normalizeReplicas } from "../../core/config.js";
 import { certificateHasExpired, certificateNeedsRenewal } from "../../shared/cert-validity.js";
+// The readiness deadline is the spawner's, and the manager's patience for a `starting` slot
+// has to be the SAME number — a slot the spawner has given up waiting for is not one this
+// path should keep waiting on. Importing it rather than restating it is what keeps the two
+// from drifting; `startup-probe-window.test.ts` asserts the wider hierarchy it belongs to.
+import { POD_READY_TIMEOUT_MS } from "./k8s-spawner.js";
 
 /** What a box reports about itself (see the agentbox `/api/internal/box-status` route). */
 export interface BoxStatusReport {
@@ -608,8 +613,21 @@ export class AgentBoxManager {
         && !this.isPlaceable(b, wantProfile));
       const slotsOf = (boxes: AgentBoxInfo[]) =>
         boxes.map((b) => b.instance ?? 0).sort((a, b) => a - b);
-      const awaitable = slotsOf(notPlaceable.filter((b) => b.status === "starting"));
-      const rebuildable = slotsOf(notPlaceable.filter((b) => b.status !== "starting"));
+
+      // 🔴 `starting` is only worth WAITING on while it is plausibly still coming up. Past
+      // the readiness deadline the spawner itself gives up on, a pod that is still `starting`
+      // is not slow — it is stuck (unschedulable is the common case: the storm's own
+      // signature). Treating it as awaitable forever means every request waits out
+      // POD_READY_TIMEOUT_MS and then fails, in a loop, while the slot is never rebuilt:
+      // nothing else will do it either, since healCrashedBoxes collects `stopped` boxes only.
+      //
+      // So patience is bounded by the same deadline the spawner uses, and past it the slot
+      // joins the rebuild set — where it is fused like any other pod destruction.
+      const isComingUp = (b: AgentBoxInfo) =>
+        b.status === "starting"
+        && Date.now() - b.createdAt.getTime() < POD_READY_TIMEOUT_MS;
+      const awaitable = slotsOf(notPlaceable.filter(isComingUp));
+      const rebuildable = slotsOf(notPlaceable.filter((b) => !isComingUp(b)));
 
       // 🔴 ONE POD ACTUALLY CREATED, ONE UNIT OF BUDGET — and both halves of that sentence
       // were wrong in turn. First the budget was spent once for a whole BATCH, making the
@@ -652,15 +670,25 @@ export class AgentBoxManager {
 
       if (target.length > 0) {
         const [first, ...rest] = target;
-        // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
-        // failed a moment ago is still worth one more try. The background remainder does
-        // respect it.
-        const [handle] = await this.spawnInstances(agentId, config, [first], true, admit);
+
+        // 🔴 LAUNCHED BEFORE THE AWAIT, and the order is the whole point. `void` makes this
+        // concurrent with the caller, not with the line above it — put after the await, the
+        // "background" work does not begin until the awaited slot resolves, which on the real
+        // K8s path is up to POD_READY_TIMEOUT_MS. So a stuck `starting` slot left the
+        // stranded `error` slots idle for three minutes and then failed the turn anyway:
+        // review measured spawnCalls holding only [0] until instance 0 was released, and [1]
+        // appearing only afterwards. The recovery has to be in flight WHILE the turn waits.
         const fillable = [...rest, ...strandedRebuilds].filter((i) => this.mayFillInstance(agentId, i));
         if (fillable.length > 0) {
           void this.spawnInstances(agentId, config, fillable, true, admit).catch((err) =>
             console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
         }
+
+        // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
+        // failed a moment ago is still worth one more try. The background remainder above
+        // does respect it. Distinct instance sets, so the two calls cannot contend — and
+        // in-flight de-duplication would merge them even if they did.
+        const [handle] = await this.spawnInstances(agentId, config, [first], true, admit);
         if (handle) {
           if (sessionId) this.bindings.remember(agentId, sessionId, handle.boxId);
           return { handle, created: true };
