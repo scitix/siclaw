@@ -1166,10 +1166,18 @@ export class AgentBoxManager {
         }
       })();
 
-      // A failed attempt yields to whoever superseded it, so being replaced mid-flight is
-      // never worse for a caller than not being replaced at all.
+      // A superseded attempt yields to whoever replaced it — REGARDLESS of its own outcome,
+      // not merely when it failed.
+      //
+      // 🔴 The successor's existence means the pod this attempt is about is going to be
+      // deleted. So a handle from here is not "a success worth returning", it is an endpoint
+      // with a demolition order on it: a Pending pod that turns Ready while the replacement
+      // is still resolving its config would otherwise be handed to the original waiters
+      // moments before the replacement removes it. Yielding on failure alone covered the
+      // common case and left this one, which is worse than the failure — the caller gets an
+      // endpoint that looks fine and dies under its first request.
       let successor: Promise<AgentBoxHandle | null> | undefined;
-      const result = attempt.then((handle) => handle ?? successor ?? null);
+      const result = attempt.then((handle) => successor ?? handle);
       const entry: InflightSpawn = {
         result,
         recreate: wantRecreate,

@@ -1640,6 +1640,36 @@ describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
     expect(fromWaiter[0]?.boxId).toBe("agentbox-agent-a-0");
   });
 
+  /**
+   * 🔴 And it yields REGARDLESS of its own outcome. A Pending pod that turns Ready while the
+   * replacement is still resolving its config makes the superseded attempt SUCCEED — but the
+   * pod it succeeded about is under a demolition order. Handing that endpoint back is worse
+   * than handing back the failure: it looks fine and dies under the first request.
+   */
+  it("yields to the replacement even when the superseded attempt succeeds", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let readyNow: (() => void) | undefined;
+    const turnsReady = new Promise<void>((r) => { readyNow = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (!config.recreate) {
+        await turnsReady; // the pod becomes Ready after the rebuild has taken over
+        return { boxId: "doomed-pod", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+      }
+      return { boxId: "replacement-pod", endpoint: "http://10.0.0.2:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const waiter = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    await Promise.resolve();
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    readyNow!();
+
+    const [fromWaiter] = await Promise.all([waiter, rebuild]);
+
+    expect(fromWaiter[0]?.boxId).toBe("replacement-pod");
+  });
+
   it("does not invent a successor when nothing superseded a failed attempt", async () => {
     const spawner = new PoolSpawner("k8s");
     spawner.spawn = async (config: AgentBoxConfig) => {
