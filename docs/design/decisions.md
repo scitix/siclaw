@@ -671,3 +671,44 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 **Files**: `src/core/agent-context.ts`, `src/core/prompt.ts`,
 `src/core/agent-factory.ts`, `src/core/model-envelope.ts`,
 `src/agentbox-main.ts`, `src/gateway/agentbox/local-spawner.ts`
+
+---
+
+## ADR-017: Knowledge Labels Are Page Metadata and an Independent Retrieval Signal
+
+**Status**: Active
+
+**Context**:
+Large knowledge packages cannot expose their full `index.md` in the model
+prompt, and content indexes that require embedding hydration may take minutes
+or fail under provider rate limits. A package-specific hardcoded route would
+solve only the observed question; a global tag dump would recreate the context
+overflow. Labels also need to survive compiler → control plane → AgentBox
+without Sicore and Siclaw independently inferring different taxonomies.
+
+**Decision**:
+Store typed Knowledge Labels in each OKF v0.2 concept page's frontmatter. A
+label has one facet (`entity`, `topic`, `task`, `component`, `environment`, or
+`version`), a canonical human-readable value, and optional aliases. Siclaw KBC
+generates labels; Sicore validates their shape and transports them unchanged.
+
+AgentBox derives a paginated Label Catalog and page index locally before
+starting content-index hydration. `knowledge_search` can list that catalog and
+returns all page labels, matched labels, and alias reasons. The Knowledge
+Resolver combines this deterministic channel with content retrieval only when
+the latter is ready. Labels never hard-filter unlabeled pages and never count
+as answer evidence; the Agent must still read and cite supporting content.
+
+**Consequences**:
+
+- ✅ Known entities, tasks, versions, and aliases route without an embedding call.
+- ✅ The first QA turn is not blocked by bulk vector hydration.
+- ✅ One page-level contract flows unchanged through compilation and delivery.
+- ✅ The complete catalog is available on demand without inflating every prompt.
+- ✅ Existing and third-party OKF v0.2 packages without labels remain valid.
+- ⚠️ Label quality is a compiler-quality concern and needs later retrieval evaluation.
+- ⚠️ Unlabeled packages use content search or exact file search until incrementally recompiled.
+- ❌ A label match is not a citation or permission to answer without reading the page.
+
+**Files**: `kbc/platform/pod/selfcheck.py`, `src/knowledge/labels.ts`,
+`src/knowledge/resolver.ts`, `src/tools/query/knowledge-search.ts`

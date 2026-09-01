@@ -20,7 +20,8 @@ from llm import call_json
 
 _PROMPT = """把下面【已编断言】(带出处)和【已裁矛盾】整理成标准 OKF 知识页。
 - 按主题把断言聚成若干页:同一主题的断言合并、跨源去重,**每条陈述后用(源:文件名)标出处**。
-- 每页给:filename(简短、.md 结尾)、type(非空字符串,一两个词,如 清单/实体/主题)、title、description(一句话)、body(markdown 正文)。
+- 每页给:filename(简短、.md 结尾)、type(非空字符串,一两个词,如 清单/实体/主题)、title、description(一句话)、labels(4-12 条高信号标签,每条含 facet/value/可选 aliases)、body(markdown 正文)。
+- labels.facet 只能是 entity/topic/task/component/environment/version;缩写和别称放 aliases;不要给每个名词都打标签。
 - 页面之间只用文件相对的标准 Markdown 链接;不要用 [[wikilink]] 或 / 开头的 bundle 链接。
 - 矛盾按裁决落地:status=ruled 的按其『裁决』写成结论(保留涉及的源);status=parked/存疑 的明确标"⚠️ 存疑:…"、不下定论。
 - 只写事实陈述,别加套话/导语。
@@ -31,7 +32,9 @@ _PROMPT = """把下面【已编断言】(带出处)和【已裁矛盾】整理�
 【已裁矛盾】
 {findings}
 
-只输出 JSON,不要其它文字:{{"pages":[{{"filename":"x.md","type":"…","title":"…","description":"…","body":"…"}}]}}"""
+只输出 JSON,不要其它文字:{{"pages":[{{"filename":"x.md","type":"…","title":"…","description":"…","labels":[{{"facet":"topic","value":"…","aliases":["…"]}}],"body":"…"}}]}}"""
+
+_LABEL_FACETS = {"entity", "topic", "task", "component", "environment", "version"}
 
 
 def _safe(name):
@@ -60,6 +63,34 @@ def _page_sources(body):
             seen.add(resource)
             resources.append({"resource": resource})
     return resources
+
+
+def _page_labels(page, filename):
+    raw = page.get("labels")
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 32:
+        raise ValueError(f"OKF page {filename} must have 1-32 knowledge labels")
+    labels = []
+    seen = set()
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict) or item.get("facet") not in _LABEL_FACETS:
+            raise ValueError(f"OKF page {filename} labels[{i}] has an invalid facet")
+        value = item.get("value")
+        if not isinstance(value, str) or not value.strip() or len(value.strip()) > 100:
+            raise ValueError(f"OKF page {filename} labels[{i}] has an invalid value")
+        aliases = item.get("aliases", [])
+        if (not isinstance(aliases, list) or len(aliases) > 8
+                or any(not isinstance(alias, str) or not alias.strip()
+                       or len(alias.strip()) > 100 for alias in aliases)):
+            raise ValueError(f"OKF page {filename} labels[{i}] has invalid aliases")
+        if len({alias.strip().casefold() for alias in aliases}) != len(aliases):
+            raise ValueError(f"OKF page {filename} labels[{i}] has duplicate aliases")
+        key = (item["facet"], value.strip().casefold())
+        if key in seen:
+            raise ValueError(f"OKF page {filename} has duplicate knowledge labels")
+        seen.add(key)
+        labels.append({"facet": item["facet"], "value": value.strip(),
+                       "aliases": [alias.strip() for alias in aliases]})
+    return labels
 
 
 def _markdown_prose(text):
@@ -138,6 +169,7 @@ def emit(ledger, out_dir):
             "type": type_name,
             "title": str(pg.get("title") or "").strip(),
             "description": str(pg.get("description") or "").strip(),
+            "labels": _page_labels(pg, fn),
             "sources": _page_sources(str(pg.get("body") or "")),
             "generated": {
                 "by": "process:siclaw-kbc",

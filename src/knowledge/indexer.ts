@@ -5,6 +5,8 @@ import path from "node:path";
 import { createEmbeddingProvider } from "../memory/embeddings.js";
 import { MemoryIndexer, type MemorySearchConfig } from "../memory/indexer.js";
 import type { MemoryIndexerOpts } from "../memory/index.js";
+import { KnowledgeLabelIndex } from "./labels.js";
+import { KnowledgeResolver } from "./resolver.js";
 
 const KNOWLEDGE_SEARCH_CONFIG: MemorySearchConfig = {
   temporalDecay: { enabled: false },
@@ -19,15 +21,18 @@ export function createKnowledgeIndexer(
   knowledgeDir: string,
   indexRoot: string,
   embeddingOpts?: MemoryIndexerOpts,
-): MemoryIndexer {
+): KnowledgeResolver {
   const resolvedKnowledgeDir = path.resolve(knowledgeDir);
   const scope = createHash("sha256").update(resolvedKnowledgeDir).digest("hex").slice(0, 24);
   fs.mkdirSync(resolvedKnowledgeDir, { recursive: true });
   fs.mkdirSync(indexRoot, { recursive: true });
-  return new MemoryIndexer(
+  const contentIndex = new MemoryIndexer(
     path.join(indexRoot, `${scope}.db`),
     resolvedKnowledgeDir,
     createEmbeddingProvider(embeddingOpts),
     KNOWLEDGE_SEARCH_CONFIG,
   );
+  return new KnowledgeResolver(new KnowledgeLabelIndex(resolvedKnowledgeDir), contentIndex);
 }
+
+export { KnowledgeResolver } from "./resolver.js";

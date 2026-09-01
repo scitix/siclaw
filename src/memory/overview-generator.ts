@@ -137,6 +137,7 @@ export function buildKnowledgeWikiCatalog(
     "",
     "Bound knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
     "Use `knowledge_search` first with alternative terms, aliases, versions, and likely document titles; " +
+    "when routing is ambiguous, call it with `listLabels=true` to inspect the paginated typed label catalog. " +
     "the catalog below is navigation context, not the only retrieval path. Use Grep/Find for exact terms " +
     "or file-level fallback. Read the complete relevant page(s) with the Read tool before answering, and " +
     "follow standard markdown links " +

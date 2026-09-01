@@ -3353,7 +3353,8 @@ async def test_exact_source_alias_is_repaired_before_l1_budget():
         (wd / "candidate" / "index.md").write_text(
             "---\nokf_version: \"0.2\"\n---\n# Index\n- [Guide](guide.md)\n")
         (wd / "candidate" / "guide.md").write_text(
-            "---\ntype: Guide\ntitle: Guide\nsources:\n"
+            "---\ntype: Guide\ntitle: Guide\nlabels:\n"
+            "  - facet: topic\n    value: source guide\nsources:\n"
             "  - resource: docs/专题目录.md\n---\n正文。(source: 专题目录)\n")
         run = compile_box.CompileRun("mechanical-source", str(wd), 1)
         run._selfcheck_key = None
@@ -3738,7 +3739,9 @@ async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
             "---\ntitle: Legacy\nsources:\n  - resource: raw/snap/one.md\n---\n# Legacy\nInherited body.\n"
         )
         (root / "candidate" / "clean.md").write_text(
-            "---\ntype: Topic\ntitle: Clean\nsources:\n  - resource: raw/snap/one.md\n---\n# Clean\nStable body.\n"
+            "---\ntype: Topic\ntitle: Clean\nlabels:\n"
+            "  - facet: topic\n    value: stable knowledge\nsources:\n"
+            "  - resource: raw/snap/one.md\n---\n# Clean\nStable body.\n"
         )
 
     with tempfile.TemporaryDirectory() as td:

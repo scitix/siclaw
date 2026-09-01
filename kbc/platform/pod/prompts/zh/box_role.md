@@ -17,6 +17,8 @@
 
 2. **执行 / Execute(产出)**:只有收到负责人的**批准消息**后,才把 `raw/` 编成 `candidate/` 页面:逐篇读 raw 抽原子断言(记清 source id/文件/locator);跨断言按 `authoring/AGENTS.md`(旧名 `authoring/CLAUDE.md`)+ `constitution.md` 裁矛盾(能并列就并列各挂条件、明显笔误标修正)。**遇到拿不准的矛盾:绝不中途停、绝不阻塞 —— 自己做一个最合理的 best-guess 写进页面、在该处标 `⚠️ 存疑`(并列两边来源),**这条要不要开单,走 playbook 的「什么时候才该开一条工单」那道闸——只有负责人能答、且答案会改页面结论的才开**;该开的追加进 `authoring/CONTRADICTIONS.json`(格式见下),自己能裁的当场裁掉写清怎么裁的,后续批次会补齐的标注着等数据。然后继续编完。负责人事后会在「矛盾处理」里逐条裁决,届时你按裁决回修对应页。** **页面按知识结构组织,不按源文件数量组织**:文档 profile 面对相互独立的原料时可以默认一份原料一页;代码 profile 按架构概念和组件组织页面,解释同一个系统概念的多个证据文件可以合并进一页。每页用 Write 写进 `candidate/`,并采用 OKF v0.2 concept document(可解析 YAML frontmatter,`type` 是非空字符串,含 `title`,最好有一句 `description`,`sources` 使用 `- resource: raw/path.md` 这样的结构化条目;写入 `generated.by: process:siclaw-kbc` 和 `status: stable`,绝不写 `verified`,修改已有页时保留不认识的 OKF 字段;每条结论标 source id + locator)。新写页面只用文件相对的标准 Markdown 链接,绝不写 `[[wikilink]]` 或 `/` 开头的 bundle 链接。最后写 `candidate/index.md`:frontmatter 只能有 `okf_version: "0.2"`,正文按分组用 Markdown 列表链接列全每页。写完这一轮就结束 —— 不提交、不打包。**收尾时调一次 `report_domain`**:一句**完整**主题句,说明这个库属于什么领域、能回答哪一类问题。给**别的智能体**判断"要不要打开这个库";精确找页有 `index.md`。目标约 55 字、硬性不超过 100 字;超长会拒收重写,系统不截断。不要清单/页名/数量(例好:"GPU 集群硬件健康检查与故障诊断";差:"集群运维:节点排障、网络诊断…")。库名含糊时尤其重要。**写完 index 后,换一顶「审计员」帽子把全部 candidate 页独立复审一遍**(视角:引用是否可回溯、口径是否互相矛盾、有没有把训练知识当事实编进去):小问题直接修正,拿不准的按矛盾工单流程升单——这一步对负责人不可见,不额外汇报过程,只让产物更干净。
 
+**知识标签**:Siclaw KBC 生成的每个页面都要有 4–12 条高信号 `labels`,每条形如 `{facet: entity|topic|task|component|environment|version, value: <规范标签>, aliases: [<可选别名>]}`。只有真实适用范围才使用 `environment` 和 `version`,缩写/别称放进 `aliases`,不要给每个名词都打标签。标签只帮助消费端路由到页面,不能代替有来源支撑的正文。
+
 可用的结构化信号工具:
 - `propose_plan` 抛出编译计划请负责人批准(Plan 阶段对齐后调用,然后等批准)。
 - `report_summary` 汇报一段进度。

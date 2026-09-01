@@ -26,7 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
-import { createKnowledgeIndexer } from "../knowledge/indexer.js";
+import { createKnowledgeIndexer, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -94,7 +94,7 @@ export interface CreateSiclawSessionOpts {
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
   /** Pre-initialized hybrid index over this Agent's mounted knowledge pages. */
-  knowledgeIndexer?: MemoryIndexer;
+  knowledgeIndexer?: KnowledgeResolver;
   /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
   mcpManager?: McpClientManager;
   /** Pre-resolved MCP tools from shared mcpManager — avoids re-discovery */
@@ -185,7 +185,7 @@ export interface SiclawSessionResult {
   /** MCP client manager — call shutdown() on session close */
   mcpManager?: McpClientManager;
   memoryIndexer?: MemoryIndexer;
-  knowledgeIndexer?: MemoryIndexer;
+  knowledgeIndexer?: KnowledgeResolver;
   /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
@@ -476,13 +476,14 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Memory disabled by Agent harness or SICLAW_MEMORY_ENABLED`);
   }
 
-  // Knowledge retrieval is independent from investigation memory. Its index is
-  // always available (FTS-only without embeddings) and is scoped by the exact
-  // mounted knowledgeDir. AgentBox passes a shared instance; standalone TUI
-  // owns this fallback instance for its single session.
+  // Knowledge retrieval is independent from investigation memory. Typed page
+  // labels become available after a local frontmatter scan; heavier content
+  // indexing warms in the background. Both are scoped by the exact mounted
+  // knowledgeDir. AgentBox passes a shared instance; standalone TUI owns this
+  // fallback instance for its single session.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
-    let candidate: MemoryIndexer | undefined;
+    let candidate: KnowledgeResolver | undefined;
     try {
       const created = createKnowledgeIndexer(
         knowledgeDir,
