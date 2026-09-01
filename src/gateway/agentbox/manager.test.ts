@@ -1576,6 +1576,79 @@ describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
     expect(spawner.spawnCalls).toHaveLength(1);
   });
 
+  /**
+   * 🔴 De-duplication is sound only between callers that want the same thing DONE TO THE POD.
+   * An attempt started while a Pending pod was still young reuses it; a caller arriving after
+   * the readiness deadline wants it deleted. Joining the older attempt left the pod in place
+   * and failed everyone with it, costing another full readiness window before anything tried
+   * again — a 95-second window in the measured case, not a race.
+   */
+  it("does not let a rebuild request join a reuse already in flight", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    // A reuse is in flight for slot 0…
+    const reuse = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    await Promise.resolve();
+    // …and a rebuild for the same slot must NOT be absorbed by it.
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    release!();
+    await Promise.all([reuse, rebuild]);
+
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect(spawner.spawnCalls[0].recreate).toBeUndefined();
+    expect(spawner.spawnCalls[1].recreate).toBe(true);
+  });
+
+  it("still de-duplicates in the weaker direction — a reuse joins a rebuild", async () => {
+    // The asymmetry is deliberate: a rebuild already does everything a reuse would.
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    await Promise.resolve();
+    const reuse = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    release!();
+    await Promise.all([rebuild, reuse]);
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].recreate).toBe(true);
+  });
+
+  it("two rebuild requests still collapse into one", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const a = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    await Promise.resolve();
+    const b = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    release!();
+    await Promise.all([a, b]);
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
   it("frees the slot once the spawn settles, so a later fill can retry it", async () => {
     const spawner = new PoolSpawner("k8s");
     const mgr = pooledManager(spawner, 2);

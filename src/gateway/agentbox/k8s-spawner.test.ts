@@ -1784,6 +1784,42 @@ describe("K8sSpawner — an explicit rebuild request", () => {
     expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1);
   });
 
+  /**
+   * 🔴 A pod with NO phase yet. The manager maps that to `error` and therefore asks for a
+   * rebuild — but while the rebuild was handled inside the Running/Pending arm, such a pod
+   * matched neither arm, fell through to create, hit 409, and the original pod was reused.
+   * Budget spent, nothing rebuilt. The caller's decision cannot depend on which phase the
+   * pod happens to report.
+   */
+  it("honours a rebuild for a pod that reports no phase at all", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) {
+        return {
+          metadata: {
+            name: "agentbox-agent-x-0",
+            creationTimestamp: new Date(),
+            labels: { "siclaw.io/agent": "agent-x", "siclaw.io/ca-fp": FAKE_CA_FP, "siclaw.io/boxType": "agent" },
+          },
+          status: {}, // no phase
+        };
+      }
+      if (reads === 2) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+
+    await s.spawn({ agentId: "agent-x", profile: "agent", recreate: true } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(1);
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1);
+  });
+
   it("names the caller's request as the reason, so a log reader can tell it apart", async () => {
     const logs: string[] = [];
     vi.spyOn(console, "log").mockImplementation((m?: any) => { logs.push(String(m)); });

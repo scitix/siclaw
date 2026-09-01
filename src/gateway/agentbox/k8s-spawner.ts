@@ -486,9 +486,17 @@ export class K8sSpawner implements BoxSpawner {
       const existingProfile = existing.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
       const profileMismatch = existingProfile !== profile.name;
       const terminating = existing.metadata?.deletionTimestamp != null;
-      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating) {
+      // 🔴 An explicit rebuild is judged BEFORE the phase, not inside one branch of it.
+      // Attached to the Running/Pending arm, it silently did nothing for a pod with NO phase
+      // at all — which is precisely a pod the manager maps to `error` and asks to rebuild, so
+      // the budget was spent and the create below then hit 409 and reused the same pod. The
+      // caller's decision does not depend on which phase the pod happens to report.
+      const explicitRebuild = boxConfig.recreate === true;
+      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating || explicitRebuild) {
         console.log(
-          `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
+          explicitRebuild && phase !== "Failed" && phase !== "Succeeded" && phase !== "Unknown" && !profileMismatch && !terminating
+            ? `[k8s-spawner] Replacing pod ${podName} — caller asked for a rebuild (phase: ${phase ?? "none"})`
+            : `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase ?? "none"}, profile: ${existingProfile}→${profile.name})`,
         );
         // Let delete errors reach the outer catch, which swallows 404 (pod
         // already gone) and rethrows everything else (finding F): a blanket
@@ -505,20 +513,12 @@ export class K8sSpawner implements BoxSpawner {
         // — pods created before the label existed have none, and reading that as stale
         // would recycle every one of them on sight.
         const podCertExp = parseCertExpiryLabel(existing.metadata?.labels?.[certExpLabel]);
-        // 🔴 `recreate` is a FIRST-CLASS reason to replace, alongside the certificate ones,
-        // because a Pending pod that will never schedule looks perfectly healthy from here:
-        // its phase is fine and its certificate is fine, so the reuse below would hand it
-        // back and wait out POD_READY_TIMEOUT_MS again — forever, once per request. Only the
-        // CALLER can know the pod has already had its chance (see AgentBoxManager's
-        // `isComingUp`), so it has to be able to say so. Without this the manager could
-        // classify such a slot as rebuildable, spend drain budget on it, and still get the
-        // same stuck pod back.
+        // Reached only when the caller did NOT ask for a rebuild (that is handled above,
+        // phase-independently), so this arm is purely about the certificate.
         const replaceReason =
           podFp !== caFp ? `stale CA (pod=${podFp ?? "none"}, current=${caFp})`
           : certificateNeedsRenewal(podCertExp)
             ? `certificate expires ${podCertExp?.toISOString() ?? "unknown"}`
-          : boxConfig.recreate
-            ? `caller asked for a rebuild (phase: ${phase})`
             : null;
         if (!replaceReason) {
           console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);

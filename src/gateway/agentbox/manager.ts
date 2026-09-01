@@ -88,6 +88,21 @@ function spawnSlotKey(agentId: string, instance: number): string {
 }
 
 /**
+ * A spawn in flight for one slot, and WHAT IT WILL DO to the pod already there.
+ *
+ * 🔴 The intent has to be recorded, not just the promise, because de-duplication is only
+ * sound between callers that want the same thing. A spawn started while a Pending pod was
+ * still young reuses that pod; once it crosses the readiness deadline a later caller wants
+ * it DELETED. Joining the older attempt then means the pod is never removed and every
+ * joined caller fails with it, delaying recovery by another full readiness window.
+ */
+interface InflightSpawn {
+  promise: Promise<AgentBoxHandle | null>;
+  /** Whether this attempt will replace the pod occupying the slot. */
+  recreate: boolean;
+}
+
+/**
  * Consecutive failed status probes before a box is treated as gone rather than busy.
  *
  * A box whose event loop is permanently blocked stays pod-phase Running with a valid
@@ -168,7 +183,7 @@ export class AgentBoxManager {
    * the same slot join the running attempt instead of starting a rival one — see
    * {@link spawnInstances}.
    */
-  private readonly inflightSpawns = new Map<string, Promise<AgentBoxHandle | null>>();
+  private readonly inflightSpawns = new Map<string, InflightSpawn>();
   /** When a slot's spawn last failed, so background fills back off — see mayFillInstance. */
   private readonly spawnFailures = new Map<string, number>();
   /** Agents already warned about pooling without shared session storage. */
@@ -1091,8 +1106,21 @@ export class AgentBoxManager {
 
     const results = await Promise.all(instances.map((instance) => {
       const key = spawnSlotKey(agentId, instance);
+      const wantRecreate = recreate?.(instance) === true;
+
+      // 🔴 De-duplication is only sound between callers that want the SAME THING done to the
+      // pod. An attempt started while a Pending pod was still young REUSES it; a caller
+      // arriving after the readiness deadline wants it DELETED. Joining the older attempt
+      // then left the pod in place and failed everyone with it, costing another full
+      // readiness window before anything tried again.
+      //
+      // So a stronger intent does not join — it starts its own attempt. The two briefly
+      // overlap, and that resolves itself: deleting the pod makes the older attempt's
+      // readiness wait fail fast ("disappeared while waiting") rather than run to its
+      // deadline. The weaker direction still joins, which is the common case.
       const inflight = this.inflightSpawns.get(key);
-      if (inflight) return inflight;
+      if (inflight && (inflight.recreate || !wantRecreate)) return inflight.promise;
+
       // Past the de-dup, so this call is the one creating the pod — the only one that may be
       // charged for it. Synchronous, and before the attempt is registered, so concurrent
       // callers either join the admitted attempt or are refused; none of them pays twice.
@@ -1105,7 +1133,7 @@ export class AgentBoxManager {
             ...config,
             agentId,
             instance,
-            ...(recreate?.(instance) ? { recreate: true } : {}),
+            ...(wantRecreate ? { recreate: true } : {}),
             persistence,
             env: {
               ...resolvedEnv,
@@ -1126,11 +1154,12 @@ export class AgentBoxManager {
         }
       })();
 
-      this.inflightSpawns.set(key, attempt);
+      const entry: InflightSpawn = { promise: attempt, recreate: wantRecreate };
+      this.inflightSpawns.set(key, entry);
       // Compare before deleting: by the time this settles the entry may already belong to
-      // a later attempt for the same slot.
+      // a later attempt for the same slot — including a stronger-intent one that took over.
       void attempt.finally(() => {
-        if (this.inflightSpawns.get(key) === attempt) this.inflightSpawns.delete(key);
+        if (this.inflightSpawns.get(key) === entry) this.inflightSpawns.delete(key);
       });
       return attempt;
     }));
