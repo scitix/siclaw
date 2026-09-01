@@ -14,6 +14,13 @@ import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources, syncResource } from "./agentbox/resource-sync.js";
 import { createToolsHandler } from "./agentbox/sync-handlers.js";
+import {
+  runWithinBudget,
+  startStartupBudget,
+  unlimitedStartupBudget,
+  STARTUP_BUDGET_MS,
+  type StartupBudget,
+} from "./agentbox/startup-budget.js";
 import { debugPodCache } from "./tools/infra/debug-pod.js";
 import { initTracing, shutdownTracing } from "./shared/tracing/otel-provider.js";
 
@@ -26,39 +33,19 @@ import { startCapacityMetrics } from "./shared/capacity-metrics.js";
 const config = loadConfig();
 const PORT = config.server.port;
 
-/**
- * How long the gateway-dependent startup work gets before the box stops waiting on it.
- *
- * Everything before `listen()` — settings, resource bundles, the tool whitelist — is a
- * round trip to the Runtime, and the moment they all happen at once is a rolling deploy:
- * the Runtime is itself restarting while every box of every agent asks it for the same
- * things. Whatever is not back by then, the box comes up without and picks up on the next
- * push, because a box that answers no probe is judged crashed at 60s and replaced by
- * another one that will queue behind the same slow gateway.
- *
- * Deliberately under that 60s so the box loses the sync, not its life.
- */
-const STARTUP_DEADLINE_MS = 30_000;
+/** The shared countdown. Replaced with a real one at the top of `main()`. */
+let startupBudget: StartupBudget = unlimitedStartupBudget();
 
 /** Run gateway-dependent startup work, giving up (loudly) rather than delaying `listen`. */
-async function withStartupDeadline<T>(label: string, work: () => Promise<T>): Promise<T | undefined> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      work(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`timed out after ${STARTUP_DEADLINE_MS}ms`)), STARTUP_DEADLINE_MS);
-      }),
-    ]);
-  } catch (err) {
-    console.warn(`[agentbox] startup: ${label} did not finish (${err instanceof Error ? err.message : String(err)}); continuing without it`);
-    return undefined;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+function withStartupDeadline<T>(label: string, work: () => Promise<T>): Promise<T | undefined> {
+  return runWithinBudget(startupBudget, label, work);
 }
 
 async function main() {
+  // Start the shared clock before the first gateway round trip. Every withStartupDeadline
+  // below draws from this one budget — see startup-budget.ts for why it must be a total.
+  startupBudget = startStartupBudget(STARTUP_BUDGET_MS);
+
   // If gatewayUrl is configured, fetch the latest settings.json from Gateway (with mTLS)
   if (config.server.gatewayUrl) {
     const gatewayClient = new GatewayClient({
