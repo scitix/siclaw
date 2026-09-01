@@ -139,23 +139,23 @@ const REPLICAS_TTL_MS = 10_000;
 /**
  * How often an agent whose replica count this runtime cannot resolve may be reported.
  *
- * In a shared AgentBox namespace every reaper tick walks other runtimes' pods too, and for
- * each of their agents the control plane answers "does not belong to this runtime" — a
- * permanent, expected condition. Reported per tick it drowned out everything else in the
- * runtime log. The lookup itself is NOT rate limited (see lookupReplicas): retrying is what
- * makes a genuine blip recover on the next tick.
+ * The reaper ticks every ten seconds over every agent with a pod in the namespace. An agent
+ * the control plane will not answer for is usually a standing condition, so reported per tick
+ * it drowns out everything else in the runtime log — including the drains that matter, which
+ * is how the production incident stayed unnoticed. The lookup itself is NOT rate limited (see
+ * lookupReplicas): retrying is what makes a genuine blip recover on the next tick.
  */
 const REPLICAS_UNKNOWN_LOG_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
- * How long the pool reconciler remembers that it could not establish ownership of an agent.
+ * How long the pool reconciler remembers that it could not establish an agent's replica count.
  *
  * Read by `reconcilePoolSizes` and NOTHING else, which is the whole point: the lookup itself
  * must keep failing fast and uncached so that a turn is never held at one box on the strength
- * of a remembered blip. Reconciliation has no such deadline — every tick re-asking the
- * control plane about every sibling agent in the namespace is a permanent question being
- * asked at 0.1 Hz per agent, and deferring it costs only a slower response to an agent that
- * has just been reassigned to this runtime.
+ * of a remembered blip. Reconciliation has no such deadline — an agent the control plane will
+ * not answer for is usually a standing condition, and re-asking at 0.1 Hz forever is waste.
+ * The cost of deferring is a slower response to an agent that has just become answerable, and
+ * nothing this loop does is urgent.
  */
 const UNOWNED_MEMO_MS = 60_000;
 
@@ -173,6 +173,22 @@ const DEFAULT_CONFIG: Required<AgentBoxManagerConfig> = {
   maxRetries: 3,
   namespace: "default",
 };
+
+/**
+ * Why a box was marked draining — and therefore whether the mark survives being re-examined.
+ *
+ * `stale` and `unresponsive` are judged from what the box itself presents (its image, its CA,
+ * its refusal to answer a probe), so re-judging them reaches the same verdict. `excess` is
+ * judged against the agent's replica count, which arrives over RPC and can therefore be
+ * WRONG — and a mark is acted on some ticks after it is made, which is long enough for the
+ * number that produced it to have been a transient failure. Only that kind is withdrawn.
+ */
+type DrainReason = "excess" | "stale" | "unresponsive";
+
+interface DrainMark {
+  at: number;
+  reason: DrainReason;
+}
 
 interface ManagedBox {
   handle: AgentBoxHandle;
@@ -203,16 +219,17 @@ export class AgentBoxManager {
   private interruptReported = new Set<string>();
   /** Which box serves which session. Only consulted when an agent runs more than one. */
   private readonly bindings = new BoxBindings();
-  /** boxId → when it was marked draining. In memory only; re-derived after a restart. */
-  private draining = new Map<string, number>();
+  /** boxId → when it was marked draining, and WHY. In memory only; re-derived after a
+   *  restart. The reason is what makes a mark revocable: see `withdrawExcessDrains`. */
+  private draining = new Map<string, DrainMark>();
   private statusCache = new Map<string, { at: number; status: BoxStatusReport }>();
   private replicasCache = new Map<string, { at: number; value: number }>();
   /** agentId → when we last said its replica count is unknown. Rate limit only; it never
    *  affects what the lookup answers. See lookupReplicas. */
   private replicasUnknownLoggedAt = new Map<string, number>();
-  /** agentId → when the reconciler last failed to establish ownership. Reconciler only —
-   *  see UNOWNED_MEMO_MS for why the serving path must not consult it. */
-  private unownedAgents = new Map<string, number>();
+  /** agentId → when the reconciler last failed to establish a replica count. Reconciler
+   *  only — see UNOWNED_MEMO_MS for why the serving path must not consult it. */
+  private unresolvedAgents = new Map<string, number>();
   /** Consecutive failed status probes per box — see UNRESPONSIVE_PROBE_LIMIT. */
   private probeFailures = new Map<string, number>();
   /** Crashes per box, so a box that keeps dying is not respawned forever. */
@@ -336,27 +353,31 @@ export class AgentBoxManager {
   }
 
   /**
-   * The agent's replica count, or UNDEFINED when this runtime cannot establish it.
+   * The agent's replica count, or UNDEFINED when it cannot be established.
    *
-   * 🔴 The distinction between "one" and "unknown" is a safety boundary, and collapsing it
-   * cost a production incident. Several runtimes share one AgentBox namespace, and the
-   * control plane answers `agent does not belong to this runtime` for an agent owned by a
-   * sibling. Reading that as "one replica" made the pool reconciler treat a healthy
-   * three-box pool as two boxes too many and drain them — pods belonging to another runtime,
-   * still serving traffic, removed at the drain deadline. The logs showed the whole chain:
-   * the lookup failure, then `Removing drained box …` for that agent, while its boxes were
-   * still reporting metrics.
+   * 🔴 "One" and "unknown" are different answers and collapsing them destroys live pods. This
+   * returned 1 on failure, so a single failed RPC shrank a multi-box pool to one box — the
+   * count carries no information about the pool's correct size, and the two directions of a
+   * wrong guess are not symmetric: high costs a pod, low costs a running pool.
+   *
+   * The failure is not one thing. `FrontendWsClient.request` rejects IMMEDIATELY when the WS
+   * is down (it does not queue), the RPC can time out against a slow or restarting control
+   * plane, and the control plane can refuse an agent whose record moved. The drain reaper
+   * starts with setBoxStatusProbe and does not wait for the control plane, so a Runtime
+   * restart puts its first tick ten seconds in — a deploy is the likeliest trigger, and it
+   * needs no second Runtime in the namespace.
    *
    * Callers therefore have to choose. Serving a turn may fall back to one (see
-   * resolveReplicas) — a single box is the safe shape for work that has to happen. But
-   * anything that DESTROYS a box must treat unknown as "not mine" and leave it alone.
+   * resolveReplicas): a single box is the safe shape for work that has to happen, and the
+   * request itself is evidence this runtime serves the agent. Anything that DESTROYS a box
+   * must treat unknown as "no answer" and leave the pool alone.
    *
    * A failure is deliberately NOT cached, and that predates this change for a good reason: a
    * genuine blip must be retried on the next tick rather than remembered, because a cached
    * unknown would make resolveReplicas fall back to one box for the whole TTL — sending a
-   * multi-replica agent's new sessions all to instance 0. The production log noise came from
-   * the same failure being REPORTED every tick, not from it being retried, so the rate limit
-   * belongs on the log line, not on the lookup.
+   * multi-replica agent's new sessions all to instance 0. The log noise came from the same
+   * failure being REPORTED every tick, not from it being retried, so the rate limit belongs
+   * on the log line, not on the lookup.
    */
   private async lookupReplicas(agentId: string): Promise<number | undefined> {
     if (!this.replicasResolver) return 1;
@@ -368,9 +389,9 @@ export class AgentBoxManager {
       this.replicasUnknownLoggedAt.delete(agentId);
       return value;
     } catch (err) {
-      // One line per agent per window, and no stack: the overwhelmingly common cause is a
-      // sibling runtime's agent — ordinary in a shared namespace — and the WS receiver
-      // frames carry nothing diagnostic. Unrated, this was the bulk of the runtime log.
+      // One line per agent per window, and the message rather than a stack: the causes are a
+      // dropped WS, an RPC timeout, or a refused agent, and none of their stacks say anything
+      // the message does not. Unrated, this was the bulk of the runtime log.
       const now = Date.now();
       const last = this.replicasUnknownLoggedAt.get(agentId);
       if (last === undefined || now - last >= REPLICAS_UNKNOWN_LOG_INTERVAL_MS) {
@@ -1034,7 +1055,7 @@ export class AgentBoxManager {
       }
       if (!this.spendDrainBudget(agentId)) continue;
       console.log(`[agentbox-manager] Draining ${box.boxId} (agent=${agentId}): ${urgent ?? rollable}`);
-      this.draining.set(box.boxId, Date.now());
+      this.draining.set(box.boxId, { at: Date.now(), reason: "stale" });
     }
   }
 
@@ -1335,7 +1356,7 @@ export class AgentBoxManager {
         this.probeFailures.set(box.boxId, fails);
         if (fails >= UNRESPONSIVE_PROBE_LIMIT && !this.draining.has(box.boxId)) {
           console.warn(`[agentbox-manager] ${box.boxId} failed ${fails} status probes; draining it so its sessions are not pinned to a box that cannot answer`);
-          this.draining.set(box.boxId, Date.now());
+          this.draining.set(box.boxId, { at: Date.now(), reason: "unresponsive" });
         }
         // A box that cannot be asked is not evidence of anything; leave it out of the
         // sample rather than guessing it is idle and stacking new sessions onto it.
@@ -1524,37 +1545,29 @@ export class AgentBoxManager {
     this.forgetStaleSpawnFailures();
 
     for (const [agentId, pool] of byAgent) {
-      // 🔴 OWNERSHIP FIRST, before anything here can drain, delete or replace a box.
+      // 🔴 GET AN ANSWER FIRST, before anything below can drain, delete or replace a box.
       //
-      // `list()` is scoped to the namespace and the `app=agentbox` label — NOT to this
-      // runtime. Several runtimes share one AgentBox namespace in production, so this loop
-      // sees siblings' pods, and every judgement below would then be made with this
-      // runtime's own configuration: its replica count, its expected image, its CA. All
-      // three read a healthy sibling box as stale.
+      // Every judgement in this loop body is made against this runtime's own view — the
+      // agent's replica count, the expected image, the CA — and the replica count arrives
+      // over RPC. With no answer there is nothing to judge against, so skip the agent
+      // entirely: no crash healing, no staleness marking, no roll, no shrink. Serving a turn
+      // still falls back to one box (resolveReplicas); only destruction needs an answer.
       //
-      // It is not hypothetical. A sibling's three-box pool was reconciled against a
-      // fallback replicas of 1, drained as "two too many", and removed at the drain
-      // deadline while those boxes were still serving traffic.
+      // Placing this after any of those means the destruction has already happened. It was
+      // after the shrink's own `accepting.length <= 1` short-circuit, which skipped the
+      // lookup for single-box agents — that saving is what put the question in the wrong
+      // place, so it is not a saving worth having.
       //
-      // An unknown replica count is the ownership signal available here: the control plane
-      // refuses the lookup for an agent it has not assigned to this runtime. Treat that as
-      // "not mine" and touch nothing — no crash healing, no staleness marking, no roll, no
-      // shrink. Serving a turn still falls back to one box (resolveReplicas); only
-      // destructive work requires ownership.
-      //
-      // This costs a lookup per agent per tick, where the previous code skipped it for
-      // single-box agents. That saving is what put the ownership question AFTER the draining,
-      // so it is not a saving worth having — but a sibling's agent is a PERMANENT answer, and
-      // re-asking about it every ten seconds forever is waste, hence the memo. It is scoped
-      // to this loop: the serving path must keep asking (see UNOWNED_MEMO_MS).
-      const unownedAt = this.unownedAgents.get(agentId);
-      if (unownedAt !== undefined && Date.now() - unownedAt < UNOWNED_MEMO_MS) continue;
+      // The memo bounds the cost of asking every tick about an agent nobody can answer for.
+      // It is scoped to this loop; the serving path must keep asking (see UNOWNED_MEMO_MS).
+      const unresolvedAt = this.unresolvedAgents.get(agentId);
+      if (unresolvedAt !== undefined && Date.now() - unresolvedAt < UNOWNED_MEMO_MS) continue;
       const replicas = await this.lookupReplicas(agentId);
       if (replicas === undefined) {
-        this.unownedAgents.set(agentId, Date.now());
+        this.unresolvedAgents.set(agentId, Date.now());
         continue;
       }
-      this.unownedAgents.delete(agentId);
+      this.unresolvedAgents.delete(agentId);
 
       await this.healCrashedBoxes(agentId, pool);
       const boxes = pool.filter((b) => b.status !== "stopped");
@@ -1563,6 +1576,16 @@ export class AgentBoxManager {
       // agent would otherwise stop half-done until someone happened to send a message.
       this.markStaleBoxesDraining(agentId, boxes, "agent");
       await this.advanceRoll(agentId, boxes);
+      // 🔴 Withdraw a shrink this runtime decided on a replica count it now knows better.
+      //
+      // `boxes.length`, NOT `accepting.length`: the question is whether the pool would be
+      // over-provisioned had nothing been marked, and `accepting` has already had the marks
+      // subtracted — asking it can only ever answer "no". A mark is acted on ticks after it
+      // is made, and the number that produced it came over RPC, so a single failed lookup
+      // (a control-plane restart during a deploy, a dropped WS) used to shrink a live pool
+      // permanently: the fallback of 1 marked every box above instance 0, and nothing ever
+      // revisited that once the lookup started working again.
+      if (boxes.length <= replicas) this.withdrawExcessDrains(agentId, boxes);
       const accepting = boxes.filter((b) => !this.draining.has(b.boxId));
       // One box is both "nothing to shrink" and the un-pooled shape.
       if (accepting.length <= 1) continue;
@@ -1572,15 +1595,33 @@ export class AgentBoxManager {
         .slice(0, accepting.length - replicas);
       for (const box of excess) {
         console.log(`[agentbox-manager] Draining ${box.boxId} (agent=${agentId}): replicas lowered to ${replicas}`);
-        this.draining.set(box.boxId, Date.now());
+        this.draining.set(box.boxId, { at: Date.now(), reason: "excess" });
       }
+    }
+  }
+
+  /**
+   * Un-mark boxes this runtime drained as surplus, now that the pool is not surplus.
+   *
+   * Only `excess` marks are withdrawn — a `stale` or `unresponsive` verdict is re-reached on
+   * re-examination, so withdrawing it would just be re-decided next tick. This also covers
+   * the ordinary case of an operator putting `replicas` back up before the shrink completes.
+   */
+  private withdrawExcessDrains(agentId: string, boxes: AgentBoxInfo[]): void {
+    for (const box of boxes) {
+      if (this.draining.get(box.boxId)?.reason !== "excess") continue;
+      console.log(
+        `[agentbox-manager] Keeping ${box.boxId} (agent=${agentId}): the pool is not over its` +
+        ` replica count after all, so the shrink that marked it is withdrawn`,
+      );
+      this.draining.delete(box.boxId);
     }
   }
 
   private async reapDrainedBoxes(): Promise<void> {
     await this.reconcilePoolSizes();
     if (this.draining.size === 0) return;
-    for (const [boxId, markedAt] of [...this.draining]) {
+    for (const [boxId, mark] of [...this.draining]) {
       let info: AgentBoxInfo | null = null;
       try {
         info = await this.spawner.get(boxId);
@@ -1592,7 +1633,26 @@ export class AgentBoxManager {
         this.probeFailures.delete(boxId);
         continue;
       }
-      const overdue = Date.now() - markedAt >= DRAIN_DEADLINE_MS;
+      // 🔴 Re-confirm AT THE POINT OF DESTRUCTION, not only where the mark is made.
+      // A drain mark is a decision taken on an earlier tick, and `reconcilePoolSizes` skipping
+      // an agent stops NEW marks — it cannot recall one already queued here. If the agent has
+      // since become unanswerable, the premise of the decision is gone.
+      //
+      // The mark is DROPPED rather than held: a held mark keeps the box out of its own pool's
+      // `accepting` set forever, since every later tick answers unknown too and never removes
+      // it either — a dead entry that degrades the pool. If the reason to drain still holds
+      // once the agent is answerable again, the next tick marks it and spends one drain-budget
+      // slot doing so, which is exactly the fuse doing its job.
+      if (info.agentId && (await this.lookupReplicas(info.agentId)) === undefined) {
+        console.warn(
+          `[agentbox-manager] dropping the drain mark on ${boxId}: agent=${info.agentId} can no` +
+          ` longer be resolved, so the judgement that produced the mark no longer holds`,
+        );
+        this.draining.delete(boxId);
+        continue;
+      }
+
+      const overdue = Date.now() - mark.at >= DRAIN_DEADLINE_MS;
       let drained = false;
       let held: string[] = [];
       if (!overdue && this.boxStatusProbe && info.endpoint) {
