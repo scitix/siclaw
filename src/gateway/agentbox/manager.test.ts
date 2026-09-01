@@ -603,6 +603,54 @@ describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
     expect(handle.endpoint).toBe("https://10.0.0.1:3000");
     expect(spawner.spawnCalls).toHaveLength(0);
   });
+
+  /**
+   * The acquisition path asks "is mTLS possible RIGHT NOW", which is a WEAKER question than
+   * the one the drain path asks. A certificate approaching expiry still authenticates, so
+   * rebuilding here would make a user's turn wait out a full cold start for a box that
+   * works — replacement is the background roll's job.
+   */
+  it("serves from a running pod whose certificate is near expiry but still valid", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", {
+      ...runningPod("ca-v2"),
+      certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // inside the renewal window
+    });
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("recreates a running pod whose certificate has already expired", async () => {
+    // Past this point mTLS fails in BOTH directions, so the endpoint is worthless — serving
+    // from it would hand the turn a box that cannot answer.
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", {
+      ...runningPod("ca-v2"),
+      certExpiresAt: new Date(Date.now() - 1000),
+    });
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("reuses a running pod that carries no expiry at all (pre-label pod)", async () => {
+    // Unknown is not expired. The CA-fingerprint version of this check once read a missing
+    // label as stale and drained every box on sight.
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", runningPod("ca-v2")); // no certExpiresAt
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
 });
 
 describe("AgentBoxManager — injected spawnEnvResolver", () => {
@@ -1299,6 +1347,39 @@ describe("AgentBoxManager — a box that died without being asked to", () => {
     for (let i = 0; i < 6; i++) if ((mgr as any).mayRespawn("agent-a#1")) allowed++;
     expect(allowed).toBe(1); // the cooldown holds the rest back
   });
+
+  /**
+   * The crash-replacement path consults two cooldowns, and only one of them is free to ask:
+   * `mayRespawn` SPENDS one of three attempts when it says yes, while the spawn-retry check
+   * merely reports. So the reporting one has to go first, or a slot filtered out afterwards
+   * has paid for a replacement that never happened.
+   *
+   * With today's constants the wrong order cannot actually bite — mayRespawn's own 2-minute
+   * cooldown returns false without spending, and it outlasts the 30-second spawn cooldown,
+   * so the windows never overlap. This test pins the ORDER rather than that coincidence:
+   * tightening one constant or lengthening the other would make it real, and neither
+   * constant's definition hints at the coupling.
+   */
+  it("consults the reporting cooldown before the one that spends an attempt", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const pool = [poolBox("agentbox-agent-a-0", 0), crashed("agentbox-agent-a-1", 1)];
+    spawner.pool = pool;
+    spawner.listReturns = pool;
+    const mgr = pooledManager(spawner, 2);
+
+    // Slot 1 is blocked by the spawn-retry cooldown and has no crash history at all, so
+    // mayRespawn WOULD say yes (and spend) if it were asked first.
+    (mgr as any).spawnFailures.set("agent-a#1", Date.now());
+
+    // Called directly rather than through the reconcile tick: both effects asserted below
+    // are SYNCHRONOUS (the cooldown write happens inside the filter, and a blocked slot
+    // never reaches spawnInstances at all), so waiting on a timer would only add a window
+    // in which the assertions could pass for the wrong reason.
+    await (mgr as any).healCrashedBoxes("agent-a", pool);
+
+    expect(spawner.spawnCalls).toHaveLength(0);                      // blocked, as intended
+    expect((mgr as any).crashRespawns.has("agent-a#1")).toBe(false); // and nothing was spent
+  });
 });
 
 describe("AgentBoxManager — a deploy rolls one box at a time", () => {
@@ -1351,6 +1432,57 @@ describe("AgentBoxManager — a deploy rolls one box at a time", () => {
     expect((mgr as any).draining.size).toBe(2); // both, immediately
   });
 
+  /**
+   * 🔴 A certificate NEARING expiry is not the same as one that is already dead, and the
+   * difference decides whether the whole pool goes at once. Every box of an agent mounts the
+   * SAME per-agent Secret, so they all come due at the same instant — treating "due" as
+   * urgent empties the pool in one tick, which is the stampede the renewal window exists to
+   * prevent. Due ⇒ roll one at a time; dead ⇒ drop immediately.
+   */
+  it("rolls boxes whose certificate is merely nearing expiry, one at a time", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    const soon = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "current", certExpiresAt: soon }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "current", certExpiresAt: soon }),
+      poolBox("agentbox-agent-a-2", 2, { caFingerprint: "current", certExpiresAt: soon }),
+    ];
+    const mgr = pooledManager(spawner, 3);
+
+    (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
+    expect((mgr as any).draining.size).toBe(1);
+  });
+
+  it("drops boxes whose certificate has already expired, all at once", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    const dead = new Date(Date.now() - 1000);
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "current", certExpiresAt: dead }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "current", certExpiresAt: dead }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
+    expect((mgr as any).draining.size).toBe(2); // worthless — mTLS cannot succeed either way
+  });
+
+  it("leaves boxes with no expiry information alone", async () => {
+    // Pods created before the expiry label existed. Reading "no answer" as stale is exactly
+    // how the CA-fingerprint version of this check once drained every box on sight.
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "current" }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "current" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
+    expect((mgr as any).draining.size).toBe(0);
+  });
+
   it("rolls a pod still named the way instance 0 used to be", async () => {
     // It works, its image is current — but nothing looks that name up any more, so it
     // would serve whatever it holds and never be counted, replaced or drained.
@@ -1361,6 +1493,149 @@ describe("AgentBoxManager — a deploy rolls one box at a time", () => {
 
     (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
     expect([...(mgr as any).draining.keys()]).toEqual(["agentbox-agent-a"]);
+  });
+});
+
+describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
+  /**
+   * 🔴 THE STORM. Pool filling is triggered from getOrCreate — once per SESSION REQUEST —
+   * and runs in the background, so while a pool sat short EVERY arriving request started its
+   * own spawn for the same instance indices. Observed in a live cluster: `pool short by 4 …
+   * spawning instances 1,2,3,4` four times inside one second, four pods created under one
+   * name, four readiness waits on the one pod, and a raw 404 whenever one of them recycled a
+   * pod another was still waiting on — all of it contending for the very resources the boxes
+   * needed in order to start.
+   */
+  it("starts ONE spawn per slot no matter how many callers ask at once", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return {
+        boxId: `agentbox-${config.agentId}-${config.instance ?? 0}`,
+        endpoint: `http://10.0.0.${(config.instance ?? 0) + 1}:3000`,
+        agentId: config.agentId,
+      };
+    };
+    const mgr = pooledManager(spawner, 3);
+
+    // Five concurrent callers, all seeing the same empty pool and the same missing slots.
+    const calls = Array.from({ length: 5 }, () => (mgr as any).spawnInstances("agent-a", undefined, [1, 2]));
+    release!();
+    await Promise.all(calls);
+
+    // Two slots ⇒ two spawns, not ten.
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect(spawner.spawnCalls.map((c) => c.instance).sort()).toEqual([1, 2]);
+  });
+
+  it("hands every joined caller the box the first caller created", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "the-one-box", endpoint: "http://10.0.0.2:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    const calls = [
+      (mgr as any).spawnInstances("agent-a", undefined, [1]),
+      (mgr as any).spawnInstances("agent-a", undefined, [1]),
+    ];
+    release!();
+    const [a, b] = await Promise.all(calls);
+
+    expect(a[0].boxId).toBe("the-one-box");
+    expect(b[0].boxId).toBe("the-one-box");
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("frees the slot once the spawn settles, so a later fill can retry it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect((mgr as any).inflightSpawns.size).toBe(0);
+  });
+
+  /**
+   * De-duplication alone does not stop the storm: an attempt leaves the in-flight map the
+   * moment it settles, so a slot that cannot be filled would be retried as fast as traffic
+   * happens to arrive.
+   */
+  it("backs a failing slot off for background fills", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      throw new Error("no capacity");
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(true);
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(false);
+  });
+
+  it("clears the backoff once the slot spawns successfully", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let fail = true;
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (fail) throw new Error("no capacity");
+      return { boxId: "b", endpoint: "http://10.0.0.2:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(false);
+
+    fail = false;
+    // The wait path is allowed through regardless of the cooldown — see getOrCreatePooled.
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(true);
+  });
+
+  it("counts the backoff per slot, not per agent", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (config.instance === 1) throw new Error("no capacity");
+      return { boxId: "b", endpoint: "http://10.0.0.3:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 3);
+
+    await (mgr as any).spawnInstances("agent-a", undefined, [1, 2]);
+
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(false);
+    expect((mgr as any).mayFillInstance("agent-a", 2)).toBe(true);
+  });
+
+  /**
+   * The one path that must NOT respect the cooldown: nothing is available to serve the turn
+   * from, so a slot that failed a moment ago is still worth one more attempt.
+   */
+  it("still tries the awaited spawn when there is nothing to serve from", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let attempts = 0;
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      attempts++;
+      if (attempts === 1) throw new Error("no capacity");
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    await expect(mgr.getOrCreate("agent-a", undefined, "s1")).rejects.toThrow(/Failed to spawn/);
+    // Cooldown is now set for slot 0, yet the next turn must still get a box.
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s2");
+    expect(handle.boxId).toBe("agentbox-agent-a-0");
   });
 });
 

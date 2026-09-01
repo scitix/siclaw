@@ -72,6 +72,20 @@ export interface AgentBoxInfo {
    */
   caFingerprint?: string;
   /**
+   * When the mTLS certificate this pod mounts expires, read from its `<prefix>/cert-exp`
+   * label (K8s only).
+   *
+   * Undefined means UNKNOWN, not "never": pods created before the label existed carry no
+   * such label, and the manager must read that as fresh — the same trap the CA fingerprint
+   * fell into once, where a missing label read as "signed by a CA we no longer trust" and
+   * every box was drained on sight.
+   *
+   * Needed as well as {@link caFingerprint} because a certificate goes bad in two
+   * independent ways: the CA that signed it can be rotated, or the leaf can simply run
+   * out. The second is invisible to a fingerprint comparison.
+   */
+  certExpiresAt?: Date;
+  /**
    * The box's process ended without being asked to — a crash, an OOM kill, an eviction.
    *
    * Distinct from ending cleanly (idle self-destruct, or a shutdown the runtime asked

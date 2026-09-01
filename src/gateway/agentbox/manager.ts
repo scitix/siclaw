@@ -14,6 +14,7 @@ import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
 import { BoxBindings } from "./box-bindings.js";
 import { normalizeReplicas } from "../../core/config.js";
+import { certificateHasExpired, certificateNeedsRenewal } from "../../shared/cert-validity.js";
 
 /** What a box reports about itself (see the agentbox `/api/internal/box-status` route). */
 export interface BoxStatusReport {
@@ -61,6 +62,25 @@ const CRASH_RESPAWN_LIMIT = 3;
 
 /** How often drained boxes are collected. */
 const DRAIN_REAP_INTERVAL_MS = 10_000;
+
+/**
+ * How long a BACKGROUND pool fill leaves a slot alone after a failed spawn.
+ *
+ * Distinct from {@link CRASH_RESPAWN_COOLDOWN_MS}, which counts boxes that RAN and died.
+ * This counts boxes that never started, and until it existed nothing rate-limited that at
+ * all: the fill is triggered per session request, so a slot that could not be filled was
+ * retried as fast as traffic arrived. Short, because the common cause is transient
+ * contention that clears in well under a minute.
+ */
+const SPAWN_RETRY_COOLDOWN_MS = 30_000;
+
+/** How long a spawn-failure record survives with nobody asking about it. */
+const SPAWN_FAILURE_FORGET_MS = 60 * 60_000;
+
+/** Key for the per-(agent, instance) spawn bookkeeping. One slot is one pod. */
+function spawnSlotKey(agentId: string, instance: number): string {
+  return `${agentId}#${instance}`;
+}
 
 /**
  * Consecutive failed status probes before a box is treated as gone rather than busy.
@@ -138,6 +158,14 @@ export class AgentBoxManager {
   private crashRespawns = new Map<string, { count: number; at: number }>();
   /** Recent drains per agent, so a wrong staleness judgement cannot spin forever. */
   private drainBudget = new Map<string, { count: number; since: number }>();
+  /**
+   * Spawns currently in flight, keyed by {@link spawnSlotKey}. Concurrent callers naming
+   * the same slot join the running attempt instead of starting a rival one — see
+   * {@link spawnInstances}.
+   */
+  private readonly inflightSpawns = new Map<string, Promise<AgentBoxHandle | null>>();
+  /** When a slot's spawn last failed, so background fills back off — see mayFillInstance. */
+  private readonly spawnFailures = new Map<string, number>();
   /** Agents already warned about pooling without shared session storage. */
   private unsharedWarned = new Set<string>();
   private legacySessionLister?: (endpoint: string) => Promise<string[]>;
@@ -410,7 +438,10 @@ export class AgentBoxManager {
       return this.getOrCreatePooled(agentId, config, sessionId, 1);
     }
 
-    if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
+    // USABLE, not fresh: a certificate approaching expiry still authenticates, so serve
+    // from it and let the background roll replace the box. Rebuilding here would make a
+    // user's turn wait out a full cold start for a box that works.
+    if (info && info.status === "running" && info.endpoint && this.isCertUsable(info)) {
       const hasProfile = info.profile ?? "agent";
       if (hasProfile === wantProfile) {
         // Warm reuse: return the running pod without spawning. Per-agent config
@@ -426,8 +457,8 @@ export class AgentBoxManager {
       );
       await this.spawner.stop(name);
     }
-    if (info && info.status === "running" && !this.isCertFresh(info)) {
-      console.log(`[agentbox-manager] Pod for agent=${agentId} has a stale CA cert; recreating to restore mTLS`);
+    if (info && info.status === "running" && !this.isCertUsable(info)) {
+      console.log(`[agentbox-manager] Pod for agent=${agentId} has an unusable mTLS cert (rotated CA, or already expired); recreating to restore mTLS`);
     }
 
     console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
@@ -517,9 +548,13 @@ export class AgentBoxManager {
 
     if (accepting.length === 0) {
       const [first, ...rest] = missing.length > 0 ? missing : this.freeInstances(pool, 1);
+      // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
+      // failed a moment ago is still worth one more try. The background remainder does
+      // respect it.
       const [handle] = await this.spawnInstances(agentId, config, [first]);
-      if (rest.length > 0) {
-        void this.spawnInstances(agentId, config, rest).catch((err) =>
+      const fillable = rest.filter((i) => this.mayFillInstance(agentId, i));
+      if (fillable.length > 0) {
+        void this.spawnInstances(agentId, config, fillable).catch((err) =>
           console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
       }
       if (handle) {
@@ -530,8 +565,14 @@ export class AgentBoxManager {
       // leaves it alone while it holds work.
       if (reachable.length === 0) throw new Error(`Failed to spawn an AgentBox for agent ${agentId}`);
     } else if (missing.length > 0) {
-      void this.spawnInstances(agentId, config, missing).catch((err) =>
-        console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
+      // 🔴 This is the hot path of the storm: it runs on EVERY session request while the
+      // pool is short. De-duplication merges the concurrent attempts and the cooldown keeps
+      // a slot that just failed from being retried at the rate traffic happens to arrive.
+      const fillable = missing.filter((i) => this.mayFillInstance(agentId, i));
+      if (fillable.length > 0) {
+        void this.spawnInstances(agentId, config, fillable).catch((err) =>
+          console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
+      }
     }
 
     if (!sessionId) {
@@ -704,18 +745,22 @@ export class AgentBoxManager {
 
     for (const box of pool) {
       if (box.status !== "running" || this.draining.has(box.boxId)) continue;
-      // A box that cannot be talked to (its cert is signed by a CA we no longer trust) or
-      // is the wrong shape entirely is not a candidate for an orderly roll — keeping it in
-      // the pool serves nobody, so it goes immediately regardless of what else is draining.
+      // A box that cannot be talked to (its cert is signed by a CA we no longer trust, or
+      // has already expired) or is the wrong shape entirely is not a candidate for an
+      // orderly roll — keeping it in the pool serves nobody, so it goes immediately
+      // regardless of what else is draining.
       const urgent =
-        !this.isCertFresh(box) ? "stale CA"
+        !this.isCertUsable(box) ? "cert unusable (rotated CA or expired)"
         : (box.profile ?? "agent") !== wantProfile ? `profile ${box.profile} != ${wantProfile}`
         : null;
-      // A new image, or a pod still named the way instance 0 was named before every
-      // instance carried its index. Both are working boxes: replace them one at a time so
-      // the pool never drops to zero boxes able to take a new session.
+      // A new image, a certificate approaching expiry, or a pod still named the way
+      // instance 0 was named before every instance carried its index. All are WORKING
+      // boxes: replace them one at a time so the pool never drops to zero boxes able to
+      // take a new session. Expiry belongs here rather than above precisely because every
+      // box of the pool shares one Secret and so comes due at the same moment.
       const rollable = urgent
         ? null
+        : !this.isCertFresh(box) ? "certificate nearing expiry"
         : this.isStaleImage(box, wantProfile) ? `image ${box.image} != ${(this.spawner as any).expectedImage(wantProfile)}`
         : this.isLegacyName(agentId, box, wantProfile) ? "pod name predates instance indices"
         : null;
@@ -816,6 +861,23 @@ export class AgentBoxManager {
     return free;
   }
 
+  /**
+   * Create the named boxes, joining any spawn already in flight for the same slot.
+   *
+   * 🔴 DE-DUPLICATION IS LOAD-BEARING, not an optimisation. Pool filling is triggered from
+   * `getOrCreatePooled`, i.e. once per SESSION REQUEST, and the fill runs in the
+   * background — so while a pool sits short, every arriving request used to start its own
+   * spawn for the very same instance indices. Observed: `pool short by 4 … spawning
+   * instances 1,2,3,4` four times within a second, four pods created under one name (409 →
+   * "concurrent create"), four independent readiness waits on that one pod, and a raw 404
+   * ApiException whenever one of them recycled a pod another was still waiting on. All of
+   * that contends for exactly the resources the boxes need in order to start, which is what
+   * turned a slow cold start into a pool that never converged.
+   *
+   * The joined caller gets the first caller's box, built with the first caller's config.
+   * That is not a compromise: one (agent, instance) is one pod by definition, so a second
+   * spawn could only ever have produced the same pod or destroyed the first one's.
+   */
   private async spawnInstances(
     agentId: string,
     config: Partial<AgentBoxConfig> | undefined,
@@ -829,32 +891,92 @@ export class AgentBoxManager {
      */
     pooled = true,
   ): Promise<AgentBoxHandle[]> {
-    const resolvedEnv = await this.resolveEnv(agentId, config?.env);
-    const persistence = await this.resolvePersistence(agentId, config?.persistence);
-    const results = await Promise.all(instances.map(async (instance) => {
-      try {
-        const handle = await this.spawner.spawn({
-          ...config,
-          agentId,
-          instance,
-          persistence,
-          env: {
-            ...resolvedEnv,
-            // A pooled box must be RESIDENT. With a finite idle window the pool would
-            // shrink itself the moment traffic dipped and pay a cold start on the next
-            // turn — the opposite of why replicas were raised. Reuses the existing
-            // non-positive-window contract rather than adding a second mechanism.
-            ...(pooled ? { SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" } : {}),
-          },
-        });
-        handle.agentId = agentId;
-        return handle;
-      } catch (err) {
-        console.warn(`[agentbox-manager] spawn of instance ${instance} for agent=${agentId} failed:`, err);
-        return null;
-      }
+    // Resolving env/persistence costs an RPC each, so pay it only if a slot turns out to be
+    // ours to fill — and resolve it LAZILY rather than up front behind an `if`. Deciding
+    // that no slot needs it, and then acting on that decision further down, would be
+    // correct only as long as nothing awaits in between; that is invisible to anyone
+    // editing this later, and getting it wrong means spawning a pod with an empty env and a
+    // default persistence mode. Memoised, so concurrent slots share the one resolution.
+    let context: Promise<{ env: Record<string, string>; persistence: boolean | undefined }> | undefined;
+    const spawnContext = () => (context ??= (async () => ({
+      env: await this.resolveEnv(agentId, config?.env),
+      persistence: await this.resolvePersistence(agentId, config?.persistence),
+    }))());
+
+    const results = await Promise.all(instances.map((instance) => {
+      const key = spawnSlotKey(agentId, instance);
+      const inflight = this.inflightSpawns.get(key);
+      if (inflight) return inflight;
+
+      const attempt = (async () => {
+        try {
+          const { env: resolvedEnv, persistence } = await spawnContext();
+          const handle = await this.spawner.spawn({
+            ...config,
+            agentId,
+            instance,
+            persistence,
+            env: {
+              ...resolvedEnv,
+              // A pooled box must be RESIDENT. With a finite idle window the pool would
+              // shrink itself the moment traffic dipped and pay a cold start on the next
+              // turn — the opposite of why replicas were raised. Reuses the existing
+              // non-positive-window contract rather than adding a second mechanism.
+              ...(pooled ? { SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" } : {}),
+            },
+          });
+          handle.agentId = agentId;
+          this.spawnFailures.delete(key);
+          return handle;
+        } catch (err) {
+          console.warn(`[agentbox-manager] spawn of instance ${instance} for agent=${agentId} failed:`, err);
+          this.spawnFailures.set(key, Date.now());
+          return null;
+        }
+      })();
+
+      this.inflightSpawns.set(key, attempt);
+      // Compare before deleting: by the time this settles the entry may already belong to
+      // a later attempt for the same slot.
+      void attempt.finally(() => {
+        if (this.inflightSpawns.get(key) === attempt) this.inflightSpawns.delete(key);
+      });
+      return attempt;
     }));
     return results.filter((h): h is AgentBoxHandle => h !== null);
+  }
+
+  /**
+   * Whether a BACKGROUND fill may try this slot yet.
+   *
+   * De-duplication alone does not stop a storm: an attempt is removed from the in-flight
+   * map the moment it settles, so a failing slot would be retried by the very next request
+   * to arrive. Deliberately NOT consulted on the path that has nothing to serve from — a
+   * user's turn waiting on the agent's only box must still be allowed to try.
+   */
+  private mayFillInstance(agentId: string, instance: number): boolean {
+    const key = spawnSlotKey(agentId, instance);
+    const failedAt = this.spawnFailures.get(key);
+    if (failedAt === undefined) return true;
+    if (Date.now() - failedAt < SPAWN_RETRY_COOLDOWN_MS) return false;
+    this.spawnFailures.delete(key);
+    return true;
+  }
+
+  /**
+   * Drop spawn-failure records nobody will ask about again.
+   *
+   * `mayFillInstance` clears a slot's record when it is next consulted, which covers every
+   * slot still in use — but a slot stops being consulted the moment `replicas` drops below
+   * its index, and its record would then outlive the pool shape that produced it. Same
+   * reasoning as CRASH_RESPAWN_FORGET_MS; bounded rather than strictly necessary, since the
+   * key space is (agents × instances).
+   */
+  private forgetStaleSpawnFailures(): void {
+    const now = Date.now();
+    for (const [key, at] of this.spawnFailures) {
+      if (now - at > SPAWN_FAILURE_FORGET_MS) this.spawnFailures.delete(key);
+    }
   }
 
   /**
@@ -957,7 +1079,10 @@ export class AgentBoxManager {
     const missing = this.missingInstances(pool, replicas, agentId)
       // A slot that just crashed is under the same cooldown here as it is in the crash
       // path; without this the roll happily respawns what crash healing declined to.
-      .filter((instance) => this.respawnCooledDown(`${agentId}#${instance}`));
+      .filter((instance) => this.respawnCooledDown(spawnSlotKey(agentId, instance)))
+      // Same for a slot whose last spawn never got off the ground: a roll must not become
+      // the path that retries it every tick.
+      .filter((instance) => this.mayFillInstance(agentId, instance));
     if (missing.length === 0) return;
     console.log(`[agentbox-manager] agent=${agentId} roll in progress; bringing instance(s) ${missing.join(",")} back`);
     void this.spawnInstances(agentId, undefined, missing, replicas > 1).catch((err) =>
@@ -1005,7 +1130,22 @@ export class AgentBoxManager {
 
     // Rate-limited per INSTANCE, not per pod name: the replacement takes the same index,
     // so "this slot keeps dying" is the thing worth counting.
-    const allowed = missing.filter((instance) => this.mayRespawn(`${agentId}#${instance}`));
+    //
+    // ORDER: the REPORTING check before the one that SPENDS. A slot can be under both
+    // cooldowns — it crashed, and the replacement then failed to start — and the two count
+    // different things, so both have to agree. But `mayRespawn` consumes one of three crash
+    // attempts when it says yes, while `mayFillInstance` only reports; a slot filtered out
+    // after mayRespawn already said yes has paid for a replacement that never happened.
+    //
+    // With today's constants that cannot actually bite: CRASH_RESPAWN_COOLDOWN_MS (2 min)
+    // exceeds SPAWN_RETRY_COOLDOWN_MS (30 s), so mayRespawn's own cooldown — which returns
+    // false WITHOUT spending — always blocks first, and the windows never overlap. This
+    // order removes the dependency on that coincidence rather than fixing a live defect:
+    // tightening the crash cooldown, or lengthening the spawn one, would otherwise make it
+    // real, and nothing in either constant's own definition hints at the coupling.
+    const allowed = missing
+      .filter((instance) => this.mayFillInstance(agentId, instance))
+      .filter((instance) => this.mayRespawn(spawnSlotKey(agentId, instance)));
     if (allowed.length === 0) return;
     console.log(`[agentbox-manager] agent=${agentId} replacing ${allowed.length} crashed box(es); spawning instances ${allowed.join(",")}`);
     void this.spawnInstances(agentId, undefined, allowed, replicas > 1).catch((err) =>
@@ -1062,6 +1202,8 @@ export class AgentBoxManager {
       list.push(box);
       byAgent.set(box.agentId, list);
     }
+
+    this.forgetStaleSpawnFailures();
 
     for (const [agentId, pool] of byAgent) {
       await this.healCrashedBoxes(agentId, pool);
@@ -1205,19 +1347,50 @@ export class AgentBoxManager {
   }
 
   /**
-   * Whether a running pod's mTLS cert still chains to the runtime's current CA.
+   * Whether a running pod's mTLS certificate is still usable.
    *
-   * If the spawner can't report a CA fingerprint (non-mTLS spawner, or cert
-   * manager not yet set), there's nothing to validate → treat as fresh. A
-   * running pod whose stamped fingerprint differs (or is absent on a pod
-   * spawned before this label existed) is stale: the runtime can no longer
-   * complete mTLS with it, so getOrCreate falls through to spawn(), which
-   * deletes and recreates it with a cert signed by the current CA.
+   * TWO independent questions, and for a long time only the first was asked:
+   *
+   *  1. Does it chain to the runtime's CURRENT CA? A rotated CA invalidates every
+   *     certificate signed by the old one.
+   *  2. Has it got life left? The leaf is valid for AGENTBOX_CERT_VALIDITY_DAYS, and a
+   *     RESIDENT pool box outlives that easily. Expiry is invisible to a fingerprint
+   *     comparison, so a box could sit here reading "fresh" while every call in both
+   *     directions failed mTLS.
+   *
+   * Returning false is what gets the box drained and replaced, and replacement is the only
+   * repair available: the box reads its certificate off disk once at startup, so re-issuing
+   * the Secret underneath a running pod does nothing for it. That is why this looks a
+   * renewal window ahead (see AGENTBOX_CERT_RENEW_BEFORE_MS) rather than waiting for actual
+   * expiry — the drain, the respawn and the drain budget all have to fit inside it.
+   *
+   * Fail-open on missing information, in BOTH questions: a spawner that reports no
+   * fingerprint (non-mTLS, or cert manager not yet set) and a pod with no expiry label
+   * (created before the label existed) are both "no answer", never "stale". Reading a
+   * missing label as stale is precisely how a previous version of this drained every
+   * freshly created box on sight.
    */
   private isCertFresh(info: AgentBoxInfo): boolean {
+    if (!this.isCertUsable(info)) return false;
+    return !certificateNeedsRenewal(info.certExpiresAt ?? null);
+  }
+
+  /**
+   * Whether mTLS with this box can succeed RIGHT NOW — a weaker question than
+   * {@link isCertFresh}, and the difference matters for how urgently a box is replaced.
+   *
+   * A rotated CA or an already-expired leaf means every call in both directions fails, so
+   * such a box is worthless and goes immediately. A box merely APPROACHING expiry still
+   * works, and must be rolled one at a time like any other stale box: every box of a pool
+   * mounts the SAME per-agent Secret and therefore expires at the same moment, so treating
+   * "nearing expiry" as urgent would drain the whole pool at once — the very stampede the
+   * renewal window exists to avoid.
+   */
+  private isCertUsable(info: AgentBoxInfo): boolean {
     const want = this.spawner.caFingerprint?.();
     if (!want) return true;
-    return info.caFingerprint === want;
+    if (info.caFingerprint !== want) return false;
+    return !certificateHasExpired(info.certExpiresAt ?? null);
   }
 
   get(agentId: string): AgentBoxHandle | undefined {

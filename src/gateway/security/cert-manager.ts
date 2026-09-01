@@ -25,6 +25,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import forge from "node-forge";
+import { AGENTBOX_CERT_VALIDITY_DAYS } from "../../shared/cert-validity.js";
 
 /** CA validity: 10 years */
 const CA_VALIDITY_DAYS = 3650;
@@ -182,7 +183,7 @@ export class CertificateManager {
     });
 
     const issuedAt = new Date();
-    const expiresAt = new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(issuedAt.getTime() + AGENTBOX_CERT_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
 
     const cert = CertificateManager.createCertificateStatic({
       subject: { CN: agentId, O: orgId, serialNumber: boxId },
@@ -190,7 +191,9 @@ export class CertificateManager {
       publicKey,
       signingKey: this.caKey,
       isCA: false,
-      validityDays: 30,
+      // Shared with the renewal logic that decides when a box must be replaced — a lifetime
+      // only one side knows is a lifetime the other cannot plan around.
+      validityDays: AGENTBOX_CERT_VALIDITY_DAYS,
       extendedKeyUsage: ["clientAuth", "serverAuth"],
       // AgentBox cert is also used to terminate HTTPS on the AgentBox side.
       // Include SANs so the Runtime (and any mTLS client) can verify hostnames
