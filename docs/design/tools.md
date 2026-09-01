@@ -604,12 +604,15 @@ are intentionally different:
 
 `read_files` is a retrieval capability group, not only filesystem access:
 
-1. `knowledge_search` queries an Agent-scoped `MemoryIndexer` over mounted
-   Markdown using hybrid semantic + FTS ranking. FTS-only remains functional
-   when embeddings are unavailable.
+1. `knowledge_search` is the stable model-visible entry to an Agent-scoped
+   `KnowledgeResolver`. The resolver performs hybrid semantic + FTS retrieval,
+   aggregates chunks by leaf page, reads selected pages, and returns evidence
+   under a context-window-derived budget. FTS-only remains functional when
+   embeddings are unavailable.
 2. `grep` / `find` provide exact-text and filename fallback for identifiers,
    versions, aliases, and terms absent from embeddings.
-3. `read` loads the complete selected page before synthesis.
+3. `read` loads linked or fallback material only when the resolver reports that
+   its ready evidence is insufficient, not as a mandatory second retrieval hop.
 4. `knowledge_cite` emits citations only for manifest-backed pages actually
    read during the current turn.
 

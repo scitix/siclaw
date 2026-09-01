@@ -99,9 +99,8 @@ const KNOWLEDGE_WIKI_BUDGET = 8000;
  * The wiki is a markdown tree at `knowledgeDir` whose `index.md` lists pages with
  * one-line descriptions and standard markdown links (legacy `[[links]]` remain
  * readable). We surface that index directly so the agent sees the catalog in
- * context for cheap routing, while knowledge_search provides hybrid retrieval
- * when titles/descriptions are insufficient. The agent then Reads only the
- * specific page(s) it needs on demand.
+ * context for cheap routing, while knowledge_search resolves the original
+ * question through hybrid retrieval and returns already-read leaf evidence.
  *
  * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
  * represented by an explicit retrieval/fallback notice, never a partial prefix.
@@ -131,9 +130,10 @@ export function buildKnowledgeWikiCatalog(
     "# Knowledge Wiki",
     "",
     "Bound knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
-    "Use `knowledge_search` first with alternative terms, aliases, versions, and likely document titles; " +
-    "the catalog below is navigation context, not the only retrieval path. Use Grep/Find for exact terms " +
-    "or file-level fallback. Read the complete relevant page(s) with the Read tool before answering, and " +
+    "Call `knowledge_search` once with the user's original question; its ready result contains already-read, " +
+    "context-bounded leaf-page evidence. The catalog below is navigation context, not the only retrieval path. " +
+    "Use Grep/Find/Read only when retrieval is unavailable, finds nothing, or explicitly leaves required material unresolved. " +
+    "When following links as a fallback, " +
     "follow standard markdown links " +
     "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
     "Also tolerate legacy `[[other-page]]` links, resolved from `.siclaw/knowledge/`. Don't read unrelated " +

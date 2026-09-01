@@ -27,6 +27,7 @@ import {
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { createKnowledgeIndexer } from "../knowledge/indexer.js";
+import { createKnowledgeResolver } from "../knowledge/resolver.js";
 import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -433,6 +434,9 @@ export async function createSiclawSession(
         sessionEventEmitter: opts.sessionEventEmitter,
       })
     : undefined;
+  // The configured model is resolved later. The tool closes over this mutable
+  // budget, which is updated before the first turn begins.
+  const knowledgeEvidenceBudgetCharsRef = { current: 8_000 };
 
   if (memoryEnabled) {
     // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
@@ -498,6 +502,21 @@ export async function createSiclawSession(
       console.warn("[agent-factory] Knowledge index init failed; Read/Grep/Find remain available:", err);
     }
   }
+  const knowledgeResolver = knowledgeIndexer
+    ? createKnowledgeResolver({
+        indexer: knowledgeIndexer,
+        knowledgeDir,
+        evidenceBudgetCharsRef: knowledgeEvidenceBudgetCharsRef,
+        readPage: async (absolutePath) => {
+          const start = citationSupport?.captureMount();
+          const body = await fsReadFile(absolutePath, "utf8");
+          if (citationSupport && start !== undefined) {
+            citationSupport.noteRead(absolutePath, body, start);
+          }
+          return body;
+        },
+      })
+    : undefined;
 
   // ── Tool Registry: declarative resolution ──
   const registry = new ToolRegistry();
@@ -514,6 +533,7 @@ export async function createSiclawSession(
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       knowledgeIndexer,
+      knowledgeResolver,
       skillScriptResolver,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
@@ -905,6 +925,12 @@ export async function createSiclawSession(
 
   // ── Guard pipeline: unified guard registration and installation ──
   const contextWindow = configuredModel?.contextWindow ?? 128_000;
+  // Keep evidence below the generic single-tool guard while reserving most of
+  // the context for instructions, history, reasoning, and the final answer.
+  knowledgeEvidenceBudgetCharsRef.current = Math.max(
+    1_024,
+    Math.min(24_000, Math.floor(contextWindow * 0.5)),
+  );
   const guardRegistry = createGuardRegistry(contextWindow);
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 

@@ -3,25 +3,25 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 import type { ToolEntry } from "../../core/tool-registry.js";
-import { isKnowledgeNavigationPath } from "../../knowledge/page-kind.js";
-import type { MemoryIndexer } from "../../memory/index.js";
+import type { KnowledgeLookupResult, KnowledgeResolver } from "../../knowledge/resolver-types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 
 interface KnowledgeSearchParams {
   query: string;
-  topK?: number;
-  minScore?: number;
 }
 
-function truncateUtf16Safe(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  const code = value.charCodeAt(maxLength - 1);
-  const end = code >= 0xd800 && code <= 0xdbff ? maxLength - 1 : maxLength;
-  return value.slice(0, end);
+interface TurnCache {
+  turn: number;
+  result: KnowledgeLookupResult;
 }
 
-/** Search one Agent's mounted knowledge pages through its scoped hybrid index. */
-export function createKnowledgeSearchTool(indexer: MemoryIndexer): ToolDefinition {
+/** Resolve a knowledge question into read leaf-page evidence in one tool call. */
+export function createKnowledgeSearchTool(
+  resolver: KnowledgeResolver,
+  turnRef?: { current: number },
+): ToolDefinition {
+  let cache: TurnCache | undefined;
+
   return {
     name: "knowledge_search",
     label: "Knowledge Search",
@@ -35,85 +35,36 @@ export function createKnowledgeSearchTool(indexer: MemoryIndexer): ToolDefinitio
     },
     renderResult: renderTextResult,
     description:
-      "Search the knowledge pages bound to this Agent using hybrid semantic and keyword retrieval. " +
-      "Use it before answering from mounted knowledge, including when the user does not know the document title. " +
-      "Try alternative product names, aliases, versions, and task terms when the first query is incomplete. " +
-      "The results are candidate snippets: Read the complete relevant leaf pages before answering, then use knowledge_cite only for pages actually used. " +
-      "Navigation results are routing hints and cannot be answer evidence.",
+      "Resolve the user's original knowledge question into a small set of relevant leaf-page evidence. " +
+      "Call this once per user turn with the question as asked; do not pre-search an index page, rewrite the query repeatedly, or Read the returned pages again. " +
+      "A ready result contains page content already read and bounded to the current model context. Answer only from that evidence, then call knowledge_cite once for the evidence_refs and citable pages actually used. " +
+      "A not_found or unavailable result is not evidence; say what is missing or use ordinary Grep/Read only when further investigation is necessary.",
     parameters: Type.Object({
-      query: Type.String({ description: "Natural-language query, document alias, version, or exact term to retrieve." }),
-      topK: Type.Optional(Type.Number({ description: "Maximum candidate chunks to return (default 8, maximum 20)." })),
-      minScore: Type.Optional(Type.Number({ description: "Optional minimum fused relevance score (default 0 to favor recall)." })),
+      query: Type.String({ description: "The user's original knowledge question, including any product, version, environment, and task details they supplied." }),
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as KnowledgeSearchParams;
-      const query = params.query?.trim();
-      if (!query) {
+      const currentTurn = turnRef?.current;
+      if (currentTurn !== undefined && cache?.turn === currentTurn) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Empty query" }) }],
-          details: {},
+          content: [{ type: "text", text: JSON.stringify(cache.result, null, 2) }],
+          details: { status: cache.result.status, resultCount: cache.result.results.length, reused: true },
         };
       }
 
-      const topK = Math.min(20, Math.max(1, Math.floor(params.topK ?? 8)));
-      try {
-        // Navigation pages often repeat every document title and can outrank the
-        // actual answer page. Retrieve a wider pool, then expose only leaf pages
-        // as answer candidates. Navigation hits remain routing hints, never
-        // evidence-bearing snippets.
-        const candidateK = Math.min(80, topK * 4);
-        const result = await indexer.search(query, candidateK, params.minScore ?? 0);
-        const leafChunks = result.chunks.filter((chunk) => !isKnowledgeNavigationPath(chunk.file));
-        const navigationChunks = result.chunks.filter((chunk) => isKnowledgeNavigationPath(chunk.file));
-        const results = leafChunks.slice(0, topK).map((chunk, index) => ({
-          rank: index + 1,
-          file: chunk.file,
-          heading: chunk.heading,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-          score: Math.round((chunk.score ?? 0) * 1000) / 1000,
-          content: truncateUtf16Safe(chunk.content, 700),
-        }));
-        const navigationResults = [...new Map(navigationChunks.map((chunk) => [chunk.file, {
-          file: chunk.file,
-          heading: chunk.heading,
-          score: Math.round((chunk.score ?? 0) * 1000) / 1000,
-        }])).values()].slice(0, 5);
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              mode: "hybrid",
-              results,
-              ...(navigationResults.length > 0 ? {
-                navigationResults,
-                navigationNotice: "Navigation pages are routing hints only. Read and cite the linked leaf page that supports the answer.",
-              } : {}),
-              ...(results.length === 0 ? {
-                message: navigationResults.length > 0
-                  ? "Only navigation pages matched. Read their linked leaf pages or retry with alternative terms; do not cite the navigation page."
-                  : "No matching knowledge pages found.",
-              } : {}),
-              totalFiles: result.totalFiles,
-              totalChunks: result.totalChunks,
-            }, null, 2),
-          }],
-          details: { resultCount: results.length },
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: `Knowledge search failed: ${message}` }) }],
-          details: { error: true },
-        };
-      }
+      const result = await resolver.lookup(params.query ?? "");
+      if (currentTurn !== undefined) cache = { turn: currentTurn, result };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details: { status: result.status, resultCount: result.results.length, reused: false },
+      };
     },
   };
 }
 
 export const registration: ToolEntry = {
   category: "query",
-  create: (refs) => createKnowledgeSearchTool(refs.knowledgeIndexer!),
-  available: (refs) => Boolean(refs.knowledgeIndexer),
+  create: (refs) => createKnowledgeSearchTool(refs.knowledgeResolver!, refs.turnRef),
+  available: (refs) => Boolean(refs.knowledgeResolver),
   readOnlyDelegable: true,
 };

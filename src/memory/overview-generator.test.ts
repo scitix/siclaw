@@ -294,9 +294,9 @@ describe("buildKnowledgeWikiCatalog", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("Use `knowledge_search` first");
-    expect(out).toContain("alternative terms");
-    expect(out).toContain("Grep/Find");
+    expect(out).toContain("Call `knowledge_search` once with the user's original question");
+    expect(out).toContain("already-read, context-bounded leaf-page evidence");
+    expect(out).toContain("Use Grep/Find/Read only when retrieval is unavailable");
     expect(out).not.toContain("there is no search tool");
     expect(out).toContain("[RoCE modes](network/roce-modes.md)");
     expect(out).toContain("[[gpu-xid]]");

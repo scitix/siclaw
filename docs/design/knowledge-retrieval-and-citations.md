@@ -17,8 +17,8 @@ that same mounted version.
 This contract has four consequences:
 
 1. `index.md` is navigation context, not the existence boundary for knowledge.
-2. Search results are candidates, not evidence; the Agent Reads the selected
-   leaf page before answering.
+2. Search chunks are candidates, not evidence; the platform reads selected
+   leaf pages and returns only their bounded content to the Agent.
 3. `index.md`, `_index.md`, and pages with `type: index` are never citable.
 4. Citation authority is the mounted `.citation-manifest.json`, not the current
    state of Sicore Manage Raw and not a URL copied by the model.
@@ -33,13 +33,14 @@ atomic knowledge mount
   pages + .sync-manifest.json + .citation-manifest.json
         |
         v
-derived hybrid index (rebuildable, Agent-scoped)
+knowledge_search -- one model-visible call per user turn
         |
         v
-knowledge_search -- leaf candidates + separate navigation hints
+KnowledgeResolver -- query derived hybrid index (rebuildable, Agent-scoped),
+                     aggregate candidates, read exact leaf snapshots
         |
         v
-Read exact leaf page snapshot
+bounded evidence + navigation hints
         |
         v
 knowledge_cite -- validate read snapshot against pinned citation manifest
@@ -56,9 +57,10 @@ index, and reloads the session prompt.
 
 ### Current baseline
 
-`knowledge_search` is platform-managed and scoped to one Agent's mounted
-knowledge directory. It uses dense and FTS keyword retrieval with MMR, and FTS
-remains available when embeddings are unavailable. This matches the common
+`KnowledgeResolver` is the platform-owned deep module behind the model-visible
+`knowledge_search` tool. It is scoped to one Agent's mounted knowledge
+directory. It uses dense and FTS keyword retrieval with MMR, and FTS remains
+available when embeddings are unavailable. This matches the common
 hybrid pattern: lexical retrieval preserves exact identifiers while embeddings
 recover semantic matches. Anthropic's Contextual Retrieval evaluation likewise
 combines BM25 and embeddings, then improves precision with reranking.
@@ -68,11 +70,21 @@ catalog is not prefix-truncated: a prefix looks complete and creates false
 absence. Search is the normal discovery path; Grep/Read of the full index is the
 deterministic fallback.
 
-Search retrieves a wider candidate pool, removes navigation pages from answer
-candidates, and returns navigation matches separately as routing hints. The
-Agent then Reads the complete leaf page. This follows the parent-document
-pattern: use smaller chunks for recall, but use the owning document as answer
-context.
+The resolver retrieves a wider chunk pool, removes navigation pages from answer
+candidates, aggregates hits by owning page, and reads up to three selected leaf
+pages concurrently. Small pages are returned whole; large pages return matched
+sections within a context-window-derived evidence budget. Reads pass through the
+same current-turn citation registrar as the Read tool. The model therefore gets
+answer evidence in one retrieval call and can register only what it used with
+`knowledge_cite`. This follows the parent-document pattern: use smaller chunks
+for recall, but use the owning document as the answer and provenance boundary.
+
+Repeated `knowledge_search` calls in the same turn reuse the first result. This
+is a latency guard, not a forced case-specific index: every question goes
+through the same Agent-scoped hybrid index, page aggregation, read, and budget
+policy. `index.md` may still be omitted from the system prompt when it exceeds
+the catalog budget; retrieval does not depend on that prompt copy and filters
+navigation pages from answer evidence.
 
 ### Next retrieval stage
 
@@ -85,7 +97,7 @@ intuition:
    not replace the original query because it can drift.
 3. Return stable `result_id` and mount generation metadata for every candidate,
    and trace query variants, candidate scores, selected reads, and citations.
-4. Add a one-shot completion gate for the Knowledge QA harness: when mounted
+4. Add a completion gate for the Knowledge QA harness: when mounted
    knowledge is required but no search or explicit-page Read occurred, continue
    the turn once with a required retrieval action instead of finalizing a factual
    answer. Never loop indefinitely.

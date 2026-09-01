@@ -1,128 +1,63 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { KnowledgeLookupResult, KnowledgeResolver } from "../../knowledge/resolver-types.js";
+import { createKnowledgeSearchTool, registration } from "./knowledge-search.js";
 
-import { MemoryIndexer } from "../../memory/indexer.js";
-import type { EmbeddingProvider } from "../../memory/types.js";
-import { createKnowledgeSearchTool } from "./knowledge-search.js";
+function readyResult(query: string): KnowledgeLookupResult {
+  return {
+    status: "ready",
+    mode: "hybrid",
+    query,
+    results: [{
+      rank: 1,
+      file: "gpu.md",
+      title: "GPU SOP",
+      score: 0.9,
+      readMode: "full_page",
+      truncated: false,
+      citationMode: "page",
+      sections: [{ heading: "GPU SOP", startLine: 1, endLine: 2, content: "# GPU SOP\n升级步骤" }],
+    }],
+  };
+}
 
-const noEmbedding: EmbeddingProvider = {
-  model: "fts-only",
-  dimensions: 1,
-  async embed() {
-    return [];
-  },
-};
+function payload(result: any): KnowledgeLookupResult {
+  return JSON.parse((result.content[0] as { text: string }).text) as KnowledgeLookupResult;
+}
 
 describe("knowledge_search", () => {
-  let root: string;
-  let knowledgeDir: string;
-  let indexer: MemoryIndexer;
+  it("returns the resolver's read evidence without exposing retrieval tuning parameters", async () => {
+    const resolver: KnowledgeResolver = { lookup: vi.fn(async (query) => readyResult(query)) };
+    const tool = createKnowledgeSearchTool(resolver);
 
-  beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-knowledge-search-"));
-    knowledgeDir = path.join(root, "knowledge");
-    fs.mkdirSync(knowledgeDir, { recursive: true });
-    indexer = new MemoryIndexer(
-      path.join(root, "knowledge-index.db"),
-      knowledgeDir,
-      noEmbedding,
-      { temporalDecay: { enabled: false }, mmr: { enabled: true, lambda: 0.75 } },
-    );
-  });
+    const result = await tool.execute("call-1", { query: "GPU 驱动怎么升级" });
 
-  afterEach(() => {
-    indexer.close();
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  it("finds a relevant page by body terms without requiring its document title", async () => {
-    fs.writeFileSync(
-      path.join(knowledgeDir, "nvshmem-install.md"),
-      "# NVSHMEM installation\n\nFor IBGDA transport, set NVSHMEM_IB_ENABLE_IBGDA=true before launch.",
-    );
-    fs.writeFileSync(
-      path.join(knowledgeDir, "nccl-generic.md"),
-      "# Generic NCCL settings\n\nUse the standard socket configuration for ordinary jobs.",
-    );
-    await indexer.sync();
-
-    const tool = createKnowledgeSearchTool(indexer);
-    const result = await tool.execute("call-1", { query: "IBGDA 怎么启用", topK: 5 });
-    const payload = JSON.parse((result.content[0] as { text: string }).text);
-
-    expect(payload.results[0]).toMatchObject({
-      file: "nvshmem-install.md",
-      heading: "NVSHMEM installation",
+    expect(resolver.lookup).toHaveBeenCalledWith("GPU 驱动怎么升级");
+    expect(payload(result)).toMatchObject({ status: "ready", results: [{ file: "gpu.md" }] });
+    expect((tool.parameters as any).properties).toEqual({
+      query: expect.any(Object),
     });
-    expect(payload.results[0].content).toContain("NVSHMEM_IB_ENABLE_IBGDA");
-    expect(payload.results[0].startLine).toBeGreaterThan(0);
   });
 
-  it("keeps keyword retrieval available when semantic embeddings are unavailable", async () => {
-    fs.writeFileSync(
-      path.join(knowledgeDir, "gpu-acceptance.md"),
-      "# GPU acceptance tool\n\nRun the R595 acceptance workflow for RTX 5090 nodes.",
-    );
-    await indexer.sync();
+  it("reuses the first lookup in the same turn and refreshes on the next turn", async () => {
+    const resolver: KnowledgeResolver = { lookup: vi.fn(async (query) => readyResult(query)) };
+    const turnRef = { current: 7 };
+    const tool = createKnowledgeSearchTool(resolver, turnRef);
 
-    const tool = createKnowledgeSearchTool(indexer);
-    const result = await tool.execute("call-2", { query: "5090 R595 验收", topK: 3 });
-    const payload = JSON.parse((result.content[0] as { text: string }).text);
+    const first = await tool.execute("call-1", { query: "first" });
+    const repeated = await tool.execute("call-2", { query: "rewritten" });
+    turnRef.current += 1;
+    const nextTurn = await tool.execute("call-3", { query: "next" });
 
-    expect(payload.results).toHaveLength(1);
-    expect(payload.results[0].file).toBe("gpu-acceptance.md");
-    expect(payload.mode).toBe("hybrid");
+    expect(resolver.lookup).toHaveBeenCalledTimes(2);
+    expect(payload(first).query).toBe("first");
+    expect(payload(repeated).query).toBe("first");
+    expect(repeated.details).toMatchObject({ reused: true });
+    expect(payload(nextTurn).query).toBe("next");
   });
 
-  it("returns the GSP leaf page instead of treating a matching index as answer evidence", async () => {
-    fs.mkdirSync(path.join(knowledgeDir, "运维"), { recursive: true });
-    fs.writeFileSync(
-      path.join(knowledgeDir, "运维", "_index.md"),
-      "# 运维索引\n\nGSP GSP GSP GPU 固件关闭方法：参见 [GSP 禁用方法](GSP禁用方法.md)。",
-    );
-    fs.writeFileSync(
-      path.join(knowledgeDir, "运维", "GSP禁用方法.md"),
-      "# NVIDIA GSP 固件禁用方法\n\n宿主机设置 NVreg_EnableGpuFirmware=0，然后更新 initramfs 并重启。",
-    );
-    await indexer.sync();
-
-    const tool = createKnowledgeSearchTool(indexer);
-    const result = await tool.execute("call-gsp", { query: "关掉 GSP 怎么操作", topK: 5 });
-    const payload = JSON.parse((result.content[0] as { text: string }).text);
-
-    expect(payload.results.map((row: { file: string }) => row.file)).toContain("运维/GSP禁用方法.md");
-    expect(payload.results.map((row: { file: string }) => row.file)).not.toContain("运维/_index.md");
-    expect(payload.navigationResults).toEqual(expect.arrayContaining([
-      expect.objectContaining({ file: "运维/_index.md" }),
-    ]));
-    expect(payload.navigationNotice).toContain("routing hints only");
-  });
-
-  it("reports navigation-only matches without returning them as answer candidates", async () => {
-    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "# Index\n\nunique-navigation-token");
-    await indexer.sync();
-
-    const tool = createKnowledgeSearchTool(indexer);
-    const result = await tool.execute("call-navigation", { query: "unique-navigation-token" });
-    const payload = JSON.parse((result.content[0] as { text: string }).text);
-
-    expect(payload.results).toEqual([]);
-    expect(payload.navigationResults[0].file).toBe("index.md");
-    expect(payload.message).toContain("Only navigation pages matched");
-  });
-
-  it("returns an explicit empty result instead of inventing a page", async () => {
-    fs.writeFileSync(path.join(knowledgeDir, "network.md"), "# Network\n\nRoCE configuration.");
-    await indexer.sync();
-
-    const tool = createKnowledgeSearchTool(indexer);
-    const result = await tool.execute("call-3", { query: "unrelated-unique-token" });
-    const payload = JSON.parse((result.content[0] as { text: string }).text);
-
-    expect(payload.results).toEqual([]);
-    expect(payload.message).toContain("No matching knowledge pages");
+  it("is registered only when a KnowledgeResolver is available", () => {
+    expect(registration.available?.({ knowledgeResolver: undefined } as any)).toBe(false);
+    expect(registration.available?.({ knowledgeResolver: { lookup: vi.fn() } } as any)).toBe(true);
   });
 });

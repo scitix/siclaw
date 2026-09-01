@@ -13,6 +13,7 @@ import type {
 } from "./types.js";
 import type { DelegateResponse, DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
+import type { KnowledgeResolver } from "../knowledge/resolver-types.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
 
 export type { SessionMode };
@@ -417,6 +418,8 @@ export interface ToolRefs {
   memoryIndexer?: MemoryIndexer;
   /** Hybrid index over the knowledge pages mounted for this Agent. */
   knowledgeIndexer?: MemoryIndexer;
+  /** One-shot resolver that returns read, context-bounded leaf-page evidence. */
+  knowledgeResolver?: KnowledgeResolver;
   /** Session-scoped Skill script lookup. Required for LocalSpawner isolation. */
   skillScriptResolver?: SkillScriptResolver;
   memoryDir?: string;
