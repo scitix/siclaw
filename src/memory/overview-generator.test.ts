@@ -316,6 +316,18 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).not.toContain("bash");
   });
 
+  it("injects only the retrieval contract when the resolver is available", () => {
+    const index = "- [RoCE modes](network/roce-modes.md) — RoCE modes and failures";
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir, { includeCatalog: false });
+
+    expect(out).toContain("# Knowledge Wiki");
+    expect(out).toContain("Call `knowledge_search` once");
+    expect(out).toContain("catalog is intentionally not embedded");
+    expect(out).not.toContain("[RoCE modes]");
+  });
+
   it("carries a real compiled index whole", () => {
     // Measured from three shipped libraries: 7453, 6651 and 2668 characters.
     // The budget has to clear the largest of those, because a catalog cut in

@@ -107,7 +107,7 @@ const KNOWLEDGE_WIKI_BUDGET = 8000;
  */
 export function buildKnowledgeWikiCatalog(
   knowledgeDir?: string,
-  opts: { operational?: boolean } = {},
+  opts: { operational?: boolean; includeCatalog?: boolean } = {},
 ): string {
   if (!knowledgeDir) return "";
   const indexPath = path.join(knowledgeDir, "index.md");
@@ -119,8 +119,11 @@ export function buildKnowledgeWikiCatalog(
   }
   if (!index) return "";
 
+  const includeCatalog = opts.includeCatalog !== false;
   const oversized = index.length > KNOWLEDGE_WIKI_BUDGET;
-  const catalog = oversized
+  const catalog = !includeCatalog
+    ? "_(The catalog is intentionally not embedded because `knowledge_search` is the discovery authority. This keeps first-turn context bounded.)_"
+    : oversized
     ? `_(Catalog not embedded: ${index.length} characters. Partial catalogs are misleading. ` +
       "Use `knowledge_search` for discovery. If retrieval is unavailable or incomplete, Grep/Read " +
       "`.siclaw/knowledge/index.md` directly. Do not infer that a page is absent from this overview.)_"
@@ -131,7 +134,8 @@ export function buildKnowledgeWikiCatalog(
     "",
     "Bound knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
     "Call `knowledge_search` once with the user's original question; its ready result contains already-read, " +
-    "context-bounded leaf-page evidence. The catalog below is navigation context, not the only retrieval path. " +
+    "context-bounded leaf-page evidence. " +
+    (includeCatalog ? "The catalog below is navigation context, not the only retrieval path. " : "") +
     "Use Grep/Find/Read only when retrieval is unavailable, finds nothing, or explicitly leaves required material unresolved. " +
     "When following links as a fallback, " +
     "follow standard markdown links " +

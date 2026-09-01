@@ -21,8 +21,8 @@ function readyResult(query: string): KnowledgeLookupResult {
   };
 }
 
-function payload(result: any): KnowledgeLookupResult {
-  return JSON.parse((result.content[0] as { text: string }).text) as KnowledgeLookupResult;
+function payload(result: any): any {
+  return JSON.parse((result.content[0] as { text: string }).text);
 }
 
 describe("knowledge_search", () => {
@@ -51,8 +51,11 @@ describe("knowledge_search", () => {
 
     expect(resolver.lookup).toHaveBeenCalledTimes(2);
     expect(payload(first).query).toBe("first");
-    expect(payload(repeated).query).toBe("first");
-    expect(repeated.details).toMatchObject({ reused: true });
+    expect(payload(repeated)).toEqual({
+      status: "already_resolved",
+      message: "Knowledge was already resolved earlier this turn. Use the evidence from the first result; do not call knowledge_search again.",
+    });
+    expect(repeated.details).toMatchObject({ reused: true, resultCount: 1 });
     expect(payload(nextTurn).query).toBe("next");
   });
 

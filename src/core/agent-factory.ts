@@ -241,6 +241,7 @@ function buildAppendSystemPrompt(
   knowledgeDir?: string,
   knowledgeCitationsEnabled = false,
   operationalKnowledge = true,
+  knowledgeResolverAvailable = false,
 ): string[] {
   const parts: string[] = [];
 
@@ -303,11 +304,11 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
     parts.push(overview);
   }
 
-  // Knowledge wiki catalog (.siclaw/knowledge/index.md) injected directly so the
-  // agent sees available pages without an eager Read and pulls pages on demand.
+  // Keep only the retrieval contract when the resolver is healthy. The full
+  // catalog remains a deterministic prompt fallback when resolver init fails.
   const wikiCatalog = buildKnowledgeWikiCatalog(
     knowledgeDir ?? path.resolve(process.cwd(), config_.paths.knowledgeDir),
-    { operational: operationalKnowledge },
+    { operational: operationalKnowledge, includeCatalog: !knowledgeResolverAvailable },
   );
   if (wikiCatalog) {
     parts.push(wikiCatalog);
@@ -507,6 +508,7 @@ export async function createSiclawSession(
         indexer: knowledgeIndexer,
         knowledgeDir,
         evidenceBudgetCharsRef: knowledgeEvidenceBudgetCharsRef,
+        inspectPage: (absolutePath) => fsReadFile(absolutePath, "utf8"),
         readPage: async (absolutePath) => {
           const start = citationSupport?.captureMount();
           const body = await fsReadFile(absolutePath, "utf8");
@@ -808,6 +810,7 @@ export async function createSiclawSession(
           knowledgeDir,
           Boolean(citationSupport),
           compiledContext.harness.includeOperationalSafety,
+          Boolean(knowledgeResolver),
         ),
       // Extension registration order: compactionSafeguard handles session_before_compact.
       extensionFactories: [

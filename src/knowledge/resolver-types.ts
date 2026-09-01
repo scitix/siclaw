@@ -18,6 +18,10 @@ export interface KnowledgeEvidencePage {
   file: string;
   title: string;
   score: number;
+  /** Stable identity for the exact page snapshot returned by this lookup. */
+  resultId?: string;
+  /** Fraction of question terms matched by page identity/frontmatter. */
+  metadataScore?: number;
   metadata?: {
     type?: string;
     description?: string;
@@ -41,6 +45,8 @@ export interface KnowledgeLookupResult {
   status: KnowledgeLookupStatus;
   mode: "hybrid";
   query: string;
+  /** Original question followed by any deterministic low-recall fallback. */
+  queryVariants?: string[];
   results: KnowledgeEvidencePage[];
   navigationResults?: KnowledgeNavigationResult[];
   totalFiles?: number;
@@ -56,7 +62,10 @@ export interface CreateKnowledgeResolverOptions {
   indexer: KnowledgeSearchIndex;
   knowledgeDir: string;
   readPage: (absolutePath: string) => Promise<string>;
+  /** Read-only preview that does not register the page as answer evidence. */
+  inspectPage?: (absolutePath: string) => Promise<string>;
   evidenceBudgetCharsRef: { current: number };
   maxPages?: number;
   maxCandidates?: number;
+  rerankCandidates?: number;
 }

@@ -65,39 +65,49 @@ hybrid pattern: lexical retrieval preserves exact identifiers while embeddings
 recover semantic matches. Anthropic's Contextual Retrieval evaluation likewise
 combines BM25 and embeddings, then improves precision with reranking.
 
-The prompt may inline a small catalog as cheap routing context. An oversized
-catalog is not prefix-truncated: a prefix looks complete and creates false
-absence. Search is the normal discovery path; Grep/Read of the full index is the
-deterministic fallback.
+When the resolver is available, the prompt contains only the compact retrieval
+contract and does not inline `index.md`; this bounds first-turn context and makes
+search the single discovery authority. If resolver initialization fails, a small
+catalog may still be injected as a deterministic fallback. An oversized catalog
+is never prefix-truncated because a prefix looks complete and creates false
+absence.
 
 The resolver retrieves a wider chunk pool, removes navigation pages from answer
-candidates, aggregates hits by owning page, and reads up to three selected leaf
-pages concurrently. Small pages are returned whole; large pages return matched
-sections within a context-window-derived evidence budget. Reads pass through the
-same current-turn citation registrar as the Read tool. The model therefore gets
-answer evidence in one retrieval call and can register only what it used with
-`knowledge_cite`. This follows the parent-document pattern: use smaller chunks
-for recall, but use the owning document as the answer and provenance boundary.
+candidates, aggregates hits by owning page, and reranks a bounded top set using
+the page title and frontmatter. This cheap local pass helps distinguish version,
+environment, product, and task applicability without another model call. If the
+original query finds no leaf page, the resolver makes at most one deterministic,
+entity-focused fallback search; a normal hit remains a single index query.
 
-Repeated `knowledge_search` calls in the same turn reuse the first result. This
-is a latency guard, not a forced case-specific index: every question goes
-through the same Agent-scoped hybrid index, page aggregation, read, and budget
-policy. `index.md` may still be omitted from the system prompt when it exceeds
-the catalog budget; retrieval does not depend on that prompt copy and filters
-navigation pages from answer evidence.
+It then reads up to three selected leaf pages concurrently. Small pages are
+returned whole; large pages return matched sections within a
+context-window-derived evidence budget. Reads pass through the same current-turn
+citation registrar as the Read tool. Every returned page also has a stable
+`resultId` derived from its relative path and exact body. The model therefore
+gets answer evidence in one model-visible retrieval call and can register only
+what it used with `knowledge_cite`. This follows the parent-document pattern:
+use smaller chunks for recall, but use the owning document as the answer and
+provenance boundary.
+
+Repeated `knowledge_search` calls in the same turn return a short
+`already_resolved` reminder instead of duplicating the first evidence payload.
+This is a latency and context guard, not a forced case-specific index: every
+question goes through the same Agent-scoped hybrid index, page aggregation,
+bounded metadata rerank, read, and budget policy. Retrieval does not depend on a
+prompt copy of `index.md` and filters navigation pages from answer evidence.
 
 ### Next retrieval stage
 
-Add these in order, measured against a fixed query set rather than by prompt
-intuition:
+The next changes should be measured against a fixed query set rather than by
+prompt intuition:
 
-1. Rerank the hybrid candidate pool before returning the top leaf pages.
-2. On low recall only, expand aliases or generate a small set of alternate
-   queries and fuse results with reciprocal-rank fusion. Query expansion must
-   not replace the original query because it can drift.
-3. Return stable `result_id` and mount generation metadata for every candidate,
-   and trace query variants, candidate scores, selected reads, and citations.
-4. Add a completion gate for the Knowledge QA harness: when mounted
+1. Calibrate metadata-rerank weights and low-recall triggers, then add curated
+   corpus aliases or a small fused query set only where evaluation proves it
+   helps. Query expansion must never replace the original query because it can
+   drift.
+2. Add mount generation metadata and structured traces for query variants,
+   candidate scores, selected reads, and citations.
+3. Add a completion gate for the Knowledge QA harness: when mounted
    knowledge is required but no search or explicit-page Read occurred, continue
    the turn once with a required retrieval action instead of finalizing a factual
    answer. Never loop indefinitely.

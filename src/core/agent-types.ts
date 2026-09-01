@@ -117,7 +117,8 @@ export const KNOWLEDGE_QA_DEFAULT_PROMPT =
   "unsupported model knowledge. Before answering, identify the relevant subject, entity, time, version, " +
   "environment, and scope. Call `knowledge_search` once with the user's original question before answering " +
   "from mounted knowledge. A ready result already contains the selected leaf-page evidence; do not Read the " +
-  "same pages again or repeatedly rewrite the query. Use Grep/Read only when retrieval reports not_found or " +
+  "same pages again or repeatedly rewrite the query. Bound Skills may add domain-specific execution guidance, " +
+  "but they must not replace or repeat this retrieval step. Use Grep/Read only when retrieval reports not_found or " +
   "unavailable, or when the returned evidence explicitly points to missing material needed for the answer. " +
   "Within the returned evidence, check for newer, superseding, deprecated, or differently scoped material. Prefer " +
   "sources that are authoritative, current, and applicable, while recognizing that newer material is not " +

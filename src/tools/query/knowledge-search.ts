@@ -37,6 +37,7 @@ export function createKnowledgeSearchTool(
     description:
       "Resolve the user's original knowledge question into a small set of relevant leaf-page evidence. " +
       "Call this once per user turn with the question as asked; do not pre-search an index page, rewrite the query repeatedly, or Read the returned pages again. " +
+      "Bound Skills are supplementary and must not replace or repeat this platform retrieval step. " +
       "A ready result contains page content already read and bounded to the current model context. Answer only from that evidence, then call knowledge_cite once for the evidence_refs and citable pages actually used. " +
       "A not_found or unavailable result is not evidence; say what is missing or use ordinary Grep/Read only when further investigation is necessary.",
     parameters: Type.Object({
@@ -46,8 +47,12 @@ export function createKnowledgeSearchTool(
       const params = rawParams as KnowledgeSearchParams;
       const currentTurn = turnRef?.current;
       if (currentTurn !== undefined && cache?.turn === currentTurn) {
+        const repeated = {
+          status: "already_resolved",
+          message: "Knowledge was already resolved earlier this turn. Use the evidence from the first result; do not call knowledge_search again.",
+        };
         return {
-          content: [{ type: "text", text: JSON.stringify(cache.result, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(repeated, null, 2) }],
           details: { status: cache.result.status, resultCount: cache.result.results.length, reused: true },
         };
       }

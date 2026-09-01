@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import yaml from "js-yaml";
@@ -12,20 +13,24 @@ import type {
   KnowledgeResolver,
 } from "./resolver-types.js";
 import type { MemoryChunk } from "../memory/types.js";
+import { tokenizeForFts } from "../memory/stop-words.js";
 
 const DEFAULT_MAX_PAGES = 3;
 const DEFAULT_MAX_CANDIDATES = 40;
+const DEFAULT_RERANK_CANDIDATES = 8;
 const MAX_NAVIGATION_RESULTS = 5;
 
 interface PageCandidate {
   file: string;
   score: number;
   chunks: MemoryChunk[];
+  metadataScore?: number;
 }
 
 interface PageMetadata {
   title: string;
   metadata?: KnowledgeEvidencePage["metadata"];
+  searchText: string;
 }
 
 function roundScore(score: number | undefined): number {
@@ -74,10 +79,57 @@ function parsePageMetadata(file: string, body: string): PageMetadata {
   }
   if (typeof raw?.timestamp === "string" && raw.timestamp.trim()) metadata.timestamp = raw.timestamp.trim();
 
+  const searchableFrontmatter = raw
+    ? Object.values(raw).flatMap((value) => {
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          return [String(value)];
+        }
+        if (Array.isArray(value)) {
+          return value.filter((item): item is string | number | boolean =>
+            typeof item === "string" || typeof item === "number" || typeof item === "boolean")
+            .map(String);
+        }
+        return [];
+      })
+    : [];
+  const title = frontmatterTitle || heading || fallbackTitle;
+
   return {
-    title: frontmatterTitle || heading || fallbackTitle,
+    title,
     ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+    searchText: [file, title, heading, ...searchableFrontmatter].filter(Boolean).join(" "),
   };
+}
+
+function metadataCoverage(queryTokens: string[], metadataText: string): number {
+  if (queryTokens.length === 0) return 0;
+  const metadataTokens = new Set(tokenizeForFts(metadataText));
+  const hits = queryTokens.filter((token) => metadataTokens.has(token)).length;
+  return hits / queryTokens.length;
+}
+
+function buildLowRecallFallback(query: string): string | null {
+  const entityFocused = query
+    .replace(/(?:请问|麻烦|帮忙|帮我|怎么|如何|为什么|哪些|什么|一下|请)/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const fallback = tokenizeForFts(entityFocused).join(" ");
+  if (!fallback || fallback.toLowerCase() === query.toLowerCase()) return null;
+  return fallback;
+}
+
+function mergeChunks(primary: MemoryChunk[], fallback: MemoryChunk[]): MemoryChunk[] {
+  const merged = new Map<string, MemoryChunk>();
+  for (const chunk of [...primary, ...fallback]) {
+    const key = `${chunk.file}:${chunk.startLine}:${chunk.endLine}`;
+    const existing = merged.get(key);
+    if (!existing || (chunk.score ?? 0) > (existing.score ?? 0)) merged.set(key, chunk);
+  }
+  return [...merged.values()];
+}
+
+function resultId(file: string, body: string): string {
+  return createHash("sha256").update(file).update("\0").update(body).digest("hex");
 }
 
 function extractEvidenceRefs(file: string, content: string): string[] {
@@ -169,6 +221,7 @@ function navigationResults(chunks: MemoryChunk[]): KnowledgeNavigationResult[] {
 export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions): KnowledgeResolver {
   const maxPages = Math.max(1, Math.floor(options.maxPages ?? DEFAULT_MAX_PAGES));
   const maxCandidates = Math.max(maxPages, Math.floor(options.maxCandidates ?? DEFAULT_MAX_CANDIDATES));
+  const rerankCandidates = Math.max(maxPages, Math.floor(options.rerankCandidates ?? DEFAULT_RERANK_CANDIDATES));
 
   return {
     async lookup(rawQuery: string): Promise<KnowledgeLookupResult> {
@@ -184,26 +237,70 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
       }
 
       let searched;
+      let allChunks: MemoryChunk[];
+      const queryVariants = [query];
       try {
         searched = await options.indexer.search(query, maxCandidates, 0);
+        allChunks = searched.chunks;
+        if (groupLeafCandidates(allChunks).length === 0) {
+          const fallbackQuery = buildLowRecallFallback(query);
+          if (fallbackQuery) {
+            const fallback = await options.indexer.search(fallbackQuery, maxCandidates, 0);
+            queryVariants.push(fallbackQuery);
+            allChunks = mergeChunks(allChunks, fallback.chunks);
+            searched = {
+              chunks: allChunks,
+              totalFiles: Math.max(searched.totalFiles, fallback.totalFiles),
+              totalChunks: Math.max(searched.totalChunks, fallback.totalChunks),
+            };
+          }
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return {
           status: "unavailable",
           mode: "hybrid",
           query,
+          queryVariants,
           results: [],
           message: `Knowledge retrieval is unavailable: ${message}`,
         };
       }
 
-      const navigation = navigationResults(searched.chunks);
-      const candidates = groupLeafCandidates(searched.chunks).slice(0, maxPages);
+      const navigation = navigationResults(allChunks);
+      let candidates = groupLeafCandidates(allChunks);
+      if (options.inspectPage && candidates.length > 0) {
+        const queryTokens = tokenizeForFts(query);
+        const inspected = await Promise.all(candidates.slice(0, rerankCandidates).map(async (candidate) => {
+          const absolutePath = safePagePath(options.knowledgeDir, candidate.file);
+          if (!absolutePath) return candidate;
+          try {
+            const body = await options.inspectPage!(absolutePath);
+            if (isKnowledgeNavigationPage(candidate.file, body)) return null;
+            return {
+              ...candidate,
+              metadataScore: metadataCoverage(queryTokens, parsePageMetadata(candidate.file, body).searchText),
+            };
+          } catch {
+            return candidate;
+          }
+        }));
+        const valid = inspected.filter((candidate): candidate is PageCandidate => candidate !== null);
+        const maxScore = Math.max(...valid.map((candidate) => candidate.score), 1e-9);
+        valid.sort((a, b) => {
+          const aScore = 0.8 * (a.score / maxScore) + 0.2 * (a.metadataScore ?? 0);
+          const bScore = 0.8 * (b.score / maxScore) + 0.2 * (b.metadataScore ?? 0);
+          return bScore - aScore || b.score - a.score || a.file.localeCompare(b.file);
+        });
+        candidates = [...valid, ...candidates.slice(rerankCandidates)];
+      }
+      candidates = candidates.slice(0, maxPages);
       if (candidates.length === 0) {
         return {
           status: "not_found",
           mode: "hybrid",
           query,
+          queryVariants,
           results: [],
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
           totalFiles: searched.totalFiles,
@@ -257,6 +354,8 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           file: candidate.file,
           title,
           score: roundScore(candidate.score),
+          resultId: resultId(candidate.file, body),
+          ...(candidate.metadataScore !== undefined ? { metadataScore: roundScore(candidate.metadataScore) } : {}),
           ...(metadata ? { metadata } : {}),
           readMode: fullPage ? "full_page" : "matched_sections",
           truncated: !fullPage,
@@ -272,6 +371,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           status: "unavailable",
           mode: "hybrid",
           query,
+          queryVariants,
           results: [],
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
           totalFiles: searched.totalFiles,
@@ -286,6 +386,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
         status: "ready",
         mode: "hybrid",
         query,
+        queryVariants,
         results,
         ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
         totalFiles: searched.totalFiles,
