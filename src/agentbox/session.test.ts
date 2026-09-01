@@ -564,6 +564,7 @@ describe("AgentBoxSessionManager — release embedding model", () => {
     const first = await mgr.getOrCreate("sess-1");
     const firstIndexer = vi.mocked(createKnowledgeIndexer).mock.results[0]?.value;
     if (!firstIndexer) throw new Error("expected first knowledge indexer");
+    expect(firstIndexer.sync).toHaveBeenCalledWith({ embeddingMode: "background" });
     expect(createKnowledgeIndexer).toHaveBeenLastCalledWith(
       expect.any(String),
       expect.any(String),

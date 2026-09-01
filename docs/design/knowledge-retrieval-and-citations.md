@@ -80,8 +80,10 @@ decide that a page answers the question.
 
 Interactive search starts local FTS immediately. Query embedding is a
 single-attempt optional network call with a short timeout. Knowledge-index
-materialization uses the same fail-fast network profile, while investigation
-memory keeps its separate durable retry policy. Scores are normalized per
+materialization commits local FTS state first, then hydrates chunk vectors in
+the background with the durable retry policy; AgentBox cold start does not wait
+for bulk embeddings. Investigation memory keeps its existing blocking durable
+policy. Scores are normalized per
 candidate across only the channels that found that candidate. Therefore a
 strong FTS-only exact match is
 not capped by the configured FTS hybrid weight merely because vectors found a

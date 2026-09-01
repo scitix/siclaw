@@ -83,13 +83,22 @@ describe("createEmbeddingProvider", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("uses fail-fast indexing for the retrieval accelerator profile", async () => {
-    const fetchMock = vi.fn(async () => new Response("temporarily unavailable", { status: 503 }));
+  it("keeps index materialization durable while interactive query embedding stays fail-fast", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("temporarily unavailable", { status: 503 }))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ data: [{ embedding: [1, 2, 3], index: 0 }] }),
+        { status: 200 },
+      ));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    const p = createEmbeddingProvider({ baseUrl: "http://fake", requestProfile: "accelerator" });
+    const p = createEmbeddingProvider({ baseUrl: "http://fake" });
 
-    await expect(p.embed(["page content"])).rejects.toThrow(/API error 503/);
+    await expect(p.embed(["page content"])).resolves.toEqual([[1, 2, 3]]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
 
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(new Response("temporarily unavailable", { status: 503 }));
+    await expect(p.embedQuery?.("page content")).rejects.toThrow(/API error 503/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

@@ -183,6 +183,37 @@ describe("MemoryIndexer.sync", () => {
     expect(indexer.countChunksByFile("x.md")).toBeGreaterThan(0);
   });
 
+  it("makes FTS available before background knowledge embeddings finish", async () => {
+    let finishEmbedding: ((vectors: number[][]) => void) | undefined;
+    const delayed: EmbeddingProvider = {
+      model: "delayed",
+      dimensions: 4,
+      async embed(texts) {
+        return new Promise<number[][]>((resolve) => {
+          finishEmbedding = (vectors) => resolve(vectors.length > 0
+            ? vectors
+            : texts.map(() => [1, 0, 0, 0]));
+        });
+      },
+    };
+    indexer.close();
+    indexer = new MemoryIndexer(dbPath, memoryDir, delayed);
+    fs.writeFileSync(path.join(memoryDir, "background.md"), "# Background\n\nvector hydration content");
+
+    await indexer.sync({ embeddingMode: "background" });
+
+    expect(indexer.countChunksByFile("background.md")).toBeGreaterThan(0);
+    expect(indexer.getEmbeddingCoverage()).toEqual(expect.objectContaining({ embeddedChunks: 0 }));
+    expect(finishEmbedding).toBeTypeOf("function");
+
+    finishEmbedding?.([]);
+    await indexer.waitForEmbeddingHydration();
+
+    const coverage = indexer.getEmbeddingCoverage();
+    expect(coverage.totalChunks).toBeGreaterThan(0);
+    expect(coverage.embeddedChunks).toBe(coverage.totalChunks);
+  });
+
   it("concurrent sync calls coalesce (second returns the first's promise)", async () => {
     fs.writeFileSync(path.join(memoryDir, "a.md"), "# A\n\nbody.");
     const p1 = indexer.sync();

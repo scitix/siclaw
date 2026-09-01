@@ -22,12 +22,30 @@ export interface MemorySearchConfig {
   mmr?: Partial<MMRConfig>;
 }
 
+export interface MemorySyncOptions {
+  /**
+   * Background mode commits local FTS state first, then hydrates vectors without
+   * delaying the caller. Investigation memory keeps the blocking default.
+   */
+  embeddingMode?: "blocking" | "background";
+}
+
+export interface EmbeddingCoverage {
+  totalChunks: number;
+  embeddedChunks: number;
+}
+
+const BACKGROUND_EMBED_BATCH_SIZE = 100;
+
 export class MemoryIndexer {
   private db: DatabaseSync;
   private memoryDir: string;
   private embedding: EmbeddingProvider;
   private searchConfig: MemorySearchConfig;
   private _syncing: Promise<void> | null = null;
+  private _hydrating: Promise<void> | null = null;
+  private _hydrationRequested = false;
+  private _hydrationModel = "";
   private _closed = false;
   /** sqlite-vec extension loaded and vec table dimensions (0 = not available) */
   private _vecDims = 0;
@@ -137,16 +155,16 @@ export class MemoryIndexer {
    * Sync all .md files from memoryDir into SQLite.
    * Only re-processes files whose mtime or hash changed.
    */
-  async sync(): Promise<void> {
+  async sync(options: MemorySyncOptions = {}): Promise<void> {
     if (this._closed) return;
     if (this._syncing) return this._syncing;
-    this._syncing = this._doSync().finally(() => {
+    this._syncing = this._doSync(options).finally(() => {
       this._syncing = null;
     });
     return this._syncing;
   }
 
-  private async _doSync(): Promise<void> {
+  private async _doSync(options: MemorySyncOptions): Promise<void> {
     // Check for embedding model change
     const currentModel = this.embedding.model;
     const storedModel = (this.stmts.getMeta.get("embedding_model") as { value: string } | undefined)?.value ?? "";
@@ -225,9 +243,11 @@ export class MemoryIndexer {
         }
       }
 
-      // Embed chunks (with cache lookup)
+      // Investigation memory blocks for embeddings so its existing durability
+      // semantics stay unchanged. Knowledge indexing can commit FTS first and
+      // hydrate vectors in the background.
       let embeddings: number[][] = [];
-      if (allChunkTexts.length > 0) {
+      if (allChunkTexts.length > 0 && options.embeddingMode !== "background") {
         try {
           embeddings = await this.embedWithCache(allChunkTexts, currentModel);
         } catch (err) {
@@ -297,6 +317,10 @@ export class MemoryIndexer {
         this.stmts.deleteFile.run(row.path);
         console.log(`[memory-indexer] Removed deleted file: ${row.path}`);
       }
+    }
+
+    if (options.embeddingMode === "background") {
+      this.scheduleEmbeddingHydration(currentModel);
     }
   }
 
@@ -795,6 +819,18 @@ export class MemoryIndexer {
     return row?.c ?? 0;
   }
 
+  getEmbeddingCoverage(): EmbeddingCoverage {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS total, SUM(CASE WHEN embedding IS NOT NULL AND length(embedding) > 0 THEN 1 ELSE 0 END) AS embedded FROM chunks",
+    ).get() as { total: number; embedded: number | null };
+    return { totalChunks: row.total, embeddedChunks: row.embedded ?? 0 };
+  }
+
+  /** Wait for currently scheduled background vector work. Primarily useful for lifecycle coordination and tests. */
+  async waitForEmbeddingHydration(): Promise<void> {
+    while (this._hydrating) await this._hydrating;
+  }
+
   close(): void {
     this._closed = true;
     this.stopWatching();
@@ -802,6 +838,96 @@ export class MemoryIndexer {
   }
 
   // --- Private helpers ---
+
+  private scheduleEmbeddingHydration(model: string): void {
+    if (this._closed) return;
+    this._hydrationModel = model;
+    this._hydrationRequested = true;
+    if (this._hydrating) return;
+
+    this._hydrating = (async () => {
+      while (this._hydrationRequested && !this._closed) {
+        this._hydrationRequested = false;
+        await this.hydrateMissingEmbeddings(this._hydrationModel);
+      }
+    })().catch((err) => {
+      if (!this._closed) console.warn("[memory-indexer] Background embedding hydration failed:", err);
+    }).finally(() => {
+      this._hydrating = null;
+    });
+  }
+
+  private async hydrateMissingEmbeddings(model: string): Promise<void> {
+    const rows = this.db.prepare(
+      "SELECT id, content FROM chunks WHERE embedding IS NULL OR length(embedding) = 0 OR model <> ? ORDER BY id",
+    ).all(model) as Array<{ id: number | bigint; content: string }>;
+    if (rows.length === 0) {
+      const coverage = this.getEmbeddingCoverage();
+      console.log(`[memory-indexer] Vector hydration already complete: ${coverage.embeddedChunks}/${coverage.totalChunks} chunks`);
+      return;
+    }
+
+    console.log(`[memory-indexer] Background vector hydration started: ${rows.length} chunks missing for model=${model}`);
+    let hydrated = 0;
+    for (let offset = 0; offset < rows.length; offset += BACKGROUND_EMBED_BATCH_SIZE) {
+      if (this._closed) return;
+      const storedModel = (this.stmts.getMeta.get("embedding_model") as { value: string } | undefined)?.value ?? "";
+      if (storedModel !== model) {
+        console.log(`[memory-indexer] Background vector hydration stopped after embedding model changed: ${model} → ${storedModel}`);
+        return;
+      }
+
+      const batch = rows.slice(offset, offset + BACKGROUND_EMBED_BATCH_SIZE);
+      let vectors: number[][];
+      try {
+        vectors = await this.embedWithCache(batch.map((row) => row.content), model);
+      } catch (err) {
+        if (!this._closed) {
+          console.warn(`[memory-indexer] Background embedding batch failed at ${offset}/${rows.length}:`, err);
+        }
+        continue;
+      }
+      if (this._closed) return;
+
+      const currentModel = (this.stmts.getMeta.get("embedding_model") as { value: string } | undefined)?.value ?? "";
+      if (currentModel !== model) return;
+      const dims = vectors.find((vector) => vector.length > 0)?.length ?? this.embedding.dimensions;
+      const vecReady = this.ensureVecTable(dims);
+      const update = this.db.prepare(
+        "UPDATE chunks SET embedding = ?, model = ? WHERE id = ? AND content = ? AND (embedding IS NULL OR length(embedding) = 0 OR model <> ?)",
+      );
+
+      this.db.exec("BEGIN");
+      try {
+        for (let index = 0; index < batch.length; index++) {
+          const vector = vectors[index];
+          if (!vector || vector.length === 0) continue;
+          const blob = vectorToBlob(vector);
+          const row = batch[index];
+          const result = update.run(blob, model, row.id, row.content, model);
+          if ((result.changes as number) === 0) continue;
+          hydrated++;
+          if (vecReady) {
+            try {
+              const id = typeof row.id === "bigint" ? row.id : BigInt(row.id);
+              this.db.prepare("DELETE FROM chunks_vec WHERE id = ?").run(id);
+              this.db.prepare("INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)").run(id, blob);
+            } catch { /* in-memory vector fallback remains valid */ }
+          }
+        }
+        this.db.exec("COMMIT");
+      } catch (err) {
+        this.db.exec("ROLLBACK");
+        throw err;
+      }
+    }
+
+    const coverage = this.getEmbeddingCoverage();
+    const status = coverage.embeddedChunks === coverage.totalChunks ? "complete" : "incomplete";
+    console.log(
+      `[memory-indexer] Background vector hydration ${status}: hydrated=${hydrated}, coverage=${coverage.embeddedChunks}/${coverage.totalChunks}`,
+    );
+  }
 
   /**
    * Embed texts with cache: look up cached embeddings first, only call API for misses.
@@ -825,6 +951,8 @@ export class MemoryIndexer {
     if (misses.length > 0) {
       const missTexts = misses.map((m) => m.text);
       const newEmbeddings = await this.embedding.embed(missTexts);
+
+      if (this._closed) return newEmbeddings;
 
       for (let j = 0; j < misses.length; j++) {
         const vec = newEmbeddings[j] ?? [];

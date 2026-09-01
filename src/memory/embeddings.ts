@@ -6,8 +6,6 @@ interface EmbeddingOpts {
   model?: string;
   dimensions?: number;
   maxInputTokens?: number;
-  /** Knowledge retrieval must fail fast; investigation-memory indexing may retry durably. */
-  requestProfile?: "durable" | "accelerator";
 }
 
 const DEFAULT_BASE_URL = "";
@@ -30,9 +28,6 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
   const model = opts?.model ?? DEFAULT_MODEL;
   const dimensions = opts?.dimensions ?? DEFAULT_DIMENSIONS;
   const maxInputTokens = opts?.maxInputTokens ?? DEFAULT_MAX_INPUT_TOKENS;
-  const batchPolicy = opts?.requestProfile === "accelerator"
-    ? { maxAttempts: 1, timeoutMs: QUERY_TIMEOUT_MS }
-    : { maxAttempts: MAX_RETRIES, timeoutMs: TIMEOUT_MS };
 
   /** Estimate token count from text (rough: 1 token ≈ 4 bytes UTF-8) */
   const estimateTokens = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf-8") / 4);
@@ -141,7 +136,10 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
       // Process batches sequentially
       const allResults: number[][] = [];
       for (const batch of batches) {
-        const results = await embedBatch(batch, batchPolicy);
+        // Index materialization is durable work. Interactive lookup uses the
+        // separate embedQuery() path below so a slow endpoint never blocks a
+        // user turn behind these retries.
+        const results = await embedBatch(batch, { maxAttempts: MAX_RETRIES, timeoutMs: TIMEOUT_MS });
         allResults.push(...results);
       }
 

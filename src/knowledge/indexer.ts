@@ -27,7 +27,7 @@ export function createKnowledgeIndexer(
   return new MemoryIndexer(
     path.join(indexRoot, `${scope}.db`),
     resolvedKnowledgeDir,
-    createEmbeddingProvider({ ...embeddingOpts, requestProfile: "accelerator" }),
+    createEmbeddingProvider(embeddingOpts),
     KNOWLEDGE_SEARCH_CONFIG,
   );
 }

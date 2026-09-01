@@ -508,13 +508,13 @@ export class AgentBoxSessionManager {
       path.join(userDataDir, "knowledge-index"),
       this._knowledgeEmbeddingConfig ?? getEmbeddingConfig() ?? undefined,
     );
-    await indexer.sync();
+    await indexer.sync({ embeddingMode: "background" });
     return indexer;
   }
 
   /** Reconcile search immediately after an Agent knowledge bundle changes. */
   async syncKnowledgeIndex(): Promise<void> {
-    await this._sharedKnowledgeIndexer?.sync();
+    await this._sharedKnowledgeIndexer?.sync({ embeddingMode: "background" });
   }
 
   /**
@@ -3604,7 +3604,6 @@ export class AgentBoxSessionManager {
 
     if (this._sharedKnowledgeIndexer) {
       try {
-        await this._sharedKnowledgeIndexer.sync();
         this._sharedKnowledgeIndexer.close();
         console.log(`[agentbox-session] Shared knowledge indexer closed`);
       } catch (err) {

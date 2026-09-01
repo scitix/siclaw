@@ -495,7 +495,7 @@ export async function createSiclawSession(
         resolveEmbeddingConfig(),
       );
       candidate = created;
-      await created.sync();
+      await created.sync({ embeddingMode: "background" });
       knowledgeIndexer = created;
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
