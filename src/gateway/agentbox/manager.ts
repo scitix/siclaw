@@ -431,16 +431,34 @@ export class AgentBoxManager {
     // creates instance 0 again and the size reconciler drains instance 1. That costs one
     // extra pod lifecycle per rollout and converges on its own — cheaper than teaching
     // this path to find a box by label instead of by name.
-    if (info && info.status === "running" && this.isStaleImage(info, wantProfile)) {
+    // 🔴 EVERY reason the reaper would roll this box has to be listed here, not just the
+    // image. The reaper drains a box whose certificate is due for renewal and creates the
+    // replacement — but this path then kept handing new sessions BACK to it, because "due
+    // for renewal" still authenticates and the warm-reuse test below only asks whether mTLS
+    // works. The replacement took no traffic, and the box being replaced was eventually
+    // killed at the drain deadline mid-request: an interruption plus another cold start.
+    //
+    // The certificate reason is gated on the box ALREADY DRAINING, and that condition is
+    // load-bearing rather than defensive. Draining is the reaper having decided to replace
+    // it, so the successor either exists or is coming. Without the gate this would roll on
+    // "due for renewal" alone — and since a certificate is due for a THIRD of its lifetime,
+    // that means paying a synchronous cold start on a box which works and which nothing has
+    // decided to replace yet.
+    const rollReason = info && info.status === "running"
+      ? this.isStaleImage(info, wantProfile) ? "a stale AgentBox image"
+        : (!this.isCertFresh(info) && this.draining.has(name)) ? "a draining box with a certificate due for renewal"
+        : null
+      : null;
+    if (rollReason) {
       console.log(
-        `[agentbox-manager] agent=${agentId} is on a stale AgentBox image; rolling it through the pool path`,
+        `[agentbox-manager] agent=${agentId} is on ${rollReason}; rolling it through the pool path`,
       );
       return this.getOrCreatePooled(agentId, config, sessionId, 1);
     }
 
-    // USABLE, not fresh: a certificate approaching expiry still authenticates, so serve
-    // from it and let the background roll replace the box. Rebuilding here would make a
-    // user's turn wait out a full cold start for a box that works.
+    // USABLE, not fresh: reached only when the box is NOT being rolled (see rollReason
+    // above). A certificate that is neither dead nor due still authenticates, so serve from
+    // it — rebuilding here would make a user's turn wait out a cold start for a working box.
     if (info && info.status === "running" && info.endpoint && this.isCertUsable(info)) {
       const hasProfile = info.profile ?? "agent";
       if (hasProfile === wantProfile) {
@@ -566,37 +584,57 @@ export class AgentBoxManager {
       // of those falling through to freeInstances — measured by review: five requests
       // pushed the highest index to 6.
       //
-      // Passing an occupied index to spawnInstances does the right thing in each case: it
-      // joins an in-flight spawn, waits out a pod that is merely slow, or deletes and
-      // recreates one that is Failed/Unknown or holding a dead certificate. Draining slots
-      // are excluded — the roll owns those, and a pool with nothing but draining boxes has a
-      // non-empty `missing` anyway, since missingInstances counts only non-draining boxes as
-      // capacity.
-      const occupiedUnusable = pool
-        .filter((b) => b.status !== "stopped"
-          && !this.draining.has(b.boxId)
-          && !this.isPlaceable(b, wantProfile))
-        .map((b) => b.instance ?? 0)
-        .sort((a, b) => a - b);
+      // 🔴 WAITING and REBUILDING are different actions, and only one of them is free.
+      //
+      // A `starting` slot just needs time: handing its index to spawnInstances joins the
+      // in-flight spawn, or finds the pod and waits for readiness. Nothing is destroyed.
+      //
+      // Every other unusable slot — `error` (a Failed/Unknown phase), `stopping`, or a
+      // `running` box with the wrong CA / a dead certificate / the wrong profile — is one
+      // that spawnInstances will DELETE AND RECREATE. That is the same act the drain budget
+      // exists to bound, and routing it through here bypassed the fuse completely: once the
+      // budget trips, markStaleBoxesDraining stops marking such boxes, so they stay
+      // non-draining in the pool, get picked up here, and are rebuilt on every request.
+      // Reproduced in review — three requests after the trip rebuilt instances 0 and 1
+      // regardless. A fuse with a path around it is not a fuse.
+      //
+      // So rebuilds spend drain budget like any other replacement, and when the budget is
+      // gone the answer is to create NOTHING: no rebuild, and no fresh index either, since
+      // allocating one is the churn the fuse is trying to stop. The turn then falls through
+      // to the reachable/draining check below and fails if there is truly nothing to serve
+      // from — which is the fuse working, not a regression.
+      const notPlaceable = pool.filter((b) => b.status !== "stopped"
+        && !this.draining.has(b.boxId)
+        && !this.isPlaceable(b, wantProfile));
+      const slotsOf = (boxes: AgentBoxInfo[]) =>
+        boxes.map((b) => b.instance ?? 0).sort((a, b) => a - b);
+      const awaitable = slotsOf(notPlaceable.filter((b) => b.status === "starting"));
+      const rebuildable = slotsOf(notPlaceable.filter((b) => b.status !== "starting"));
+
       const target = missing.length > 0 ? missing
-        : occupiedUnusable.length > 0 ? occupiedUnusable
+        : awaitable.length > 0 ? awaitable
+        : rebuildable.length > 0 ? (this.spendDrainBudget(agentId) ? rebuildable : [])
         : this.freeInstances(pool, 1);
-      const [first, ...rest] = target;
-      // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
-      // failed a moment ago is still worth one more try. The background remainder does
-      // respect it.
-      const [handle] = await this.spawnInstances(agentId, config, [first]);
-      const fillable = rest.filter((i) => this.mayFillInstance(agentId, i));
-      if (fillable.length > 0) {
-        void this.spawnInstances(agentId, config, fillable).catch((err) =>
-          console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
+
+      if (target.length > 0) {
+        const [first, ...rest] = target;
+        // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
+        // failed a moment ago is still worth one more try. The background remainder does
+        // respect it.
+        const [handle] = await this.spawnInstances(agentId, config, [first]);
+        const fillable = rest.filter((i) => this.mayFillInstance(agentId, i));
+        if (fillable.length > 0) {
+          void this.spawnInstances(agentId, config, fillable).catch((err) =>
+            console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
+        }
+        if (handle) {
+          if (sessionId) this.bindings.remember(agentId, sessionId, handle.boxId);
+          return { handle, created: true };
+        }
       }
-      if (handle) {
-        if (sessionId) this.bindings.remember(agentId, sessionId, handle.boxId);
-        return { handle, created: true };
-      }
-      // The spawn failed. Serving from a draining box beats failing the turn; the reaper
-      // leaves it alone while it holds work.
+      // Nothing was created — the spawn failed, or the drain budget refused a rebuild.
+      // Serving from a draining box beats failing the turn; the reaper leaves it alone while
+      // it holds work.
       if (reachable.length === 0) throw new Error(`Failed to spawn an AgentBox for agent ${agentId}`);
     } else if (missing.length > 0) {
       // 🔴 This is the hot path of the storm: it runs on EVERY session request while the

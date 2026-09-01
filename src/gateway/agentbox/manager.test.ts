@@ -1765,6 +1765,120 @@ describe("AgentBoxManager — a pool that is at size but not up yet", () => {
   });
 });
 
+describe("AgentBoxManager — the drain fuse has no path around it", () => {
+  /**
+   * Enough calls to exhaust DRAIN_BUDGET whatever it is set to. Deliberately not importing
+   * the constant: the point is "the budget is gone", and a test that tracks its exact value
+   * would need editing every time the fuse is retuned.
+   */
+  const DRAIN_BUDGET_FOR_TEST = 32;
+
+  /**
+   * 🔴 A fuse with a bypass is not a fuse. Once the drain budget trips,
+   * markStaleBoxesDraining stops marking stale boxes — so they stay non-draining in the
+   * pool. The at-size path then picked them up as "occupied but not placeable" and handed
+   * their indices to spawnInstances, which DELETES AND RECREATES such a pod. Reproduced in
+   * review: three requests after the trip rebuilt instances 0 and 1 regardless.
+   *
+   * Rebuilding is the same act the budget bounds, so it spends the budget too — and when
+   * the budget is gone the answer is to create NOTHING, not to fall through to a fresh
+   * index, which is the churn being prevented.
+   */
+  it("stops rebuilding unusable slots once the drain budget is spent", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    // Wrong CA ⇒ not placeable, and `running` ⇒ a rebuild rather than a wait.
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "old" }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "old" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    // Burn the budget the way a churn loop would.
+    for (let i = 0; i < DRAIN_BUDGET_FOR_TEST; i++) (mgr as any).spendDrainBudget("agent-a");
+
+    for (let i = 0; i < 3; i++) {
+      await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+    }
+
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("still waits on a starting slot after the budget is spent — waiting destroys nothing", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" })];
+    const mgr = pooledManager(spawner, 1);
+
+    for (let i = 0; i < DRAIN_BUDGET_FOR_TEST; i++) (mgr as any).spendDrainBudget("agent-a");
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    // The slot is joined/awaited, not rebuilt, so the fuse has no reason to block it.
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]);
+  });
+
+  it("rebuilds while the budget still has room", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    spawner.pool = [poolBox("agentbox-agent-a-0", 0, { caFingerprint: "old" })];
+    const mgr = pooledManager(spawner, 1);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    expect(spawner.spawnCalls.length).toBeGreaterThan(0);
+  });
+});
+
+describe("AgentBoxManager — a single box being rolled must hand over", () => {
+  const runningBox = (over: Partial<AgentBoxInfo> = {}): AgentBoxInfo => ({
+    boxId: "agentbox-agent-a-0", agentId: "agent-a", status: "running",
+    endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    caFingerprint: "ca-v1", image: "agentbox:v2", profile: "agent", instance: 0,
+    ...over,
+  });
+
+  /**
+   * 🔴 The reaper drains a single box whose certificate is due and creates the replacement,
+   * but the single-box path kept returning the drained box: "due for renewal" still
+   * authenticates, and only a stale IMAGE used to divert to the pool path. The replacement
+   * took no traffic and the old box was killed at the drain deadline mid-request.
+   */
+  it("rolls through the pool path once the box is draining for its certificate", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    const box = runningBox({ certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+    spawner.getReturns.set("agentbox-agent-a-0", box);
+    (spawner as any).listForAgent = async () => [box];
+    (mgr as any).draining.set(box.boxId, Date.now());
+
+    await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
+
+    // The pool path creates the successor rather than returning the box being replaced.
+    expect(spawner.spawnCalls.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The gate matters in the other direction too. A certificate is "due" for a THIRD of its
+   * lifetime, so rolling on that alone would pay a synchronous cold start on a box that
+   * works and that nothing has decided to replace.
+   */
+  it("keeps serving a due-but-not-draining box without a cold start", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    spawner.getReturns.set("agentbox-agent-a-0", runningBox({
+      certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    }));
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+});
+
 describe("AgentBoxManager — a box mTLS cannot reach is not a candidate", () => {
   /**
    * 🔴 Marking a box draining does NOT stop it being served from — that is deliberate ("a
