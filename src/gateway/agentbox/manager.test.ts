@@ -1736,7 +1736,17 @@ describe("AgentBoxManager — a box mTLS cannot reach is not a candidate", () =>
     expect(acquired.boxId).toBe(soon.boxId); // still authenticates; the roll replaces it
   });
 
-  it("excludes an expired box from getHolder, so abort/steer do not target a dead endpoint", async () => {
+  /**
+   * 🔴 THE OPPOSITE ANSWER, and the reason the certificate test is not inside isReachable.
+   *
+   * getHolder answers "where IS this turn", for steer / abort / clearQueue. Hiding the box
+   * that holds it does not stop the turn: the caller (boxForRunningTurn) falls through to
+   * placement, which SPAWNS a pod to answer an abort, and that fresh box replies "session
+   * not found" — which reads as already-stopped. An abort the box never confirmed must FAIL
+   * rather than report success, because success tells the management plane to stop retrying
+   * and tear down supervision. So the unreachable holder is the honest answer here.
+   */
+  it("still reports an expired box as the holder, so an abort fails honestly", async () => {
     const spawner = new PoolSpawner("k8s");
     spawner.fingerprint = "ca-v1";
     const dead = withCert(0, { certExpiresAt: new Date(Date.now() - 1000) });
@@ -1746,9 +1756,9 @@ describe("AgentBoxManager — a box mTLS cannot reach is not a candidate", () =>
       [dead.boxId]: { endpoint: dead.endpoint, sessionIds: ["s1"], turnsInFlight: 1, drained: false },
     });
 
-    // Returning an endpoint that cannot be reached shows the user a failure they did not
-    // cause; undefined lets the caller answer "already stopped".
-    await expect(mgr.getHolder("agent-a", "s1")).resolves.toBeUndefined();
+    const holder = await mgr.getHolder("agent-a", "s1");
+
+    expect(holder?.boxId).toBe(dead.boxId);
   });
 });
 

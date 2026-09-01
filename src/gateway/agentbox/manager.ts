@@ -494,7 +494,9 @@ export class AgentBoxManager {
     this.markStaleBoxesDraining(agentId, pool, wantProfile);
     this.bindings.retainBoxes(agentId, new Set(pool.map((b) => b.boxId)));
 
-    const reachable = pool.filter((b) => this.isReachable(b, wantProfile));
+    // PLACEABLE, not merely reachable — see isPlaceable for why getHolder must not use the
+    // same test.
+    const reachable = pool.filter((b) => this.isPlaceable(b, wantProfile));
 
     // Ask the boxes what they are HOLDING before deciding anything. Residency is the
     // input every rule below turns on, and two separate bugs came from branches that
@@ -741,19 +743,35 @@ export class AgentBoxManager {
   /** A box the Runtime can talk to right now. Says nothing about whether it accepts NEW
    *  sessions — a draining box is still reachable and still serves what it holds. */
   private isReachable(box: AgentBoxInfo, wantProfile: string): boolean {
-    return box.status === "running"
-      && !!box.endpoint
-      && (box.profile ?? "agent") === wantProfile
-      // 🔴 An endpoint mTLS cannot complete is NOT reachable, and this is the only place
-      // that judgement can be made once: `reachable` feeds placement, the holder lookup AND
-      // the binding fallback, and the fallback is the one that matters most — a session
-      // already bound to a box keeps being handed back to it, so a dead certificate made
-      // EVERY turn of that conversation fail while marking the box draining did nothing to
-      // stop it (a draining box is deliberately still served from). Excluding it here lets
-      // the session move to a box that can answer; the transcript is on shared storage, so
-      // moving costs nothing. Unknown expiry reads as usable, so pods predating the label
-      // are unaffected.
-      && this.isCertUsable(box);
+    return box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
+  }
+
+  /**
+   * Reachable AND able to complete mTLS — the test for PLACEMENT, i.e. "where should this
+   * session go".
+   *
+   * 🔴 DELIBERATELY NOT folded into {@link isReachable}, because the two questions
+   * placement and {@link getHolder} ask want OPPOSITE answers about a box whose
+   * certificate died:
+   *
+   *  - Placement asks where a session SHOULD go. A dead box is not an answer: a session
+   *    bound to it was being handed straight back to it, so every turn of that conversation
+   *    failed, and marking the box draining did nothing (a draining box is deliberately
+   *    still served from). Excluding it lets the session move to a box that can answer —
+   *    the transcript is on shared storage, so moving costs nothing.
+   *
+   *  - getHolder asks where a turn ALREADY IS, for steer / abort / clearQueue. Hiding the
+   *    box that holds it does not make the turn stop: the caller falls through to
+   *    placement, which SPAWNS a pod to answer an abort, and that fresh box replies "session
+   *    not found" — which reads as already-stopped. An abort the box never confirmed must
+   *    FAIL rather than report success, so returning the unreachable holder (and failing the
+   *    call honestly) is the correct answer there.
+   *
+   * Unknown expiry counts as usable, so pods predating the expiry label are unaffected, and
+   * a certificate merely NEARING expiry still places — only the already-dead are excluded.
+   */
+  private isPlaceable(box: AgentBoxInfo, wantProfile: string): boolean {
+    return this.isReachable(box, wantProfile) && this.isCertUsable(box);
   }
 
   /**
