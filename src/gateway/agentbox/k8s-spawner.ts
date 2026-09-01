@@ -128,13 +128,33 @@ export function clampRequestToLimit(request: string, limit: string, podName: str
  * Startup gate handed to kubelet: `periodSeconds × failureThreshold` is how long a container
  * gets to answer its first probe.
  *
+ * 🔴 IT MUST COVER WORK THAT HAPPENS BEFORE THE BOX CAN LOG ANYTHING, and 60s did not.
+ * A production pool could never fill: kubelet killed every box here, the Runtime reported a
+ * spawn failure and respawned one that met the same end. Under `restartPolicy: Never` the
+ * kill is terminal:
+ *
+ *   t+0s    container starts
+ *   t+59s   30th probe fails → kubelet: "Container agentbox failed startup probe", KillPod
+ *   t+119s  termination grace elapses → SIGKILL → exitCode 137, phase Failed
+ *
+ * The box was not slow at anything it logs — measured from its own first line to `listen()`
+ * is 0.4s. The time went to the entrypoint's `chown -R` over the NFS-backed user-data
+ * subPath, which runs before node starts, is silent, and grows with the agent's accumulated
+ * session history. **That is the root cause and it is NOT fixed here** — this number only
+ * stops a slow start from being a permanent one.
+ *
+ * Which is also why the margin is wide rather than merely sufficient: the span this window
+ * has to cover includes pre-node work that no code here can see or time, and it grows on its
+ * own. Nobody connects "the agent accumulated more state" to "pods stopped starting", and
+ * being one second short costs a pod that never runs again.
+ *
  * Named constants rather than literals at the call site because two other timeouts are
  * defined RELATIVE to this window — the Runtime's readiness wait above it and the box's own
  * startup budget below it — and `startup-probe-window.test.ts` asserts those relations. A
  * literal here would let the window move without the relations being rechecked.
  */
 export const STARTUP_PROBE_PERIOD_SECONDS = 2;
-export const STARTUP_PROBE_FAILURE_THRESHOLD = 30;
+export const STARTUP_PROBE_FAILURE_THRESHOLD = 90;
 
 /** The window itself, in ms: how long kubelet allows before it gives up on the container. */
 export const STARTUP_PROBE_WINDOW_MS =
@@ -144,9 +164,15 @@ export const STARTUP_PROBE_WINDOW_MS =
  * How long the Runtime waits for a pod it created to become Ready.
  *
  * MUST stay well above {@link STARTUP_PROBE_WINDOW_MS} — see waitForPodReady for why the two
- * measure different spans and what happened when they were equal.
+ * measure different spans and what happened when they were equal. Raised with the window for
+ * that reason; `startup-probe-window.test.ts` pins the ratio.
+ *
+ * Seven minutes reads long, and the two costs are not symmetric: a window too SMALL kills a
+ * healthy box permanently, while a timeout too LARGE only delays reporting a spawn that is
+ * genuinely broken — and is only ever waited out in that case, since a box that comes up
+ * returns in under a minute.
  */
-export const POD_READY_TIMEOUT_MS = 180_000;
+export const POD_READY_TIMEOUT_MS = 420_000;
 
 /**
  * How kubelet asks a box whether it is up.
