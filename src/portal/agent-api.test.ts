@@ -36,12 +36,14 @@ function fakeReq(opts: { url: string; method: string; headers?: Record<string, s
   return em;
 }
 
-function runRoute(router: ReturnType<typeof createRestRouter>, req: any): Promise<{ status: number; body: any }> {
+function runRoute(router: ReturnType<typeof createRestRouter>, req: any): Promise<{ status: number; body: any; headers: Record<string, string> }> {
   return new Promise((resolve, reject) => {
     const res: any = new EventEmitter();
+    res._headers = {};
+    res.setHeader = (name: string, value: string) => { res._headers[name.toLowerCase()] = value; };
     res.writeHead = (s: number) => { res._status = s; res.headersSent = true; return res; };
     res.end = (b?: string) => {
-      resolve({ status: res._status ?? 0, body: b ? JSON.parse(b) : null });
+      resolve({ status: res._status ?? 0, body: b ? JSON.parse(b) : null, headers: res._headers });
       return res;
     };
     try { if (!router.handle(req, res)) reject(new Error("no route")); } catch (err) { reject(err); }
@@ -276,7 +278,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(201);
     });
 
-    it("persists a built-in default when create omits a prompt", async () => {
+    it("does not materialize a built-in contract when create omits an addendum", async () => {
       // Coordinator has defaultNoSkills → no auto-bind: INSERT then SELECT-back.
       query
         .mockResolvedValueOnce([undefined, []])                        // insert agent
@@ -291,7 +293,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(201);
       const insertArgs = query.mock.calls[0][1];
       expect(insertArgs[8]).toBe("coordinator"); // agent_type
-      expect(insertArgs[9]).toBe(COORDINATOR_DEFAULT_PROMPT);
+      expect(insertArgs[9]).toBeNull();
     });
 
     it("persists a maintainer-supplied prompt for a built-in type", async () => {
@@ -347,6 +349,37 @@ describe("registerAgentRoutes", () => {
       }));
       expect(status).toBe(200);
       expect(body.id).toBe("a1");
+    });
+  });
+
+  describe("GET /api/v1/agents/:id/prompt-inspection", () => {
+    it("requires admin and forwards one explicit resident-session inspection", async () => {
+      const denied = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1/prompt-inspection?session_id=s1",
+        method: "GET",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(denied.status).toBe(403);
+
+      (connMap.isConnected as ReturnType<typeof vi.fn>).mockReturnValue(true);
+      (connMap.sendCommand as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ok: true,
+        payload: { available: true, inspection: { prompt: { text: "exact prompt" } } },
+      });
+      const allowed = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1/prompt-inspection?session_id=s1",
+        method: "GET",
+      }));
+
+      expect(allowed.status).toBe(200);
+      expect(allowed.headers["cache-control"]).toBe("no-store");
+      expect(allowed.body.inspection.prompt.text).toBe("exact prompt");
+      expect(connMap.sendCommand).toHaveBeenCalledWith(
+        "a1",
+        "agent.promptInspection",
+        { agentId: "a1", sessionId: "s1" },
+        10_000,
+      );
     });
   });
 
@@ -415,9 +448,8 @@ describe("registerAgentRoutes", () => {
 
       const updateArgs = query.mock.calls[1][1] as unknown[];
       expect(updateArgs).toContain("coordinator");
-      expect(updateArgs.some((value) =>
-        value === COORDINATOR_DEFAULT_PROMPT,
-      )).toBe(true);
+      expect(updateArgs).toContain(null);
+      expect(updateArgs).not.toContain(COORDINATOR_DEFAULT_PROMPT);
     });
 
     it("keeps the visible prompt when switching to custom with an unchanged textarea", async () => {

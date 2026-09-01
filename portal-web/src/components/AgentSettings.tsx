@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { ArrowDown, ArrowUp, Check, ChevronRight, Cpu, Loader2, Plus, Save, Trash2, Users } from "lucide-react"
+import { ArrowDown, ArrowUp, Check, ChevronRight, Cpu, Eye, Loader2, Plus, Save, Trash2, Users } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
@@ -21,6 +21,8 @@ interface Agent {
   idle_timeout_sec?: number
   replicas?: number
   agent_type?: string
+  /** Normalized editable addendum; old API versions may omit it. */
+  agent_prompt_addendum?: string | null
   // Wire form: the raw `agents` TEXT column — a JSON string ('["read_files"]')
   // or null, not a decoded array (mirrors model_routing). toCapabilitySet
   // coerces both forms.
@@ -57,6 +59,7 @@ const TABS = [
   { key: "basic", label: "Basic" },
   { key: "model", label: "Model" },
   { key: "tools", label: "Tools" },
+  { key: "prompt", label: "Prompt" },
   { key: "skills", label: "Skills" },
   { key: "mcp", label: "MCP" },
   { key: "knowledge", label: "Knowledge" },
@@ -68,6 +71,22 @@ const TABS = [
 ] as const
 
 type TabKey = (typeof TABS)[number]["key"]
+
+interface PromptInspection {
+  stage: "session_ready" | "provider_wire"
+  agentType: string
+  mode: string
+  prompt: { text: string; chars: number; sha256: string }
+  layers: Array<{ id: string; owner: string; source: string; mutable: boolean; text: string; chars: number; sha256: string }>
+  tools: Array<{ name: string; description: string | null; toolset: string | null; schemaSha256: string }>
+  skills: string[]
+  design: {
+    standard: string
+    verdict: "pass" | "warn" | "fail"
+    checks: Array<{ id: string; status: "pass" | "warn" | "fail"; summary: string; detail: string }>
+    references: Array<{ title: string; url: string }>
+  }
+}
 
 function parseModelRouting(raw: unknown): ModelRoutePolicy | null {
   if (!raw) return null
@@ -179,7 +198,9 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [modelId, setModelId] = useState(agent.model_id || "")
   const [routingEnabled, setRoutingEnabled] = useState(false)
   const [fallbackCandidates, setFallbackCandidates] = useState<ModelRouteCandidateForm[]>([])
-  const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
+  const [systemPrompt, setSystemPrompt] = useState(
+    agent.agent_prompt_addendum !== undefined ? (agent.agent_prompt_addendum || "") : (agent.system_prompt || ""),
+  )
   const [isProduction, setIsProduction] = useState(agent.is_production)
   const [idleTimeoutSec, setIdleTimeoutSec] = useState<number>(agent.idle_timeout_sec ?? 300)
   const [replicas, setReplicas] = useState<number>(agent.replicas ?? 1)
@@ -211,6 +232,10 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [allAgents, setAllAgents] = useState<DelegatableAgent[]>([])
   const [skillLabelFilter, setSkillLabelFilter] = useState("")
   const [saving, setSaving] = useState(false)
+  const [inspectionSessionId, setInspectionSessionId] = useState("")
+  const [promptInspection, setPromptInspection] = useState<PromptInspection | null>(null)
+  const [promptInspectionError, setPromptInspectionError] = useState<string | null>(null)
+  const [loadingPromptInspection, setLoadingPromptInspection] = useState(false)
 
   // Sync form state when agent prop changes
   useEffect(() => {
@@ -220,7 +245,9 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     const modelRouting = parseModelRouting(agent.model_routing)
     setRoutingEnabled(modelRouting?.enabled === true)
     setFallbackCandidates(normalizeRouteCandidates(modelRouting, agent.model_provider || "", agent.model_id || ""))
-    setSystemPrompt(agent.system_prompt || ""); setIsProduction(agent.is_production)
+    setSystemPrompt(agent.agent_prompt_addendum !== undefined
+      ? (agent.agent_prompt_addendum || "")
+      : (agent.system_prompt || "")); setIsProduction(agent.is_production)
     setIdleTimeoutSec(agent.idle_timeout_sec ?? 300)
     setReplicas(agent.replicas ?? 1)
     setSelectedCapabilities(toCapabilitySet(agent.tool_capabilities))
@@ -288,6 +315,42 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const availableModels = selectedProvider?.models || []
   const activeTabNeedsResourceBindings = requiresLoadedResourceBindings(activeTab)
   const resourceBindingsUnavailable = activeTabNeedsResourceBindings && resourceBaseline === null
+
+  const inspectPrompt = async () => {
+    const sessionId = inspectionSessionId.trim()
+    if (!sessionId) {
+      setPromptInspectionError("Enter a resident chat session ID.")
+      return
+    }
+    setLoadingPromptInspection(true)
+    setPromptInspectionError(null)
+    try {
+      const result = await api<{
+        available: boolean
+        reason?: string
+        consistent?: boolean
+        inspection?: PromptInspection
+      }>(`/agents/${agent.id}/prompt-inspection?session_id=${encodeURIComponent(sessionId)}`)
+      if (!result.available || !result.inspection) {
+        setPromptInspection(null)
+        setPromptInspectionError(
+          result.reason === "session_not_resident"
+            ? "That session is no longer resident. Send a message in the session and inspect again within the idle window."
+            : `Runtime inspection unavailable${result.reason ? `: ${result.reason}` : "."}`,
+        )
+        return
+      }
+      setPromptInspection(result.inspection)
+      if (result.consistent === false) {
+        setPromptInspectionError("Running replicas returned different prompt hashes. Treat this as a rollout inconsistency.")
+      }
+    } catch (err: any) {
+      setPromptInspection(null)
+      setPromptInspectionError(err.message || "Prompt inspection failed")
+    } finally {
+      setLoadingPromptInspection(false)
+    }
+  }
 
   const handleSave = async () => {
     if (!name.trim()) return
@@ -386,10 +449,12 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "tools" && (
           <div className="px-6 py-6 space-y-4 max-w-2xl">
-            {/* Agent type governs the capability set and initial prompt default. */}
+            {/* Agent type governs the immutable contract and capability set. */}
             <div>
               <h3 className="text-[13px] font-medium text-foreground">Agent type</h3>
-              <p className="text-[12px] text-muted-foreground mt-0.5">The type locks built-in capabilities and seeds an initial prompt. Every agent's prompt remains editable in Basic.</p>
+              <p className="text-[12px] text-muted-foreground mt-0.5">
+                The type supplies an immutable behavior contract and locks its built-in capabilities. Add agent-specific specialization in Basic without replacing that contract.
+              </p>
               <div className="mt-2 space-y-1.5">
                 {AGENT_TYPES.map(t => (
                   <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">
@@ -423,6 +488,16 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
               <CapabilityGroupSelector selected={selectedCapabilities} onChange={setSelectedCapabilities} />
             )}
           </div>
+        )}
+        {activeTab === "prompt" && (
+          <PromptInspectionTab
+            sessionId={inspectionSessionId}
+            setSessionId={setInspectionSessionId}
+            inspect={inspectPrompt}
+            loading={loadingPromptInspection}
+            error={promptInspectionError}
+            inspection={promptInspection}
+          />
         )}
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
@@ -639,8 +714,11 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
         <textarea value={description} onChange={e => setDescription(e.target.value)} rows={2} className="w-full px-3 py-2 text-[13px] rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" />
       </div>
       <div className="space-y-1.5">
-        <label className="text-[12px] text-muted-foreground">System Prompt</label>
-        <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional agent identity and behavior instructions..." />
+        <label className="text-[12px] text-muted-foreground">Agent Addendum</label>
+        <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional specialization for this agent..." />
+        <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
+          Appended after the immutable Agent Type contract. It can specialize the agent, but cannot replace platform safety or type behavior.
+        </p>
       </div>
       <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
       <ReplicasField value={replicas} onChange={setReplicas} />
@@ -665,6 +743,154 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
             : "Development agent operates on test environments only. Draft skills take effect immediately without approval — ideal for rapid skill development and validation."}
         </p>
       </div>
+    </div>
+  )
+}
+
+function PromptInspectionTab({ sessionId, setSessionId, inspect, loading, error, inspection }: {
+  sessionId: string
+  setSessionId: (value: string) => void
+  inspect: () => void
+  loading: boolean
+  error: string | null
+  inspection: PromptInspection | null
+}) {
+  const statusClass: Record<"pass" | "warn" | "fail", string> = {
+    pass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    warn: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+    fail: "border-destructive/30 bg-destructive/10 text-destructive",
+  }
+
+  return (
+    <div className="px-6 py-6 space-y-5 max-w-5xl">
+      <div>
+        <h3 className="text-sm font-semibold text-foreground">Effective prompt inspection</h3>
+        <p className="text-[12px] text-muted-foreground mt-1 leading-relaxed max-w-3xl">
+          Inspect one resident chat session to see the exact assembled system prompt, actual model-visible tools, prompt layers, and deterministic design checks. The prompt is fetched only on demand and is not written to routine logs.
+        </p>
+      </div>
+
+      <div className="flex items-end gap-2 max-w-2xl">
+        <label className="flex-1 space-y-1.5">
+          <span className="text-[12px] text-muted-foreground">Session ID</span>
+          <input
+            value={sessionId}
+            onChange={event => setSessionId(event.target.value)}
+            onKeyDown={event => { if (event.key === "Enter" && !loading) inspect() }}
+            placeholder="Send a message, then paste its resident session ID"
+            className="w-full h-9 px-3 text-[13px] font-mono rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={inspect}
+          disabled={loading || !sessionId.trim()}
+          className="flex items-center gap-1.5 h-9 px-3 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50 hover:opacity-90"
+        >
+          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Eye className="h-3.5 w-3.5" />}
+          Inspect
+        </button>
+      </div>
+
+      {error && (
+        <div role="alert" className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
+          {error}
+        </div>
+      )}
+
+      {inspection && (
+        <div className="space-y-5">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+            {[
+              ["Verdict", inspection.design.verdict.toUpperCase()],
+              ["Agent Type", inspection.agentType],
+              ["Mode", inspection.mode],
+              ["Stage", inspection.stage],
+              ["Prompt", `${inspection.prompt.chars.toLocaleString()} chars`],
+            ].map(([label, value]) => (
+              <div key={label} className="rounded-lg border border-border bg-card px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+                <div className="mt-1 text-[12px] font-medium text-foreground break-all">{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <section className="space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <h4 className="text-[13px] font-semibold text-foreground">Design checks</h4>
+              <span className="text-[11px] font-mono text-muted-foreground">{inspection.design.standard}</span>
+            </div>
+            <div className="space-y-2">
+              {inspection.design.checks.map(check => (
+                <div key={check.id} className="rounded-lg border border-border bg-card px-3 py-2.5">
+                  <div className="flex items-start gap-2">
+                    <span className={`shrink-0 px-1.5 py-0.5 rounded-full border text-[10px] font-semibold ${statusClass[check.status]}`}>{check.status.toUpperCase()}</span>
+                    <div className="min-w-0">
+                      <div className="text-[12px] font-medium text-foreground">{check.summary}</div>
+                      <div className="mt-0.5 text-[11px] text-muted-foreground leading-relaxed">{check.detail}</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="space-y-2">
+            <h4 className="text-[13px] font-semibold text-foreground">Prompt layers</h4>
+            <div className="space-y-2">
+              {inspection.layers.map(layer => (
+                <details key={`${layer.id}:${layer.sha256}`} className="rounded-lg border border-border bg-card group">
+                  <summary className="cursor-pointer list-none px-3 py-2.5 flex items-center gap-2">
+                    <ChevronRight className="h-3.5 w-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
+                    <span className="text-[12px] font-mono font-medium text-foreground">{layer.id}</span>
+                    <span className="text-[10px] rounded-full border border-border px-1.5 py-0.5 text-muted-foreground">{layer.owner}</span>
+                    {layer.mutable && <span className="text-[10px] rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">editable</span>}
+                    <span className="ml-auto text-[10px] text-muted-foreground">{layer.chars.toLocaleString()} chars</span>
+                  </summary>
+                  <div className="border-t border-border px-3 py-3 space-y-2">
+                    <div className="text-[10px] text-muted-foreground break-all">Source: {layer.source} · SHA-256: {layer.sha256}</div>
+                    <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-secondary/50 p-3 text-[11px] leading-relaxed text-foreground">{layer.text}</pre>
+                  </div>
+                </details>
+              ))}
+            </div>
+          </section>
+
+          <section className="space-y-2">
+            <h4 className="text-[13px] font-semibold text-foreground">Actual tools ({inspection.tools.length})</h4>
+            <div className="grid gap-2 md:grid-cols-2">
+              {inspection.tools.map(tool => (
+                <div key={tool.name} className="rounded-lg border border-border bg-card px-3 py-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[12px] font-mono font-medium text-foreground">{tool.name}</span>
+                    {tool.toolset && <span className="text-[10px] text-muted-foreground">{tool.toolset}</span>}
+                  </div>
+                  <p className="mt-1 text-[11px] text-muted-foreground leading-relaxed">{tool.description || "No tool description"}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <details className="rounded-lg border border-border bg-card group">
+            <summary className="cursor-pointer list-none px-3 py-2.5 flex items-center gap-2">
+              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
+              <span className="text-[12px] font-semibold text-foreground">Full effective prompt</span>
+              <span className="ml-auto text-[10px] font-mono text-muted-foreground">SHA-256 {inspection.prompt.sha256}</span>
+            </summary>
+            <pre className="max-h-[36rem] overflow-auto whitespace-pre-wrap border-t border-border p-4 text-[11px] leading-relaxed text-foreground">{inspection.prompt.text}</pre>
+          </details>
+
+          <div className="text-[11px] text-muted-foreground leading-relaxed">
+            Structural checks do not prove answer quality. Validate task success, evidence quality, latency, and token use with representative end-to-end cases. References:{" "}
+            {inspection.design.references.map((reference, index) => (
+              <span key={reference.url}>
+                {index > 0 && " · "}
+                <a className="text-primary hover:underline" href={reference.url} target="_blank" rel="noreferrer">{reference.title}</a>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

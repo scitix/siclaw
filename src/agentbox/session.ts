@@ -45,12 +45,13 @@ import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "../core/types.js";
 import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
-import { effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
+import { normalizeAgentType } from "../core/agent-types.js";
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
+import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
-import { createKnowledgeIndexer } from "../knowledge/indexer.js";
+import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
@@ -106,6 +107,8 @@ export interface ManagedSession {
   skillDigests: Record<string, string>;
   /** Re-read Skills after an in-session hot reload before recording evidence. */
   getSkillSnapshot?: () => { skillNames: string[]; skillDigests: Record<string, string> };
+  /** Exact on-demand prompt/tool inspection; never emitted through routine status or logs. */
+  getPromptInspection: () => PromptInspection;
   createdAt: Date;
   lastActiveAt: Date;
   /** Callbacks fired when the current prompt completes */
@@ -167,8 +170,8 @@ export interface ManagedSession {
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
-  /** Knowledge indexer — shared at AgentBox level and scoped to this Agent's mount. */
-  knowledgeIndexer?: MemoryIndexer;
+  /** Knowledge label resolver — shared at AgentBox level and scoped to this Agent's mount. */
+  knowledgeIndexer?: KnowledgeResolver;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
   /**
@@ -414,7 +417,7 @@ export class AgentBoxSessionManager {
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
-  private _sharedKnowledgeIndexer: MemoryIndexer | null = null;
+  private _sharedKnowledgeIndexer: KnowledgeResolver | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
 
@@ -472,17 +475,12 @@ export class AgentBoxSessionManager {
     return indexer;
   }
 
-  private async createSharedKnowledgeIndexer(): Promise<MemoryIndexer> {
+  private async createSharedKnowledgeIndexer(): Promise<KnowledgeResolver> {
     const config = loadConfig();
-    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
     const knowledgeDir = this.knowledgeDir ?? path.resolve(process.cwd(), config.paths.knowledgeDir);
-    const indexer = createKnowledgeIndexer(
-      knowledgeDir,
-      path.join(userDataDir, "knowledge-index"),
-      getEmbeddingConfig() ?? undefined,
-    );
-    await indexer.sync();
-    return indexer;
+    const resolver = createKnowledgeResolver(knowledgeDir);
+    await resolver.sync();
+    return resolver;
   }
 
   /** Reconcile search immediately after an Agent knowledge bundle changes. */
@@ -500,9 +498,9 @@ export class AgentBoxSessionManager {
 
     try {
       this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
-      console.log(`[agentbox-session] Shared knowledge indexer initialized`);
+      console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
     } catch (err) {
-      console.warn(`[agentbox-session] Shared knowledge indexer init failed:`, err);
+      console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
       this._sharedKnowledgeIndexer = null;
     }
 
@@ -2884,8 +2882,8 @@ export class AgentBoxSessionManager {
       // Per-agent tool capability whitelist. null remains unrestricted only for
       // explicit Custom; built-in types expand their locked capability groups.
       allowedTools: this.allowedToolsState,
-      // The stored system_prompt is the agent-owned identity/behaviour
-      // instruction, not a replacement for Siclaw's platform prompt. Keep the
+      // The stored system_prompt is the optional Agent-owned Addendum, not a
+      // replacement for Siclaw's platform or type contract. Keep the
       // platform template so safety/mode rules and dynamic context continue to
       // be assembled by agent-factory.
       systemPromptTemplate: undefined,
@@ -2893,13 +2891,13 @@ export class AgentBoxSessionManager {
       // readOnlyDelegable + read file tools) and prepend the worker persona so
       // the model knows to end with report_findings.
       delegation,
-      // Persisted system_prompt replaces the built-in type default. Delegated
-      // read-only is an exclusive runtime constraint: composing it with an SRE
-      // or Coordinator identity would instruct the model to use tools that the
-      // read-only gate deliberately removed.
+      // Built-in types compile their immutable contract plus this persisted
+      // Agent addendum. Delegated read-only is an exclusive runtime constraint:
+      // composing it with an SRE or Coordinator contract would instruct the
+      // model to use tools that the read-only gate deliberately removed.
       systemPromptAppend: delegation?.readOnly
         ? DELEGATED_READONLY_PERSONA
-        : effectiveAgentPrompt(normalizeAgentType(this.agentTypeState), systemPromptTemplate),
+        : systemPromptTemplate,
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,
@@ -2936,6 +2934,7 @@ export class AgentBoxSessionManager {
       skillNames: [...(result.skillNames ?? [])].sort(),
       skillDigests: { ...(result.skillDigests ?? {}) },
       getSkillSnapshot: result.getSkillSnapshot,
+      getPromptInspection: result.getPromptInspection,
       createdAt: new Date(),
       lastActiveAt: new Date(),
       _promptDoneCallbacks: new Set(),
@@ -3521,11 +3520,10 @@ export class AgentBoxSessionManager {
 
     if (this._sharedKnowledgeIndexer) {
       try {
-        await this._sharedKnowledgeIndexer.sync();
         this._sharedKnowledgeIndexer.close();
-        console.log(`[agentbox-session] Shared knowledge indexer closed`);
+        console.log(`[agentbox-session] Shared knowledge label resolver closed`);
       } catch (err) {
-        console.warn(`[agentbox-session] Shared knowledge indexer close error:`, err);
+        console.warn(`[agentbox-session] Shared knowledge label resolver close error:`, err);
       }
       this._sharedKnowledgeIndexer = null;
     }

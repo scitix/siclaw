@@ -294,10 +294,11 @@ describe("buildKnowledgeWikiCatalog", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("Use `knowledge_search` first");
-    expect(out).toContain("alternative terms");
-    expect(out).toContain("Grep/Find");
-    expect(out).not.toContain("there is no search tool");
+    expect(out).toContain(`under \`${knowledgeDir}\``);
+    expect(out).toContain(`catalog is \`${path.join(knowledgeDir, "index.md")}\``);
+    expect(out).toContain("complete page catalog");
+    expect(out).toContain("typed page labels only");
+    expect(out).toContain("navigation metadata, not answer evidence");
     expect(out).toContain("[RoCE modes](network/roce-modes.md)");
     expect(out).toContain("[[gpu-xid]]");
     expect(out).toContain("relative to the current page's directory");
@@ -316,32 +317,23 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).not.toContain("bash");
   });
 
-  it("carries a real compiled index whole", () => {
-    // Measured from three shipped libraries: 7453, 6651 and 2668 characters.
-    // The budget has to clear the largest of those, because a catalog cut in
-    // half reads exactly like a complete one — the agent finds no page for the
-    // task and concludes the wiki has nothing to say about it.
+  it("injects every entry from a 21K+ compiled index", () => {
+    // Regression fixture based on a shipped 185-line hardware Wiki whose last
+    // relevant routes sat beyond the former 8K head-only prompt budget.
     const realistic = [
       "---", "title: Siclaw SRE Knowledge", "type: index", "---", "",
       "# Siclaw SRE Knowledge", "", "## Components", "",
-      ...Array.from({ length: 60 }, (_, i) =>
-        `| [[component-${i}]] | what it is, how it fails, and which signals distinguish the two |`),
+      ...Array.from({ length: 176 }, (_, i) =>
+        i === 175
+          ? "- [招摇 B30X 多厂商评估](topics/招摇B30X.md) — B300 LSTM 算子通过 cudagraph 优化的技嘉平台实测数据"
+          : `- [Component ${i}](components/component-${i}.md) — what it is, how it fails, which environment it applies to, and which signals distinguish the failure mode`),
     ].join("\n");
-    expect(realistic.length).toBeGreaterThan(4000);
+    expect(realistic.split("\n")).toHaveLength(185);
+    expect(realistic.length).toBeGreaterThan(21_000);
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), realistic);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).not.toContain("truncated");
-    expect(out).toContain("[[component-59]]");
-  });
-
-  it("truncates an oversized index and points to the full file", () => {
-    const big = Array.from({ length: 500 }, (_, i) => `- [[page-${i}]] — description number ${i} with some padding text`).join("\n");
-    fs.writeFileSync(path.join(knowledgeDir, "index.md"), big);
-    const out = buildKnowledgeWikiCatalog(knowledgeDir);
-    expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("Catalog truncated");
-    expect(out).toContain(".siclaw/knowledge/index.md");
-    // Budgeted: well under the full size.
-    expect(out.length).toBeLessThan(big.length);
+    expect(out).toContain("[招摇 B30X 多厂商评估](topics/招摇B30X.md)");
+    expect(out).toContain("B300 LSTM 算子通过 cudagraph 优化");
   });
 });

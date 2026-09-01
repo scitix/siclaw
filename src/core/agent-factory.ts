@@ -26,7 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
-import { createKnowledgeIndexer } from "../knowledge/indexer.js";
+import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -46,7 +46,13 @@ import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
-import { inspectModelEnvelope, type ModelEnvelopeManifest } from "./model-envelope.js";
+import {
+  extractModelEnvelopeInspection,
+  inspectModelEnvelope,
+  type ModelEnvelopeInspection,
+  type ModelEnvelopeManifest,
+} from "./model-envelope.js";
+import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
@@ -87,14 +93,14 @@ export interface CreateSiclawSessionOpts {
   agentType?: AgentType;
   /** False when the control plane could not prove the Agent's type/capability policy. */
   harnessResolved?: boolean;
-  /** Extra system prompt content appended for agent customization */
+  /** Persisted Agent-owned addendum; built-in type contracts are compiled separately. */
   systemPromptAppend?: string;
-  /** Custom system prompt template from agent settings (overrides DEFAULT_TEMPLATE) */
+  /** Legacy platform-template override for standalone callers; not an Agent setting. */
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
-  /** Pre-initialized hybrid index over this Agent's mounted knowledge pages. */
-  knowledgeIndexer?: MemoryIndexer;
+  /** Pre-initialized labels-only resolver over this Agent's mounted knowledge pages. */
+  knowledgeIndexer?: KnowledgeResolver;
   /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
   mcpManager?: McpClientManager;
   /** Pre-resolved MCP tools from shared mcpManager — avoids re-discovery */
@@ -185,7 +191,7 @@ export interface SiclawSessionResult {
   /** MCP client manager — call shutdown() on session close */
   mcpManager?: McpClientManager;
   memoryIndexer?: MemoryIndexer;
-  knowledgeIndexer?: MemoryIndexer;
+  knowledgeIndexer?: KnowledgeResolver;
   /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
@@ -196,6 +202,8 @@ export interface SiclawSessionResult {
   contextManifest: AgentContextManifest;
   /** Updated at the provider boundary with the final serialized instruction/tool fingerprint. */
   modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest };
+  /** Explicit sensitive inspection. Callers must never place its prompt text in ordinary logs. */
+  getPromptInspection: () => PromptInspection;
 
 }
 
@@ -476,26 +484,22 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Memory disabled by Agent harness or SICLAW_MEMORY_ENABLED`);
   }
 
-  // Knowledge retrieval is independent from investigation memory. Its index is
-  // always available (FTS-only without embeddings) and is scoped by the exact
-  // mounted knowledgeDir. AgentBox passes a shared instance; standalone TUI
-  // owns this fallback instance for its single session.
+  // Knowledge routing is independent from investigation memory and embedding
+  // configuration. Typed page labels become available after one local
+  // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
+  // shared resolver, while standalone TUI owns this fallback instance.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
-    let candidate: MemoryIndexer | undefined;
+    let candidate: KnowledgeResolver | undefined;
     try {
-      const created = createKnowledgeIndexer(
-        knowledgeDir,
-        path.join(userDataDir, "knowledge-index"),
-        resolveEmbeddingConfig(),
-      );
+      const created = createKnowledgeResolver(knowledgeDir);
       candidate = created;
       await created.sync();
       knowledgeIndexer = created;
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
       knowledgeIndexer = undefined;
-      console.warn("[agent-factory] Knowledge index init failed; Read/Grep/Find remain available:", err);
+      console.warn("[agent-factory] Knowledge label resolver init failed; the complete Wiki catalog and Read remain available:", err);
     }
   }
 
@@ -777,10 +781,9 @@ export async function createSiclawSession(
     authStorage,
     modelRegistry,
     resourceLoaderOptions: {
-      // Agent-owned identity is rendered inside the assembled prompt before
-      // the hardcoded Safety section. Dynamic profile/knowledge context stays
-      // in the resource-loader append, but admin text no longer has recency
-      // precedence over platform safety.
+      // The immutable type contract and optional Agent Addendum are rendered
+      // before hardcoded Safety. Dynamic profile/knowledge context stays in the
+      // ResourceLoader append; editable text cannot displace platform policy.
       systemPromptOverride: () => compiledContext.systemPrompt,
       appendSystemPromptOverride: () =>
         buildAppendSystemPrompt(
@@ -845,6 +848,7 @@ export async function createSiclawSession(
   });
   console.log(`[agent-context] ${JSON.stringify(contextManifest)}`);
   const modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest } = {};
+  const modelEnvelopeInspectionRef: { current?: ModelEnvelopeInspection } = {};
 
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());
@@ -889,6 +893,7 @@ export async function createSiclawSession(
       : converted;
     const finalPayload = convertOpenAIPdfPayload(next ?? converted);
     const manifest = inspectModelEnvelope(finalPayload);
+    modelEnvelopeInspectionRef.current = extractModelEnvelopeInspection(finalPayload);
     const previous = modelEnvelopeManifestRef.current;
     modelEnvelopeManifestRef.current = manifest;
     if (!previous ||
@@ -931,10 +936,22 @@ export async function createSiclawSession(
     return { skillNames, skillDigests };
   };
   const { skillNames, skillDigests } = getSkillSnapshot();
+  const getPromptInspection = (): PromptInspection => {
+    const wire = modelEnvelopeInspectionRef.current;
+    return createPromptInspection({
+      context: compiledContext,
+      mode,
+      effectivePrompt: wire?.systemPrompt ?? session.systemPrompt,
+      stage: wire ? "provider_wire" : "session_ready",
+      tools: wire ? wire.toolSchemas : customTools,
+      skillNames: getSkillSnapshot().skillNames,
+    });
+  };
   return {
     brain, session, services, extensionsResult, modelFallbackMessage, customTools,
     skillNames, skillDigests, getSkillSnapshot,
     kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
     sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,
+    getPromptInspection,
   };
 }

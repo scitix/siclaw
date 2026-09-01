@@ -70,6 +70,10 @@ Each page:
 type: <one or two words, you decide by content, e.g. entity/list/topic>
 title: <title>
 description: <one sentence that helps an index or agent route to this page>
+labels:
+  - facet: <entity|topic|task|component|environment|version>
+    value: <canonical, human-readable label>
+    aliases: [<optional query aliases>]
 sources:
   - resource: <raw-relative source path>
 generated:
@@ -78,7 +82,7 @@ status: stable
 ---
 <Body. Tag each statement with (source: filename). Adjudicated contradictions are written as conclusions with the involved sources retained; unadjudicated ones are tagged "⚠️ 存疑 (doubtful): …">
 ```
-Every concept frontmatter must be parseable YAML and `type` must be a non-empty string. `sources` is a list of mappings whose `resource` is the raw-relative path; preserve unknown OKF fields. The compile agent never writes `verified`: only a real reviewer or verification process may add it.
+Every concept frontmatter must be parseable YAML and `type` must be a non-empty string. Siclaw KBC pages carry 4–12 high-signal `labels`: use `entity` for named systems/products, `topic` for subject matter, `task` for the question or action the page supports, `component` for architecture parts, and `environment`/`version` only when the page is actually scoped that way. Put alternate names and abbreviations in `aliases`; do not tag every noun. `sources` is a list of mappings whose `resource` is the raw-relative path; preserve unknown OKF fields. The compile agent never writes `verified`: only a real reviewer or verification process may add it.
 
 The root `index.md` carries only `okf_version: "0.2"` in frontmatter, then groups every page under headings with entries like `- [Title](relative/path.md) - one-line description`. Emit only file-relative standard Markdown links — never `[[wikilinks]]` or `/`-prefixed bundle links. Nested `index.md` and all `log.md` files carry no frontmatter; logs use newest-first `## YYYY-MM-DD` groups.
 

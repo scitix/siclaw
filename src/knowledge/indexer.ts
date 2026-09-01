@@ -1,33 +1,16 @@
-import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 
-import { createEmbeddingProvider } from "../memory/embeddings.js";
-import { MemoryIndexer, type MemorySearchConfig } from "../memory/indexer.js";
-import type { MemoryIndexerOpts } from "../memory/index.js";
-
-const KNOWLEDGE_SEARCH_CONFIG: MemorySearchConfig = {
-  temporalDecay: { enabled: false },
-  mmr: { enabled: true, lambda: 0.75 },
-};
+import { KnowledgeLabelIndex } from "./labels.js";
+import { KnowledgeResolver } from "./resolver.js";
 
 /**
- * Build a durable hybrid index for exactly one mounted knowledge directory.
- * The database stays outside the atomically replaced knowledge mount.
+ * Build a labels-only resolver for exactly one mounted knowledge directory.
+ * It scans page frontmatter in memory and creates no database or embedding
+ * client; the complete root index remains the route for unlabeled packages.
  */
-export function createKnowledgeIndexer(
-  knowledgeDir: string,
-  indexRoot: string,
-  embeddingOpts?: MemoryIndexerOpts,
-): MemoryIndexer {
+export function createKnowledgeResolver(knowledgeDir: string): KnowledgeResolver {
   const resolvedKnowledgeDir = path.resolve(knowledgeDir);
-  const scope = createHash("sha256").update(resolvedKnowledgeDir).digest("hex").slice(0, 24);
-  fs.mkdirSync(resolvedKnowledgeDir, { recursive: true });
-  fs.mkdirSync(indexRoot, { recursive: true });
-  return new MemoryIndexer(
-    path.join(indexRoot, `${scope}.db`),
-    resolvedKnowledgeDir,
-    createEmbeddingProvider(embeddingOpts),
-    KNOWLEDGE_SEARCH_CONFIG,
-  );
+  return new KnowledgeResolver(new KnowledgeLabelIndex(resolvedKnowledgeDir));
 }
+
+export { KnowledgeResolver } from "./resolver.js";

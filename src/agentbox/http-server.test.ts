@@ -168,6 +168,17 @@ function makeFakeBrain() {
 }
 
 function makeFakeSession(id: string) {
+  const promptInspection = {
+    version: "prompt-inspection/v1",
+    stage: "session_ready",
+    agentType: "sre",
+    mode: "web",
+    prompt: { text: "exact prompt", chars: 12, sha256: "prompt-hash" },
+    layers: [],
+    tools: [],
+    skills: [],
+    design: { standard: "siclaw-prompt-design/v1", verdict: "pass", checks: [], references: [] },
+  };
   return {
     id,
     brain: makeFakeBrain(),
@@ -175,6 +186,7 @@ function makeFakeSession(id: string) {
     skillNames: ["personal-probe", "skill-authoring"],
     skillDigests: { "personal-probe": "abc", "skill-authoring": "def" },
     getSkillSnapshot: undefined as (() => { skillNames: string[]; skillDigests: Record<string, string> }) | undefined,
+    getPromptInspection: vi.fn(() => promptInspection),
     createdAt: new Date(),
     lastActiveAt: new Date(),
     _promptDoneCallbacks: new Set<() => void>(),
@@ -252,7 +264,7 @@ function makeFakeSessionManager() {
   };
 }
 
-async function getJson(port: number, path: string, method = "GET", body?: unknown): Promise<{ status: number; data: any }> {
+async function getJson(port: number, path: string, method = "GET", body?: unknown): Promise<{ status: number; data: any; headers: Headers }> {
   const resp = await fetch(`http://127.0.0.1:${port}${path}`, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
@@ -261,7 +273,7 @@ async function getJson(port: number, path: string, method = "GET", body?: unknow
   const text = await resp.text();
   let data: any = text;
   try { data = JSON.parse(text); } catch { /* not json */ }
-  return { status: resp.status, data };
+  return { status: resp.status, data, headers: resp.headers };
 }
 
 async function flushAsync(): Promise<void> {
@@ -1023,6 +1035,19 @@ describe("http-server — prompt + session lifecycle", () => {
   it("GET /api/sessions/:id/context 404s for unknown session", async () => {
     const r = await getJson(port, "/api/sessions/ghost/context");
     expect(r.status).toBe(404);
+  });
+
+  it("GET /api/sessions/:id/prompt-inspection returns exact data only for a resident session", async () => {
+    const session = await sm.getOrCreate("s-prompt");
+
+    const resident = await getJson(port, "/api/sessions/s-prompt/prompt-inspection");
+    const missing = await getJson(port, "/api/sessions/ghost/prompt-inspection");
+
+    expect(resident.status).toBe(200);
+    expect(resident.headers.get("cache-control")).toBe("no-store");
+    expect(resident.data.prompt.text).toBe("exact prompt");
+    expect(session.getPromptInspection).toHaveBeenCalledOnce();
+    expect(missing.status).toBe(404);
   });
 });
 

@@ -98,11 +98,30 @@ def test_okf_v02_conformance():
     assert selfcheck.format_policy_violations(pages) == []
 
     metadata_page = {
-        "text": "---\ntype: Topic\nsources:\n  - id: manual\n    resource: raw/manual.md\n    author: team:docs\n"
+        "text": "---\ntype: Topic\nlabels:\n  - facet: entity\n    value: B300\n    aliases: [GB300]\n"
+                "  - facet: task\n    value: performance evaluation\n"
+                "sources:\n  - id: manual\n    resource: raw/manual.md\n    author: team:docs\n"
                 "generated:\n  by: process:siclaw-kbc\n  at: 2026-08-04T10:00:00Z\n"
                 "status: stable\nstale_after: 2027-01-01\n---\nBody"
     }
     assert selfcheck.okf_v02_violations({"topic.md": metadata_page}) == []
+    assert selfcheck.siclaw_portable_output_violations({"topic.md": metadata_page}) == []
+
+    invalid_labels = {
+        "bad-labels.md": {"text": "---\ntype: Topic\nlabels:\n"
+                                      "  - facet: invented\n    value: B300\n"
+                                      "  - facet: entity\n    value: B300\n    aliases: [GPU, gpu]\n"
+                                      "  - facet: entity\n    value: b300\n---\nBody"},
+    }
+    label_violations = [v for v in selfcheck.okf_v02_violations(invalid_labels)
+                        if v["kind"] == "okf_labels"]
+    assert len(label_violations) == 3, label_violations
+
+    generated_without_labels = {
+        "topic.md": {"text": "---\ntype: Topic\ngenerated:\n  by: process:siclaw-kbc\n---\nBody"},
+    }
+    assert {v["kind"] for v in selfcheck.siclaw_portable_output_violations(
+        generated_without_labels)} == {"siclaw_profile_labels"}
 
     attested_path = {"text": "---\ntype: Attested Computation\nruntime: python\n"
                              "computation: jobs/run.py\n---\n# Result"}
@@ -392,14 +411,17 @@ def test_emit_ignores_links_in_code():
 
         ledger = {"claims": [{"text": "x", "src": "a.md"}], "findings": {}}
         page = {"filename": "guide.md", "type": "Guide", "title": "Guide", "description": "d",
+                "labels": [{"facet": "topic", "value": "shell examples", "aliases": ["bash"]}],
                 "body": "```bash\nif [[ -f /etc/foo ]]; then echo yes; fi\n```\n`[root](/x.md)`"}
         module.call_json = lambda _: {"pages": [page]}
         with tempfile.TemporaryDirectory() as td:
             assert module.emit(ledger, td) == ["guide.md"]
             emitted = selfcheck.yaml.safe_load((Path(td) / "guide.md").read_text().split("---", 2)[1])
             assert emitted["sources"] == []
+            assert emitted["labels"][0]["value"] == "shell examples"
             assert emitted["generated"]["by"] == "process:siclaw-kbc"
             assert emitted["status"] == "stable"
+            assert "- [Guide](guide.md) - d" in (Path(td) / "index.md").read_text()
 
         module.call_json = lambda _: {"pages": [{**page, "body": "See [[legacy]]."}]}
         with tempfile.TemporaryDirectory() as td:
@@ -1190,7 +1212,9 @@ async def test_noop_gate_survives_missing_selfcheck():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/b.md")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)")
-        _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
+            "  - facet: topic\n    value: wiring test\nsources:\n"
+            "  - resource: s/a.md\n---\nx")
         run = _FakeRun(td)
         msg1 = await _post_turn_selfcheck(run)      # b.md unaccounted → repairing
         assert msg1 and run._l1_repairs_used == 1
@@ -1222,7 +1246,9 @@ async def test_ledger_repairs_reset_budget():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/b.md")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)")
-        _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
+            "  - facet: topic\n    value: wiring test\nsources:\n"
+            "  - resource: s/a.md\n---\nx")
         run = _FakeRun(td)
         run._l1_repairs_used = 99  # earlier interactive turns spent the budget
 
@@ -1379,7 +1405,9 @@ async def test_wiring():
         # index exists, b.md unaccounted → repairing + repair prompt returned
         run._turn_page_hashes = incremental.page_hashes(td)
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)")
-        _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
+            "  - facet: topic\n    value: wiring test\nsources:\n"
+            "  - resource: s/a.md\n---\nx")
         msg = await _post_turn_selfcheck(run)
         assert msg and "s/b.md" in msg, msg
         stamped, _, stamp_error = selfcheck.parse_okf_frontmatter(
@@ -1403,9 +1431,13 @@ async def test_wiring():
 
         # budget exhaustion: reopen the gap twice without fixing → unconverged, no injection
         _mk(base, "raw/s/c.md")
-        _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx2")  # rotate key
+        _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
+            "  - facet: topic\n    value: wiring test\nsources:\n"
+            "  - resource: s/a.md\n---\nx2")  # rotate key
         assert await _post_turn_selfcheck(run) is not None      # round 1 → repairing
-        _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx3")  # agent "fixed" nothing
+        _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
+            "  - facet: topic\n    value: wiring test\nsources:\n"
+            "  - resource: s/a.md\n---\nx3")  # agent "fixed" nothing
         assert await _post_turn_selfcheck(run) is None          # budget spent → unconverged
         sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
         assert sc["state"] == "unconverged", sc

@@ -638,6 +638,8 @@ constraint. Its outputs are:
 
 - a role-neutral system prompt with capability-derived infrastructure,
   workflow, memory, skill-authoring, and operational-safety sections;
+- an immutable built-in Agent Type contract plus an optional Agent-owned
+  Addendum, rather than a persisted prompt that replaces the type contract;
 - an enforceable harness for built-in tools, configured MCP exposure, memory,
   and allowed skill roots.
 
@@ -645,20 +647,24 @@ All AgentBox and Portal-backed TUI entry points pass the locked Agent type and
 resolution state through this compiler. Unresolved startup is fail-closed.
 Custom plus a successfully resolved null selection remains the sole legacy
 unrestricted case. Session and final provider-envelope manifests record only
-hashes, lengths, and model-visible resource names, never prompt or user content.
+hashes, lengths, layer provenance, and model-visible resource names, never
+prompt or user content. Exact effective prompt/tool inspection is available
+only through an explicit administrator request for a resident session.
 
 **Consequences**:
 
 - ✅ QA cold starts without SRE cluster-binding or shell guidance.
 - ✅ Prompt claims and model-visible tools/skills derive from one policy.
 - ✅ Capability-sync failure cannot silently become an unrestricted session.
-- ✅ Knowledge QA has a first-class hybrid search → exact fallback → full Read
-  → citation retrieval stack rather than depending only on catalog titles.
+- ✅ Knowledge QA has a complete Wiki catalog → labels-only resolver → full
+  Read → citation retrieval stack without content-index hydration.
 - ✅ LocalSpawner materializes explicitly bound Skills and MCP per Agent before
   the first prompt, without leaking process-global SRE resources into QA.
 - ✅ Domain-neutral state-change confirmation rules apply even when a QA or
   Coordinator is explicitly bound to an effectful MCP.
 - ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
+- ✅ A deterministic prompt-design check covers layer ownership, completion,
+  capability/tool alignment, retrieval behavior, duplication, and size.
 - ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
   skills; required skills must be explicitly bound.
 - ⚠️ Explicitly configured MCP remains orthogonal to built-in capability
@@ -670,4 +676,49 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 
 **Files**: `src/core/agent-context.ts`, `src/core/prompt.ts`,
 `src/core/agent-factory.ts`, `src/core/model-envelope.ts`,
+`src/core/prompt-inspection.ts`,
 `src/agentbox-main.ts`, `src/gateway/agentbox/local-spawner.ts`
+
+---
+
+## ADR-017: Knowledge Labels Are Page Metadata and an Independent Retrieval Signal
+
+**Status**: Active
+
+**Context**:
+The runtime previously injected only the first 8,000 characters of `index.md`.
+That prefix looked complete while silently hiding valid pages, so an Agent could
+wrongly conclude that the Wiki did not cover a question. Content indexes that
+require FTS/vector construction or embedding hydration add another cold-start
+dependency and can take minutes or fail under provider rate limits. A
+package-specific hardcoded route would solve only the observed question.
+Labels also need to survive compiler → control plane → AgentBox without Sicore
+and Siclaw independently inferring different taxonomies.
+
+**Decision**:
+Store typed Knowledge Labels in each OKF v0.2 concept page's frontmatter. A
+label has one facet (`entity`, `topic`, `task`, `component`, `environment`, or
+`version`), a canonical human-readable value, and optional aliases. Siclaw KBC
+generates labels; Sicore validates their shape and transports them unchanged.
+
+The complete root `index.md` is injected into the model prompt as the common
+navigation baseline. AgentBox also derives an in-memory, paginated Label Catalog
+from page frontmatter before the first turn. `knowledge_search` resolves typed
+labels and aliases only; it never searches page bodies, creates a database, or
+opens an embedding provider. It returns page metadata, matched labels, and alias
+reasons, never snippets. Labels and catalog entries never count as answer
+evidence; the Agent must still read and cite supporting pages.
+
+**Consequences**:
+
+- ✅ Every root-index route remains visible; no valid tail page is silently lost.
+- ✅ Known entities, tasks, versions, and aliases route without FTS, vectors, a database, or an embedding call.
+- ✅ The first QA turn has no content-index hydration dependency.
+- ✅ One page-level contract flows unchanged through compilation and delivery.
+- ✅ Existing and third-party OKF v0.2 packages without labels navigate through the complete root index.
+- ⚠️ Label quality is a compiler-quality concern and needs later retrieval evaluation.
+- ⚠️ The full root index consumes fixed prompt tokens; KBC must keep entries concise, and any future oversized representation must remain complete rather than head-truncated.
+- ❌ A label match is not a citation or permission to answer without reading the page.
+
+**Files**: `kbc/platform/pod/selfcheck.py`, `src/knowledge/labels.ts`,
+`src/knowledge/resolver.ts`, `src/tools/query/knowledge-search.ts`

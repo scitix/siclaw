@@ -64,6 +64,10 @@ _EVIDENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVIDENCE_MARKER_RE = re.compile(r"<!--[ \t]*okf:evidence[ \t]+(\{[^\r\n]*\})[ \t]*-->")
 _EVIDENCE_MARKER_START_RE = re.compile(r"<!--[ \t]*okf:evidence\b")
 _MAX_EVIDENCE_SOURCES = 8
+_OKF_LABEL_FACETS = {"entity", "topic", "task", "component", "environment", "version"}
+_MAX_OKF_LABELS = 32
+_MAX_OKF_LABEL_ALIASES = 8
+_MAX_OKF_LABEL_TEXT = 100
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -821,6 +825,48 @@ def _okf_v02_metadata_violations(rel: str, fm: dict, body: str) -> list[dict]:
         violations.append({"page": rel, "kind": "okf_usage_window",
                            "detail": "usage_window 必须包含合法且有序的 YYYY-MM-DD from/to 日期"})
 
+    if "labels" in fm:
+        raw_labels = fm.get("labels")
+        if not isinstance(raw_labels, list) or not raw_labels:
+            violations.append({"page": rel, "kind": "okf_labels",
+                               "detail": "labels 必须是非空 mapping 列表"})
+        elif len(raw_labels) > _MAX_OKF_LABELS:
+            violations.append({"page": rel, "kind": "okf_labels",
+                               "detail": f"labels 最多允许 {_MAX_OKF_LABELS} 项"})
+        else:
+            seen_labels: set[tuple[str, str]] = set()
+            for i, label in enumerate(raw_labels):
+                if not isinstance(label, dict):
+                    violations.append({"page": rel, "kind": "okf_labels",
+                                       "detail": f"labels[{i}] 必须是 mapping"})
+                    continue
+                facet = label.get("facet")
+                value = label.get("value")
+                if facet not in _OKF_LABEL_FACETS:
+                    violations.append({"page": rel, "kind": "okf_labels",
+                                       "detail": f"labels[{i}].facet 必须是 {', '.join(sorted(_OKF_LABEL_FACETS))} 之一"})
+                if (not isinstance(value, str) or not value.strip()
+                        or len(value.strip()) > _MAX_OKF_LABEL_TEXT):
+                    violations.append({"page": rel, "kind": "okf_labels",
+                                       "detail": f"labels[{i}].value 必须是 1-{_MAX_OKF_LABEL_TEXT} 字符的非空字符串"})
+                if isinstance(facet, str) and isinstance(value, str) and value.strip():
+                    key = (facet, value.strip().casefold())
+                    if key in seen_labels:
+                        violations.append({"page": rel, "kind": "okf_labels",
+                                           "detail": f"labels 中存在重复项: {facet}:{value.strip()}"})
+                    seen_labels.add(key)
+                if "aliases" in label:
+                    aliases = label.get("aliases")
+                    if (not isinstance(aliases, list) or len(aliases) > _MAX_OKF_LABEL_ALIASES
+                            or any(not isinstance(alias, str) or not alias.strip()
+                                   or len(alias.strip()) > _MAX_OKF_LABEL_TEXT
+                                   for alias in aliases)):
+                        violations.append({"page": rel, "kind": "okf_labels",
+                                           "detail": f"labels[{i}].aliases 必须是最多 {_MAX_OKF_LABEL_ALIASES} 个非空短字符串"})
+                    elif len({alias.strip().casefold() for alias in aliases}) != len(aliases):
+                        violations.append({"page": rel, "kind": "okf_labels",
+                                           "detail": f"labels[{i}].aliases 不得重复"})
+
     violations.extend(_okf_evidence_violations(rel, fm, body))
 
     if "generated" in fm:
@@ -1200,6 +1246,12 @@ def siclaw_portable_output_violations(pages: dict[str, dict]) -> list[dict]:
             if "verified" in fm:
                 violations.append({"page": rel, "kind": "siclaw_profile_verified",
                                    "detail": "编译 Agent 不得自写 verified；验证事件由确定性系统或人工流程记录"})
+            generated = fm.get("generated")
+            if (isinstance(generated, dict)
+                    and generated.get("by") == "process:siclaw-kbc"
+                    and not fm.get("labels")):
+                violations.append({"page": rel, "kind": "siclaw_profile_labels",
+                                   "detail": "Siclaw KBC 生成的知识页必须声明非空 labels"})
     return violations
 
 

@@ -2455,6 +2455,9 @@ async def test_prompt_packs_locale():
     assert "the code profile organizes pages around architectural concepts and components" in en_box_role, en_box_role
     assert "**一页一个文件" not in zh_box_role, zh_box_role
     assert "**One page per file" not in en_box_role, en_box_role
+    assert "4–12 条高信号" in zh_box_role and "4–12 high-signal" in en_box_role
+    assert "每个链接条目都带该页的一句话 `description`" in zh_box_role, zh_box_role
+    assert "every link entry includes the page's one-line `description`" in en_box_role, en_box_role
 
     # A regression round's consumer identity is deterministic and changes only
     # with answer-affecting contract inputs. Tool order is not semantic.
@@ -3353,7 +3356,8 @@ async def test_exact_source_alias_is_repaired_before_l1_budget():
         (wd / "candidate" / "index.md").write_text(
             "---\nokf_version: \"0.2\"\n---\n# Index\n- [Guide](guide.md)\n")
         (wd / "candidate" / "guide.md").write_text(
-            "---\ntype: Guide\ntitle: Guide\nsources:\n"
+            "---\ntype: Guide\ntitle: Guide\nlabels:\n"
+            "  - facet: topic\n    value: source guide\nsources:\n"
             "  - resource: docs/专题目录.md\n---\n正文。(source: 专题目录)\n")
         run = compile_box.CompileRun("mechanical-source", str(wd), 1)
         run._selfcheck_key = None
@@ -3738,7 +3742,9 @@ async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
             "---\ntitle: Legacy\nsources:\n  - resource: raw/snap/one.md\n---\n# Legacy\nInherited body.\n"
         )
         (root / "candidate" / "clean.md").write_text(
-            "---\ntype: Topic\ntitle: Clean\nsources:\n  - resource: raw/snap/one.md\n---\n# Clean\nStable body.\n"
+            "---\ntype: Topic\ntitle: Clean\nlabels:\n"
+            "  - facet: topic\n    value: stable knowledge\nsources:\n"
+            "  - resource: raw/snap/one.md\n---\n# Clean\nStable body.\n"
         )
 
     with tempfile.TemporaryDirectory() as td:
