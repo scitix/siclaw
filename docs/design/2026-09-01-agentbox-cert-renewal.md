@@ -63,9 +63,23 @@ and the agent worked or failed depending on which box a turn landed on. Observed
 2026-09-01: a pod started 09:38 against a certificate reissued at 09:49 failed every
 resource sync while a sibling started at 09:52 synced cleanly.
 
-Detection is by **stat, not `fs.watch`**: a Secret volume update is an atomic swap of
-the `..data` directory, which replaces the inode behind each file, and a watcher bound
-to the old inode can miss it entirely.
+Detection is **event-driven with a periodic backstop**, and the watch is on the
+DIRECTORY. A Secret update renames a symlink over `..data`; the visible paths keep
+resolving through it, so a watcher bound to a FILE holds the inode that rename orphaned
+and goes silent forever. The rename happens inside the directory, so a directory watch
+sees it.
+
+The backstop poll is not redundant. inotify queues overflow, `fs.watch` has
+platform-dependent gaps, and a watch that stops delivering is indistinguishable from a
+certificate that never changed — the same "nothing happened and nobody noticed" shape
+as the outage itself. It runs at a long interval because C3a means one interval is
+still days of margin.
+
+The AgentBox deliberately has no Kubernetes API access
+(`automountServiceAccountToken: false`), so watching the Secret *resource* is not an
+option — and would not help anyway: the API tells you the Secret changed, while what
+matters is when kubelet has projected it onto the volume, which is a separate and
+later event.
 
 ### C3a — The 7-day head start is what makes C3 optional per consumer
 

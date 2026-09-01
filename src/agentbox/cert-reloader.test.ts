@@ -205,3 +205,86 @@ describe("torn reads and partial material", () => {
     expect(attempts).toBeGreaterThan(1);
   });
 });
+
+// ── The directory watch: renewal should land in seconds, not one interval ──
+
+describe("event-driven reload", () => {
+  /** Reproduces kubelet's atomic writer: new timestamped dir, then a symlink rename. */
+  function publishLikeKubelet(tag: string) {
+    const real = path.join(dir, `..${tag}`);
+    fs.mkdirSync(real, { recursive: true });
+    for (const f of ["tls.crt", "tls.key", "ca.crt"]) fs.writeFileSync(path.join(real, f), `${f.split(".")[0].toUpperCase()}-${tag}`);
+    const tmp = path.join(dir, "..data_tmp");
+    try { fs.unlinkSync(tmp); } catch { /* first publish */ }
+    fs.symlinkSync(real, tmp);
+    fs.renameSync(tmp, path.join(dir, "..data"));
+    for (const f of ["tls.crt", "tls.key", "ca.crt"]) {
+      const link = path.join(dir, f);
+      try { fs.unlinkSync(link); } catch { /* first publish */ }
+      fs.symlinkSync(path.join("..data", f), link);
+    }
+  }
+
+  it("reacts to a volume swap without waiting for the backstop interval", async () => {
+    publishLikeKubelet("gen1");
+    // A backstop an hour out: anything observed here came from the watch.
+    const r = new ReloadingCertMaterial(dir, 3_600_000);
+    expect(r.current()?.cert.toString()).toBe("TLS-gen1");
+
+    const seen: string[] = [];
+    const stop = r.watch((m) => seen.push(m.cert.toString()));
+
+    publishLikeKubelet("gen2");
+    await new Promise((res) => setTimeout(res, 500));
+    stop();
+
+    expect(seen).toEqual(["TLS-gen2"]);
+  });
+
+  it("notifies once per swap even though the swap emits a burst of events", async () => {
+    // A swap fires a dozen renames (the new directory, ..data, then each visible
+    // symlink). What collapses them is the FINGERPRINT comparison, not the debounce —
+    // verified by mutation: removing the debounce keeps this green. The debounce only
+    // keeps the burst from causing a dozen reads.
+    publishLikeKubelet("gen1");
+    const r = new ReloadingCertMaterial(dir, 3_600_000);
+    const seen: string[] = [];
+    const stop = r.watch((m) => seen.push(m.cert.toString()));
+
+    publishLikeKubelet("gen2");
+    await new Promise((res) => setTimeout(res, 500));
+    stop();
+
+    expect(seen).toHaveLength(1);
+  });
+
+  it("still converges on the backstop when the watch delivers nothing", async () => {
+    // inotify queues overflow and fs.watch has platform gaps, and a watch that stops
+    // delivering looks exactly like a certificate that never changed. The seven-day
+    // head start means one interval is plenty — but only if the interval exists.
+    writeCerts("a");
+    const r = new ReloadingCertMaterial(dir, 20);
+    (r as any).watcher?.close();
+    (r as any).watcher = undefined; // simulate a watch that silently died
+
+    const seen: string[] = [];
+    const stop = r.watch((m) => seen.push(m.cert.toString()));
+    writeCerts("b", 5_000);
+    await new Promise((res) => setTimeout(res, 120));
+    stop();
+
+    expect(seen).toEqual(["CERT-b"]);
+  });
+
+  it("releases the watch and the timer when the last listener goes", async () => {
+    writeCerts("a");
+    const r = new ReloadingCertMaterial(dir, 20);
+    const stop = r.watch(() => {});
+    expect((r as any).timer).toBeDefined();
+
+    stop();
+
+    expect((r as any).timer).toBeUndefined();
+    expect((r as any).watcher).toBeUndefined();
+  });
+});
