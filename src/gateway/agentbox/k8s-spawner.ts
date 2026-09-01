@@ -505,19 +505,29 @@ export class K8sSpawner implements BoxSpawner {
         // — pods created before the label existed have none, and reading that as stale
         // would recycle every one of them on sight.
         const podCertExp = parseCertExpiryLabel(existing.metadata?.labels?.[certExpLabel]);
-        const certStale =
+        // 🔴 `recreate` is a FIRST-CLASS reason to replace, alongside the certificate ones,
+        // because a Pending pod that will never schedule looks perfectly healthy from here:
+        // its phase is fine and its certificate is fine, so the reuse below would hand it
+        // back and wait out POD_READY_TIMEOUT_MS again — forever, once per request. Only the
+        // CALLER can know the pod has already had its chance (see AgentBoxManager's
+        // `isComingUp`), so it has to be able to say so. Without this the manager could
+        // classify such a slot as rebuildable, spend drain budget on it, and still get the
+        // same stuck pod back.
+        const replaceReason =
           podFp !== caFp ? `stale CA (pod=${podFp ?? "none"}, current=${caFp})`
           : certificateNeedsRenewal(podCertExp)
             ? `certificate expires ${podCertExp?.toISOString() ?? "unknown"}`
+          : boxConfig.recreate
+            ? `caller asked for a rebuild (phase: ${phase})`
             : null;
-        if (!certStale) {
+        if (!replaceReason) {
           console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);
           const endpoint = await this.waitForPodReady(podName, namespace);
           return { boxId: podName, agentId, endpoint };
         }
-        // Recycle it instead of returning an endpoint mTLS cannot reach. The Secret is
-        // re-issued below, since ensureCertSecret judges the leaf as well as the CA.
-        console.log(`[k8s-spawner] Pod ${podName} has an unusable certificate — ${certStale}; recreating`);
+        // Recycle it rather than returning an endpoint that cannot serve. For the certificate
+        // reasons the Secret is re-issued below, since ensureCertSecret judges the leaf too.
+        console.log(`[k8s-spawner] Replacing pod ${podName} — ${replaceReason}`);
         await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
         await this.waitForPodDeleted(podName, namespace);
       }

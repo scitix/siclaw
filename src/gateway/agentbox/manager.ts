@@ -646,6 +646,12 @@ export class AgentBoxManager {
       const rebuildSet = new Set(rebuildable);
       const admit = (instance: number): boolean =>
         !rebuildSet.has(instance) || this.spendDrainBudget(agentId);
+      // 🔴 The classification is not self-enforcing. A slot in the rebuild set may hold a pod
+      // the spawner would happily REUSE — a Pending pod with a valid certificate passes every
+      // check it makes — so calling it "rebuildable" here achieved nothing on its own: the
+      // budget was spent and the same stuck pod came back, once per request, forever. The
+      // intent has to travel with the request.
+      const recreate = (instance: number): boolean => rebuildSet.has(instance);
 
       // What this turn WAITS on: whichever set can produce a usable box soonest. A starting
       // slot beats a rebuild, because waiting out a pod that is already coming up is cheaper
@@ -680,7 +686,7 @@ export class AgentBoxManager {
         // appearing only afterwards. The recovery has to be in flight WHILE the turn waits.
         const fillable = [...rest, ...strandedRebuilds].filter((i) => this.mayFillInstance(agentId, i));
         if (fillable.length > 0) {
-          void this.spawnInstances(agentId, config, fillable, true, admit).catch((err) =>
+          void this.spawnInstances(agentId, config, fillable, true, admit, recreate).catch((err) =>
             console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
         }
 
@@ -688,7 +694,7 @@ export class AgentBoxManager {
         // failed a moment ago is still worth one more try. The background remainder above
         // does respect it. Distinct instance sets, so the two calls cannot contend — and
         // in-flight de-duplication would merge them even if they did.
-        const [handle] = await this.spawnInstances(agentId, config, [first], true, admit);
+        const [handle] = await this.spawnInstances(agentId, config, [first], true, admit, recreate);
         if (handle) {
           if (sessionId) this.bindings.remember(agentId, sessionId, handle.boxId);
           return { handle, created: true };
@@ -1065,6 +1071,11 @@ export class AgentBoxManager {
      * placed before de-duplication counts the wrong thing.
      */
     admit?: (instance: number) => boolean,
+    /**
+     * Whether this slot's existing pod must be replaced rather than reused. Per slot, for
+     * the same reason as `admit`: one call can cover slots that need opposite treatment.
+     */
+    recreate?: (instance: number) => boolean,
   ): Promise<AgentBoxHandle[]> {
     // Resolving env/persistence costs an RPC each, so pay it only if a slot turns out to be
     // ours to fill — and resolve it LAZILY rather than up front behind an `if`. Deciding
@@ -1094,6 +1105,7 @@ export class AgentBoxManager {
             ...config,
             agentId,
             instance,
+            ...(recreate?.(instance) ? { recreate: true } : {}),
             persistence,
             env: {
               ...resolvedEnv,

@@ -54,6 +54,19 @@ export interface AgentBoxConfig {
    * name is not parseable back into an index.
    */
   instance?: number;
+  /**
+   * Replace the pod occupying this slot even if it looks reusable.
+   *
+   * 🔴 Needed because "reusable" is judged from the pod alone — phase, profile, certificate
+   * — and a Pending pod that will never be scheduled passes every one of those checks. Only
+   * the caller knows it has already been given its chance (see AgentBoxManager's
+   * `isComingUp`, bounded by POD_READY_TIMEOUT_MS), so only the caller can ask for the
+   * rebuild. Without it, classifying such a slot for rebuild spends drain budget and still
+   * gets the same stuck pod back.
+   *
+   * Honoured by K8sSpawner only; other spawners have no pod to replace.
+   */
+  recreate?: boolean;
 }
 
 /** AgentBox information */

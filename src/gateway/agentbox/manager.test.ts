@@ -1787,6 +1787,51 @@ describe("AgentBoxManager — a pool that is at size but not up yet", () => {
     expect(after - before).toBe(1); // and charged, because a rebuild destroys a pod
   });
 
+  /**
+   * 🔴 THE GAP BETWEEN CLASSIFYING AND ACTING. Putting an over-age slot in the rebuild set
+   * only decided what the manager INTENDED; the spawner still judges reuse from the pod
+   * alone, and a Pending pod with a valid certificate passes every check it makes. So the
+   * budget was spent and the same stuck pod was handed back — once per request, forever. The
+   * intent has to travel with the spawn request, which is what `recreate` carries.
+   */
+  it("tells the spawner to REPLACE an over-age slot, not just classify it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const longStuck = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    longStuck.createdAt = new Date(Date.now() - POD_READY_TIMEOUT_MS - 60_000);
+    spawner.pool = [longStuck];
+    const mgr = pooledManager(spawner, 1);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].recreate).toBe(true);
+  });
+
+  it("does NOT ask for a replacement when the slot is merely still coming up", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const fresh = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    fresh.createdAt = new Date(Date.now() - 5_000);
+    spawner.pool = [fresh];
+    const mgr = pooledManager(spawner, 1);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].recreate).toBeUndefined(); // waiting, not replacing
+  });
+
+  it("does not ask for a replacement when simply filling a short pool", async () => {
+    // A missing index has no pod to replace; sending `recreate` there would be meaningless
+    // at best and, on a slot that raced into existence, destructive.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+
+    expect(spawner.spawnCalls.every((c) => c.recreate === undefined)).toBe(true);
+  });
+
   it("keeps waiting on a starting slot that is still within the deadline", async () => {
     const spawner = new PoolSpawner("k8s");
     const fresh = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });

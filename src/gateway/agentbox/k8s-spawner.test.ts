@@ -1719,6 +1719,94 @@ describe("K8sSpawner — get() and the listings must report the SAME shape", () 
   });
 });
 
+describe("K8sSpawner — an explicit rebuild request", () => {
+  const g = globalThis as any;
+
+  const healthyPending = (name: string) => ({
+    metadata: {
+      name,
+      creationTimestamp: new Date(),
+      labels: {
+        "siclaw.io/agent": "agent-x",
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-exp": String(Math.floor(daysFromNow(25).getTime() / 1000)),
+        "siclaw.io/boxType": "agent",
+        "siclaw.io/instance": "0",
+      },
+    },
+    // Pending with a perfectly good certificate: every check the spawner makes passes.
+    status: { phase: "Pending" },
+  });
+
+  /**
+   * 🔴 Classification alone changes NOTHING. A Pending pod that will never be scheduled has
+   * a fine phase, a fine profile and a fine certificate, so the reuse branch hands it back
+   * and waits POD_READY_TIMEOUT_MS again. The manager calling such a slot "rebuildable" and
+   * spending drain budget on it therefore achieved nothing at all — same stuck pod, once per
+   * request, with the fuse draining. The intent has to reach the spawner.
+   */
+  it("reuses a healthy Pending pod when no rebuild was asked for", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) return healthyPending("agentbox-agent-x-0");
+      return {
+        status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+
+    await s.spawn({ agentId: "agent-x", profile: "agent" } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(0);
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(0); // reused, as before
+  });
+
+  it("deletes and recreates that same pod when the caller asks for a rebuild", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) return healthyPending("agentbox-agent-x-0");
+      if (reads === 2) throw Object.assign(new Error("nf"), { code: 404 }); // gone after delete
+      return {
+        status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+
+    await s.spawn({ agentId: "agent-x", profile: "agent", recreate: true } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(1);
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1);
+  });
+
+  it("names the caller's request as the reason, so a log reader can tell it apart", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((m?: any) => { logs.push(String(m)); });
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) return healthyPending("agentbox-agent-x-0");
+      if (reads === 2) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+
+    await s.spawn({ agentId: "agent-x", profile: "agent", recreate: true } as any);
+
+    // Not "unusable certificate" — that would send the reader looking at the wrong thing.
+    expect(logs.some((l) => /caller asked for a rebuild/.test(l))).toBe(true);
+  });
+});
+
 describe("K8sSpawner — waitForPodReady", () => {
   const g = globalThis as any;
 
