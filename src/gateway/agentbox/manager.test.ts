@@ -1639,6 +1639,119 @@ describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
   });
 });
 
+describe("AgentBoxManager — a pool that is at size but not up yet", () => {
+  /**
+   * 🔴 "Nothing reachable" and "pool short" are DIFFERENT conditions, and the gap between
+   * them was a second, independent unbounded-growth path that de-duplication could not
+   * close. A starting box counts as live for missingInstances (so `missing` is empty) but
+   * is not reachable (so `accepting` is 0) — and the fall-through allocated a NEW index
+   * every time. Each request picking a different index is precisely what de-dup cannot
+   * merge, so the pool climbed 1, 2, 3, … while never actually being short.
+   */
+  /** A pool AT SIZE with nothing reachable: every box is still coming up. */
+  function allStarting(count: number): AgentBoxInfo[] {
+    return Array.from({ length: count }, (_, i) =>
+      poolBox(`agentbox-agent-a-${i}`, i, { status: "starting", endpoint: "" }));
+  }
+
+  it("waits for a starting slot instead of allocating another index", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = allStarting(2);
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
+
+    // A slot already coming up, never a fresh index above the pool size.
+    expect(spawner.spawnCalls.every((c) => (c.instance ?? -1) < 2)).toBe(true);
+    expect(spawner.spawnCalls.map((c) => c.instance)).toContain(0);
+  });
+
+  it("does not climb when request after request finds the pool starting", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = allStarting(2);
+    const mgr = pooledManager(spawner, 2);
+
+    for (let i = 0; i < 5; i++) {
+      await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+    }
+
+    // The pool was never short, so no index beyond it may be invented — this is the
+    // assertion the old code failed, climbing 2, 3, 4, … one per request.
+    const indices = [...new Set(spawner.spawnCalls.map((c) => c.instance ?? -1))].sort();
+    expect(Math.max(...indices)).toBeLessThan(2);
+  });
+
+  it("still allocates a free index when the pool is genuinely empty", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).toContain(0);
+  });
+});
+
+describe("AgentBoxManager — a box mTLS cannot reach is not a candidate", () => {
+  /**
+   * 🔴 Marking a box draining does NOT stop it being served from — that is deliberate ("a
+   * draining box beats failing the turn"). So a box whose certificate died kept being
+   * handed back to every session already bound to it, and every one of those turns failed.
+   * The certificate check therefore belongs in isReachable, which is what placement, the
+   * holder lookup and the binding fallback all derive from.
+   */
+  const withCert = (instance: number, over: Partial<AgentBoxInfo>) =>
+    poolBox(`agentbox-agent-a-${instance}`, instance, { caFingerprint: "ca-v1", ...over });
+
+  it("does not hand a session back to a box whose certificate expired", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const dead = withCert(0, { certExpiresAt: new Date(Date.now() - 1000) });
+    const alive = withCert(1, { certExpiresAt: new Date(Date.now() + 20 * 24 * 60 * 60 * 1000) });
+    spawner.pool = [dead, alive];
+    const mgr = pooledManager(spawner, 2, {
+      [dead.boxId]: { endpoint: dead.endpoint, sessionIds: ["s1"], turnsInFlight: 0, drained: false },
+      [alive.boxId]: { endpoint: alive.endpoint, sessionIds: [], turnsInFlight: 0, drained: true },
+    });
+
+    // s1 is bound to the dead box, and the dead box even reports holding it — which is
+    // exactly the state that used to pin the session there and fail every turn.
+    (mgr as any).bindings.remember("agent-a", "s1", dead.boxId);
+    const acquired = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    expect(acquired.boxId).not.toBe(dead.boxId);
+  });
+
+  it("keeps serving a box whose certificate is merely near expiry", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const soon = withCert(0, { certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+    spawner.pool = [soon, withCert(1, { certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) })];
+    const mgr = pooledManager(spawner, 2, {
+      [soon.boxId]: { endpoint: soon.endpoint, sessionIds: ["s1"], turnsInFlight: 0, drained: false },
+    });
+
+    const acquired = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    expect(acquired.boxId).toBe(soon.boxId); // still authenticates; the roll replaces it
+  });
+
+  it("excludes an expired box from getHolder, so abort/steer do not target a dead endpoint", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const dead = withCert(0, { certExpiresAt: new Date(Date.now() - 1000) });
+    spawner.pool = [dead];
+    spawner.listReturns = spawner.pool;
+    const mgr = pooledManager(spawner, 2, {
+      [dead.boxId]: { endpoint: dead.endpoint, sessionIds: ["s1"], turnsInFlight: 1, drained: false },
+    });
+
+    // Returning an endpoint that cannot be reached shows the user a failure they did not
+    // cause; undefined lets the caller answer "already stopped".
+    await expect(mgr.getHolder("agent-a", "s1")).resolves.toBeUndefined();
+  });
+});
+
 describe("AgentBoxManager — a wrong staleness judgement must not spin", () => {
   it("stops draining after a budget of replacements in one window", async () => {
     // Observed in a cluster: the reaper judged staleness from a projection that carried no

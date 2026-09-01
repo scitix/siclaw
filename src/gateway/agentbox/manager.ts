@@ -547,7 +547,27 @@ export class AgentBoxManager {
     const accepting = reachable.filter((b) => !this.draining.has(b.boxId));
 
     if (accepting.length === 0) {
-      const [first, ...rest] = missing.length > 0 ? missing : this.freeInstances(pool, 1);
+      // 🔴 "Nothing reachable" and "pool short" are DIFFERENT conditions, and the gap
+      // between them is a second, independent way to grow the pool without bound. A box
+      // that is still starting counts as live for `missingInstances` (so `missing` is
+      // empty — the pool is at size) but is not reachable (so `accepting` is 0). Falling
+      // through to `freeInstances` then allocates a NEW index every time, and since each
+      // request picks a different one, de-duplication cannot merge them: index 1, 2, 3, …
+      // while the pool was never actually short. This is the other half of the observed
+      // index climb.
+      //
+      // So when the pool is at size and simply not up yet, WAIT for a slot that is already
+      // starting instead of adding one. Passing its index to spawnInstances joins the
+      // in-flight spawn when there is one, and otherwise finds the existing pod and waits
+      // for it to become ready — which is exactly what this turn needs.
+      const startingSlots = pool
+        .filter((b) => b.status === "starting" && !this.draining.has(b.boxId))
+        .map((b) => b.instance ?? 0)
+        .sort((a, b) => a - b);
+      const target = missing.length > 0 ? missing
+        : startingSlots.length > 0 ? startingSlots
+        : this.freeInstances(pool, 1);
+      const [first, ...rest] = target;
       // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
       // failed a moment ago is still worth one more try. The background remainder does
       // respect it.
@@ -721,7 +741,19 @@ export class AgentBoxManager {
   /** A box the Runtime can talk to right now. Says nothing about whether it accepts NEW
    *  sessions — a draining box is still reachable and still serves what it holds. */
   private isReachable(box: AgentBoxInfo, wantProfile: string): boolean {
-    return box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
+    return box.status === "running"
+      && !!box.endpoint
+      && (box.profile ?? "agent") === wantProfile
+      // 🔴 An endpoint mTLS cannot complete is NOT reachable, and this is the only place
+      // that judgement can be made once: `reachable` feeds placement, the holder lookup AND
+      // the binding fallback, and the fallback is the one that matters most — a session
+      // already bound to a box keeps being handed back to it, so a dead certificate made
+      // EVERY turn of that conversation fail while marking the box draining did nothing to
+      // stop it (a draining box is deliberately still served from). Excluding it here lets
+      // the session move to a box that can answer; the transcript is on shared storage, so
+      // moving costs nothing. Unknown expiry reads as usable, so pods predating the label
+      // are unaffected.
+      && this.isCertUsable(box);
   }
 
   /**
