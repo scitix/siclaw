@@ -330,6 +330,23 @@ export class PiAgentBrain implements BrainSession {
     this.session.modelRegistry.registerProvider(name, config as any);
   }
 
+  /**
+   * Snapshot the tunables in effect, for restoring after a failed tier attempt.
+   *
+   * See `BrainSession.captureModelParams`: pi's `setModel` carries the current
+   * thinking level across a switch when the target supports thinking
+   * (`_getThinkingLevelForModelSwitch` returns `this.thinkingLevel`), so nothing
+   * in the ordinary set/switch path puts a raised level back down.
+   */
+  captureModelParams(): BrainModelParams | undefined {
+    try {
+      const level = this.session.thinkingLevel;
+      return typeof level === "string" ? { reasoningEffort: level } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   applyModelParams(params: BrainModelParams): void {
     // reasoningEffort → session thinking level. pi maps this to the provider's
     // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.
@@ -337,6 +354,68 @@ export class PiAgentBrain implements BrainSession {
     if (effort && THINKING_LEVELS.has(effort)) {
       this.session.setThinkingLevel(effort as any);
     }
+  }
+
+  /**
+   * Pure fit check — see `BrainSession.checkContextFitForModelPrompt`.
+   *
+   * Shares the estimation with `ensureContextForModelPrompt` but stops at the
+   * verdict: it never calls `session.compact()`, so it neither rewrites history
+   * nor issues a model request. `compacted` is therefore always false.
+   *
+   * Note it deliberately does NOT consult `compaction.enabled`: this answers
+   * "does it fit", and whether compaction *could* rescue an over-budget prompt is
+   * the caller's decision, not part of the measurement.
+   */
+  checkContextFitForModelPrompt(
+    model: BrainModelInfo,
+    text: string,
+  ): BrainContextPreflightResult {
+    const settings = this.session.settingsManager.getCompactionSettings();
+    const contextWindow = Math.max(0, Math.floor(model.contextWindow || 0));
+    const reserveTokens = Math.max(0, Math.floor(settings.reserveTokens || 0));
+    const promptTokens = estimatePromptTokens(text) + Math.min(
+      PiAgentBrain.PROMPT_PREFLIGHT_SAFETY_TOKENS,
+      Math.max(0, Math.floor(contextWindow * 0.02)),
+    );
+    const budget = contextWindow - reserveTokens;
+
+    if (contextWindow <= 0) {
+      return {
+        ok: false,
+        compacted: false,
+        contextWindow,
+        errorMessage: `Context fit check failed for ${model.provider}/${model.id}: context window must be greater than 0 tokens (received ${contextWindow}).`,
+      };
+    }
+    if (budget <= 0) {
+      return {
+        ok: false,
+        compacted: false,
+        contextWindow,
+        errorMessage: `Context fit check failed for ${model.provider}/${model.id}: context window ${contextWindow} tokens must exceed compaction reserve ${reserveTokens} tokens.`,
+      };
+    }
+
+    // A REQUEST is not just the conversation. On a freshly created sub-agent the
+    // message history is nearly empty while the system prompt, the skill/knowledge
+    // preamble folded into it, and the tool schemas are the bulk of what gets sent
+    // — so counting messages alone would pass a tier whose window the real request
+    // then overflows, and by then the prompt has started and cannot be taken back.
+    const tokens =
+      estimateCurrentContextTokens(this.session)
+      + estimateRequestOverheadTokens(this.session)
+      + promptTokens;
+    if (tokens > budget) {
+      return {
+        ok: false,
+        compacted: false,
+        tokens,
+        contextWindow,
+        errorMessage: `Context fit check failed: estimated ${tokens} tokens exceeds ${model.provider}/${model.id} budget ${budget}.`,
+      };
+    }
+    return { ok: true, compacted: false, tokens, contextWindow };
   }
 
   async ensureContextForModelPrompt(
@@ -466,6 +545,44 @@ function estimatePromptTokens(text: string): number {
       timestamp: Date.now(),
     } as any,
   ]);
+}
+
+/**
+ * Tokens a request carries beyond the conversation: the system prompt and every
+ * active tool's schema.
+ *
+ * `estimateCurrentContextTokens` prefers pi's own `getContextUsage()`, which
+ * reports what the LAST request actually consumed. A session that has never
+ * prompted has no such reading and falls back to counting messages — and a
+ * just-created sub-agent's messages are nearly empty while its system prompt and
+ * tool schemas are most of the payload. Without this, a fit check against a
+ * smaller tier window passes on a child that cannot possibly fit.
+ *
+ * Deliberately an over-estimate rather than an under-estimate: being wrong high
+ * costs a needless fallback to the parent model, being wrong low costs a
+ * mid-stream failure that nothing can recover from.
+ *
+ * Defensive throughout — this runs on a hot-ish path against an SDK surface we do
+ * not own, and a fit check that throws would be worse than one that guesses.
+ */
+function estimateRequestOverheadTokens(session: AgentSession): number {
+  let text = "";
+  try {
+    const systemPrompt = session.systemPrompt;
+    if (typeof systemPrompt === "string") text += systemPrompt;
+  } catch { /* not exposed on this build — fall through to tools */ }
+
+  try {
+    const tools = session.getAllTools?.();
+    if (Array.isArray(tools)) {
+      for (const tool of tools) {
+        // name + description + parameter schema, which is what a provider is sent.
+        text += JSON.stringify(tool ?? "");
+      }
+    }
+  } catch { /* ignore — the system prompt alone is still better than nothing */ }
+
+  return estimatePromptTokens(text);
 }
 
 function estimateCurrentContextTokens(session: AgentSession): number {

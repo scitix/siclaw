@@ -24,6 +24,7 @@ import type { CertificateManager } from "../security/cert-manager.js";
 import { getDb } from "../db.js";
 import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../../core/tool-capabilities.js";
 import { requireAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
+import { resolveAgentSubagentTiers } from "../../portal/model-routing-config.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveUnderDir } from "../../shared/path-utils.js";
 
@@ -140,9 +141,9 @@ export class LocalSpawner implements BoxSpawner {
     try {
       const db = getDb();
       const [rows] = await db.query(
-        "SELECT tool_capabilities, agent_type FROM agents WHERE id = ?",
+        "SELECT tool_capabilities, agent_type, subagent_models FROM agents WHERE id = ?",
         [agentId],
-      ) as [Array<{ tool_capabilities?: unknown; agent_type?: unknown }>, unknown];
+      ) as [Array<{ tool_capabilities?: unknown; agent_type?: unknown; subagent_models?: unknown }>, unknown];
       if (rows.length !== 1) {
         throw new Error(`Expected exactly one agent row, got ${rows.length}`);
       }
@@ -151,6 +152,32 @@ export class LocalSpawner implements BoxSpawner {
       sessionManager.allowedToolsState = resolveCapabilities(effectiveCapabilityKeys(agentType, groupKeys));
       sessionManager.agentTypeState = agentType;
       sessionManager.harnessResolvedState = true;
+
+      // Sub-agent tier MENU, resolved here for the same reason the capabilities are:
+      // Local mode runs no initial tools sync (the loop below covers only
+      // knowledge/skills/mcp), and creating the tools handler merely REGISTERS the
+      // later reload callback. K8s is unaffected because agentbox-main awaits a
+      // tools sync before it listens.
+      //
+      // Without this the menu was null on a cold box, so a preconfigured agent's
+      // FIRST turn shipped candidates with no `model_tier` in the tool schema: the
+      // lead could not name a tier it was never offered, every child inherited, and
+      // it silently corrected itself only after some unrelated tools reload.
+      //
+      // Resolved through the SAME entry point the candidates use, so both channels
+      // agree on the revision and on which tiers survived — projecting the raw
+      // config separately is what made them disagree before.
+      //
+      // Its own try: a tier problem must not reach the fail-closed handler below and
+      // cost the agent its tools. Tiering degrades; it never breaks the harness.
+      try {
+        sessionManager.subagentTierMenuState =
+          (await resolveAgentSubagentTiers(rows[0].subagent_models)).menu;
+      } catch (tierErr) {
+        const msg = tierErr instanceof Error ? tierErr.message : String(tierErr);
+        console.warn(`[local-spawner] subagent tier menu resolve failed for agent=${agentId} (no tiers): ${msg}`);
+        sessionManager.subagentTierMenuState = null;
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Fail closed: without a proven type policy, do not expose built-in or

@@ -5,6 +5,9 @@
  * running box so the developer console can show what actually landed.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
+// The envelope carries the RUNTIME's version, so assert against the constant:
+// pinning a literal makes every deliberate bump look like 7 regressions.
+import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
 import type { BoxSyncStatus } from "../shared/agentbox-sync-status.js";
 
 vi.mock("./chat-repo.js", () => ({
@@ -99,7 +102,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "no_running_box",
@@ -120,7 +123,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "no_running_box",
@@ -142,7 +145,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: true,
       boxes: 2,
@@ -162,6 +165,9 @@ describe("agent.syncStatus RPC", () => {
       mcp: { names: [] },
       harness: null,
       model: null,
+      // The v2 fixture box reports no `tiers`, so the aggregate has nothing to
+      // publish. Gated on `consistent` like harness/model above.
+      tiers: null,
     });
     expect(getJsonCalls).toEqual([{ endpoint: "https://b1", path: "/api/sync-status" }]);
     expect(clientCalls).toEqual([{
@@ -228,6 +234,87 @@ describe("agent.syncStatus RPC", () => {
     });
   });
 
+  /**
+   * Tier state is part of replica identity.
+   *
+   * The box reports it per turn, but the CONSENSUS is what a publisher gates on:
+   * while `identity` ignored `tiers`, two boxes serving different tier state hashed
+   * identically and the aggregate said `consistent: true`. Reporting a thing per box
+   * while the agreement check ignores it is worse than not reporting it — the
+   * publisher reads a green light for exactly the divergence the field exists to
+   * surface.
+   */
+  function twoBoxes(t1: unknown, t2: unknown): void {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    getJsonByEndpoint.set("https://b1", async () => ({ ...defaultSyncStatus, tiers: t1 }));
+    getJsonByEndpoint.set("https://b2", async () => ({ ...defaultSyncStatus, tiers: t2 }));
+  }
+  const REV_X = "c".repeat(64);
+  const REV_Y = "d".repeat(64);
+
+  it("refuses consensus when replicas disagree on the MENU revision", async () => {
+    // One replica's tools channel is stale, so it offers the lead a different menu
+    // than its sibling — children of the two boxes cannot behave the same.
+    twoBoxes(
+      { menuRevision: REV_X, candidatesRevision: REV_X, observedAt: "t1" },
+      { menuRevision: REV_Y, candidatesRevision: REV_X, observedAt: "t2" },
+    );
+    server = await bootRuntime();
+    const r = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(r).toMatchObject({ consistent: false, tiers: null });
+  });
+
+  it("refuses consensus when one replica received NO candidates", async () => {
+    // The failure this branch already shipped once: menu arrives, candidates do
+    // not, every child silently inherits. On one replica only, it must not pass.
+    twoBoxes(
+      { menuRevision: REV_X, candidatesRevision: REV_X, observedAt: "t1" },
+      { menuRevision: REV_X, candidatesRevision: null, observedAt: "t2" },
+    );
+    server = await bootRuntime();
+    const r = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(r).toMatchObject({ consistent: false, tiers: null });
+  });
+
+  it("refuses consensus between a box that has run and one that has not", async () => {
+    // `null` (nothing observed yet) is not the same claim as {both null} (a turn ran
+    // and carried no tiers). Collapsing them would let a box that never ran pass as
+    // agreeing with one that did.
+    twoBoxes(null, { menuRevision: null, candidatesRevision: null, observedAt: "t2" });
+    server = await bootRuntime();
+    const r = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(r).toMatchObject({ consistent: false, tiers: null });
+  });
+
+  it("reaches consensus on identical tier state and surfaces it in the aggregate", async () => {
+    twoBoxes(
+      { menuRevision: REV_X, candidatesRevision: REV_X, observedAt: "t1" },
+      { menuRevision: REV_X, candidatesRevision: REV_X, observedAt: "t2" },
+    );
+    server = await bootRuntime();
+    const r = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    // observedAt differs between the two and must NOT break agreement: a timestamp
+    // is evidence freshness, not identity — the same rule harness/model follow.
+    expect(r).toMatchObject({
+      consistent: true,
+      tiers: { menuRevision: REV_X, candidatesRevision: REV_X },
+    });
+  });
+
+  it("agrees when both replicas ran without tiers", async () => {
+    // The overwhelmingly common case must not read as divergence.
+    twoBoxes(
+      { menuRevision: null, candidatesRevision: null, observedAt: "t1" },
+      { menuRevision: null, candidatesRevision: null, observedAt: "t2" },
+    );
+    server = await bootRuntime();
+    const r = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(r).toMatchObject({ consistent: true, tiers: { menuRevision: null, candidatesRevision: null } });
+  });
+
   it("observes every running box and refuses a legacy model consensus when one box differs", async () => {
     listReturns = [
       { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
@@ -253,7 +340,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       available: true,
       boxes: 2,
       runningBoxes: 2,
@@ -292,7 +379,7 @@ describe("agent.syncStatus RPC", () => {
 
     const result = await syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
     expect(result).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       available: true,
       runningBoxes: 2,
       observedBoxes: 1,
@@ -318,7 +405,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "unsupported",
@@ -345,7 +432,7 @@ describe("agent.syncStatus RPC", () => {
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
 
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
-      schemaVersion: 2,
+      schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
       ok: true,
       available: false,
       reason: "unsupported",

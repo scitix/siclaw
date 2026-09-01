@@ -2,6 +2,7 @@
 // and tool-registry does not import shared → no cycle). Keeps the group item-status snapshot
 // precisely typed on the wire.
 import type { GroupItemStatus } from "../core/tool-registry.js";
+import type { PersistedTierOutcome } from "../core/subagent-models.js";
 
 export interface DelegationLineagePayload {
   parentSessionId?: string | null;
@@ -70,12 +71,30 @@ export interface DelegationEventPayload {
   partialSource?: "steered" | "runtime_fallback";
   interruptedTool?: string;
   /**
+   * Which model a SINGLE child ran on and why — identifiers and reasons only.
+   * The group equivalent lives per-item inside `itemStatuses`.
+   */
+  tier?: PersistedTierOutcome;
+  /**
    * Per-item status snapshot for a spawn_subagent GROUP terminal event (index → status). Lets the
    * frontend render items that were never persisted as their own child event — chiefly `skipped`
    * ones (circuit-break / group-timeout / pre-launch stop) — instead of stranding them on the
    * live-only "running" fallback after a reload. Absent for single-subagent events. Additive.
    */
-  itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
+  /**
+   * Per-item terminal snapshot. `tier` records which model ran an item and why,
+   * carrying identifiers and reasons only — never a `modelConfig`.
+   *
+   * It is here rather than only in the tool result because a BACKGROUND group's
+   * tool call returns `launched` before any of it is known: this event is the only
+   * record that survives, so without it a detached run can never be asked which
+   * model it actually used.
+   */
+  itemStatuses?: Array<{
+    index: number;
+    status: GroupItemStatus;
+    tier?: PersistedTierOutcome;
+  }>;
   /** per-prompt root trace id inherited from the parent, for DB trace filtering. */
   traceId?: string | null;
 }

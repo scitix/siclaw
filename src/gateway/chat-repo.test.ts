@@ -212,6 +212,59 @@ describe("bindMessageTraceId", () => {
 });
 
 describe("appendDelegationEvent", () => {
+  it("sanitizes a tier outcome before persisting it (direct-DB path)", async () => {
+    // The SECOND persistence path. The RPC path has the same allow-list and its
+    // own test; a field handled in only one of the two is persisted on some
+    // deployments and dropped on others, which is how the tier outcome went
+    // missing in the first place.
+    fake.responses.set("chat.appendMessage", { id: "event-tier" });
+
+    await appendDelegationEvent({
+      parentSessionId: "parent",
+      parentAgentId: "agent-parent",
+      userId: "u1",
+      delegationId: "delegation-1",
+      childSessionId: "child-1",
+      targetAgentId: "agent-parent",
+      status: "done",
+      capsule: "done",
+      tier: {
+        requestedTier: "fast",
+        resolvedTier: "fast",
+        source: "request",
+        provider: "p",
+        modelId: "m",
+        // Planted so the assertion tests the FILTER, not the input.
+        modelConfig: { apiKey: "sk-must-not-persist" },
+        detail: "internal diagnostic",
+      },
+      itemStatuses: [
+        { index: 0, status: "done", tier: { source: "env", apiKey: "sk-group-leak" } },
+        // Malformed entries are dropped rather than stored half-formed.
+        { index: -1, status: "done" },
+        { index: 1, status: "running" },
+      ],
+    } as never);
+
+    const raw = fake.calls[0].params.metadata as string;
+    const metadata = JSON.parse(raw);
+
+    expect(metadata.tier).toEqual({
+      requestedTier: "fast",
+      resolvedTier: "fast",
+      source: "request",
+      provider: "p",
+      modelId: "m",
+    });
+    // A negative index and a non-terminal status are both refused: this record is
+    // read back to render a UI.
+    expect(metadata.item_statuses).toEqual([{ index: 0, status: "done", tier: { source: "env" } }]);
+    expect(raw).not.toContain("apiKey");
+    expect(raw).not.toContain("sk-must-not-persist");
+    expect(raw).not.toContain("sk-group-leak");
+    expect(raw).not.toContain("internal diagnostic");
+  });
+
   it("persists a model-compatible synthetic event with UI-distinguishing metadata", async () => {
     fake.responses.set("chat.appendMessage", { id: "event-1" });
 

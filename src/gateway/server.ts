@@ -755,6 +755,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
+    // Sub-agent tier CANDIDATES, relayed like every other binding field on this
+    // path. Omitting it was a hard blocker rather than a degradation: the menu
+    // travels on the tools channel and arrives, so the lead sees `model_tier`,
+    // picks a tier, and every child falls back — the one-sided state the runtime
+    // reports as candidate_missing. `chat.send` is THE entry path under a control
+    // plane, so the whole feature was inert there while every unit test passed.
+    const subagentTiers = params.subagentTiers;
     const images = params.images as PromptOptions["images"];
     const files = params.files as PromptOptions["files"];
     // One id for this turn, held from before the async ack until the turn settles.
@@ -802,6 +809,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       delegation,
       modelConfig,
       modelRouting,
+      subagentTiers,
       images,
       files,
     };
@@ -2201,6 +2209,29 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         releaseId: status.model.releaseId,
         modelFingerprint: status.model.modelFingerprint,
       } : null,
+      // Sub-agent tiering is part of what a replica IS, so it belongs here for the
+      // same reason `model` does. Without it two boxes serving different tier state
+      // — one that lost its menu, one that never received candidates — produced an
+      // identical identity and the aggregate reported `consistent: true`, which is
+      // the exact silent divergence the observation was added to expose. Reporting
+      // per box while the consensus ignores it is worse than not reporting: a
+      // publisher gating on `consistent` reads a green light.
+      //
+      // `observedAt` is deliberately excluded, like harness/model above: a timestamp
+      // is evidence freshness, not identity.
+      //
+      // A differing revision therefore makes replicas inconsistent, and that is the
+      // intent — same semantics as a differing `releaseId`. Two boxes whose last
+      // turns straddled a config change have not converged yet, and "not converged"
+      // must read as pending rather than verified.
+      //
+      // `null` (no turn observed yet) stays distinct from `{both null}` (a turn ran,
+      // carrying no tiers). Collapsing them would let a box that has never run pass
+      // as agreeing with one that ran without tiers.
+      tiers: status.tiers ? {
+        menuRevision: status.tiers.menuRevision,
+        candidatesRevision: status.tiers.candidatesRevision,
+      } : null,
     });
     const first = observed[0].status;
     const firstIdentity = identity(first);
@@ -2224,6 +2255,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       mcp: first.mcp ?? { names: [] },
       harness: consistent ? (first.harness ?? null) : null,
       model: consistent ? (first.model ?? null) : null,
+      // Same gate as the two above: a tier observation is proof only when every
+      // running box agrees. A consumer that reads this flat aggregate instead of
+      // walking `observations` would otherwise have no way to see tier state at all.
+      tiers: consistent ? (first.tiers ?? null) : null,
     };
   });
 

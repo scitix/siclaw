@@ -63,11 +63,16 @@ vi.mock("../core/agent-factory.js", async () => {
       steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
       getModel: () => null,
-      setModel: async () => {},
-      findModel: () => null,
+      // Overridable, unchanged defaults. Model SETUP is where a provider exception
+      // is raised, and a factory that could only vary prompt/abort/steer could not
+      // express that at all: every failure arrived as `findModel → null`, whose
+      // detail is just `provider/modelId` and can never carry a credential. The one
+      // path that can was therefore untestable end to end.
+      setModel: behavior.setModel ?? (async () => {}),
+      findModel: behavior.findModel ?? (() => null),
       getContextUsage: () => null,
       getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 }),
-      registerProvider: () => {},
+      registerProvider: behavior.registerProvider ?? (() => {}),
     };
   }
   return {
@@ -166,6 +171,72 @@ afterEach(() => {
 });
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+describe("AgentBoxSessionManager — placing a child on its model", () => {
+  /** Minimal brain that records what was done to it, in order. */
+  function fakeBrain() {
+    const calls: string[] = [];
+    const applied: Array<Record<string, unknown>> = [];
+    return {
+      calls,
+      applied,
+      registerProvider: (name: string) => { calls.push(`register:${name}`); },
+      findModel: (provider: string, modelId: string) =>
+        ({ id: modelId, provider, contextWindow: 100_000, maxTokens: 4096, reasoning: true }),
+      setModel: async (m: { id: string }) => { calls.push(`setModel:${m.id}`); },
+      applyModelParams: (params: Record<string, unknown>) => {
+        calls.push("applyParams");
+        applied.push(params);
+      },
+      checkContextFitForModelPrompt: () => ({ ok: true, compacted: false }),
+    };
+  }
+
+  const candidate = {
+    provider: "p",
+    modelId: "m",
+    modelConfig: { apiKey: "k", models: [], params: { reasoning_effort: "high" } },
+  };
+
+  it("does NOT touch runtime params when no tier was involved", async () => {
+    // Compatibility contract: before tiering, a child was placed with
+    // registerProvider + setModel and nothing else. Applying the parent
+    // candidate's params here would start honouring a reasoning_effort that every
+    // child has ignored, changing behaviour for deployments with no tiers at all.
+    const mgr = new AgentBoxSessionManager();
+    const brain = fakeBrain();
+
+    await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", false, false);
+
+    expect(brain.calls).toEqual(["register:p", "setModel:m"]);
+    expect(brain.applied).toHaveLength(0);
+  });
+
+  it("applies the candidate's params once a tier is in play", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const brain = fakeBrain();
+
+    await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", true, true);
+
+    expect(brain.calls).toContain("applyParams");
+    expect(brain.applied[0]).toEqual({ reasoningEffort: "high" });
+  });
+
+  it("restores the parent's params BEFORE the candidate's, so an explicit setting wins", async () => {
+    // Order matters: the restore undoes a rejected tier's level, and the
+    // candidate's own params are the parent's actual intent on top of it.
+    const mgr = new AgentBoxSessionManager();
+    const brain = fakeBrain();
+
+    await (mgr as any).putBrainOnCandidate(
+      brain, candidate, "briefing", false, true, { reasoningEffort: "low" },
+    );
+
+    expect(brain.applied).toEqual([{ reasoningEffort: "low" }, { reasoningEffort: "high" }]);
+    // And both land after the model switch, which is what re-clamps to the target.
+    expect(brain.calls.indexOf("setModel:m")).toBeLessThan(brain.calls.indexOf("applyParams"));
+  });
+});
 
 describe("AgentBoxSessionManager — getOrCreate", () => {
   it("creates a new session on first call and caches it", async () => {
@@ -1803,6 +1874,109 @@ describe("AgentBoxSessionManager — background sub-agents obey the ceilings", (
       else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
       if (prevPod === undefined) delete process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
       else process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = prevPod;
+    }
+  });
+});
+
+/**
+ * Tier state must never cross a session boundary, and a provider setup failure must
+ * never carry a credential out of one.
+ *
+ * Both were found in review of the tiering PR, and neither is hypothetical: the
+ * first placed one session's children on another session's provider config, the
+ * second put raw `registerProvider` exception text — which routinely quotes the
+ * endpoint it dialled and sometimes the key it sent — into the value that becomes
+ * the child's log line, its persisted transcript, and the tool result the PARENT
+ * MODEL reads.
+ */
+describe("sub-agent tier isolation and redaction", () => {
+  it("takes the parent candidate from THIS session, never from box-level state", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    // Box-level, as setDelegationModel writes it — one value for the whole box, so
+    // with several live sessions it holds whichever bound a model most recently.
+    mgr.setDelegationModel({ provider: "p-b", modelId: "m-b", config: { apiKey: "sk-SESSION-B" } });
+
+    // Session A published its own running candidate this turn (onAttemptReady).
+    mgr.sessions.set("A", {
+      id: "A",
+      effectiveModelCandidate: { provider: "p-a", modelId: "m-a", modelConfig: { apiKey: "sk-SESSION-A" } },
+      effectiveModelParams: null,
+    });
+    // Session C has published nothing — a turn that has not reached its first
+    // attempt, or a synthetic turn on an older build.
+    mgr.sessions.set("C", { id: "C" });
+
+    expect(mgr.buildTierPlan("A").effectiveParent).toMatchObject({ provider: "p-a", modelId: "m-a" });
+
+    // The regression. C must NOT be handed B's binding: same box, different user's
+    // conversation, and the config carries credentials.
+    const planC = mgr.buildTierPlan("C");
+    expect(planC.effectiveParent).toBeNull();
+    expect(JSON.stringify(planC)).not.toContain("sk-SESSION-B");
+    expect(JSON.stringify(planC)).not.toContain("p-b");
+  });
+
+  it("redacts a provider setup failure before it reaches the report or the log", async () => {
+    const TIER_KEY = "sk-TIER-SECRET-0001";
+    const PARENT_URL = "https://parent-endpoint.invalid";
+    const mgr = new AgentBoxSessionManager() as any;
+    mgr.sessions.set("p1", { id: "p1" });
+
+    // A provider setup exception that quotes both — the realistic shape, and the
+    // reason `detail` cannot be passed through verbatim.
+    (globalThis as any).__fakeBrainFactories.push(() => ({
+      registerProvider: () => {
+        throw new Error(`connect failed to ${PARENT_URL} using key ${TIER_KEY}`);
+      },
+      prompt: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
+    }));
+
+    const warnings: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+    });
+
+    try {
+      const res = await mgr.runSpawnedSubagent(
+        {
+          spawnId: "s-redact",
+          parentSessionId: "p1",
+          description: "d",
+          prompt: "do x",
+          userId: "u",
+          tierPlan: {
+            requestedTier: "fast",
+            selectionSource: "request",
+            menu: { revision: "a".repeat(64), items: [{ tier: "fast", whenToUse: "read logs and summarise" }] },
+            candidates: {
+              revision: "a".repeat(64),
+              candidates: [
+                { tier: "fast", provider: "p-fast", modelId: "m-fast", modelConfig: { apiKey: TIER_KEY } },
+              ],
+            },
+            // Present so the tier miss falls back to it and that ALSO fails, which is
+            // the only path that surfaces `detail` to the caller.
+            effectiveParent: { provider: "p-parent", modelId: "m-parent", modelConfig: { baseUrl: PARENT_URL } },
+          },
+        },
+        { childSessionId: "c-redact", jobId: "s-redact" },
+      );
+
+      // Pin the PATH first. Without this the redaction assertions below pass
+      // vacuously whenever the setup does not actually fail, which is exactly how
+      // this test read green against unredacted code the first time it was written.
+      expect(res.status).toBe("failed");
+      expect(JSON.stringify(res)).toMatch(/could not be placed on a model/);
+
+      const reported = JSON.stringify(res);
+      expect(reported).not.toContain(TIER_KEY);
+      expect(reported).not.toContain(PARENT_URL);
+      const logged = warnings.join("\n");
+      expect(logged).not.toContain(TIER_KEY);
+      expect(logged).not.toContain(PARENT_URL);
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -1414,7 +1415,7 @@ describe("readBoxSyncStatus", () => {
       knowledgeDir: knowledgeTmpDir,
       knowledgeHandler: syncStatusHandler,
     });
-    expect(status.schemaVersion).toBe(2);
+    expect(status.schemaVersion).toBe(AGENT_SYNC_STATUS_SCHEMA_VERSION);
     expect(status.knowledge.repos).toEqual([
       expect.objectContaining({ id: "repo-a", name: "硬件设施", version: 2 }),
     ]);

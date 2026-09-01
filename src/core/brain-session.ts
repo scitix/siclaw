@@ -211,6 +211,36 @@ export interface BrainSession {
    */
   ensureContextForModelPrompt?(model: BrainModelInfo, text: string): Promise<BrainContextPreflightResult>;
 
+  /**
+   * PURE context-fit check: does this prompt fit that model's window as things
+   * stand? Estimate only — no compaction, no model call, no session mutation.
+   *
+   * Distinct from {@link ensureContextForModelPrompt}, whose name is accurate:
+   * that one COMPACTS when over budget, which rewrites history and spends a model
+   * round-trip to produce the summary. Running it against a freshly created
+   * sub-agent would compact the one thing that child's context consists of — its
+   * task briefing — and would spend a model call to decide whether to spend a
+   * model call.
+   *
+   * Used when switching a child onto a tier model whose window may be smaller
+   * than the parent's: a miss falls back to the parent rather than attempting the
+   * prompt and failing mid-stream.
+   */
+  checkContextFitForModelPrompt?(model: BrainModelInfo, text: string): BrainContextPreflightResult;
+
+  /**
+   * Read the runtime tunables currently in effect, so a caller can restore them.
+   *
+   * Needed because `applyModelParams` is a SETTER with no reset — an absent
+   * `reasoningEffort` is a no-op, not a clear — and `setModel` does not restore a
+   * default either: pi carries the current thinking level across a model switch
+   * whenever the new model supports thinking, and only falls back to the default
+   * when it does not. So a rejected sub-agent tier that raised the level leaves it
+   * raised on the model it fell back to, silently changing that model's cost and
+   * latency. Capture before, restore after.
+   */
+  captureModelParams?(): BrainModelParams | undefined;
+
   /** Register a provider dynamically (from gateway DB config). */
   registerProvider?(name: string, config: Record<string, unknown>): void;
 

@@ -26,7 +26,7 @@ import {
   type ErrorDetail,
 } from "../lib/error-envelope.js";
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
-import { resolveAgentModelRouting } from "./model-routing-config.js";
+import { resolveAgentModelRouting, resolveAgentSubagentTiers } from "./model-routing-config.js";
 import { authenticateApiKey } from "./api-key-auth.js";
 
 interface ChatAttachment {
@@ -282,10 +282,10 @@ async function parseChatRequestBody(
 export async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
   const db = getDb();
   const [agentRows] = await db.query(
-    "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
+    "SELECT model_provider, model_id, model_routing, subagent_models, system_prompt FROM agents WHERE id = ?",
     [agentId],
   ) as any;
-  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
+  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; subagent_models?: unknown; system_prompt?: string | null } | undefined;
   if (!agent?.model_provider || !agent?.model_id) return null;
 
   const [providerRows] = await db.query(
@@ -310,6 +310,10 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
     provider: agent.model_provider,
     modelId: agent.model_id,
   });
+  // Candidates only: the MENU travels on the tools channel, because it is consumed
+  // while building a session's tool description and a per-prompt binding arrives
+  // too late for that.
+  const subagentTiers = (await resolveAgentSubagentTiers(agent.subagent_models)).candidates;
 
   return {
     modelProvider: provider.name,
@@ -323,6 +327,7 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
       models,
     },
     ...(modelRouting ? { modelRouting } : {}),
+    ...(subagentTiers ? { subagentTiers } : {}),
     systemPrompt: agent.system_prompt ?? null,
   };
 }
@@ -510,6 +515,7 @@ export function registerChatRoutes(
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
+      subagentTiers: modelBinding.subagentTiers,
       systemPrompt: modelBinding.systemPrompt ?? undefined,
       turnStartMs,
     });
@@ -766,6 +772,7 @@ export function registerChatRoutes(
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
+      subagentTiers: modelBinding.subagentTiers,
       systemPrompt: modelBinding.systemPrompt ?? undefined,
     });
 

@@ -291,6 +291,7 @@ export class TaskCoordinator {
         modelFingerprint: binding.modelFingerprint,
         modelConfig: binding.modelConfig,
         modelRouting: binding.modelRouting,
+        subagentTiers: binding.subagentTiers,
         systemPromptTemplate: binding.systemPrompt ?? undefined,
       };
       const promptResult = await client.prompt(promptOpts);

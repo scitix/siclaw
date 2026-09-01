@@ -47,7 +47,7 @@ import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "
 import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
 import { normalizeAgentType } from "../core/agent-types.js";
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
-import type { BrainSession } from "../core/brain-session.js";
+import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
@@ -78,10 +78,25 @@ import {
   normalizeModelRouteState,
   runPromptWithModelRouting,
   resolveEffectivePolicy,
+  withResolvedCandidateConfig,
+  applyModelParamsForCandidate,
+  type ModelRouteCandidate,
   type ModelRouteEvent,
   type ModelRoutePolicy,
   type ModelRouteState,
 } from "../core/model-routing.js";
+import { resolveRequestedTier } from "../core/subagent-registry.js";
+import {
+  persistableTierOutcome,
+  resolveTierSelection,
+  type ChildModelOutcome,
+  type PersistedTierOutcome,
+  type SubagentTierCandidates,
+  type SubagentTierMenu,
+  type SubagentTierPlan,
+  type TierFallbackReason,
+  type TierSelectionSource,
+} from "../core/subagent-models.js";
 import type { GatewayClient } from "./gateway-client.js";
 import { extractToolResultId } from "../core/message-utils.js";
 // topic-consolidator import removed — consolidation disabled
@@ -145,6 +160,49 @@ export interface ManagedSession {
   _promptInflight: Promise<void> | null;
   /** Mutable reference to the active kubeconfig path — tools read .current at execution time */
   kubeconfigRef: KubeconfigRef;
+  /**
+   * The tier MENU this session advertised when its tool schema was built.
+   *
+   * Snapshotted from box state at creation and never updated: the tool
+   * description is baked in at creation, so honouring a newer menu would let the
+   * lead pick a name it was shown while resolving it against a list it was not.
+   */
+  subagentTierMenu: SubagentTierMenu | null;
+  /**
+   * Tier CANDIDATES for the CURRENT turn — carries credentials.
+   *
+   * Session-scoped and overwritten by every prompt, INCLUDING being overwritten
+   * with null: a turn whose binding carries no tiers must leave none behind, or a
+   * withdrawn model stays reachable and outlives a credential rotation. Never
+   * box-level (that would share credentials across sessions and let one session
+   * resolve against another's binding), never persisted, never logged.
+   */
+  subagentTierCandidates: SubagentTierCandidates | null;
+  /**
+   * The candidate this turn is ACTUALLY running on, published by the routing
+   * runner's `onAttemptReady` once setup and preflight have passed.
+   *
+   * This is the fallback target for every tier miss. It cannot be read from
+   * `activeCandidateKey` (only written after an attempt succeeds, so mid-prompt it
+   * holds the previous turn's value) nor from `brain.getModel()` (no credentials,
+   * no params) — and it must not be the configured primary, since the parent may
+   * already have failed over away from it.
+   */
+  effectiveModelCandidate: ModelRouteCandidate | null;
+  /**
+   * The runtime tunables actually in effect on the PARENT after its attempt was
+   * set up — captured by the same `onAttemptReady` hook, which fires after the
+   * params have been applied.
+   *
+   * This is the only correct restore target for a child that tried a tier and had
+   * to fall back. A child's own pre-tier value is NOT usable for it: pi clamps the
+   * thinking level to the current model's capabilities, so a child that started on
+   * a non-reasoning model reads back `off` regardless of what the deployment's
+   * default is — and pi's own `setModel` would have given that default rather than
+   * the clamped value (`_getThinkingLevelForModelSwitch` consults
+   * `supportsThinking()` on the model being switched AWAY from).
+   */
+  effectiveModelParams: BrainModelParams | null;
   /** Whether the current prompt was aborted (prevents empty response retry) */
   _aborted: boolean;
   /**
@@ -407,6 +465,19 @@ export class AgentBoxSessionManager {
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
 
+  /**
+   * Latest sub-agent tier MENU for this box (credential-free), refreshed by the
+   * tools sync handler. null = no tiers configured.
+   *
+   * Box-level because it arrives on a box-level channel — but a session must NOT
+   * read it at spawn time. Each session snapshots it at creation
+   * (`managedSession.subagentTierMenu`), because the menu that built a session's
+   * tool description is the menu that session has to honour: resolving against a
+   * newer one would run a model the operator did not intend for a tier name the
+   * lead chose from the older menu.
+   */
+  subagentTierMenuState: SubagentTierMenu | null = null;
+
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
@@ -429,6 +500,242 @@ export class AgentBoxSessionManager {
     if (opts.provider) this.delegationModelProvider = opts.provider;
     if (opts.modelId) this.delegationModelId = opts.modelId;
     if (opts.config) this.delegationModelConfig = opts.config;
+  }
+
+  /**
+   * The parent's effective model as a routing candidate — the fallback target for
+   * every tier miss, and what a sub-agent runs on when no tier applies.
+   *
+   * Reads what the routing runner published for the CURRENT turn OF THIS SESSION
+   * (`effectiveModelCandidate`): the parent may already have failed over, and
+   * sending children at the configured primary would aim them at a model the
+   * parent just found broken.
+   *
+   * ⚠️ SESSION-OWNED ONLY — deliberately no box-level fallback. This used to fall
+   * back to `delegationModel*`, which is box-scoped: with more than one live
+   * session it holds whichever one most recently bound a model, so session A's
+   * children could be placed on session B's provider config, credentials included.
+   * That is precisely the isolation the two-channel split exists to preserve.
+   *
+   * Both prompt paths now publish (HTTP via its own `onAttemptReady`, synthetic via
+   * the one in `processSyntheticPrompt`), so nothing legitimate reached that
+   * fallback anyway. When a session genuinely has nothing published, `null` is the
+   * honest answer and `applyParent` already handles it: the child runs on whatever
+   * the factory gave it, which is the pre-tiering no-op path. Borrowing another
+   * session's binding is never the better answer.
+   */
+  private effectiveParentCandidate(
+    parentSessionId: string,
+  ): (ModelRouteCandidate & { params?: BrainModelParams }) | null {
+    const parent = this.sessions.get(parentSessionId);
+    const live = parent?.effectiveModelCandidate;
+    if (!live) return null;
+    // Carry the parent's ACTUAL tunables alongside its model. Only meaningful
+    // together: restoring one without the other puts the child on the right model
+    // at the wrong level.
+    return { ...live, params: parent?.effectiveModelParams ?? undefined };
+  }
+
+  /**
+   * Build the immutable tier plan for one `spawn_subagent` dispatch.
+   *
+   * Captured ONCE, at dispatch, and reused by the collapse path, every map child,
+   * every later wave, the background continuation, and the reduce child. See
+   * docs/design/subagent-model-tiering.md §4.
+   */
+  buildTierPlan(
+    parentSessionId: string,
+    requestedTier?: string | null,
+    subagentType?: string,
+  ): SubagentTierPlan {
+    const parent = this.sessions.get(parentSessionId);
+    // Resolution order (design §3.7): env override > request > type default >
+    // inherit. Recorded alongside the tier so a report can say WHICH level won —
+    // "the lead chose fast" and "ops pinned fast" look identical otherwise.
+    const resolved = resolveRequestedTier(requestedTier, subagentType);
+    return {
+      menu: parent?.subagentTierMenu ?? null,
+      candidates: parent?.subagentTierCandidates ?? null,
+      requestedTier: resolved.tier,
+      selectionSource: resolved.source,
+      effectiveParent: this.effectiveParentCandidate(parentSessionId),
+    };
+  }
+
+  /**
+   * Put a child brain on its model, and report what actually happened.
+   *
+   * Ordering per candidate is fixed and mirrors the routing runner's:
+   * `registerProvider` → `findModel` → `setModel` → apply params → fit check.
+   * Params are applied unconditionally after `setModel` because the level is
+   * session state a previous model may have moved.
+   *
+   * Everything that can fail BEFORE the child prompts is a fallback to the
+   * parent's effective model, never an error — a bad tier must not cost the caller
+   * its task. The one exception is the parent itself failing to apply: there is no
+   * further fallback by definition, so the child fails with
+   * `parent_fallback_failed` rather than looping.
+   */
+  private async applyChildModel(
+    child: { brain: BrainSession },
+    plan: SubagentTierPlan | undefined,
+    briefing: string,
+  ): Promise<ChildModelOutcome> {
+    const requested = plan?.requestedTier ?? null;
+    const parentCandidate = plan?.effectiveParent ?? null;
+
+    const applyParent = async (
+      reason: TierFallbackReason | undefined,
+      source: TierSelectionSource,
+    ): Promise<ChildModelOutcome> => {
+      if (!parentCandidate) {
+        // No binding at all — the pre-tiering no-op path. The child runs on
+        // whatever the factory gave it.
+        return { requestedTier: requested, resolvedTier: null, source, fallbackReason: reason };
+      }
+      // `reason` is undefined on the plain inherit path and set on every fallback.
+      // That distinction decides whether the child's tunables are touched AT ALL.
+      //
+      // Inherit must leave them alone. Before tiering a child was placed on its
+      // model with registerProvider + setModel and nothing else, so both applying
+      // the parent candidate's own params and writing back a captured level would
+      // be new behaviour — and contract 1 says a deployment with no tiers behaves
+      // exactly as it did. Note pi's setModel consults supportsThinking() on the
+      // model being switched AWAY from and hands out the deployment default when
+      // that model is non-reasoning; writing anything over that would replace the
+      // default with a clamped artifact.
+      //
+      // Fallback is the opposite case: the tier has already moved the level, and
+      // neither setModel nor applyModelParams can lower it, so the parent's real
+      // params are the restore target.
+      const isFallback = reason !== undefined;
+      const applied = await this.putBrainOnCandidate(
+        child.brain, parentCandidate, briefing, false,
+        isFallback,
+        isFallback ? plan?.effectiveParent?.params : undefined,
+      );
+      if (!applied.ok) {
+        return {
+          requestedTier: requested,
+          resolvedTier: null,
+          source,
+          fallbackReason: "parent_fallback_failed",
+          failed: true,
+          detail: applied.detail,
+        };
+      }
+      return {
+        requestedTier: requested,
+        resolvedTier: null,
+        source,
+        fallbackReason: reason,
+        provider: parentCandidate.provider,
+        modelId: parentCandidate.modelId,
+      };
+    };
+
+    const selection = resolveTierSelection(plan?.menu, plan?.candidates, requested);
+    if (selection.kind === "inherit") return applyParent(undefined, "inherit");
+    if (selection.kind === "fallback") return applyParent(selection.reason, plan?.selectionSource ?? "request");
+
+    const tierCandidate: ModelRouteCandidate = {
+      provider: selection.candidate.provider,
+      modelId: selection.candidate.modelId,
+      modelConfig: selection.candidate.modelConfig,
+    };
+    // A tier IS an explicit request to run differently, so its params apply.
+    const applied = await this.putBrainOnCandidate(child.brain, tierCandidate, briefing, true, true);
+    if (!applied.ok) {
+      // The tier could not be used. The brain may already have been moved part of
+      // the way onto it, so restoring the parent re-runs the whole sequence.
+      return applyParent(applied.reason, plan?.selectionSource ?? "request");
+    }
+    return {
+      requestedTier: requested,
+      resolvedTier: selection.candidate.tier,
+      source: plan?.selectionSource ?? "request",
+      provider: tierCandidate.provider,
+      modelId: tierCandidate.modelId,
+    };
+  }
+
+  /**
+   * Register + select one candidate on a brain, then check the prompt fits.
+   *
+   * The fit check is PURE (`checkContextFitForModelPrompt`): a tier model may have
+   * a smaller window than the parent, and the alternative to checking is failing
+   * mid-stream. It must not be `ensureContextForModelPrompt`, which compacts —
+   * that would rewrite the child's history, which at this point is nothing but the
+   * task briefing, and spend a model call to decide whether to spend a model call.
+   */
+  private async putBrainOnCandidate(
+    brain: BrainSession,
+    candidate: ModelRouteCandidate,
+    briefing: string,
+    checkFit: boolean,
+    /**
+     * Whether to touch the brain's runtime tunables at all.
+     *
+     * FALSE on the plain inherit path, and that is a compatibility requirement
+     * rather than an optimisation: before tiering, a child was placed on its model
+     * with `registerProvider` + `setModel` and nothing else. Applying the parent
+     * candidate's `params` here would start honouring a `reasoning_effort` that
+     * every child has ignored until now — a behaviour change for deployments that
+     * configured no tiers, which contract 1 forbids.
+     *
+     * TRUE once a tier has been attempted: the brain's level has already been
+     * moved, so leaving it alone is no longer the neutral option.
+     */
+    applyParams: boolean,
+    /**
+     * Tunables to restore before the candidate's own are applied. Supplied on the
+     * FALLBACK path, where a rejected tier may have left the level raised and
+     * neither `setModel` nor `applyModelParams` will lower it.
+     */
+    restoreParams?: BrainModelParams,
+  ): Promise<{ ok: true } | { ok: false; reason: TierFallbackReason; detail?: string }> {
+    const resolved = withResolvedCandidateConfig(candidate);
+    try {
+      if (resolved.modelConfig && brain.registerProvider) {
+        brain.registerProvider(resolved.provider, resolved.modelConfig);
+      }
+      const model = brain.findModel(resolved.provider, resolved.modelId);
+      if (!model) {
+        return {
+          ok: false,
+          reason: "model_not_found",
+          detail: `${resolved.provider}/${resolved.modelId}`,
+        };
+      }
+      // Unconditional, without a `modelNeedsRebind` guard — the routing runner can
+      // skip a no-op switch, this path cannot, because the switch is also what
+      // re-clamps the level to the target model's capabilities.
+      await brain.setModel(model);
+
+      if (applyParams) {
+        // Restore the parent's real params BEFORE applying the candidate's own, so
+        // an explicit setting still wins. `setModel` does not do this for us: pi
+        // carries the current thinking level across a switch whenever the target
+        // supports thinking, so a rejected `xhigh` tier would otherwise leave the
+        // parent model running at `xhigh`.
+        if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
+        applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
+      }
+
+      if (checkFit && brain.checkContextFitForModelPrompt) {
+        const fit = brain.checkContextFitForModelPrompt(model, briefing);
+        if (!fit.ok) {
+          return { ok: false, reason: "context_overflow", detail: fit.errorMessage };
+        }
+      }
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: "model_setup_failed",
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   /**
@@ -711,6 +1018,13 @@ export class AgentBoxSessionManager {
         spawnSpanContext: tracingRecorder.ensureToolSpan(request.parentSessionId, request.spawnId, "spawn_subagent"),
       };
 
+      // Tier plan captured ONCE, here, for the same reason the trace context is:
+      // children start in waves and the state behind this is mutable. Every child
+      // of this dispatch — collapse, each map wave, the detached continuation, and
+      // the reduce — resolves against this one snapshot, so a batch cannot
+      // straddle a configuration change and report both halves as one result.
+      const tierPlan = this.buildTierPlan(request.parentSessionId, request.modelTier, request.subagentType);
+
       const isCollapse = request.renderedTasks.length === 1 && !request.reducePrompt;
 
       if (isCollapse) {
@@ -727,6 +1041,7 @@ export class AgentBoxSessionManager {
           userId: request.userId,
           taskListId: request.taskListId,
           spawnId: request.spawnId,
+          tierPlan,
         };
         if (childReq.runInBackground) return this.startBackgroundSubagent(childReq, traceCtx);
         // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
@@ -771,7 +1086,15 @@ export class AgentBoxSessionManager {
 
       // ── Batch (map→reduce): background (default for a multi-item batch) → register a job, return
       //    "launched", notify on completion; foreground → run the whole group and return inline. ──
-      if (request.runInBackground) return this.startBackgroundSubagentGroup(request, traceCtx);
+      // Carry the dispatch snapshot on the request so both the foreground and the
+      // detached background path hand the SAME plan to every child. A background
+      // group outlives its parent turn, so re-reading state later would resolve
+      // against a session that no longer exists.
+      const plannedRequest: SpawnSubagentGroupRequest = { ...request, tierPlan };
+
+      if (plannedRequest.runInBackground) {
+        return this.startBackgroundSubagentGroup(plannedRequest, traceCtx);
+      }
       // Already aborted before we queue anything (whole turn cancelled): short-circuit
       // without creating any child session — every item is skipped.
       if (signal?.aborted) {
@@ -793,7 +1116,7 @@ export class AgentBoxSessionManager {
       // separate throttled group_progress emitter instead.
       const throttled = onProgress ? throttleTrailing(onProgress, GROUP_PROGRESS_THROTTLE_MS) : undefined;
       try {
-        return await this.runSubagentGroup(request, throttled?.call, signal, traceCtx);
+        return await this.runSubagentGroup(plannedRequest, throttled?.call, signal, traceCtx);
       } finally {
         throttled?.cancel();
       }
@@ -859,6 +1182,8 @@ export class AgentBoxSessionManager {
       summary: string;
       childSessionId: string;
       activity?: string;
+      /** Which model this item ran on and why — absent for items that never started. */
+      tierOutcome?: ChildModelOutcome;
     };
     const states: ItemState[] = tasks.map(() => ({ status: "queued", summary: "", childSessionId: "" }));
     let reduceChildSessionId: string | undefined;
@@ -905,6 +1230,9 @@ export class AgentBoxSessionManager {
         // `#` is not touched by delegation-id validation (verified): children of a group are
         // tied to it by this prefix, which the UI groups on.
         spawnId: `${groupId}#${i}`,
+        // The dispatch snapshot, identical for every wave. A batch is one unit of
+        // work and must report against one model.
+        tierPlan: request.tierPlan,
       };
       // (B) The group may abort (circuit break / timeout / user stop) WHILE this item is still
       //     queued for a global-limiter slot (saturated by another session). Re-check AFTER the
@@ -971,6 +1299,7 @@ export class AgentBoxSessionManager {
         state.status = res.status;
         state.summary = res.summary;
         state.childSessionId = res.childSessionId;
+        state.tierOutcome = res.tierOutcome;
       }
       breaker.record(state.status as GroupItemStatus);
       if (breaker.tripped) {
@@ -1036,6 +1365,13 @@ export class AgentBoxSessionManager {
           userId: request.userId,
           taskListId: request.taskListId,
           spawnId: `${groupId}#reduce`,
+          // Reduce does NOT downgrade: same snapshot, but with the tier request
+          // dropped so it lands on the parent's effective model. Synthesis is the
+          // step a cheaper model hurts most, and reduce runs once — there is
+          // nothing to save. Not a caller-visible option.
+          tierPlan: request.tierPlan
+            ? { ...request.tierPlan, requestedTier: null, selectionSource: "inherit" }
+            : undefined,
         };
         try {
           const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() => {
@@ -1097,6 +1433,7 @@ export class AgentBoxSessionManager {
       status: s.status as GroupItemStatus,
       summary: s.summary,
       childSessionId: s.childSessionId,
+      tierOutcome: s.tierOutcome,
     }));
 
     // Group-level explanation surfaced when there is NO reduce summary (circuit break / reduce
@@ -1123,7 +1460,16 @@ export class AgentBoxSessionManager {
       capsule,
       summaryTruncated: reduceTruncated,
       reduceChildSessionId,
-      itemStatuses: itemResults.map((r, i) => ({ index: i, status: r.status })),
+      // Tier outcome rides the terminal event because for a BACKGROUND group it is
+      // the only place a result survives: the tool call returned `launched` long
+      // before any of this was known, so nothing else ever carries which model ran
+      // or why it fell back. Identifiers only — `modelConfig` never leaves the
+      // candidate payload, and this record is persisted.
+      itemStatuses: itemResults.map((r, i) => ({
+        index: i,
+        status: r.status,
+        ...(r.tierOutcome ? { tier: persistableTierOutcome(r.tierOutcome) } : {}),
+      })),
       durationMs,
       traceId: traceCtx?.mainTraceId,
     });
@@ -1147,7 +1493,7 @@ export class AgentBoxSessionManager {
       capsule: string;
       summaryTruncated: boolean;
       reduceChildSessionId?: string;
-      itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
+      itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
       durationMs: number;
       traceId?: string;
     },
@@ -1908,6 +2254,17 @@ export class AgentBoxSessionManager {
               // (turnMessages) and have no live viewer — buffer every attempt
               // so a failed primary can't leak into the persisted turn.
               optimisticPrimaryStream: false,
+              // Publish THIS session's running candidate, exactly as the HTTP path
+              // does. A synthetic turn can spawn sub-agents, so without this the
+              // tier plan had no session-owned answer for "what is the parent on"
+              // and fell through to box-level state — which, with more than one
+              // live session, is whichever session most recently bound a model.
+              // That would hand session A's children session B's provider config,
+              // credentials included.
+              onAttemptReady: (candidate) => {
+                managed.effectiveModelCandidate = candidate;
+                managed.effectiveModelParams = managed.brain.captureModelParams?.() ?? null;
+              },
             },
           );
         } catch (err) {
@@ -2317,14 +2674,41 @@ export class AgentBoxSessionManager {
     });
     child.sessionIdRef.current = childSessionId;
 
-    // Use the same model the parent's delegated agents use, when configured.
-    if (this.delegationModelProvider && this.delegationModelConfig && child.brain.registerProvider) {
-      child.brain.registerProvider(this.delegationModelProvider, this.delegationModelConfig);
-    }
-    if (this.delegationModelProvider && this.delegationModelId) {
-      const model = child.brain.findModel(this.delegationModelProvider, this.delegationModelId);
-      if (model) await child.brain.setModel(model);
-    }
+    // ── Model selection: tier, or the parent's effective model ──────────────
+    //
+    // `request.tierPlan` is the SNAPSHOT captured when spawn_subagent dispatched
+    // (menu + candidates + effective parent), shared by every child of that call
+    // and every later wave of a batch. Reading live state per child would let a
+    // long batch straddle a configuration change and report both halves as one.
+    // Redact the union of the parent's credentials and every tier candidate's: a
+    // tiered child may run on another provider entirely, and its own apiKey/baseUrl
+    // would otherwise pass through echoed tool output unmasked. Cheap and static,
+    // so it covers every candidate rather than only the one that resolved.
+    //
+    // Built BEFORE the outcome exists, because the outcome is the first thing that
+    // needs it — see the sanitize below.
+    const redactionConfig = buildRedactionConfigForModelConfig(
+      this.delegationModelConfig,
+      ...(request.tierPlan?.candidates?.candidates ?? []).map((c) => c.modelConfig),
+      request.tierPlan?.effectiveParent?.modelConfig,
+    );
+
+    const rawTierOutcome = await this.applyChildModel(child, request.tierPlan, request.prompt);
+    // `detail` is the raw `registerProvider` / `setModel` exception text, and such an
+    // exception routinely quotes the endpoint it dialled and sometimes the key it
+    // sent. Sanitized ONCE, here, rather than at each consumer: it is thrown at the
+    // prompt boundary, persisted onto the terminal event, and returned to the caller,
+    // and a fix applied per consumer leaves whichever one is added next unprotected.
+    // Redacting the summaries alone was not enough — the field itself still carried
+    // the key into the returned report.
+    const tierOutcome: ChildModelOutcome = rawTierOutcome.detail
+      ? { ...rawTierOutcome, detail: redactText(rawTierOutcome.detail, redactionConfig) }
+      : rawTierOutcome;
+
+    // A `failed` outcome means not even the parent's effective model could be
+    // applied, so there is nothing left to fall back to (§7.4). It is NOT handled
+    // here: it throws at the prompt boundary below, so the failure funnels through
+    // the same cleanup and terminal-event persistence as any other.
 
     // Sub-agent trace: open a ROOT span that NESTS under the parent's spawn_subagent tool
     // span (spawnSpanContext) so its tree hangs beneath that tool call in Langfuse; falls back
@@ -2366,7 +2750,6 @@ export class AgentBoxSessionManager {
     // ── Transcript persistence (design §13). Serialized via a promise queue so
     //    writes land in order; a write failure disables the trace but never the run. ──
     const delegationId = request.spawnId;
-    const redactionConfig = buildRedactionConfigForModelConfig(this.delegationModelConfig);
     const lineage = { parentSessionId: request.parentSessionId, parentAgentId: agentId, delegationId, targetAgentId: agentId };
     // canPersist = is the trace persistable at all (config present). Constant — never
     // flipped. persistTrace is the per-write latch that disables further *non-terminal*
@@ -2496,6 +2879,24 @@ export class AgentBoxSessionManager {
       // no-op with no active run — so DON'T start the prompt at all, or it would run a fresh,
       // un-aborted turn. Throw straight into the stopRequested branch below.
       if (stopRequested) throw new Error("stopped before sub-agent prompt started");
+      // Not even the parent's effective model could be applied (§7.4). Throw rather
+      // than returning early: this path has to reach the same `finally` — which
+      // shuts down an MCP manager this child opened — and the terminal-event
+      // persistence below, or the card sticks "Running" on reload and the child
+      // leaks its connections.
+      if (tierOutcome.failed) {
+        // REDACTED AT CONSTRUCTION, not just where it is rendered. `detail` is the
+        // raw `registerProvider` / `setModel` exception text, and a provider setup
+        // failure routinely quotes the baseUrl it dialled and sometimes the key it
+        // sent. From here the message becomes `finalText`, which is logged,
+        // persisted to the delegation transcript, shown in the UI, and returned to
+        // the PARENT MODEL as the tool result — so the moment it carries a secret
+        // it has carried it into a prompt. Redacting the thrown value means every
+        // one of those derives from sanitized text without each having to remember.
+        throw new Error(
+          `sub-agent could not be placed on a model${tierOutcome.detail ? `: ${tierOutcome.detail}` : ""}`,
+        );
+      }
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );
@@ -2515,8 +2916,18 @@ export class AgentBoxSessionManager {
           : `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms with no output.`;
       } else {
         status = "failed";
-        console.warn(`[agentbox-session] sub-agent ${childSessionId} failed:`, err);
-        finalText = finalText || `Sub-agent failed: ${err instanceof Error ? err.message : String(err)}`;
+        // Redact before BOTH uses. The union config covers the parent's credentials
+        // and every tier candidate's, because a tiered child may run on a different
+        // provider entirely — and an exception raised inside a model call is exactly
+        // the kind that quotes its endpoint back. Logging the raw `err` object was
+        // the remaining hole after the thrown message was sanitized above: a log
+        // line is no less of a disclosure than the tool result.
+        const failureText = redactText(
+          err instanceof Error ? err.message : String(err),
+          redactionConfig,
+        );
+        console.warn(`[agentbox-session] sub-agent ${childSessionId} failed: ${failureText}`);
+        finalText = finalText || `Sub-agent failed: ${failureText}`;
       }
     } finally {
       unsubscribe();
@@ -2575,6 +2986,10 @@ export class AgentBoxSessionManager {
             durationMs,
             interruptedTool,
             traceId: mainTraceId,
+            // Same reason as the group's terminal event: a DETACHED single spawn
+            // returned `launched` long before this, so without it here nothing
+            // records which model ran or why it fell back. Identifiers only.
+            ...(tierOutcome ? { tier: persistableTierOutcome(tierOutcome) } : {}),
           });
         } catch (err) {
           console.warn(`[agentbox-session] terminal delegation event persist failed for ${childSessionId}:`, err);
@@ -2590,6 +3005,7 @@ export class AgentBoxSessionManager {
         durationMs,
         interruptedTool,
         steps: liveSteps,
+        tierOutcome,
       };
     } finally {
       tracingRecorder.detach(childSessionId);
@@ -2908,6 +3324,9 @@ export class AgentBoxSessionManager {
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
+      // Snapshot the box's menu at creation — this is the value the session will
+      // hold for its lifetime, and the tool schema built below derives from it.
+      subagentTierMenu: this.subagentTierMenuState,
       jobStopExecutor: this.createJobStopExecutor(),
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
       taskOutputReader: this.createTaskOutputReader(),
@@ -2946,6 +3365,14 @@ export class AgentBoxSessionManager {
       _bufferUnsub: null,
       _syntheticPromptQueue: null,
       kubeconfigRef,
+      // Snapshot the box's menu HERE, at creation, because the tool description
+      // built for this session is derived from it. A later reload changes what the
+      // next session advertises, not what this one resolves against.
+      subagentTierMenu: this.subagentTierMenuState,
+      // Installed per turn by the prompt path; a session starts with none.
+      subagentTierCandidates: null,
+      effectiveModelCandidate: null,
+      effectiveModelParams: null,
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,

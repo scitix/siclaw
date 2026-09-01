@@ -25,7 +25,7 @@ import { assembleExporterHeaders, type ExporterAuth } from "./tracing-exporters.
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
-import { resolveAgentModelRouting } from "./model-routing-config.js";
+import { resolveAgentModelRouting, resolveAgentSubagentTiers } from "./model-routing-config.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
@@ -2150,6 +2150,19 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // capabilities and an immutable behavior contract; system_prompt stores
       // only the optional Agent-owned Addendum.
       agent_type: agent.agent_type,
+      // Sub-agent tier MENU, already projected — credential-free {tier, whenToUse}
+      // plus the revision.
+      //
+      // Resolved through the SAME entry point the candidates use, deliberately.
+      // Handing over the raw config instead left the two channels resolving
+      // independently: the candidate side dropped entries whose model no longer
+      // existed (and returned nothing when none did), while the menu was projected
+      // straight from the config and kept advertising every tier. The revisions
+      // then disagreed and tiering failed for the healthy tiers too.
+      //
+      // Projecting here also discloses less: the Gateway never needs provider or
+      // modelId to build a menu, so it should not receive them.
+      subagent_model_tiers: (await resolveAgentSubagentTiers(agent.subagent_models)).menu,
     };
   });
 
@@ -2310,10 +2323,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getModelBinding", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing, subagent_models, system_prompt FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
-    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; subagent_models?: unknown; system_prompt?: string | null } | undefined;
     if (!agent?.model_provider || !agent?.model_id) {
       return { binding: null };
     }
@@ -2337,6 +2350,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       provider: agent.model_provider,
       modelId: agent.model_id,
     });
+    // Candidates only — the menu rides the tools channel (see chat-gateway).
+    const subagentTiers = (await resolveAgentSubagentTiers(agent.subagent_models)).candidates;
     return {
       binding: {
         modelProvider: p.name,
@@ -2350,6 +2365,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           models,
         },
         ...(modelRouting ? { modelRouting } : {}),
+        ...(subagentTiers ? { subagentTiers } : {}),
         systemPrompt: agent.system_prompt ?? null,
       },
     };

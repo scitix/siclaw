@@ -12,6 +12,24 @@ import { signToken } from "./auth.js";
 import { registerAgentRoutes } from "./agent-api.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
+/**
+ * Read one column's bound value out of an INSERT call by NAME.
+ *
+ * These assertions used hardcoded positions, which silently shift every time a
+ * column is added to `agents` — three of them broke on the `subagent_models`
+ * addition, and a position that has shifted still type-checks and can still pass
+ * against the wrong value. Resolving the index from the statement's own column
+ * list makes the assertion say what it means.
+ */
+function insertedColumn(call: [string, unknown[]], column: string): unknown {
+  const [sql, values] = call;
+  const columns = sql.match(/INSERT INTO \w+ \(([^)]+)\)/i)?.[1];
+  if (!columns) throw new Error(`could not parse column list from: ${sql}`);
+  const index = columns.split(",").map((c) => c.trim()).indexOf(column);
+  if (index < 0) throw new Error(`column ${column} not in INSERT: ${columns}`);
+  return values[index];
+}
+
 const JWT_SECRET = "test-agent-secret";
 const ADMIN_TOKEN = signToken("admin-1", "admin", "admin", JWT_SECRET);
 const USER_TOKEN = signToken("u1", "user", "user", JWT_SECRET);
@@ -291,9 +309,12 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(201);
-      const insertArgs = query.mock.calls[0][1];
-      expect(insertArgs[8]).toBe("coordinator"); // agent_type
-      expect(insertArgs[9]).toBeNull();
+      // main's VALUE (a built-in type no longer materializes its default prompt
+      // into system_prompt — the Addendum refactor) read through the by-NAME
+      // accessor, because this branch adds a column and positional indices into
+      // the INSERT would silently start pointing at the wrong value.
+      expect(insertedColumn(query.mock.calls[0], "agent_type")).toBe("coordinator");
+      expect(insertedColumn(query.mock.calls[0], "system_prompt")).toBeNull();
     });
 
     it("persists a maintainer-supplied prompt for a built-in type", async () => {
@@ -308,7 +329,7 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(201);
-      expect(query.mock.calls[0][1][9]).toBe("single truth");
+      expect(insertedColumn(query.mock.calls[0], "system_prompt")).toBe("single truth");
     });
 
     it("keeps a custom agent's system_prompt on create", async () => {
@@ -324,8 +345,7 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(201);
-      const insertArgs = query.mock.calls[0][1];
-      expect(insertArgs[9]).toBe("keep me");
+      expect(insertedColumn(query.mock.calls[0], "system_prompt")).toBe("keep me");
     });
   });
 
@@ -501,6 +521,149 @@ describe("registerAgentRoutes", () => {
         "agent.reload",
         { agentId: "a1", resources: ["prompt"] },
       );
+    });
+
+    it("reloads tools when the sub-agent tier list changes", async () => {
+      // The menu is baked into a session's tool description at creation, while the
+      // next turn's binding already carries the new candidates. Without this
+      // reload a warm session advertises the old menu against new candidates, the
+      // revisions disagree on every spawn, and tiering silently stops working
+      // until that session happens to die.
+      query
+        // Order matters: the tier reference check runs BEFORE the current-state read.
+        .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: JSON.stringify([
+            { tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" },
+          ]),
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          subagent_models: [
+            { tier: "deep", provider: "p", modelId: "m", whenToUse: "causal reasoning across sources" },
+          ],
+        },
+      }));
+
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("can REPAIR a corrupted tier config instead of being blocked by it", async () => {
+      // A PUT reads the current value to decide whether anything changed, so a
+      // comparison that throws on a corrupted row makes that row permanently
+      // unfixable — the one operation that repairs it is the one guaranteed to
+      // fail. `[null]` is the shape that used to throw: it parses, passes
+      // Array.isArray, then dies on field access.
+      query
+        .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: "[null]",
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          subagent_models: [
+            { tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" },
+          ],
+        },
+      }));
+
+      expect(status).toBe(200);
+      // An unusable config was already producing no tiers, so replacing it with a
+      // usable one IS a change and must invalidate warm sessions.
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("can CLEAR a corrupted tier config", async () => {
+      // The other half of repairable: setting it back to null must work too.
+      query
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: '[{"tier":"fast"}]',
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { subagent_models: null },
+      }));
+
+      expect(status).toBe(200);
+    });
+
+    it("reloads tools whenever the tier list is SUPPLIED, even unchanged", async () => {
+      // Deliberately not a no-op-detecting comparison. The old value is read
+      // outside the UPDATE's transaction, so two concurrent saves can compare
+      // against the same snapshot: A writes A and reloads, B writes the old value
+      // back and concludes "unchanged", and if A's reload lands first the warm
+      // sessions cache A while the row holds B's value.
+      //
+      // The asymmetry decides it: a redundant reload costs one session rebuild,
+      // while a missed one leaves warm sessions advertising a menu the binding no
+      // longer matches — producing revision_mismatch on every spawn until those
+      // sessions happen to die.
+      const tiers = [{ tier: "fast", provider: "p", modelId: "m", whenToUse: "read logs and summarise" }];
+      query
+        .mockResolvedValueOnce([[{ id: "m" }], []])   // tier ref existence check
+        .mockResolvedValueOnce([[{
+          system_prompt: "p", agent_type: "custom", is_production: 1, idle_timeout_sec: 300,
+          subagent_models: JSON.stringify(tiers),
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { subagent_models: tiers },
+      }));
+
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("does not reload tools when the tier list is not supplied at all", async () => {
+      // The other half: an unrelated edit must not kick warm sessions.
+      //
+      // `description` is not in the needs-current-state set, so this request reads
+      // NO current row — only UPDATE + select-back. An earlier version of this
+      // test mocked a current-state read that never happens, which desynchronised
+      // every later mock and made the request throw; with no status assertion it
+      // passed anyway. Asserting 200 is what makes "no reload" mean "the request
+      // succeeded and chose not to reload" instead of "the request died early".
+      query
+        .mockResolvedValueOnce([undefined, []])                       // UPDATE
+        .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);      // select-back
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { description: "just a rename" },
+      }));
+
+      expect(status).toBe(200);
+      expect(connMap.notify).not.toHaveBeenCalledWith("a1", "agent.reload", expect.anything());
     });
 
     it("does not reload prompt or tools when the complete form resubmits identical values", async () => {

@@ -44,6 +44,7 @@ vi.mock("../../agentbox/session.js", () => ({
     knowledgeDir?: string;
     allowedToolsState: string[] | null = null;
     agentTypeState = "custom";
+    subagentTierMenuState: unknown;
     credentialBroker = { dispose: () => { sessionManagerShutdownCalls.push("broker.dispose"); } };
     async closeAll(): Promise<void> { sessionManagerShutdownCalls.push("closeAll"); }
   },
@@ -54,6 +55,16 @@ vi.mock("../../agentbox/session.js", () => ({
 let dbQueryImpl: (sql: string, params: unknown[]) => Promise<[unknown[], unknown]>;
 vi.mock("../db.js", () => ({
   getDb: () => ({ query: (sql: string, params: unknown[]) => dbQueryImpl(sql, params) }),
+}));
+
+// Sub-agent tier menu resolver. Mocked rather than exercised: the resolver has its
+// own tests, and what broke here was the WIRING — LocalSpawner never called it, so
+// a cold Standalone box had no menu on its first turn and every child inherited
+// while the candidates were already being sent.
+let resolveTiersImpl: (raw: unknown) => Promise<{ menu: unknown; candidates: unknown }>;
+const resolveTiersMock = vi.fn((raw: unknown) => resolveTiersImpl(raw));
+vi.mock("../../portal/model-routing-config.js", () => ({
+  resolveAgentSubagentTiers: (raw: unknown) => resolveTiersMock(raw),
 }));
 
 // Import the SUT after mocks.
@@ -96,6 +107,8 @@ beforeEach(() => {
   createHttpServerMock.mockReset().mockImplementation(createFakeHttpServer);
   // Default: agent has no tool_capabilities row value → unrestricted.
   dbQueryImpl = async () => [[{ tool_capabilities: null, agent_type: "custom" }], undefined];
+  resolveTiersMock.mockClear();
+  resolveTiersImpl = async () => ({ menu: null, candidates: null });
 
   origCwd = process.cwd();
   tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "local-spawner-")));
@@ -362,5 +375,69 @@ describe("LocalSpawner — invariant §1: never calls skillsHandler.materialize"
     expect(src).not.toMatch(/\bskillsHandler\b[^,}]*from\s+["'][^"']*sync-handlers/);
     expect(src).toContain("createSkillsHandler");
     expect(src).not.toContain("preserveExistingOnEmpty");
+  });
+});
+
+/**
+ * Cold-start bootstrap of the sub-agent tier menu.
+ *
+ * Local mode runs NO initial tools sync — the loop in spawn() covers only
+ * knowledge/skills/mcp, and creating the tools handler just registers the later
+ * reload callback. K8s is unaffected because agentbox-main awaits a tools sync
+ * before it listens.
+ *
+ * So without an explicit resolve here the menu was null on a cold box: a
+ * preconfigured agent's FIRST turn shipped tier candidates with no `model_tier` in
+ * the tool schema, the lead could not name a tier it had never been offered, every
+ * child inherited, and it appeared to fix itself later after some unrelated reload.
+ */
+/** The in-process session manager LocalSpawner created for agent a1. */
+function managerOf(spawner: LocalSpawner): any {
+  return (spawner as any).boxes.get("local-a1").sessionManager;
+}
+
+describe("LocalSpawner — sub-agent tier menu bootstrap", () => {
+  it("resolves the menu before the box accepts prompts, from the agent's stored config", async () => {
+    const MENU = { revision: "a".repeat(64), items: [{ tier: "fast", whenToUse: "read logs and summarise" }] };
+    dbQueryImpl = async () => [
+      [{ tool_capabilities: null, agent_type: "custom", subagent_models: '[{"tier":"fast"}]' }],
+      undefined,
+    ];
+    resolveTiersImpl = async () => ({ menu: MENU, candidates: null });
+
+    const cm = new FakeCertManager();
+    const spawner = new LocalSpawner(cm as any, "https://127.0.0.1:3002", 5000);
+    await spawner.spawn({ agentId: "a1" });
+
+    // Resolved through the same entry point the candidates use, so both channels
+    // agree on the revision — projecting the raw config separately is what made
+    // them disagree before.
+    expect(resolveTiersMock).toHaveBeenCalledWith('[{"tier":"fast"}]');
+    expect(managerOf(spawner).subagentTierMenuState).toEqual(MENU);
+  });
+
+  it("leaves the menu null when the agent has no tiers, and still resolves tools", async () => {
+    // The overwhelmingly common case: no tiers configured. Must not disturb the
+    // capability resolution that shares this block.
+    const cm = new FakeCertManager();
+    const spawner = new LocalSpawner(cm as any, "https://127.0.0.1:3002", 5000);
+    await spawner.spawn({ agentId: "a1" });
+
+    expect(managerOf(spawner).subagentTierMenuState ?? null).toBeNull();
+    expect(managerOf(spawner).harnessResolvedState).toBe(true);
+  });
+
+  it("a tier resolve failure costs the agent its tiers, never its tools", async () => {
+    // Its own try/catch on purpose: falling into the capabilities fail-closed
+    // handler would strip every tool over an optional optimisation.
+    resolveTiersImpl = async () => { throw new Error("provider table unreachable"); };
+
+    const cm = new FakeCertManager();
+    const spawner = new LocalSpawner(cm as any, "https://127.0.0.1:3002", 5000);
+    await spawner.spawn({ agentId: "a1" });
+
+    expect(managerOf(spawner).subagentTierMenuState ?? null).toBeNull();
+    expect(managerOf(spawner).harnessResolvedState).toBe(true);
+    expect(managerOf(spawner).allowedToolsState).not.toEqual([]);
   });
 });

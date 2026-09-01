@@ -726,6 +726,10 @@ export async function handleDelegate(
           modelId: binding.modelId,
           modelConfig: binding.modelConfig,
           modelRouting: binding.modelRouting,
+          // The PEER's own tiers, not the coordinator's — a delegated agent runs
+          // under its own configuration, and that includes which models its
+          // sub-agents may use.
+          subagentTiers: binding.subagentTiers,
           systemPrompt: binding.systemPrompt ?? undefined,
           origin: "api",
           delegation: {
@@ -795,6 +799,8 @@ export async function handleDelegate(
       modelFingerprint: binding.modelFingerprint,
       modelConfig: binding.modelConfig,
       modelRouting: binding.modelRouting,
+      // The peer's own tiers — see the remote path above.
+      subagentTiers: binding.subagentTiers,
       systemPromptTemplate: binding.systemPrompt ?? undefined,
       origin: "api",
       delegation: {

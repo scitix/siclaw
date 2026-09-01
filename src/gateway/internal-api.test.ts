@@ -221,14 +221,26 @@ describe("handleToolCapabilities", () => {
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
+    // subagentTierMenu is null when the agent configures no tiers — the payload
+    // always carries the field so an empty one CLEARS whatever the box held.
+    expect(JSON.parse(res.body)).toEqual({
+      allowedTools: null,
+      agentType: "custom",
+      subagentTierMenu: null,
+    });
   });
 
   it("treats an empty selection as null (whitelist off)", async () => {
     frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: [] });
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
-    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
+    // subagentTierMenu is null when the agent configures no tiers — the payload
+    // always carries the field so an empty one CLEARS whatever the box held.
+    expect(JSON.parse(res.body)).toEqual({
+      allowedTools: null,
+      agentType: "custom",
+      subagentTierMenu: null,
+    });
   });
 
   it("500 when the agent lookup fails", async () => {
@@ -632,6 +644,118 @@ describe("handleDelegationEvents", () => {
 
     expect(res.statusCode).toBe(403);
     expect(frontend.calls).toHaveLength(0);
+  });
+
+  it("persists a single child's tier outcome all the way into chat.appendMessage metadata", async () => {
+    // The gap this covers: the AgentBox emitted `tier` on the terminal event and
+    // this projection did not copy it, so the field died at the Gateway. A group's
+    // outcome travels inside `item_statuses` and WAS copied, which made the
+    // single-child loss invisible — and asserting only that the AgentBox sent the
+    // field would not have caught it either. For a DETACHED single spawn this
+    // event is the only surviving record.
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.append_event",
+        event: {
+          parentSessionId: "sess-1",
+          parentAgentId: "agent-1",
+          userId: "u1",
+          delegationId: "spawn-1",
+          childSessionId: "child-1",
+          targetAgentId: "agent-1",
+          status: "done",
+          capsule: "found it",
+          tier: {
+            requestedTier: "fast",
+            resolvedTier: "fast",
+            source: "request",
+            provider: "p",
+            modelId: "m",
+            // Fields the producer would never send, present HERE precisely so the
+            // assertion below tests the FILTER rather than the input. An earlier
+            // version of this test passed a clean object and asserted "no apiKey",
+            // which proved nothing.
+            modelConfig: { apiKey: "sk-must-not-persist", baseUrl: "https://leak.invalid" },
+            detail: "internal diagnostic text",
+            apiKey: "sk-also-must-not-persist",
+          },
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const append = frontend.calls.find((c) => c.method === "chat.appendMessage");
+    expect(append).toBeDefined();
+    const raw = (append!.params as { metadata: string }).metadata;
+    const metadata = JSON.parse(raw);
+
+    // Exactly the allow-listed keys — nothing more, so a new field upstream is
+    // dropped by default rather than persisted until someone excludes it.
+    expect(metadata.tier).toEqual({
+      requestedTier: "fast",
+      resolvedTier: "fast",
+      source: "request",
+      provider: "p",
+      modelId: "m",
+    });
+    // The HTTP boundary types its body by assertion, which strips nothing — so
+    // this is what stops a caller writing credentials into a durable record.
+    expect(raw).not.toContain("apiKey");
+    expect(raw).not.toContain("sk-must-not-persist");
+    expect(raw).not.toContain("leak.invalid");
+    expect(raw).not.toContain("internal diagnostic text");
+  });
+
+  it("sanitizes a group's per-item tier outcomes too", async () => {
+    // Same allow-list, applied inside item_statuses — the group path was already
+    // persisting this field before the single-child one existed, so it needs the
+    // same guard rather than inheriting trust from being older.
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.append_event",
+        event: {
+          parentSessionId: "sess-1",
+          parentAgentId: "agent-1",
+          userId: "u1",
+          delegationId: "group-1",
+          childSessionId: "",
+          targetAgentId: "agent-1",
+          status: "done",
+          capsule: "batch done",
+          itemStatuses: [
+            {
+              index: 0,
+              status: "done",
+              tier: {
+                source: "request",
+                resolvedTier: "fast",
+                modelConfig: { apiKey: "sk-group-leak" },
+              },
+            },
+            { index: 1, status: "skipped" },
+          ],
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const append = frontend.calls.find((c) => c.method === "chat.appendMessage");
+    const raw = (append!.params as { metadata: string }).metadata;
+    const metadata = JSON.parse(raw);
+
+    expect(metadata.item_statuses[0].tier).toEqual({ source: "request", resolvedTier: "fast" });
+    expect(metadata.item_statuses[1]).toEqual({ index: 1, status: "skipped" });
+    expect(raw).not.toContain("sk-group-leak");
   });
 
   it("delivers background assistant messages to a registered channel even when Portal has no chat session", async () => {

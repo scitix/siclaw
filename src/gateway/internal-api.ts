@@ -26,6 +26,12 @@ import {
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import {
+  projectTierMenuFromConfig,
+  sanitizeWireItemStatuses,
+  sanitizeWireTierOutcome,
+} from "../core/subagent-models.js";
+import { sha256Hex } from "../portal/model-routing-config.js";
 import { requireAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
 import type {
   DelegationAppendMessagePayload,
@@ -296,8 +302,13 @@ export async function handleToolCapabilities(
       parseToolCapabilitiesAtBoundary(agent?.tool_capabilities),
     );
     const allowedTools = resolveCapabilities(capsKeys);
+    // The sub-agent tier MENU rides this channel rather than the prompt binding,
+    // because a session's tool description is built at creation and a per-prompt
+    // field would arrive too late to appear in it. Credential-free by contract:
+    // only {tier, whenToUse}. `null` clears whatever the box held.
+    const subagentTierMenu = projectTierMenuFromConfig(agent?.subagent_model_tiers, sha256Hex);
     // agentType rides along for capabilities and legacy-row prompt fallback.
-    sendJson(res, 200, { allowedTools, agentType });
+    sendJson(res, 200, { allowedTools, agentType, subagentTierMenu });
   } catch (err) {
     console.error("[internal-api] tool-capabilities error:", err);
     sendJson(res, 500, { error: "Internal server error" });
@@ -593,9 +604,22 @@ async function appendDelegationEvent(
     ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
     ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
     ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
-    // Group terminal event: per-item status snapshot so the frontend can render never-persisted
-    // (skipped) items on reload instead of the live-only "running" fallback.
-    ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
+    // ⚠️ Both of these are SANITIZED, not copied. This runs on an HTTP boundary
+    // whose body is typed by assertion, which strips nothing — a payload carrying
+    // `modelConfig`, `apiKey` or an internal `detail` would otherwise be written
+    // to a durable record verbatim. The allow-list lives in one place so this path
+    // and the direct-DB one cannot diverge.
+    //
+    // A group's tier outcome rides inside `item_statuses`; a single child's is its
+    // own field, and for a DETACHED spawn that event is the only surviving record.
+    ...(() => {
+      const items = sanitizeWireItemStatuses(evt.itemStatuses);
+      return items ? { item_statuses: items } : {};
+    })(),
+    ...(() => {
+      const tier = sanitizeWireTierOutcome(evt.tier);
+      return tier ? { tier } : {};
+    })(),
   };
 
   return appendDelegationMessage(frontendClient, {

@@ -92,8 +92,19 @@ export function buildRedactionConfig(
  */
 export function buildRedactionConfigForModelConfig(
   modelConfig?: { apiKey?: string; baseUrl?: string },
+  /**
+   * Additional model configs whose secrets must ALSO be redacted.
+   *
+   * A sub-agent may run on a different provider than its parent (model tiering),
+   * and then the parent's apiKey/baseUrl alone is the wrong redaction set: the
+   * child's own credentials would pass through echoed tool output unmasked. The
+   * union is taken rather than a replacement because a child can emit either
+   * side's values.
+   */
+  ...alsoRedact: Array<{ apiKey?: string; baseUrl?: string } | undefined>
 ): RedactionConfig {
-  const extras = [modelConfig?.apiKey, modelConfig?.baseUrl]
+  const extras = [modelConfig, ...alsoRedact]
+    .flatMap((config) => [config?.apiKey, config?.baseUrl])
     .filter((v): v is string => typeof v === "string" && v.length > 0);
   return buildRedactionConfig(undefined, undefined, extras);
 }

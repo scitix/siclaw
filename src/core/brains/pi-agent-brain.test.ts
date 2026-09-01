@@ -296,6 +296,104 @@ describe("PiAgentBrain", () => {
     expect(brain.getContextUsage()).toEqual({ tokens: 50, contextWindow: 100, percent: 0 });
   });
 
+  describe("captureModelParams", () => {
+    it("reads the level back so a caller can restore it", () => {
+      // pi carries the current thinking level across a model switch whenever the
+      // target supports thinking (_getThinkingLevelForModelSwitch returns
+      // this.thinkingLevel), and applyModelParams cannot lower it — an absent
+      // effort is a no-op, not a reset. So a rejected sub-agent tier that raised
+      // the level would leave the fallback model running raised, changing the
+      // cost and latency of work nobody asked to be expensive. Capture/restore is
+      // the only way down.
+      const session = makeFakeSession({ thinkingLevel: "xhigh" });
+      const brain = new PiAgentBrain(session);
+      expect(brain.captureModelParams()).toEqual({ reasoningEffort: "xhigh" });
+    });
+
+    it("returns undefined rather than throwing when the level is unavailable", () => {
+      const session = makeFakeSession();
+      Object.defineProperty(session, "thinkingLevel", {
+        get() { throw new Error("not available"); },
+      });
+      const brain = new PiAgentBrain(session);
+      expect(() => brain.captureModelParams()).not.toThrow();
+      expect(brain.captureModelParams()).toBeUndefined();
+    });
+  });
+
+  describe("checkContextFitForModelPrompt (pure fit check)", () => {
+    it("never compacts and never prompts, whatever the verdict", async () => {
+      // This is the whole reason it exists separately from
+      // ensureContextForModelPrompt: run against a freshly created sub-agent, a
+      // compacting check would compact the one thing that child's context IS —
+      // its task briefing — and spend a model round-trip to decide whether to
+      // spend a model round-trip.
+      const session = makeFakeSession({
+        getContextUsage: vi.fn(() => ({ tokens: 100_000, contextWindow: 200_000, percent: 50 })),
+      });
+      const brain = new PiAgentBrain(session);
+
+      const result = brain.checkContextFitForModelPrompt(
+        { id: "small", provider: "p", contextWindow: 1000, maxTokens: 100, reasoning: false } as any,
+        "briefing",
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.compacted).toBe(false);
+      expect(session.compact).not.toHaveBeenCalled();
+      expect(session.prompt).not.toHaveBeenCalled();
+    });
+
+    it("counts the system prompt and tool schemas, not just the messages", async () => {
+      // A new child's message history is nearly empty while its system prompt and
+      // tool schemas are the bulk of the request. Counting messages alone passed
+      // a tier whose window the real request then overflowed — mid-stream, where
+      // nothing can fall back any more.
+      const bigPrompt = "x".repeat(40_000);
+      const withOverhead = makeFakeSession({
+        // No prior request, so pi reports no usage and the estimate falls back to
+        // messages — which are empty. Exactly the sub-agent case.
+        getContextUsage: vi.fn(() => undefined),
+        systemPrompt: bigPrompt,
+        getAllTools: vi.fn(() => [{ name: "bash", description: "y".repeat(20_000), parameters: {} }]),
+      });
+      const withoutOverhead = makeFakeSession({
+        getContextUsage: vi.fn(() => undefined),
+        systemPrompt: "",
+        getAllTools: vi.fn(() => []),
+      });
+
+      const model = { id: "m", provider: "p", contextWindow: 8000, maxTokens: 100, reasoning: false } as any;
+      const lean = new PiAgentBrain(withoutOverhead).checkContextFitForModelPrompt(model, "briefing");
+      const fat = new PiAgentBrain(withOverhead).checkContextFitForModelPrompt(model, "briefing");
+
+      expect(lean.ok).toBe(true);
+      expect(fat.ok).toBe(false);
+      expect(fat.tokens).toBeGreaterThan(lean.tokens ?? 0);
+    });
+
+    it("survives a session that exposes neither accessor", async () => {
+      // Defensive by design: it reads an SDK surface we do not own, and a fit
+      // check that throws is worse than one that guesses.
+      const session = makeFakeSession({
+        getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),
+        getAllTools: undefined,
+      });
+      // Defined AFTER construction: the factory spreads its overrides, and a
+      // spread READS a getter — so declaring it inline would throw while building
+      // the fixture instead of inside the code under test.
+      Object.defineProperty(session, "systemPrompt", {
+        get() { throw new Error("not available"); },
+      });
+      const brain = new PiAgentBrain(session);
+
+      expect(() => brain.checkContextFitForModelPrompt(
+        { id: "m", provider: "p", contextWindow: 1000, maxTokens: 100, reasoning: false } as any,
+        "briefing",
+      )).not.toThrow();
+    });
+  });
+
   it("context preflight skips compaction when the target model window fits", async () => {
     const session = makeFakeSession({
       getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),

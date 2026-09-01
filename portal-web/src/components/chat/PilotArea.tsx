@@ -48,6 +48,7 @@ import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
 import { ErrorBubble } from "./ErrorBubble"
 import { stripAttachmentOcrEvidence } from "./user-message-text"
+import { extractTierOutcome, tierBadge, type TierOutcomeView } from "./subagent-tier-view"
 import type {
   ChatAttachment,
   PilotMessage,
@@ -1377,7 +1378,7 @@ function isBackgroundSpawn(message: PilotMessage): boolean {
   return stringValue(parsed?.status) === "launched"
 }
 
-function agentWorkSummary(message: PilotMessage): {
+export function agentWorkSummary(message: PilotMessage): {
   target: string
   targetLabel: string
   isSelfDelegation: boolean
@@ -1390,6 +1391,12 @@ function agentWorkSummary(message: PilotMessage): {
   duration?: string
   toolTrace: AgentToolTrace[]
   status: string
+  /**
+   * Tier outcome for a single spawn. Same reason the batch card carries it: a
+   * single task is the COMMON case, so leaving it out here would mean the
+   * most-used path is the one that cannot show which model ran.
+   */
+  tier?: TierOutcomeView
 } {
   const args = message.toolArgs ?? {}
   const details = message.toolDetails ?? {}
@@ -1402,6 +1409,14 @@ function agentWorkSummary(message: PilotMessage): {
   const firstItem =
     (Array.isArray((result as Record<string, unknown>).item_results)
       ? ((result as Record<string, unknown>).item_results as unknown[])[0]
+      : undefined) as Record<string, unknown> | undefined
+  // The same slot on the DETAILS side. `result` above falls back to details only
+  // when the content is unparseable, so on the normal path these are two different
+  // objects: the model-visible one omits every field the model must not see, which
+  // is exactly where the tier outcome lives.
+  const detailsFirstItem =
+    (Array.isArray((details as Record<string, unknown>).item_results)
+      ? ((details as Record<string, unknown>).item_results as unknown[])[0]
       : undefined) as Record<string, unknown> | undefined
   const rawTarget =
     stringValue(args.agent_id) ??
@@ -1461,6 +1476,15 @@ function agentWorkSummary(message: PilotMessage): {
       stringValue(metadata.status) ??
       message.toolStatus ??
       "ready",
+    // Foreground: the DETAILS item, not `firstItem`. Those differ and it matters —
+    // `result` prefers the parsed model-visible content, whose `item_results[]`
+    // carries only {item, status, summary} because the tier fields are deliberately
+    // NOT model-visible (they name a provider and a model). They exist only under
+    // toolDetails, so reading `firstItem` meant the single-task path — the common
+    // one — could never render a badge.
+    // Background: only the persisted terminal event exists, which nests the outcome
+    // under metadata.tier — the launch returned before it was known.
+    tier: extractTierOutcome(detailsFirstItem, metadata),
   }
 }
 
@@ -2018,6 +2042,7 @@ function AgentWorkCard({ message, onOpenSubagent }: { message: PilotMessage; onO
                   <Clock className="w-3.5 h-3.5" />
                 </span>
               )}
+              <GroupItemTierBadge tier={work.tier} />
               <span className={cn("shrink-0 px-2 py-0.5 rounded-full border text-[11px] font-medium", tone.className)}>
                 {tone.label}
               </span>
@@ -2370,9 +2395,45 @@ interface GroupItemView {
   status: string
   summary?: string
   childSessionId?: string
+  /**
+   * Which model tier this item actually ran on, and why it may differ from what
+   * was asked for.
+   *
+   * The runtime records these precisely so a mis-picked tier is diagnosable — a
+   * tier is chosen from prose in a tool description, so "the child reported badly"
+   * and "the lead picked the wrong tier" are indistinguishable without them. They
+   * were being carried all the way to the payload and then dropped here, which
+   * left the intended diagnostic entry point with no exit.
+   */
+  tier?: TierOutcomeView
 }
 
 /** One-line label for a group item (a plain string, or a compact JSON of an object item). */
+/**
+ * Which model tier ran this item, and why it differs from what was asked.
+ *
+ * Text and tooltip come from `tierBadge` so the wording is unit-tested; this only
+ * decides how it looks. A fallback is tinted, because it is the case worth
+ * noticing — the item did not run on the model the lead chose.
+ */
+function GroupItemTierBadge({ tier }: { tier: TierOutcomeView | undefined }) {
+  const badge = tierBadge(tier)
+  if (!badge) return null
+  return (
+    <span
+      className={cn(
+        "shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded border",
+        badge.fellBack
+          ? "text-amber-300/90 border-amber-500/30 bg-amber-500/10"
+          : "text-muted-foreground/70 border-border/60 bg-muted/20",
+      )}
+      title={badge.title}
+    >
+      {badge.text}
+    </span>
+  )
+}
+
 function groupItemLabel(raw: unknown): string {
   if (typeof raw === "string") return raw
   if (raw && typeof raw === "object") {
@@ -2388,7 +2449,7 @@ function groupItemLabel(raw: unknown): string {
  * from the live event, groupStatus/reduce from the terminal event). The launch args always carry the
  * original items, so item count + labels survive even before any child completes.
  */
-function groupWorkSummary(message: PilotMessage): {
+export function groupWorkSummary(message: PilotMessage): {
   title: string
   background: boolean
   overallStatus: string
@@ -2443,6 +2504,12 @@ function groupWorkSummary(message: PilotMessage): {
       stringValue(fold?.status) ??
       stringValue(live?.status) ??
       (background ? "running" : "pending")
+    // Tier outcome comes from two differently-shaped sources: the FOREGROUND
+    // result flattens it into snake_case fields on item_results, while a
+    // BACKGROUND run only has the persisted terminal event, which nests it under
+    // `tier` inside item_statuses. A background group returns `launched` long
+    // before the outcome exists, so the persisted form is the only one it ever has.
+
     items.push({
       index: i,
       label: groupItemLabel(rawItem),
@@ -2451,6 +2518,7 @@ function groupWorkSummary(message: PilotMessage): {
       childSessionId:
         stringValue(inline?.child_session_id) ??
         stringValue(fold?.childSessionId),
+      tier: extractTierOutcome(inline, fold),
     })
   }
 
@@ -2630,6 +2698,7 @@ function SubagentGroupRow({
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-xs text-foreground truncate">{item.label || `Item ${item.index + 1}`}</span>
             <TaskStatusPill status={item.status} compact />
+            <GroupItemTierBadge tier={item.tier} />
           </div>
         </div>
       </button>

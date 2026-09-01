@@ -39,6 +39,7 @@ import {
   RUN_IN_BACKGROUND_ENABLED,
   isSubagentGroupEnabled,
 } from "../../core/subagent-registry.js";
+import { renderTierMenuForDescription, type ChildModelOutcome } from "../../core/subagent-models.js";
 import { validateAndRenderGroupPlan } from "../../agentbox/subagent-group.js";
 
 interface SpawnSubagentParams {
@@ -48,6 +49,28 @@ interface SpawnSubagentParams {
   reduce_prompt?: string;
   subagent_type?: string;
   run_in_background?: boolean;
+  model_tier?: string;
+}
+
+/**
+ * Snake_case tier fields for one item's report, shared by the batch and the
+ * collapsed-single paths so they cannot describe the same thing differently.
+ *
+ * Requested vs resolved plus a reason is what separates "the report is weak",
+ * "the lead picked the wrong tier" and "the candidate never arrived" — they look
+ * identical from outside otherwise. Identifiers only; credentials never leave the
+ * candidate payload.
+ */
+function tierFieldsForReport(outcome: ChildModelOutcome | undefined): Record<string, unknown> {
+  if (!outcome) return {};
+  return {
+    requested_tier: outcome.requestedTier ?? undefined,
+    resolved_tier: outcome.resolvedTier ?? undefined,
+    selection_source: outcome.source,
+    effective_provider: outcome.provider,
+    effective_model_id: outcome.modelId,
+    fallback_reason: outcome.fallbackReason,
+  };
 }
 
 function errorResult(message: string) {
@@ -134,12 +157,18 @@ export function createSpawnSubagentTool(
   // (see agent-factory) — there every launch runs foreground so the turn carries the real answer.
   // web/cli keep background; a2a/api/task never resolve this tool (see `modes` below). exec is separate.
   const backgroundAllowed = RUN_IN_BACKGROUND_ENABLED && !refs.foregroundSubagentOnly;
+  // The menu this SESSION advertises. Read once, here, because the schema and the
+  // description are built once — the same reason the resolution honours the
+  // session's snapshot rather than the box's current menu.
+  const tierMenu = refs.subagentTierMenu ?? null;
   return {
     name: "spawn_subagent",
     label: "Spawn Sub-agent",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("spawn_subagent")), 0, 0),
     renderResult: renderTextResult,
-    description: buildDescription(isSubagentGroupEnabled(), backgroundAllowed),
+    description:
+      buildDescription(isSubagentGroupEnabled(), backgroundAllowed) +
+      renderTierMenuForDescription(tierMenu),
     parameters: Type.Object({
       description: Type.String({ description: "Short (3-5 word) label for the task or batch." }),
       task_template: Type.Optional(
@@ -171,6 +200,26 @@ export function createSpawnSubagentTool(
           description: `Sub-agent type for every map + reduce child. Default: ${DEFAULT_SUBAGENT_TYPE}.`,
         }),
       ),
+      // Tier selection exists ONLY when this agent has tiers configured. With no
+      // menu the parameter is absent entirely, so a deployment without tiering
+      // never shows the model a concept it cannot act on. When present it is a
+      // CLOSED union built from the menu: a typo then violates the schema (which
+      // the harness can repair) instead of silently falling back and surfacing
+      // only later, in the report.
+      ...(tierMenu && tierMenu.items.length > 0
+        ? {
+            model_tier: Type.Optional(
+              Type.Union(
+                tierMenu.items.map((item) => Type.Literal(item.tier)),
+                {
+                  description:
+                    "Which model tier runs the map children. Omit to use this agent's own model. " +
+                    "The reduce child always uses the agent's own model regardless.",
+                },
+              ),
+            ),
+          }
+        : {}),
       // run_in_background is gated OFF (RUN_IN_BACKGROUND_ENABLED) until background jobs notify the
       // parent model on completion. While gated the param is hidden AND background is force-disabled
       // (see the runInBackground resolution below), so every launch runs FOREGROUND — this overrides
@@ -296,6 +345,9 @@ export function createSpawnSubagentTool(
           userId: refs.userId,
           taskListId: refs.taskListId,
           spawnId: toolCallId,
+          // Pass the REQUEST, not a resolution: only the executor can see session
+          // state, and it owns the env-override / type-default ordering.
+          modelTier: p.model_tier ?? null,
         },
         onProgress,
         signal,
@@ -367,6 +419,7 @@ function toToolOutput(
           status: r.status,
           summary: r.summary,
           child_session_id: r.childSessionId,
+          ...tierFieldsForReport(r.tierOutcome),
         })),
         duration_ms: result.durationMs,
         ...(result.reduceChildSessionId ? { reduce_child_session_id: result.reduceChildSessionId } : {}),
@@ -383,7 +436,15 @@ function toToolOutput(
       ...modelVisible,
       // Legacy single-spawn fields for the AgentWorkCard (it reads these from details): the raw item,
       // capsule/full report, child session for drill-in, tool-call + duration counters, and the steps.
-      item_results: [{ ...single, item: items[0], child_session_id: result.childSessionId }],
+      // Same tier fields the batch path reports — a single task is the common case,
+      // so omitting them here would leave the most-used path unable to show which
+      // model ran or why it fell back.
+      item_results: [{
+        ...single,
+        item: items[0],
+        child_session_id: result.childSessionId,
+        ...tierFieldsForReport(result.tierOutcome),
+      }],
       summary: result.summary,
       tool_calls: result.toolCalls,
       duration_ms: result.durationMs,

@@ -1,0 +1,123 @@
+{
+  "_comment": [
+    "CROSS-REPO WIRE CONTRACT for sub-agent model tiering. The management plane",
+    "PRODUCES these two payloads; this runtime CONSUMES them.",
+    "",
+    "STRUCTURE IS NOW ALIGNED with the producer's copy: same top-level",
+    "{config_getAgent, config_getModelBinding} envelopes, same casing split, same",
+    "already-projected menu. The contract test here reads this structure.",
+    "",
+    "BYTES ARE NOT YET IDENTICAL, and the remaining difference is not an oversight.",
+    "The producer's copy uses generated provider names that carry internal",
+    "deployment identifiers, and this repository is public — it must not contain",
+    "them. So `provider` values here keep the SHAPE of a generated name",
+    "(<runtime>-<type>-<qualifier>) with neutral tokens.",
+    "",
+    "COMPARISON IS ON THE PAYLOAD, NOT THE FILE. Whole-file hashing could never",
+    "have worked: both repositories carry the same payloads under different prose,",
+    "each documenting it for its own readers, so the files differ for reasons that",
+    "are not the contract — and each side then pins a value only it can satisfy,",
+    "which is two constants rather than one contract.",
+    "",
+    "CANONICALIZATION (implement identically on both sides):",
+    "  1. drop every top-level key starting with `_` (this commentary)",
+    "  2. sort object keys recursively; PRESERVE array order (menu order is",
+    "     meaningful — it is the order the lead reads)",
+    "  3. serialize with no insignificant whitespace",
+    "  4. sha256 of the UTF-8 bytes",
+    "In Go this is nearly free: unmarshal into map[string]any and re-marshal, since",
+    "encoding/json sorts map keys. The pinned value lives in",
+    "subagent-tier-wire-contract.test.ts (EXPECTED_PAYLOAD_SHA256), not in this",
+    "file — a digest cannot describe bytes it is part of.",
+    "",
+    "MEASURED: the two payloads currently differ in EXACTLY ONE field, the",
+    "`provider` prefix. Neutralise it in the canonical copy and both sides compute",
+    "de8aa805a00228e637f47d7480940f89361ba35de255ae9e8f76d6c2c31b7e4e. That is a",
+    "one-line change to a SAMPLE VALUE: `provider` is opaque to the consumer, which",
+    "the contract test pins by feeding it deliberate garbage and asserting",
+    "acceptance. Nothing about the contract depends on what it says.",
+    "",
+    "NOTE THE CASING SPLIT, deliberate and not a mistake to 'fix':",
+    "  - the config.getAgent FIELD is snake_case (subagent_model_tiers), matching",
+    "    every other field of that RPC;",
+    "  - the menu PAYLOAD inside it is camelCase (whenToUse), matching the",
+    "    candidate channel and what this runtime parses.",
+    "",
+    "The menu is ALREADY PROJECTED — {revision, items}, not the raw config array.",
+    "revision is computed from the stored tier mapping, which only the producer",
+    "holds; a second implementation of 'hash the config' would drift into a",
+    "permanent false revision_mismatch. This runtime therefore accepts BOTH shapes",
+    "on config.getAgent: its own standalone config array, and this envelope.",
+    "",
+    "Every drift here is SILENT. A renamed key errors on neither side: the",
+    "normalizer yields nothing, the tool description carries no tiers, `model_tier`",
+    "never appears on spawn_subagent, and both suites stay green. That is exactly",
+    "how the first integration attempt failed."
+  ],
+
+  "config_getAgent": {
+    "subagent_model_tiers": {
+      "revision": "0000000000000000000000000000000000000000000000000000000000000000",
+      "items": [
+        { "tier": "fast", "whenToUse": "查日志、读代码、翻配置这类只需要检索和摘要的活" },
+        { "tier": "deep", "whenToUse": "需要跨多个证据源做因果推断、或结论要直接给人看的活" }
+      ]
+    }
+  },
+
+  "config_getModelBinding": {
+    "binding": {
+      "subagentTiers": {
+        "revision": "0000000000000000000000000000000000000000000000000000000000000000",
+        "candidates": [
+          {
+            "tier": "fast",
+            "provider": "runtime-openai-llm-fast",
+            "modelId": "gpt-4o-mini",
+            "modelConfig": {
+              "name": "openai",
+              "baseUrl": "https://api.example/v1",
+              "apiKey": "REDACTED-IN-FIXTURE",
+              "api": "openai-completions",
+              "authHeader": true,
+              "models": [
+                {
+                  "id": "gpt-4o-mini",
+                  "name": "gpt-4o-mini",
+                  "reasoning": false,
+                  "input": ["text"],
+                  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                  "compat": {
+                    "maxTokensField": "max_tokens",
+                    "supportsDeveloperRole": false,
+                    "supportsUsageInStreaming": true
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+
+  "_rules": [
+    "revision is 64 lowercase hex characters (SHA-256), computed over the RAW tier",
+    "mapping sorted by tier — NOT over the hydrated candidates. Hashing the",
+    "candidates would let one unresolvable model change the revision, which this",
+    "runtime would read as a version skew instead of candidate_missing.",
+    "",
+    "Both channels publish the SAME revision for the same configuration.",
+    "",
+    "No tiers is expressed by OMITTING the field, never by an envelope with an",
+    "empty list: a revision on one channel with nothing to match on the other is",
+    "what the mismatch rule fires on.",
+    "",
+    "The menu never carries provider, modelId, modelConfig or any credential — it",
+    "is rendered into a tool description, i.e. into a prompt. The candidates never",
+    "carry whenToUse.",
+    "",
+    "`provider` is an OPAQUE string to the consumer. It never parses or pattern-",
+    "matches it, which is why neutral sample values here cost nothing semantically."
+  ]
+}

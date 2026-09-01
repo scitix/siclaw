@@ -19,21 +19,54 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { encodeSubagentModelsForDb } from "../core/subagent-models.js";
 import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
 /**
+ * Reject a tier entry naming a provider/model this deployment does not have.
+ *
+ * Shape validation cannot catch this, and the runtime degrades silently when it
+ * happens: `findModel` misses and every child falls back to the inherited model,
+ * so a typo looks exactly like "tiering was never configured". Refusing the write
+ * is where it can still be reported to whoever made the mistake.
+ *
+ * Returns an error message, or undefined when everything resolves.
+ */
+async function validateSubagentTierRefs(
+  db: ReturnType<typeof getDb>,
+  encoded: string | null | undefined,
+): Promise<string | undefined> {
+  if (!encoded) return undefined;
+  type TierRef = { tier: string; provider: string; modelId: string };
+  const entries = safeParseJson<TierRef[]>(encoded, [] as TierRef[]);
+  if (!Array.isArray(entries)) return undefined;
+  for (const entry of entries) {
+    const [rows] = await db.query(
+      `SELECT 1 FROM model_entries me
+         JOIN model_providers mp ON me.provider_id = mp.id
+        WHERE mp.name = ? AND me.model_id = ? LIMIT 1`,
+      [entry.provider, entry.modelId],
+    ) as any;
+    if (!rows?.length) {
+      return `tier "${entry.tier}" references unknown model ${entry.provider}/${entry.modelId}`;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Decode an `agents` row's JSON-in-TEXT columns so the REST response carries
  * real objects/arrays, not raw JSON strings. These columns (`model_routing`,
- * `tool_capabilities`) are stored as TEXT-of-JSON (no JSON column type); a raw
- * `SELECT *` returns the undecoded string, which every Web client then has to
- * remember to JSON.parse — a forgotten parse silently mis-renders (see the
- * tool_capabilities echo bug). Decoding here is the single boundary that keeps
- * the wire honest. `safeParseJson` tolerates null / TEXT-string / pre-parsed
- * object, so this is safe across MySQL + SQLite and non-breaking for the
- * already-tolerant frontend coercers.
+ * `tool_capabilities`, `subagent_models`) are stored as TEXT-of-JSON (no JSON
+ * column type); a raw `SELECT *` returns the undecoded string, which every Web
+ * client then has to remember to JSON.parse — a forgotten parse silently
+ * mis-renders (see the tool_capabilities echo bug). Decoding here is the single
+ * boundary that keeps the wire honest. `safeParseJson` tolerates null /
+ * TEXT-string / pre-parsed object, so this is safe across MySQL + SQLite and
+ * non-breaking for the already-tolerant frontend coercers.
  */
 function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   if (!row) return row;
@@ -46,6 +79,7 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
     // built-in default in system_prompt. The settings UI edits only the real
     // addendum while legacy clients can keep reading the raw column.
     agent_prompt_addendum: agentPromptAddendum(agentType, row.system_prompt) ?? null,
+    subagent_models: safeParseJson(row.subagent_models, null),
   };
 }
 
@@ -58,6 +92,7 @@ function normalizedToolCapabilities(value: unknown): string {
   if (!Array.isArray(parsed) || parsed.length === 0) return "";
   return JSON.stringify([...new Set(parsed)].sort());
 }
+
 
 
 export function registerAgentRoutes(
@@ -124,18 +159,27 @@ export function registerAgentRoutes(
     const db = getDb();
     let modelRouting: string | null | undefined;
     let toolCapabilities: string | null | undefined;
+    let subagentModels: string | null | undefined;
     try {
       modelRouting = encodeModelRoutingForDb(body.model_routing);
       toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
+      subagentModels = encodeSubagentModelsForDb(body.subagent_models);
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    // Shape is valid; now check the models actually exist. Without this the first
+    // symptom of a typo is every fan-out silently running on the inherited model.
+    const tierRefError = await validateSubagentTierRefs(db, subagentModels);
+    if (tierRefError) {
+      sendJson(res, 400, { error: tierRefError });
       return;
     }
 
     const agentType = normalizeAgentType(body.agent_type);
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -145,6 +189,7 @@ export function registerAgentRoutes(
         body.model_id ?? null,
         modelRouting ?? null,
         toolCapabilities ?? null,
+        subagentModels ?? null,
         agentType,
         // Built-in type contracts live in code. Persist only the optional
         // Agent-owned addendum so an edit cannot replace core type behavior.
@@ -246,10 +291,25 @@ export function registerAgentRoutes(
       }
     }
 
+    let encodedSubagentModels: string | null | undefined;
+    if ("subagent_models" in body) {
+      try {
+        encodedSubagentModels = encodeSubagentModelsForDb(body.subagent_models);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+      const tierRefError = await validateSubagentTierRefs(db, encodedSubagentModels);
+      if (tierRefError) {
+        sendJson(res, 400, { error: tierRefError });
+        return;
+      }
+    }
+
     // The Web settings form sends a complete snapshot on every Save. Read the
     // fields whose side effects must be change-driven so an unrelated rename,
     // model edit, or binding save does not invalidate warm sessions.
-    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities"]
+    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities", "subagent_models"]
       .some((field) => field in body);
     let current: {
       idle_timeout_sec?: unknown;
@@ -257,10 +317,11 @@ export function registerAgentRoutes(
       agent_type?: unknown;
       is_production?: unknown;
       tool_capabilities?: unknown;
+      subagent_models?: unknown;
     } | undefined;
     if (needsCurrentState) {
       const [rows] = await db.query(
-        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities FROM agents WHERE id = ?",
+        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities, subagent_models FROM agents WHERE id = ?",
         [params.id],
       ) as any;
       current = rows[0];
@@ -300,6 +361,17 @@ export function registerAgentRoutes(
     const toolCapabilitiesChanged =
       encodedToolCapabilities !== undefined &&
       normalizedToolCapabilities(encodedToolCapabilities) !== normalizedToolCapabilities(current?.tool_capabilities);
+    // Refresh whenever the field is SUPPLIED, without comparing to the old value.
+    //
+    // The read happens outside the UPDATE's transaction, so two concurrent saves
+    // can compare against the same snapshot: A writes A and reloads, B writes the
+    // old value back and concludes "unchanged", and if A's reload lands first the
+    // warm sessions end up caching A while the row holds B's value. A locked
+    // read-compare-write would also fix it, but the asymmetry here makes the cheap
+    // option the right one — a redundant reload costs one session rebuild, while a
+    // missed one leaves warm sessions advertising a menu the binding no longer
+    // matches, producing revision_mismatch until those sessions happen to die.
+    const subagentModelsChanged = encodedSubagentModels !== undefined;
 
     // Capture the current idle window before the update — needed to detect the
     // resident(0) → finite transition, which (unlike every other transition)
@@ -371,6 +443,11 @@ export function registerAgentRoutes(
       values.push(encodedToolCapabilities);
     }
 
+    if (encodedSubagentModels !== undefined) {
+      setClauses.push("subagent_models = ?");
+      values.push(encodedSubagentModels);
+    }
+
     if (setClauses.length === 0) {
       sendJson(res, 400, { error: "No fields to update" });
       return;
@@ -402,7 +479,12 @@ export function registerAgentRoutes(
     // invalidate warm sessions so the next turn immediately restores with the
     // latest editable prompt (no AgentBox kill and no 30s idle wait).
     const reloadResources: string[] = [];
-    if (toolCapabilitiesChanged || agentTypeChanged) reloadResources.push("tools");
+    // A tier edit changes the MENU, which is baked into a session's tool
+    // description at creation — so a warm session keeps advertising the old one
+    // while the next turn's binding already carries the new candidates. The two
+    // revisions then disagree on every spawn and tiering silently stops working
+    // until the session happens to die. Reloading `tools` invalidates it.
+    if (toolCapabilitiesChanged || agentTypeChanged || subagentModelsChanged) reloadResources.push("tools");
     if (promptChanged) reloadResources.push("prompt");
     if (reloadResources.length > 0) {
       const payload = { agentId: params.id, resources: reloadResources };
@@ -675,9 +757,13 @@ export function registerAgentRoutes(
     try {
       await conn.beginTransaction();
 
+      // ⚠️ Every per-agent config column must be listed here. `tool_capabilities`
+      // was missing, so a cloned agent silently lost its tool restriction — a
+      // clone that is BROADER than its source is a privilege bug, not a cosmetic
+      // one. Adding a column to `agents` means adding it here too.
       await conn.query(
-        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, agent_type, system_prompt, is_production, icon, color, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newId,
           newName,
@@ -686,6 +772,8 @@ export function registerAgentRoutes(
           source.model_provider,
           source.model_id,
           source.model_routing,
+          source.tool_capabilities,
+          source.subagent_models,
           source.agent_type ?? "custom",
           source.system_prompt,
           source.is_production,

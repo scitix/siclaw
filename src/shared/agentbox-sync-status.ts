@@ -13,8 +13,17 @@ export interface ObservedKnowledgeRepo {
   fileCount?: number | null;
 }
 
-/** Version of the AgentBox inventory and Runtime observation envelope. */
-export const AGENT_SYNC_STATUS_SCHEMA_VERSION = 2;
+/**
+ * Version of the AgentBox inventory and Runtime observation envelope.
+ *
+ * 3 adds `tiers`. The bump is load-bearing rather than cosmetic: `tiers` is
+ * reported on EVERY successful turn, nulls included, so on a v3 box an absent
+ * field cannot happen and a present one with two nulls means "ran, no tiers". A
+ * consumer needs the version to tell that apart from a v2 box, which says nothing
+ * either way. Without it, "this box is not tiering" and "this box is too old to
+ * say" are the same observation.
+ */
+export const AGENT_SYNC_STATUS_SCHEMA_VERSION = 3;
 
 export interface BoxSyncStatus {
   /** Preserve the box-reported version during rolling upgrades. */
@@ -39,6 +48,38 @@ export interface BoxSyncStatus {
   model?: {
     releaseId: string;
     modelFingerprint: string;
+    observedAt: string;
+  } | null;
+  /**
+   * Sub-agent model tiering, as the latest successful turn actually held it.
+   *
+   * The box implements tiering entirely on the turn path and, until this field,
+   * said nothing about it anywhere — it ran correctly without being able to state
+   * that it had. The two channels arrive independently (menu over tools sync,
+   * candidates on the prompt), and every way that pairing fails is SILENT: falling
+   * back is the documented behaviour for missing tier state, so a dropped channel
+   * costs nothing observable except that no child ever runs on a tier.
+   *
+   * Reported as two revisions rather than one fingerprint, because which one is
+   * missing is the diagnosis:
+   *   both null            no tiering configured for this agent
+   *   menu, no candidates  the prompt path is not forwarding them — the lead is
+   *                        offered a tier that can never resolve
+   *   candidates, no menu  the tools channel is stale; the lead was never offered
+   *                        the tier whose credentials it holds
+   *   equal revisions      tiering is live end to end on this box
+   *   differing revisions  the two channels are on different config versions
+   *
+   * Emitted on every successful turn INCLUDING when both are null. A field that
+   * appeared only when tiering worked would make a box that lost its tiers
+   * indistinguishable from one released before this existed, which is the exact
+   * ambiguity the reporting is for.
+   */
+  tiers?: {
+    /** Revision of the menu the session's tool schema was built from. */
+    menuRevision: string | null;
+    /** Revision of the candidates the turn carried. */
+    candidatesRevision: string | null;
     observedAt: string;
   } | null;
 }
@@ -85,6 +126,10 @@ export function normalizeBoxSyncStatus(value: unknown): BoxSyncStatus {
   }
 
   const model = record(root.model);
+  const tiers = record(root.tiers);
+  /** A revision is 64 lowercase hex; anything else is not a revision. */
+  const revision = (value: unknown): string | null =>
+    typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
   return {
     schemaVersion: typeof root.schemaVersion === "number" && Number.isFinite(root.schemaVersion)
       ? root.schemaVersion
@@ -116,6 +161,16 @@ export function normalizeBoxSyncStatus(value: unknown): BoxSyncStatus {
           observedAt: typeof model.observedAt === "string" ? model.observedAt : "",
         } }
       : root.model === null ? { model: null } : {}),
+    // Preserved whenever the box sent the object, even with both revisions null:
+    // that IS the report ("ran a turn, held no tiers"). Dropping it would restore
+    // the ambiguity with a box too old to report at all.
+    ...(tiers
+      ? { tiers: {
+          menuRevision: revision(tiers.menuRevision),
+          candidatesRevision: revision(tiers.candidatesRevision),
+          observedAt: typeof tiers.observedAt === "string" ? tiers.observedAt : "",
+        } }
+      : root.tiers === null ? { tiers: null } : {}),
   };
 }
 

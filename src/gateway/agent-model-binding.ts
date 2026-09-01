@@ -35,6 +35,20 @@ export interface ResolvedModelBinding {
     }>;
   };
   modelRouting?: ModelRoutePolicy;
+  /**
+   * Sub-agent model tier CANDIDATES — `{revision, candidates:[…]}`, each with its
+   * own `modelConfig` (credentials included).
+   *
+   * ⚠️ Candidates only. The credential-free MENU travels on the tools sync channel
+   * because it is consumed while building a session's tool description, which
+   * happens before any binding is applied.
+   *
+   * ⚠️ This is a passthrough field: `resolveAgentModelBinding` returns
+   * `data.binding` verbatim, so nothing here is validated on arrival. The Runtime
+   * normalizes it at the point of use (`normalizeSubagentTierCandidates`) —
+   * write-side validation on either side is necessary but not sufficient.
+   */
+  subagentTiers?: unknown;
   /** Agent-owned Addendum (legacy storage column: agents.system_prompt). */
   systemPrompt?: string | null;
   /**
