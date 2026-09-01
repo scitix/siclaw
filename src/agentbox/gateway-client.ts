@@ -12,6 +12,7 @@ import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
+import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
 
 export interface GatewayClientOptions {
   gatewayUrl: string;
@@ -57,13 +58,28 @@ export class GatewayClient {
 
     // Check if certificate files exist
     if (fs.existsSync(certFile) && fs.existsSync(keyFile) && fs.existsSync(caFile)) {
+      const cert = fs.readFileSync(certFile);
       this.tlsOptions = {
-        cert: fs.readFileSync(certFile),
+        cert,
         key: fs.readFileSync(keyFile),
         ca: fs.readFileSync(caFile),
         rejectUnauthorized: true, // Verify Gateway's certificate
       };
-      console.log(`[gateway-client] Loaded client certificates from ${certPath}`);
+      // Say so when the certificate is already dead, because NOTHING else will. The Runtime
+      // rejects it during the TLS handshake, which reaches this process as `socket hang up`
+      // — a message that names neither certificates nor expiry, and which every startup
+      // sync then repeats three times. The certificate is loaded anyway: refusing to start
+      // would trade a diagnosable box for one that is not there at all, and the same
+      // process also serves HTTPS with this certificate.
+      const notAfter = readCertificateNotAfter(cert.toString("utf8"));
+      if (certificateHasExpired(notAfter)) {
+        console.error(
+          `[gateway-client] CLIENT CERTIFICATE EXPIRED at ${notAfter?.toISOString()} — every call to the Gateway will fail ` +
+          `the mTLS handshake and surface as "socket hang up". This pod needs to be recreated so it picks up a re-issued certificate.`,
+        );
+      } else {
+        console.log(`[gateway-client] Loaded client certificates from ${certPath} (expires ${notAfter?.toISOString() ?? "unknown"})`);
+      }
     } else {
       console.warn(`[gateway-client] Client certificates not found at ${certPath}, will use plain HTTP`);
     }

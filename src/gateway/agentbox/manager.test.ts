@@ -3,6 +3,8 @@ import { AgentBoxManager } from "./manager.js";
 import { getBoxProfile } from "./box-profile.js";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
+// The same deadline the manager bounds its patience by — asserted against, not restated.
+import { POD_READY_TIMEOUT_MS } from "./k8s-spawner.js";
 
 /**
  * Tests for AgentBoxManager — agent-scoped pod identity (see 2026-04-18 spec).
@@ -598,6 +600,74 @@ describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
     spawner.fingerprint = undefined; // spawner can't report a CA → nothing to validate
     const mgr = new AgentBoxManager(spawner);
     spawner.getReturns.set("agentbox-agent-a-0", runningPod("whatever"));
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  /**
+   * The acquisition path asks "is mTLS possible RIGHT NOW", which is a WEAKER question than
+   * the one the drain path asks. A certificate approaching expiry still authenticates, so
+   * rebuilding here would make a user's turn wait out a full cold start for a box that
+   * works — replacement is the background roll's job.
+   */
+  it("serves from a running pod whose certificate is near expiry but still valid", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", {
+      ...runningPod("ca-v2"),
+      certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // inside the renewal window
+    });
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("recreates a running pod whose certificate has already expired", async () => {
+    // Past this point mTLS fails in BOTH directions, so the endpoint is worthless — serving
+    // from it would hand the turn a box that cannot answer.
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", {
+      ...runningPod("ca-v2"),
+      certExpiresAt: new Date(Date.now() - 1000),
+    });
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  /**
+   * 🔴 The SINGLE-BOX path reads its box through spawner.get(), not through a listing, and
+   * that projection used to omit certExpiresAt — so this check silently passed on "unknown
+   * is usable" and the certificate fix did nothing for every one-box agent. The spawner side
+   * is pinned in k8s-spawner.test.ts; this is the manager side of the same contract.
+   */
+  it("recreates a single box whose certificate expired, as reported through get()", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", {
+      ...runningPod("ca-v2"),
+      certExpiresAt: new Date(Date.now() - 1000),
+    });
+
+    await mgr.getOrCreate("agent-a");
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("reuses a running pod that carries no expiry at all (pre-label pod)", async () => {
+    // Unknown is not expired. The CA-fingerprint version of this check once read a missing
+    // label as stale and drained every box on sight.
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a-0", runningPod("ca-v2")); // no certExpiresAt
 
     const handle = await mgr.getOrCreate("agent-a");
     expect(handle.endpoint).toBe("https://10.0.0.1:3000");
@@ -1299,6 +1369,39 @@ describe("AgentBoxManager — a box that died without being asked to", () => {
     for (let i = 0; i < 6; i++) if ((mgr as any).mayRespawn("agent-a#1")) allowed++;
     expect(allowed).toBe(1); // the cooldown holds the rest back
   });
+
+  /**
+   * The crash-replacement path consults two cooldowns, and only one of them is free to ask:
+   * `mayRespawn` SPENDS one of three attempts when it says yes, while the spawn-retry check
+   * merely reports. So the reporting one has to go first, or a slot filtered out afterwards
+   * has paid for a replacement that never happened.
+   *
+   * With today's constants the wrong order cannot actually bite — mayRespawn's own 2-minute
+   * cooldown returns false without spending, and it outlasts the 30-second spawn cooldown,
+   * so the windows never overlap. This test pins the ORDER rather than that coincidence:
+   * tightening one constant or lengthening the other would make it real, and neither
+   * constant's definition hints at the coupling.
+   */
+  it("consults the reporting cooldown before the one that spends an attempt", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const pool = [poolBox("agentbox-agent-a-0", 0), crashed("agentbox-agent-a-1", 1)];
+    spawner.pool = pool;
+    spawner.listReturns = pool;
+    const mgr = pooledManager(spawner, 2);
+
+    // Slot 1 is blocked by the spawn-retry cooldown and has no crash history at all, so
+    // mayRespawn WOULD say yes (and spend) if it were asked first.
+    (mgr as any).spawnFailures.set("agent-a#1", Date.now());
+
+    // Called directly rather than through the reconcile tick: both effects asserted below
+    // are SYNCHRONOUS (the cooldown write happens inside the filter, and a blocked slot
+    // never reaches spawnInstances at all), so waiting on a timer would only add a window
+    // in which the assertions could pass for the wrong reason.
+    await (mgr as any).healCrashedBoxes("agent-a", pool);
+
+    expect(spawner.spawnCalls).toHaveLength(0);                      // blocked, as intended
+    expect((mgr as any).crashRespawns.has("agent-a#1")).toBe(false); // and nothing was spent
+  });
 });
 
 describe("AgentBoxManager — a deploy rolls one box at a time", () => {
@@ -1351,6 +1454,57 @@ describe("AgentBoxManager — a deploy rolls one box at a time", () => {
     expect((mgr as any).draining.size).toBe(2); // both, immediately
   });
 
+  /**
+   * 🔴 A certificate NEARING expiry is not the same as one that is already dead, and the
+   * difference decides whether the whole pool goes at once. Every box of an agent mounts the
+   * SAME per-agent Secret, so they all come due at the same instant — treating "due" as
+   * urgent empties the pool in one tick, which is the stampede the renewal window exists to
+   * prevent. Due ⇒ roll one at a time; dead ⇒ drop immediately.
+   */
+  it("rolls boxes whose certificate is merely nearing expiry, one at a time", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    const soon = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "current", certExpiresAt: soon }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "current", certExpiresAt: soon }),
+      poolBox("agentbox-agent-a-2", 2, { caFingerprint: "current", certExpiresAt: soon }),
+    ];
+    const mgr = pooledManager(spawner, 3);
+
+    (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
+    expect((mgr as any).draining.size).toBe(1);
+  });
+
+  it("drops boxes whose certificate has already expired, all at once", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    const dead = new Date(Date.now() - 1000);
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "current", certExpiresAt: dead }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "current", certExpiresAt: dead }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
+    expect((mgr as any).draining.size).toBe(2); // worthless — mTLS cannot succeed either way
+  });
+
+  it("leaves boxes with no expiry information alone", async () => {
+    // Pods created before the expiry label existed. Reading "no answer" as stale is exactly
+    // how the CA-fingerprint version of this check once drained every box on sight.
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "current" }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "current" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
+    expect((mgr as any).draining.size).toBe(0);
+  });
+
   it("rolls a pod still named the way instance 0 used to be", async () => {
     // It works, its image is current — but nothing looks that name up any more, so it
     // would serve whatever it holds and never be counted, replaced or drained.
@@ -1361,6 +1515,830 @@ describe("AgentBoxManager — a deploy rolls one box at a time", () => {
 
     (mgr as any).markStaleBoxesDraining("agent-a", spawner.pool, "agent");
     expect([...(mgr as any).draining.keys()]).toEqual(["agentbox-agent-a"]);
+  });
+});
+
+describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
+  /**
+   * 🔴 THE STORM. Pool filling is triggered from getOrCreate — once per SESSION REQUEST —
+   * and runs in the background, so while a pool sat short EVERY arriving request started its
+   * own spawn for the same instance indices. Observed in a live cluster: `pool short by 4 …
+   * spawning instances 1,2,3,4` four times inside one second, four pods created under one
+   * name, four readiness waits on the one pod, and a raw 404 whenever one of them recycled a
+   * pod another was still waiting on — all of it contending for the very resources the boxes
+   * needed in order to start.
+   */
+  it("starts ONE spawn per slot no matter how many callers ask at once", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return {
+        boxId: `agentbox-${config.agentId}-${config.instance ?? 0}`,
+        endpoint: `http://10.0.0.${(config.instance ?? 0) + 1}:3000`,
+        agentId: config.agentId,
+      };
+    };
+    const mgr = pooledManager(spawner, 3);
+
+    // Five concurrent callers, all seeing the same empty pool and the same missing slots.
+    const calls = Array.from({ length: 5 }, () => (mgr as any).spawnInstances("agent-a", undefined, [1, 2]));
+    release!();
+    await Promise.all(calls);
+
+    // Two slots ⇒ two spawns, not ten.
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect(spawner.spawnCalls.map((c) => c.instance).sort()).toEqual([1, 2]);
+  });
+
+  it("hands every joined caller the box the first caller created", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "the-one-box", endpoint: "http://10.0.0.2:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    const calls = [
+      (mgr as any).spawnInstances("agent-a", undefined, [1]),
+      (mgr as any).spawnInstances("agent-a", undefined, [1]),
+    ];
+    release!();
+    const [a, b] = await Promise.all(calls);
+
+    expect(a[0].boxId).toBe("the-one-box");
+    expect(b[0].boxId).toBe("the-one-box");
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  /**
+   * 🔴 De-duplication is sound only between callers that want the same thing DONE TO THE POD.
+   * An attempt started while a Pending pod was still young reuses it; a caller arriving after
+   * the readiness deadline wants it deleted. Joining the older attempt left the pod in place
+   * and failed everyone with it, costing another full readiness window before anything tried
+   * again — a 95-second window in the measured case, not a race.
+   */
+  it("does not let a rebuild request join a reuse already in flight", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    // A reuse is in flight for slot 0…
+    const reuse = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    await Promise.resolve();
+    // …and a rebuild for the same slot must NOT be absorbed by it.
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    release!();
+    await Promise.all([reuse, rebuild]);
+
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect(spawner.spawnCalls[0].recreate).toBeUndefined();
+    expect(spawner.spawnCalls[1].recreate).toBe(true);
+  });
+
+  /**
+   * 🔴 Superseding must not HARM the callers already waiting. The stronger attempt deletes
+   * the pod, which is exactly what makes the older attempt's readiness wait fail — so every
+   * caller holding the older promise got null and reported `Failed to spawn`, while the
+   * replacement came up fine moments later. The failure was caused by the recovery.
+   */
+  it("hands the superseded attempt's waiters to the replacement", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let failReuse: (() => void) | undefined;
+    const reuseGate = new Promise<void>((r) => { failReuse = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (!config.recreate) {
+        // Stands in for "the pod I was waiting on was deleted under me".
+        await reuseGate;
+        throw new Error("disappeared while waiting for it to become ready");
+      }
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.7:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const waiter = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    await Promise.resolve();
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    failReuse!();
+
+    const [fromWaiter, fromRebuild] = await Promise.all([waiter, rebuild]);
+
+    // The original caller gets the replacement's box, not the casualty of its own recovery.
+    expect(fromRebuild[0]?.boxId).toBe("agentbox-agent-a-0");
+    expect(fromWaiter[0]?.boxId).toBe("agentbox-agent-a-0");
+  });
+
+  /**
+   * 🔴 And it yields REGARDLESS of its own outcome. A Pending pod that turns Ready while the
+   * replacement is still resolving its config makes the superseded attempt SUCCEED — but the
+   * pod it succeeded about is under a demolition order. Handing that endpoint back is worse
+   * than handing back the failure: it looks fine and dies under the first request.
+   */
+  it("yields to the replacement even when the superseded attempt succeeds", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let readyNow: (() => void) | undefined;
+    const turnsReady = new Promise<void>((r) => { readyNow = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (!config.recreate) {
+        await turnsReady; // the pod becomes Ready after the rebuild has taken over
+        return { boxId: "doomed-pod", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+      }
+      return { boxId: "replacement-pod", endpoint: "http://10.0.0.2:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const waiter = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    await Promise.resolve();
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    readyNow!();
+
+    const [fromWaiter] = await Promise.all([waiter, rebuild]);
+
+    expect(fromWaiter[0]?.boxId).toBe("replacement-pod");
+  });
+
+  it("does not invent a successor when nothing superseded a failed attempt", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      throw new Error("no capacity");
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const out = await (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+
+    expect(out).toEqual([]); // a plain failure stays a failure
+  });
+
+  it("still de-duplicates in the weaker direction — a reuse joins a rebuild", async () => {
+    // The asymmetry is deliberate: a rebuild already does everything a reuse would.
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    await Promise.resolve();
+    const reuse = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    release!();
+    await Promise.all([rebuild, reuse]);
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].recreate).toBe(true);
+  });
+
+  it("two rebuild requests still collapse into one", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate;
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const a = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    await Promise.resolve();
+    const b = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    release!();
+    await Promise.all([a, b]);
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("frees the slot once the spawn settles, so a later fill can retry it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect((mgr as any).inflightSpawns.size).toBe(0);
+  });
+
+  /**
+   * De-duplication alone does not stop the storm: an attempt leaves the in-flight map the
+   * moment it settles, so a slot that cannot be filled would be retried as fast as traffic
+   * happens to arrive.
+   */
+  it("backs a failing slot off for background fills", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      throw new Error("no capacity");
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(true);
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(false);
+  });
+
+  it("clears the backoff once the slot spawns successfully", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let fail = true;
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (fail) throw new Error("no capacity");
+      return { boxId: "b", endpoint: "http://10.0.0.2:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(false);
+
+    fail = false;
+    // The wait path is allowed through regardless of the cooldown — see getOrCreatePooled.
+    await (mgr as any).spawnInstances("agent-a", undefined, [1]);
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(true);
+  });
+
+  it("counts the backoff per slot, not per agent", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (config.instance === 1) throw new Error("no capacity");
+      return { boxId: "b", endpoint: "http://10.0.0.3:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 3);
+
+    await (mgr as any).spawnInstances("agent-a", undefined, [1, 2]);
+
+    expect((mgr as any).mayFillInstance("agent-a", 1)).toBe(false);
+    expect((mgr as any).mayFillInstance("agent-a", 2)).toBe(true);
+  });
+
+  /**
+   * The one path that must NOT respect the cooldown: nothing is available to serve the turn
+   * from, so a slot that failed a moment ago is still worth one more attempt.
+   */
+  it("still tries the awaited spawn when there is nothing to serve from", async () => {
+    const spawner = new PoolSpawner("k8s");
+    // Failure keyed on the SLOT, not on call order: the background fill for the remaining
+    // indices is now launched before the awaited one, so "the first call" is no longer the
+    // one this test is about.
+    let slotZeroFailed = false;
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if ((config.instance ?? 0) === 0 && !slotZeroFailed) {
+        slotZeroFailed = true;
+        throw new Error("no capacity");
+      }
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 2);
+
+    await expect(mgr.getOrCreate("agent-a", undefined, "s1")).rejects.toThrow(/Failed to spawn/);
+    // Cooldown is now set for slot 0, yet the next turn must still get a box.
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s2");
+    expect(handle.boxId).toBe("agentbox-agent-a-0");
+  });
+});
+
+describe("AgentBoxManager — a pool that is at size but not up yet", () => {
+  /**
+   * 🔴 "Nothing reachable" and "pool short" are DIFFERENT conditions, and the gap between
+   * them was a second, independent unbounded-growth path that de-duplication could not
+   * close. A starting box counts as live for missingInstances (so `missing` is empty) but
+   * is not reachable (so `accepting` is 0) — and the fall-through allocated a NEW index
+   * every time. Each request picking a different index is precisely what de-dup cannot
+   * merge, so the pool climbed 1, 2, 3, … while never actually being short.
+   */
+  /** A pool AT SIZE with nothing reachable: every box is still coming up. */
+  function allStarting(count: number): AgentBoxInfo[] {
+    return Array.from({ length: count }, (_, i) =>
+      poolBox(`agentbox-agent-a-${i}`, i, { status: "starting", endpoint: "" }));
+  }
+
+  it("waits for a starting slot instead of allocating another index", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = allStarting(2);
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
+
+    // A slot already coming up, never a fresh index above the pool size.
+    expect(spawner.spawnCalls.every((c) => (c.instance ?? -1) < 2)).toBe(true);
+    expect(spawner.spawnCalls.map((c) => c.instance)).toContain(0);
+  });
+
+  it("does not climb when request after request finds the pool starting", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = allStarting(2);
+    const mgr = pooledManager(spawner, 2);
+
+    for (let i = 0; i < 5; i++) {
+      await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+    }
+
+    // The pool was never short, so no index beyond it may be invented — this is the
+    // assertion the old code failed, climbing 2, 3, 4, … one per request.
+    const indices = [...new Set(spawner.spawnCalls.map((c) => c.instance ?? -1))].sort();
+    expect(Math.max(...indices)).toBeLessThan(2);
+  });
+
+  /**
+   * 🔴 PRIORITY IS NOT ABANDONMENT. A starting slot is the right thing to WAIT on — cheaper
+   * than deleting and recreating a pod — but the rebuildable slots still have to be dealt
+   * with, because nothing else deals with them: healCrashedBoxes collects `stopped` boxes
+   * only, so an `error` slot (a Failed/Unknown phase, or a pod with no phase yet) is
+   * invisible to the reaper. Review measured a pool of starting(0) + error(1) where every
+   * request went to instance 0 and instance 1 was never touched again — permanently broken
+   * capacity if the starting pod stayed Pending.
+   */
+  it("does not strand an error slot while waiting on a starting one", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20)); // the stranded rebuild goes to the background
+
+    const touched = new Set(spawner.spawnCalls.map((c) => c.instance));
+    expect(touched.has(0)).toBe(true); // waited on
+    expect(touched.has(1)).toBe(true); // and not forgotten
+  });
+
+  /**
+   * 🔴 `void` makes the call concurrent with the CALLER, not with the line above it. Placed
+   * after the await, the "background" rebuild does not begin until the awaited slot resolves
+   * — up to POD_READY_TIMEOUT_MS on the real path. So a stuck starting slot left the
+   * stranded error slots idle for three minutes and then failed the turn anyway. Review
+   * measured spawnCalls holding only [0] until instance 0 was released.
+   */
+  it("starts the stranded rebuild WHILE waiting, not after", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if ((config.instance ?? 0) === 0) await gate; // the awaited slot stays stuck
+      return { boxId: `agentbox-agent-a-${config.instance}`, endpoint: "http://10.0.0.9:3000", agentId: config.agentId };
+    };
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    const inflight = (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20));
+
+    // BEFORE the awaited slot resolves, the rebuild must already be under way.
+    expect(spawner.spawnCalls.map((c) => c.instance)).toContain(1);
+
+    release!();
+    await inflight;
+  });
+
+  /**
+   * 🔴 A `starting` slot is worth waiting on only while it is plausibly still coming up. Past
+   * the deadline the spawner itself gives up on, a pod still `starting` is stuck — typically
+   * unschedulable, which is the storm's own signature. Waiting on it forever means every
+   * request burns POD_READY_TIMEOUT_MS and fails, in a loop, while the slot is never rebuilt:
+   * healCrashedBoxes collects `stopped` boxes only, so nothing else would ever touch it.
+   */
+  it("rebuilds a starting slot that is past the readiness deadline instead of waiting again", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const longStuck = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    longStuck.createdAt = new Date(Date.now() - POD_READY_TIMEOUT_MS - 60_000);
+    spawner.pool = [longStuck];
+    const mgr = pooledManager(spawner, 1);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]); // same slot, rebuilt
+    expect(after - before).toBe(1); // and charged, because a rebuild destroys a pod
+  });
+
+  /**
+   * 🔴 THE GAP BETWEEN CLASSIFYING AND ACTING. Putting an over-age slot in the rebuild set
+   * only decided what the manager INTENDED; the spawner still judges reuse from the pod
+   * alone, and a Pending pod with a valid certificate passes every check it makes. So the
+   * budget was spent and the same stuck pod was handed back — once per request, forever. The
+   * intent has to travel with the spawn request, which is what `recreate` carries.
+   */
+  it("tells the spawner to REPLACE an over-age slot, not just classify it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const longStuck = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    longStuck.createdAt = new Date(Date.now() - POD_READY_TIMEOUT_MS - 60_000);
+    spawner.pool = [longStuck];
+    const mgr = pooledManager(spawner, 1);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].recreate).toBe(true);
+  });
+
+  it("does NOT ask for a replacement when the slot is merely still coming up", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const fresh = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    fresh.createdAt = new Date(Date.now() - 5_000);
+    spawner.pool = [fresh];
+    const mgr = pooledManager(spawner, 1);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].recreate).toBeUndefined(); // waiting, not replacing
+  });
+
+  it("does not ask for a replacement when simply filling a short pool", async () => {
+    // A missing index has no pod to replace; sending `recreate` there would be meaningless
+    // at best and, on a slot that raced into existence, destructive.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = pooledManager(spawner, 2);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+
+    expect(spawner.spawnCalls.every((c) => c.recreate === undefined)).toBe(true);
+  });
+
+  it("keeps waiting on a starting slot that is still within the deadline", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const fresh = poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" });
+    fresh.createdAt = new Date(Date.now() - 5_000);
+    spawner.pool = [fresh];
+    const mgr = pooledManager(spawner, 1);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]);
+    expect(after - before).toBe(0); // waiting destroys nothing, so nothing is charged
+  });
+
+  it("still fuses the stranded rebuild — the background path is not a way around the budget", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+    while ((mgr as any).spendDrainBudget("agent-a")) { /* exhaust, whatever its size */ }
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 2).catch(() => {});
+    await new Promise((r) => setTimeout(r, 20));
+
+    const touched = new Set(spawner.spawnCalls.map((c) => c.instance));
+    expect(touched.has(0)).toBe(true);  // waiting is never fused
+    expect(touched.has(1)).toBe(false); // the rebuild is
+  });
+
+  it("still allocates a free index when the pool is genuinely empty", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).toContain(0);
+  });
+
+  /**
+   * 🔴 `starting` was too narrow. missingInstances counts capacity as every pod that is not
+   * `stopped`, which also covers `error` — what a Failed/Unknown phase, or a pod with no
+   * phase yet, maps to — plus `stopping` and a running box with a dead certificate. Matching
+   * only `starting` left all of those falling through to freeInstances; measured by review,
+   * five requests pushed the highest index to 6.
+   */
+  for (const status of ["error", "stopping"] as const) {
+    it(`rebuilds a ${status} slot in place instead of allocating past the pool`, async () => {
+      const spawner = new PoolSpawner("k8s");
+      spawner.pool = [
+        poolBox("agentbox-agent-a-0", 0, { status, endpoint: "" }),
+        poolBox("agentbox-agent-a-1", 1, { status, endpoint: "" }),
+      ];
+      const mgr = pooledManager(spawner, 2);
+
+      for (let i = 0; i < 5; i++) {
+        await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+      }
+
+      const indices = spawner.spawnCalls.map((c) => c.instance ?? -1);
+      expect(Math.max(...indices)).toBeLessThan(2);
+    });
+  }
+
+  /**
+   * A running box with a dead certificate takes a DIFFERENT route, and the distinction is
+   * worth pinning: markStaleBoxesDraining judges it urgent and drains it, so it stops
+   * counting as capacity and `missing` is non-empty — the replacement legitimately takes an
+   * index above `replicas`, because the draining box still owns its name until it is reaped
+   * ("indices need not be contiguous; the pool converges").
+   *
+   * What must NOT happen is a fresh index PER REQUEST. The bound is the number of distinct
+   * slots, not their numeric value.
+   */
+  it("replaces expired boxes on a bounded set of slots, not one per request", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const expired = { caFingerprint: "ca-v1", certExpiresAt: new Date(Date.now() - 1000) };
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, expired),
+      poolBox("agentbox-agent-a-1", 1, expired),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    for (let i = 0; i < 5; i++) {
+      await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+    }
+
+    const distinct = new Set(spawner.spawnCalls.map((c) => c.instance ?? -1));
+    expect(distinct.size).toBeLessThanOrEqual(2); // the pool's width, however they are numbered
+  });
+});
+
+describe("AgentBoxManager — the drain fuse has no path around it", () => {
+  /**
+   * Enough calls to exhaust DRAIN_BUDGET whatever it is set to. Deliberately not importing
+   * the constant: the point is "the budget is gone", and a test that tracks its exact value
+   * would need editing every time the fuse is retuned.
+   */
+  const DRAIN_BUDGET_FOR_TEST = 32;
+
+  /**
+   * 🔴 A fuse with a bypass is not a fuse. Once the drain budget trips,
+   * markStaleBoxesDraining stops marking stale boxes — so they stay non-draining in the
+   * pool. The at-size path then picked them up as "occupied but not placeable" and handed
+   * their indices to spawnInstances, which DELETES AND RECREATES such a pod. Reproduced in
+   * review: three requests after the trip rebuilt instances 0 and 1 regardless.
+   *
+   * Rebuilding is the same act the budget bounds, so it spends the budget too — and when
+   * the budget is gone the answer is to create NOTHING, not to fall through to a fresh
+   * index, which is the churn being prevented.
+   */
+  it("stops rebuilding unusable slots once the drain budget is spent", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    // Wrong CA ⇒ not placeable, and `running` ⇒ a rebuild rather than a wait.
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { caFingerprint: "old" }),
+      poolBox("agentbox-agent-a-1", 1, { caFingerprint: "old" }),
+    ];
+    const mgr = pooledManager(spawner, 2);
+
+    // Burn the budget the way a churn loop would.
+    for (let i = 0; i < DRAIN_BUDGET_FOR_TEST; i++) (mgr as any).spendDrainBudget("agent-a");
+
+    for (let i = 0; i < 3; i++) {
+      await mgr.getOrCreate("agent-a", undefined, `s${i}`).catch(() => {});
+    }
+
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("still waits on a starting slot after the budget is spent — waiting destroys nothing", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a-0", 0, { status: "starting", endpoint: "" })];
+    const mgr = pooledManager(spawner, 1);
+
+    for (let i = 0; i < DRAIN_BUDGET_FOR_TEST; i++) (mgr as any).spendDrainBudget("agent-a");
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    // The slot is joined/awaited, not rebuilt, so the fuse has no reason to block it.
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]);
+  });
+
+  /**
+   * 🔴 ONE POD, ONE UNIT. The fuse counts boxes replaced — that is how
+   * markStaleBoxesDraining spends it, once per box inside its loop. Spending once for a
+   * whole batch made the unit a REQUEST: at 7 of 8 used, one request still rebuilt instances
+   * 0, 1 and 2 while the counter moved only to 8, so the real ceiling was 8 × replicas pods.
+   *
+   * `error` boxes are used deliberately: they are not placeable, and markStaleBoxesDraining
+   * skips them (it only marks `running` boxes), so they reach the rebuild branch without the
+   * drain pass having spent anything first — which keeps the arithmetic below unambiguous.
+   */
+  it("spends one unit of budget per rebuilt pod, not one per request", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-2", 2, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 3);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 3).catch(() => {});
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    // Three slots rebuilt ⇒ three units gone. Batch-spending scored this as 1.
+    expect(after - before).toBe(3);
+  });
+
+  /**
+   * 🔴 CHARGED FOR PODS CREATED, NOT FOR REQUESTS MADE — the third variant of the same
+   * unit mismatch. Charging per slot fixed the batch case, but the charge still happened
+   * BEFORE spawnInstances de-duplicates: eight concurrent requests naming one dead slot each
+   * spent a unit and then all waited on the single spawn that resulted. One pod creation
+   * exhausted the fuse, and had that spawn failed, recovery was blocked for the rest of the
+   * window.
+   *
+   * The gate therefore lives past the de-dup, so a caller that merely JOINS pays nothing.
+   */
+  it("charges one unit for one pod even when many requests race for it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate; // hold the spawn open so every caller is concurrent with it
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    // One unusable, non-starting slot ⇒ the rebuild branch, for every caller.
+    spawner.pool = [poolBox("agentbox-agent-a-0", 0, { status: "error", endpoint: "" })];
+    const mgr = pooledManager(spawner, 1);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    const calls = Array.from({ length: 8 }, (_, i) =>
+      (mgr as any).getOrCreatePooled("agent-a", undefined, `s${i}`, 1).catch(() => {}));
+    release!();
+    await Promise.all(calls);
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    expect(spawner.spawnCalls).toHaveLength(1);   // de-dup already guaranteed this
+    expect(after - before).toBe(1);               // and the charge must match it
+  });
+
+  it("rebuilds only as many slots as the remaining budget allows", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-2", 2, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 3);
+
+    // Drain the budget to exactly one remaining unit, without assuming its size.
+    let remaining = 0;
+    while ((mgr as any).spendDrainBudget("agent-a")) remaining++;
+    (mgr as any).drainBudget.set("agent-a", { count: remaining - 1, since: Date.now() });
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 3).catch(() => {});
+
+    // One unit left ⇒ one slot, not all three.
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("rebuilds while the budget still has room", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "current";
+    spawner.pool = [poolBox("agentbox-agent-a-0", 0, { caFingerprint: "old" })];
+    const mgr = pooledManager(spawner, 1);
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 1).catch(() => {});
+
+    expect(spawner.spawnCalls.length).toBeGreaterThan(0);
+  });
+});
+
+describe("AgentBoxManager — a single box being rolled must hand over", () => {
+  const runningBox = (over: Partial<AgentBoxInfo> = {}): AgentBoxInfo => ({
+    boxId: "agentbox-agent-a-0", agentId: "agent-a", status: "running",
+    endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    caFingerprint: "ca-v1", image: "agentbox:v2", profile: "agent", instance: 0,
+    ...over,
+  });
+
+  /**
+   * 🔴 The reaper drains a single box whose certificate is due and creates the replacement,
+   * but the single-box path kept returning the drained box: "due for renewal" still
+   * authenticates, and only a stale IMAGE used to divert to the pool path. The replacement
+   * took no traffic and the old box was killed at the drain deadline mid-request.
+   */
+  it("rolls through the pool path once the box is draining for its certificate", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    const box = runningBox({ certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+    spawner.getReturns.set("agentbox-agent-a-0", box);
+    (spawner as any).listForAgent = async () => [box];
+    (mgr as any).draining.set(box.boxId, Date.now());
+
+    await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
+
+    // The pool path creates the successor rather than returning the box being replaced.
+    expect(spawner.spawnCalls.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The gate matters in the other direction too. A certificate is "due" for a THIRD of its
+   * lifetime, so rolling on that alone would pay a synchronous cold start on a box that
+   * works and that nothing has decided to replace.
+   */
+  it("keeps serving a due-but-not-draining box without a cold start", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    spawner.getReturns.set("agentbox-agent-a-0", runningBox({
+      certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    }));
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+});
+
+describe("AgentBoxManager — a box mTLS cannot reach is not a candidate", () => {
+  /**
+   * 🔴 Marking a box draining does NOT stop it being served from — that is deliberate ("a
+   * draining box beats failing the turn"). So a box whose certificate died kept being
+   * handed back to every session already bound to it, and every one of those turns failed.
+   * The certificate check therefore belongs in isReachable, which is what placement, the
+   * holder lookup and the binding fallback all derive from.
+   */
+  const withCert = (instance: number, over: Partial<AgentBoxInfo>) =>
+    poolBox(`agentbox-agent-a-${instance}`, instance, { caFingerprint: "ca-v1", ...over });
+
+  it("does not hand a session back to a box whose certificate expired", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const dead = withCert(0, { certExpiresAt: new Date(Date.now() - 1000) });
+    const alive = withCert(1, { certExpiresAt: new Date(Date.now() + 20 * 24 * 60 * 60 * 1000) });
+    spawner.pool = [dead, alive];
+    const mgr = pooledManager(spawner, 2, {
+      [dead.boxId]: { endpoint: dead.endpoint, sessionIds: ["s1"], turnsInFlight: 0, drained: false },
+      [alive.boxId]: { endpoint: alive.endpoint, sessionIds: [], turnsInFlight: 0, drained: true },
+    });
+
+    // s1 is bound to the dead box, and the dead box even reports holding it — which is
+    // exactly the state that used to pin the session there and fail every turn.
+    (mgr as any).bindings.remember("agent-a", "s1", dead.boxId);
+    const acquired = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    expect(acquired.boxId).not.toBe(dead.boxId);
+  });
+
+  it("keeps serving a box whose certificate is merely near expiry", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const soon = withCert(0, { certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+    spawner.pool = [soon, withCert(1, { certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) })];
+    const mgr = pooledManager(spawner, 2, {
+      [soon.boxId]: { endpoint: soon.endpoint, sessionIds: ["s1"], turnsInFlight: 0, drained: false },
+    });
+
+    const acquired = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    expect(acquired.boxId).toBe(soon.boxId); // still authenticates; the roll replaces it
+  });
+
+  /**
+   * 🔴 THE OPPOSITE ANSWER, and the reason the certificate test is not inside isReachable.
+   *
+   * getHolder answers "where IS this turn", for steer / abort / clearQueue. Hiding the box
+   * that holds it does not stop the turn: the caller (boxForRunningTurn) falls through to
+   * placement, which SPAWNS a pod to answer an abort, and that fresh box replies "session
+   * not found" — which reads as already-stopped. An abort the box never confirmed must FAIL
+   * rather than report success, because success tells the management plane to stop retrying
+   * and tear down supervision. So the unreachable holder is the honest answer here.
+   */
+  it("still reports an expired box as the holder, so an abort fails honestly", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.fingerprint = "ca-v1";
+    const dead = withCert(0, { certExpiresAt: new Date(Date.now() - 1000) });
+    spawner.pool = [dead];
+    spawner.listReturns = spawner.pool;
+    const mgr = pooledManager(spawner, 2, {
+      [dead.boxId]: { endpoint: dead.endpoint, sessionIds: ["s1"], turnsInFlight: 1, drained: false },
+    });
+
+    const holder = await mgr.getHolder("agent-a", "s1");
+
+    expect(holder?.boxId).toBe(dead.boxId);
   });
 });
 

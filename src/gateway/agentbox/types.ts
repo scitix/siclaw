@@ -54,6 +54,19 @@ export interface AgentBoxConfig {
    * name is not parseable back into an index.
    */
   instance?: number;
+  /**
+   * Replace the pod occupying this slot even if it looks reusable.
+   *
+   * 🔴 Needed because "reusable" is judged from the pod alone — phase, profile, certificate
+   * — and a Pending pod that will never be scheduled passes every one of those checks. Only
+   * the caller knows it has already been given its chance (see AgentBoxManager's
+   * `isComingUp`, bounded by POD_READY_TIMEOUT_MS), so only the caller can ask for the
+   * rebuild. Without it, classifying such a slot for rebuild spends drain budget and still
+   * gets the same stuck pod back.
+   *
+   * Honoured by K8sSpawner only; other spawners have no pod to replace.
+   */
+  recreate?: boolean;
 }
 
 /** AgentBox information */
@@ -71,6 +84,20 @@ export interface AgentBoxInfo {
    * matches the runtime's current CA — see AgentBoxManager.getOrCreateK8s.
    */
   caFingerprint?: string;
+  /**
+   * When the mTLS certificate this pod mounts expires, read from its `<prefix>/cert-exp`
+   * label (K8s only).
+   *
+   * Undefined means UNKNOWN, not "never": pods created before the label existed carry no
+   * such label, and the manager must read that as fresh — the same trap the CA fingerprint
+   * fell into once, where a missing label read as "signed by a CA we no longer trust" and
+   * every box was drained on sight.
+   *
+   * Needed as well as {@link caFingerprint} because a certificate goes bad in two
+   * independent ways: the CA that signed it can be rotated, or the leaf can simply run
+   * out. The second is invisible to a fingerprint comparison.
+   */
+  certExpiresAt?: Date;
   /**
    * The box's process ended without being asked to — a crash, an OOM kill, an eviction.
    *

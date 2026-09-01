@@ -425,12 +425,26 @@ Two background modes (bash command, sub-agent) share one core; see tools.md §9,
 
 **Invariant**: mTLS is used **only between Gateway and AgentBox in K8s mode**. It is not used in LocalSpawner mode (same-machine, in-process) or TUI mode (no network).
 
-- CA: 10-year, stored in DB (`system_config` table), auto-renewed when fewer than 30 days remain
-- Client certs: issued per-pod at spawn time, short-lived
-- Identity encoded in certificate CN/OU: `userId`, `workspaceId`, `boxId`
+- CA: 10-year, supplied to the Runtime as configuration (`SICLAW_CA_CERT` / `SICLAW_CA_KEY`, or their `_FILE` forms), falling back to an ephemeral CA for local dev. It is **not** renewed automatically — a 10-year window outlives any deployment, and a CA that rotated itself would invalidate every live box's certificate at a moment nobody chose.
+- Client certs: issued **per AGENT, not per pod** — the certificate asserts the agent (`CN` = agentId, `O` = orgId, `serialNumber` = the agent's base pod name), so every box of an agent presents the same one and they share a single Secret. A box additionally uses it to terminate its own HTTPS, so it is both the client and the server credential.
+- **No `userId` appears in a certificate.** AgentBox is user-unaware end to end; user attribution is resolved at Runtime boundaries via `sessionId`.
 - Protected endpoints: `/api/internal/*` on Gateway HTTPS port (3002)
 
-**Source**: `src/gateway/security/cert-manager.ts`
+### Certificate lifetime is a liveness property, not just a security one
+
+A leaf certificate expires, and when it does mTLS fails **in both directions** — the Runtime cannot reach the box and the box cannot reach the Runtime. So the pair (issue, replace) has to be complete, and three things must hold:
+
+- **Re-issue is judged on the LEAF, not only on the CA.** A Secret signed by the current CA can still hold a dead certificate. Judging staleness by CA fingerprint alone meant the Secret was written once and never again.
+- **Replacement means recreating the pod.** A box reads its certificate from disk at startup, so re-issuing the Secret underneath a running pod does nothing for it. Consequently a certificate must be judged due for replacement far enough ahead that a drain, a respawn and the drain budget all fit inside the remaining window.
+- **A pool comes due all at once**, because every box of an agent mounts the same Secret. "Nearing expiry" must therefore roll boxes one at a time; only an already-dead or wrong-CA certificate justifies dropping a box immediately.
+
+Missing information is never treated as expiry. An unreadable certificate, or a pod predating the expiry label, reads as fresh — the opposite reading recycles healthy boxes on sight, which has happened here before with the CA fingerprint.
+
+**The renewal window is bounded from both sides.** It must be wide enough for a drain plus a respawn, and narrower than half the certificate lifetime — because a window at or above the lifetime makes every certificate due the moment it is signed, so each replacement is born stale and the pool churns until the drain budget stops it. That has been observed on a live cluster, not merely reasoned about. A consequence worth stating: renewal therefore **cannot be forced on demand** by widening the window, since any window that makes a fresh certificate due also makes its replacement due.
+
+A rejected client certificate is invisible by default: Node fails the handshake inside `rejectUnauthorized` before any request handler runs, and the peer sees only `socket hang up`. The Runtime therefore logs `tlsClientError` on its internal server; without it, an expired certificate is indistinguishable from a network fault.
+
+**Source**: `src/gateway/security/cert-manager.ts`, `src/shared/cert-validity.ts`
 
 ---
 

@@ -21,6 +21,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
+import type tls from "node:tls";
 import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
@@ -2667,6 +2668,37 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         });
       },
     );
+
+    // 🔴 A rejected client certificate is otherwise INVISIBLE ON BOTH SIDES. Node fails the
+    // handshake inside `rejectUnauthorized` and closes the socket without ever reaching a
+    // request handler, so nothing above logs it; the AgentBox, which has already sent its
+    // request, sees only `socket hang up`. An expired AgentBox certificate presented
+    // exactly that way for a whole release — every internal call failing with a message
+    // that names neither certificates nor expiry. This one line is the difference between
+    // reading the cause and inferring it.
+    //
+    // Rate-limited per (peer, code), because the condition it reports PERSISTS: a box whose
+    // certificate expired keeps calling — every turn, several times — and each call fails
+    // the handshake. Logging all of them would bury everything else in the runtime's output
+    // for as long as nobody fixes it, which is exactly the window the line exists to serve.
+    const tlsErrorLastLogged = new Map<string, number>();
+    const TLS_ERROR_LOG_INTERVAL_MS = 60_000;
+    httpsServer.on("tlsClientError", (err: Error & { code?: string }, socket: tls.TLSSocket) => {
+      const peer = socket.remoteAddress ?? "unknown";
+      const code = err.code ?? "unknown";
+      const key = `${peer} ${code}`;
+      const now = Date.now();
+      const last = tlsErrorLastLogged.get(key);
+      if (last !== undefined && now - last < TLS_ERROR_LOG_INTERVAL_MS) return;
+      // Bounded: one entry per (peer, code) seen in the window, swept as it is consulted.
+      if (tlsErrorLastLogged.size > 256) {
+        for (const [k, at] of tlsErrorLastLogged) {
+          if (now - at >= TLS_ERROR_LOG_INTERVAL_MS) tlsErrorLastLogged.delete(k);
+        }
+      }
+      tlsErrorLastLogged.set(key, now);
+      console.warn(`[runtime] mTLS handshake rejected from ${peer}: ${code} ${err.message}`);
+    });
 
     httpsServer.listen(internalPort, config.host, () => {
       console.log(`[runtime] Internal mTLS API on https://${config.host}:${internalPort}`);

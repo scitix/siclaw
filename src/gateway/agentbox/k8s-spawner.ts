@@ -11,6 +11,12 @@ import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
 import { CertificateManager } from "../security/cert-manager.js";
+import {
+  certExpiryLabel,
+  certificateNeedsRenewal,
+  parseCertExpiryLabel,
+  readCertificateNotAfter,
+} from "../../shared/cert-validity.js";
 
 export interface K8sSpawnerConfig {
   /** K8s namespace */
@@ -117,6 +123,30 @@ export function clampRequestToLimit(request: string, limit: string, podName: str
   }
   return request;
 }
+
+/**
+ * Startup gate handed to kubelet: `periodSeconds × failureThreshold` is how long a container
+ * gets to answer its first probe.
+ *
+ * Named constants rather than literals at the call site because two other timeouts are
+ * defined RELATIVE to this window — the Runtime's readiness wait above it and the box's own
+ * startup budget below it — and `startup-probe-window.test.ts` asserts those relations. A
+ * literal here would let the window move without the relations being rechecked.
+ */
+export const STARTUP_PROBE_PERIOD_SECONDS = 2;
+export const STARTUP_PROBE_FAILURE_THRESHOLD = 30;
+
+/** The window itself, in ms: how long kubelet allows before it gives up on the container. */
+export const STARTUP_PROBE_WINDOW_MS =
+  STARTUP_PROBE_PERIOD_SECONDS * STARTUP_PROBE_FAILURE_THRESHOLD * 1000;
+
+/**
+ * How long the Runtime waits for a pod it created to become Ready.
+ *
+ * MUST stay well above {@link STARTUP_PROBE_WINDOW_MS} — see waitForPodReady for why the two
+ * measure different spans and what happened when they were equal.
+ */
+export const POD_READY_TIMEOUT_MS = 180_000;
 
 /**
  * How kubelet asks a box whether it is up.
@@ -230,14 +260,120 @@ export class K8sSpawner implements BoxSpawner {
     return `${this.podBaseName(agentId, prefix)}-cert`;
   }
 
-  /** CA fingerprint stamped on an existing cert Secret, or undefined if unreadable. */
-  private async certSecretCaFingerprint(name: string): Promise<string | undefined> {
+  /**
+   * What an existing cert Secret holds: the CA that signed it, and when its leaf dies.
+   *
+   * The CA comes from the label (that is what stamps it), but `notAfter` is parsed from
+   * the certificate ITSELF rather than from a second label. A label would be a separate
+   * answer to a question the bytes already answer, and the two could disagree — the leaf
+   * is the thing pods actually present.
+   *
+   * Null ⇒ the Secret could not be read at all, which the caller treats as stale.
+   */
+  private async readCertSecret(name: string): Promise<{ caFp?: string; notAfter: Date | null } | null> {
     const { namespace, labelPrefix } = this.config;
     try {
       const s = await this.coreApi.readNamespacedSecret({ name, namespace });
-      return s.metadata?.labels?.[`${labelPrefix}/ca-fp`];
+      const encoded = s.data?.["tls.crt"];
+      return {
+        caFp: s.metadata?.labels?.[`${labelPrefix}/ca-fp`],
+        notAfter: encoded
+          ? readCertificateNotAfter(Buffer.from(encoded, "base64").toString("utf8"))
+          : null,
+      };
     } catch {
-      return undefined; // unreadable ⇒ treat as stale and take the replace path
+      return null; // unreadable ⇒ treat as stale and take the replace path
+    }
+  }
+
+  /**
+   * Make sure the agent's cert Secret holds a certificate a new pod can actually use, and
+   * report when that certificate expires.
+   *
+   * 🔴 TWO reasons a Secret is stale, and for a long time only the first was checked. A
+   * ROTATED CA is the loud one. The quiet one is EXPIRY: the leaf is valid for
+   * AGENTBOX_CERT_VALIDITY_DAYS, a fresh certificate is minted on every spawn, and the
+   * 409 branch below then threw it away whenever the CA still matched — so the Secret was
+   * written once and never again. Past day 30 every box of the agent failed mTLS in both
+   * directions (the Runtime reporting CERT_HAS_EXPIRED, the box seeing only a socket hang
+   * up), and recreating the pod did not help because the new pod mounted the same dead
+   * Secret. Judging the LEAF is what closes that.
+   *
+   * The Secret is per-AGENT, so two replicas spawning at once both land in the 409 branch.
+   * Replacing a certificate a sibling is already mounting is safe in the sense that
+   * matters — a certificate signed by the current CA authenticates any box of the agent —
+   * but it does not help a RUNNING sibling: the box reads its certificate off disk once at
+   * startup, so the pod has to be recreated to pick a new one up. That is the manager's
+   * job (see AgentBoxManager.isCertFresh); here we only guarantee that a pod being created
+   * now gets a live certificate.
+   *
+   * Returns null when the effective expiry could not be determined, which callers must
+   * treat as "unknown", never as "expired".
+   */
+  private async ensureCertSecret(
+    certSecretName: string,
+    secretLabels: Record<string, string>,
+    certBundle: { cert: string; key: string; ca: string },
+    caFp: string,
+  ): Promise<Date | null> {
+    const { namespace } = this.config;
+    const body: k8s.V1Secret = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: { name: certSecretName, labels: secretLabels },
+      type: "kubernetes.io/tls",
+      data: {
+        "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
+        "tls.key": Buffer.from(certBundle.key).toString("base64"),
+        "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
+      },
+    };
+
+    try {
+      await this.coreApi.createNamespacedSecret({ namespace, body });
+      console.log(`[k8s-spawner] Created certificate Secret ${certSecretName}`);
+      return readCertificateNotAfter(certBundle.cert);
+    } catch (err: any) {
+      if (err.code !== 409 && err.statusCode !== 409) throw err;
+    }
+
+    const existing = await this.readCertSecret(certSecretName);
+    // 🔴 An unreadable SECRET is stale; a Secret whose CERTIFICATE will not parse is not.
+    // The difference is deliberate. `certificateNeedsRenewal(null)` is false, so a parse
+    // failure lands on the reuse branch — because this Secret is per-agent, and replacing
+    // on a parse failure would make any blind spot in the parser delete and recreate, on
+    // every single spawn, a certificate the agent's other boxes are mounting. A genuinely
+    // corrupt certificate is caught by the pod failing to start, which the spawn-retry
+    // cooldown already bounds.
+    const staleReason =
+      !existing ? "unreadable"
+      : existing.caFp !== caFp ? `CA rotated (secret=${existing.caFp ?? "none"}, current=${caFp})`
+      : certificateNeedsRenewal(existing.notAfter)
+        ? `certificate expires ${existing.notAfter?.toISOString() ?? "unknown"}`
+        : null;
+
+    if (!staleReason) {
+      // The pod below mounts the existing Secret; the certificate just minted is discarded.
+      console.log(`[k8s-spawner] Reusing certificate Secret ${certSecretName} (current CA, expires ${existing?.notAfter?.toISOString() ?? "unknown"})`);
+      return existing?.notAfter ?? null;
+    }
+
+    console.log(`[k8s-spawner] Replacing certificate Secret ${certSecretName}: ${staleReason}`);
+    // 404-tolerant: a sibling replica may have replaced it first.
+    try {
+      await this.coreApi.deleteNamespacedSecret({ name: certSecretName, namespace });
+    } catch (delErr: any) {
+      if (delErr?.code !== 404 && delErr?.statusCode !== 404) throw delErr;
+    }
+    try {
+      await this.coreApi.createNamespacedSecret({ namespace, body });
+      console.log(`[k8s-spawner] Replaced certificate Secret ${certSecretName}`);
+      return readCertificateNotAfter(certBundle.cert);
+    } catch (recreateErr: any) {
+      // A sibling won the race and already recreated it. Its certificate is the one this
+      // pod will mount, so re-read rather than reporting the expiry of ours.
+      if (recreateErr?.code !== 409 && recreateErr?.statusCode !== 409) throw recreateErr;
+      return (await this.readCertSecret(certSecretName))?.notAfter ?? null;
     }
   }
 
@@ -312,13 +448,15 @@ export class K8sSpawner implements BoxSpawner {
       await this.reapRenamedLegacyPod(this.legacyPodName(agentId, "agent"), namespace, labelPrefix);
     }
 
-    // Stamp the pod + its cert Secret with the CA fingerprint. The runtime uses
-    // it to detect pods whose mTLS cert was signed by a rotated CA (those can no
-    // longer complete mTLS in either direction) and recycle them — see the reuse
-    // branch below and AgentBoxManager.getOrCreateK8s.
+    // Stamp the pod + its cert Secret with the CA fingerprint, and the pod with its
+    // certificate's expiry. The runtime uses the first to detect pods whose mTLS cert was
+    // signed by a rotated CA and the second to detect pods whose cert is simply running
+    // out — neither can complete mTLS in either direction once it happens, so both mean
+    // recycle. See the reuse branch below and AgentBoxManager.isCertFresh.
     if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
     const caFp = this.certManager.caFingerprint();
     const caFpLabel = `${labelPrefix}/ca-fp`;
+    const certExpLabel = `${labelPrefix}/cert-exp`;
 
     // Clean up any existing pod in non-running state (Failed, Succeeded, Error)
     // so we can recreate with the same name
@@ -348,9 +486,17 @@ export class K8sSpawner implements BoxSpawner {
       const existingProfile = existing.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
       const profileMismatch = existingProfile !== profile.name;
       const terminating = existing.metadata?.deletionTimestamp != null;
-      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating) {
+      // 🔴 An explicit rebuild is judged BEFORE the phase, not inside one branch of it.
+      // Attached to the Running/Pending arm, it silently did nothing for a pod with NO phase
+      // at all — which is precisely a pod the manager maps to `error` and asks to rebuild, so
+      // the budget was spent and the create below then hit 409 and reused the same pod. The
+      // caller's decision does not depend on which phase the pod happens to report.
+      const explicitRebuild = boxConfig.recreate === true;
+      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating || explicitRebuild) {
         console.log(
-          `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
+          explicitRebuild && phase !== "Failed" && phase !== "Succeeded" && phase !== "Unknown" && !profileMismatch && !terminating
+            ? `[k8s-spawner] Replacing pod ${podName} — caller asked for a rebuild (phase: ${phase ?? "none"})`
+            : `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase ?? "none"}, profile: ${existingProfile}→${profile.name})`,
         );
         // Let delete errors reach the outer catch, which swallows 404 (pod
         // already gone) and rethrows everything else (finding F): a blanket
@@ -362,15 +508,26 @@ export class K8sSpawner implements BoxSpawner {
         await this.waitForPodDeleted(podName, namespace);
       } else if (phase === "Running" || phase === "Pending") {
         const podFp = existing.metadata?.labels?.[caFpLabel];
-        if (podFp === caFp) {
+        // Two ways the pod's certificate can be unusable, and both mean the runtime can no
+        // longer talk to it in either direction. A MISSING expiry label is not one of them
+        // — pods created before the label existed have none, and reading that as stale
+        // would recycle every one of them on sight.
+        const podCertExp = parseCertExpiryLabel(existing.metadata?.labels?.[certExpLabel]);
+        // Reached only when the caller did NOT ask for a rebuild (that is handled above,
+        // phase-independently), so this arm is purely about the certificate.
+        const replaceReason =
+          podFp !== caFp ? `stale CA (pod=${podFp ?? "none"}, current=${caFp})`
+          : certificateNeedsRenewal(podCertExp)
+            ? `certificate expires ${podCertExp?.toISOString() ?? "unknown"}`
+            : null;
+        if (!replaceReason) {
           console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);
           const endpoint = await this.waitForPodReady(podName, namespace);
           return { boxId: podName, agentId, endpoint };
         }
-        // CA fingerprint mismatch (or an unlabeled legacy pod): the pod's mTLS
-        // cert was signed by a different/rotated CA, so the runtime can no
-        // longer talk to it. Recycle it instead of returning a dead endpoint.
-        console.log(`[k8s-spawner] Pod ${podName} has stale CA (pod=${podFp ?? "none"}, current=${caFp}); recreating`);
+        // Recycle it rather than returning an endpoint that cannot serve. For the certificate
+        // reasons the Secret is re-issued below, since ensureCertSecret judges the leaf too.
+        console.log(`[k8s-spawner] Replacing pod ${podName} — ${replaceReason}`);
         await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
         await this.waitForPodDeleted(podName, namespace);
       }
@@ -391,7 +548,6 @@ export class K8sSpawner implements BoxSpawner {
     const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
     const certSecretName = this.certSecretName(agentId, podPrefix);
 
-    // Create certificate Secret
     const secretLabels = {
       [`${labelPrefix}/app`]: "agentbox",
       [`${labelPrefix}/agent`]: agentId,
@@ -400,69 +556,7 @@ export class K8sSpawner implements BoxSpawner {
       // tell a capability box's cert from a chat box's (review finding).
       [`${labelPrefix}/boxType`]: profile.name,
     };
-    try {
-      await this.coreApi.createNamespacedSecret({
-        namespace,
-        body: {
-          apiVersion: "v1",
-          kind: "Secret",
-          metadata: { name: certSecretName, labels: secretLabels },
-          type: "kubernetes.io/tls",
-          data: {
-            "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
-            "tls.key": Buffer.from(certBundle.key).toString("base64"),
-            "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
-          },
-        },
-      });
-      console.log(`[k8s-spawner] Created certificate Secret ${certSecretName}`);
-    } catch (err: any) {
-      if (err.code === 409 || err.statusCode === 409) {
-        // 🔴 The Secret is per-AGENT, so two replicas of one agent spawning at the same
-        // time both land here — and blindly replacing it would delete a certificate a
-        // sibling pod is already mounting, or race the sibling's own replace (observed as
-        // a 404 on the second delete). A Secret signed by the CURRENT CA is equally valid
-        // for every box of the agent, so leave it alone: the certificate asserts the
-        // agent, not the pod.
-        const existingFp = await this.certSecretCaFingerprint(certSecretName);
-        if (existingFp === caFp) {
-          // Nothing to do — the pod below mounts the existing Secret. The certificate we
-          // just minted is simply discarded.
-          console.log(`[k8s-spawner] Reusing certificate Secret ${certSecretName} (signed by the current CA)`);
-        } else {
-          // CA rotated: the cert is genuinely stale, and every pod of this agent is being
-          // recreated for that same reason, so replacing is safe. The delete is
-          // 404-tolerant because a sibling replica may have replaced it first.
-          try {
-            await this.coreApi.deleteNamespacedSecret({ name: certSecretName, namespace });
-          } catch (delErr: any) {
-            if (delErr?.code !== 404 && delErr?.statusCode !== 404) throw delErr;
-          }
-          try {
-            await this.coreApi.createNamespacedSecret({
-              namespace,
-              body: {
-                apiVersion: "v1",
-                kind: "Secret",
-                metadata: { name: certSecretName, labels: secretLabels },
-                type: "kubernetes.io/tls",
-                data: {
-                  "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
-                  "tls.key": Buffer.from(certBundle.key).toString("base64"),
-                  "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
-                },
-              },
-            });
-            console.log(`[k8s-spawner] Replaced certificate Secret ${certSecretName}`);
-          } catch (recreateErr: any) {
-            // A sibling won the race and already recreated it under the current CA.
-            if (recreateErr?.code !== 409 && recreateErr?.statusCode !== 409) throw recreateErr;
-          }
-        }
-      } else {
-        throw err;
-      }
-    }
+    const certNotAfter = await this.ensureCertSecret(certSecretName, secretLabels, certBundle, caFp);
 
     // Environment variables — only bootstrap deps that cannot come from settings.json
     const env: k8s.V1EnvVar[] = [
@@ -627,6 +721,11 @@ export class K8sSpawner implements BoxSpawner {
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/agent`]: agentId,
           [caFpLabel]: caFp,
+          // Expiry of the certificate this pod actually mounts — which may be the one
+          // ensureCertSecret reused from a sibling, not the one minted above. Omitted when
+          // unknown: an ABSENT label means "no answer", and the manager reads it as
+          // fresh. Stamping a wrong date would be worse than stamping none.
+          ...(certNotAfter ? { [certExpLabel]: certExpiryLabel(certNotAfter) } : {}),
           [`${labelPrefix}/boxType`]: profile.name,
           // Which replica of the agent this is. The label is the record — the pod NAME
           // is not, because instance 0 is deliberately unsuffixed (see podName).
@@ -809,7 +908,11 @@ export class K8sSpawner implements BoxSpawner {
             // the two do not disagree about when a box has failed to come up. Readiness
             // and liveness carry no initialDelay: kubelet holds them until this passes,
             // and a delay measured from container start would be spent by then anyway.
-            startupProbe: { ...healthProbe, periodSeconds: 2, failureThreshold: 30 },
+            startupProbe: {
+              ...healthProbe,
+              periodSeconds: STARTUP_PROBE_PERIOD_SECONDS,
+              failureThreshold: STARTUP_PROBE_FAILURE_THRESHOLD,
+            },
             readinessProbe: { ...healthProbe, periodSeconds: 2 },
             livenessProbe: { ...healthProbe, periodSeconds: 10 },
           },
@@ -858,17 +961,43 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Wait for Pod to be Ready and obtain its IP
+   * Wait for Pod to be Ready and obtain its IP.
+   *
+   * 🔴 This deadline and the pod's `startupProbe` window (see `healthProbeFor`:
+   * periodSeconds × failureThreshold) do NOT measure the same thing, so they must not carry
+   * the same number — and for a long time both were 60s. The probe budget starts when the
+   * CONTAINER starts; this one starts at pod CREATION and additionally has to cover
+   * scheduling, the image pull and volume attachment. A pod that spent 30s being scheduled
+   * and then passed its probe in 40s is healthy and Ready at t=70s, yet the runtime had
+   * already declared the spawn failed at t=60s — which is exactly what the pool-fill
+   * storm was made of: several boxes of one agent cold-starting together contend for the
+   * node and the shared PVC, every one of them is reported failed, and every failure feeds
+   * another fill attempt.
+   *
+   * Raising this does NOT hide a broken pod: a genuinely failed one leaves through the
+   * `Failed` branch below within seconds of kubelet giving up on it.
    */
   private async waitForPodReady(
     podName: string,
     namespace: string,
-    timeoutMs = 60000,
+    timeoutMs = POD_READY_TIMEOUT_MS,
   ): Promise<string> {
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
-      const pod = await this.coreApi.readNamespacedPod({ name: podName, namespace });
+      let pod: k8s.V1Pod;
+      try {
+        pod = await this.coreApi.readNamespacedPod({ name: podName, namespace });
+      } catch (err: any) {
+        // The pod went away while we were waiting for it — a concurrent spawn of the same
+        // index recycled it, or a reaper collected it. That is a plain fact about this
+        // spawn, so say it plainly instead of letting a raw k8s ApiException (HTTP headers
+        // and all) surface as the reason a box could not be created.
+        if (err?.code === 404 || err?.statusCode === 404) {
+          throw new Error(`Pod ${podName} disappeared while waiting for it to become ready`);
+        }
+        throw err;
+      }
 
       const podIP = pod.status?.podIP;
       const phase = pod.status?.phase;
@@ -1095,24 +1224,18 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const pod = await this.coreApi.readNamespacedPod({ name: boxId, namespace });
 
-      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
-      const status = this.mapPodStatus(pod);
-      const podIP = pod.status?.podIP;
-
-      return {
-        boxId,
-        agentId,
-        status,
-        exitedUnexpectedly: this.exitedUnexpectedly(pod),
-        endpoint: podIP ? `https://${podIP}:3000` : "",
-        createdAt: pod.metadata?.creationTimestamp
-          ? new Date(pod.metadata.creationTimestamp)
-          : new Date(),
-        lastActiveAt: new Date(),
-        caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
-        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
-        ...this.replicaFields(pod),
-      };
+      // 🔴 THROUGH toBoxInfo, never hand-rolled. This function used to build the same shape
+      // field by field, and the copy fell behind: it never carried `certExpiresAt`, so the
+      // SINGLE-BOX acquisition path (getOrCreateK8s reads a box through get()) saw "expiry
+      // unknown", read that as usable — correctly, that is the fail-open rule — and went on
+      // returning an endpoint mTLS could no longer complete. The certificate fix was
+      // therefore inert for exactly the agents that run one box.
+      //
+      // This is the SECOND time a second projection caused that class of bug; the first cost
+      // a spawn loop when list() omitted the CA fingerprint, which is why toBoxInfo says
+      // ONE mapper on purpose. `boxId` stays the argument rather than the pod's name so the
+      // lookup answers about the name it was asked about.
+      return { ...this.toBoxInfo(pod), boxId };
     } catch (err: any) {
       if (err.code === 404 || err.statusCode === 404) {
         return null;
@@ -1212,6 +1335,7 @@ export class K8sSpawner implements BoxSpawner {
       createdAt: pod.metadata?.creationTimestamp ? new Date(pod.metadata.creationTimestamp) : new Date(),
       lastActiveAt: new Date(),
       caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
+      certExpiresAt: parseCertExpiryLabel(pod.metadata?.labels?.[`${labelPrefix}/cert-exp`]) ?? undefined,
       profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
       ...this.replicaFields(pod),
     };
