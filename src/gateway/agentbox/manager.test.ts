@@ -1816,6 +1816,53 @@ describe("AgentBoxManager — the drain fuse has no path around it", () => {
     expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([0]);
   });
 
+  /**
+   * 🔴 ONE POD, ONE UNIT. The fuse counts boxes replaced — that is how
+   * markStaleBoxesDraining spends it, once per box inside its loop. Spending once for a
+   * whole batch made the unit a REQUEST: at 7 of 8 used, one request still rebuilt instances
+   * 0, 1 and 2 while the counter moved only to 8, so the real ceiling was 8 × replicas pods.
+   *
+   * `error` boxes are used deliberately: they are not placeable, and markStaleBoxesDraining
+   * skips them (it only marks `running` boxes), so they reach the rebuild branch without the
+   * drain pass having spent anything first — which keeps the arithmetic below unambiguous.
+   */
+  it("spends one unit of budget per rebuilt pod, not one per request", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-2", 2, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 3);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 3).catch(() => {});
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    // Three slots rebuilt ⇒ three units gone. Batch-spending scored this as 1.
+    expect(after - before).toBe(3);
+  });
+
+  it("rebuilds only as many slots as the remaining budget allows", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [
+      poolBox("agentbox-agent-a-0", 0, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-1", 1, { status: "error", endpoint: "" }),
+      poolBox("agentbox-agent-a-2", 2, { status: "error", endpoint: "" }),
+    ];
+    const mgr = pooledManager(spawner, 3);
+
+    // Drain the budget to exactly one remaining unit, without assuming its size.
+    let remaining = 0;
+    while ((mgr as any).spendDrainBudget("agent-a")) remaining++;
+    (mgr as any).drainBudget.set("agent-a", { count: remaining - 1, since: Date.now() });
+
+    await (mgr as any).getOrCreatePooled("agent-a", undefined, "s1", 3).catch(() => {});
+
+    // One unit left ⇒ one slot, not all three.
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
   it("rebuilds while the budget still has room", async () => {
     const spawner = new PoolSpawner("k8s");
     spawner.fingerprint = "current";

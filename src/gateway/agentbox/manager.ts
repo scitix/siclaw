@@ -611,9 +611,25 @@ export class AgentBoxManager {
       const awaitable = slotsOf(notPlaceable.filter((b) => b.status === "starting"));
       const rebuildable = slotsOf(notPlaceable.filter((b) => b.status !== "starting"));
 
+      // 🔴 ONE POD, ONE UNIT OF BUDGET. The fuse counts boxes replaced, which is how
+      // markStaleBoxesDraining spends it — once per box, inside its loop. Spending once for
+      // a whole batch made the unit a REQUEST instead: at 7 of 8 used, a single request
+      // still rebuilt instances 0, 1 and 2 while the counter moved to 8, so the real ceiling
+      // was 8 × replicas pods rather than 8. A fuse whose unit does not match what it is
+      // fusing does not bound anything.
+      //
+      // `break`, not `continue`: once the budget is refused it stays refused for the rest of
+      // the window, so there is nothing further to ask about.
+      const permitted: number[] = [];
+      if (missing.length === 0 && awaitable.length === 0) {
+        for (const instance of rebuildable) {
+          if (!this.spendDrainBudget(agentId)) break;
+          permitted.push(instance);
+        }
+      }
       const target = missing.length > 0 ? missing
         : awaitable.length > 0 ? awaitable
-        : rebuildable.length > 0 ? (this.spendDrainBudget(agentId) ? rebuildable : [])
+        : rebuildable.length > 0 ? permitted
         : this.freeInstances(pool, 1);
 
       if (target.length > 0) {
