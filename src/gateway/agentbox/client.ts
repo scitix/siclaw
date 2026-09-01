@@ -70,6 +70,14 @@ export interface PromptOptions {
       maxTokens: number;
       compat?: Record<string, unknown>;
     }>;
+    /** Release-pinned retrieval model, applied at the turn boundary. */
+    embedding?: {
+      baseUrl: string;
+      apiKey?: string;
+      model: string;
+      dimensions: number;
+      fingerprint?: string;
+    };
   };
   /** Optional ordered model fallback policy. Omitted means legacy single-model behavior. */
   modelRouting?: ModelRoutePolicy;

@@ -879,6 +879,7 @@ export function createHttpServer(
     // A delegated agent runs under its own configuration; delegation does not
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
+    await sessionManager.applyKnowledgeEmbeddingConfig(body.modelConfig);
     const managed = await sessionManager.getOrCreate(
       body.sessionId,
       body.mode,

@@ -13,7 +13,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
@@ -49,7 +49,7 @@ import { effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
-import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
+import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { createKnowledgeIndexer } from "../knowledge/indexer.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
@@ -316,6 +316,29 @@ function delegationSignature(d: DelegationContext | undefined): "none" | "ro" | 
   return d.readOnly ? "ro" : "rw";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function releaseEmbeddingConfig(modelConfig: Record<string, unknown> | undefined):
+  | { opts: MemoryIndexerOpts; key: string }
+  | undefined {
+  if (!modelConfig || !("embedding" in modelConfig)) return undefined;
+  const value = modelConfig.embedding;
+  if (!isRecord(value)) throw new Error("modelConfig.embedding must be an object");
+  const baseUrl = typeof value.baseUrl === "string" ? value.baseUrl.trim().replace(/\/+$/, "") : "";
+  const apiKey = typeof value.apiKey === "string" ? value.apiKey : "";
+  const model = typeof value.model === "string" ? value.model.trim() : "";
+  const dimensions = typeof value.dimensions === "number" ? value.dimensions : 0;
+  if (!baseUrl || !model || !Number.isInteger(dimensions) || dimensions <= 0) {
+    throw new Error("modelConfig.embedding requires baseUrl, model, and positive integer dimensions");
+  }
+  const key = createHash("sha256")
+    .update(JSON.stringify({ baseUrl, apiKey, model, dimensions }))
+    .digest("hex");
+  return { opts: { baseUrl, apiKey, model, dimensions }, key };
+}
+
 async function abortBrainBestEffort(
   brain: Pick<BrainSession, "abort">,
   label: string,
@@ -415,6 +438,10 @@ export class AgentBoxSessionManager {
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
   private _sharedKnowledgeIndexer: MemoryIndexer | null = null;
+  private _knowledgeEmbeddingConfig?: MemoryIndexerOpts;
+  private _knowledgeEmbeddingKey?: string;
+  private _retiredKnowledgeIndexers: MemoryIndexer[] = [];
+  private _knowledgeEmbeddingApply: Promise<void> = Promise.resolve();
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
 
@@ -479,7 +506,7 @@ export class AgentBoxSessionManager {
     const indexer = createKnowledgeIndexer(
       knowledgeDir,
       path.join(userDataDir, "knowledge-index"),
-      getEmbeddingConfig() ?? undefined,
+      this._knowledgeEmbeddingConfig ?? getEmbeddingConfig() ?? undefined,
     );
     await indexer.sync();
     return indexer;
@@ -488,6 +515,60 @@ export class AgentBoxSessionManager {
   /** Reconcile search immediately after an Agent knowledge bundle changes. */
   async syncKnowledgeIndex(): Promise<void> {
     await this._sharedKnowledgeIndexer?.sync();
+  }
+
+  /**
+   * Apply a release-pinned embedding descriptor before resolving the session for
+   * this turn. The control plane sends it inside the existing per-turn
+   * modelConfig, so a promoted Agent Type reaches warm AgentBoxes at the same
+   * boundary as the generation model.
+   *
+   * Existing busy sessions keep their old indexer until their turn completes;
+   * idle sessions are invalidated and transparently rebuilt. Retired handles
+   * remain open until box shutdown so an in-flight resolver is never closed
+   * underneath a running tool call.
+   */
+  async applyKnowledgeEmbeddingConfig(modelConfig: Record<string, unknown> | undefined): Promise<void> {
+    const apply = async (): Promise<void> => {
+      const resolved = releaseEmbeddingConfig(modelConfig);
+      if (!resolved || resolved.key === this._knowledgeEmbeddingKey) return;
+      this._knowledgeEmbeddingConfig = resolved.opts;
+      this._knowledgeEmbeddingKey = resolved.key;
+      if (!this._sharedInitialized) return;
+
+      const replacement = await this.createSharedKnowledgeIndexer();
+      const previous = this._sharedKnowledgeIndexer;
+      this._sharedKnowledgeIndexer = replacement;
+      if (previous) this._retiredKnowledgeIndexers.push(previous);
+      for (const session of this.sessions.keys()) this.invalidate(session);
+      this.closeRetiredKnowledgeIndexersIfUnused();
+      console.log(`[agentbox-session] Release embedding model applied: model=${resolved.opts.model} dimensions=${resolved.opts.dimensions}`);
+    };
+    const pending = this._knowledgeEmbeddingApply.then(apply, apply);
+    this._knowledgeEmbeddingApply = pending.catch(() => {});
+    return pending;
+  }
+
+  private closeRetiredKnowledgeIndexersIfUnused(): void {
+    if (this._retiredKnowledgeIndexers.length === 0) return;
+    const inUse = new Set(
+      [...this.sessions.values()]
+        .map((session) => session.knowledgeIndexer)
+        .filter((indexer): indexer is MemoryIndexer => indexer !== null),
+    );
+    const retained: MemoryIndexer[] = [];
+    for (const indexer of this._retiredKnowledgeIndexers) {
+      if (inUse.has(indexer)) {
+        retained.push(indexer);
+        continue;
+      }
+      try {
+        indexer.close();
+      } catch (err) {
+        console.warn(`[agentbox-session] Retired knowledge indexer close error:`, err);
+      }
+    }
+    this._retiredKnowledgeIndexers = retained;
   }
 
   /**
@@ -3362,6 +3443,7 @@ export class AgentBoxSessionManager {
       this.clearPendingNotificationState(managed);
       this.sessions.delete(sessionId);
       this.teardownTracing(sessionId, managed);
+      this.closeRetiredKnowledgeIndexersIfUnused();
       emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
@@ -3440,6 +3522,7 @@ export class AgentBoxSessionManager {
         }
       }
       this.sessions.delete(sessionId);
+      this.closeRetiredKnowledgeIndexersIfUnused();
       // Permanent closure — drop the in-memory ledger so it doesn't accumulate
       // (the durable snapshot + Portal task_events remain for history/recovery).
       const hideTimer = this.ledgerHideTimers.get(sessionId);
@@ -3529,6 +3612,15 @@ export class AgentBoxSessionManager {
       }
       this._sharedKnowledgeIndexer = null;
     }
+
+    for (const indexer of this._retiredKnowledgeIndexers) {
+      try {
+        indexer.close();
+      } catch (err) {
+        console.warn(`[agentbox-session] Retired knowledge indexer close error:`, err);
+      }
+    }
+    this._retiredKnowledgeIndexers = [];
 
     this._sharedInitialized = false;
   }

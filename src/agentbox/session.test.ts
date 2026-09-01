@@ -102,6 +102,14 @@ vi.mock("../memory/index.js", () => ({
   })),
 }));
 
+vi.mock("../knowledge/indexer.js", () => ({
+  createKnowledgeIndexer: vi.fn((_knowledgeDir: string, _indexRoot: string, embedding: unknown) => ({
+    embedding,
+    sync: vi.fn(async () => {}),
+    close: vi.fn(),
+  })),
+}));
+
 vi.mock("../memory/session-summarizer.js", () => ({
   saveSessionKnowledge: vi.fn(async () => null),
 }));
@@ -129,6 +137,7 @@ vi.mock("../core/config.js", () => ({
 import { AgentBoxSessionManager } from "./session.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { createMemoryIndexer } from "../memory/index.js";
+import { createKnowledgeIndexer } from "../knowledge/indexer.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import * as subagentRegistry from "../core/subagent-registry.js";
 import { getSubagentConcurrency } from "../core/subagent-registry.js";
@@ -542,6 +551,44 @@ describe("AgentBoxSessionManager — invalidate", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("AgentBoxSessionManager — release embedding model", () => {
+  it("rebuilds the knowledge index and idle sessions when the release descriptor changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const firstConfig = {
+      embedding: { baseUrl: "https://embedding.example/v1/", apiKey: "key-1", model: "emb-1", dimensions: 768 },
+    };
+    await mgr.applyKnowledgeEmbeddingConfig(firstConfig);
+    const first = await mgr.getOrCreate("sess-1");
+    const firstIndexer = vi.mocked(createKnowledgeIndexer).mock.results[0]?.value;
+    if (!firstIndexer) throw new Error("expected first knowledge indexer");
+    expect(createKnowledgeIndexer).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.any(String),
+      { baseUrl: "https://embedding.example/v1", apiKey: "key-1", model: "emb-1", dimensions: 768 },
+    );
+
+    await mgr.applyKnowledgeEmbeddingConfig({
+      embedding: { baseUrl: "https://embedding.example/v1", apiKey: "key-2", model: "emb-2", dimensions: 1024 },
+    });
+    expect(first._invalidated).toBe(true);
+    const second = await mgr.getOrCreate("sess-1");
+    expect(second).not.toBe(first);
+    expect(firstIndexer.close).toHaveBeenCalledOnce();
+    expect(createKnowledgeIndexer).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.any(String),
+      { baseUrl: "https://embedding.example/v1", apiKey: "key-2", model: "emb-2", dimensions: 1024 },
+    );
+  });
+
+  it("fails closed on a malformed release embedding descriptor", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await expect(mgr.applyKnowledgeEmbeddingConfig({ embedding: { model: "emb" } })).rejects.toThrow(
+      /requires baseUrl, model, and positive integer dimensions/,
+    );
   });
 });
 
