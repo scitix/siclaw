@@ -19,27 +19,12 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
-import {
-  canonicalTierConfig,
-  encodeSubagentModelsForDb,
-  normalizeSubagentTierConfig,
-} from "../core/subagent-models.js";
+import { encodeSubagentModelsForDb } from "../core/subagent-models.js";
 import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
-/**
- * Decode an `agents` row's JSON-in-TEXT columns so the REST response carries
- * real objects/arrays, not raw JSON strings. These columns (`model_routing`,
- * `tool_capabilities`) are stored as TEXT-of-JSON (no JSON column type); a raw
- * `SELECT *` returns the undecoded string, which every Web client then has to
- * remember to JSON.parse — a forgotten parse silently mis-renders (see the
- * tool_capabilities echo bug). Decoding here is the single boundary that keeps
- * the wire honest. `safeParseJson` tolerates null / TEXT-string / pre-parsed
- * object, so this is safe across MySQL + SQLite and non-breaking for the
- * already-tolerant frontend coercers.
- */
 /**
  * Reject a tier entry naming a provider/model this deployment does not have.
  *
@@ -72,6 +57,17 @@ async function validateSubagentTierRefs(
   return undefined;
 }
 
+/**
+ * Decode an `agents` row's JSON-in-TEXT columns so the REST response carries
+ * real objects/arrays, not raw JSON strings. These columns (`model_routing`,
+ * `tool_capabilities`, `subagent_models`) are stored as TEXT-of-JSON (no JSON
+ * column type); a raw `SELECT *` returns the undecoded string, which every Web
+ * client then has to remember to JSON.parse — a forgotten parse silently
+ * mis-renders (see the tool_capabilities echo bug). Decoding here is the single
+ * boundary that keeps the wire honest. `safeParseJson` tolerates null /
+ * TEXT-string / pre-parsed object, so this is safe across MySQL + SQLite and
+ * non-breaking for the already-tolerant frontend coercers.
+ */
 function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   if (!row) return row;
   const agentType = normalizeAgentType(row.agent_type);
