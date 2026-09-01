@@ -42,9 +42,12 @@ describe("KnowledgeResolver", () => {
 
     expect(result.status).toBe("direct_hit");
     expect(result.mode).toBe("accelerator");
+    expect(result.wikiRoot).toBe(knowledgeDir);
+    expect(result.indexPath).toBe(path.join(knowledgeDir, "index.md"));
     expect(result.results).toHaveLength(1);
     expect(result.results[0]).toMatchObject({
       file: "b200.md",
+      readPath: path.join(knowledgeDir, "b200.md"),
       title: "B200 Ubuntu driver upgrade",
       score: 0.91,
       routingConfidence: 0.982,
@@ -84,6 +87,7 @@ describe("KnowledgeResolver", () => {
     expect(result.status).toBe("direct_hit");
     expect(result.results.map((page) => page.file)).toEqual(["ops/gpu.md"]);
     expect(result.navigationResults).toEqual([expect.objectContaining({ file: "index.md" })]);
+    expect(result.navigationResults?.[0].readPath).toBe(path.join(knowledgeDir, "index.md"));
     expect(readPage).not.toHaveBeenCalledWith(path.join(knowledgeDir, "index.md"));
   });
 
@@ -168,6 +172,68 @@ describe("KnowledgeResolver", () => {
     expect(readPage).not.toHaveBeenCalled();
   });
 
+  it("does not direct-hit an opposite-action page after FTS drops negation", async () => {
+    const indexer = indexReturning([
+      { file: "enable-gsp.md", heading: "Enable GSP", content: "Enable GSP", startLine: 1, endLine: 5, score: 0.98 },
+    ]);
+    const body = "---\ntitle: Enable GSP\ndescription: Enable GSP on supported GPUs\n---\n# Enable GSP\n";
+    const readPage = vi.fn(async () => body);
+    const resolver = createKnowledgeResolver({
+      indexer,
+      knowledgeDir,
+      inspectPage: vi.fn(async () => body),
+      readPage,
+      evidenceBudgetCharsRef: { current: 8_000 },
+    });
+
+    const result = await resolver.lookup("do not enable GSP");
+
+    expect(result.status).toBe("explore");
+    expect(result.results).toEqual([]);
+    expect(readPage).not.toHaveBeenCalled();
+  });
+
+  it("does not direct-hit a page for a different requested version or year", async () => {
+    const indexer = indexReturning([
+      { file: "b200-2025.md", heading: "B200 driver upgrade 2025", content: "B200 driver upgrade 2025", startLine: 1, endLine: 5, score: 0.98 },
+    ]);
+    const body = "---\ntitle: B200 driver upgrade 2025\ndescription: B200 driver upgrade for the 2025 baseline\n---\n# B200 driver upgrade 2025\n";
+    const readPage = vi.fn(async () => body);
+    const resolver = createKnowledgeResolver({
+      indexer,
+      knowledgeDir,
+      inspectPage: vi.fn(async () => body),
+      readPage,
+      evidenceBudgetCharsRef: { current: 8_000 },
+    });
+
+    const result = await resolver.lookup("B200 driver upgrade 2026");
+
+    expect(result.status).toBe("explore");
+    expect(result.results).toEqual([]);
+    expect(readPage).not.toHaveBeenCalled();
+  });
+
+  it("preserves versions attached directly to a product name", async () => {
+    const indexer = indexReturning([
+      { file: "cuda-12-5.md", heading: "CUDA12.5 install", content: "CUDA12.5 install", startLine: 1, endLine: 5, score: 0.99 },
+    ]);
+    const body = "---\ntitle: CUDA12.5 install\ndescription: Install CUDA12.5\n---\n# CUDA12.5 install\n";
+    const readPage = vi.fn(async () => body);
+    const resolver = createKnowledgeResolver({
+      indexer,
+      knowledgeDir,
+      inspectPage: vi.fn(async () => body),
+      readPage,
+      evidenceBudgetCharsRef: { current: 8_000 },
+    });
+
+    const result = await resolver.lookup("CUDA12.4 install");
+
+    expect(result.status).toBe("explore");
+    expect(readPage).not.toHaveBeenCalled();
+  });
+
   it("leaves two similarly strong pages for Agent-led exploration", async () => {
     const indexer = indexReturning([
       { file: "b200-v1.md", heading: "B200 driver upgrade", content: "B200 Ubuntu driver upgrade", startLine: 1, endLine: 8, score: 0.9 },
@@ -220,7 +286,7 @@ describe("KnowledgeResolver", () => {
     expect(indexer.search).toHaveBeenCalledWith("unknown operational topic", 40, 0.35);
   });
 
-  it("returns matched sections instead of an oversized direct-hit page", async () => {
+  it("keeps an oversized page as an unverified exploration lead", async () => {
     const marker = '<!-- okf:evidence {"id":"step-1","sources":["source-1"]} -->';
     const target = "## B200 driver upgrade\nRun the B200 driver upgrade command.";
     const filler = Array.from({ length: 900 }, () => "Background material.").join("\n");
@@ -240,19 +306,14 @@ describe("KnowledgeResolver", () => {
     });
 
     const result = await resolver.lookup("B200 driver upgrade");
-    const page = result.results[0];
-    const returnedChars = page.sections.reduce((sum, section) => sum + section.content.length, 0);
-
-    expect(result.status).toBe("direct_hit");
-    expect(page).toMatchObject({
-      readMode: "matched_sections",
-      truncated: true,
-      citationMode: "evidence",
-      evidenceRefs: ["large.md#step-1"],
-    });
-    expect(returnedChars).toBeLessThanOrEqual(budget);
-    expect(page.sections[0].content).toContain(marker);
-    expect(page.sections[0].content).toContain("Run the B200 driver upgrade command");
+    expect(result.status).toBe("explore");
+    expect(result.results).toEqual([]);
+    expect(result.explorationHints).toEqual([expect.objectContaining({
+      file: "large.md",
+      readPath: path.join(knowledgeDir, "large.md"),
+    })]);
+    expect(result.message).toContain("too large");
+    expect(readPage).not.toHaveBeenCalled();
   });
 
   it("does not allow an index candidate to escape the mounted knowledge directory", async () => {

@@ -312,24 +312,34 @@ export class MemoryIndexer {
     const ftsWeight = this.searchConfig.ftsWeight ?? DEFAULT_FTS_WEIGHT;
     const candidateK = Math.min(200, Math.max(1, topK * 4));
 
-    // 1. Vector search
-    let vectorResults: Array<{ id: number; score: number }> = [];
-    try {
-      const [queryVec] = await this.embedding.embed([cleaned]);
-      if (queryVec && queryVec.length > 0 && queryVec.some((v) => v !== 0)) {
-        vectorResults = this.vectorSearch(queryVec, candidateK);
+    // Start the optional vector channel, but never serialize local FTS behind
+    // a network endpoint. The built-in provider gives this query call a short,
+    // single-attempt budget; background indexing keeps its independent retry
+    // policy.
+    const vectorPromise = (async (): Promise<Array<{ id: number; score: number }>> => {
+      try {
+        const queryVec = this.embedding.embedQuery
+          ? await this.embedding.embedQuery(cleaned)
+          : (await this.embedding.embed([cleaned]))[0];
+        if (queryVec && queryVec.length > 0 && queryVec.some((v) => v !== 0)) {
+          return this.vectorSearch(queryVec, candidateK);
+        }
+      } catch (err) {
+        console.warn(`[memory-indexer] Vector search failed:`, err);
       }
-    } catch (err) {
-      console.warn(`[memory-indexer] Vector search failed:`, err);
-    }
+      return [];
+    })();
 
-    // 2. FTS5 search
+    // 1. FTS5 search proceeds immediately and remains independently useful.
     let ftsResults: Array<{ id: number; score: number }> = [];
     try {
       ftsResults = this.ftsSearch(cleaned, candidateK);
     } catch (err) {
       console.warn(`[memory-indexer] FTS search failed:`, err);
     }
+
+    // 2. Add vector candidates only when the optional accelerator completed.
+    const vectorResults = await vectorPromise;
 
     // 3. Fuse results
     const scoreMap = new Map<number, { vectorScore: number; ftsScore: number }>();
@@ -344,20 +354,21 @@ export class MemoryIndexer {
       scoreMap.set(r.id, entry);
     }
 
-    // Weights describe the relative contribution of channels that actually
-    // produced candidates. If embeddings are disabled or fail, FTS must use
-    // the full score range instead of being capped by its hybrid-only weight.
-    const activeVectorWeight = vectorResults.length > 0 ? Math.max(0, vectorWeight) : 0;
-    const activeFtsWeight = ftsResults.length > 0 ? Math.max(0, ftsWeight) : 0;
-    const activeWeightTotal = activeVectorWeight + activeFtsWeight;
-    const effectiveVectorWeight = activeWeightTotal > 0 ? activeVectorWeight / activeWeightTotal : 0;
-    const effectiveFtsWeight = activeWeightTotal > 0 ? activeFtsWeight / activeWeightTotal : 0;
-
     const fused = Array.from(scoreMap.entries())
-      .map(([id, { vectorScore, ftsScore }]) => ({
-        id,
-        score: effectiveVectorWeight * vectorScore + effectiveFtsWeight * ftsScore,
-      }))
+      .map(([id, { vectorScore, ftsScore }]) => {
+        // Normalize weights per candidate. A strong exact FTS match must not be
+        // capped at 0.30 merely because some unrelated vector candidate exists,
+        // and the inverse holds for a semantic-only lead.
+        const candidateVectorWeight = vectorScore > 0 ? Math.max(0, vectorWeight) : 0;
+        const candidateFtsWeight = ftsScore > 0 ? Math.max(0, ftsWeight) : 0;
+        const weightTotal = candidateVectorWeight + candidateFtsWeight;
+        return {
+          id,
+          score: weightTotal > 0
+            ? (candidateVectorWeight * vectorScore + candidateFtsWeight * ftsScore) / weightTotal
+            : 0,
+        };
+      })
       .filter((r) => r.score >= minScore)
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateK);

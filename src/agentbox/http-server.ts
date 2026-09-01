@@ -879,7 +879,14 @@ export function createHttpServer(
     // A delegated agent runs under its own configuration; delegation does not
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
-    await sessionManager.applyKnowledgeEmbeddingConfig(body.modelConfig);
+    try {
+      await sessionManager.applyKnowledgeEmbeddingConfig(body.modelConfig);
+    } catch (err) {
+      // Retrieval embeddings are optional acceleration. A malformed release
+      // descriptor must be observable, but it must not prevent the Agent from
+      // answering through the existing FTS/Wiki exploration path.
+      console.warn("[agentbox-http] Ignoring invalid knowledge embedding config; continuing with FTS/Wiki exploration:", err);
+    }
     const managed = await sessionManager.getOrCreate(
       body.sessionId,
       body.mode,

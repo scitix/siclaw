@@ -607,8 +607,9 @@ are intentionally different:
 1. `knowledge_search` is an optional single-page accelerator backed by an
    Agent-scoped `KnowledgeResolver`. Hybrid semantic + FTS retrieval generates
    candidates, but only a unique high-confidence identity-and-passage match is
-   read and returned as `direct_hit`. FTS-only remains functional when
-   embeddings are unavailable.
+   read and returned as `direct_hit`, and only when the complete page fits the
+   evidence budget. Oversized pages remain unverified exploration leads.
+   FTS-only remains functional when embeddings are unavailable.
 2. `grep` / `find` are first-class Wiki exploration tools, not only error
    fallbacks. They preserve exact identifiers, versions, aliases, and let the
    Agent discover material that similarity search did not safely route.

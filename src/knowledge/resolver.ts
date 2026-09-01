@@ -13,6 +13,7 @@ import type {
   KnowledgeNavigationResult,
   KnowledgeResolver,
 } from "./resolver-types.js";
+import { modelKnowledgeLocations, modelKnowledgePath } from "./model-path.js";
 import type { MemoryChunk } from "../memory/types.js";
 import { tokenizeForFts } from "../memory/stop-words.js";
 
@@ -34,6 +35,8 @@ interface PageCandidate {
   metadataScore?: number;
   passageScore?: number;
   routingConfidence?: number;
+  qualifiersMatch?: boolean;
+  inspectedBody?: string;
 }
 
 interface PageMetadata {
@@ -46,14 +49,6 @@ function roundScore(score: number | undefined): number {
   return Math.round((score ?? 0) * 1_000) / 1_000;
 }
 
-function truncateUtf16Safe(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  if (maxLength <= 0) return "";
-  const code = value.charCodeAt(maxLength - 1);
-  const end = code >= 0xd800 && code <= 0xdbff ? maxLength - 1 : maxLength;
-  return value.slice(0, end);
-}
-
 function safePagePath(knowledgeDir: string, file: string): string | null {
   const normalizedFile = file.replaceAll("\\", "/");
   if (!normalizedFile.toLowerCase().endsWith(".md")) return null;
@@ -61,6 +56,24 @@ function safePagePath(knowledgeDir: string, file: string): string | null {
   const relative = path.relative(path.resolve(knowledgeDir), absolutePath);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   return absolutePath;
+}
+
+/**
+ * FTS tokenization is intentionally recall-oriented and drops common negation
+ * words and pure numbers. Those omissions are unsafe at the direct-hit gate:
+ * "enable" is not the same task as "do not enable", and 2025 is not 2026.
+ */
+function tokenizeForRouting(value: string): string[] {
+  const tokens = new Set(tokenizeForFts(value));
+  if (/\b(?:no|not|never|without)\b/iu.test(value) || /(?:不|未|无|没有|禁止|禁用|关闭|关掉|停用)/u.test(value)) {
+    tokens.add("__negated__");
+  }
+  // Do not require word boundaries: versions are often attached to product
+  // names (`CUDA12.4`, `RHEL8`, `B200`).
+  for (const match of value.matchAll(/v?\d+(?:[._/-]\d+)*/giu)) {
+    tokens.add(`__number:${match[0].toLowerCase()}`);
+  }
+  return [...tokens];
 }
 
 function parsePageMetadata(file: string, body: string): PageMetadata {
@@ -112,7 +125,7 @@ function parsePageMetadata(file: string, body: string): PageMetadata {
 
 function metadataCoverage(queryTokens: string[], metadataText: string): number {
   if (queryTokens.length === 0) return 0;
-  const metadataTokens = new Set(tokenizeForFts(metadataText));
+  const metadataTokens = new Set(tokenizeForRouting(metadataText));
   const hits = queryTokens.filter((token) => metadataTokens.has(token)).length;
   return hits / queryTokens.length;
 }
@@ -120,9 +133,16 @@ function metadataCoverage(queryTokens: string[], metadataText: string): number {
 function contentCoverage(queryTokens: string[], candidate: PageCandidate): number {
   if (queryTokens.length === 0) return 0;
   const text = candidate.chunks.map((chunk) => `${chunk.heading} ${chunk.content}`).join(" ");
-  const contentTokens = new Set(tokenizeForFts(text));
+  const contentTokens = new Set(tokenizeForRouting(text));
   const hits = queryTokens.filter((token) => contentTokens.has(token)).length;
   return hits / queryTokens.length;
+}
+
+function routingQualifiersMatch(queryTokens: string[], pageText: string): boolean {
+  const required = queryTokens.filter((token) => token.startsWith("__"));
+  if (required.length === 0) return true;
+  const pageTokens = new Set(tokenizeForRouting(pageText));
+  return required.every((token) => pageTokens.has(token));
 }
 
 function calculateRoutingConfidence(candidate: PageCandidate): number {
@@ -133,10 +153,11 @@ function calculateRoutingConfidence(candidate: PageCandidate): number {
   return 0.8 * coverage + 0.2 * retrieval;
 }
 
-function explorationHint(candidate: PageCandidate, rank: number): KnowledgeExplorationHint {
+function explorationHint(knowledgeDir: string, candidate: PageCandidate, rank: number): KnowledgeExplorationHint {
   return {
     rank,
     file: candidate.file,
+    readPath: modelKnowledgePath(knowledgeDir, candidate.file),
     title: candidate.title ?? path.posix.basename(candidate.file, path.posix.extname(candidate.file)),
     score: roundScore(candidate.score),
     routingConfidence: roundScore(candidate.routingConfidence),
@@ -166,40 +187,6 @@ function extractEvidenceRefs(file: string, content: string): string[] {
   return [...new Set(refs)];
 }
 
-function matchedSections(chunks: MemoryChunk[], body: string, budget: number): KnowledgeEvidenceSection[] {
-  const sections: KnowledgeEvidenceSection[] = [];
-  const seen = new Set<string>();
-  const lines = body.split(/\r?\n/);
-  let remaining = Math.max(0, budget);
-  for (const chunk of chunks) {
-    const key = `${chunk.startLine}:${chunk.endLine}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (remaining <= 0) break;
-    let startIndex = Math.max(0, chunk.startLine - 1);
-    const endIndex = Math.min(lines.length, Math.max(startIndex + 1, chunk.endLine));
-    // OKF evidence markers conventionally sit immediately before the heading
-    // they bind. Include that marker with a matched heading so the returned
-    // snapshot remains citable without returning the rest of a large page.
-    let markerIndex = startIndex - 1;
-    while (markerIndex >= 0 && lines[markerIndex].trim() === "") markerIndex -= 1;
-    if (markerIndex >= 0 && /<!--[ \t]*okf:evidence[ \t]+\{[^\r\n]*\}[ \t]*-->/.test(lines[markerIndex])) {
-      startIndex = markerIndex;
-    }
-    const snapshotContent = lines.slice(startIndex, endIndex).join("\n").trim();
-    const content = truncateUtf16Safe(snapshotContent, remaining);
-    if (!content) break;
-    sections.push({
-      heading: chunk.heading,
-      startLine: startIndex + 1,
-      endLine: endIndex,
-      content,
-    });
-    remaining -= content.length;
-  }
-  return sections;
-}
-
 function groupLeafCandidates(chunks: MemoryChunk[]): PageCandidate[] {
   const byFile = new Map<string, PageCandidate>();
   for (const chunk of chunks) {
@@ -219,11 +206,17 @@ function groupLeafCandidates(chunks: MemoryChunk[]): PageCandidate[] {
   return [...byFile.values()].sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
 }
 
-function navigationResults(chunks: MemoryChunk[]): KnowledgeNavigationResult[] {
+function navigationResults(knowledgeDir: string, chunks: MemoryChunk[]): KnowledgeNavigationResult[] {
   const byFile = new Map<string, KnowledgeNavigationResult>();
   for (const chunk of chunks) {
     if (!isKnowledgeNavigationPath(chunk.file)) continue;
-    const next = { file: chunk.file, heading: chunk.heading, score: roundScore(chunk.score) };
+    if (!safePagePath(knowledgeDir, chunk.file)) continue;
+    const next = {
+      file: chunk.file,
+      readPath: modelKnowledgePath(knowledgeDir, chunk.file),
+      heading: chunk.heading,
+      score: roundScore(chunk.score),
+    };
     const existing = byFile.get(chunk.file);
     if (!existing || next.score > existing.score) byFile.set(chunk.file, next);
   }
@@ -250,11 +243,13 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
   return {
     async lookup(rawQuery: string): Promise<KnowledgeLookupResult> {
       const query = rawQuery.trim();
+      const locations = modelKnowledgeLocations(options.knowledgeDir);
       if (!query) {
         return {
           status: "explore",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           message: "No direct lookup was attempted. Understand the question, then explore the Wiki with Find/Grep/Read.",
         };
@@ -269,14 +264,15 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           status: "unavailable",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           message: `The retrieval accelerator is unavailable (${message}). Continue with Wiki Find/Grep/Read; this does not mean the knowledge is absent.`,
         };
       }
 
       const allChunks = searched.chunks;
-      const navigation = navigationResults(allChunks);
-      const queryTokens = tokenizeForFts(query);
+      const navigation = navigationResults(options.knowledgeDir, allChunks);
+      const queryTokens = tokenizeForRouting(query);
       let candidates: PageCandidate[] = groupLeafCandidates(allChunks).map((candidate) => ({
         ...candidate,
         passageScore: contentCoverage(queryTokens, candidate),
@@ -300,6 +296,8 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
               title: parsed.title,
               metadata: parsed.metadata,
               metadataScore: metadataCoverage(queryTokens, parsed.searchText),
+              qualifiersMatch: routingQualifiersMatch(queryTokens, `${parsed.searchText} ${body}`),
+              inspectedBody: body,
             };
           } catch {
             return candidate;
@@ -324,6 +322,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           status: hadInvalidPath ? "unavailable" : "explore",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
           totalFiles: searched.totalFiles,
@@ -336,7 +335,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
 
       const hints = candidates
         .slice(0, maxExplorationHints)
-        .map((candidate, index) => explorationHint(candidate, index + 1));
+        .map((candidate, index) => explorationHint(options.knowledgeDir, candidate, index + 1));
       const directCandidate = candidates[0];
       const competitor = candidates.slice(1).find((candidate) =>
         (candidate.routingConfidence ?? 0) >= COMPETING_HINT_CONFIDENCE &&
@@ -345,6 +344,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
         (directCandidate.routingConfidence ?? 0) >= DIRECT_HIT_CONFIDENCE &&
         (directCandidate.metadataScore ?? 0) >= DIRECT_HIT_CONFIDENCE &&
         (directCandidate.passageScore ?? 0) >= COMPETING_HINT_CONFIDENCE &&
+        directCandidate.qualifiersMatch !== false &&
         competitor === undefined;
 
       if (!isDirectHit) {
@@ -352,6 +352,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           status: "explore",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           explorationHints: hints,
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
@@ -369,12 +370,29 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           status: "unavailable",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           explorationHints: hints,
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
           totalFiles: searched.totalFiles,
           totalChunks: searched.totalChunks,
           message: "The direct-hit path is invalid. Continue with Wiki Find/Grep/Read.",
+        };
+      }
+
+      const evidenceBudget = Math.max(256, Math.floor(options.evidenceBudgetCharsRef.current));
+      if (directCandidate.inspectedBody !== undefined && directCandidate.inspectedBody.length > evidenceBudget) {
+        return {
+          status: "explore",
+          mode: "accelerator",
+          query,
+          ...locations,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: "The best page is too large for a complete, context-safe direct snapshot. Treat it as an unverified lead and inspect the page and its Wiki neighbors with Find/Grep/Read.",
         };
       }
 
@@ -387,6 +405,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           status: "unavailable",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           explorationHints: hints,
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
@@ -396,11 +415,27 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
         };
       }
 
+      if (directCandidate.inspectedBody !== undefined && body !== directCandidate.inspectedBody) {
+        return {
+          status: "unavailable",
+          mode: "accelerator",
+          query,
+          ...locations,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: "The candidate page changed between validation and evidence registration. Continue with Wiki Find/Grep/Read against the current mount.",
+        };
+      }
+
       if (isKnowledgeNavigationPage(directCandidate.file, body)) {
         return {
           status: "explore",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           explorationHints: hints,
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
@@ -411,36 +446,34 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
       }
 
       const parsed = parsePageMetadata(directCandidate.file, body);
-      const evidenceBudget = Math.max(256, Math.floor(options.evidenceBudgetCharsRef.current));
-      const fullPage = body.length <= evidenceBudget;
-      const sections = fullPage
-        ? [{
-            heading: parsed.title,
-            startLine: 1,
-            endLine: Math.max(1, body.split(/\r?\n/).length),
-            content: body,
-          }]
-        : matchedSections(directCandidate.chunks, body, evidenceBudget);
-      if (sections.length === 0) {
+      if (body.length > evidenceBudget) {
         return {
           status: "explore",
           mode: "accelerator",
           query,
+          ...locations,
           results: [],
           explorationHints: hints,
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
           totalFiles: searched.totalFiles,
           totalChunks: searched.totalChunks,
-          message: "The direct-hit page could not yield a bounded evidence snapshot. Explore the Wiki with Find/Grep/Read.",
+          message: "The best page is too large for a complete, context-safe direct snapshot. Treat it as an unverified lead and inspect the page and its Wiki neighbors with Find/Grep/Read.",
         };
       }
 
+      const sections: KnowledgeEvidenceSection[] = [{
+        heading: parsed.title,
+        startLine: 1,
+        endLine: Math.max(1, body.split(/\r?\n/).length),
+        content: body,
+      }];
       const selectedContent = sections.map((section) => section.content).join("\n");
       const evidenceRefs = extractEvidenceRefs(directCandidate.file, selectedContent);
       const pageHasEvidenceMarkers = /<!--[ \t]*okf:evidence\b/.test(body);
       const result: KnowledgeEvidencePage = {
         rank: 1,
         file: directCandidate.file,
+        readPath: modelKnowledgePath(options.knowledgeDir, directCandidate.file),
         title: parsed.title,
         score: roundScore(directCandidate.score),
         routingConfidence: roundScore(directCandidate.routingConfidence),
@@ -449,8 +482,8 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
           ? { metadataScore: roundScore(directCandidate.metadataScore) }
           : {}),
         ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
-        readMode: fullPage ? "full_page" : "matched_sections",
-        truncated: !fullPage,
+        readMode: "full_page",
+        truncated: false,
         citationMode: evidenceRefs.length > 0 ? "evidence" : pageHasEvidenceMarkers ? "none" : "page",
         ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
         sections,
@@ -460,6 +493,7 @@ export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions)
         status: "direct_hit",
         mode: "accelerator",
         query,
+        ...locations,
         results: [result],
         ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
         totalFiles: searched.totalFiles,

@@ -16,6 +16,8 @@ export interface KnowledgeEvidenceSection {
 export interface KnowledgeEvidencePage {
   rank: number;
   file: string;
+  /** Path accepted directly by the current session's Read tool. */
+  readPath: string;
   title: string;
   score: number;
   /** Conservative routing confidence; it is not answer confidence. */
@@ -30,7 +32,7 @@ export interface KnowledgeEvidencePage {
     tags?: string[];
     timestamp?: string;
   };
-  readMode: "full_page" | "matched_sections";
+  readMode: "full_page";
   truncated: boolean;
   citationMode: "evidence" | "page" | "none";
   evidenceRefs?: string[];
@@ -44,6 +46,8 @@ export interface KnowledgeEvidencePage {
 export interface KnowledgeExplorationHint {
   rank: number;
   file: string;
+  /** Path accepted directly by the current session's Read tool. */
+  readPath: string;
   title: string;
   score: number;
   routingConfidence: number;
@@ -54,6 +58,8 @@ export interface KnowledgeExplorationHint {
 
 export interface KnowledgeNavigationResult {
   file: string;
+  /** Path accepted directly by the current session's Read tool. */
+  readPath: string;
   heading: string;
   score: number;
 }
@@ -62,6 +68,10 @@ export interface KnowledgeLookupResult {
   status: KnowledgeLookupStatus;
   mode: "accelerator";
   query: string;
+  /** Runtime-scoped Wiki root accepted by Find/Grep/Read. */
+  wikiRoot: string;
+  /** Runtime-scoped top-level catalog accepted by Read. */
+  indexPath: string;
   /** Exact page content is present only for a conservative direct hit. */
   results: KnowledgeEvidencePage[];
   /** Unverified routing hints for Find/Grep/Read exploration. */

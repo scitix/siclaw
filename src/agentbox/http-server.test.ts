@@ -241,6 +241,7 @@ function makeFakeSessionManager() {
     close: async (id: string) => { sessions.delete(id); },
     closeAll: async () => { sessions.clear(); },
     resetMemory: async () => {},
+    applyKnowledgeEmbeddingConfig: vi.fn(async () => {}),
     scheduleRelease: (_id: string) => {},
     invalidate: (_id: string) => {},
     setDelegationModel: vi.fn(),
@@ -1051,6 +1052,19 @@ describe("http-server — model switching", () => {
     const r = await getJson(port, "/api/sessions/m4/model", "PUT", { provider: "openai", modelId: "gpt-4" });
     expect(r.status).toBe(200);
     expect(r.data.ok).toBe(true);
+  });
+
+  it("POST /api/prompt keeps answering when optional embedding config is invalid", async () => {
+    sm.applyKnowledgeEmbeddingConfig.mockRejectedValueOnce(new Error("bad embedding descriptor"));
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "use the Wiki",
+      modelConfig: { embedding: { model: "broken" } },
+    });
+
+    expect(r.status).toBe(200);
+    expect(r.data.ok).toBe(true);
+    expect(sm.applyKnowledgeEmbeddingConfig).toHaveBeenCalledOnce();
   });
 
   it("PUT /api/sessions/:id/model marks a strict user model selection and clears route cooldowns", async () => {

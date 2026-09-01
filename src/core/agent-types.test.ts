@@ -1,6 +1,13 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import { AGENT_TYPES, normalizeAgentType, effectiveAgentPrompt, effectiveCapabilityKeys } from "./agent-types.js";
+import {
+  AGENT_TYPES,
+  LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT,
+  PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT,
+  normalizeAgentType,
+  effectiveAgentPrompt,
+  effectiveCapabilityKeys,
+} from "./agent-types.js";
 
 describe("agent-types", () => {
   it("has the four designed types; built-ins lock caps and supply editable prompt defaults", () => {
@@ -73,5 +80,14 @@ describe("agent-types", () => {
     expect(effectiveAgentPrompt("knowledge_qa", null)).toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("custom", "custom truth")).toBe("custom truth");
     expect(effectiveAgentPrompt("custom", "")).toBeUndefined();
+  });
+
+  it("upgrades only exact materialized Knowledge QA defaults", () => {
+    expect(effectiveAgentPrompt("knowledge_qa", LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT))
+      .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
+    expect(effectiveAgentPrompt("knowledge_qa", PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT))
+      .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
+    expect(effectiveAgentPrompt("knowledge_qa", `${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`))
+      .toBe(`${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`);
   });
 });

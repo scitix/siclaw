@@ -15,6 +15,8 @@ export interface MemorySearchResult {
 
 export interface EmbeddingProvider {
   embed(texts: string[]): Promise<number[][]>;
+  /** Latency-bounded single-query embedding used only by interactive search. */
+  embedQuery?(text: string): Promise<number[]>;
   dimensions: number;
   model: string;
   /** Max input tokens per text. Texts exceeding this are truncated before embedding. */

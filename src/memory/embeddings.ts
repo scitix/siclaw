@@ -6,6 +6,8 @@ interface EmbeddingOpts {
   model?: string;
   dimensions?: number;
   maxInputTokens?: number;
+  /** Knowledge retrieval must fail fast; investigation-memory indexing may retry durably. */
+  requestProfile?: "durable" | "accelerator";
 }
 
 const DEFAULT_BASE_URL = "";
@@ -15,6 +17,7 @@ const DEFAULT_MAX_INPUT_TOKENS = 8192;
 
 const MAX_RETRIES = 3;
 const TIMEOUT_MS = 30_000;
+const QUERY_TIMEOUT_MS = 1_500;
 const MAX_RETRY_DELAY_MS = 8000;
 /** Max estimated tokens per embedding API batch */
 const BATCH_MAX_TOKENS = 8000;
@@ -27,6 +30,9 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
   const model = opts?.model ?? DEFAULT_MODEL;
   const dimensions = opts?.dimensions ?? DEFAULT_DIMENSIONS;
   const maxInputTokens = opts?.maxInputTokens ?? DEFAULT_MAX_INPUT_TOKENS;
+  const batchPolicy = opts?.requestProfile === "accelerator"
+    ? { maxAttempts: 1, timeoutMs: QUERY_TIMEOUT_MS }
+    : { maxAttempts: MAX_RETRIES, timeoutMs: TIMEOUT_MS };
 
   /** Estimate token count from text (rough: 1 token ≈ 4 bytes UTF-8) */
   const estimateTokens = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf-8") / 4);
@@ -49,12 +55,15 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
     return text.slice(0, lo);
   };
 
-  /** Send a single batch to the embedding API with retries */
-  const embedBatch = async (texts: string[]): Promise<number[][]> => {
+  /** Send a single batch to the embedding API under an explicit latency policy. */
+  const embedBatch = async (
+    texts: string[],
+    policy: { maxAttempts: number; timeoutMs: number } = { maxAttempts: MAX_RETRIES, timeoutMs: TIMEOUT_MS },
+  ): Promise<number[][]> => {
     if (texts.length === 0) return [];
 
     let lastError: Error | undefined;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < policy.maxAttempts; attempt++) {
       try {
         const resp = await fetch(`${baseUrl}/embeddings`, {
           method: "POST",
@@ -66,7 +75,7 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
             model,
             input: texts,
           }),
-          signal: AbortSignal.timeout(TIMEOUT_MS),
+          signal: AbortSignal.timeout(policy.timeoutMs),
         });
 
         if (!resp.ok) {
@@ -75,7 +84,7 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
           // 4xx errors are not retryable, except 429 (rate limit)
           if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) throw err;
           lastError = err;
-          await sleep(retryDelay(attempt));
+          if (attempt < policy.maxAttempts - 1) await sleep(retryDelay(attempt));
           continue;
         }
 
@@ -91,7 +100,7 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
         // Don't retry abort errors or non-retryable 4xx (but allow 429)
         if (lastError.name === "AbortError") throw lastError;
         if (/API error 4\d\d/.test(lastError.message) && !lastError.message.includes("API error 429")) throw lastError;
-        if (attempt < MAX_RETRIES - 1) {
+        if (attempt < policy.maxAttempts - 1) {
           await sleep(retryDelay(attempt));
         }
       }
@@ -132,11 +141,19 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
       // Process batches sequentially
       const allResults: number[][] = [];
       for (const batch of batches) {
-        const results = await embedBatch(batch);
+        const results = await embedBatch(batch, batchPolicy);
         allResults.push(...results);
       }
 
       return allResults;
+    },
+    async embedQuery(text: string): Promise<number[]> {
+      if (!text || !baseUrl) return [];
+      const [result] = await embedBatch(
+        [truncateToLimit(text)],
+        { maxAttempts: 1, timeoutMs: QUERY_TIMEOUT_MS },
+      );
+      return result ?? [];
     },
   };
 }

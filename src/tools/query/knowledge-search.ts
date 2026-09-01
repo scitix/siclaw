@@ -38,7 +38,7 @@ export function createKnowledgeSearchTool(
       "Optional accelerator for a concrete knowledge question that likely has one direct page answer. " +
       "Use it at most once per user turn with the question as asked; do not repeatedly rewrite or search. " +
       "A direct_hit contains one page snapshot, but similarity is not proof: validate subject, task, version, environment, and scope before using it, then cite only material actually used. " +
-      "An explore result contains unverified page hints, not evidence. Continue with Find/Grep/Read over `.siclaw/knowledge/index.md` and linked pages for broad, novel, ambiguous, comparative, weak-match, or cross-page questions. " +
+      "An explore result contains unverified page hints, not evidence. Continue with Find/Grep/Read using the returned indexPath, readPath hints, and linked pages for broad, novel, ambiguous, comparative, weak-match, or cross-page questions. " +
       "Unavailable also means use Wiki exploration; neither status means the knowledge is absent. Bound Skills supplement domain reasoning and must not replace it.",
     parameters: Type.Object({
       query: Type.String({ description: "The user's original knowledge question, including any product, version, environment, and task details they supplied." }),
@@ -49,6 +49,8 @@ export function createKnowledgeSearchTool(
       if (currentTurn !== undefined && cache?.turn === currentTurn) {
         const repeated = {
           status: "already_resolved",
+          wikiRoot: cache.result.wikiRoot,
+          indexPath: cache.result.indexPath,
           message: "The retrieval accelerator was already used this turn. Do not call it again; validate the direct page or continue Wiki exploration with Find/Grep/Read.",
         };
         return {

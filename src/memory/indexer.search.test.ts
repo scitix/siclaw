@@ -186,6 +186,32 @@ describe("MemoryIndexer.search", () => {
     expect(result.chunks[0]).toMatchObject({ file: "catcher.md", score: 1 });
   });
 
+  it("does not suppress an FTS-only exact candidate when vectors return a different page", async () => {
+    indexer.close();
+    const splitEmbedding: EmbeddingProvider = {
+      model: "split-channels",
+      dimensions: 2,
+      async embed(texts: string[]) {
+        return texts.map((text) => text.includes("semantic-anchor") ? [1, 0] : [0, 1]);
+      },
+      async embedQuery() {
+        return [1, 0];
+      },
+    };
+    indexer = new MemoryIndexer(path.join(tmpDir, "split.db"), memoryDir, splitEmbedding);
+    fs.writeFileSync(path.join(memoryDir, "semantic.md"), "# Semantic\n\nsemantic-anchor concept");
+    fs.writeFileSync(path.join(memoryDir, "exact.md"), "# Exact\n\nexact-key exact-key exact-key");
+    await indexer.sync();
+
+    const result = await indexer.search("exact-key", 10, 0.35);
+
+    expect(result.chunks.map((chunk) => chunk.file)).toEqual(expect.arrayContaining([
+      "semantic.md",
+      "exact.md",
+    ]));
+    expect(result.chunks.find((chunk) => chunk.file === "exact.md")?.score).toBeGreaterThanOrEqual(0.35);
+  });
+
   it("CJK query uses OR join and still returns results", async () => {
     fs.writeFileSync(
       path.join(memoryDir, "cn.md"),

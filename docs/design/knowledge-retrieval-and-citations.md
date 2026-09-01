@@ -26,8 +26,9 @@ This contract has six consequences:
 2. A search candidate is a hypothesis, not evidence and not proof that the page
    applies to the user's subject, task, version, environment, or scope.
 3. Only one unique, high-confidence leaf page may take the direct-hit fast path.
-   Weak or competing matches return exploration hints without reading or
-   registering them as evidence.
+   The complete page must fit the evidence budget. Weak, competing, or
+   oversized matches return exploration hints without reading or registering
+   them as evidence.
 4. `explore` and `unavailable` never mean the Wiki lacks an answer. They hand
    discovery back to the Agent through `index.md`, links, Find, Grep, and Read.
 5. `index.md`, `_index.md`, and pages with `type: index` are navigation, never
@@ -77,6 +78,21 @@ MMR; FTS remains functional when no embedding model is configured or an
 embedding request fails. Embeddings improve recall but have no authority to
 decide that a page answers the question.
 
+Interactive search starts local FTS immediately. Query embedding is a
+single-attempt optional network call with a short timeout. Knowledge-index
+materialization uses the same fail-fast network profile, while investigation
+memory keeps its separate durable retry policy. Scores are normalized per
+candidate across only the channels that found that candidate. Therefore a
+strong FTS-only exact match is
+not capped by the configured FTS hybrid weight merely because vectors found a
+different page, and an unavailable or slow embedding endpoint degrades to the
+same FTS candidate path used when embeddings are not configured.
+
+Malformed release embedding descriptors are logged at the AgentBox boundary
+but do not reject the user's prompt. The current FTS/Wiki path remains usable;
+model-registration correctness is therefore observable without making an
+optional accelerator a question-answering availability dependency.
+
 The resolver makes one search with the user's original question. It does not
 rewrite weak queries or retry with entity fragments, because query expansion
 can silently change intent. It removes navigation pages, aggregates chunks by
@@ -87,6 +103,12 @@ then combines:
 - query-term coverage in page identity metadata such as path, title,
   description, and tags;
 - query-term coverage in the matched passages.
+
+The direct-hit gate additionally preserves intent qualifiers that recall-
+oriented FTS tokenization may discard, including explicit negation and numeric
+version/date tokens. A page for an opposite action or a different requested
+version can remain an exploration lead but cannot become a direct hit merely
+because the remaining words overlap.
 
 A direct hit requires a conservative threshold in all three dimensions and no
 similarly strong competing page. This intentionally prefers false negatives:
@@ -99,10 +121,12 @@ Those fields make a known user phrasing part of the page's identity signal; they
 do not force selection, bypass competing-page detection, or become answer text.
 
 Only the winning direct-hit page is read through the current-turn citation
-registrar. Small pages are returned whole; large pages return matched sections
-under the context-derived evidence budget. The exact page snapshot has a stable
-`resultId`. Even then, the Agent must validate subject, task, version,
-environment, and scope and may reject the hit and explore the Wiki instead.
+registrar. A direct hit is returned only when the complete page fits the
+context-derived evidence budget; large pages remain unverified exploration
+leads because isolated matched sections can omit applicability, deprecation,
+version, or conflict context. The exact page snapshot has a stable `resultId`.
+Even then, the Agent must validate subject, task, version, environment, and
+scope and may reject the hit and explore the Wiki instead.
 
 For weak or ambiguous matches the resolver returns `explore` with bounded,
 unverified page hints and no page body. Those hints are leads for Agent
@@ -112,8 +136,11 @@ exploration instruction. Repeated calls in one turn return an
 looping through query rewrites.
 
 The prompt does not inline a large `index.md`, because that inflates every first
-turn and a truncated catalog creates false absence. The full catalog remains
-readable at `.siclaw/knowledge/index.md`; omitting it from the prompt is a
+turn and a truncated catalog creates false absence. The runtime injects the
+actual scoped Wiki root and top-level `indexPath`; results also return
+model-usable `readPath` values. In Kubernetes this may be the configured
+`.siclaw/knowledge` mount, while LocalSpawner and Portal CLI layouts may use an
+Agent-scoped or custom directory. Omitting the catalog from the prompt is a
 context-budget choice, not a transfer of discovery authority to search.
 
 ### Next retrieval stage

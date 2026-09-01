@@ -89,7 +89,9 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("task_create");
     expect(context.systemPrompt).not.toContain("spawn_subagent");
     expect(context.systemPrompt).not.toContain("delete/evict/cordon");
-    expect(context.systemPrompt).toContain("knowledge_search");
+    // Retrieval policy is injected with the runtime-scoped Wiki context, not
+    // materialized into the editable Agent identity without a mounted Wiki.
+    expect(context.systemPrompt).not.toContain("knowledge_search");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
     expect(context.harness.includeBundledSkills).toBe(false);
     expect(context.harness.mcpExposure).toBe("configured");

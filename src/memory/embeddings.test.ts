@@ -69,7 +69,28 @@ describe("createEmbeddingProvider", () => {
     const fetchSpy = vi.fn();
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
     expect(await p.embed(["hello"])).toEqual([]);
+    expect(await p.embedQuery?.("hello")).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses a single network attempt for interactive query embedding", async () => {
+    const fetchMock = vi.fn(async () => new Response("temporarily unavailable", { status: 503 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const p = createEmbeddingProvider({ baseUrl: "http://fake" });
+
+    await expect(p.embedQuery?.("catcher model id")).rejects.toThrow(/API error 503/);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses fail-fast indexing for the retrieval accelerator profile", async () => {
+    const fetchMock = vi.fn(async () => new Response("temporarily unavailable", { status: 503 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const p = createEmbeddingProvider({ baseUrl: "http://fake", requestProfile: "accelerator" });
+
+    await expect(p.embed(["page content"])).rejects.toThrow(/API error 503/);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("calls fetch with Bearer auth when apiKey given", async () => {

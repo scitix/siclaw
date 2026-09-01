@@ -125,14 +125,22 @@ Whitelist-only model with 4-pass validation: binary allowlist → per-command va
 Memory search needs to handle both semantic similarity ("find memories about OOMKilled pods") and exact keyword matching ("find memories mentioning node-23"). Pure vector search misses exact terms; pure BM25 misses semantic similarity.
 
 **Decision**:
-Hybrid scoring: `score = vectorWeight × cosineSimilarity + ftsWeight × BM25`
+Generate candidates independently with FTS5 and, when configured, vector
+similarity. Fuse each candidate using only the channels that found that
+candidate:
 
-Default: `vectorWeight = 0.70`, `ftsWeight = 0.30` (source: `src/memory/indexer.ts:14-15`). Configurable via `MemorySearchConfig`.
+`score = Σ(channelWeight × channelScore) / Σ(activeCandidateChannelWeights)`
+
+Defaults are `vectorWeight = 0.70` and `ftsWeight = 0.30`, configurable via
+`MemorySearchConfig`. Query embeddings use one short, non-retrying request;
+background indexing retains its separate batching and retry policy. FTS starts
+without waiting for the embedding network call.
 
 **Consequences**:
 - ✅ Handles both "find semantically similar incidents" and "find the exact error message I saw"
 - ✅ CJK-aware: Chinese queries use bigram OR matching; Latin queries use AND
-- ⚠️ Requires embedding API to be configured — memory search is unavailable without it
+- ✅ FTS-only search remains available when embeddings are unconfigured, slow, or fail
+- ✅ A candidate found by only one channel retains that channel's full score range
 - ⚠️ In-memory cosine similarity over all chunks: acceptable for personal-scale (~1000 chunks), not for team-scale (use sqlite-vec extension for that)
 
 **Future**: When chunk count consistently exceeds ~10k, evaluate sqlite-vec GPU-accelerated vector search.

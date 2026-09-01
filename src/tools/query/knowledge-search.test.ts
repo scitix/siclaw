@@ -8,9 +8,12 @@ function directHitResult(query: string): KnowledgeLookupResult {
     status: "direct_hit",
     mode: "accelerator",
     query,
+    wikiRoot: ".siclaw/knowledge/a",
+    indexPath: ".siclaw/knowledge/a/index.md",
     results: [{
       rank: 1,
       file: "gpu.md",
+      readPath: ".siclaw/knowledge/a/gpu.md",
       title: "GPU SOP",
       score: 0.9,
       routingConfidence: 0.95,
@@ -38,6 +41,8 @@ describe("knowledge_search", () => {
     expect((tool.parameters as any).properties).toEqual({
       query: expect.any(Object),
     });
+    expect(tool.description).toContain("returned indexPath");
+    expect(tool.description).not.toContain(".siclaw/knowledge/index.md");
   });
 
   it("reuses the first lookup in the same turn and refreshes on the next turn", async () => {
@@ -54,6 +59,8 @@ describe("knowledge_search", () => {
     expect(payload(first).query).toBe("first");
     expect(payload(repeated)).toEqual({
       status: "already_resolved",
+      wikiRoot: ".siclaw/knowledge/a",
+      indexPath: ".siclaw/knowledge/a/index.md",
       message: "The retrieval accelerator was already used this turn. Do not call it again; validate the direct page or continue Wiki exploration with Find/Grep/Read.",
     });
     expect(repeated.details).toMatchObject({ reused: true, resultCount: 1 });
