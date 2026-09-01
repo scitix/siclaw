@@ -26,6 +26,17 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import forge from "node-forge";
 
+/**
+ * How long an AgentBox client certificate lives.
+ *
+ * ⚠️ COUPLED TO k8s-spawner's CERT_RENEW_THRESHOLD_MS, which must stay comfortably
+ * below it — renewal replaces a certificate once it is within the threshold of
+ * expiring, so a validity SHORTER than the threshold would mean every certificate is
+ * always due for renewal: re-minted on every tick and on every cold spawn. There is a
+ * test binding the two; shortening this without revisiting that is the trap.
+ */
+export const AGENTBOX_CERT_VALIDITY_DAYS = 30;
+
 /** CA validity: 10 years */
 const CA_VALIDITY_DAYS = 3650;
 
@@ -182,7 +193,7 @@ export class CertificateManager {
     });
 
     const issuedAt = new Date();
-    const expiresAt = new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(issuedAt.getTime() + AGENTBOX_CERT_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
 
     const cert = CertificateManager.createCertificateStatic({
       subject: { CN: agentId, O: orgId, serialNumber: boxId },
@@ -190,7 +201,7 @@ export class CertificateManager {
       publicKey,
       signingKey: this.caKey,
       isCA: false,
-      validityDays: 30,
+      validityDays: AGENTBOX_CERT_VALIDITY_DAYS,
       extendedKeyUsage: ["clientAuth", "serverAuth"],
       // AgentBox cert is also used to terminate HTTPS on the AgentBox side.
       // Include SANs so the Runtime (and any mTLS client) can verify hostnames
@@ -211,6 +222,36 @@ export class CertificateManager {
       ca: this.caCert,
       identity: { agentId, orgId, boxId, issuedAt, expiresAt },
     };
+  }
+
+  /**
+   * Read the identity a certificate ASSERTS, without judging whether it is still
+   * usable. Returns undefined only when the PEM cannot be parsed at all.
+   *
+   * ⚠️ NOT AN AUTHENTICATION PRIMITIVE — it checks neither the CA signature nor the
+   * validity window, so it must never gate a request; verifyCertificate is what does
+   * that. It exists for renewal: reissuing a certificate has to carry the SAME
+   * subject forward (the org in particular, which nothing else on the stored Secret
+   * records). Steady-state renewal runs a week early and so normally sees a valid
+   * certificate; the reason verifyCertificate cannot be used anyway is the RECOVERY
+   * case — an already-lapsed certificate, which it correctly refuses to say anything
+   * about, and which is exactly what an agent that has already gone dark is holding.
+   *
+   * The caller must cross-check what this returns against an independent witness
+   * before acting on it; k8s-spawner compares it with the Secret's own agent label.
+   */
+  readAssertedIdentity(clientCert: string): { agentId: string; orgId: string; boxId: string } | undefined {
+    try {
+      const cert = forge.pki.certificateFromPem(clientCert);
+      const getAttr = (name: string) =>
+        cert.subject.attributes.find((attr: any) => attr.name === name)?.value as string | undefined;
+      const agentId = getAttr("commonName");
+      const boxId = getAttr("serialNumber");
+      if (!agentId || !boxId) return undefined;
+      return { agentId, orgId: getAttr("organizationName") || "", boxId };
+    } catch {
+      return undefined;
+    }
   }
 
   /** Verify and extract identity from a client certificate. */

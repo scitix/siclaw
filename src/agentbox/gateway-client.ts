@@ -7,8 +7,7 @@
 
 import http from "node:http";
 import https from "node:https";
-import fs from "node:fs";
-import path from "node:path";
+import { ReloadingCertMaterial, certMaterialExists } from "./cert-reloader.js";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
@@ -41,7 +40,14 @@ export interface AgentTask {
 
 export class GatewayClient {
   private gatewayUrl: string;
-  private tlsOptions: https.RequestOptions | null = null;
+  /**
+   * Reloading rather than a snapshot: this used to be read once in the constructor,
+   * so a pod outlived its own certificate. An AgentBox cert is valid for 30 days
+   * while a resident pod runs indefinitely, and every call after expiry failed with
+   * `socket hang up` — the Gateway closing the connection on an expired client cert
+   * — with no way back short of recreating the pod.
+   */
+  private certs: ReloadingCertMaterial | null = null;
   private sessionId?: string;
 
   constructor(options: GatewayClientOptions) {
@@ -51,22 +57,30 @@ export class GatewayClient {
     // Load client certificates if certPath provided
     const certPath = options.certPath || process.env.SICLAW_CERT_PATH || "/etc/siclaw/certs";
 
-    const certFile = path.join(certPath, "tls.crt");
-    const keyFile = path.join(certPath, "tls.key");
-    const caFile = path.join(certPath, "ca.crt");
-
     // Check if certificate files exist
-    if (fs.existsSync(certFile) && fs.existsSync(keyFile) && fs.existsSync(caFile)) {
-      this.tlsOptions = {
-        cert: fs.readFileSync(certFile),
-        key: fs.readFileSync(keyFile),
-        ca: fs.readFileSync(caFile),
-        rejectUnauthorized: true, // Verify Gateway's certificate
-      };
+    if (certMaterialExists(certPath)) {
+      this.certs = new ReloadingCertMaterial(certPath, undefined, "gateway-client");
       console.log(`[gateway-client] Loaded client certificates from ${certPath}`);
     } else {
       console.warn(`[gateway-client] Client certificates not found at ${certPath}, will use plain HTTP`);
     }
+  }
+
+  /**
+   * mTLS options for one request, re-read from disk if the mounted Secret changed.
+   *
+   * Resolved per call, never cached on the instance: a renewal has to reach the very
+   * next request, and this client is long-lived by design.
+   */
+  private tlsRequestOptions(): https.RequestOptions | null {
+    const material = this.certs?.current();
+    if (!material) return null;
+    return {
+      cert: material.cert,
+      key: material.key,
+      ca: material.ca,
+      rejectUnauthorized: true, // Verify Gateway's certificate
+    };
   }
 
   /**
@@ -182,7 +196,7 @@ export class GatewayClient {
         path: url.pathname,
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        ...(isHttps && this.tlsOptions ? this.tlsOptions : {}),
+        ...(isHttps ? this.tlsRequestOptions() ?? {} : {}),
       };
       const client = isHttps ? https : http;
       let result: DelegateResponse | undefined;
@@ -293,7 +307,7 @@ export class GatewayClient {
         headers: {
           "Content-Type": "application/json",
         },
-        ...(isHttps && this.tlsOptions ? this.tlsOptions : {}),
+        ...(isHttps ? this.tlsRequestOptions() ?? {} : {}),
       };
 
       const client = isHttps ? https : http;
