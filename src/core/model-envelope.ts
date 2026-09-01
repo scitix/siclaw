@@ -13,6 +13,15 @@ export interface ModelEnvelopeManifest {
   };
 }
 
+/**
+ * Sensitive in-memory view used only by the explicit prompt inspection path.
+ * Never serialize this into ordinary logs, traces, or sync-status payloads.
+ */
+export interface ModelEnvelopeInspection {
+  systemPrompt: string;
+  toolSchemas: unknown[];
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -63,6 +72,27 @@ function toolName(value: unknown): string | undefined {
  * and user content stay private.
  */
 export function inspectModelEnvelope(payload: unknown): ModelEnvelopeManifest {
+  const inspection = extractModelEnvelopeInspection(payload);
+  const system = inspection.systemPrompt;
+  const toolSchemas = inspection.toolSchemas;
+  const names = [...new Set(toolSchemas.map(toolName).filter((name): name is string => Boolean(name)))].sort();
+
+  return {
+    system: { chars: system.length, sha256: sha256(system) },
+    tools: { names, schemaSha256: sha256(JSON.stringify(toolSchemas)) },
+    markers: {
+      sreIdentity: system.includes("specialist SRE agent"),
+      infrastructureGuidance: system.includes("# SRE Work Policy") || system.includes("# Infrastructure Access"),
+      operationalSafety: system.includes("# Operational Safety"),
+      memoryGuidance: system.includes("# Memory — Search On Demand"),
+      planningGuidance: system.includes("making a plan with `task_create` is your FIRST move"),
+      subagentGuidance: system.includes("make **one `spawn_subagent` call"),
+    },
+  };
+}
+
+/** Extract only model-visible system instructions and tool schemas. */
+export function extractModelEnvelopeInspection(payload: unknown): ModelEnvelopeInspection {
   const record = payload && typeof payload === "object"
     ? payload as Record<string, unknown>
     : {};
@@ -76,22 +106,8 @@ export function inspectModelEnvelope(payload: unknown): ModelEnvelopeManifest {
   instructions.push(...instructionMessages(record.messages));
   instructions.push(...instructionMessages(record.input));
 
-  const system = instructions.join("\n\n");
-  const names = Array.isArray(record.tools)
-    ? [...new Set(record.tools.map(toolName).filter((name): name is string => Boolean(name)))].sort()
-    : [];
-  const toolSchemas = Array.isArray(record.tools) ? record.tools : [];
-
   return {
-    system: { chars: system.length, sha256: sha256(system) },
-    tools: { names, schemaSha256: sha256(JSON.stringify(toolSchemas)) },
-    markers: {
-      sreIdentity: system.includes("specialist SRE agent"),
-      infrastructureGuidance: system.includes("# Infrastructure Access"),
-      operationalSafety: system.includes("# Operational Safety"),
-      memoryGuidance: system.includes("# Memory — Search On Demand"),
-      planningGuidance: system.includes("making a plan with `task_create` is your FIRST move"),
-      subagentGuidance: system.includes("make **one `spawn_subagent` call"),
-    },
+    systemPrompt: instructions.join("\n\n"),
+    toolSchemas: Array.isArray(record.tools) ? record.tools : [],
   };
 }

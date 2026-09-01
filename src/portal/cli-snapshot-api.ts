@@ -45,7 +45,6 @@ import { safeParseSkillFiles } from "../shared/skill-package.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
 import { resolveSnapshotModelRouting } from "./model-routing-config.js";
 import {
-  effectiveAgentPrompt,
   effectiveCapabilityKeys,
   requireAgentType,
 } from "../core/agent-types.js";
@@ -555,10 +554,10 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           name: activeAgent.name,
           description: activeAgent.description,
           agentType: activeAgentType!,
-          systemPrompt: effectiveAgentPrompt(
-            activeAgentType!,
-            activeAgent.system_prompt,
-          ) ?? null,
+          // Carry the stored addendum/raw compatibility value. The context
+          // compiler owns the immutable type contract and recognizes older
+          // rows that materialized a built-in default.
+          systemPrompt: activeAgent.system_prompt ?? null,
           modelProvider: activeAgent.model_provider,
           modelId: activeAgent.model_id,
           ...(modelRoutingOut ? { modelRouting: modelRoutingOut } : {}),

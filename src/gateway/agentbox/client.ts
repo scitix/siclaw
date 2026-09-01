@@ -49,7 +49,7 @@ export interface PromptOptions {
   modelFingerprint?: string;
   /** Agent ID (for logging/context) */
   agentId?: string;
-  /** Custom system prompt template from agent settings */
+  /** Agent-owned Addendum (legacy wire field name). */
   systemPromptTemplate?: string;
   /** Full provider config for dynamic registration (from gateway DB) */
   modelConfig?: {

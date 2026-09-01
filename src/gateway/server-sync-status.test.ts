@@ -364,3 +364,65 @@ describe("agent.syncStatus RPC", () => {
     ]);
   });
 });
+
+describe("agent.promptInspection RPC", () => {
+  const inspection = {
+    version: "prompt-inspection/v1",
+    stage: "provider_wire",
+    agentType: "knowledge_qa",
+    mode: "web",
+    prompt: { text: "exact effective prompt", chars: 22, sha256: "same-hash" },
+    layers: [],
+    tools: [],
+    skills: [],
+    design: { standard: "siclaw-prompt-design/v1", verdict: "pass", checks: [], references: [] },
+  };
+
+  it("returns one exact inspection and hash-only replica observations", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    getJsonByEndpoint.set("https://b1", async () => inspection);
+    getJsonByEndpoint.set("https://b2", async () => ({ ...inspection }));
+    server = await bootRuntime();
+    const inspect = server.rpcMethods.get("agent.promptInspection")!;
+
+    const result = await inspect({ agentId: "preview", sessionId: "session/1" }, { sendEvent: vi.fn() } as any);
+
+    expect(result).toMatchObject({
+      ok: true,
+      available: true,
+      consistent: true,
+      inspection: { prompt: { text: "exact effective prompt", sha256: "same-hash" } },
+      observations: [
+        { boxId: "b1", available: true, promptSha256: "same-hash", stage: "provider_wire" },
+        { boxId: "b2", available: true, promptSha256: "same-hash", stage: "provider_wire" },
+      ],
+    });
+    expect(JSON.stringify(result.observations)).not.toContain("exact effective prompt");
+    expect(getJsonCalls.map((call) => call.path)).toEqual([
+      "/api/sessions/session%2F1/prompt-inspection",
+      "/api/sessions/session%2F1/prompt-inspection",
+    ]);
+  });
+
+  it("reports a released session without returning prompt text", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+    ];
+    getJsonByEndpoint.set("https://b1", async () => { throw { status: 404 }; });
+    server = await bootRuntime();
+    const inspect = server.rpcMethods.get("agent.promptInspection")!;
+
+    await expect(inspect(
+      { agentId: "preview", sessionId: "released" },
+      { sendEvent: vi.fn() } as any,
+    )).resolves.toEqual({
+      ok: true,
+      available: false,
+      reason: "session_not_resident",
+      observations: [{ boxId: "b1", available: false, reason: "session_not_resident" }],
+    });
+  });
+});
