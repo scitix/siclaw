@@ -106,8 +106,62 @@ fi
 chown -R agentbox:agentbox /app/.siclaw/skills 2>/dev/null || true
 chmod 0755 /app/.siclaw/skills 2>/dev/null || true
 
-chown -R agentbox:agentbox /app/.siclaw/user-data 2>/dev/null || true
-chmod 0777 /app/.siclaw/user-data 2>/dev/null || true
+# 🔴 user-data is the one directory here that is NOT a local emptyDir: it is a subPath on a
+# shared NFS PVC, and EVERY box of an agent mounts the SAME path (by design — session history
+# lives there, so a session can be picked up by another box). Two consequences that an
+# unconditional `chown -R` gets badly wrong:
+#
+#   - It is O(agent's whole history), over NFS, one SETATTR round trip per file, and that
+#     history only grows. It ran BEFORE node starts and is silent, so it was invisible from
+#     every angle: it consumed the entire 60s startupProbe window, kubelet killed the
+#     container, and under `restartPolicy: Never` that is permanent. The box's own startup
+#     work, once it got to run, took 0.4 seconds.
+#   - Boxes starting together each run it over the SAME inodes — the same idempotent work N
+#     times, contending on one NFS server, while any already-serving box takes the IO hit.
+#
+# So the root directory's ownership IS the completion marker: correct means "this tree has
+# already been claimed", and every later start is one stat.
+#
+# ORDER IS LOAD-BEARING — contents first, root last. `chown -R` does the opposite (root, then
+# recurse), which is exactly what makes it unsafe to resume: killed midway it leaves the root
+# already correct and the tree half-done, so every future start skips the repair forever. And
+# "killed midway" is not hypothetical here; it is the failure this whole block is about.
+#
+# `-h` is not pedantry: without it chown FOLLOWS symlinks and changes the target's owner, and
+# this tree holds agent-written content — one link pointing outside would let the root-owned
+# entrypoint retitle a file beyond it.
+#
+# Numeric ids rather than names, so nothing depends on name resolution inside the container.
+# 1000 is `useradd --uid 1000 agentbox` in Dockerfile.agentbox — keep in step. Both halves are
+# checked: a root left at `1000:0` is not claimed, and reading only the uid would call it done.
+#
+# Assumes the export preserves the writer's ids. If it maps them (all_squash / anonuid) every
+# file reads as wrongly-owned forever, the guard never matches, and this degenerates into the
+# full walk on every start — that has to be fixed at the mount, not here.
+user_data_dir=/app/.siclaw/user-data
+if [ "$(stat -c '%u:%g' "$user_data_dir" 2>/dev/null || echo '')" != "1000:1000" ]; then
+  if find "$user_data_dir" -xdev -mindepth 1 \( ! -uid 1000 -o ! -gid 1000 \) \
+       -exec chown -h 1000:1000 {} + 2>/dev/null \
+     && chown 1000:1000 "$user_data_dir" 2>/dev/null
+  then
+    :
+  else
+    # Deliberately not fatal, unlike the credential checks above. Those guard an isolation
+    # property — running without it is worse than not running. This is a degradation: the
+    # directory itself is world-writable (below), so the box still works, it just may not be
+    # able to write some pre-existing file. Exiting here would also brick `docker run` without
+    # CAP_CHOWN, which every `|| true` in this script exists to keep working.
+    #
+    # But it must not be SILENT — a silent chown over this directory is what made the outage
+    # unreadable. Not marking the root is the other half: the repair simply runs again next
+    # start.
+    echo "WARNING: could not claim ownership of $user_data_dir — the box may be unable to" >&2
+    echo "         write files left by an earlier version; retrying on next start." >&2
+  fi
+fi
+# Outside the guard: O(1), idempotent, and a freshly provisioned subPath needs it before the
+# box can write at all.
+chmod 0777 "$user_data_dir" 2>/dev/null || true
 
 chown -R agentbox:agentbox /app/.siclaw/config 2>/dev/null || true
 chmod 0700 /app/.siclaw/config 2>/dev/null || true

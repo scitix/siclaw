@@ -95,7 +95,12 @@ const originalGatewayEnv = {
 };
 
 // Import SUT after mocks.
-import { K8sSpawner, parseK8sQuantity, clampRequestToLimit } from "./k8s-spawner.js";
+import {
+  K8sSpawner,
+  parseK8sQuantity,
+  clampRequestToLimit,
+  STARTUP_PROBE_WINDOW_MS,
+} from "./k8s-spawner.js";
 
 // ── Fake cert manager ─────────────────────────────────────────────────
 
@@ -479,9 +484,12 @@ describe("K8sSpawner — spawn branches", () => {
     await s.spawn({ agentId: "probe-gate" }).catch(() => {});
     const container = calls.createNamespacedPod[0].body.spec.containers[0];
     expect(container.startupProbe.httpGet).toMatchObject({ path: "/health", scheme: "HTTPS" });
-    // 30 x 2s: the same 60s the manager waits before calling a box crashed, so the two
-    // do not disagree about when a box has failed to come up.
-    expect(container.startupProbe.periodSeconds! * container.startupProbe.failureThreshold!).toBe(60);
+    // Assert the RELATION, not the number, so the emitted window cannot drift from the one
+    // the module exports. (It was a literal 60, justified by a comment claiming the manager
+    // waits the same 60s before calling a box crashed — it does not; `exitedUnexpectedly` is
+    // pod phase `Failed`. Raising the window after a production outage surfaced the claim.)
+    expect(container.startupProbe.periodSeconds! * container.startupProbe.failureThreshold! * 1000)
+      .toBe(STARTUP_PROBE_WINDOW_MS);
     expect(container.startupProbe.initialDelaySeconds).toBeUndefined();
   });
 
