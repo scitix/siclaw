@@ -1843,6 +1843,40 @@ describe("AgentBoxManager — the drain fuse has no path around it", () => {
     expect(after - before).toBe(3);
   });
 
+  /**
+   * 🔴 CHARGED FOR PODS CREATED, NOT FOR REQUESTS MADE — the third variant of the same
+   * unit mismatch. Charging per slot fixed the batch case, but the charge still happened
+   * BEFORE spawnInstances de-duplicates: eight concurrent requests naming one dead slot each
+   * spent a unit and then all waited on the single spawn that resulted. One pod creation
+   * exhausted the fuse, and had that spawn failed, recovery was blocked for the rest of the
+   * window.
+   *
+   * The gate therefore lives past the de-dup, so a caller that merely JOINS pays nothing.
+   */
+  it("charges one unit for one pod even when many requests race for it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      await gate; // hold the spawn open so every caller is concurrent with it
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.1:3000", agentId: config.agentId };
+    };
+    // One unusable, non-starting slot ⇒ the rebuild branch, for every caller.
+    spawner.pool = [poolBox("agentbox-agent-a-0", 0, { status: "error", endpoint: "" })];
+    const mgr = pooledManager(spawner, 1);
+
+    const before = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+    const calls = Array.from({ length: 8 }, (_, i) =>
+      (mgr as any).getOrCreatePooled("agent-a", undefined, `s${i}`, 1).catch(() => {}));
+    release!();
+    await Promise.all(calls);
+    const after = (mgr as any).drainBudget.get("agent-a")?.count ?? 0;
+
+    expect(spawner.spawnCalls).toHaveLength(1);   // de-dup already guaranteed this
+    expect(after - before).toBe(1);               // and the charge must match it
+  });
+
   it("rebuilds only as many slots as the remaining budget allows", async () => {
     const spawner = new PoolSpawner("k8s");
     spawner.pool = [

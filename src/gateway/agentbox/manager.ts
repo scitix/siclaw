@@ -611,36 +611,37 @@ export class AgentBoxManager {
       const awaitable = slotsOf(notPlaceable.filter((b) => b.status === "starting"));
       const rebuildable = slotsOf(notPlaceable.filter((b) => b.status !== "starting"));
 
-      // 🔴 ONE POD, ONE UNIT OF BUDGET. The fuse counts boxes replaced, which is how
-      // markStaleBoxesDraining spends it — once per box, inside its loop. Spending once for
-      // a whole batch made the unit a REQUEST instead: at 7 of 8 used, a single request
-      // still rebuilt instances 0, 1 and 2 while the counter moved to 8, so the real ceiling
-      // was 8 × replicas pods rather than 8. A fuse whose unit does not match what it is
-      // fusing does not bound anything.
+      // 🔴 ONE POD ACTUALLY CREATED, ONE UNIT OF BUDGET — and both halves of that sentence
+      // were wrong in turn. First the budget was spent once for a whole BATCH, making the
+      // unit a request: at 7 of 8 used, one request rebuilt instances 0, 1 and 2 while the
+      // counter moved only to 8. Charging per slot fixed the batch, but charging HERE still
+      // counted requests, because this runs before spawnInstances de-duplicates: eight
+      // concurrent requests naming one dead slot spent eight units between them and then all
+      // waited on the single spawn that resulted — one pod creation exhausting the fuse and
+      // blocking recovery for the rest of the window.
       //
-      // `break`, not `continue`: once the budget is refused it stays refused for the rest of
-      // the window, so there is nothing further to ask about.
-      const permitted: number[] = [];
-      if (missing.length === 0 && awaitable.length === 0) {
-        for (const instance of rebuildable) {
-          if (!this.spendDrainBudget(agentId)) break;
-          permitted.push(instance);
-        }
-      }
+      // So the fuse is handed to spawnInstances as an `admit` gate, which consults it only
+      // for a slot it is actually creating. Nothing is charged here.
+      const rebuildGate = (): boolean => this.spendDrainBudget(agentId);
       const target = missing.length > 0 ? missing
         : awaitable.length > 0 ? awaitable
-        : rebuildable.length > 0 ? permitted
+        : rebuildable.length > 0 ? rebuildable
         : this.freeInstances(pool, 1);
+      // Only the rebuild set is fused; waiting on a starting slot and filling a genuinely
+      // short pool both create nothing that the drain budget exists to bound.
+      const admit = (missing.length === 0 && awaitable.length === 0 && rebuildable.length > 0)
+        ? rebuildGate
+        : undefined;
 
       if (target.length > 0) {
         const [first, ...rest] = target;
         // No cooldown on THIS one: there is nothing to serve this turn from, so a slot that
         // failed a moment ago is still worth one more try. The background remainder does
         // respect it.
-        const [handle] = await this.spawnInstances(agentId, config, [first]);
+        const [handle] = await this.spawnInstances(agentId, config, [first], true, admit);
         const fillable = rest.filter((i) => this.mayFillInstance(agentId, i));
         if (fillable.length > 0) {
-          void this.spawnInstances(agentId, config, fillable).catch((err) =>
+          void this.spawnInstances(agentId, config, fillable, true, admit).catch((err) =>
             console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
         }
         if (handle) {
@@ -993,6 +994,13 @@ export class AgentBoxManager {
    * The joined caller gets the first caller's box, built with the first caller's config.
    * That is not a compromise: one (agent, instance) is one pod by definition, so a second
    * spawn could only ever have produced the same pod or destroyed the first one's.
+   *
+   * `admit` is consulted ONLY by the caller that actually starts a spawn — never by one that
+   * joins an existing one. That placement is the whole point: a quota checked before
+   * de-duplication counts REQUESTS, not pods. Eight concurrent requests naming one dead slot
+   * spent eight units of drain budget between them and then all waited on the single spawn
+   * that resulted, so one pod creation exhausted the fuse and blocked recovery for the rest
+   * of the window.
    */
   private async spawnInstances(
     agentId: string,
@@ -1006,6 +1014,12 @@ export class AgentBoxManager {
      * there would quietly turn every agent in the cluster into a permanent pod.
      */
     pooled = true,
+    /**
+     * Consulted once per slot this call actually starts a spawn for, and never for a slot it
+     * merely joins. Returning false skips that slot. See the note above on why a quota
+     * placed before de-duplication counts the wrong thing.
+     */
+    admit?: (instance: number) => boolean,
   ): Promise<AgentBoxHandle[]> {
     // Resolving env/persistence costs an RPC each, so pay it only if a slot turns out to be
     // ours to fill — and resolve it LAZILY rather than up front behind an `if`. Deciding
@@ -1023,6 +1037,10 @@ export class AgentBoxManager {
       const key = spawnSlotKey(agentId, instance);
       const inflight = this.inflightSpawns.get(key);
       if (inflight) return inflight;
+      // Past the de-dup, so this call is the one creating the pod — the only one that may be
+      // charged for it. Synchronous, and before the attempt is registered, so concurrent
+      // callers either join the admitted attempt or are refused; none of them pays twice.
+      if (admit && !admit(instance)) return Promise.resolve(null);
 
       const attempt = (async () => {
         try {
