@@ -168,9 +168,21 @@ export class AgentBoxManager {
   startOrphanSweep(isLive: (boxId: string) => boolean | Promise<boolean>, intervalMs = 10 * 60_000): void {
     const s: any = this.spawner;
     if (typeof s.sweepOrphans !== "function") return;
-    const tick = () =>
+    const tick = () => {
       void s.sweepOrphans(isLive).catch((err: any) =>
         console.warn("[agentbox-manager] orphan sweep failed:", err?.message ?? err));
+      // Certificate renewal rides the same tick because it needs the same thing the
+      // sweep needs — the clock — and nothing the request path can offer. It is
+      // deliberately NOT folded into getOrCreate: this manager warm-reuses a running
+      // box without consulting the spawner (isCertFresh compares the CA fingerprint
+      // and nothing else), so a resident pod can outlive its 30-day certificate
+      // without any spawn-path code executing. Independent of the sweep's outcome:
+      // one failing must not silently cancel the other.
+      if (typeof (s as any).renewExpiringCertificates === "function") {
+        void (s as any).renewExpiringCertificates().catch((err: any) =>
+          console.warn("[agentbox-manager] certificate renewal failed:", err?.message ?? err));
+      }
+    };
     // unref'd + stored (review finding): the sweep must never pin the event
     // loop or outlive cleanup() — same discipline as the run watchdog.
     this.orphanSweepInitialTimer = setTimeout(tick, 60_000);

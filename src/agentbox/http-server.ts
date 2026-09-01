@@ -21,6 +21,7 @@ import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metri
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
+import { ReloadingCertMaterial, certMaterialExists } from "./cert-reloader.js";
 import {
   getSyncHandler,
   createClusterHandler,
@@ -1944,23 +1945,39 @@ export function createHttpServer(
 
   // Detect TLS certificates
   const certPath = process.env.SICLAW_CERT_PATH || "/etc/siclaw/certs";
-  const certFile = path.join(certPath, "tls.crt");
-  const keyFile = path.join(certPath, "tls.key");
-  const caFile = path.join(certPath, "ca.crt");
-  const useTls = fs.existsSync(certFile) && fs.existsSync(keyFile) && fs.existsSync(caFile);
+  // Referenced by requestHandler above (closure, evaluated per request) to decide
+  // whether a peer certificate is expected at all.
+  const useTls = certMaterialExists(certPath);
 
   if (useTls) {
     console.log(`[agentbox-http] TLS certificates found at ${certPath}, starting HTTPS server`);
+    const certs = new ReloadingCertMaterial(certPath, undefined, "agentbox-http");
+    const material = certs.current();
+    if (!material) throw new Error(`TLS certificates at ${certPath} exist but could not be read`);
+    const tlsOptions = {
+      requestCert: true,
+      rejectUnauthorized: false, // Allow K8s probes without client cert; app-layer checks OU for non-health routes
+    };
     const server = https.createServer(
-      {
-        cert: fs.readFileSync(certFile),
-        key: fs.readFileSync(keyFile),
-        ca: fs.readFileSync(caFile),
-        requestCert: true,
-        rejectUnauthorized: false, // Allow K8s probes without client cert; app-layer checks OU for non-health routes
-      },
+      { ...tlsOptions, cert: material.cert, key: material.key, ca: material.ca },
       requestHandler,
     );
+    // A server cannot re-resolve its material per request the way the client does, so
+    // it has to be PUSHED the new generation. setSecureContext swaps what future
+    // handshakes use; connections already established keep the old context, which is
+    // correct — they were authenticated when they were made.
+    //
+    // This is the inbound half of the same defect: the AgentBox terminates HTTPS with
+    // the very certificate whose renewal it used to ignore, so a pod that had outlived
+    // it answered the Runtime with an expired certificate ("certificate has expired")
+    // while still passing its own loopback readiness probe.
+    // Only the context material: requestCert/rejectUnauthorized are SERVER options and
+    // are no-ops here, so passing them would suggest the whole TLS config is being
+    // swapped when it is not.
+    certs.watch((next) => {
+      server.setSecureContext({ cert: next.cert, key: next.key, ca: next.ca });
+      console.log("[agentbox-http] HTTPS secure context updated from renewed certificates");
+    });
     return server;
   }
 

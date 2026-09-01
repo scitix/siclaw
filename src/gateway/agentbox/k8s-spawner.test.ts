@@ -26,6 +26,7 @@ vi.mock("@kubernetes/client-node", () => {
     createNamespacedPod: [],
     createNamespacedSecret: [],
     readNamespacedSecret: [],
+    replaceNamespacedSecret: [],
     deleteNamespacedSecret: [],
     listNamespacedPod: [],
     listNamespacedSecret: [],
@@ -38,12 +39,16 @@ vi.mock("@kubernetes/client-node", () => {
     createNamespacedPod: async () => ({}),
     createNamespacedSecret: async () => ({}),
     readNamespacedSecret: async () => { throw Object.assign(new Error("nf"), { code: 404 }); },
+    replaceNamespacedSecret: async () => ({}),
     deleteNamespacedSecret: async () => ({}),
     listNamespacedPod: async () => ({ items: [] }),
     listNamespacedSecret: async () => ({ items: [] }),
     deleteCollectionNamespacedPod: async () => ({}),
     deleteCollectionNamespacedSecret: async () => ({}),
   };
+
+  // Pristine copy for resetCalls() to restore between tests.
+  g.__k8sImplDefaults = { ...g.__k8sImpls };
 
   class FakeCoreV1Api {
     async readNamespacedPod(args: any) { g.__k8sCalls.readNamespacedPod.push(args); return g.__k8sImpls.readNamespacedPod(args); }
@@ -54,6 +59,7 @@ vi.mock("@kubernetes/client-node", () => {
     async deleteNamespacedSecret(args: any) { g.__k8sCalls.deleteNamespacedSecret.push(args); return g.__k8sImpls.deleteNamespacedSecret(args); }
     async listNamespacedPod(args: any) { g.__k8sCalls.listNamespacedPod.push(args); return g.__k8sImpls.listNamespacedPod(args); }
     async listNamespacedSecret(args: any) { g.__k8sCalls.listNamespacedSecret.push(args); return g.__k8sImpls.listNamespacedSecret(args); }
+    async replaceNamespacedSecret(args: any) { g.__k8sCalls.replaceNamespacedSecret.push(args); return g.__k8sImpls.replaceNamespacedSecret(args); }
     async deleteCollectionNamespacedPod(args: any) { g.__k8sCalls.deleteCollectionNamespacedPod.push(args); return g.__k8sImpls.deleteCollectionNamespacedPod(args); }
     async deleteCollectionNamespacedSecret(args: any) { g.__k8sCalls.deleteCollectionNamespacedSecret.push(args); return g.__k8sImpls.deleteCollectionNamespacedSecret(args); }
   }
@@ -99,21 +105,67 @@ import { K8sSpawner, parseK8sQuantity, clampRequestToLimit } from "./k8s-spawner
 // ── Fake cert manager ─────────────────────────────────────────────────
 
 const FAKE_CA_FP = "fakecafp00000000";
+/**
+ * The certificate stamp a FakeCertManager mints, as the Secret/pod labels carry it.
+ * Pod reuse is decided on the CA plus the cert-reload CAPABILITY, never on which
+ * certificate a pod started with — a running pod re-reads its own material. These
+ * stamps live on the SECRET, where they drive renewal and the sweep's still-valid
+ * skip.
+ */
+const FAKE_CERT_NB = String(Math.floor(new Date("2026-09-01T00:00:00Z").getTime() / 1000));
+/** Far future, so "fresh" in a test never depends on when the suite runs. */
+const FAKE_CERT_NA = String(Math.floor(new Date("2099-01-01T00:00:00Z").getTime() / 1000));
+const freshSecretLabels = {
+  "siclaw.io/ca-fp": FAKE_CA_FP,
+  "siclaw.io/cert-nb": FAKE_CERT_NB,
+  "siclaw.io/cert-na": FAKE_CERT_NA,
+};
 
 class FakeCertManager {
   issuedCalls: any[] = [];
   fp = FAKE_CA_FP;
+  /** Overridable so a test can mint a certificate with a chosen lifetime. */
+  issuedAt = new Date("2026-09-01T00:00:00Z");
+  validityDays = 30;
+  /** Distinguishable per mint, so a test can tell NEW material from recycled bytes. */
+  mintCount = 0;
   issueAgentBoxCertificate(...args: any[]) {
     this.issuedCalls.push(args);
-    return { cert: "CERT", key: "KEY", ca: "CA" };
+    this.mintCount++;
+    // `identity` is part of the CertificateBundle contract, not decoration: spawn
+    // derives the certificate VERSION (notBefore) and EXPIRY from it to decide
+    // whether a stored Secret and a running pod are still usable.
+    return {
+      cert: `CERT-${this.mintCount}`,
+      key: `KEY-${this.mintCount}`,
+      ca: "CA",
+      identity: {
+        agentId: args[0],
+        orgId: args[1],
+        boxId: args[2],
+        issuedAt: this.issuedAt,
+        expiresAt: new Date(this.issuedAt.getTime() + this.validityDays * 86_400_000),
+      },
+    };
   }
   caFingerprint() { return this.fp; }
+  readAssertedIdentity(pem: string) {
+    // The renewal path carries the subject forward from the stored certificate; the
+    // fixture encodes it in the PEM so a test can assert it survives.
+    const m = /SUBJECT:([^:]*):([^:]*):([^\s]*)/.exec(pem);
+    return m ? { agentId: m[1], orgId: m[2], boxId: m[3] } : undefined;
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
 function resetCalls() {
   for (const k of Object.keys(g.__k8sCalls)) g.__k8sCalls[k].length = 0;
+  // ⚠️ THE STUBS TOO, not just the call logs. Tests assign into __k8sImpls to set
+  // up a scenario and nothing used to put them back, so an impl leaked into every
+  // later test in file order — a suite that passes only in the order it happens to
+  // be written, and that reports the leak as a failure in an unrelated test.
+  g.__k8sImpls = { ...g.__k8sImplDefaults };
 }
 
 beforeEach(() => {
@@ -187,8 +239,10 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
     expect(calls.createNamespacedSecret).toHaveLength(1);
     const secretBody = calls.createNamespacedSecret[0].body;
     expect(secretBody.type).toBe("kubernetes.io/tls");
-    expect(Buffer.from(secretBody.data["tls.crt"], "base64").toString()).toBe("CERT");
-    expect(Buffer.from(secretBody.data["tls.key"], "base64").toString()).toBe("KEY");
+    // Suffixed because the fixture now mints distinguishable material per call — the
+    // renewal tests need to tell a fresh certificate from recycled bytes.
+    expect(Buffer.from(secretBody.data["tls.crt"], "base64").toString()).toBe("CERT-1");
+    expect(Buffer.from(secretBody.data["tls.key"], "base64").toString()).toBe("KEY-1");
     expect(Buffer.from(secretBody.data["ca.crt"], "base64").toString()).toBe("CA");
   });
 
@@ -533,8 +587,10 @@ describe("K8sSpawner — spawn branches", () => {
 
     readPodImpl.fn = async () => ({
       status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
-      metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } },
+      metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP, "siclaw.io/cert-reload": "1" } },
     });
+    // A fresh stored Secret, so this exercises pod reuse rather than the mint path.
+    (globalThis as any).__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: freshSecretLabels } });
 
     const handle = await s.spawn({ agentId: "default" });
     expect(handle.endpoint).toBe("https://10.9.9.9:3000");
@@ -1311,10 +1367,14 @@ describe("K8sSpawner — replica identity and the shared certificate", () => {
 describe("K8sSpawner — concurrent replica spawns share one certificate Secret", () => {
   const g = globalThis as any;
 
-  it("reuses an existing Secret signed by the current CA instead of replacing it", async () => {
-    // Two replicas of one agent spawn at the same time and both reach the 409 branch.
-    // Replacing would delete a certificate the sibling pod is already mounting — observed
-    // in a live cluster as a 404 on the second delete, with the spawn then failing.
+  it("tolerates a sibling having already deleted the Secret it was about to replace", async () => {
+    // Was "reuses an existing Secret signed by the current CA". That scenario is now
+    // covered twice over — "keeps a Secret ... far from expiry" (no write attempted at
+    // all) and "adopts a Secret a sibling replica renewed" (409 then re-read) — and it
+    // could no longer reach the 409 branch it claimed to test, because a fresh stored
+    // Secret is skipped before any write. Repointed at the one concurrent path that
+    // had a comment but no test: both replicas decide to replace, and the loser's
+    // delete finds the Secret already gone.
     const s = new K8sSpawner();
     s.setCertManager(new FakeCertManager() as any);
     let reads = 0;
@@ -1323,13 +1383,20 @@ describe("K8sSpawner — concurrent replica spawns share one certificate Secret"
       if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
-    g.__k8sImpls.createNamespacedSecret = async () => { throw Object.assign(new Error("exists"), { code: 409 }); };
-    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } } });
+    // Stale on both reads, so this spawn commits to replacing.
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: { "siclaw.io/ca-fp": "an-older-ca" } } });
+    let creates = 0;
+    g.__k8sImpls.createNamespacedSecret = async () => {
+      creates++;
+      if (creates === 1) throw Object.assign(new Error("exists"), { code: 409 });
+      return {};
+    };
+    g.__k8sImpls.deleteNamespacedSecret = async () => { throw Object.assign(new Error("gone"), { code: 404 }); };
 
+    // A 404 on the delete is the sibling having won the race, not a failure.
     await s.spawn({ agentId: "agent-x", profile: "agent", instance: 1 } as any);
 
-    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
-    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1); // spawn still completes
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1);
   });
 
   it("still replaces the Secret when the CA has rotated", async () => {
@@ -1430,5 +1497,591 @@ describe("K8sSpawner — every listing carries what staleness is judged on", () 
     const [forAgent] = await s.listForAgent("a");
     const withoutClock = ({ createdAt: _c, lastActiveAt: _l, ...rest }: AgentBoxInfo) => rest;
     expect(withoutClock(forAgent)).toEqual(withoutClock(fromList));
+  });
+});
+
+// ── Certificate expiry: renewal and the pods left behind by one ────────
+//
+// AgentBox certificates live 30 days while a resident pod runs indefinitely, and
+// both reuse checks used to compare only the CA fingerprint — which answers who
+// signed a certificate, never whether it is still valid or still the current one.
+// The result was an agent that went permanently dark 30 days after its Secret was
+// minted, unrecoverable without a human deleting that Secret by hand.
+
+describe("K8sSpawner — certificate renewal", () => {
+  const g = globalThis as any;
+  const secondsFromNow = (days: number) => String(Math.floor((Date.now() + days * 86_400_000) / 1000));
+
+  /**
+   * A spawner whose pod reads follow the shape every successful spawn has: absent
+   * first (so spawn creates one), Running afterwards (so waitForPodReady settles).
+   */
+  function spawnerWithCerts() {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.0.0.8", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+    return s;
+  }
+
+  it("keeps a Secret that is signed by the current CA and far from expiry", async () => {
+    const s = spawnerWithCerts();
+    g.__k8sImpls.readNamespacedSecret = async () => ({
+      metadata: { labels: { ...freshSecretLabels, "siclaw.io/cert-na": secondsFromNow(20) } },
+    });
+
+    await s.spawn({ agentId: "steady" } as any);
+
+    // Not rewritten, and — the part that used to be wrong the other way round —
+    // not even attempted, so there is no 409 to mishandle.
+    expect(g.__k8sCalls.createNamespacedSecret).toHaveLength(0);
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
+  });
+
+  it("replaces a Secret whose certificate is inside the renewal window", async () => {
+    const s = spawnerWithCerts();
+    g.__k8sImpls.readNamespacedSecret = async () => ({
+      // Same CA, 3 days left: the exact state the old check called reusable and
+      // that went on to expire with no path back.
+      metadata: { labels: { ...freshSecretLabels, "siclaw.io/cert-na": secondsFromNow(3) } },
+    });
+    g.__k8sImpls.createNamespacedSecret = async () => { throw Object.assign(new Error("exists"), { code: 409 }); };
+
+    await s.spawn({ agentId: "expiring" } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(1);
+  });
+
+  it("replaces a Secret that predates the certificate stamps", async () => {
+    const s = spawnerWithCerts();
+    // Only ca-fp: every Secret in a cluster upgrading to this build. It must converge
+    // on the next spawn rather than be grandfathered into the bug forever.
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } } });
+    g.__k8sImpls.createNamespacedSecret = async () => { throw Object.assign(new Error("exists"), { code: 409 }); };
+
+    await s.spawn({ agentId: "legacy" } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(1);
+  });
+
+  it("stamps the Secret with the certificate's validity, and the pod with neither", async () => {
+    const s = spawnerWithCerts();
+    await s.spawn({ agentId: "stamped" } as any);
+
+    const secretLabels = g.__k8sCalls.createNamespacedSecret[0].body.metadata.labels;
+    expect(secretLabels["siclaw.io/cert-nb"]).toBe(FAKE_CERT_NB);
+    expect(Number(secretLabels["siclaw.io/cert-na"])).toBeGreaterThan(Number(FAKE_CERT_NB));
+
+    // The pod gets NO certificate stamp. Its certificate is whatever the mounted
+    // Secret currently holds — cert-reloader.ts keeps the process level with it — so a
+    // copy taken at creation would go out of date and then be believed.
+    const podLabels = g.__k8sCalls.createNamespacedPod[0].body.metadata.labels;
+    expect(podLabels["siclaw.io/cert-nb"]).toBeUndefined();
+    expect(podLabels["siclaw.io/cert-na"]).toBeUndefined();
+  });
+
+  it("reuses a Running pod across a renewal instead of recycling it", async () => {
+    // The counterpart of the P1 reloader, and the opposite of what an earlier draft
+    // did. A renewal happens a week BEFORE expiry, so the pod's current certificate is
+    // still valid while it picks the new one off the mounted volume. Destroying it
+    // would trade a free swap for a cold start and a dropped turn.
+    const s = spawnerWithCerts();
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: freshSecretLabels } });
+    g.__k8sImpls.readNamespacedPod = async () => ({
+      status: { phase: "Running", podIP: "10.0.0.7", conditions: [{ type: "Ready", status: "True" }] },
+      metadata: { labels: { "siclaw.io/agent": "resident", "siclaw.io/ca-fp": FAKE_CA_FP, "siclaw.io/cert-reload": "1" } },
+    });
+
+    await s.spawn({ agentId: "resident" } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(0);
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(0);
+  });
+
+  it("still recycles a Running pod whose CA has rotated", async () => {
+    // A rotated CA is the one case re-reading cannot fix: the Secret the pod would
+    // re-read is signed by the same dead CA until it is replaced.
+    const s = spawnerWithCerts();
+    let podReads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      podReads++;
+      if (podReads === 1) {
+        return {
+          status: { phase: "Running", podIP: "10.0.0.7", conditions: [{ type: "Ready", status: "True" }] },
+          metadata: { labels: { "siclaw.io/agent": "rotated", "siclaw.io/ca-fp": "an-older-ca" } },
+        };
+      }
+      if (podReads === 2) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.0.0.7", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+
+    await s.spawn({ agentId: "rotated" } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(1);
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1);
+  });
+
+  it("adopts a Secret a sibling replica renewed instead of renewing it again", async () => {
+    // Two replicas of one agent decide to renew at the same moment. Without the
+    // re-read, the loser deletes the winner's brand-new certificate and mints a
+    // second one seconds later, forcing another recycle of pods that were correct.
+    const s = spawnerWithCerts();
+    let secretReads = 0;
+    g.__k8sImpls.readNamespacedSecret = async () => {
+      secretReads++;
+      return secretReads === 1
+        // First read: stale, so this spawn decides to renew.
+        ? { metadata: { labels: { ...freshSecretLabels, "siclaw.io/cert-na": secondsFromNow(2) } } }
+        // Re-read after the 409: a sibling got there first and it is fresh now.
+        : { metadata: { labels: { ...freshSecretLabels, "siclaw.io/cert-nb": "1893456000", "siclaw.io/cert-na": secondsFromNow(29) } } };
+    };
+    g.__k8sImpls.createNamespacedSecret = async () => { throw Object.assign(new Error("exists"), { code: 409 }); };
+
+    await s.spawn({ agentId: "raced" } as any);
+
+    // The sibling's Secret stands; this spawn's bundle is dropped rather than
+    // replacing a certificate that is already current.
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
+  });
+});
+
+// ── The renewal pass: the mechanism that actually keeps certificates alive ──
+//
+// spawn()'s freshness check is only a backstop. AgentBoxManager.getOrCreateK8s warm-
+// reuses a running box without ever calling the spawner, so a resident pod — the
+// normal shape for an agent with live sessions — can run the whole 30-day life of its
+// certificate with the spawn path never executing. Expiry is driven by the clock, so
+// renewal is too.
+
+describe("K8sSpawner — renewExpiringCertificates", () => {
+  const g = globalThis as any;
+  const secondsFromNow = (days: number) => String(Math.floor((Date.now() + days * 86_400_000) / 1000));
+  const pemFor = (agentId: string, orgId: string, boxId: string) => `SUBJECT:${agentId}:${orgId}:${boxId}`;
+
+  function secretItem(name: string, agentId: string, labels: Record<string, string>, orgId = "org-7") {
+    return {
+      metadata: { name, labels: { "siclaw.io/app": "agentbox", "siclaw.io/agent": agentId, ...labels } },
+      data: { "tls.crt": Buffer.from(pemFor(agentId, orgId, name.slice(0, -"-cert".length))).toString("base64") },
+    };
+  }
+
+  function spawnerWithCerts() {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    return s;
+  }
+
+  /** Renewal only touches agents that still have a pod, so a fixture must supply one. */
+  function podsFor(...agentIds: string[]) {
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: agentIds.map((a) => ({
+        metadata: { name: `agentbox-${a}`, labels: { "siclaw.io/agent": a } },
+        status: { phase: "Running" },
+      })),
+    });
+  }
+
+  it("renews a certificate inside the renewal window", async () => {
+    const s = spawnerWithCerts();
+    podsFor("resident");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-resident-cert", "resident", {
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-nb": FAKE_CERT_NB,
+        "siclaw.io/cert-na": secondsFromNow(3),
+      })],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(1);
+    const body = g.__k8sCalls.replaceNamespacedSecret[0].body;
+    // Replaced in place: same name, so every pod already mounting it just sees new
+    // bytes at the same path. Nothing is rescheduled and nothing is deleted.
+    expect(g.__k8sCalls.replaceNamespacedSecret[0].name).toBe("agentbox-resident-cert");
+    expect(Number(body.metadata.labels["siclaw.io/cert-na"])).toBeGreaterThan(Number(secondsFromNow(20)));
+
+    // 🔴 THE BYTES, not just the labels. Writing a +30d cert-na over the OLD
+    // certificate is the worst outcome this code can produce and it is invisible from
+    // the metadata alone: the Secret would advertise a month of validity around a
+    // certificate dying in days, renewal would never look at it again, and
+    // certStampIsFresh would assure spawn everything is fine — an agent that goes
+    // dark and that deleting the pod cannot fix. Strictly worse than the original bug.
+    const writtenCert = Buffer.from(body.data["tls.crt"], "base64").toString();
+    const writtenKey = Buffer.from(body.data["tls.key"], "base64").toString();
+    expect(writtenCert).toMatch(/^CERT-\d+$/);        // freshly minted, not the stored PEM
+    expect(writtenCert).not.toBe(pemFor("resident", "org-7", "agentbox-resident"));
+    // And the pair must belong together — a swapped cert/key fails the handshake with
+    // an error naming neither.
+    expect(writtenKey).toBe(writtenCert.replace("CERT-", "KEY-"));
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(0);
+  });
+
+  it("leaves a certificate that is nowhere near expiry alone", async () => {
+    const s = spawnerWithCerts();
+    podsFor("fine");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-fine-cert", "fine", {
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-na": secondsFromNow(20),
+      })],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(0);
+  });
+
+  it("renews one that has already lapsed", async () => {
+    // The state the incident left behind. verifyCertificate refuses to speak about an
+    // expired certificate, so the subject has to be read without the validity check —
+    // otherwise the agents most in need of renewal are exactly the ones skipped.
+    const s = spawnerWithCerts();
+    podsFor("dead");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-dead-cert", "dead", {
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-na": secondsFromNow(-2),
+      })],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(1);
+  });
+
+  it("carries the certificate's subject forward instead of reconstructing it", async () => {
+    // The org is recorded nowhere on the Secret. Minting a renewal without it would
+    // silently rewrite the identity every box of the agent presents.
+    const s = spawnerWithCerts();
+    const cm = new FakeCertManager();
+    s.setCertManager(cm as any);
+    podsFor("owned");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-owned-cert", "owned", {
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-na": secondsFromNow(1),
+      }, "org-org-42")],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(cm.issuedCalls).toHaveLength(1);
+    // agentId, orgId, boxId — all three from the certificate being replaced.
+    expect(cm.issuedCalls[0]).toEqual(["owned", "org-org-42", "agentbox-owned"]);
+  });
+
+  it("refuses to sign a subject that disagrees with the Secret's own label", async () => {
+    // 🔴 PRIVILEGE ESCALATION. The subject is read from the Secret's DATA with no
+    // signature or validity check (readAssertedIdentity says so in its own docstring),
+    // and the only gate on renewal is a LABEL. Anyone able to write this Secret's data
+    // — namespace Secret write, which does not require reading the CA key — could
+    // plant a certificate claiming another agent's identity and have the next tick
+    // sign that identity with the real CA, into a Secret they control. The label is
+    // set by the spawner and is the independent witness.
+    const s = spawnerWithCerts();
+    const cm = new FakeCertManager();
+    s.setCertManager(cm as any);
+    podsFor("victim");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [{
+        metadata: {
+          name: "agentbox-victim-cert",
+          labels: {
+            "siclaw.io/app": "agentbox",
+            "siclaw.io/agent": "victim",
+            "siclaw.io/ca-fp": FAKE_CA_FP,
+            "siclaw.io/cert-na": secondsFromNow(1),
+          },
+        },
+        // Planted: claims a different agent and org than the Secret's label.
+        data: { "tls.crt": Buffer.from("SUBJECT:attacker:evil-org:agentbox-attacker").toString("base64") },
+      }],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(0);
+    // And crucially the CA was never asked to sign the planted identity.
+    expect(cm.issuedCalls).toHaveLength(0);
+  });
+
+  it("does not count a finished pod as keeping its agent alive", async () => {
+    // A Succeeded box holds nothing open. Renewing for it would refresh a certificate
+    // about to be collected and — through the still-valid skip in sweepOrphans —
+    // postpone that collection by a whole certificate lifetime.
+    const s = spawnerWithCerts();
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [{ metadata: { name: "agentbox-done", labels: { "siclaw.io/agent": "done" } }, status: { phase: "Succeeded" } }],
+    });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-done-cert", "done", {
+        "siclaw.io/ca-fp": FAKE_CA_FP,
+        "siclaw.io/cert-na": secondsFromNow(1),
+      })],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(0);
+  });
+
+  it("does not touch a certificate signed by a rotated CA", async () => {
+    // Replacing it here would hand a live pod material signed by a CA it cannot
+    // chain. Rotation is spawn()'s job, because it also recreates the pods.
+    const s = spawnerWithCerts();
+    podsFor("oldca");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-old-ca-cert", "oldca", {
+        "siclaw.io/ca-fp": "an-older-ca",
+        "siclaw.io/cert-na": secondsFromNow(1),
+      })],
+    });
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(0);
+  });
+
+  it("keeps going after one Secret fails to renew", async () => {
+    // A conflict with a concurrent spawn must not abandon every other agent for the
+    // next ten minutes.
+    const s = spawnerWithCerts();
+    podsFor("a", "b");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [
+        secretItem("agentbox-a-cert", "a", { "siclaw.io/ca-fp": FAKE_CA_FP, "siclaw.io/cert-na": secondsFromNow(1) }),
+        secretItem("agentbox-b-cert", "b", { "siclaw.io/ca-fp": FAKE_CA_FP, "siclaw.io/cert-na": secondsFromNow(1) }),
+      ],
+    });
+    let calls = 0;
+    g.__k8sImpls.replaceNamespacedSecret = async () => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error("conflict"), { code: 409 });
+      return {};
+    };
+
+    await s.renewExpiringCertificates();
+
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(2);
+  });
+
+  it("renews a Secret that predates the validity stamps", async () => {
+    // 🔴 THE UPGRADE CASE, and the one an earlier draft got backwards by deferring it
+    // to "the agent's next cold start" — which contradicts why this method exists: a
+    // resident agent never cold-starts. EVERY Secret written before this build is
+    // unstamped, including the one from the outage, so skipping them meant renewal
+    // never looked at the pods that actually went dark.
+    const s = spawnerWithCerts();
+    podsFor("legacy");
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [secretItem("agentbox-legacy-cert", "legacy", { "siclaw.io/ca-fp": FAKE_CA_FP })],
+    });
+
+    await s.renewExpiringCertificates();
+
+    // Self-clearing: the renewal stamps it, so it never lands in this branch again.
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(1);
+    expect(g.__k8sCalls.replaceNamespacedSecret[0].body.metadata.labels["siclaw.io/cert-na"]).toBeDefined();
+  });
+
+  it("recycles a Running pod from a build that cannot reload its certificate", async () => {
+    // Renewal only spares a pod because the pod re-reads its certificate. One from
+    // before cert-reloader.ts shipped cannot, and nothing else removes it —
+    // isStaleImage compares image STRINGS and the default deployment pins
+    // `tag: latest`, so a rebuilt image never rolls the pod. It would survive the
+    // upgrade, have its Secret renewed underneath it, and go dark a week later.
+    const s = spawnerWithCerts();
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: freshSecretLabels } });
+    let podReads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      podReads++;
+      if (podReads === 1) {
+        return {
+          status: { phase: "Running", podIP: "10.0.0.5", conditions: [{ type: "Ready", status: "True" }] },
+          // Current CA, no cert-reload label: a pre-upgrade pod.
+          metadata: { labels: { "siclaw.io/agent": "preP1", "siclaw.io/ca-fp": FAKE_CA_FP } },
+        };
+      }
+      if (podReads === 2) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.0.0.5", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { labels: {} },
+      };
+    };
+
+    await s.spawn({ agentId: "preP1" } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(1);
+    // And the replacement advertises the capability, so this never fires for it again.
+    expect(g.__k8sCalls.createNamespacedPod[0].body.metadata.labels["siclaw.io/cert-reload"]).toBe("1");
+  });
+});
+
+describe("certificate lifetime and the renewal threshold", () => {
+  it("leaves room between the certificate's life and the renewal window", async () => {
+    const { AGENTBOX_CERT_VALIDITY_DAYS } = await import("../security/cert-manager.js");
+    const { CERT_RENEW_THRESHOLD_MS } = await import("./k8s-spawner.js");
+    const validityMs = AGENTBOX_CERT_VALIDITY_DAYS * 86_400_000;
+
+    // 🔴 A threshold at or above the validity makes every certificate permanently
+    // "expiring": re-minted on every renewal tick AND on every cold spawn, forever.
+    // The two constants live in different files with nothing else tying them
+    // together, so shortening the validity for a security policy would silently turn
+    // renewal into a hot loop. Half is an arbitrary but comfortable bound — what
+    // matters is that the relationship is asserted somewhere.
+    expect(CERT_RENEW_THRESHOLD_MS).toBeLessThan(validityMs / 2);
+  });
+});
+
+describe("K8sSpawner — renewal and the orphan sweep must not deadlock", () => {
+  const g = globalThis as any;
+  const secondsFromNow = (days: number) => String(Math.floor((Date.now() + days * 86_400_000) / 1000));
+
+  it("does not renew a certificate no pod is mounting", async () => {
+    // 🔴 THE IMMORTAL SECRET. The sweep now skips anything still valid (so a cold
+    // spawn's Secret cannot be swept out from under the pod being created). If
+    // renewal also refreshed orphans, the two rules would trap each other: renewal
+    // keeps pushing the expiry out, the sweep never sees an expired Secret to
+    // collect, and the orphan lives forever — precisely the accumulation the sweep
+    // was built to stop.
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] }); // agent has no pods
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [{
+        metadata: {
+          name: "agentbox-gone-cert",
+          labels: {
+            "siclaw.io/app": "agentbox",
+            "siclaw.io/agent": "gone",
+            "siclaw.io/ca-fp": FAKE_CA_FP,
+            "siclaw.io/cert-na": secondsFromNow(1),
+          },
+        },
+        data: { "tls.crt": Buffer.from("SUBJECT:gone:org-7:agentbox-gone").toString("base64") },
+      }],
+    });
+
+    await s.renewExpiringCertificates();
+
+    // Left to lapse, which is what lets the sweep collect it.
+    expect(g.__k8sCalls.replaceNamespacedSecret).toHaveLength(0);
+  });
+});
+
+describe("K8sSpawner — the sweep must not collect a certificate still in use", () => {
+  const g = globalThis as any;
+  const old = new Date(Date.now() - 40 * 86400_000).toISOString();
+  const secondsFromNow = (days: number) => String(Math.floor((Date.now() + days * 86_400_000) / 1000));
+
+  it("spares an orphaned chat Secret whose certificate is still valid", async () => {
+    // 🔴 THE COLD-SPAWN TOCTOU. spawn() leaves a current Secret untouched rather than
+    // rewriting it, so the 10-minute age guard — which assumes a spawning box's Secret
+    // was just created — stops covering it. An agent with no pods yet is exactly the
+    // state a cold spawn begins from, so without this the sweep could delete a good
+    // Secret out from under the pod being created, leaving it on a missing volume
+    // forever (restartPolicy is Never).
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [{
+        metadata: {
+          name: "agentbox-idle-cert",
+          creationTimestamp: old,
+          labels: { "siclaw.io/agent": "idle", "siclaw.io/boxType": "agent", "siclaw.io/cert-na": secondsFromNow(20) },
+        },
+      }],
+    });
+
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+
+    expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).not.toContain("agentbox-idle-cert");
+  });
+
+  it("still collects the same Secret once its certificate has lapsed", async () => {
+    // The other half: sparing valid certificates must not become sparing everything,
+    // or orphans accumulate — which is what this sweep exists to stop.
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [{
+        metadata: {
+          name: "agentbox-idle-cert",
+          creationTimestamp: old,
+          labels: { "siclaw.io/agent": "idle", "siclaw.io/boxType": "agent", "siclaw.io/cert-na": secondsFromNow(-1) },
+        },
+      }],
+    });
+
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+
+    expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).toContain("agentbox-idle-cert");
+  });
+
+  it("collects a finished capability run's Secret even though its certificate is valid", async () => {
+    // A capability Secret is per-RUN (`kbc-box-<runId>-cert`) and freshly written on
+    // every spawn, so the age guard always covered it and it never needed the
+    // still-valid protection. Extending that protection here would pin every finished
+    // run's Secret for a full certificate lifetime — a busy KB-compile cluster would
+    // hold thousands instead of roughly none.
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [{
+        metadata: {
+          name: "kbc-box-run-9-cert",
+          creationTimestamp: old,
+          labels: { "siclaw.io/agent": "run-9", "siclaw.io/boxType": "kb-compile", "siclaw.io/cert-na": secondsFromNow(25) },
+        },
+      }],
+    });
+
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+
+    expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).toContain("kbc-box-run-9-cert");
+  });
+});
+
+describe("K8sSpawner — the certificate mount must stay updatable", () => {
+  const g = globalThis as any;
+
+  it("mounts the cert Secret without subPath", async () => {
+    // 🔴 Kubernetes does not propagate Secret updates into a subPath mount. Adding one
+    // here would freeze the files at pod start: renewal would replace the Secret, the
+    // pod would never see it, no event would fire, and the agent would go dark 30 days
+    // later — the original outage, with the renewal machinery running and reporting
+    // success the whole time. The persistence volume in the same pod spec DOES use
+    // subPath, so this is a plausible edit, which is why it is pinned.
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.4", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "mounted" } as any);
+
+    const mounts = g.__k8sCalls.createNamespacedPod[0].body.spec.containers[0].volumeMounts;
+    const certMount = mounts.find((m: any) => m.mountPath === "/etc/siclaw/certs");
+    expect(certMount).toBeDefined();
+    expect(certMount.subPath).toBeUndefined();
+    // And it must be a whole-Secret volume, not a projection of a single key.
+    const volume = g.__k8sCalls.createNamespacedPod[0].body.spec.volumes
+      .find((v: any) => v.name === certMount.name);
+    expect(volume.secret.items).toBeUndefined();
   });
 });
