@@ -662,10 +662,10 @@ export function createKnowledgeHandler(
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
           citationRepos.push({ id: repo.id, root: `repos/${dirName}`, sources: repo.citationSources ?? [] });
-          // This line is the cheap routing surface injected into the prompt.
-          // knowledge_search can retrieve across every mounted page when the
-          // label is insufficient, while the domain still avoids unnecessary
-          // searches and library-by-library index reads.
+          // This line is the complete top-level routing surface injected into
+          // the prompt. The domain lets the Agent choose a library before it
+          // opens that library's complete index; knowledge_search is only the
+          // labels-and-aliases resolver for ambiguous routes.
           const displayName = catalogNameLine(repo.name);
           const domain = catalogDomainLine(repo.consumerDomain);
           indexLines.push(

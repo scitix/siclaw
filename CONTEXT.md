@@ -16,6 +16,10 @@ _Avoid_: Category, namespace
 The runtime-derived, queryable union of Knowledge Labels and aliases across one mounted knowledge package.
 _Avoid_: Global tag prompt, taxonomy dump
 
+**Knowledge Wiki Catalog**:
+The complete root `index.md`, injected as page titles, paths, and one-line descriptions so unlabeled and labeled packages share one navigation baseline.
+_Avoid_: Index prefix, sampled catalog
+
 **Knowledge Resolver**:
-The runtime boundary that combines immediately available label routing with any ready content-retrieval channels and explains why a page matched.
-_Avoid_: Search wrapper, vector router
+The labels-only runtime boundary that maps a question to candidate pages and explains which canonical values or aliases matched. It never searches page bodies and never returns answer evidence.
+_Avoid_: Search wrapper, vector router, content index

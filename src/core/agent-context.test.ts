@@ -90,6 +90,9 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("spawn_subagent");
     expect(context.systemPrompt).not.toContain("delete/evict/cordon");
     expect(context.systemPrompt).toContain("knowledge_search");
+    expect(context.systemPrompt).toContain("complete mounted Wiki catalog as the primary navigation map");
+    expect(context.systemPrompt).toContain("navigation metadata, not answer evidence");
+    expect(context.systemPrompt).not.toContain("Use `knowledge_search` before answering");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
     expect(context.harness.includeBundledSkills).toBe(false);
     expect(context.harness.mcpExposure).toBe("configured");

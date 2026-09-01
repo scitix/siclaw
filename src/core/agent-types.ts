@@ -115,8 +115,10 @@ export const KNOWLEDGE_QA_DEFAULT_PROMPT =
   "an accurate, complete, and clear answer. Treat the bound knowledge bases as the primary source of truth " +
   "for factual claims. You may summarize, compare, and reason from their contents, but do not fill gaps with " +
   "unsupported model knowledge. Before answering, identify the relevant subject, entity, time, version, " +
-  "environment, and scope. Use `knowledge_search` before answering from mounted knowledge, and search with " +
-  "alternative terms, names, and versions when useful; do not stop at the " +
+  "environment, and scope. Use the complete mounted Wiki catalog as the primary navigation map. When the " +
+  "catalog leaves multiple plausible pages or the question uses an alternate name, use `knowledge_search` " +
+  "to resolve typed page labels and aliases; its results are navigation metadata, not answer evidence. Read " +
+  "the complete relevant pages before answering, and do not stop at the " +
   "first relevant result. Check for newer, superseding, deprecated, or differently scoped material. Prefer " +
   "sources that are authoritative, current, and applicable, while recognizing that newer material is not " +
   "automatically more applicable. If sources conflict, continue searching for version or scope differences; " +

@@ -3,9 +3,6 @@ import path from "node:path";
 
 import yaml from "js-yaml";
 
-import { chunkMarkdown } from "../memory/chunker.js";
-import type { MemoryChunk, MemorySearchResult } from "../memory/types.js";
-
 export const KNOWLEDGE_LABEL_FACETS = [
   "entity", "topic", "task", "component", "environment", "version",
 ] as const;
@@ -32,12 +29,31 @@ export interface KnowledgeLabelCatalogResult {
   hasMore: boolean;
 }
 
+export interface MatchedKnowledgeLabel {
+  facet: KnowledgeLabelFacet;
+  value: string;
+  matchedBy: string;
+}
+
+export interface KnowledgePageCandidate {
+  file: string;
+  title: string;
+  description: string;
+  score: number;
+  labels: KnowledgeLabel[];
+  matchedLabels: MatchedKnowledgeLabel[];
+}
+
+export interface KnowledgeResolutionResult {
+  pages: KnowledgePageCandidate[];
+  totalPages: number;
+  totalLabels: number;
+}
+
 interface KnowledgePageLabels {
   file: string;
   title: string;
   description: string;
-  body: string;
-  bodyStartLine: number;
   labels: KnowledgeLabel[];
 }
 
@@ -57,7 +73,7 @@ function normalize(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/[\s_\-./]+/g, " ");
 }
 
-function parseFrontmatter(markdown: string): { metadata: Record<string, unknown>; body: string; bodyStartLine: number } | null {
+function parseFrontmatter(markdown: string): Record<string, unknown> | null {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   if (lines[0]?.trim() !== "---") return null;
   const end = lines.slice(1).findIndex((line) => {
@@ -69,11 +85,7 @@ function parseFrontmatter(markdown: string): { metadata: Record<string, unknown>
   try {
     const metadata = yaml.load(lines.slice(1, delimiterLine).join("\n"));
     if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
-    return {
-      metadata: metadata as Record<string, unknown>,
-      body: lines.slice(delimiterLine + 1).join("\n"),
-      bodyStartLine: delimiterLine + 2,
-    };
+    return metadata as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -82,13 +94,11 @@ function parseFrontmatter(markdown: string): { metadata: Record<string, unknown>
 export function parseKnowledgeLabels(markdown: string): {
   title: string;
   description: string;
-  body: string;
-  bodyStartLine: number;
   labels: KnowledgeLabel[];
 } | null {
-  const parsed = parseFrontmatter(markdown);
-  if (!parsed) return null;
-  const rawLabels = parsed.metadata.labels;
+  const metadata = parseFrontmatter(markdown);
+  if (!metadata) return null;
+  const rawLabels = metadata.labels;
   if (!Array.isArray(rawLabels) || rawLabels.length === 0 || rawLabels.length > MAX_LABELS) return null;
 
   const labels: KnowledgeLabel[] = [];
@@ -112,10 +122,8 @@ export function parseKnowledgeLabels(markdown: string): {
   }
 
   return {
-    title: typeof parsed.metadata.title === "string" ? parsed.metadata.title.trim() : "",
-    description: typeof parsed.metadata.description === "string" ? parsed.metadata.description.trim() : "",
-    body: parsed.body,
-    bodyStartLine: parsed.bodyStartLine,
+    title: typeof metadata.title === "string" ? metadata.title.trim() : "",
+    description: typeof metadata.description === "string" ? metadata.description.trim() : "",
     labels,
   };
 }
@@ -140,20 +148,6 @@ function matchLabel(query: string, label: KnowledgeLabel): { score: number; matc
     if (score > best.score) best = { score, matchedBy: alias };
   }
   return best.score > 0 ? best : null;
-}
-
-function firstPageChunk(page: KnowledgePageLabels): MemoryChunk {
-  const first = chunkMarkdown(page.body)[0];
-  const heading = first?.heading || page.title;
-  const content = first?.content || [page.title, page.description].filter(Boolean).join("\n");
-  return {
-    file: page.file,
-    heading,
-    content,
-    startLine: page.bodyStartLine + (first?.startLine ?? 1) - 1,
-    endLine: page.bodyStartLine + (first?.endLine ?? 1) - 1,
-    labels: page.labels,
-  };
 }
 
 /** Fast page-label catalog. It scans local frontmatter only and never calls a model. */
@@ -192,39 +186,29 @@ export class KnowledgeLabelIndex {
     this.pages = next;
   }
 
-  search(query: string, topK = 10): MemorySearchResult {
-    const candidates: MemoryChunk[] = [];
+  search(query: string, topK = 10): KnowledgeResolutionResult {
+    const candidates: KnowledgePageCandidate[] = [];
     for (const page of this.pages.values()) {
       const matches = page.labels.flatMap((label) => {
         const match = matchLabel(query, label);
         return match ? [{ facet: label.facet, value: label.value, matchedBy: match.matchedBy, score: match.score }] : [];
       });
       if (matches.length === 0) continue;
-      const chunk = firstPageChunk(page);
-      chunk.score = Math.min(1, Math.max(...matches.map((match) => match.score)) + 0.03 * (matches.length - 1));
-      chunk.matchedLabels = matches.map(({ facet, value, matchedBy }) => ({ facet, value, matchedBy }));
-      candidates.push(chunk);
+      candidates.push({
+        file: page.file,
+        title: page.title,
+        description: page.description,
+        score: Math.min(1, Math.max(...matches.map((match) => match.score)) + 0.03 * (matches.length - 1)),
+        labels: page.labels,
+        matchedLabels: matches.map(({ facet, value, matchedBy }) => ({ facet, value, matchedBy })),
+      });
     }
-    candidates.sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.file.localeCompare(b.file));
+    candidates.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
     return {
-      chunks: candidates.slice(0, topK),
-      totalFiles: this.pages.size,
-      totalChunks: this.pages.size,
-      retrievalMode: "labels",
-      contentIndexReady: false,
+      pages: candidates.slice(0, topK),
+      totalPages: this.pages.size,
       totalLabels: this.catalog({ limit: 1 }).totalLabels,
     };
-  }
-
-  labelsForFile(file: string): KnowledgeLabel[] {
-    return this.pages.get(file)?.labels ?? [];
-  }
-
-  matchedLabelsForFile(file: string, query: string): MemoryChunk["matchedLabels"] {
-    return (this.pages.get(file)?.labels ?? []).flatMap((label) => {
-      const match = matchLabel(query, label);
-      return match ? [{ facet: label.facet, value: label.value, matchedBy: match.matchedBy }] : [];
-    });
   }
 
   catalog(opts: { query?: string; facet?: string; offset?: number; limit?: number } = {}): KnowledgeLabelCatalogResult {

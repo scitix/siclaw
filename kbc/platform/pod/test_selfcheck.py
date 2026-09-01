@@ -421,6 +421,7 @@ def test_emit_ignores_links_in_code():
             assert emitted["labels"][0]["value"] == "shell examples"
             assert emitted["generated"]["by"] == "process:siclaw-kbc"
             assert emitted["status"] == "stable"
+            assert "- [Guide](guide.md) - d" in (Path(td) / "index.md").read_text()
 
         module.call_json = lambda _: {"pages": [{**page, "body": "See [[legacy]]."}]}
         with tempfile.TemporaryDirectory() as td:

@@ -1270,8 +1270,8 @@ describe("knowledgeHandler multi-repo identity", () => {
     expect(index).toContain(`[[repos/${businessDir}/index]] - 业务知识 v7`);
   });
 
-  // This catalog is the cheap routing surface; the domain lets the agent pick a
-  // library before it needs hybrid search or another library index read.
+  // This catalog is the complete top-level routing surface; the domain lets
+  // the agent pick a library before it opens that library's complete index.
   it("carries each library's domain into the catalog line", async () => {
     const repos = [
       { id: "repo-a", name: "sre通用知识库", version: 3, sizeBytes: 10,

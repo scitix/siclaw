@@ -5,19 +5,12 @@ export interface MemoryChunk {
   startLine: number;  // 1-indexed start line in source file
   endLine: number;    // 1-indexed end line (inclusive)
   score?: number;     // search relevance score
-  /** Page-level routing metadata. It helps locate evidence; it is not evidence. */
-  labels?: Array<{ facet: string; value: string; aliases: string[] }>;
-  /** Labels whose value or alias matched the current query. */
-  matchedLabels?: Array<{ facet: string; value: string; matchedBy: string }>;
 }
 
 export interface MemorySearchResult {
   chunks: MemoryChunk[];
   totalFiles: number;
   totalChunks: number;
-  retrievalMode?: "labels" | "content" | "labels+content";
-  contentIndexReady?: boolean;
-  totalLabels?: number;
 }
 
 export interface EmbeddingProvider {

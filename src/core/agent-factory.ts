@@ -26,7 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
-import { createKnowledgeIndexer, type KnowledgeResolver } from "../knowledge/indexer.js";
+import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -93,7 +93,7 @@ export interface CreateSiclawSessionOpts {
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
-  /** Pre-initialized hybrid index over this Agent's mounted knowledge pages. */
+  /** Pre-initialized labels-only resolver over this Agent's mounted knowledge pages. */
   knowledgeIndexer?: KnowledgeResolver;
   /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
   mcpManager?: McpClientManager;
@@ -476,27 +476,22 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Memory disabled by Agent harness or SICLAW_MEMORY_ENABLED`);
   }
 
-  // Knowledge retrieval is independent from investigation memory. Typed page
-  // labels become available after a local frontmatter scan; heavier content
-  // indexing warms in the background. Both are scoped by the exact mounted
-  // knowledgeDir. AgentBox passes a shared instance; standalone TUI owns this
-  // fallback instance for its single session.
+  // Knowledge routing is independent from investigation memory and embedding
+  // configuration. Typed page labels become available after one local
+  // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
+  // shared resolver, while standalone TUI owns this fallback instance.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
     let candidate: KnowledgeResolver | undefined;
     try {
-      const created = createKnowledgeIndexer(
-        knowledgeDir,
-        path.join(userDataDir, "knowledge-index"),
-        resolveEmbeddingConfig(),
-      );
+      const created = createKnowledgeResolver(knowledgeDir);
       candidate = created;
       await created.sync();
       knowledgeIndexer = created;
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
       knowledgeIndexer = undefined;
-      console.warn("[agent-factory] Knowledge index init failed; Read/Grep/Find remain available:", err);
+      console.warn("[agent-factory] Knowledge label resolver init failed; the complete Wiki catalog and Read remain available:", err);
     }
   }
 

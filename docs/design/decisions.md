@@ -652,8 +652,8 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 - ✅ QA cold starts without SRE cluster-binding or shell guidance.
 - ✅ Prompt claims and model-visible tools/skills derive from one policy.
 - ✅ Capability-sync failure cannot silently become an unrestricted session.
-- ✅ Knowledge QA has a first-class hybrid search → exact fallback → full Read
-  → citation retrieval stack rather than depending only on catalog titles.
+- ✅ Knowledge QA has a complete Wiki catalog → labels-only resolver → full
+  Read → citation retrieval stack without content-index hydration.
 - ✅ LocalSpawner materializes explicitly bound Skills and MCP per Agent before
   the first prompt, without leaking process-global SRE resources into QA.
 - ✅ Domain-neutral state-change confirmation rules apply even when a QA or
@@ -679,12 +679,14 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 **Status**: Active
 
 **Context**:
-Large knowledge packages cannot expose their full `index.md` in the model
-prompt, and content indexes that require embedding hydration may take minutes
-or fail under provider rate limits. A package-specific hardcoded route would
-solve only the observed question; a global tag dump would recreate the context
-overflow. Labels also need to survive compiler → control plane → AgentBox
-without Sicore and Siclaw independently inferring different taxonomies.
+The runtime previously injected only the first 8,000 characters of `index.md`.
+That prefix looked complete while silently hiding valid pages, so an Agent could
+wrongly conclude that the Wiki did not cover a question. Content indexes that
+require FTS/vector construction or embedding hydration add another cold-start
+dependency and can take minutes or fail under provider rate limits. A
+package-specific hardcoded route would solve only the observed question.
+Labels also need to survive compiler → control plane → AgentBox without Sicore
+and Siclaw independently inferring different taxonomies.
 
 **Decision**:
 Store typed Knowledge Labels in each OKF v0.2 concept page's frontmatter. A
@@ -692,22 +694,23 @@ label has one facet (`entity`, `topic`, `task`, `component`, `environment`, or
 `version`), a canonical human-readable value, and optional aliases. Siclaw KBC
 generates labels; Sicore validates their shape and transports them unchanged.
 
-AgentBox derives a paginated Label Catalog and page index locally before
-starting content-index hydration. `knowledge_search` can list that catalog and
-returns all page labels, matched labels, and alias reasons. The Knowledge
-Resolver combines this deterministic channel with content retrieval only when
-the latter is ready. Labels never hard-filter unlabeled pages and never count
-as answer evidence; the Agent must still read and cite supporting content.
+The complete root `index.md` is injected into the model prompt as the common
+navigation baseline. AgentBox also derives an in-memory, paginated Label Catalog
+from page frontmatter before the first turn. `knowledge_search` resolves typed
+labels and aliases only; it never searches page bodies, creates a database, or
+opens an embedding provider. It returns page metadata, matched labels, and alias
+reasons, never snippets. Labels and catalog entries never count as answer
+evidence; the Agent must still read and cite supporting pages.
 
 **Consequences**:
 
-- ✅ Known entities, tasks, versions, and aliases route without an embedding call.
-- ✅ The first QA turn is not blocked by bulk vector hydration.
+- ✅ Every root-index route remains visible; no valid tail page is silently lost.
+- ✅ Known entities, tasks, versions, and aliases route without FTS, vectors, a database, or an embedding call.
+- ✅ The first QA turn has no content-index hydration dependency.
 - ✅ One page-level contract flows unchanged through compilation and delivery.
-- ✅ The complete catalog is available on demand without inflating every prompt.
-- ✅ Existing and third-party OKF v0.2 packages without labels remain valid.
+- ✅ Existing and third-party OKF v0.2 packages without labels navigate through the complete root index.
 - ⚠️ Label quality is a compiler-quality concern and needs later retrieval evaluation.
-- ⚠️ Unlabeled packages use content search or exact file search until incrementally recompiled.
+- ⚠️ The full root index consumes fixed prompt tokens; KBC must keep entries concise, and any future oversized representation must remain complete rather than head-truncated.
 - ❌ A label match is not a citation or permission to answer without reading the page.
 
 **Files**: `kbc/platform/pod/selfcheck.py`, `src/knowledge/labels.ts`,

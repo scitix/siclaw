@@ -50,7 +50,7 @@ import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
-import { createKnowledgeIndexer, type KnowledgeResolver } from "../knowledge/indexer.js";
+import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
@@ -167,7 +167,7 @@ export interface ManagedSession {
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
-  /** Knowledge indexer — shared at AgentBox level and scoped to this Agent's mount. */
+  /** Knowledge label resolver — shared at AgentBox level and scoped to this Agent's mount. */
   knowledgeIndexer?: KnowledgeResolver;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
@@ -474,15 +474,10 @@ export class AgentBoxSessionManager {
 
   private async createSharedKnowledgeIndexer(): Promise<KnowledgeResolver> {
     const config = loadConfig();
-    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
     const knowledgeDir = this.knowledgeDir ?? path.resolve(process.cwd(), config.paths.knowledgeDir);
-    const indexer = createKnowledgeIndexer(
-      knowledgeDir,
-      path.join(userDataDir, "knowledge-index"),
-      getEmbeddingConfig() ?? undefined,
-    );
-    await indexer.sync();
-    return indexer;
+    const resolver = createKnowledgeResolver(knowledgeDir);
+    await resolver.sync();
+    return resolver;
   }
 
   /** Reconcile search immediately after an Agent knowledge bundle changes. */
@@ -500,9 +495,9 @@ export class AgentBoxSessionManager {
 
     try {
       this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
-      console.log(`[agentbox-session] Shared knowledge indexer initialized`);
+      console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
     } catch (err) {
-      console.warn(`[agentbox-session] Shared knowledge indexer init failed:`, err);
+      console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
       this._sharedKnowledgeIndexer = null;
     }
 
@@ -3521,12 +3516,10 @@ export class AgentBoxSessionManager {
 
     if (this._sharedKnowledgeIndexer) {
       try {
-        await this._sharedKnowledgeIndexer.sync();
-        await this._sharedKnowledgeIndexer.waitForContentIndex();
         this._sharedKnowledgeIndexer.close();
-        console.log(`[agentbox-session] Shared knowledge indexer closed`);
+        console.log(`[agentbox-session] Shared knowledge label resolver closed`);
       } catch (err) {
-        console.warn(`[agentbox-session] Shared knowledge indexer close error:`, err);
+        console.warn(`[agentbox-session] Shared knowledge label resolver close error:`, err);
       }
       this._sharedKnowledgeIndexer = null;
     }

@@ -82,31 +82,18 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 }
 
 /**
- * Max chars of the knowledge wiki index injected into the prompt before
- * truncation.
- *
- * Sized against real compiled indexes rather than a round number: three
- * measured 7453, 6651 and 2668 characters, so 4000 cut roughly half the page
- * list of the single-library case — which is the common one, since one library
- * unpacks its own index at the root. A truncated catalog reads exactly like a
- * complete one; the agent finds no page for the task and concludes the wiki has
- * nothing, and the "read index.md for the full list" footer only helps an agent
- * that already suspects something is missing.
- */
-const KNOWLEDGE_WIKI_BUDGET = 8000;
-
-/**
  * Inject the knowledge wiki's page catalog into the system prompt.
  *
  * The wiki is a markdown tree at `knowledgeDir` whose `index.md` lists pages with
  * one-line descriptions and standard markdown links (legacy `[[links]]` remain
  * readable). We surface that index directly so the agent sees the catalog in
- * context for cheap routing, while knowledge_search provides hybrid retrieval
- * when titles/descriptions are insufficient. The agent then Reads only the
- * specific page(s) it needs on demand.
+ * context for complete routing. knowledge_search is an optional typed-label
+ * resolver when titles/descriptions are ambiguous; it never searches page
+ * bodies. The agent then Reads only the specific page(s) it needs on demand.
  *
- * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
- * truncated with a pointer to read the full file.
+ * Returns "" when there is no wiki (no index.md). The complete root index is a
+ * correctness contract: silently dropping its tail makes valid pages invisible
+ * while presenting the remaining prefix as if it were the full catalog.
  */
 export function buildKnowledgeWikiCatalog(
   knowledgeDir?: string,
@@ -122,24 +109,15 @@ export function buildKnowledgeWikiCatalog(
   }
   if (!index) return "";
 
-  let catalog = index;
-  let truncated = false;
-  if (catalog.length > KNOWLEDGE_WIKI_BUDGET) {
-    catalog = catalog.slice(0, KNOWLEDGE_WIKI_BUDGET);
-    // Drop a trailing partial line so the catalog ends cleanly.
-    const lastNl = catalog.lastIndexOf("\n");
-    if (lastNl > 0) catalog = catalog.slice(0, lastNl);
-    truncated = true;
-  }
-
   return [
     "# Knowledge Wiki",
     "",
     "Bound knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
-    "Use `knowledge_search` first with alternative terms, aliases, versions, and likely document titles; " +
-    "when routing is ambiguous, call it with `listLabels=true` to inspect the paginated typed label catalog. " +
-    "the catalog below is navigation context, not the only retrieval path. Use Grep/Find for exact terms " +
-    "or file-level fallback. Read the complete relevant page(s) with the Read tool before answering, and " +
+    "The complete page catalog is below. Route from its titles and descriptions first. When multiple pages " +
+    "remain plausible or the question uses an alias, use `knowledge_search`; it resolves typed page labels only " +
+    "and never searches page bodies. Set `listLabels=true` to inspect the paginated label catalog. Catalog and " +
+    "label results are navigation metadata, not answer evidence. Read the complete relevant page(s) with the " +
+    "Read tool before answering, and " +
     "follow standard markdown links " +
     "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
     "Also tolerate legacy `[[other-page]]` links, resolved from `.siclaw/knowledge/`. Don't read unrelated " +
@@ -148,10 +126,7 @@ export function buildKnowledgeWikiCatalog(
       ? "Answer from the most relevant pages, synthesize the evidence, and say when the knowledge is insufficient."
       : "Pages are semantic — translate what you learn into concrete checks using the tools and skills available to you."),
     "",
-    catalog,
-    ...(truncated
-      ? ["", "_(Catalog truncated — read `.siclaw/knowledge/index.md` for the complete list.)_"]
-      : []),
+    index,
   ].join("\n");
 }
 

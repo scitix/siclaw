@@ -2455,6 +2455,9 @@ async def test_prompt_packs_locale():
     assert "the code profile organizes pages around architectural concepts and components" in en_box_role, en_box_role
     assert "**一页一个文件" not in zh_box_role, zh_box_role
     assert "**One page per file" not in en_box_role, en_box_role
+    assert "4–12 条高信号" in zh_box_role and "4–12 high-signal" in en_box_role
+    assert "每个链接条目都带该页的一句话 `description`" in zh_box_role, zh_box_role
+    assert "every link entry includes the page's one-line `description`" in en_box_role, en_box_role
 
     # A regression round's consumer identity is deterministic and changes only
     # with answer-affecting contract inputs. Tool order is not semantic.

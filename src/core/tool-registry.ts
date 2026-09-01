@@ -416,7 +416,7 @@ export interface ToolRefs {
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
   memoryIndexer?: MemoryIndexer;
-  /** Label-first resolver over the knowledge pages mounted for this Agent. */
+  /** Labels-only resolver over the knowledge pages mounted for this Agent. */
   knowledgeIndexer?: KnowledgeResolver;
   /** Session-scoped Skill script lookup. Required for LocalSpawner isolation. */
   skillScriptResolver?: SkillScriptResolver;

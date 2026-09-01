@@ -10,7 +10,6 @@ import { renderTextResult } from "../infra/tool-render.js";
 interface KnowledgeSearchParams {
   query?: string;
   topK?: number;
-  minScore?: number;
   listLabels?: boolean;
   facet?: string;
   offset?: number;
@@ -24,8 +23,8 @@ function truncateUtf16Safe(value: string, maxLength: number): string {
   return value.slice(0, end);
 }
 
-/** Search one Agent's mounted knowledge pages through its scoped hybrid index. */
-export function createKnowledgeSearchTool(indexer: KnowledgeResolver): ToolDefinition {
+/** Resolve candidate pages from one Agent's mounted typed Knowledge Labels. */
+export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefinition {
   return {
     name: "knowledge_search",
     label: "Knowledge Search",
@@ -39,15 +38,13 @@ export function createKnowledgeSearchTool(indexer: KnowledgeResolver): ToolDefin
     },
     renderResult: renderTextResult,
     description:
-      "Search the knowledge pages bound to this Agent using immediately available typed labels plus any ready content indexes. " +
-      "Use it before answering from mounted knowledge, including when the user does not know the document title. " +
-      "Set listLabels=true to inspect the package's paginated label catalog without loading it into the system prompt. " +
-      "Try alternative product names, aliases, versions, and task terms when the first query is incomplete. " +
-      "The results are candidate snippets: Read the complete relevant pages before answering, then use knowledge_cite only for pages actually used.",
+      "Resolve candidate knowledge pages using typed page labels and aliases only; this tool never searches page bodies. " +
+      "Use it when the complete Wiki catalog leaves multiple plausible pages or the question uses alternate names, versions, or task terms. " +
+      "Set listLabels=true to inspect the package's paginated label catalog. Results are navigation metadata, not evidence: " +
+      "Read the complete relevant pages before answering, then use knowledge_cite only for pages actually used.",
     parameters: Type.Object({
       query: Type.Optional(Type.String({ description: "Natural-language query, label alias, version, or exact term to retrieve." })),
-      topK: Type.Optional(Type.Number({ description: "Maximum candidate chunks to return (default 8, maximum 20)." })),
-      minScore: Type.Optional(Type.Number({ description: "Optional minimum fused relevance score (default 0 to favor recall)." })),
+      topK: Type.Optional(Type.Number({ description: "Maximum candidate pages to return (default 8, maximum 20)." })),
       listLabels: Type.Optional(Type.Boolean({ description: "List the typed label catalog instead of searching page content." })),
       facet: Type.Optional(Type.String({ description: "When listing labels, restrict to one facet." })),
       offset: Type.Optional(Type.Number({ description: "When listing labels, zero-based pagination offset." })),
@@ -65,7 +62,7 @@ export function createKnowledgeSearchTool(indexer: KnowledgeResolver): ToolDefin
             details: { error: true },
           };
         }
-        const catalog = indexer.catalog({
+        const catalog = resolver.catalog({
           query: params.query?.trim() || undefined,
           facet: params.facet?.trim() || undefined,
           offset: params.offset,
@@ -86,33 +83,27 @@ export function createKnowledgeSearchTool(indexer: KnowledgeResolver): ToolDefin
 
       const topK = Math.min(20, Math.max(1, Math.floor(params.topK ?? 8)));
       try {
-        const result = await indexer.search(query, topK, params.minScore ?? 0);
-        const results = result.chunks.map((chunk, index) => ({
+        const result = resolver.search(query, topK);
+        const results = result.pages.map((page, index) => ({
           rank: index + 1,
-          file: chunk.file,
-          heading: chunk.heading,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-          score: Math.round((chunk.score ?? 0) * 1000) / 1000,
-          labels: chunk.labels ?? [],
-          matchedLabels: chunk.matchedLabels ?? [],
-          content: truncateUtf16Safe(chunk.content, 700),
+          file: page.file,
+          title: truncateUtf16Safe(page.title, 200),
+          description: truncateUtf16Safe(page.description, 700),
+          score: Math.round(page.score * 1000) / 1000,
+          labels: page.labels,
+          matchedLabels: page.matchedLabels,
         }));
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              mode: result.retrievalMode ?? "content",
+              mode: "labels",
               results,
               ...(results.length === 0 ? {
-                message: result.contentIndexReady === false
-                  ? "No label-matched page found while the content index is warming. Inspect the label catalog or use exact file search as fallback."
-                  : "No matching knowledge pages found.",
+                message: "No label-matched knowledge page found. Use the complete Wiki catalog to choose and Read plausible pages, or inspect the label catalog with listLabels=true.",
               } : {}),
-              totalFiles: result.totalFiles,
-              totalChunks: result.totalChunks,
-              contentIndexReady: result.contentIndexReady ?? true,
-              totalLabels: result.totalLabels ?? 0,
+              totalPages: result.totalPages,
+              totalLabels: result.totalLabels,
             }, null, 2),
           }],
           details: { resultCount: results.length },
