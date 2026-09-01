@@ -1,9 +1,17 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import { AGENT_TYPES, normalizeAgentType, effectiveAgentPrompt, effectiveCapabilityKeys } from "./agent-types.js";
+import {
+  AGENT_TYPES,
+  LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT,
+  PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT,
+  normalizeAgentType,
+  effectiveAgentPrompt,
+  effectiveCapabilityKeys,
+  resolveAgentPromptLayers,
+} from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the four designed types; built-ins lock caps and supply editable prompt defaults", () => {
+  it("has the four designed types; built-ins lock capabilities and own immutable contracts", () => {
     expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "knowledge_qa", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
@@ -66,12 +74,30 @@ describe("agent-types", () => {
     expect(effectiveCapabilityKeys("custom", null)).toBeNull();
   });
 
-  it("effectiveAgentPrompt: persisted prompt replaces the built-in default", () => {
+  it("keeps the compatibility text helper while layering authored specialization", () => {
     expect(effectiveAgentPrompt("coordinator", "maintainer truth")).toBe("maintainer truth");
     expect(effectiveAgentPrompt("coordinator", null)).toBe(AGENT_TYPES.coordinator.defaultPrompt);
     expect(effectiveAgentPrompt("knowledge_qa", "Prefer concise Chinese answers.")).toBe("Prefer concise Chinese answers.");
     expect(effectiveAgentPrompt("knowledge_qa", null)).toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("custom", "custom truth")).toBe("custom truth");
     expect(effectiveAgentPrompt("custom", "")).toBeUndefined();
+
+    expect(resolveAgentPromptLayers("coordinator", "maintainer truth")).toEqual({
+      typeContract: AGENT_TYPES.coordinator.defaultPrompt,
+      addendum: "maintainer truth",
+    });
+    expect(resolveAgentPromptLayers("custom", "custom truth")).toEqual({ addendum: "custom truth" });
+  });
+  it("upgrades only exact materialized Knowledge QA defaults", () => {
+    expect(effectiveAgentPrompt("knowledge_qa", LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT))
+      .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
+    expect(effectiveAgentPrompt("knowledge_qa", PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT))
+      .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
+    expect(resolveAgentPromptLayers("knowledge_qa", LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT)).toEqual({
+      typeContract: AGENT_TYPES.knowledge_qa.defaultPrompt,
+      addendum: undefined,
+    });
+    expect(effectiveAgentPrompt("knowledge_qa", `${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`))
+      .toBe(`${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`);
   });
 });

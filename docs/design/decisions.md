@@ -638,6 +638,8 @@ constraint. Its outputs are:
 
 - a role-neutral system prompt with capability-derived infrastructure,
   workflow, memory, skill-authoring, and operational-safety sections;
+- an immutable built-in Agent Type contract plus an optional Agent-owned
+  Addendum, rather than a persisted prompt that replaces the type contract;
 - an enforceable harness for built-in tools, configured MCP exposure, memory,
   and allowed skill roots.
 
@@ -645,7 +647,9 @@ All AgentBox and Portal-backed TUI entry points pass the locked Agent type and
 resolution state through this compiler. Unresolved startup is fail-closed.
 Custom plus a successfully resolved null selection remains the sole legacy
 unrestricted case. Session and final provider-envelope manifests record only
-hashes, lengths, and model-visible resource names, never prompt or user content.
+hashes, lengths, layer provenance, and model-visible resource names, never
+prompt or user content. Exact effective prompt/tool inspection is available
+only through an explicit administrator request for a resident session.
 
 **Consequences**:
 
@@ -659,6 +663,8 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 - ✅ Domain-neutral state-change confirmation rules apply even when a QA or
   Coordinator is explicitly bound to an effectful MCP.
 - ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
+- ✅ A deterministic prompt-design check covers layer ownership, completion,
+  capability/tool alignment, retrieval behavior, duplication, and size.
 - ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
   skills; required skills must be explicitly bound.
 - ⚠️ Explicitly configured MCP remains orthogonal to built-in capability
@@ -670,4 +676,5 @@ hashes, lengths, and model-visible resource names, never prompt or user content.
 
 **Files**: `src/core/agent-context.ts`, `src/core/prompt.ts`,
 `src/core/agent-factory.ts`, `src/core/model-envelope.ts`,
+`src/core/prompt-inspection.ts`,
 `src/agentbox-main.ts`, `src/gateway/agentbox/local-spawner.ts`

@@ -2,16 +2,16 @@ import { createHash } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import {
-  effectiveAgentPrompt,
   effectiveCapabilityKeys,
   requireAgentType,
+  resolveAgentPromptLayers,
   type AgentType,
 } from "./agent-types.js";
-import { buildSystemPrompt } from "./prompt.js";
+import { buildSystemPromptAssembly, type PromptAssembly } from "./prompt.js";
 import { resolveCapabilities } from "./tool-capabilities.js";
 import type { DelegationContext, SessionMode } from "./types.js";
 
-export const AGENT_CONTEXT_VERSION = "agent-context/v1" as const;
+export const AGENT_CONTEXT_VERSION = "agent-context/v2" as const;
 
 export type HarnessResolution = "resolved" | "unresolved";
 export type McpExposure = "configured" | "none";
@@ -51,7 +51,19 @@ export interface AgentContextManifest {
   agentType: AgentType;
   resolution: HarnessResolution;
   mode: SessionMode;
-  prompt: { chars: number; sha256: string };
+  prompt: {
+    chars: number;
+    sha256: string;
+    assemblyVersion: PromptAssembly["version"];
+    layers: Array<{
+      id: string;
+      owner: string;
+      source: string;
+      mutable: boolean;
+      chars: number;
+      sha256: string;
+    }>;
+  };
   tools: { names: string[]; sha256: string };
   skills: { names: string[]; sha256: string };
   resources: {
@@ -73,6 +85,7 @@ export interface AgentContextManifest {
 
 export interface CompiledAgentContext {
   systemPrompt: string;
+  promptAssembly: PromptAssembly;
   harness: AgentHarnessPolicy;
 }
 
@@ -86,7 +99,9 @@ function hasAnyTool(allowedTools: string[] | null, names: readonly string[]): bo
  * This is deliberately fail-closed when the control plane has not resolved the
  * Agent type/capabilities. Prompt wording is never used as a permission gate.
  */
-export function resolveAgentHarness(input: Omit<CompileAgentContextInput, "mode" | "agentPrompt" | "systemPromptTemplate">): AgentHarnessPolicy {
+export function resolveAgentHarness(
+  input: Omit<CompileAgentContextInput, "mode" | "agentPrompt" | "systemPromptTemplate"> & { mode?: SessionMode },
+): AgentHarnessPolicy {
   const agentType = requireAgentType(input.agentType);
   const resolution: HarnessResolution = input.harnessResolved === false ? "unresolved" : "resolved";
   // null is unrestricted only for an explicit Custom Agent. Built-in types own
@@ -96,7 +111,13 @@ export function resolveAgentHarness(input: Omit<CompileAgentContextInput, "mode"
   const resolvedTools = input.allowedTools === null && agentType !== "custom"
     ? (resolveCapabilities(effectiveCapabilityKeys(agentType, null)) ?? [])
     : input.allowedTools;
-  const allowedTools = resolution === "resolved" ? resolvedTools : [];
+  // task_report is part of the automated-task transport contract, not an
+  // Agent's ordinary interactive capability set. Grant it only in task mode so
+  // CRON_SECTION never instructs any Agent Type to call an unavailable tool.
+  const modeTools = input.mode === "task" && Array.isArray(resolvedTools) && !resolvedTools.includes("task_report")
+    ? [...resolvedTools, "task_report"]
+    : resolvedTools;
+  const allowedTools = resolution === "resolved" ? modeTools : [];
   const delegatedReadOnly = input.delegation?.readOnly === true;
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
 
@@ -151,11 +172,18 @@ export function resolveAgentHarness(input: Omit<CompileAgentContextInput, "mode"
 /** Compile the stable system prompt and enforceable policy for one session. */
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
-  const agentPrompt = effectiveAgentPrompt(harness.agentType, input.agentPrompt);
-  const systemPrompt = buildSystemPrompt({
+  const agentPrompt = input.delegation?.readOnly
+    ? {
+        addendum: typeof input.agentPrompt === "string" && input.agentPrompt.trim()
+          ? input.agentPrompt.trim()
+          : undefined,
+      }
+    : resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
+  const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
     templateOverride: input.systemPromptTemplate,
-    agentPrompt,
+    agentTypePrompt: agentPrompt.typeContract,
+    agentAddendum: agentPrompt.addendum,
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,
     includeOperationalSafety: harness.includeOperationalSafety,
@@ -163,7 +191,7 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
     includePlanningGuidance: harness.includePlanningGuidance,
     includeSubagentGuidance: harness.includeSubagentGuidance,
   });
-  return { systemPrompt, harness };
+  return { systemPrompt: promptAssembly.text, promptAssembly, harness };
 }
 
 function sha256(value: string): string {
@@ -190,13 +218,25 @@ export function createAgentContextManifest(input: {
   const toolNames = sortedUnique(input.tools.map((tool) => tool.name));
   const skillNames = sortedUnique(input.skillNames);
   const mcpServerNames = sortedUnique(input.mcpServerNames);
-  const { harness, systemPrompt } = input.context;
+  const { harness, systemPrompt, promptAssembly } = input.context;
   return {
     version: AGENT_CONTEXT_VERSION,
     agentType: harness.agentType,
     resolution: harness.resolution,
     mode: input.mode,
-    prompt: { chars: systemPrompt.length, sha256: sha256(systemPrompt) },
+    prompt: {
+      chars: systemPrompt.length,
+      sha256: sha256(systemPrompt),
+      assemblyVersion: promptAssembly.version,
+      layers: promptAssembly.layers.map((layer) => ({
+        id: layer.id,
+        owner: layer.owner,
+        source: layer.source,
+        mutable: layer.mutable,
+        chars: layer.text.length,
+        sha256: sha256(layer.text),
+      })),
+    },
     tools: { names: toolNames, sha256: sha256(JSON.stringify(toolNames)) },
     skills: { names: skillNames, sha256: sha256(JSON.stringify(skillNames)) },
     resources: {

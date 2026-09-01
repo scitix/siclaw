@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import { inspectModelEnvelope } from "./model-envelope.js";
+import { extractModelEnvelopeInspection, inspectModelEnvelope } from "./model-envelope.js";
 
 describe("inspectModelEnvelope", () => {
+  it("keeps exact model-visible instructions available only to the explicit in-memory inspection", () => {
+    const payload = {
+      instructions: "exact private system prompt",
+      tools: [{ type: "function", function: { name: "read", description: "Read", parameters: { type: "object" } } }],
+    };
+
+    expect(extractModelEnvelopeInspection(payload)).toEqual({
+      systemPrompt: "exact private system prompt",
+      toolSchemas: payload.tools,
+    });
+    expect(JSON.stringify(inspectModelEnvelope(payload))).not.toContain("exact private system prompt");
+  });
   it("observes Chat Completions system/developer messages and function tools", () => {
     const manifest = inspectModelEnvelope({
       messages: [

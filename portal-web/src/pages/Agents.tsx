@@ -199,7 +199,7 @@ export function Agents() {
             )}
           </div>
           ) : (
-            <p className="text-xs text-muted-foreground">Capabilities are defined by the <span className="font-medium text-foreground">{form.agent_type}</span> type. Its initial prompt can be edited after creation.</p>
+            <p className="text-xs text-muted-foreground">Capabilities and the immutable behavior contract are defined by the <span className="font-medium text-foreground">{form.agent_type}</span> type. An optional Agent Addendum can be edited after creation.</p>
           )}
           </div>
           <div className="flex gap-2 p-4 border-t border-border shrink-0">

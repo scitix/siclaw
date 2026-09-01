@@ -1,129 +1,171 @@
 # Agent prompt lifecycle
 
-`system_prompt` is the Agent-owned identity and behaviour instruction. It has
-the same semantics for `sre`, `coordinator`, `knowledge_qa`, and `custom`
-agents:
+Siclaw compiles prompt text and the enforceable runtime harness from the same
+Agent Context. Prompt wording explains behavior; tool schemas, resource
+bindings, and runtime gates decide what the model can actually do.
 
-- an Agent type selects an initial default prompt;
-- a non-empty persisted `system_prompt` replaces that default;
-- the default is never appended behind a persisted prompt.
+## Assembly contract
 
-The editable prompt does not replace Siclaw's platform assembly. Every session
-entry point passes Agent type, resolved capabilities, mode, and delegation
-constraints to `compileAgentContext()`. The compiler produces two coupled
-outputs:
+The effective system prompt is an ordered set of owned layers:
 
-- a role-neutral platform prompt plus only the type/capability sections the
-  harness can actually support;
-- an enforceable harness policy for built-in tools, configured MCP exposure,
-  memory, and skill roots.
+1. **Platform Kernel** — stable completion, evidence, communication, tool, and
+   runtime rules shared by every Agent.
+2. **Capability and mode policy** — only sections supported by the compiled
+   harness, such as SRE infrastructure guidance, planning, sub-agents, channel
+   format, or automated-task behavior.
+3. **Agent Type Contract** — immutable behavior for `sre`, `coordinator`, or
+   `knowledge_qa`. `custom` intentionally has no built-in contract.
+4. **Agent Addendum** — optional administrator-authored specialization stored
+   in the legacy `agents.system_prompt` column. It extends a built-in contract;
+   it never replaces it.
+5. **Platform Safety** — operational and common safety rules, placed after
+   editable Agent text.
+6. **Runtime context** — Pi's ResourceLoader appends the current Profile, Wiki
+   navigation/retrieval contract, citations, context files, Skills, and working
+   directory.
+7. **Provider transform** — the provider adapter may convert the assembled
+   prompt and tools into its wire envelope.
 
-Prompt text is descriptive, never the permission gate. The model-visible tool
-schemas and skill index are filtered from the same policy that selected their
-prompt guidance. In particular:
+`buildSystemPromptAssembly()` records the identity, owner, source, mutability,
+text length, and hash of every static layer. `session.systemPrompt` is the exact
+assembled prompt after runtime context. The payload hook observes the final
+provider-visible instructions and tool schemas after provider transforms.
 
-- SRE, and Custom Agents that selected discovery tools, get infrastructure
-  guidance; QA/Coordinator do not;
-- planning and sub-agent guidance appear only when their tools are allowed;
-- QA uses the catalog for cheap routing, `knowledge_search` for hybrid
-  semantic/keyword retrieval, Grep/Find as exact-text fallback, Read for full
-  pages, and `knowledge_cite` for adopted sources; it never suggests shell checks;
-- QA/Coordinator do not inherit repo-bundled or user-global operational skills,
-  but they still receive skills, knowledge, and MCP explicitly configured for
-  that Agent;
-- delegated read-only sessions suppress MCP, memory, writes, and operational
-  guidance;
-- an unresolved control-plane lookup exposes no tools, MCP, memory, or ambient
-  skills until a later successful sync.
+The Platform Kernel deliberately distinguishes progress from completion. A
+turn must end with the requested answer/result, one necessary clarification,
+an insufficient-evidence result, or a concrete failure/blocker. A short
+progress update alone is not a completed turn.
 
-The final model context has two independent availability axes:
+## Type and capability alignment
+
+Each entry point passes Agent type, resolved capabilities, mode, and delegation
+constraints to `compileAgentContext()`. The compiler returns:
+
+- the prompt assembly described above;
+- an enforceable harness for built-in tools, configured MCP exposure, memory,
+  and skill roots.
+
+The model-visible tool schemas and Skill index are filtered from the same
+policy that selected prompt guidance:
+
+- SRE, and Custom Agents with discovery tools, receive infrastructure guidance;
+  QA and Coordinator do not.
+- Planning and sub-agent guidance appears only when those tools are available.
+- Automated-task mode grants only its transport-owned `task_report` tool in
+  addition to the type's ordinary capabilities, keeping the required terminal
+  report aligned for every Agent Type.
+- QA/Coordinator do not inherit repo-bundled or user-global operational Skills;
+  explicitly bound Skills, knowledge, and MCP remain available.
+- Delegated read-only sessions suppress MCP, memory, writes, and operational
+  guidance, and use an exclusive read-only worker contract.
+- An unresolved control-plane lookup exposes no tools, MCP, memory, or ambient
+  Skills until a successful sync.
+
+The two availability axes remain independent:
 
 | Agent type | Built-in capability groups | Explicitly configured resources |
 |---|---|---|
-| SRE | infrastructure, commands, scripts, files, memory, planning and sub-agents | skills, knowledge and MCP |
-| Coordinator | files and delegation; no own `cluster_list` / `host_list` | knowledge/skills for answering and routing, plus MCP for an attached resource-locator helper |
-| Knowledge QA | `knowledge_search`, Grep/Find, Read and `knowledge_cite` | knowledge, explicitly bound skills and query/visual MCP |
-| Custom | standalone Portal selection, or legacy unrestricted built-ins only when type `custom` is explicitly resolved with no selection | skills, knowledge and MCP |
+| SRE | infrastructure, commands, scripts, files, memory, planning, sub-agents, session output | Skills, knowledge, MCP |
+| Coordinator | files and delegation; no own `cluster_list` / `host_list` | knowledge/Skills for answering and routing, MCP for an attached resource locator |
+| Knowledge QA | `knowledge_search`, Grep/Find, Read, `knowledge_cite` | knowledge, explicitly bound Skills and query/visual MCP |
+| Custom | Portal selection, or legacy unrestricted built-ins only when an explicit Custom type has no selection | Skills, knowledge, MCP |
 
-`allowedTools` controls the first axis. It does not classify dynamic MCP tool
-names. In scoped AgentBox/Portal sessions, the MCP config contains only the
-Agent's resolved bindings. LocalSpawner keeps it in per-Agent SessionManager
-state rather than process-global settings; in standalone mode it is the user's
-explicit `settings.json` configuration. The current MCP payload carries neither a
-trustworthy read/write classification nor binding-source provenance, so Siclaw
-must not guess from a server or tool name. An SRE MCP bound to a QA Agent would
-therefore still put its tool descriptions in model context; preventing that is
-a control-plane resource-binding responsibility until the wire contract gains
-enforceable provenance/effect metadata.
+`allowedTools` controls built-in tools, not dynamically named MCP tools. In
+scoped AgentBox/Portal sessions the MCP config already contains only that
+Agent's resource bindings. The current MCP wire payload has no trustworthy
+read/write classification or binding-source provenance, so Siclaw must not
+guess safety from a server or tool name. Until the contract carries enforceable
+effect metadata, Agent-type-safe MCP binding remains a control-plane
+responsibility.
 
-For Coordinator, `list_delegates` is the authorization/coverage check, not a
-resource search. A concrete Pod/Job/Node/reservation/entry ID/IP without its
-cluster may be resolved by an explicitly bound resource-locator skill and MCP;
-only one confirmed Siclaw binding may then be passed to `list_delegates` with
-`binding_name_confirmed=true`.
+For Knowledge QA, `knowledge_search` is an optional accelerator for a likely
+single-page answer. A `direct_hit` is not authority: similarity is not proof,
+and the Agent validates subject, task, version, environment, and scope before
+adopting evidence. Broad, novel, ambiguous, comparative, weak-match, and
+cross-page questions return to Agent-led Wiki exploration through Find/Grep/Read.
+`explore` and `unavailable` never prove the Wiki lacks an answer. This preserves
+semantic reasoning and the Wiki's linked navigation model while accelerating
+clear high-frequency questions.
 
-`custom` plus a successfully resolved null capability selection retains the
-legacy unrestricted built-in behavior. The permission boundary requires an
-explicit supported `agent_type`; a missing/unknown type, missing row, malformed
-capability value, or failed lookup stays unresolved and fail-closed.
+That retrieval policy is owned by the runtime Wiki context and tool contract,
+not duplicated in the Agent Type Contract or an editable Addendum. The prompt
+inspection standard reports `retrieval_below_reasoning: fail` when a deployed
+tool still requires search before every answer, making a retrieval-policy drift
+visible without coupling the prompt compiler to one search implementation.
 
-The same contract applies in AgentBox sessions and the Portal-backed TUI.
-Persisted prompt fragments retain the legacy template conveniences:
-`{{mode}}`, `{{settingsPath}}`, `{{credentialsPath}}`, `{{memoryIntro}}`,
-`{{memorySection}}`, and web/CLI conditional blocks are resolved before the
-fragment is inserted. The Agent-owned fragment is placed before Siclaw's
-hardcoded Safety and Language sections, so editable identity text cannot gain
-recency precedence over those platform-owned instructions.
+## Stored Addendum compatibility
 
-For `custom` agents this is an intentional semantic migration: their stored
-prompt used to replace the whole Siclaw template. It now replaces only the
-Agent-owned identity/behaviour layer, so the platform assembly is present for
-all agent types.
+New built-in Agent rows no longer materialize a copy of the type contract in
+`system_prompt`. Exact historical built-in defaults are recognized as migration
+data and are not exposed as editable addenda. Any other stored text is preserved
+as an Addendum and composed with the current immutable type contract.
 
-Delegated read-only work is an exclusive platform constraint. It replaces the
-Agent-owned identity for that delegated turn rather than composing potentially
-conflicting remediation or routing instructions with a read-only toolset.
+Addenda retain the legacy fragment conveniences: `{{mode}}`,
+`{{settingsPath}}`, `{{credentialsPath}}`, `{{memoryIntro}}`,
+`{{memorySection}}`, and Web/CLI conditional blocks. Safety follows the Addendum
+and therefore cannot be displaced by editable text.
 
-## Audit manifests
+When a built-in type changes and the submitted Addendum is unchanged, Portal
+clears that old specialization instead of carrying a potentially conflicting
+persona onto a new immutable contract and toolset. An Addendum edited in the
+same request is retained. Switching to Custom preserves the visible text
+because Custom has no type contract of its own.
 
-Session creation emits an `agent-context/v1` manifest containing Agent type,
-resolution state, mode, policy flags, resource names, model-visible tool and
-skill names, and prompt hashes. It never logs prompt or user-message content.
+## Exact inspection and design standard
 
-Provider payload hooks additionally emit a wire-level manifest for the final
-request envelope after provider transforms. It records only system-prompt
-length/hash, the full tool-schema hash, sorted tool names, and boolean markers
-for known SRE/infrastructure/memory/workflow prompt sections. This is the source
-of truth for answering "what prompt and tools did this model call actually
-receive?" and whether an unexpected platform section was present, without
-storing sensitive text.
+Routine status and telemetry remain non-sensitive. The `agent-context/v2`
+manifest records only prompt layer metadata/hashes, model-visible tool and Skill
+names, resource state, and policy flags. The provider-envelope manifest records
+only prompt length/hash, tool names/schema hash, and known-section markers.
+
+An administrator can explicitly inspect a resident chat session from the
+Agent's **Prompt** tab by supplying its session ID. The call follows:
+
+```text
+Portal GET /api/v1/agents/:id/prompt-inspection?session_id=...
+  -> Runtime RPC agent.promptInspection
+  -> AgentBox GET /api/sessions/:sessionId/prompt-inspection
+```
+
+The response contains the exact effective prompt, layer texts and provenance,
+actual model-visible tool descriptions/schema hashes, visible Skill names, and
+replica consistency hashes. Exact text is produced only on demand, stays behind
+admin authentication plus the Runtime/AgentBox mTLS boundary, and is never
+added to normal polling, sync status, or logs. A released session must be sent a
+message and inspected again within its resident idle window.
+
+`siclaw-prompt-design/v1` is a deterministic structural standard, not a claim
+that prose alone proves answer quality. It checks:
+
+- unique layer ownership and immutable built-in type contracts;
+- explicit completion semantics and a stable Platform Kernel;
+- capability-scoped role guidance and prompt/tool alignment;
+- Knowledge QA retrieval below reasoning and linked Wiki exploration;
+- duplicate sections, tool descriptions, and visible prompt size.
+
+Its conventions are informed by current public guidance from
+[OpenAI model optimization](https://developers.openai.com/api/docs/guides/latest-model),
+[Codex as a harness](https://developers.openai.com/blog/codex-as-a-platform),
+the [OpenAI Codex repository](https://github.com/openai/codex), and
+[xAI Grok Build](https://github.com/xai-org/grok-build): keep stable policy
+lean, expose only relevant tools, make boundaries and terminal outcomes
+explicit, and evaluate representative task success, evidence quality, latency,
+and token use. Structural `pass` therefore still requires end-to-end case
+evaluation; it does not certify semantic answer correctness.
 
 ## Hot application
 
-Saving an effectively changed prompt sends `agent.reload` with
-`resources: ["prompt"]`. Re-saving an identical form, changing unrelated Agent
-fields, and binding resources do not include `prompt`. Runtime
-calls the running AgentBox's `/api/reload-prompt` endpoint. AgentBox has no
-prompt payload to cache: the Gateway already resolves the latest value for
-each message. The reload only invalidates warm sessions.
+Saving an effectively changed Addendum sends `agent.reload` with
+`resources: ["prompt"]`. Re-saving identical text, editing unrelated fields, or
+binding resources does not reload the prompt. Runtime invalidates warm sessions
+through AgentBox; it does not mutate an in-flight brain:
 
-- An in-flight turn completes with the prompt it started with.
-- An idle, quiescent session is scheduled for immediate release.
-- Detached background work is allowed to finish rather than being torn down.
-  Because it does not own `brain.prompt()`, the chat may continue on the old
-  in-memory prompt while that work is outstanding. Its buffered completion
-  notification drains first, including the coalescing window and any synthetic
-  model turn; only then is the deferred release scheduled. An invalidated
-  session uses a next-tick release at that point rather than the idle TTL.
-- The next turn restores the existing JSONL conversation into a new in-memory
-  brain with the latest prompt.
-- The AgentBox process/pod is not killed, and the 30-second idle release TTL is
-  not part of prompt propagation.
+- an in-flight turn completes with the prompt it started with;
+- an idle, quiescent session is released immediately;
+- detached background work drains before deferred release;
+- the next turn restores existing JSONL conversation history into a new brain
+  with the latest Type Contract and Addendum;
+- the AgentBox process is not killed, and its normal idle TTL is not the prompt
+  propagation mechanism.
 
-This contract preserves conversation history while avoiding mid-turn prompt
-mutation.
-
-Changing Agent type also changes the built-in capability set. If the submitted
-prompt is still effectively unchanged from the old stored prompt, the server initializes the
-new type's default instead of carrying an SRE persona onto Coordinator tools
-(or the reverse). A prompt edited in the same request remains authoritative.
+This preserves conversation history while avoiding mid-turn prompt mutation.

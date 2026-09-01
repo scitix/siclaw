@@ -1850,6 +1850,22 @@ export function createHttpServer(
   });
 
   /**
+   * GET /api/sessions/:sessionId/prompt-inspection — explicit sensitive audit.
+   *
+   * Unlike sync-status and ordinary manifests this returns the exact effective
+   * system prompt. It stays behind the AgentBox's Gateway/Runtime mTLS boundary,
+   * is generated only on demand, and is never written to routine logs.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/prompt-inspection", async (_req, res, params) => {
+    const managed = sessionManager.get(params.sessionId);
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+    sendJson(res, 200, managed.getPromptInspection());
+  });
+
+  /**
    * DELETE /api/sessions/:sessionId - close session
    */
   addRoute("DELETE", "/api/sessions/:sessionId", async (_req, res, params) => {

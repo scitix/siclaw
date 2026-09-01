@@ -46,7 +46,13 @@ import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
-import { inspectModelEnvelope, type ModelEnvelopeManifest } from "./model-envelope.js";
+import {
+  extractModelEnvelopeInspection,
+  inspectModelEnvelope,
+  type ModelEnvelopeInspection,
+  type ModelEnvelopeManifest,
+} from "./model-envelope.js";
+import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
@@ -87,9 +93,9 @@ export interface CreateSiclawSessionOpts {
   agentType?: AgentType;
   /** False when the control plane could not prove the Agent's type/capability policy. */
   harnessResolved?: boolean;
-  /** Extra system prompt content appended for agent customization */
+  /** Persisted Agent-owned addendum; built-in type contracts are compiled separately. */
   systemPromptAppend?: string;
-  /** Custom system prompt template from agent settings (overrides DEFAULT_TEMPLATE) */
+  /** Legacy platform-template override for standalone callers; not an Agent setting. */
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
@@ -196,6 +202,8 @@ export interface SiclawSessionResult {
   contextManifest: AgentContextManifest;
   /** Updated at the provider boundary with the final serialized instruction/tool fingerprint. */
   modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest };
+  /** Explicit sensitive inspection. Callers must never place its prompt text in ordinary logs. */
+  getPromptInspection: () => PromptInspection;
 
 }
 
@@ -777,10 +785,9 @@ export async function createSiclawSession(
     authStorage,
     modelRegistry,
     resourceLoaderOptions: {
-      // Agent-owned identity is rendered inside the assembled prompt before
-      // the hardcoded Safety section. Dynamic profile/knowledge context stays
-      // in the resource-loader append, but admin text no longer has recency
-      // precedence over platform safety.
+      // The immutable type contract and optional Agent Addendum are rendered
+      // before hardcoded Safety. Dynamic profile/knowledge context stays in the
+      // ResourceLoader append; editable text cannot displace platform policy.
       systemPromptOverride: () => compiledContext.systemPrompt,
       appendSystemPromptOverride: () =>
         buildAppendSystemPrompt(
@@ -845,6 +852,7 @@ export async function createSiclawSession(
   });
   console.log(`[agent-context] ${JSON.stringify(contextManifest)}`);
   const modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest } = {};
+  const modelEnvelopeInspectionRef: { current?: ModelEnvelopeInspection } = {};
 
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());
@@ -889,6 +897,7 @@ export async function createSiclawSession(
       : converted;
     const finalPayload = convertOpenAIPdfPayload(next ?? converted);
     const manifest = inspectModelEnvelope(finalPayload);
+    modelEnvelopeInspectionRef.current = extractModelEnvelopeInspection(finalPayload);
     const previous = modelEnvelopeManifestRef.current;
     modelEnvelopeManifestRef.current = manifest;
     if (!previous ||
@@ -931,10 +940,22 @@ export async function createSiclawSession(
     return { skillNames, skillDigests };
   };
   const { skillNames, skillDigests } = getSkillSnapshot();
+  const getPromptInspection = (): PromptInspection => {
+    const wire = modelEnvelopeInspectionRef.current;
+    return createPromptInspection({
+      context: compiledContext,
+      mode,
+      effectivePrompt: wire?.systemPrompt ?? session.systemPrompt,
+      stage: wire ? "provider_wire" : "session_ready",
+      tools: wire ? wire.toolSchemas : customTools,
+      skillNames: getSkillSnapshot().skillNames,
+    });
+  };
   return {
     brain, session, services, extensionsResult, modelFallbackMessage, customTools,
     skillNames, skillDigests, getSkillSnapshot,
     kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
     sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,
+    getPromptInspection,
   };
 }

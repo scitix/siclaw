@@ -899,15 +899,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         }
         throwIfStoppedBeforePrompt();
 
-        // Agent-prompt precedence for the box session. An explicit
+        // Agent-Addendum precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
         // agent's model binding) wins as-is. When the caller does NOT forward one
         // — e.g. control-plane's web-chat proxy, which never sends systemPrompt — fall
-        // back to the agent's persisted instruction (agents.system_prompt via
-        // config.getAgent). Every agent type uses the same precedence.
+        // back to the Agent's persisted Addendum (agents.system_prompt via
+        // config.getAgent). The AgentBox separately compiles immutable type policy.
         //
         // Best-effort: resolveAgentSystemPrompt swallows RPC errors and returns
-        // undefined (no prompt / lookup failed) → type default, so a lookup
+        // undefined (no Addendum / lookup failed) → type contract only, so a lookup
         // failure never turns into a chat failure. Prompt publication invalidates
         // warm sessions, so the next turn rebuilds with the latest value.
         if (promptOpts.systemPromptTemplate === undefined) {
@@ -2224,6 +2224,69 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       mcp: first.mcp ?? { names: [] },
       harness: consistent ? (first.harness ?? null) : null,
       model: consistent ? (first.model ?? null) : null,
+    };
+  });
+
+  // agent.promptInspection — explicit sensitive audit of one resident session.
+  // The exact prompt is never included in routine sync status or logs. Portal
+  // exposes this RPC only through its admin-only, session-addressed endpoint.
+  rpcMethods.set("agent.promptInspection", async (params) => {
+    const agentId = params.agentId as string;
+    const sessionId = params.sessionId as string;
+    if (!agentId) throw new Error("agentId required");
+    if (!sessionId) throw new Error("sessionId required");
+
+    const boxes = await agentBoxManager.list();
+    const targets = boxes.filter((box) =>
+      box.agentId === agentId && box.status === "running" && Boolean(box.endpoint));
+    if (targets.length === 0) {
+      return { ok: true, available: false, reason: "no_running_box" };
+    }
+
+    const observations = await Promise.all(targets.map(async (box) => {
+      try {
+        const client = new AgentBoxClient(box.endpoint, 8_000, agentBoxTlsOptions);
+        const inspection = await client.getJson<any>(
+          `/api/sessions/${encodeURIComponent(sessionId)}/prompt-inspection`,
+        );
+        return { boxId: box.boxId, available: true as const, inspection };
+      } catch (err: any) {
+        const status = Number(err?.status ?? err?.metadata?.status ?? err?.statusCode ?? 0);
+        return {
+          boxId: box.boxId,
+          available: false as const,
+          reason: status === 404 ? "session_not_resident" : "query_failed",
+        };
+      }
+    }));
+    const found = observations.filter((item) => item.available);
+    if (found.length === 0) {
+      return {
+        ok: true,
+        available: false,
+        reason: observations.some((item) => item.reason === "query_failed")
+          ? "query_failed"
+          : "session_not_resident",
+        observations,
+      };
+    }
+
+    const first = found[0].inspection;
+    const promptHash = first?.prompt?.sha256;
+    const consistent = found.every((item) => item.inspection?.prompt?.sha256 === promptHash);
+    return {
+      ok: true,
+      available: true,
+      consistent,
+      inspection: first,
+      observations: observations.map((item) => item.available
+        ? {
+            boxId: item.boxId,
+            available: true,
+            promptSha256: item.inspection?.prompt?.sha256 ?? null,
+            stage: item.inspection?.stage ?? null,
+          }
+        : item),
     };
   });
 

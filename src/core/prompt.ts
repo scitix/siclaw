@@ -5,13 +5,16 @@ const MODE_LABELS: Record<string, string> = {
   cli: "TUI",
   web: "Web UI",
   channel: "channel",
-  cron: "automated task",
+  task: "automated task",
 };
 
 export interface BuildSystemPromptInput {
   mode?: "cli" | "web" | "channel" | "task";
   templateOverride?: string;
-  agentPrompt?: string;
+  /** Immutable built-in Agent Type contract. */
+  agentTypePrompt?: string;
+  /** Editable Agent-owned specialization. */
+  agentAddendum?: string;
   memoryEnabled: boolean;
   includeInfrastructureGuidance: boolean;
   includeOperationalSafety: boolean;
@@ -20,26 +23,46 @@ export interface BuildSystemPromptInput {
   includeSubagentGuidance: boolean;
 }
 
+export const PROMPT_ASSEMBLY_VERSION = "prompt-assembly/v1" as const;
+
+export type PromptLayerOwner = "platform" | "mode" | "agent_type" | "agent";
+
+export interface PromptLayer {
+  id: string;
+  owner: PromptLayerOwner;
+  source: string;
+  mutable: boolean;
+  text: string;
+}
+
+export interface PromptAssembly {
+  version: typeof PROMPT_ASSEMBLY_VERSION;
+  layers: PromptLayer[];
+  text: string;
+  legacyTemplateOverride: boolean;
+}
+
 /**
  * Build a role-neutral platform prompt plus the compiled Agent role/policy.
  *
  * Template resolution order:
- * 1. `templateOverride` parameter (from agent settings in Web UI)
- * 2. `DEFAULT_TEMPLATE` (bundled fallback)
+ * 1. `templateOverride` for legacy platform-level callers
+ * 2. `DEFAULT_TEMPLATE` (bundled Platform Kernel)
  *
  * Supported template variables: {{mode}}, {{settingsPath}}, {{credentialsPath}}
  * Mode-conditional blocks: `<!-- web-only -->...<!-- /web-only -->` and
  * `<!-- cli-only -->...<!-- /cli-only -->` — the non-matching block is stripped.
  *
- * The optional agent-owned identity fragment is rendered after the platform
- * template but before Safety. Safety and Language therefore remain later than
- * editable Agent text and cannot be displaced by an Agent template.
+ * The immutable Agent Type contract and optional Agent addendum are rendered
+ * after mode/capability guidance but before Safety. Safety therefore remains
+ * later than editable Agent text and cannot be displaced by an addendum.
  */
-export function buildSystemPrompt(input: BuildSystemPromptInput): string {
+export function buildSystemPromptAssembly(input: BuildSystemPromptInput): PromptAssembly {
   const {
     mode,
     templateOverride,
-    agentPrompt,
+    agentTypePrompt,
+    agentAddendum,
     memoryEnabled,
     includeInfrastructureGuidance,
     includeOperationalSafety,
@@ -49,44 +72,81 @@ export function buildSystemPrompt(input: BuildSystemPromptInput): string {
   } = input;
   const hasTemplateOverride = Boolean(templateOverride?.trim());
   const template = hasTemplateOverride ? templateOverride!.trim() : DEFAULT_TEMPLATE;
-  let prompt = renderSystemPromptFragment(template, mode, memoryEnabled);
+  const layers: PromptLayer[] = [];
+  const add = (
+    id: string,
+    owner: PromptLayerOwner,
+    source: string,
+    mutable: boolean,
+    text: string,
+  ): void => {
+    if (text.trim()) layers.push({ id, owner, source, mutable, text });
+  };
+  add(
+    hasTemplateOverride ? "platform.legacy_template_override" : "platform.kernel",
+    "platform",
+    hasTemplateOverride ? "systemPromptTemplate" : "src/core/prompt.ts#DEFAULT_TEMPLATE",
+    hasTemplateOverride,
+    renderSystemPromptFragment(template, mode, memoryEnabled),
+  );
 
   const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
 
   // Type/capability-specific platform guidance is compiled, never hidden in
-  // the common template. A persisted legacy full-template override remains
+  // the common template. A legacy platform-level full-template override stays
   // authoritative and therefore does not receive bundled role guidance.
   if (!hasTemplateOverride && includeInfrastructureGuidance) {
-    prompt += renderSystemPromptFragment(SRE_PLATFORM_SECTION, mode, memoryEnabled);
+    add("platform.infrastructure", "platform", "src/core/prompt.ts#SRE_PLATFORM_SECTION", false,
+      renderSystemPromptFragment(SRE_PLATFORM_SECTION, mode, memoryEnabled));
   }
 
   if (!hasTemplateOverride && includeSkillAuthoring) {
-    prompt += renderSystemPromptFragment(SKILL_AUTHORING_SECTION, mode, memoryEnabled);
+    add("platform.skill_authoring", "platform", "src/core/prompt.ts#SKILL_AUTHORING_SECTION", false,
+      renderSystemPromptFragment(SKILL_AUTHORING_SECTION, mode, memoryEnabled));
   }
 
   if (!hasTemplateOverride && (includePlanningGuidance || includeSubagentGuidance)) {
-    prompt += buildWorkflowSection(includePlanningGuidance, includeSubagentGuidance);
+    add("platform.workflow", "platform", "src/core/prompt.ts#buildWorkflowSection", false,
+      buildWorkflowSection(includePlanningGuidance, includeSubagentGuidance));
   }
 
   // Append task-specific section for automated task mode.
   if (mode === "task") {
-    prompt += CRON_SECTION;
+    add("mode.task", "mode", "src/core/prompt.ts#CRON_SECTION", false, CRON_SECTION);
   }
   if (mode === "channel") {
-    prompt += CHANNEL_SECTION;
+    add("mode.channel", "mode", "src/core/prompt.ts#CHANNEL_SECTION", false, CHANNEL_SECTION);
   }
 
-  if (agentPrompt?.trim()) {
-    prompt += `\n\n${renderSystemPromptFragment(agentPrompt, mode, memoryEnabled)}`;
+  if (agentTypePrompt?.trim()) {
+    add("agent_type.contract", "agent_type", "src/core/agent-types.ts", false,
+      `\n\n${renderSystemPromptFragment(agentTypePrompt, mode, memoryEnabled)}`);
+  }
+
+  if (agentAddendum?.trim()) {
+    add("agent.addendum", "agent", "agents.system_prompt", true,
+      `\n\n# Agent Addendum\n\n${renderSystemPromptFragment(agentAddendum, mode, memoryEnabled)}`);
   }
 
   if (includeOperationalSafety) {
-    prompt += OPERATIONAL_SAFETY_SECTION;
+    add("platform.operational_safety", "platform", "src/core/prompt.ts#OPERATIONAL_SAFETY_SECTION", false,
+      OPERATIONAL_SAFETY_SECTION);
   }
   // Hardcoded common safety — NOT overridable by agent templates.
-  prompt += COMMON_SAFETY_SECTION(credentialsPath);
+  add("platform.safety", "platform", "src/core/prompt.ts#COMMON_SAFETY_SECTION", false,
+    COMMON_SAFETY_SECTION(credentialsPath));
 
-  return prompt;
+  return {
+    version: PROMPT_ASSEMBLY_VERSION,
+    layers,
+    text: layers.map((layer) => layer.text).join(""),
+    legacyTemplateOverride: hasTemplateOverride,
+  };
+}
+
+/** Build only the final text for callers that do not need layer provenance. */
+export function buildSystemPrompt(input: BuildSystemPromptInput): string {
+  return buildSystemPromptAssembly(input).text;
 }
 
 /** Backward-compatible standalone/TUI helper: an unscoped session is SRE. */
@@ -98,7 +158,8 @@ export function buildSreSystemPrompt(
   return buildSystemPrompt({
     mode,
     templateOverride,
-    agentPrompt: agentPromptFragment?.trim() || SRE_DEFAULT_PROMPT,
+    agentTypePrompt: SRE_DEFAULT_PROMPT,
+    agentAddendum: agentPromptFragment?.trim() || undefined,
     memoryEnabled: isMemoryEnabled(),
     includeInfrastructureGuidance: true,
     includeOperationalSafety: true,
@@ -110,9 +171,8 @@ export function buildSreSystemPrompt(
 
 /**
  * Resolve variables and mode-conditional blocks in one system-prompt
- * fragment. Agent-owned prompt text is appended to the platform template, but
- * keeps the same placeholder contract that persisted custom templates had
- * before agent prompts became a separate identity/behaviour layer.
+ * fragment. Agent-owned addenda keep the same placeholder contract that
+ * persisted custom prompts had before prompt layers became explicit.
  */
 export function renderSystemPromptFragment(
   fragment: string,
@@ -150,11 +210,11 @@ const CRON_SECTION = `
 
 This is a NON-INTERACTIVE scheduled task. There is no user present.
 
-- Do NOT ask questions or request confirmations — execute the task directly.
-- If multiple environments or credentials are available, operate on ALL of them unless the task specifies a target.
-- **Fail fast**: If a tool fails with the same error on 2 consecutive attempts, STOP using that tool. Switch approach or report the failure.
-- **Budget awareness**: You have a strict time limit. Prefer lightweight commands (kubectl, bash) over heavy tools (node_exec, node_script) when possible. If a referenced skill does not exist, fall back to simple kubectl commands.
-- After completing your investigation, you MUST call the \`task_report\` tool with a structured summary of your findings. This is the ONLY output recorded and sent to the user. Even if all checks failed, call \`task_report\` to report the failures.`;
+- Do not ask questions or wait for confirmation. Execute the specified task with the tools and resources actually available; report a concrete blocker when required authority or information is missing.
+- Do not silently broaden an explicit target. If the task intentionally names no target and several equivalent bound resources apply, cover them all within the time budget.
+- If a tool fails with the same error twice, stop repeating it. Use one focused alternative or report the failure.
+- Prefer the cheapest evidence that can support the result. Do not load unrelated context or invent a fallback tool that is not present.
+- After completing the work, you MUST call the \`task_report\` tool with a structured summary of the result. This is the ONLY output recorded and sent to the user. Even if every attempt failed, call \`task_report\` to report the failures.`;
 
 // ---------------------------------------------------------------------------
 // Channel section — appended only for IM channel sessions
@@ -211,7 +271,7 @@ Respond in the user's language. \`[System: respond in X]\` overrides to language
 }
 
 // ---------------------------------------------------------------------------
-// Bundled default template — overridable via agent settings
+// Bundled Platform Kernel — only legacy platform-level callers may override it
 // ---------------------------------------------------------------------------
 const MEMORY_INTRO = " You remember context from previous sessions and grow more helpful over time.";
 
@@ -223,7 +283,13 @@ Use \`memory_search\` **on demand** when symptoms suggest a previously-seen issu
 
 const SRE_PLATFORM_SECTION = `
 
-# Infrastructure Access
+# SRE Work Policy
+
+- Start from a concrete hypothesis and the cheapest evidence that can confirm or falsify it. Read errors and question assumptions before changing approach; never repeat the same failed call blindly.
+- Stop when the evidence is sufficient, or when focused attempts stop producing new information. If root cause remains undetermined, say what was checked and name the smallest useful next steps.
+- Report each material anomaly already found, not only the most prominent one. Separate observed facts, inference, and recommended action.
+
+## Infrastructure Access
 
 - **Know the environment before acting on infrastructure.** When a request needs cluster or host access, establish context first: \`cluster_list\` (clusters available to this agent, with admin-maintained infra facts — RDMA/GPU/CNI/storage — not visible via kubectl; pass \`name\` to search, \`probe:true\` to also test live reachability), \`host_list\` (SSH-reachable non-K8s hosts; metadata only, credentials materialized lazily). When several clusters are available, confirm which one before acting on it. Skip discovery for questions that don't touch infrastructure.
 - When users ask about infrastructure setup: call \`cluster_list\`, then guide to {{settingsPath}}. "Environment" means infrastructure access, not dev toolchain.`;
@@ -248,35 +314,27 @@ function buildWorkflowSection(includePlanning: boolean, includeSubagents: boolea
   return lines.join("\n");
 }
 
-const DEFAULT_TEMPLATE = `Help the user accomplish their goal using the available context, knowledge, skills, and tools. Be competent, direct, and warm.{{memoryIntro}}
+const DEFAULT_TEMPLATE = `Help the user accomplish their goal with the available context, knowledge, skills, and tools.{{memoryIntro}}
 
-# Core Behavior
+# Platform Kernel
 
-- **Stay focused, but stay a collaborator**: Act only on what the user asked — don't add targets or change scope on your own, and if conditions can't be met, say so rather than silently switching targets. But you're a collaborator, not just an executor: when you notice an adjacent problem, a likely misconception in the request, or a related anomaly, surface it — report it, don't act on it unasked.
-- **Conclude, don't explore endlessly**: State the answer as soon as you have enough — short or negative answers are fine. Stop investigating when 2–3 rounds reveal nothing new, you're about to act without a hypothesis, or you're re-checking the same resource with tweaked params — though for a severe or wide-impact symptom, try one more angle before concluding. When you stop without a root cause: say what you checked, state it's undetermined, and suggest 1–2 directions. Never claim an answer you don't have.
-- **Report ALL findings**: List every anomaly you found, each with its own fix — not just the most prominent. "Stop investigating" means stop running commands, not stop reporting what you already found.
-- **Diagnose failures**: A tool *failure* is not a dead end — read the error, check your assumptions, and try a focused fix or another approach. But don't blindly repeat a failing call, and don't abandon a viable approach after one transient error.
+- Retain the user's explicit requirements until they are satisfied, the user changes them, or a real blocker is reported. Do not silently change the target, scope, or acceptance criteria.
+- Act on clear, reversible work within the request. Ask only when a missing choice materially changes the outcome or when authorization is required for a destructive, irreversible, credential-gated, or shared-state action.
+- Use evidence proportionate to the claim. Distinguish observed facts from inference, never invent missing facts, and verify before claiming completion.
+- A progress update is not a completed turn. Continue until you provide the requested answer or result, ask one necessary clarifying question, explain that evidence is insufficient, or report a concrete failure or blocker.
 
-# Communicating with the user
+# Communication
 
-- **Narrate as you work, not just at the end**: the user sees your text, not your tool calls or reasoning. Before your first tool call, say what you're about to check; as the investigation unfolds, drop a short line when you find something load-bearing (a root cause, an anomaly), change direction, or start a bigger step (laying out a plan, fanning out across nodes). The user should be able to follow what you're doing and why — not stare at a pile of tool calls.
-- **Clarity beats brevity**: lead with the answer or diagnosis and skip filler, preamble, and restating the request — but what matters most is the user following along without rereading or asking you to explain, not how few words you use. Err toward one more sentence of explanation over silence. A turn can be just a short update; it doesn't have to end in a tool call or a conclusion.
-- Plain prose by default. Use tables only for enumerable facts (pod/node names, states, pass/fail), not for explanation. Match depth to the task and the user's expertise.
-- Be precise: filter and summarize tool output, don't dump it. When the user only asks to list resources, summarize and ask which to investigate. No emojis unless asked; keep identifiers (pod/node names, commands, errors) exact.
+- Lead with the answer or outcome. Keep progress updates brief and reserve them for meaningful milestones, changed direction, or a load-bearing finding.
+- The final response must stand on its own. Summarize relevant evidence instead of dumping raw tool output; keep exact identifiers, commands, and errors when they matter.
+- Use plain prose by default and tables only for facts that are genuinely easier to compare as rows and columns. Match the user's language and level of detail.
 
-# Skills and Tools
+# Tools and Skills
 
-- **Prefer a matching skill over ad-hoc commands.** When a skill list is present and a skill covers what you're about to do, read its SKILL.md first (skills change — don't trust memory) and run it with the tool names documented there; don't hand-replicate what a skill script already does. If no skill is available, an ad-hoc tool is fine. If a skill fails, analyze the failure — don't silently fall back to ad-hoc.
-
-# Visual Output
-
-- Choose the rendered visual output path by intent: Mermaid for diagrams and \`\`\`chart\` or, when available, \`render_chart\` for finalized numeric pie/bar/line charts.
-- Use Mermaid diagrams when you are actually drawing structure, relationships, flow, sequence, lifecycle, topology, or dependency chains. Supported Mermaid forms are \`flowchart\` / \`graph\`, \`sequenceDiagram\`, \`timeline\`, and \`xychart-beta\`. Keep diagrams small and readable; prefer roughly 5-12 nodes/events and avoid decorative detail.
-- Use \`flowchart\` for cause/effect, decision, dependency, or remediation flows; \`sequenceDiagram\` for request paths and cross-component call order; \`timeline\` for pure event ordering; \`xychart-beta\` for compact x/y bars or trends when a full chart tool call is unnecessary.
-- Inside Mermaid fences, output only Mermaid syntax. Do not add line numbers, event labels, or stream prefixes such as \`123-content:\`. If exact times or relationships are unknown, label them as unknown/approx instead of inventing precision.
-- Do not force a diagram into simple answers. If the response is a prose report rather than a diagram or finalized numeric chart, write normal Markdown so every Siclaw surface can render it.
+- Choose tools from the actual tool schemas available in this turn. Tool descriptions define their contract; do not claim a tool ran when it did not.
+- When a listed Skill clearly covers the task, read its current instructions before using it. If a tool or Skill fails, inspect the failure and take a focused alternative rather than blindly repeating it.
 
 {{memorySection}}
-# Environment & Configuration
+# Runtime
 
-Siclaw {{mode}} session. All configuration via {{settingsPath}} (Models, Credentials). Config file \`.siclaw/config/settings.json\` is auto-managed — don't edit manually.`;
+Siclaw {{mode}} session. Configuration is managed through {{settingsPath}}; do not edit \`.siclaw/config/settings.json\` manually.`;

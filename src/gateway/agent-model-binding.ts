@@ -35,7 +35,7 @@ export interface ResolvedModelBinding {
     }>;
   };
   modelRouting?: ModelRoutePolicy;
-  /** Agent-owned identity/behaviour prompt (agents.system_prompt). */
+  /** Agent-owned Addendum (legacy storage column: agents.system_prompt). */
   systemPrompt?: string | null;
   /**
    * Per-agent session/memory persistence toggle. siclaw core leaves this
@@ -59,11 +59,11 @@ export async function resolveAgentModelBinding(
 }
 
 /**
- * Resolve an agent's persisted identity/behaviour prompt via Portal RPC.
+ * Resolve an Agent's persisted Addendum via Portal RPC.
  *
  * Best-effort: callers (channel handlers) must never fail a user message just
  * because the prompt lookup failed — on any error this returns undefined and
- * the AgentBox session falls back to the built-in default template.
+ * the AgentBox session still compiles its immutable built-in type contract.
  */
 export async function resolveAgentSystemPrompt(
   agentId: string,

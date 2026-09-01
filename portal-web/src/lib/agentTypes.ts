@@ -1,6 +1,6 @@
 // Agent types — UI mirror of src/core/agent-types.ts. Built-in types lock the
-// capability set and provide an initial prompt, but every agent's persisted
-// prompt remains editable by the portal admin.
+// capability set and provide an immutable type contract. The Portal edits only
+// an optional Agent Addendum; it never replaces that contract.
 
 export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "custom"
 

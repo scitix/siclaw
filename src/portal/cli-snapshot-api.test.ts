@@ -7,7 +7,6 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { COORDINATOR_DEFAULT_PROMPT } from "../core/agent-types.js";
 import { EventEmitter } from "node:events";
 import { initDb, closeDb, getDb } from "../gateway/db.js";
 import { runPortalMigrations } from "./migrate.js";
@@ -524,7 +523,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.availableAgents).toContain("real-agent");
   });
 
-  it("supplies the built-in prompt fallback to a scoped legacy row", async () => {
+  it("leaves a built-in contract out of the persisted scoped snapshot", async () => {
     const db = getDb();
     await db.query(
       "INSERT INTO agents (id, name, status, agent_type, system_prompt, is_production, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -541,7 +540,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     expect(status).toBe(200);
     expect(body.activeAgent.agentType).toBe("coordinator");
-    expect(body.activeAgent.systemPrompt).toBe(COORDINATOR_DEFAULT_PROMPT);
+    expect(body.activeAgent.systemPrompt).toBeNull();
     expect(body.activeAgent.allowedTools).not.toContain("cluster_list");
     expect(body.activeAgent.allowedTools).toContain("delegate_to_agent");
   });

@@ -70,6 +70,24 @@ describe("resolveAgentHarness", () => {
     expect(harness.memoryEnabled).toBe(false);
     expect(harness.includeOperationalSafety).toBe(false);
   });
+
+  it("adds the automated-task report tool without broadening interactive capabilities", () => {
+    const task = resolveAgentHarness({
+      agentType: "knowledge_qa",
+      allowedTools: null,
+      memoryConfigured: false,
+      mode: "task",
+    });
+    const web = resolveAgentHarness({
+      agentType: "knowledge_qa",
+      allowedTools: null,
+      memoryConfigured: false,
+      mode: "web",
+    });
+
+    expect(task.allowedTools).toContain("task_report");
+    expect(web.allowedTools).not.toContain("task_report");
+  });
 });
 
 describe("compileAgentContext", () => {
@@ -89,7 +107,9 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("task_create");
     expect(context.systemPrompt).not.toContain("spawn_subagent");
     expect(context.systemPrompt).not.toContain("delete/evict/cordon");
-    expect(context.systemPrompt).toContain("knowledge_search");
+    // Retrieval policy is injected with the runtime-scoped Wiki context, not
+    // materialized into the editable Agent identity without a mounted Wiki.
+    expect(context.systemPrompt).not.toContain("knowledge_search");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
     expect(context.harness.includeBundledSkills).toBe(false);
     expect(context.harness.mcpExposure).toBe("configured");
@@ -123,7 +143,7 @@ describe("compileAgentContext", () => {
       mode: "channel",
     });
 
-    expect(context.systemPrompt).toContain("COORDINATOR");
+    expect(context.systemPrompt).toContain("# Coordinator Contract");
     expect(context.systemPrompt).toContain("resource-locator helper");
     expect(context.systemPrompt).toContain("binding_name_confirmed=true");
     expect(context.systemPrompt).not.toContain("# Infrastructure Access");
@@ -155,6 +175,8 @@ describe("createAgentContextManifest", () => {
     expect(manifest.resources.mcpServers).toEqual(["knowledge-search"]);
     expect(manifest.prompt.chars).toBe(context.systemPrompt.length);
     expect(manifest.prompt.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(manifest.prompt.assemblyVersion).toBe("prompt-assembly/v1");
+    expect(manifest.prompt.layers.map((layer) => layer.id)).toContain("agent_type.contract");
     expect(JSON.stringify(manifest)).not.toContain("question answering agent");
   });
 });

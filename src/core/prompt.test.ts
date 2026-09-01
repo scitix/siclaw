@@ -20,7 +20,7 @@ describe("buildSreSystemPrompt memory flag", () => {
     expect(prompt).toContain("memory_search");
     expect(prompt).toContain("memory_get");
     expect(prompt).toContain("remember context from previous sessions");
-    expect(prompt).toContain("# Environment & Configuration");
+    expect(prompt).toContain("# Runtime");
     expect(prompt).not.toContain("{{memoryIntro}}");
     expect(prompt).not.toContain("{{memorySection}}");
   });
@@ -33,7 +33,7 @@ describe("buildSreSystemPrompt memory flag", () => {
     expect(prompt).not.toContain("memory_search");
     expect(prompt).not.toContain("memory_get");
     expect(prompt).not.toContain("remember context from previous sessions");
-    expect(prompt).toContain("# Environment & Configuration");
+    expect(prompt).toContain("# Runtime");
     expect(prompt).not.toContain("{{memoryIntro}}");
     expect(prompt).not.toContain("{{memorySection}}");
   });
@@ -48,14 +48,14 @@ describe("buildSreSystemPrompt memory flag", () => {
   });
 });
 
-describe("buildSreSystemPrompt visual output guidance", () => {
-  it("authorizes every Mermaid family supported by ControlPlane Web", () => {
+describe("buildSreSystemPrompt output guidance", () => {
+  it("does not spend the shared Web prompt on renderer-specific syntax", () => {
     const prompt = buildSreSystemPrompt("web");
 
-    expect(prompt).toContain("flowchart");
-    expect(prompt).toContain("sequenceDiagram");
-    expect(prompt).toContain("timeline");
-    expect(prompt).toContain("xychart-beta");
+    expect(prompt).not.toContain("flowchart");
+    expect(prompt).not.toContain("sequenceDiagram");
+    expect(prompt).not.toContain("xychart-beta");
+    expect(prompt).toContain("Use plain prose by default");
   });
 
   it("does not steer shared Siclaw surfaces to unsupported visual-card output", () => {
@@ -71,8 +71,8 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     expect(prompt).not.toContain("metric_snapshot");
     expect(prompt).not.toContain("status_distribution");
     expect(prompt).not.toContain("action_plan");
-    expect(prompt).toContain("Mermaid for diagrams");
-    expect(prompt).toContain("chart");
+    expect(prompt).not.toContain("Mermaid for diagrams");
+    expect(prompt).not.toContain("render_chart");
   });
 
   it("adds channel-only guidance for visual Feishu replies and conclusion cards", () => {
@@ -114,6 +114,14 @@ describe("buildSystemPrompt safety composition", () => {
     expect(prompt).toContain("target, impact, and blast radius");
     expect(prompt).toContain("explicit confirmation");
     expect(prompt).not.toContain("delete/evict/cordon");
+  });
+
+  it("requires a terminal answer instead of allowing progress-only stops", () => {
+    const prompt = buildSystemPrompt(neutralInput);
+
+    expect(prompt).toContain("A progress update is not a completed turn");
+    expect(prompt).toContain("The final response must stand on its own");
+    expect(prompt).not.toContain("A turn can be just a short update");
   });
 
   it("adds infrastructure-specific operational safety only when compiled for that harness", () => {

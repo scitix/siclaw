@@ -19,7 +19,7 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
-import { AGENT_TYPES, effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
+import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
@@ -37,10 +37,15 @@ import { safeParseJson } from "../gateway/dialect-helpers.js";
  */
 function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   if (!row) return row;
+  const agentType = normalizeAgentType(row.agent_type);
   return {
     ...row,
     model_routing: safeParseJson(row.model_routing, null),
     tool_capabilities: safeParseJson(row.tool_capabilities, null),
+    // Additive migration field: old rows may still contain a materialized
+    // built-in default in system_prompt. The settings UI edits only the real
+    // addendum while legacy clients can keep reading the raw column.
+    agent_prompt_addendum: agentPromptAddendum(agentType, row.system_prompt) ?? null,
   };
 }
 
@@ -141,10 +146,9 @@ export function registerAgentRoutes(
         modelRouting ?? null,
         toolCapabilities ?? null,
         agentType,
-        // Materialize the type default into the row so system_prompt becomes
-        // the agent's visible, editable instruction instead of a hidden runtime
-        // overlay. Custom agents keep their supplied prompt (or null).
-        effectiveAgentPrompt(agentType, body.system_prompt) ?? null,
+        // Built-in type contracts live in code. Persist only the optional
+        // Agent-owned addendum so an edit cannot replace core type behavior.
+        agentPromptAddendum(agentType, body.system_prompt) ?? null,
         body.is_production ?? 1,
         normalizeIdleTimeoutSec(body.idle_timeout_sec),
         normalizeReplicas(body.replicas),
@@ -192,6 +196,37 @@ export function registerAgentRoutes(
     sendJson(res, 200, decodeAgentRow(rows[0]));
   });
 
+  // GET /api/v1/agents/:id/prompt-inspection?session_id=...
+  //
+  // Explicit admin-only access to the exact resident-session prompt and tool
+  // surface. This is intentionally separate from ordinary Agent GET/status
+  // responses so prompt text never appears in polling, logs, or telemetry.
+  router.get("/api/v1/agents/:id/prompt-inspection", async (req, res, params) => {
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
+    const sessionId = parseQuery(req.url ?? "").session_id?.trim();
+    if (!sessionId) {
+      sendJson(res, 400, { error: "session_id is required" });
+      return;
+    }
+    if (!connectionMap.isConnected(params.id)) {
+      sendJson(res, 503, { error: "Agent runtime is not connected" });
+      return;
+    }
+
+    const result = await connectionMap.sendCommand(
+      params.id,
+      "agent.promptInspection",
+      { agentId: params.id, sessionId },
+      10_000,
+    );
+    if (!result.ok) {
+      sendJson(res, 502, { error: result.error || "Runtime prompt inspection failed" });
+      return;
+    }
+    sendJson(res, 200, result.payload ?? { ok: true, available: false, reason: "empty_response" });
+  });
+
   // PUT /api/v1/agents/:id — update (admin only)
   router.put("/api/v1/agents/:id", async (req, res, params) => {
     const auth = requireAdmin(req, res, jwtSecret);
@@ -237,22 +272,22 @@ export function registerAgentRoutes(
     const agentTypeChanged = "agent_type" in body && nextAgentType !== currentAgentType;
 
     const promptSupplied = "system_prompt" in body;
-    let nextSystemPrompt = promptSupplied ? body.system_prompt : current?.system_prompt;
-    let resetToTypeDefault = false;
-    // A type switch from an unchanged textarea means "take the new type's
-    // initial prompt", not "pin the previous type's persona to new tools".
-    // An actually edited prompt remains authoritative. Custom has no default,
-    // so switching to it must retain the visible admin-authored prompt rather
-    // than silently replacing it with NULL.
+    let nextSystemPrompt = promptSupplied
+      ? (agentPromptAddendum(nextAgentType, body.system_prompt) ?? null)
+      : current?.system_prompt;
+    let resetAddendumForTypeChange = false;
+    // A type switch from an unchanged textarea drops the previous type's
+    // specialization. The new immutable type contract is supplied at runtime;
+    // carrying an old persona onto new tools would recreate the conflict this
+    // separation is designed to prevent. An addendum edited in the same request
+    // is retained and composed with the new contract.
     if (
       agentTypeChanged &&
+      nextAgentType !== "custom" &&
       (!promptSupplied || normalizedPrompt(body.system_prompt) === normalizedPrompt(current?.system_prompt))
     ) {
-      const typeDefault = effectiveAgentPrompt(nextAgentType, null);
-      if (typeDefault !== undefined) {
-        nextSystemPrompt = typeDefault;
-        resetToTypeDefault = true;
-      }
+      nextSystemPrompt = null;
+      resetAddendumForTypeChange = true;
     }
     const promptChanged =
       (promptSupplied || agentTypeChanged) &&
@@ -311,9 +346,9 @@ export function registerAgentRoutes(
         }
       }
     }
-    // If a caller changes the type without supplying a prompt, initialize the
-    // new type's default as the editable row truth.
-    if (agentTypeChanged && !promptSupplied && resetToTypeDefault) {
+    // If a caller changes type without supplying the field, clear the old
+    // addendum explicitly. The new type contract is not materialized in DB.
+    if (agentTypeChanged && !promptSupplied && resetAddendumForTypeChange) {
       setClauses.push("system_prompt = ?");
       values.push(nextSystemPrompt);
     }

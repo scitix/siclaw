@@ -168,6 +168,17 @@ function makeFakeBrain() {
 }
 
 function makeFakeSession(id: string) {
+  const promptInspection = {
+    version: "prompt-inspection/v1",
+    stage: "session_ready",
+    agentType: "sre",
+    mode: "web",
+    prompt: { text: "exact prompt", chars: 12, sha256: "prompt-hash" },
+    layers: [],
+    tools: [],
+    skills: [],
+    design: { standard: "siclaw-prompt-design/v1", verdict: "pass", checks: [], references: [] },
+  };
   return {
     id,
     brain: makeFakeBrain(),
@@ -175,6 +186,7 @@ function makeFakeSession(id: string) {
     skillNames: ["personal-probe", "skill-authoring"],
     skillDigests: { "personal-probe": "abc", "skill-authoring": "def" },
     getSkillSnapshot: undefined as (() => { skillNames: string[]; skillDigests: Record<string, string> }) | undefined,
+    getPromptInspection: vi.fn(() => promptInspection),
     createdAt: new Date(),
     lastActiveAt: new Date(),
     _promptDoneCallbacks: new Set<() => void>(),
@@ -1023,6 +1035,18 @@ describe("http-server — prompt + session lifecycle", () => {
   it("GET /api/sessions/:id/context 404s for unknown session", async () => {
     const r = await getJson(port, "/api/sessions/ghost/context");
     expect(r.status).toBe(404);
+  });
+
+  it("GET /api/sessions/:id/prompt-inspection returns exact data only for a resident session", async () => {
+    const session = await sm.getOrCreate("s-prompt");
+
+    const resident = await getJson(port, "/api/sessions/s-prompt/prompt-inspection");
+    const missing = await getJson(port, "/api/sessions/ghost/prompt-inspection");
+
+    expect(resident.status).toBe(200);
+    expect(resident.data.prompt.text).toBe("exact prompt");
+    expect(session.getPromptInspection).toHaveBeenCalledOnce();
+    expect(missing.status).toBe(404);
   });
 });
 
