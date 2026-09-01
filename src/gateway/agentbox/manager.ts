@@ -97,9 +97,21 @@ function spawnSlotKey(agentId: string, instance: number): string {
  * joined caller fails with it, delaying recovery by another full readiness window.
  */
 interface InflightSpawn {
-  promise: Promise<AgentBoxHandle | null>;
+  /**
+   * What callers joining this slot receive. NOT the raw attempt: if this attempt is
+   * superseded and then fails, its waiters are handed the successor's outcome instead.
+   *
+   * 🔴 Without that hand-off, superseding actively HARMED the callers already waiting. The
+   * stronger attempt deletes the pod, which makes this attempt's readiness wait fail with
+   * "disappeared while waiting" — so everyone holding this promise got null and reported
+   * `Failed to spawn`, while the replacement pod came up fine moments later. The failure
+   * they saw was caused by the recovery, not by the fault.
+   */
+  result: Promise<AgentBoxHandle | null>;
   /** Whether this attempt will replace the pod occupying the slot. */
   recreate: boolean;
+  /** Called when a stronger intent takes over, so this attempt's waiters follow it. */
+  adopt(successor: Promise<AgentBoxHandle | null>): void;
 }
 
 /**
@@ -1119,7 +1131,7 @@ export class AgentBoxManager {
       // readiness wait fail fast ("disappeared while waiting") rather than run to its
       // deadline. The weaker direction still joins, which is the common case.
       const inflight = this.inflightSpawns.get(key);
-      if (inflight && (inflight.recreate || !wantRecreate)) return inflight.promise;
+      if (inflight && (inflight.recreate || !wantRecreate)) return inflight.result;
 
       // Past the de-dup, so this call is the one creating the pod — the only one that may be
       // charged for it. Synchronous, and before the attempt is registered, so concurrent
@@ -1154,14 +1166,25 @@ export class AgentBoxManager {
         }
       })();
 
-      const entry: InflightSpawn = { promise: attempt, recreate: wantRecreate };
+      // A failed attempt yields to whoever superseded it, so being replaced mid-flight is
+      // never worse for a caller than not being replaced at all.
+      let successor: Promise<AgentBoxHandle | null> | undefined;
+      const result = attempt.then((handle) => handle ?? successor ?? null);
+      const entry: InflightSpawn = {
+        result,
+        recreate: wantRecreate,
+        adopt: (p) => { successor = p; },
+      };
       this.inflightSpawns.set(key, entry);
+      // The attempt this one displaced now routes its waiters here. Reached only when the
+      // guard above declined to join, i.e. this intent is the stronger one.
+      inflight?.adopt(result);
       // Compare before deleting: by the time this settles the entry may already belong to
       // a later attempt for the same slot — including a stronger-intent one that took over.
       void attempt.finally(() => {
         if (this.inflightSpawns.get(key) === entry) this.inflightSpawns.delete(key);
       });
-      return attempt;
+      return result;
     }));
     return results.filter((h): h is AgentBoxHandle => h !== null);
   }

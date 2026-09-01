@@ -1607,6 +1607,52 @@ describe("AgentBoxManager — concurrent pool fills must not multiply", () => {
     expect(spawner.spawnCalls[1].recreate).toBe(true);
   });
 
+  /**
+   * 🔴 Superseding must not HARM the callers already waiting. The stronger attempt deletes
+   * the pod, which is exactly what makes the older attempt's readiness wait fail — so every
+   * caller holding the older promise got null and reported `Failed to spawn`, while the
+   * replacement came up fine moments later. The failure was caused by the recovery.
+   */
+  it("hands the superseded attempt's waiters to the replacement", async () => {
+    const spawner = new PoolSpawner("k8s");
+    let failReuse: (() => void) | undefined;
+    const reuseGate = new Promise<void>((r) => { failReuse = r; });
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      if (!config.recreate) {
+        // Stands in for "the pod I was waiting on was deleted under me".
+        await reuseGate;
+        throw new Error("disappeared while waiting for it to become ready");
+      }
+      return { boxId: "agentbox-agent-a-0", endpoint: "http://10.0.0.7:3000", agentId: config.agentId };
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const waiter = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+    await Promise.resolve();
+    const rebuild = (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => true);
+    failReuse!();
+
+    const [fromWaiter, fromRebuild] = await Promise.all([waiter, rebuild]);
+
+    // The original caller gets the replacement's box, not the casualty of its own recovery.
+    expect(fromRebuild[0]?.boxId).toBe("agentbox-agent-a-0");
+    expect(fromWaiter[0]?.boxId).toBe("agentbox-agent-a-0");
+  });
+
+  it("does not invent a successor when nothing superseded a failed attempt", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.spawn = async (config: AgentBoxConfig) => {
+      spawner.spawnCalls.push(config);
+      throw new Error("no capacity");
+    };
+    const mgr = pooledManager(spawner, 1);
+
+    const out = await (mgr as any).spawnInstances("agent-a", undefined, [0], true, undefined, () => false);
+
+    expect(out).toEqual([]); // a plain failure stays a failure
+  });
+
   it("still de-duplicates in the weaker direction — a reuse joins a rebuild", async () => {
     // The asymmetry is deliberate: a rebuild already does everything a reuse would.
     const spawner = new PoolSpawner("k8s");
