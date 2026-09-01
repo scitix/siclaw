@@ -1862,6 +1862,7 @@ export function createHttpServer(
       sendJson(res, 404, { error: "Session not found" });
       return;
     }
+    res.setHeader("Cache-Control", "no-store");
     sendJson(res, 200, managed.getPromptInspection());
   });
 

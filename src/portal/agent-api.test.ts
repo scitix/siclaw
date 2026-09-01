@@ -36,12 +36,14 @@ function fakeReq(opts: { url: string; method: string; headers?: Record<string, s
   return em;
 }
 
-function runRoute(router: ReturnType<typeof createRestRouter>, req: any): Promise<{ status: number; body: any }> {
+function runRoute(router: ReturnType<typeof createRestRouter>, req: any): Promise<{ status: number; body: any; headers: Record<string, string> }> {
   return new Promise((resolve, reject) => {
     const res: any = new EventEmitter();
+    res._headers = {};
+    res.setHeader = (name: string, value: string) => { res._headers[name.toLowerCase()] = value; };
     res.writeHead = (s: number) => { res._status = s; res.headersSent = true; return res; };
     res.end = (b?: string) => {
-      resolve({ status: res._status ?? 0, body: b ? JSON.parse(b) : null });
+      resolve({ status: res._status ?? 0, body: b ? JSON.parse(b) : null, headers: res._headers });
       return res;
     };
     try { if (!router.handle(req, res)) reject(new Error("no route")); } catch (err) { reject(err); }
@@ -370,6 +372,7 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(allowed.status).toBe(200);
+      expect(allowed.headers["cache-control"]).toBe("no-store");
       expect(allowed.body.inspection.prompt.text).toBe("exact prompt");
       expect(connMap.sendCommand).toHaveBeenCalledWith(
         "a1",

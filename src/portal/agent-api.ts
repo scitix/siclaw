@@ -224,6 +224,7 @@ export function registerAgentRoutes(
       sendJson(res, 502, { error: result.error || "Runtime prompt inspection failed" });
       return;
     }
+    res.setHeader("Cache-Control", "no-store");
     sendJson(res, 200, result.payload ?? { ok: true, available: false, reason: "empty_response" });
   });
 
