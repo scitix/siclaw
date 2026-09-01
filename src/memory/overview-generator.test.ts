@@ -294,9 +294,9 @@ describe("buildKnowledgeWikiCatalog", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("Call `knowledge_search` once with the user's original question");
-    expect(out).toContain("already-read, context-bounded leaf-page evidence");
-    expect(out).toContain("Use Grep/Find/Read only when retrieval is unavailable");
+    expect(out).toContain("Use `knowledge_search` as an optional accelerator");
+    expect(out).toContain("`direct_hit` contains one bounded page snapshot");
+    expect(out).toContain("For broad, novel, ambiguous, comparative, weak-match, or cross-page questions");
     expect(out).not.toContain("there is no search tool");
     expect(out).toContain("[RoCE modes](network/roce-modes.md)");
     expect(out).toContain("[[gpu-xid]]");
@@ -323,8 +323,9 @@ describe("buildKnowledgeWikiCatalog", () => {
     const out = buildKnowledgeWikiCatalog(knowledgeDir, { includeCatalog: false });
 
     expect(out).toContain("# Knowledge Wiki");
-    expect(out).toContain("Call `knowledge_search` once");
+    expect(out).toContain("optional accelerator");
     expect(out).toContain("catalog is intentionally not embedded");
+    expect(out).toContain("Read `.siclaw/knowledge/index.md`");
     expect(out).not.toContain("[RoCE modes]");
   });
 
@@ -353,7 +354,7 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("# Knowledge Wiki");
     expect(out).toContain("Catalog not embedded");
     expect(out).toContain("Partial catalogs are misleading");
-    expect(out).toContain("Use `knowledge_search` for discovery");
+    expect(out).toContain("Use `knowledge_search` only for a likely single-page direct lookup");
     expect(out).toContain("Do not infer that a page is absent");
     expect(out).toContain(".siclaw/knowledge/index.md");
     expect(out).not.toContain("[[page-0]]");

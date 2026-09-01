@@ -8,6 +8,7 @@ import type {
   CreateKnowledgeResolverOptions,
   KnowledgeEvidencePage,
   KnowledgeEvidenceSection,
+  KnowledgeExplorationHint,
   KnowledgeLookupResult,
   KnowledgeNavigationResult,
   KnowledgeResolver,
@@ -15,16 +16,24 @@ import type {
 import type { MemoryChunk } from "../memory/types.js";
 import { tokenizeForFts } from "../memory/stop-words.js";
 
-const DEFAULT_MAX_PAGES = 3;
 const DEFAULT_MAX_CANDIDATES = 40;
 const DEFAULT_RERANK_CANDIDATES = 8;
+const DEFAULT_MAX_EXPLORATION_HINTS = 5;
 const MAX_NAVIGATION_RESULTS = 5;
+const MIN_ACCELERATOR_SCORE = 0.35;
+const DIRECT_HIT_CONFIDENCE = 0.72;
+const DIRECT_HIT_MARGIN = 0.12;
+const COMPETING_HINT_CONFIDENCE = 0.64;
 
 interface PageCandidate {
   file: string;
   score: number;
   chunks: MemoryChunk[];
+  title?: string;
+  metadata?: KnowledgeEvidencePage["metadata"];
   metadataScore?: number;
+  passageScore?: number;
+  routingConfidence?: number;
 }
 
 interface PageMetadata {
@@ -108,24 +117,33 @@ function metadataCoverage(queryTokens: string[], metadataText: string): number {
   return hits / queryTokens.length;
 }
 
-function buildLowRecallFallback(query: string): string | null {
-  const entityFocused = query
-    .replace(/(?:请问|麻烦|帮忙|帮我|怎么|如何|为什么|哪些|什么|一下|请)/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  const fallback = tokenizeForFts(entityFocused).join(" ");
-  if (!fallback || fallback.toLowerCase() === query.toLowerCase()) return null;
-  return fallback;
+function contentCoverage(queryTokens: string[], candidate: PageCandidate): number {
+  if (queryTokens.length === 0) return 0;
+  const text = candidate.chunks.map((chunk) => `${chunk.heading} ${chunk.content}`).join(" ");
+  const contentTokens = new Set(tokenizeForFts(text));
+  const hits = queryTokens.filter((token) => contentTokens.has(token)).length;
+  return hits / queryTokens.length;
 }
 
-function mergeChunks(primary: MemoryChunk[], fallback: MemoryChunk[]): MemoryChunk[] {
-  const merged = new Map<string, MemoryChunk>();
-  for (const chunk of [...primary, ...fallback]) {
-    const key = `${chunk.file}:${chunk.startLine}:${chunk.endLine}`;
-    const existing = merged.get(key);
-    if (!existing || (chunk.score ?? 0) > (existing.score ?? 0)) merged.set(key, chunk);
-  }
-  return [...merged.values()];
+function calculateRoutingConfidence(candidate: PageCandidate): number {
+  const metadata = candidate.metadataScore ?? 0;
+  const passage = candidate.passageScore ?? 0;
+  const coverage = Math.max(metadata, passage * 0.8);
+  const retrieval = Math.min(1, Math.max(0, candidate.score));
+  return 0.8 * coverage + 0.2 * retrieval;
+}
+
+function explorationHint(candidate: PageCandidate, rank: number): KnowledgeExplorationHint {
+  return {
+    rank,
+    file: candidate.file,
+    title: candidate.title ?? path.posix.basename(candidate.file, path.posix.extname(candidate.file)),
+    score: roundScore(candidate.score),
+    routingConfidence: roundScore(candidate.routingConfidence),
+    ...(candidate.metadataScore !== undefined ? { metadataScore: roundScore(candidate.metadataScore) } : {}),
+    ...(candidate.passageScore !== undefined ? { passageScore: roundScore(candidate.passageScore) } : {}),
+    ...(candidate.metadata ? { metadata: candidate.metadata } : {}),
+  };
 }
 
 function resultId(file: string, body: string): string {
@@ -215,185 +233,238 @@ function navigationResults(chunks: MemoryChunk[]): KnowledgeNavigationResult[] {
 }
 
 /**
- * Resolve one natural-language question into a small, read, evidence-bearing
- * set of leaf pages. Search is an implementation detail behind this boundary.
+ * Use the index as a conservative single-page accelerator. Anything less than
+ * a unique, identity-level match stays an Agent-led Wiki exploration problem.
  */
 export function createKnowledgeResolver(options: CreateKnowledgeResolverOptions): KnowledgeResolver {
-  const maxPages = Math.max(1, Math.floor(options.maxPages ?? DEFAULT_MAX_PAGES));
-  const maxCandidates = Math.max(maxPages, Math.floor(options.maxCandidates ?? DEFAULT_MAX_CANDIDATES));
-  const rerankCandidates = Math.max(maxPages, Math.floor(options.rerankCandidates ?? DEFAULT_RERANK_CANDIDATES));
+  const maxExplorationHints = Math.max(
+    1,
+    Math.floor(options.maxExplorationHints ?? DEFAULT_MAX_EXPLORATION_HINTS),
+  );
+  const maxCandidates = Math.max(maxExplorationHints, Math.floor(options.maxCandidates ?? DEFAULT_MAX_CANDIDATES));
+  const rerankCandidates = Math.max(
+    maxExplorationHints,
+    Math.floor(options.rerankCandidates ?? DEFAULT_RERANK_CANDIDATES),
+  );
 
   return {
     async lookup(rawQuery: string): Promise<KnowledgeLookupResult> {
       const query = rawQuery.trim();
       if (!query) {
         return {
-          status: "not_found",
-          mode: "hybrid",
+          status: "explore",
+          mode: "accelerator",
           query,
           results: [],
-          message: "A non-empty knowledge question is required.",
+          message: "No direct lookup was attempted. Understand the question, then explore the Wiki with Find/Grep/Read.",
         };
       }
 
       let searched;
-      let allChunks: MemoryChunk[];
-      const queryVariants = [query];
       try {
-        searched = await options.indexer.search(query, maxCandidates, 0);
-        allChunks = searched.chunks;
-        if (groupLeafCandidates(allChunks).length === 0) {
-          const fallbackQuery = buildLowRecallFallback(query);
-          if (fallbackQuery) {
-            const fallback = await options.indexer.search(fallbackQuery, maxCandidates, 0);
-            queryVariants.push(fallbackQuery);
-            allChunks = mergeChunks(allChunks, fallback.chunks);
-            searched = {
-              chunks: allChunks,
-              totalFiles: Math.max(searched.totalFiles, fallback.totalFiles),
-              totalChunks: Math.max(searched.totalChunks, fallback.totalChunks),
-            };
-          }
-        }
+        searched = await options.indexer.search(query, maxCandidates, MIN_ACCELERATOR_SCORE);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return {
           status: "unavailable",
-          mode: "hybrid",
+          mode: "accelerator",
           query,
-          queryVariants,
           results: [],
-          message: `Knowledge retrieval is unavailable: ${message}`,
+          message: `The retrieval accelerator is unavailable (${message}). Continue with Wiki Find/Grep/Read; this does not mean the knowledge is absent.`,
         };
       }
 
+      const allChunks = searched.chunks;
       const navigation = navigationResults(allChunks);
-      let candidates = groupLeafCandidates(allChunks);
-      if (options.inspectPage && candidates.length > 0) {
-        const queryTokens = tokenizeForFts(query);
-        const inspected = await Promise.all(candidates.slice(0, rerankCandidates).map(async (candidate) => {
+      const queryTokens = tokenizeForFts(query);
+      let candidates: PageCandidate[] = groupLeafCandidates(allChunks).map((candidate) => ({
+        ...candidate,
+        passageScore: contentCoverage(queryTokens, candidate),
+      }));
+      let hadInvalidPath = false;
+
+      if (candidates.length > 0) {
+        const inspected = await Promise.all(candidates.slice(0, rerankCandidates).map(async (candidate): Promise<PageCandidate | null> => {
           const absolutePath = safePagePath(options.knowledgeDir, candidate.file);
-          if (!absolutePath) return candidate;
+          if (!absolutePath) {
+            hadInvalidPath = true;
+            return null;
+          }
+          if (!options.inspectPage) return candidate;
           try {
-            const body = await options.inspectPage!(absolutePath);
+            const body = await options.inspectPage(absolutePath);
             if (isKnowledgeNavigationPage(candidate.file, body)) return null;
+            const parsed = parsePageMetadata(candidate.file, body);
             return {
               ...candidate,
-              metadataScore: metadataCoverage(queryTokens, parsePageMetadata(candidate.file, body).searchText),
+              title: parsed.title,
+              metadata: parsed.metadata,
+              metadataScore: metadataCoverage(queryTokens, parsed.searchText),
             };
           } catch {
             return candidate;
           }
         }));
-        const valid = inspected.filter((candidate): candidate is PageCandidate => candidate !== null);
-        const maxScore = Math.max(...valid.map((candidate) => candidate.score), 1e-9);
-        valid.sort((a, b) => {
-          const aScore = 0.8 * (a.score / maxScore) + 0.2 * (a.metadataScore ?? 0);
-          const bScore = 0.8 * (b.score / maxScore) + 0.2 * (b.metadataScore ?? 0);
-          return bScore - aScore || b.score - a.score || a.file.localeCompare(b.file);
+        const inspectedCandidates = inspected.filter((candidate): candidate is PageCandidate => candidate !== null);
+        const remainder = candidates.slice(rerankCandidates).filter((candidate) => {
+          const valid = safePagePath(options.knowledgeDir, candidate.file) !== null;
+          if (!valid) hadInvalidPath = true;
+          return valid;
         });
-        candidates = [...valid, ...candidates.slice(rerankCandidates)];
+        candidates = [...inspectedCandidates, ...remainder]
+          .map((candidate) => ({ ...candidate, routingConfidence: calculateRoutingConfidence(candidate) }))
+          .sort((a, b) =>
+            (b.routingConfidence ?? 0) - (a.routingConfidence ?? 0) ||
+            b.score - a.score ||
+            a.file.localeCompare(b.file));
       }
-      candidates = candidates.slice(0, maxPages);
+
       if (candidates.length === 0) {
         return {
-          status: "not_found",
-          mode: "hybrid",
+          status: hadInvalidPath ? "unavailable" : "explore",
+          mode: "accelerator",
           query,
-          queryVariants,
-          results: [],
-          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
-          totalFiles: searched.totalFiles,
-          totalChunks: searched.totalChunks,
-          message: "No matching knowledge leaf pages found.",
-        };
-      }
-
-      const totalEvidenceBudget = Math.max(256, Math.floor(options.evidenceBudgetCharsRef.current));
-      const perPageBudget = Math.max(1, Math.floor(totalEvidenceBudget / candidates.length));
-      const reads = await Promise.all(candidates.map(async (candidate) => {
-        const absolutePath = safePagePath(options.knowledgeDir, candidate.file);
-        if (!absolutePath) {
-          return { kind: "error", candidate, error: "candidate path is outside the mounted knowledge directory" } as const;
-        }
-        try {
-          const body = await options.readPage(absolutePath);
-          if (isKnowledgeNavigationPage(candidate.file, body)) {
-            return { kind: "navigation", candidate } as const;
-          }
-          return { kind: "page", candidate, body } as const;
-        } catch (error) {
-          return {
-            kind: "error",
-            candidate,
-            error: error instanceof Error ? error.message : String(error),
-          } as const;
-        }
-      }));
-
-      const results: KnowledgeEvidencePage[] = [];
-      for (const read of reads) {
-        if (read.kind !== "page") continue;
-        const { candidate, body } = read;
-        const { title, metadata } = parsePageMetadata(candidate.file, body);
-        const fullPage = body.length <= perPageBudget;
-        const sections = fullPage
-          ? [{
-              heading: title,
-              startLine: 1,
-              endLine: Math.max(1, body.split(/\r?\n/).length),
-              content: body,
-            }]
-          : matchedSections(candidate.chunks, body, perPageBudget);
-        if (sections.length === 0) continue;
-        const selectedContent = sections.map((section) => section.content).join("\n");
-        const evidenceRefs = extractEvidenceRefs(candidate.file, selectedContent);
-        const pageHasEvidenceMarkers = /<!--[ \t]*okf:evidence\b/.test(body);
-        results.push({
-          rank: results.length + 1,
-          file: candidate.file,
-          title,
-          score: roundScore(candidate.score),
-          resultId: resultId(candidate.file, body),
-          ...(candidate.metadataScore !== undefined ? { metadataScore: roundScore(candidate.metadataScore) } : {}),
-          ...(metadata ? { metadata } : {}),
-          readMode: fullPage ? "full_page" : "matched_sections",
-          truncated: !fullPage,
-          citationMode: evidenceRefs.length > 0 ? "evidence" : pageHasEvidenceMarkers ? "none" : "page",
-          ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
-          sections,
-        });
-      }
-
-      if (results.length === 0) {
-        const hadInvalidPath = reads.some((read) => read.kind === "error" && read.error.includes("outside"));
-        return {
-          status: "unavailable",
-          mode: "hybrid",
-          query,
-          queryVariants,
           results: [],
           ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
           totalFiles: searched.totalFiles,
           totalChunks: searched.totalChunks,
           message: hadInvalidPath
-            ? "Knowledge retrieval is unavailable: the index returned an invalid page path."
-            : "Knowledge retrieval is unavailable: matching leaf pages could not be read.",
+            ? "The retrieval accelerator returned an invalid page path. Continue with Wiki Find/Grep/Read."
+            : "No safe direct hit was found. This is not evidence that the Wiki lacks an answer; explore its catalog, links, and pages with Find/Grep/Read.",
         };
       }
 
+      const hints = candidates
+        .slice(0, maxExplorationHints)
+        .map((candidate, index) => explorationHint(candidate, index + 1));
+      const directCandidate = candidates[0];
+      const competitor = candidates.slice(1).find((candidate) =>
+        (candidate.routingConfidence ?? 0) >= COMPETING_HINT_CONFIDENCE &&
+        (directCandidate.routingConfidence ?? 0) - (candidate.routingConfidence ?? 0) < DIRECT_HIT_MARGIN);
+      const isDirectHit =
+        (directCandidate.routingConfidence ?? 0) >= DIRECT_HIT_CONFIDENCE &&
+        (directCandidate.metadataScore ?? 0) >= DIRECT_HIT_CONFIDENCE &&
+        (directCandidate.passageScore ?? 0) >= COMPETING_HINT_CONFIDENCE &&
+        competitor === undefined;
+
+      if (!isDirectHit) {
+        return {
+          status: "explore",
+          mode: "accelerator",
+          query,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: competitor
+            ? "Several pages plausibly match, so similarity cannot choose the answer. Treat the hints as unverified leads and explore the Wiki with Find/Grep/Read."
+            : "The best match is not strong enough for a safe direct hit. Treat the hints as unverified leads and explore the Wiki with Find/Grep/Read.",
+        };
+      }
+
+      const absolutePath = safePagePath(options.knowledgeDir, directCandidate.file);
+      if (!absolutePath) {
+        return {
+          status: "unavailable",
+          mode: "accelerator",
+          query,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: "The direct-hit path is invalid. Continue with Wiki Find/Grep/Read.",
+        };
+      }
+
+      let body: string;
+      try {
+        body = await options.readPage(absolutePath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          status: "unavailable",
+          mode: "accelerator",
+          query,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: `The direct-hit page could not be read (${message}). Continue with Wiki Find/Grep/Read.`,
+        };
+      }
+
+      if (isKnowledgeNavigationPage(directCandidate.file, body)) {
+        return {
+          status: "explore",
+          mode: "accelerator",
+          query,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: "The match is a navigation page, not answer evidence. Follow its links and explore with Find/Grep/Read.",
+        };
+      }
+
+      const parsed = parsePageMetadata(directCandidate.file, body);
+      const evidenceBudget = Math.max(256, Math.floor(options.evidenceBudgetCharsRef.current));
+      const fullPage = body.length <= evidenceBudget;
+      const sections = fullPage
+        ? [{
+            heading: parsed.title,
+            startLine: 1,
+            endLine: Math.max(1, body.split(/\r?\n/).length),
+            content: body,
+          }]
+        : matchedSections(directCandidate.chunks, body, evidenceBudget);
+      if (sections.length === 0) {
+        return {
+          status: "explore",
+          mode: "accelerator",
+          query,
+          results: [],
+          explorationHints: hints,
+          ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
+          totalFiles: searched.totalFiles,
+          totalChunks: searched.totalChunks,
+          message: "The direct-hit page could not yield a bounded evidence snapshot. Explore the Wiki with Find/Grep/Read.",
+        };
+      }
+
+      const selectedContent = sections.map((section) => section.content).join("\n");
+      const evidenceRefs = extractEvidenceRefs(directCandidate.file, selectedContent);
+      const pageHasEvidenceMarkers = /<!--[ \t]*okf:evidence\b/.test(body);
+      const result: KnowledgeEvidencePage = {
+        rank: 1,
+        file: directCandidate.file,
+        title: parsed.title,
+        score: roundScore(directCandidate.score),
+        routingConfidence: roundScore(directCandidate.routingConfidence),
+        resultId: resultId(directCandidate.file, body),
+        ...(directCandidate.metadataScore !== undefined
+          ? { metadataScore: roundScore(directCandidate.metadataScore) }
+          : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+        readMode: fullPage ? "full_page" : "matched_sections",
+        truncated: !fullPage,
+        citationMode: evidenceRefs.length > 0 ? "evidence" : pageHasEvidenceMarkers ? "none" : "page",
+        ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
+        sections,
+      };
+
       return {
-        status: "ready",
-        mode: "hybrid",
+        status: "direct_hit",
+        mode: "accelerator",
         query,
-        queryVariants,
-        results,
+        results: [result],
         ...(navigation.length > 0 ? { navigationResults: navigation } : {}),
         totalFiles: searched.totalFiles,
         totalChunks: searched.totalChunks,
-        ...(results.length < candidates.length
-          ? { message: "Some matching knowledge pages could not be returned; answer only from the evidence present." }
-          : {}),
+        message: "One strong page match was read. Validate its subject, task, version, environment, and scope before using it; reject it and explore the Wiki if any of those differ.",
       };
     },
   };

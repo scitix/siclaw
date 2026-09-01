@@ -4,7 +4,7 @@ export interface KnowledgeSearchIndex {
   search(query: string, topK?: number, minScore?: number): Promise<MemorySearchResult>;
 }
 
-export type KnowledgeLookupStatus = "ready" | "not_found" | "unavailable";
+export type KnowledgeLookupStatus = "direct_hit" | "explore" | "unavailable";
 
 export interface KnowledgeEvidenceSection {
   heading: string;
@@ -18,6 +18,8 @@ export interface KnowledgeEvidencePage {
   file: string;
   title: string;
   score: number;
+  /** Conservative routing confidence; it is not answer confidence. */
+  routingConfidence: number;
   /** Stable identity for the exact page snapshot returned by this lookup. */
   resultId?: string;
   /** Fraction of question terms matched by page identity/frontmatter. */
@@ -35,6 +37,21 @@ export interface KnowledgeEvidencePage {
   sections: KnowledgeEvidenceSection[];
 }
 
+/**
+ * An unverified page hypothesis for Agent-led Wiki exploration. Hints carry no
+ * page body and are never registered as answer evidence.
+ */
+export interface KnowledgeExplorationHint {
+  rank: number;
+  file: string;
+  title: string;
+  score: number;
+  routingConfidence: number;
+  metadataScore?: number;
+  passageScore?: number;
+  metadata?: KnowledgeEvidencePage["metadata"];
+}
+
 export interface KnowledgeNavigationResult {
   file: string;
   heading: string;
@@ -43,11 +60,12 @@ export interface KnowledgeNavigationResult {
 
 export interface KnowledgeLookupResult {
   status: KnowledgeLookupStatus;
-  mode: "hybrid";
+  mode: "accelerator";
   query: string;
-  /** Original question followed by any deterministic low-recall fallback. */
-  queryVariants?: string[];
+  /** Exact page content is present only for a conservative direct hit. */
   results: KnowledgeEvidencePage[];
+  /** Unverified routing hints for Find/Grep/Read exploration. */
+  explorationHints?: KnowledgeExplorationHint[];
   navigationResults?: KnowledgeNavigationResult[];
   totalFiles?: number;
   totalChunks?: number;
@@ -65,7 +83,7 @@ export interface CreateKnowledgeResolverOptions {
   /** Read-only preview that does not register the page as answer evidence. */
   inspectPage?: (absolutePath: string) => Promise<string>;
   evidenceBudgetCharsRef: { current: number };
-  maxPages?: number;
   maxCandidates?: number;
   rerankCandidates?: number;
+  maxExplorationHints?: number;
 }

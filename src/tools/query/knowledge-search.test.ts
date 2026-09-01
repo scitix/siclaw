@@ -3,16 +3,17 @@ import { describe, expect, it, vi } from "vitest";
 import type { KnowledgeLookupResult, KnowledgeResolver } from "../../knowledge/resolver-types.js";
 import { createKnowledgeSearchTool, registration } from "./knowledge-search.js";
 
-function readyResult(query: string): KnowledgeLookupResult {
+function directHitResult(query: string): KnowledgeLookupResult {
   return {
-    status: "ready",
-    mode: "hybrid",
+    status: "direct_hit",
+    mode: "accelerator",
     query,
     results: [{
       rank: 1,
       file: "gpu.md",
       title: "GPU SOP",
       score: 0.9,
+      routingConfidence: 0.95,
       readMode: "full_page",
       truncated: false,
       citationMode: "page",
@@ -26,21 +27,21 @@ function payload(result: any): any {
 }
 
 describe("knowledge_search", () => {
-  it("returns the resolver's read evidence without exposing retrieval tuning parameters", async () => {
-    const resolver: KnowledgeResolver = { lookup: vi.fn(async (query) => readyResult(query)) };
+  it("returns the resolver's direct-hit snapshot without exposing retrieval tuning parameters", async () => {
+    const resolver: KnowledgeResolver = { lookup: vi.fn(async (query) => directHitResult(query)) };
     const tool = createKnowledgeSearchTool(resolver);
 
     const result = await tool.execute("call-1", { query: "GPU 驱动怎么升级" });
 
     expect(resolver.lookup).toHaveBeenCalledWith("GPU 驱动怎么升级");
-    expect(payload(result)).toMatchObject({ status: "ready", results: [{ file: "gpu.md" }] });
+    expect(payload(result)).toMatchObject({ status: "direct_hit", results: [{ file: "gpu.md" }] });
     expect((tool.parameters as any).properties).toEqual({
       query: expect.any(Object),
     });
   });
 
   it("reuses the first lookup in the same turn and refreshes on the next turn", async () => {
-    const resolver: KnowledgeResolver = { lookup: vi.fn(async (query) => readyResult(query)) };
+    const resolver: KnowledgeResolver = { lookup: vi.fn(async (query) => directHitResult(query)) };
     const turnRef = { current: 7 };
     const tool = createKnowledgeSearchTool(resolver, turnRef);
 
@@ -53,7 +54,7 @@ describe("knowledge_search", () => {
     expect(payload(first).query).toBe("first");
     expect(payload(repeated)).toEqual({
       status: "already_resolved",
-      message: "Knowledge was already resolved earlier this turn. Use the evidence from the first result; do not call knowledge_search again.",
+      message: "The retrieval accelerator was already used this turn. Do not call it again; validate the direct page or continue Wiki exploration with Find/Grep/Read.",
     });
     expect(repeated.details).toMatchObject({ reused: true, resultCount: 1 });
     expect(payload(nextTurn).query).toBe("next");

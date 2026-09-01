@@ -481,10 +481,10 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Memory disabled by Agent harness or SICLAW_MEMORY_ENABLED`);
   }
 
-  // Knowledge retrieval is independent from investigation memory. Its index is
-  // always available (FTS-only without embeddings) and is scoped by the exact
-  // mounted knowledgeDir. AgentBox passes a shared instance; standalone TUI
-  // owns this fallback instance for its single session.
+  // The knowledge index is an optional direct-hit accelerator, independent
+  // from investigation memory and scoped by the exact mounted knowledgeDir.
+  // FTS remains usable without embeddings. If initialization fails, the Agent
+  // still owns discovery through the mounted Wiki and Find/Grep/Read.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
     let candidate: MemoryIndexer | undefined;

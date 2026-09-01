@@ -550,7 +550,7 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
-| `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
+| `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Optional direct-hit accelerator over this Agent's mounted knowledge |
 
 ### allowedTools — Built-in and File-Tool Availability Axis
 
@@ -604,21 +604,25 @@ are intentionally different:
 
 `read_files` is a retrieval capability group, not only filesystem access:
 
-1. `knowledge_search` is the stable model-visible entry to an Agent-scoped
-   `KnowledgeResolver`. The resolver performs hybrid semantic + FTS retrieval,
-   aggregates chunks by leaf page, reads selected pages, and returns evidence
-   under a context-window-derived budget. FTS-only remains functional when
+1. `knowledge_search` is an optional single-page accelerator backed by an
+   Agent-scoped `KnowledgeResolver`. Hybrid semantic + FTS retrieval generates
+   candidates, but only a unique high-confidence identity-and-passage match is
+   read and returned as `direct_hit`. FTS-only remains functional when
    embeddings are unavailable.
-2. `grep` / `find` provide exact-text and filename fallback for identifiers,
-   versions, aliases, and terms absent from embeddings.
-3. `read` loads linked or fallback material only when the resolver reports that
-   its ready evidence is insufficient, not as a mandatory second retrieval hop.
+2. `grep` / `find` are first-class Wiki exploration tools, not only error
+   fallbacks. They preserve exact identifiers, versions, aliases, and let the
+   Agent discover material that similarity search did not safely route.
+3. `read` follows the catalog and page links for broad, novel, ambiguous,
+   comparative, weak-match, and cross-page questions. `explore` hints from the
+   accelerator are unverified leads and do not replace this reasoning path.
 4. `knowledge_cite` emits citations only for manifest-backed pages actually
    read during the current turn.
 
-The injected catalog remains a cheap navigation hint; it is not the only
-recall surface. Knowledge materialization explicitly resyncs the index, and
-the index database lives outside the atomically replaced knowledge mount.
+The mounted Wiki and its links remain the knowledge authority. The derived
+index is disposable optimization state: `explore` or `unavailable` never means
+that the Wiki lacks an answer. Knowledge materialization explicitly resyncs the
+index, and the index database lives outside the atomically replaced knowledge
+mount.
 
 MCP server descriptions become part of the corresponding model-visible tool
 descriptions. The current config contract has no read/write classification or

@@ -8,122 +8,131 @@ description: "Platform-owned discovery, leaf-page evidence, and version-scoped c
 
 ## Product contract
 
-A bound OKF wiki is the Agent's factual knowledge snapshot. A user must be able
-to ask with task language, aliases, or exact terms without knowing a document
-title. If the answer is supported by that snapshot, the Agent should find the
-leaf page, read it, answer from it, and cite only the trusted original mapped by
-that same mounted version.
+A bound OKF wiki is the Agent's factual knowledge snapshot and its navigable
+reasoning space. The Karpathy-style LLM Wiki value is not "find the most similar
+page and rewrite it". Its value is that the Agent can understand a question,
+follow a catalog and links, discover facts distributed across pages, compare
+scope and versions, and synthesize an answer.
 
-This contract has four consequences:
+`knowledge_search` is therefore a retrieval accelerator, not the knowledge
+authority or a mandatory router. It may shorten a frequent, concrete,
+single-page lookup. It must not replace Agent-led exploration for novel,
+ambiguous, broad, comparative, weak-match, or cross-page questions.
 
-1. `index.md` is navigation context, not the existence boundary for knowledge.
-2. Search chunks are candidates, not evidence; the platform reads selected
-   leaf pages and returns only their bounded content to the Agent.
-3. `index.md`, `_index.md`, and pages with `type: index` are never citable.
-4. Citation authority is the mounted `.citation-manifest.json`, not the current
+This contract has six consequences:
+
+1. The mounted pages and their graph are authoritative; the derived index is
+   disposable optimization state.
+2. A search candidate is a hypothesis, not evidence and not proof that the page
+   applies to the user's subject, task, version, environment, or scope.
+3. Only one unique, high-confidence leaf page may take the direct-hit fast path.
+   Weak or competing matches return exploration hints without reading or
+   registering them as evidence.
+4. `explore` and `unavailable` never mean the Wiki lacks an answer. They hand
+   discovery back to the Agent through `index.md`, links, Find, Grep, and Read.
+5. `index.md`, `_index.md`, and pages with `type: index` are navigation, never
+   answer evidence or citable sources.
+6. Citation authority is the mounted `.citation-manifest.json`, not the current
    state of Sicore Manage Raw and not a URL copied by the model.
 
 ## Runtime flow
 
 ```text
-published OKF version
-        |
-        v
-atomic knowledge mount
-  pages + .sync-manifest.json + .citation-manifest.json
-        |
-        v
-knowledge_search -- one model-visible call per user turn
-        |
-        v
-KnowledgeResolver -- query derived hybrid index (rebuildable, Agent-scoped),
-                     aggregate candidates, read exact leaf snapshots
-        |
-        v
-bounded evidence + navigation hints
-        |
-        v
-knowledge_cite -- validate read snapshot against pinned citation manifest
-        |
-        v
-answer + trusted original links
+user question
+     |
+     v
+Agent understands subject / task / version / environment / scope
+     |
+     +-- concrete and likely single-page --> knowledge_search (optional)
+     |                                      |
+     |                                      +-- direct_hit --> read one page
+     |                                      |                 validate applicability
+     |                                      |
+     |                                      +-- explore/unavailable --+
+     |                                                                  |
+     +-- broad / novel / ambiguous / cross-page ------------------------+
+                                                                        v
+                                                        Wiki network exploration
+                                                        index + links + Find/Grep/Read
+                                                                        |
+                                                                        v
+                                                        Agent synthesis and conflict checks
+                                                                        |
+                                                                        v
+                                                        knowledge_cite for pages actually used
 ```
 
-The index is derived state. The mounted pages and manifests are authoritative.
-A knowledge reload replaces those files as one mount, refreshes the derived
-index, and reloads the session prompt.
+The optional fast path and the exploration path read the same atomic knowledge
+mount: pages plus `.sync-manifest.json` and `.citation-manifest.json`. A reload
+replaces those files as one generation and refreshes the derived index.
 
 ## Retrieval design
 
 ### Current baseline
 
-`KnowledgeResolver` is the platform-owned deep module behind the model-visible
-`knowledge_search` tool. It is scoped to one Agent's mounted knowledge
-directory. It uses dense and FTS keyword retrieval with MMR, and FTS remains
-available when embeddings are unavailable. This matches the common
-hybrid pattern: lexical retrieval preserves exact identifiers while embeddings
-recover semantic matches. Anthropic's Contextual Retrieval evaluation likewise
-combines BM25 and embeddings, then improves precision with reranking.
+`KnowledgeResolver` is the platform-owned module behind the optional
+model-visible `knowledge_search` tool. It is scoped to one Agent's mounted
+knowledge directory. Candidate generation uses dense and FTS retrieval with
+MMR; FTS remains functional when no embedding model is configured or an
+embedding request fails. Embeddings improve recall but have no authority to
+decide that a page answers the question.
 
-SQLite BM25 ranks are normalized per query with lower raw ranks mapped to
-higher relevance scores. The configured 70/30 vector/FTS ratio applies when
-both channels produce candidates; if one channel is unavailable, the remaining
-channel uses the full score range. This keeps FTS-only fallback compatible with
-the public relevance threshold instead of treating a hybrid weight as an
-absolute score ceiling.
+The resolver makes one search with the user's original question. It does not
+rewrite weak queries or retry with entity fragments, because query expansion
+can silently change intent. It removes navigation pages, aggregates chunks by
+leaf page, and inspects only a bounded candidate set. Local routing confidence
+then combines:
 
-When the resolver is available, the prompt contains only the compact retrieval
-contract and does not inline `index.md`; this bounds first-turn context and makes
-search the single discovery authority. If resolver initialization fails, a small
-catalog may still be injected as a deterministic fallback. An oversized catalog
-is never prefix-truncated because a prefix looks complete and creates false
-absence.
+- retrieval score as a weak signal;
+- query-term coverage in page identity metadata such as path, title,
+  description, and tags;
+- query-term coverage in the matched passages.
 
-The resolver retrieves a wider chunk pool, removes navigation pages from answer
-candidates, aggregates hits by owning page, and reranks a bounded top set using
-the page title and frontmatter. This cheap local pass helps distinguish version,
-environment, product, and task applicability without another model call. If the
-original query finds no leaf page, the resolver makes at most one deterministic,
-entity-focused fallback search; a normal hit remains a single index query.
+A direct hit requires a conservative threshold in all three dimensions and no
+similarly strong competing page. This intentionally prefers false negatives:
+an overly strict gate costs extra Agent exploration, while an overly permissive
+gate can turn a tangential similarity into a confident wrong answer.
 
-It then reads up to three selected leaf pages concurrently. Small pages are
-returned whole; large pages return matched sections within a
-context-window-derived evidence budget. Reads pass through the same current-turn
-citation registrar as the Read tool. Every returned page also has a stable
-`resultId` derived from its relative path and exact body. The model therefore
-gets answer evidence in one model-visible retrieval call and can register only
-what it used with `knowledge_cite`. This follows the parent-document pattern:
-use smaller chunks for recall, but use the owning document as the answer and
-provenance boundary.
+Maintainers can improve the fast path without changing Raw source ownership by
+adding accurate Wiki metadata such as aliases, tags, and `example_questions`.
+Those fields make a known user phrasing part of the page's identity signal; they
+do not force selection, bypass competing-page detection, or become answer text.
 
-Repeated `knowledge_search` calls in the same turn return a short
-`already_resolved` reminder instead of duplicating the first evidence payload.
-This is a latency and context guard, not a forced case-specific index: every
-question goes through the same Agent-scoped hybrid index, page aggregation,
-bounded metadata rerank, read, and budget policy. Retrieval does not depend on a
-prompt copy of `index.md` and filters navigation pages from answer evidence.
+Only the winning direct-hit page is read through the current-turn citation
+registrar. Small pages are returned whole; large pages return matched sections
+under the context-derived evidence budget. The exact page snapshot has a stable
+`resultId`. Even then, the Agent must validate subject, task, version,
+environment, and scope and may reject the hit and explore the Wiki instead.
+
+For weak or ambiguous matches the resolver returns `explore` with bounded,
+unverified page hints and no page body. Those hints are leads for Agent
+reasoning, not sources. Search failure returns `unavailable` with the same
+exploration instruction. Repeated calls in one turn return an
+`already_resolved` reminder so the model exits the accelerator instead of
+looping through query rewrites.
+
+The prompt does not inline a large `index.md`, because that inflates every first
+turn and a truncated catalog creates false absence. The full catalog remains
+readable at `.siclaw/knowledge/index.md`; omitting it from the prompt is a
+context-budget choice, not a transfer of discovery authority to search.
 
 ### Next retrieval stage
 
-The next changes should be measured against a fixed query set rather than by
-prompt intuition:
+Further optimization is evaluation-driven and must preserve the exploration
+baseline:
 
-1. Calibrate metadata-rerank weights and low-recall triggers, then add curated
-   corpus aliases or a small fused query set only where evaluation proves it
-   helps. Query expansion must never replace the original query because it can
-   drift.
-2. Add mount generation metadata and structured traces for query variants,
-   candidate scores, selected reads, and citations.
-3. Add a completion gate for the Knowledge QA harness: when mounted
-   knowledge is required but no search or explicit-page Read occurred, continue
-   the turn once with a required retrieval action instead of finalizing a factual
-   answer. Never loop indefinitely.
-
-Graph retrieval is a later, separate path for corpus-wide synthesis such as
-"what are the recurring failure families across all GPU runbooks?". Entity-local
-SOP questions such as "how do I disable GSP?" should stay on the lower-cost local
-hybrid path. GraphRAG itself distinguishes local entity search from global
-map-reduce search over community reports.
+1. Build a fixed set containing direct lookups, weak tangential matches,
+   cross-library ambiguity, multi-page synthesis, version conflicts, and no-hit
+   questions. The catcher-versus-sichek case is mandatory.
+2. Measure both fast-path precision and end-answer quality. A new accelerator
+   configuration ships only when its worst-case answer quality is no worse than
+   Wiki exploration without embeddings.
+3. Add mount generation metadata and traces for candidate channels, scores,
+   direct-hit decisions, Agent rejection, page reads, and citations.
+4. Calibrate thresholds or metadata only from observed errors. Do not add a
+   completion gate that forces every factual question through
+   `knowledge_search`; the valid completion condition is that the Agent used
+   sufficient mounted evidence, whether reached by acceleration or exploration.
 
 ## Citation design
 
@@ -172,8 +181,9 @@ Use cold sessions and questions that do not include document titles.
 - correct abstention when the mounted Wiki has no support
 - p50/p95 search and end-to-answer latency
 
-The GSP regression case is mandatory: `关掉 GSP 怎么操作` must retrieve and
-Read `运维/GSP禁用方法.md`; it must not answer from or cite an index page.
+The GSP regression case is mandatory: `关掉 GSP 怎么操作` must reach and Read
+`运维/GSP禁用方法.md` through either a maintained direct hit or Wiki
+exploration; it must not answer from or cite an index page.
 
 ## Primary references
 

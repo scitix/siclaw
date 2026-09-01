@@ -15,7 +15,7 @@ interface TurnCache {
   result: KnowledgeLookupResult;
 }
 
-/** Resolve a knowledge question into read leaf-page evidence in one tool call. */
+/** Try to accelerate a concrete question into one conservative page read. */
 export function createKnowledgeSearchTool(
   resolver: KnowledgeResolver,
   turnRef?: { current: number },
@@ -35,11 +35,11 @@ export function createKnowledgeSearchTool(
     },
     renderResult: renderTextResult,
     description:
-      "Resolve the user's original knowledge question into a small set of relevant leaf-page evidence. " +
-      "Call this once per user turn with the question as asked; do not pre-search an index page, rewrite the query repeatedly, or Read the returned pages again. " +
-      "Bound Skills are supplementary and must not replace or repeat this platform retrieval step. " +
-      "A ready result contains page content already read and bounded to the current model context. Answer only from that evidence, then call knowledge_cite once for the evidence_refs and citable pages actually used. " +
-      "A not_found or unavailable result is not evidence; say what is missing or use ordinary Grep/Read only when further investigation is necessary.",
+      "Optional accelerator for a concrete knowledge question that likely has one direct page answer. " +
+      "Use it at most once per user turn with the question as asked; do not repeatedly rewrite or search. " +
+      "A direct_hit contains one page snapshot, but similarity is not proof: validate subject, task, version, environment, and scope before using it, then cite only material actually used. " +
+      "An explore result contains unverified page hints, not evidence. Continue with Find/Grep/Read over `.siclaw/knowledge/index.md` and linked pages for broad, novel, ambiguous, comparative, weak-match, or cross-page questions. " +
+      "Unavailable also means use Wiki exploration; neither status means the knowledge is absent. Bound Skills supplement domain reasoning and must not replace it.",
     parameters: Type.Object({
       query: Type.String({ description: "The user's original knowledge question, including any product, version, environment, and task details they supplied." }),
     }),
@@ -49,7 +49,7 @@ export function createKnowledgeSearchTool(
       if (currentTurn !== undefined && cache?.turn === currentTurn) {
         const repeated = {
           status: "already_resolved",
-          message: "Knowledge was already resolved earlier this turn. Use the evidence from the first result; do not call knowledge_search again.",
+          message: "The retrieval accelerator was already used this turn. Do not call it again; validate the direct page or continue Wiki exploration with Find/Grep/Read.",
         };
         return {
           content: [{ type: "text", text: JSON.stringify(repeated, null, 2) }],

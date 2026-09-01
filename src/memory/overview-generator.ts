@@ -88,8 +88,8 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
  * measured 7453, 6651 and 2668 characters, so 4000 cut roughly half the page
  * list of the single-library case. An oversized catalog is omitted instead of
  * prefix-truncated: a partial catalog looks complete and creates false absence.
- * knowledge_search is the scalable discovery path; the full file remains a
- * deterministic Grep/Read fallback.
+ * knowledge_search is a bounded direct-hit accelerator; the full file remains
+ * the entry to Agent-led graph exploration with Find/Grep/Read.
  */
 const KNOWLEDGE_WIKI_BUDGET = 8000;
 
@@ -99,8 +99,8 @@ const KNOWLEDGE_WIKI_BUDGET = 8000;
  * The wiki is a markdown tree at `knowledgeDir` whose `index.md` lists pages with
  * one-line descriptions and standard markdown links (legacy `[[links]]` remain
  * readable). We surface that index directly so the agent sees the catalog in
- * context for cheap routing, while knowledge_search resolves the original
- * question through hybrid retrieval and returns already-read leaf evidence.
+ * context for cheap routing. knowledge_search can accelerate a conservative
+ * single-page lookup, while the Agent keeps control of broader discovery.
  *
  * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
  * represented by an explicit retrieval/fallback notice, never a partial prefix.
@@ -122,22 +122,23 @@ export function buildKnowledgeWikiCatalog(
   const includeCatalog = opts.includeCatalog !== false;
   const oversized = index.length > KNOWLEDGE_WIKI_BUDGET;
   const catalog = !includeCatalog
-    ? "_(The catalog is intentionally not embedded because `knowledge_search` is the discovery authority. This keeps first-turn context bounded.)_"
+    ? "_(The catalog is intentionally not embedded to keep first-turn context bounded. Read `.siclaw/knowledge/index.md` and follow its links for Wiki exploration.)_"
     : oversized
     ? `_(Catalog not embedded: ${index.length} characters. Partial catalogs are misleading. ` +
-      "Use `knowledge_search` for discovery. If retrieval is unavailable or incomplete, Grep/Read " +
-      "`.siclaw/knowledge/index.md` directly. Do not infer that a page is absent from this overview.)_"
+      "Use `knowledge_search` only for a likely single-page direct lookup; otherwise Find/Grep/Read " +
+      "`.siclaw/knowledge/index.md` and linked pages. Do not infer that a page is absent from this overview.)_"
     : index;
 
   return [
     "# Knowledge Wiki",
     "",
     "Bound knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
-    "Call `knowledge_search` once with the user's original question; its ready result contains already-read, " +
-    "context-bounded leaf-page evidence. " +
-    (includeCatalog ? "The catalog below is navigation context, not the only retrieval path. " : "") +
-    "Use Grep/Find/Read only when retrieval is unavailable, finds nothing, or explicitly leaves required material unresolved. " +
-    "When following links as a fallback, " +
+    "Use `knowledge_search` as an optional accelerator only when the question likely has one concrete page answer. " +
+    "Its `direct_hit` contains one bounded page snapshot that still requires subject, task, version, environment, and scope validation. " +
+    "Its `explore` hints are unverified leads, not evidence, and `explore` or `unavailable` never proves absence. " +
+    (includeCatalog ? "The catalog below is navigation context for Agent-led exploration. " : "") +
+    "For broad, novel, ambiguous, comparative, weak-match, or cross-page questions, use Find/Grep/Read to navigate the Wiki. " +
+    "When following links, " +
     "follow standard markdown links " +
     "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
     "Also tolerate legacy `[[other-page]]` links, resolved from `.siclaw/knowledge/`. Don't read unrelated " +

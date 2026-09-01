@@ -662,10 +662,9 @@ export function createKnowledgeHandler(
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
           citationRepos.push({ id: repo.id, root: `repos/${dirName}`, sources: repo.citationSources ?? [] });
-          // This line is the cheap routing surface injected into the prompt.
-          // knowledge_search can retrieve across every mounted page when the
-          // label is insufficient, while the domain still avoids unnecessary
-          // searches and library-by-library index reads.
+          // This line is a cheap navigation hint. The Agent may use the
+          // direct-hit accelerator for a concrete lookup or enter the mounted
+          // Wiki through its catalogs and links for broader exploration.
           const displayName = catalogNameLine(repo.name);
           const domain = catalogDomainLine(repo.consumerDomain);
           indexLines.push(
