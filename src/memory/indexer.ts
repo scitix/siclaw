@@ -344,10 +344,19 @@ export class MemoryIndexer {
       scoreMap.set(r.id, entry);
     }
 
+    // Weights describe the relative contribution of channels that actually
+    // produced candidates. If embeddings are disabled or fail, FTS must use
+    // the full score range instead of being capped by its hybrid-only weight.
+    const activeVectorWeight = vectorResults.length > 0 ? Math.max(0, vectorWeight) : 0;
+    const activeFtsWeight = ftsResults.length > 0 ? Math.max(0, ftsWeight) : 0;
+    const activeWeightTotal = activeVectorWeight + activeFtsWeight;
+    const effectiveVectorWeight = activeWeightTotal > 0 ? activeVectorWeight / activeWeightTotal : 0;
+    const effectiveFtsWeight = activeWeightTotal > 0 ? activeFtsWeight / activeWeightTotal : 0;
+
     const fused = Array.from(scoreMap.entries())
       .map(([id, { vectorScore, ftsScore }]) => ({
         id,
-        score: vectorWeight * vectorScore + ftsWeight * ftsScore,
+        score: effectiveVectorWeight * vectorScore + effectiveFtsWeight * ftsScore,
       }))
       .filter((r) => r.score >= minScore)
       .sort((a, b) => b.score - a.score)
@@ -911,10 +920,16 @@ export class MemoryIndexer {
         )
         .all(ftsQuery, limit) as Array<{ id: number; rank: number }>;
 
-      // BM25 rank is negative (lower is better), convert to bounded (0, 1] score
-      return rows.map((r) => ({
-        id: r.id,
-        score: Number.isFinite(r.rank) ? 1 / (1 + Math.max(0, -r.rank)) : 0,
+      // SQLite BM25 rank is negative and lower is better. Normalize relevance
+      // within this query's bounded candidate set so the best lexical match is
+      // 1 and weaker matches approach 0. Absolute BM25 magnitudes are corpus-
+      // and query-dependent, so a fixed nonlinear transform is not calibrated
+      // for fusion or the public minScore threshold.
+      const relevance = rows.map((row) => Number.isFinite(row.rank) ? Math.max(0, -row.rank) : 0);
+      const maxRelevance = Math.max(0, ...relevance);
+      return rows.map((row, index) => ({
+        id: row.id,
+        score: maxRelevance > 0 ? relevance[index] / maxRelevance : 0,
       }));
     } catch {
       return [];

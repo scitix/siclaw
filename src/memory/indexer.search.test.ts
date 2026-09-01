@@ -136,9 +136,54 @@ describe("MemoryIndexer.search", () => {
       },
     };
 
-    const result = await indexer.search("kubernetes", 10, 0);
+    const result = await indexer.search("kubernetes");
     // FTS should still return results from the indexed chunks
     expect(result.chunks.length).toBeGreaterThan(0);
+  });
+
+  it("keeps exact FTS matches ahead of incidental mentions without embeddings", async () => {
+    fs.writeFileSync(
+      path.join(memoryDir, "catcher.md"),
+      "# Catcher model identification\n\ncatcher catcher catcher collects server configuration and generates the model id.",
+    );
+    fs.writeFileSync(
+      path.join(memoryDir, "sichek.md"),
+      "# Sichek inspection\n\nsichek checks server hardware; its report contains one catcher reference.",
+    );
+    await indexer.sync();
+
+    (indexer as any).embedding = {
+      model: "disabled",
+      dimensions: 0,
+      async embed() { return []; },
+    };
+
+    const result = await indexer.search("catcher server", 10, 0);
+
+    expect(result.chunks.map((chunk) => chunk.file)).toEqual([
+      "catcher.md",
+      "sichek.md",
+    ]);
+    expect(result.chunks[0].score).toBeGreaterThan(result.chunks[1].score ?? 0);
+  });
+
+  it("uses the full relevance range when FTS is the only available channel", async () => {
+    fs.writeFileSync(
+      path.join(memoryDir, "catcher.md"),
+      "# Catcher\n\ncatcher collects configuration and generates a model id.",
+    );
+    await indexer.sync();
+
+    (indexer as any).embedding = {
+      model: "disabled",
+      dimensions: 0,
+      async embed() { return []; },
+    };
+
+    const result = await indexer.search("catcher");
+
+    expect(result.chunks).toHaveLength(1);
+    expect(result.chunks[0]).toMatchObject({ file: "catcher.md", score: 1 });
   });
 
   it("CJK query uses OR join and still returns results", async () => {

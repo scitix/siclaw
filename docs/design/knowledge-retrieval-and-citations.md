@@ -65,6 +65,13 @@ hybrid pattern: lexical retrieval preserves exact identifiers while embeddings
 recover semantic matches. Anthropic's Contextual Retrieval evaluation likewise
 combines BM25 and embeddings, then improves precision with reranking.
 
+SQLite BM25 ranks are normalized per query with lower raw ranks mapped to
+higher relevance scores. The configured 70/30 vector/FTS ratio applies when
+both channels produce candidates; if one channel is unavailable, the remaining
+channel uses the full score range. This keeps FTS-only fallback compatible with
+the public relevance threshold instead of treating a hybrid weight as an
+absolute score ceiling.
+
 When the resolver is available, the prompt contains only the compact retrieval
 contract and does not inline `index.md`; this bounds first-turn context and makes
 search the single discovery authority. If resolver initialization fails, a small
