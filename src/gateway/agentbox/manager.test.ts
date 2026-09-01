@@ -1021,6 +1021,106 @@ describe("AgentBoxManager — regressions found in review", () => {
   });
 });
 
+describe("AgentBoxManager — the pool it reconciles may not be its own", () => {
+  // `list()` is scoped to the namespace and the `app=agentbox` label, not to this runtime.
+  // Production runs several runtimes against one AgentBox namespace, so the reconciler sees
+  // siblings' pods and — before the ownership check — judged them by this runtime's own
+  // configuration. Three healthy boxes read as two too many and were destroyed.
+  const sibling = () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [
+      poolBox("agentbox-agent-a-0", 0),
+      poolBox("agentbox-agent-a-1", 1),
+      // The reasons this runtime would have found to act: a corpse to collect and replace,
+      // and an image this runtime does not consider current.
+      poolBox("agentbox-agent-a-2", 2, { status: "stopped", exitedUnexpectedly: true }),
+      poolBox("agentbox-agent-a-3", 3, { image: "agentbox:v1" }),
+    ];
+    spawner.pool = spawner.listReturns;
+    return spawner;
+  };
+
+  it("touches nothing when it cannot establish that the agent is its own", async () => {
+    const spawner = sibling();
+    const mgr = new AgentBoxManager(spawner);
+    // What the control plane actually answers for another runtime's agent.
+    mgr.setReplicasResolver(async () => { throw new Error("agent does not belong to this runtime"); });
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+
+    await (mgr as any).reconcilePoolSizes();
+    await new Promise((r) => setTimeout(r, 10)); // a replacement would spawn in the background
+
+    expect((mgr as any).draining.size).toBe(0); // no shrink, no staleness marking
+    expect(spawner.stopCalls).toHaveLength(0);  // no corpse collection, no roll
+    expect(spawner.spawnCalls).toHaveLength(0); // and nothing put back in someone else's pool
+  });
+
+  it("stops re-asking the control plane about an agent that is not its own", async () => {
+    // A sibling's agent is a permanent answer, and the reaper ticks every ten seconds. The
+    // memo is the reconciler's alone — the lookup stays uncached so a turn is never held at
+    // one box on the strength of a remembered blip.
+    const spawner = sibling();
+    const mgr = new AgentBoxManager(spawner);
+    let lookups = 0;
+    mgr.setReplicasResolver(async () => { lookups++; throw new Error("agent does not belong to this runtime"); });
+
+    for (let i = 0; i < 4; i++) await (mgr as any).reconcilePoolSizes();
+    expect(lookups).toBe(1);
+
+    (mgr as any).unownedAgents.clear(); // as if the memo window had elapsed
+    await (mgr as any).reconcilePoolSizes();
+    expect(lookups).toBe(2); // and it does ask again — a reassigned agent must be picked up
+  });
+
+  it("acts on the very same pool once the agent is known to be its own", async () => {
+    // The control against the test above: without it, a reconciler broken in some unrelated
+    // way would pass by doing nothing at all.
+    const spawner = sibling();
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+
+    await (mgr as any).reconcilePoolSizes();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(spawner.stopCalls).toContain("agentbox-agent-a-2"); // the corpse is collected
+    expect((mgr as any).draining.size).toBeGreaterThan(0);     // and the pool is shrunk
+  });
+
+  it("still serves a turn for an agent whose replica count is unavailable", async () => {
+    // Ownership gates DESTRUCTION only. A request naming the agent is itself the evidence
+    // that this runtime serves it, so an unresolvable count falls back to a single box
+    // rather than refusing the turn.
+    const spawner = new PoolSpawner("k8s");
+    const box = poolBox("agentbox-agent-a-0", 0);
+    spawner.pool = [box];
+    spawner.getReturns.set("agentbox-agent-a-0", box);
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => { throw new Error("control plane down"); });
+
+    const acquired = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(acquired.boxId).toBe("agentbox-agent-a-0");
+  });
+
+  it("reports an unresolvable agent once a window, not once a tick", async () => {
+    // The reaper runs every few seconds against every sibling agent in the namespace. Said
+    // each time, this was the bulk of the runtime log — which is how the drain that mattered
+    // went unnoticed.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mgr = new AgentBoxManager(new PoolSpawner("k8s"));
+    let lookups = 0;
+    mgr.setReplicasResolver(async () => { lookups++; throw new Error("agent does not belong to this runtime"); });
+
+    for (let i = 0; i < 4; i++) {
+      expect(await (mgr as any).lookupReplicas("agent-a")).toBeUndefined();
+      (mgr as any).replicasCache.clear(); // as if the TTL had elapsed between ticks
+    }
+
+    expect(lookups).toBe(4); // the lookup itself is NOT throttled — a blip must recover
+    expect(warn.mock.calls.filter((c) => /replicas unknown/.test(String(c[0])))).toHaveLength(1);
+  });
+});
+
 describe("AgentBoxManager — a single-box agent still rolls onto a new image", () => {
   it("drains a stale box and serves from a replacement, rather than keeping the old image forever", async () => {
     // The single-box path compares phase, profile and CA but never the image, and a box

@@ -136,6 +136,29 @@ const UNRESPONSIVE_PROBE_LIMIT = 3;
  */
 const REPLICAS_TTL_MS = 10_000;
 
+/**
+ * How often an agent whose replica count this runtime cannot resolve may be reported.
+ *
+ * In a shared AgentBox namespace every reaper tick walks other runtimes' pods too, and for
+ * each of their agents the control plane answers "does not belong to this runtime" — a
+ * permanent, expected condition. Reported per tick it drowned out everything else in the
+ * runtime log. The lookup itself is NOT rate limited (see lookupReplicas): retrying is what
+ * makes a genuine blip recover on the next tick.
+ */
+const REPLICAS_UNKNOWN_LOG_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * How long the pool reconciler remembers that it could not establish ownership of an agent.
+ *
+ * Read by `reconcilePoolSizes` and NOTHING else, which is the whole point: the lookup itself
+ * must keep failing fast and uncached so that a turn is never held at one box on the strength
+ * of a remembered blip. Reconciliation has no such deadline — every tick re-asking the
+ * control plane about every sibling agent in the namespace is a permanent question being
+ * asked at 0.1 Hz per agent, and deferring it costs only a slower response to an agent that
+ * has just been reassigned to this runtime.
+ */
+const UNOWNED_MEMO_MS = 60_000;
+
 export interface AgentBoxManagerConfig {
   /** Health check interval (ms) — local dev only */
   healthCheckIntervalMs?: number;
@@ -184,6 +207,12 @@ export class AgentBoxManager {
   private draining = new Map<string, number>();
   private statusCache = new Map<string, { at: number; status: BoxStatusReport }>();
   private replicasCache = new Map<string, { at: number; value: number }>();
+  /** agentId → when we last said its replica count is unknown. Rate limit only; it never
+   *  affects what the lookup answers. See lookupReplicas. */
+  private replicasUnknownLoggedAt = new Map<string, number>();
+  /** agentId → when the reconciler last failed to establish ownership. Reconciler only —
+   *  see UNOWNED_MEMO_MS for why the serving path must not consult it. */
+  private unownedAgents = new Map<string, number>();
   /** Consecutive failed status probes per box — see UNRESPONSIVE_PROBE_LIMIT. */
   private probeFailures = new Map<string, number>();
   /** Crashes per box, so a box that keeps dying is not respawned forever. */
@@ -303,19 +332,57 @@ export class AgentBoxManager {
   }
 
   private async resolveReplicas(agentId: string): Promise<number> {
+    return (await this.lookupReplicas(agentId)) ?? 1;
+  }
+
+  /**
+   * The agent's replica count, or UNDEFINED when this runtime cannot establish it.
+   *
+   * 🔴 The distinction between "one" and "unknown" is a safety boundary, and collapsing it
+   * cost a production incident. Several runtimes share one AgentBox namespace, and the
+   * control plane answers `agent does not belong to this runtime` for an agent owned by a
+   * sibling. Reading that as "one replica" made the pool reconciler treat a healthy
+   * three-box pool as two boxes too many and drain them — pods belonging to another runtime,
+   * still serving traffic, removed at the drain deadline. The logs showed the whole chain:
+   * the lookup failure, then `Removing drained box …` for that agent, while its boxes were
+   * still reporting metrics.
+   *
+   * Callers therefore have to choose. Serving a turn may fall back to one (see
+   * resolveReplicas) — a single box is the safe shape for work that has to happen. But
+   * anything that DESTROYS a box must treat unknown as "not mine" and leave it alone.
+   *
+   * A failure is deliberately NOT cached, and that predates this change for a good reason: a
+   * genuine blip must be retried on the next tick rather than remembered, because a cached
+   * unknown would make resolveReplicas fall back to one box for the whole TTL — sending a
+   * multi-replica agent's new sessions all to instance 0. The production log noise came from
+   * the same failure being REPORTED every tick, not from it being retried, so the rate limit
+   * belongs on the log line, not on the lookup.
+   */
+  private async lookupReplicas(agentId: string): Promise<number | undefined> {
     if (!this.replicasResolver) return 1;
     const cached = this.replicasCache.get(agentId);
     if (cached && Date.now() - cached.at < REPLICAS_TTL_MS) return cached.value;
     try {
       const value = normalizeReplicas(await this.replicasResolver(agentId));
       this.replicasCache.set(agentId, { at: Date.now(), value });
+      this.replicasUnknownLoggedAt.delete(agentId);
       return value;
     } catch (err) {
-      // Fail to ONE, never to many: a config lookup blip must not scale an agent up.
-      // Deliberately NOT cached — a blip should be retried on the next turn, not
-      // remembered for the next ten seconds.
-      console.warn(`[agentbox-manager] replicas lookup failed for agent=${agentId}; using 1:`, err);
-      return 1;
+      // One line per agent per window, and no stack: the overwhelmingly common cause is a
+      // sibling runtime's agent — ordinary in a shared namespace — and the WS receiver
+      // frames carry nothing diagnostic. Unrated, this was the bulk of the runtime log.
+      const now = Date.now();
+      const last = this.replicasUnknownLoggedAt.get(agentId);
+      if (last === undefined || now - last >= REPLICAS_UNKNOWN_LOG_INTERVAL_MS) {
+        this.replicasUnknownLoggedAt.set(agentId, now);
+        // State the FACT, not a consequence: the two callers act differently on it, so a
+        // message that names one of them is wrong at the other site.
+        console.warn(
+          `[agentbox-manager] replicas unknown for agent=${agentId} — not owned by this runtime,` +
+          ` or its config is unreachable (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+      return undefined;
     }
   }
 
@@ -1457,6 +1524,38 @@ export class AgentBoxManager {
     this.forgetStaleSpawnFailures();
 
     for (const [agentId, pool] of byAgent) {
+      // 🔴 OWNERSHIP FIRST, before anything here can drain, delete or replace a box.
+      //
+      // `list()` is scoped to the namespace and the `app=agentbox` label — NOT to this
+      // runtime. Several runtimes share one AgentBox namespace in production, so this loop
+      // sees siblings' pods, and every judgement below would then be made with this
+      // runtime's own configuration: its replica count, its expected image, its CA. All
+      // three read a healthy sibling box as stale.
+      //
+      // It is not hypothetical. A sibling's three-box pool was reconciled against a
+      // fallback replicas of 1, drained as "two too many", and removed at the drain
+      // deadline while those boxes were still serving traffic.
+      //
+      // An unknown replica count is the ownership signal available here: the control plane
+      // refuses the lookup for an agent it has not assigned to this runtime. Treat that as
+      // "not mine" and touch nothing — no crash healing, no staleness marking, no roll, no
+      // shrink. Serving a turn still falls back to one box (resolveReplicas); only
+      // destructive work requires ownership.
+      //
+      // This costs a lookup per agent per tick, where the previous code skipped it for
+      // single-box agents. That saving is what put the ownership question AFTER the draining,
+      // so it is not a saving worth having — but a sibling's agent is a PERMANENT answer, and
+      // re-asking about it every ten seconds forever is waste, hence the memo. It is scoped
+      // to this loop: the serving path must keep asking (see UNOWNED_MEMO_MS).
+      const unownedAt = this.unownedAgents.get(agentId);
+      if (unownedAt !== undefined && Date.now() - unownedAt < UNOWNED_MEMO_MS) continue;
+      const replicas = await this.lookupReplicas(agentId);
+      if (replicas === undefined) {
+        this.unownedAgents.set(agentId, Date.now());
+        continue;
+      }
+      this.unownedAgents.delete(agentId);
+
       await this.healCrashedBoxes(agentId, pool);
       const boxes = pool.filter((b) => b.status !== "stopped");
       // Keep a roll moving without waiting for traffic: mark the next stale box once the
@@ -1465,10 +1564,8 @@ export class AgentBoxManager {
       this.markStaleBoxesDraining(agentId, boxes, "agent");
       await this.advanceRoll(agentId, boxes);
       const accepting = boxes.filter((b) => !this.draining.has(b.boxId));
-      // One box is both "nothing to shrink" and the un-pooled shape — skip without
-      // paying a replicas lookup for every agent in the cluster on every tick.
+      // One box is both "nothing to shrink" and the un-pooled shape.
       if (accepting.length <= 1) continue;
-      const replicas = await this.resolveReplicas(agentId);
       if (accepting.length <= replicas) continue;
       const excess = [...accepting]
         .sort((a, b) => (b.instance ?? 0) - (a.instance ?? 0))
