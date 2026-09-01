@@ -75,6 +75,21 @@ certificate that never changed — the same "nothing happened and nobody noticed
 as the outage itself. It runs at a long interval because C3a means one interval is
 still days of margin.
 
+### C3b — The certificate volume must stay a plain whole-Secret mount
+
+No `subPath`, no `items` projection. Kubernetes does not propagate Secret updates into
+a `subPath` mount: the files are frozen at pod start and kubelet never touches them
+again. Renewal would replace the Secret, no file would change, no event would fire,
+and the agent would go dark thirty days later — the original outage, with the renewal
+machinery running and reporting success throughout.
+
+The persistence volume in the same pod spec **does** use `subPath`, so the shape is
+close at hand and the edit is a plausible one. Pinned by test.
+
+Other path shapes that deliver no notification, for the same reason the backstop poll
+exists: network filesystems (inotify sees only local changes), writes that bypass an
+overlay mount, `/proc` and `/sys`, and a directory shadowed by a later mount.
+
 The AgentBox deliberately has no Kubernetes API access
 (`automountServiceAccountToken: false`), so watching the Secret *resource* is not an
 option — and would not help anyway: the API tells you the Secret changed, while what

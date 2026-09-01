@@ -905,6 +905,14 @@ export class K8sSpawner implements BoxSpawner {
                 name: "client-cert",
                 mountPath: "/etc/siclaw/certs",
                 readOnly: true,
+                // 🔴 NEVER ADD subPath HERE. Kubernetes does not propagate Secret
+                // updates into a subPath mount — the files are frozen at the moment
+                // the pod started and kubelet never touches them again. That would
+                // silently disable certificate renewal for every box: no error, no
+                // filesystem event, nothing for cert-reloader.ts to observe, and the
+                // agent goes dark 30 days later exactly as it did before this existed.
+                // The persistence volume a few lines above DOES use subPath, so the
+                // shape is close at hand; a test pins this one.
               },
               {
                 name: "tmp",

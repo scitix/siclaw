@@ -2053,3 +2053,35 @@ describe("K8sSpawner — the sweep must not collect a certificate still in use",
     expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).toContain("kbc-box-run-9-cert");
   });
 });
+
+describe("K8sSpawner — the certificate mount must stay updatable", () => {
+  const g = globalThis as any;
+
+  it("mounts the cert Secret without subPath", async () => {
+    // 🔴 Kubernetes does not propagate Secret updates into a subPath mount. Adding one
+    // here would freeze the files at pod start: renewal would replace the Secret, the
+    // pod would never see it, no event would fire, and the agent would go dark 30 days
+    // later — the original outage, with the renewal machinery running and reporting
+    // success the whole time. The persistence volume in the same pod spec DOES use
+    // subPath, so this is a plausible edit, which is why it is pinned.
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.4", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "mounted" } as any);
+
+    const mounts = g.__k8sCalls.createNamespacedPod[0].body.spec.containers[0].volumeMounts;
+    const certMount = mounts.find((m: any) => m.mountPath === "/etc/siclaw/certs");
+    expect(certMount).toBeDefined();
+    expect(certMount.subPath).toBeUndefined();
+    // And it must be a whole-Secret volume, not a projection of a single key.
+    const volume = g.__k8sCalls.createNamespacedPod[0].body.spec.volumes
+      .find((v: any) => v.name === certMount.name);
+    expect(volume.secret.items).toBeUndefined();
+  });
+});
