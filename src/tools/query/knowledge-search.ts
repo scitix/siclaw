@@ -46,7 +46,8 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
       "steps prove navigation only; do not reread them as evidence. Set listLabels=true to inspect the package's paginated " +
       "label catalog, but do not enumerate it before a normal search. Full candidate labels and catalog page lists are omitted " +
       "unless includeLabels/includePages is explicitly requested. Results are navigation metadata, not evidence: Read the complete relevant leaf pages before answering, " +
-      "then use knowledge_cite only for pages actually used.",
+      "then use knowledge_cite only for pages actually used. matchedPages counts all query matches before topK truncation; " +
+      "a top score below about 0.7 is normally a weak match, so refine the query or use the complete Wiki catalog.",
     parameters: Type.Object({
       query: Type.Optional(Type.String({ description: "Natural-language query, label alias, version, or exact term to retrieve." })),
       topK: Type.Optional(Type.Number({ description: "Maximum candidate pages to return (default 3, maximum 20)." })),
@@ -108,6 +109,11 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
           matchedLabels: page.matchedLabels,
           routeProof: page.routeProof,
         }));
+        const hasMore = result.matchedPages > results.length;
+        const weakOrAmbiguous = results.length > 0 && (
+          results[0].score < 0.7 ||
+          (hasMore && results.length > 1 && results[0].score - results[1].score < 0.05)
+        );
         return {
           content: [{
             type: "text",
@@ -116,9 +122,15 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
               results,
               ...(results.length === 0 ? {
                 message: "No label-matched knowledge page found. Use the complete Wiki catalog to choose and Read plausible pages, or inspect the label catalog with listLabels=true.",
+              } : weakOrAmbiguous ? {
+                message: "Weak or ambiguous label match. Refine the query with an entity, component, task, environment, or version, or use the complete Wiki catalog before reading a leaf.",
               } : {}),
+              matchedPages: result.matchedPages,
+              hasMore,
               totalPages: result.totalPages,
               totalLabels: result.totalLabels,
+              invalidLabeledPages: result.invalidLabeledPages,
+              unlabeledPages: result.unlabeledPages,
               unreachableLabeledPages: result.unreachableLabeledPages,
             }, null, 2),
           }],

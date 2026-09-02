@@ -161,6 +161,49 @@ describe("knowledge_search", () => {
     expect(payload.results[0].score - payload.results[1].score).toBeGreaterThan(0.2);
   });
 
+  it("downranks an exact alias shared across many pages and reports truncation", async () => {
+    const links: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const file = `upgrade-${i}.md`;
+      links.push(`- [Upgrade ${i}](${file})`);
+      fs.writeFileSync(
+        path.join(knowledgeDir, file),
+        "---\ntype: Procedure\ntitle: Upgrade " + i + "\nlabels:\n" +
+        `  - facet: task\n    value: Upgrade process ${i}\n    aliases: [升级]\n` +
+        "---\n# Upgrade\n",
+      );
+    }
+    fs.writeFileSync(
+      path.join(knowledgeDir, "zhaoyao.md"),
+      "---\ntype: Topic\ntitle: 招摇B30X\nlabels:\n" +
+      "  - facet: topic\n    value: 招摇B30X\n---\n# 招摇B30X\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      `# Knowledge Index\n\n${links.join("\n")}\n- [招摇B30X](zhaoyao.md)\n`,
+    );
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const broadResult = await tool.execute("call-broad-exact", { query: "升级" });
+    const broad = JSON.parse((broadResult.content[0] as { text: string }).text);
+
+    expect(broad.results).toHaveLength(3);
+    expect(broad.matchedPages).toBe(10);
+    expect(broad.hasMore).toBe(true);
+    expect(broad.results.every((row: { score: number }) => row.score < 0.7)).toBe(true);
+    expect(broad.results[0].matchedLabels[0].pageCount).toBe(10);
+    expect(broad.message).toContain("Weak or ambiguous label match");
+
+    const rareResult = await tool.execute("call-rare-exact", { query: "招摇B30X" });
+    const rare = JSON.parse((rareResult.content[0] as { text: string }).text);
+    expect(rare.results[0].score).toBe(1);
+    expect(rare.results[0].matchedLabels[0].pageCount).toBe(1);
+    expect(rare.matchedPages).toBe(1);
+    expect(rare.hasMore).toBe(false);
+    expect(rare).not.toHaveProperty("message");
+  });
+
   it("does not route to a labeled page that is unreachable from the root catalog", async () => {
     fs.writeFileSync(
       path.join(knowledgeDir, "index.md"),
@@ -194,6 +237,37 @@ describe("knowledge_search", () => {
     ]);
     expect(catalog.totalPages).toBe(1);
     expect(catalog.unreachableLabeledPages).toBe(1);
+  });
+
+  it("reports invalid label declarations separately from unlabeled pages", async () => {
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [Valid](valid.md)\n- [Invalid](invalid.md)\n- [Unlabeled](unlabeled.md)\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "valid.md"),
+      "---\ntype: Topic\ntitle: Valid\nlabels:\n  - facet: entity\n    value: B300\n---\n# Valid\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "invalid.md"),
+      "---\ntype: Topic\ntitle: Invalid\nlabels:\n  - facet: unsupported\n    value: broken\n---\n# Invalid\n",
+    );
+    fs.writeFileSync(path.join(knowledgeDir, "unlabeled.md"), "# Unlabeled\n");
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const result = await tool.execute("call-observability", { query: "B300" });
+    const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(payload.totalPages).toBe(1);
+    expect(payload.invalidLabeledPages).toBe(1);
+    expect(payload.unlabeledPages).toBe(1);
+    expect(payload.unreachableLabeledPages).toBe(0);
+
+    const catalogResult = await tool.execute("call-observability-catalog", { listLabels: true });
+    const catalog = JSON.parse((catalogResult.content[0] as { text: string }).text);
+    expect(catalog.invalidLabeledPages).toBe(1);
+    expect(catalog.unlabeledPages).toBe(1);
   });
 
   it("returns the canonical multi-library catalog trail without requiring intermediate reads", async () => {
