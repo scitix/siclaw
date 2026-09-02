@@ -76,12 +76,120 @@ describe("knowledge_cite", () => {
     // The legacy bare-string form and an empty claim are the same padding
     // shape: provenance validates identically for a read-but-unused page, so
     // the claim is the only cited-vs-read distinction the runtime can demand.
+    // The rejection must SAY that nothing was registered and how to retry —
+    // unlike overflow, a shape error is fixable, so fail-closed is honest
+    // here as long as the guidance does not loop.
     for (const pages of [[page], [{ path: page, claim: "" }], [{ path: page, claim: "   " }]]) {
       const output = await support.tool.execute("call", { pages } as never);
-      expect((output.content[0] as { text: string }).text).toContain("requires { path, claim }");
+      const text = (output.content[0] as { text: string }).text;
+      expect(text).toContain("requires { path, claim }");
+      expect(text).toContain("No citations were registered, including any evidence_refs");
+      expect(text).toContain("Retry knowledge_cite once");
       expect(output.details).toEqual({ cited: 0 });
     }
     expect(events).toEqual([]);
+  });
+
+  it("enforces the claim bounds the schema only advertises", async () => {
+    // pi does not validate tool params against the TypeBox schema, so the
+    // 4-300 bounds must be enforced in execute — a 1-character claim would
+    // let padding back in, and an unbounded claim lands in durable storage.
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    const short = await support.tool.execute("call", {
+      pages: [{ path: page, claim: "x" }],
+    } as never);
+    expect((short.content[0] as { text: string }).text).toContain("claim too short");
+    expect(short.details).toEqual({ cited: 0 });
+
+    const long = await support.tool.execute("call", {
+      pages: [{ path: page, claim: "长".repeat(301) }],
+    } as never);
+    expect((long.content[0] as { text: string }).text).toContain("claim too long");
+    expect(long.details).toEqual({ cited: 0 });
+    expect(events).toEqual([]);
+  });
+
+  it("rejects non-array parameter shapes instead of silently dropping them", async () => {
+    // Array.isArray coercion used to turn a bare {path, claim} object into
+    // an empty list: the call reported success while the page's link never
+    // reached the references — the model shipped believing it was cited.
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    const objectPages = await support.tool.execute("call", {
+      pages: { path: page, claim: "The runbook documents the reset procedure." },
+    } as never);
+    expect((objectPages.content[0] as { text: string }).text).toContain("pages must be an ARRAY");
+    expect(objectPages.details).toEqual({ cited: 0 });
+
+    const stringRefs = await support.tool.execute("call", {
+      evidence_refs: "guide.md#entry",
+      pages: [{ path: page, claim: "The runbook documents the reset procedure." }],
+    } as never);
+    expect((stringRefs.content[0] as { text: string }).text).toContain("evidence_refs must be an ARRAY");
+    expect(stringRefs.details).toEqual({ cited: 0 });
+    expect(events).toEqual([]);
+  });
+
+  it("merges repeated successful calls into one capped union event", async () => {
+    // Both gateway consumers ASSIGN the knowledge_sources event, so a second
+    // call would overwrite the first call's references. The tool therefore
+    // emits the deduped union of the turn — and the cap applies to the union,
+    // so follow-up calls cannot raise the ceiling.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-union-"));
+    dirs.push(dir);
+    const first = path.join(dir, "first.md");
+    const second = path.join(dir, "second.md");
+    fs.writeFileSync(first, "---\nsources:\n  - resource: raw/a.md\n---\n# First\n");
+    fs.writeFileSync(second, "---\nsources:\n  - resource: raw/b.md\n---\n# Second\n");
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({
+      version: 1,
+      repos: [{ id: "repo", root: "", sources: [
+        { resource: "a.md", title: "A", url: "https://docs.feishu.cn/wiki/a" },
+        { resource: "b.md", title: "B", url: "https://docs.feishu.cn/wiki/b" },
+      ] }],
+    }));
+    const events: Array<{ sources: Array<{ title: string }> }> = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event as never),
+    });
+    readPage(support, first);
+    readPage(support, second);
+
+    const call1 = await support.tool.execute("call-1", {
+      pages: [{ path: first, claim: "First page supports the opening claim." }],
+    } as never);
+    expect(call1.details).toEqual({ cited: 1 });
+    const call2 = await support.tool.execute("call-2", {
+      pages: [{ path: second, claim: "Second page supports the follow-up claim." }],
+    } as never);
+    expect(call2.details).toEqual({ cited: 1 });
+    expect(events).toHaveLength(2);
+    expect(events[1].sources.map((source) => source.title)).toEqual(["A", "B"]);
+
+    // Re-citing an already-registered source adds nothing and says so.
+    const recite = await support.tool.execute("call-3", {
+      pages: [{ path: first, claim: "First page supports the opening claim." }],
+    } as never);
+    expect(recite.details).toEqual({ cited: 0 });
+    expect((recite.content[0] as { text: string }).text).toContain("already registered this turn");
+    expect(events).toHaveLength(2);
   });
 
   it.each([

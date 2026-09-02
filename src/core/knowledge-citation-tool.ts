@@ -242,11 +242,18 @@ export function createKnowledgeCitationSupport(opts: {
   let turn = -1;
   const readPages = new Map<string, string>();
   let pinnedManifest: CitationManifest | null | undefined;
+  // Union of every SUCCESSFUL call's citations this turn. Both gateway
+  // consumers ASSIGN the knowledge_sources event (`pendingKnowledgeSources =
+  // ev.sources`), so a second call would otherwise overwrite the first call's
+  // references; emitting the deduped, capped union keeps assignment semantics
+  // correct without touching the gateway image.
+  let registeredThisTurn: KnowledgeSourceCitation[] = [];
   const resetForTurn = () => {
     if (turn !== opts.turnRef.current) {
       turn = opts.turnRef.current;
       readPages.clear();
       pinnedManifest = undefined;
+      registeredThisTurn = [];
     }
   };
   const pinManifest = () => {
@@ -293,7 +300,7 @@ export function createKnowledgeCitationSupport(opts: {
       "is a citation error, not thoroughness. " +
       "Call once, immediately before the final answer. If the tool reports unresolved refs, retry once with only the remaining valid refs. " +
       "The runtime validates frozen original-source metadata and appends trusted links; never invent or copy source URLs yourself. " +
-      `At most ${MAX_KNOWLEDGE_CITATIONS} unique original sources are registered per call, in the order given; any overflow is named in the result, never silently dropped.`,
+      `At most ${MAX_KNOWLEDGE_CITATIONS} unique original sources are registered per answer — evidence refs first, then pages, each in its given order; any overflow is named in the result, never silently dropped, and further calls cannot raise the ceiling.`,
     parameters: Type.Object({
       evidence_refs: Type.Optional(Type.Array(Type.String({ minLength: 3 }), {
         minItems: 1,
@@ -319,6 +326,16 @@ export function createKnowledgeCitationSupport(opts: {
       const manifest = pinnedManifest ?? null;
       if (!manifest) return result("No trusted original-source metadata is available for this knowledge mount.", 0);
       const params = rawParams as { evidence_refs?: unknown; pages?: unknown };
+      // pi does not validate tool params against the TypeBox schema, so shape
+      // errors land here. Silently coercing a non-array to [] is the worst
+      // answer: the call reports success while the misshapen half is dropped,
+      // and the model ships the answer believing those pages are cited.
+      if (params.evidence_refs !== undefined && !Array.isArray(params.evidence_refs)) {
+        return result(
+          "evidence_refs must be an ARRAY of page.md#evidence-id strings. No citations were registered. Retry knowledge_cite once with the corrected shape.",
+          0,
+        );
+      }
       const refs = Array.isArray(params.evidence_refs) ? params.evidence_refs.map(String) : [];
       // A whole-page citation is the coarse instrument (evidence refs are
       // already claim-scoped by their marker), and provenance validation alone
@@ -326,26 +343,40 @@ export function createKnowledgeCitationSupport(opts: {
       // to a load-bearing one. The one cited-vs-read distinction the runtime
       // can demand is that the caller states WHAT the page contributed: a page
       // the model cannot bind to a concrete claim is a read, not a citation.
+      // The schema's 4-300 char claim bounds are enforced HERE for the same
+      // no-schema-validation reason: a 1-character claim would let padding
+      // back in, and an unbounded one lands unvalidated in durable storage.
+      if (params.pages !== undefined && !Array.isArray(params.pages)) {
+        return result(
+          "pages must be an ARRAY of { path, claim } objects. No citations were registered. Retry knowledge_cite once with the corrected shape.",
+          0,
+        );
+      }
       const rawPages = Array.isArray(params.pages) ? params.pages : [];
       const pageArgs: Array<{ path: string; claim: string }> = [];
-      const claimless: string[] = [];
+      const invalidPages: string[] = [];
       for (const item of rawPages) {
         if (item && typeof item === "object" && !Array.isArray(item)) {
           const row = item as Record<string, unknown>;
           const pagePath = typeof row.path === "string" ? row.path.trim() : "";
           const claim = typeof row.claim === "string" ? row.claim.trim() : "";
-          if (pagePath && claim) {
+          const label = pagePath || JSON.stringify(row).slice(0, 120);
+          if (!pagePath || !claim) {
+            invalidPages.push(`${label} (missing claim)`);
+          } else if ([...claim].length < 4) {
+            invalidPages.push(`${label} (claim too short — a one-word claim is not a binding)`);
+          } else if ([...claim].length > 300) {
+            invalidPages.push(`${label} (claim too long — max 300 characters)`);
+          } else {
             pageArgs.push({ path: pagePath, claim });
-            continue;
           }
-          claimless.push(pagePath || JSON.stringify(row).slice(0, 120));
         } else {
-          claimless.push(String(item));
+          invalidPages.push(String(item));
         }
       }
-      if (claimless.length > 0) {
+      if (invalidPages.length > 0) {
         return result(
-          `Each pages item requires { path, claim } — claim is the specific statement in your final answer that the page supports. Missing or empty claim for: ${claimless.join(", ")}. A page you cannot bind to a concrete claim is a read, not a citation; drop it or use evidence_refs.`,
+          `Each pages item requires { path, claim } — claim is the specific statement (4-300 characters) in your final answer that the page supports. Invalid: ${invalidPages.join("; ")}. No citations were registered, including any evidence_refs in this call. Retry knowledge_cite once with a concrete claim bound to each page (or drop the unbound pages), keeping your evidence_refs.`,
           0,
         );
       }
@@ -479,30 +510,38 @@ export function createKnowledgeCitationSupport(opts: {
       // Rejecting an over-cap call registered ZERO citations on exactly the
       // answers with the most validated support — and reported the resolved
       // refs as "unresolved", whose retry guidance loops (retrying identical
-      // valid refs fails identically). Cap in input order and NAME the
-      // overflow instead: nothing is dropped silently, and a broad answer
-      // keeps its strongest references. Unresolved refs above still fail the
+      // valid refs fails identically). Cap and NAME the overflow instead:
+      // nothing is dropped silently, and a broad answer keeps its strongest
+      // references. Evidence refs are accumulated before pages, so the cap
+      // sacrifices pages first — the wording below and both design docs say
+      // exactly that rather than promising a global input order that does not
+      // exist across the two lists. Unresolved refs above still fail the
       // whole call — that is a correctness problem, not a breadth problem.
-      const overflow = citations.length > MAX_KNOWLEDGE_CITATIONS
-        ? citations.splice(MAX_KNOWLEDGE_CITATIONS)
-        : [];
-      if (citations.length > 0) {
-        opts.sessionEventEmitter({ type: "knowledge_sources", sources: citations });
+      // The cap applies to the TURN's union: repeated calls cannot raise it.
+      const already = new Set(registeredThisTurn.map((citation) => citation.url));
+      const fresh = citations.filter((citation) => !already.has(citation.url));
+      const capacity = Math.max(0, MAX_KNOWLEDGE_CITATIONS - registeredThisTurn.length);
+      const overflow = fresh.length > capacity ? fresh.splice(capacity) : [];
+      if (fresh.length > 0) {
+        registeredThisTurn.push(...fresh);
+        opts.sessionEventEmitter({ type: "knowledge_sources", sources: [...registeredThisTurn] });
       }
       const overflowNote = overflow.length === 0
         ? ""
         : ` ${overflow.length} more source${overflow.length === 1 ? " was" : "s were"} NOT registered ` +
-          `(beyond the ${MAX_KNOWLEDGE_CITATIONS}-source cap): ` +
+          `(beyond the ${MAX_KNOWLEDGE_CITATIONS}-source per-answer cap): ` +
           overflow.slice(0, MAX_KNOWLEDGE_CITATIONS).map((citation) => citation.title).join(", ") +
           `${overflow.length > MAX_KNOWLEDGE_CITATIONS ? ` (+${overflow.length - MAX_KNOWLEDGE_CITATIONS} more)` : ""}.` +
-          " Split very broad answers if every source must appear.";
+          " Further calls cannot raise the ceiling; keep the strongest sources or narrow the answer.";
       return result(
-        citations.length > 0
-          ? `Registered ${citations.length} ${refs.length > 0 ? "exact " : ""}trusted original source${citations.length === 1 ? "" : "s"}; links will be appended automatically.${overflowNote}`
-          : refs.length > 0
-            ? "The evidence refs resolved but have no unique original-source links."
-            : "The selected pages have no trusted clickable original sources; answer normally without a references section.",
-        citations.length,
+        fresh.length > 0
+          ? `Registered ${fresh.length} ${refs.length > 0 ? "exact " : ""}trusted original source${fresh.length === 1 ? "" : "s"}; links will be appended automatically.${overflowNote}`
+          : registeredThisTurn.length > 0
+            ? `All resolved sources were already registered this turn; the references list is unchanged.${overflowNote}`
+            : refs.length > 0
+              ? `The evidence refs resolved but have no unique original-source links.${overflowNote}`
+              : `The selected pages have no trusted clickable original sources; answer normally without a references section.${overflowNote}`,
+        fresh.length,
         refs.length > 0 ? [] : undefined,
       );
     },

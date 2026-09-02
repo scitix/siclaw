@@ -79,14 +79,19 @@ manifest entry at a different original.
   registers zero citations for the call. Offline consumers parsing
   historical `knowledge_cite` tool rows must handle both shapes — `pages`
   was `string[]` before 2026-09.
-- One call never emits more than `MAX_KNOWLEDGE_CITATIONS` (8) originals.
-  Crossing the cap no longer fails closed: the first 8 unique sources in
-  input order are registered and the dropped overflow is NAMED in the tool
-  result — nothing is silently truncated, and the model can re-scope or
-  mention what was cut. (The old reject-whole-call behavior zeroed the
-  citations of exactly the best-supported answers, and its retry guidance
-  looped on identical valid refs.) Gateway rendering
-  (`appendKnowledgeSourceCitations`) uses the same cap.
+- One answer never carries more than `MAX_KNOWLEDGE_CITATIONS` (8)
+  originals. Crossing the cap no longer fails closed: the first 8 unique
+  sources are registered — evidence refs first, then pages, each in its
+  given order (there is no global order across the two lists, so the cap
+  sacrifices pages first) — and the dropped overflow is NAMED in the tool
+  result. Nothing is silently truncated. (The old reject-whole-call
+  behavior zeroed the citations of exactly the best-supported answers, and
+  its retry guidance looped on identical valid refs.) The cap applies to
+  the TURN's union: gateway consumers ASSIGN the `knowledge_sources` event
+  rather than merging, so the tool emits the deduped, capped union of every
+  successful call this turn — a follow-up call adds to the references list
+  instead of overwriting it, and cannot raise the ceiling. Gateway
+  rendering (`appendKnowledgeSourceCitations`) uses the same cap.
 - A mount that has any `sourceId` in the manifest offers evidence guidance.
   Mixed answers are expressed in one call, not by flipping modes.
 

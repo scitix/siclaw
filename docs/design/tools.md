@@ -616,9 +616,12 @@ are intentionally different:
    cannot distinguish a cited-and-used page from a read-and-discarded one, so
    the claim is the one materiality demand the runtime can make. Evidence refs
    are exempt — the `okf:evidence` marker is already claim-scoped. Resolved
-   sources beyond the per-answer cap are registered up to the cap in input
-   order with the overflow named in the result, never silently dropped; only
-   genuinely unresolved refs fail the whole call.
+   sources beyond the per-answer cap are registered up to the cap — evidence
+   refs first, then pages, each in its given order — with the overflow named
+   in the result, never silently dropped. The cap applies to the turn's
+   union across calls (consumers assign the event, so the tool emits the
+   deduped union). Only genuinely unresolved refs and malformed pages items
+   fail the whole call.
 
 The injected catalog remains a cheap navigation hint; it is not the only
 recall surface. Knowledge materialization explicitly resyncs the index, and
