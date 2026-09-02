@@ -155,6 +155,58 @@ function matchLabel(query: string, label: KnowledgeLabel): { score: number; matc
   return best.score > 0 ? best : null;
 }
 
+function queryCoverage(query: string, matchedTerms: string[]): number {
+  const queryChars = [...normalize(query)];
+  const meaningful = queryChars.map((char) => char !== " ");
+  const total = meaningful.filter(Boolean).length;
+  if (total === 0) return 0;
+
+  const covered = new Array(queryChars.length).fill(false);
+  const findSequence = (haystack: string[], needle: string[], from = 0): number => {
+    if (needle.length === 0) return -1;
+    for (let start = from; start <= haystack.length - needle.length; start++) {
+      if (needle.every((char, offset) => haystack[start + offset] === char)) return start;
+    }
+    return -1;
+  };
+  for (const rawTerm of matchedTerms) {
+    const termChars = [...normalize(rawTerm)];
+    if (termChars.length === 0) continue;
+    if (findSequence(termChars, queryChars) >= 0) {
+      for (let i = 0; i < queryChars.length; i++) covered[i] = meaningful[i];
+      continue;
+    }
+    let cursor = 0;
+    while (cursor < queryChars.length) {
+      const start = findSequence(queryChars, termChars, cursor);
+      if (start < 0) break;
+      for (let i = start; i < start + termChars.length; i++) covered[i] = meaningful[i];
+      cursor = start + termChars.length;
+    }
+  }
+  return covered.filter(Boolean).length / total;
+}
+
+function pageScore(
+  query: string,
+  matches: Array<MatchedKnowledgeLabel & { score: number }>,
+): number {
+  const uniqueTerms = new Map<string, number>();
+  for (const match of matches) {
+    const key = normalize(match.matchedBy);
+    uniqueTerms.set(key, Math.max(uniqueTerms.get(key) ?? 0, match.score));
+  }
+  const qualities = [...uniqueTerms.values()];
+  const best = Math.max(...qualities);
+  const coverage = queryCoverage(query, [...uniqueTerms.keys()]);
+  if (uniqueTerms.size === 1 && best === 1 && coverage === 1) return 1;
+
+  const distinctFacets = new Set(matches.map((match) => match.facet)).size;
+  const termBonus = 0.06 * Math.min(2, uniqueTerms.size - 1);
+  const facetBonus = 0.04 * Math.min(2, distinctFacets - 1);
+  return Math.min(1, best * (0.55 + 0.35 * coverage) + termBonus + facetBonus);
+}
+
 /** Fast page-label catalog. It scans local frontmatter only and never calls a model. */
 export class KnowledgeLabelIndex {
   private readonly knowledgeDir: string;
@@ -209,7 +261,7 @@ export class KnowledgeLabelIndex {
         file: page.file,
         title: page.title,
         description: page.description,
-        score: Math.min(1, Math.max(...matches.map((match) => match.score)) + 0.03 * (matches.length - 1)),
+        score: pageScore(query, matches),
         labels: page.labels,
         matchedLabels: matches.map(({ facet, value, matchedBy }) => ({ facet, value, matchedBy })),
         routeProof,

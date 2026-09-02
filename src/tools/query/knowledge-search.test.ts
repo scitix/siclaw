@@ -80,7 +80,7 @@ describe("knowledge_search", () => {
       expect.objectContaining({ value: "B300" }),
       expect.objectContaining({ value: "CUDA Graph", matchedBy: "cudagraph" }),
     ]));
-    expect(payload.results[0].labels).toHaveLength(3);
+    expect(payload.results[0]).not.toHaveProperty("labels");
     expect(payload.results[0].routeProof).toEqual({
       reachable: true,
       trail: [
@@ -90,6 +90,13 @@ describe("knowledge_search", () => {
     });
     expect(payload.results[0]).not.toHaveProperty("content");
     expect(JSON.stringify(payload)).not.toContain("29.71 ms");
+
+    const expanded = await tool.execute("call-label-expanded", {
+      query: "B300 cudagraph 实测数据",
+      includeLabels: true,
+    });
+    const expandedPayload = JSON.parse((expanded.content[0] as { text: string }).text);
+    expect(expandedPayload.results[0].labels).toHaveLength(3);
   });
 
   it("ranks a page with more matching labels ahead of a generic page", async () => {
@@ -118,6 +125,40 @@ describe("knowledge_search", () => {
       "giga-b300-lstm.md",
       "generic-b300.md",
     ]);
+    expect(payload.results[0].score - payload.results[1].score).toBeGreaterThan(0.2);
+  });
+
+  it("downranks a generic alias that covers little of a multi-term query", async () => {
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [GPU driver](gpu-driver.md)\n- [Generic upgrade](generic-upgrade.md)\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "gpu-driver.md"),
+      "---\ntype: Procedure\ntitle: GPU driver upgrade\nlabels:\n" +
+      "  - facet: entity\n    value: GPU\n" +
+      "  - facet: task\n    value: GPU driver installation\n    aliases: [升级GPU驱动]\n" +
+      "  - facet: topic\n    value: SOP\n---\n# GPU driver\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "generic-upgrade.md"),
+      "---\ntype: Procedure\ntitle: Generic upgrade\nlabels:\n" +
+      "  - facet: task\n    value: Change management\n    aliases: [升级]\n---\n# Upgrade\n",
+    );
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const result = await tool.execute("call-specific-alias", {
+      query: "升级GPU驱动SOP",
+      topK: 2,
+    });
+    const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(payload.results.map((row: { file: string }) => row.file)).toEqual([
+      "gpu-driver.md",
+      "generic-upgrade.md",
+    ]);
+    expect(payload.results[0].score - payload.results[1].score).toBeGreaterThan(0.2);
   });
 
   it("does not route to a labeled page that is unreachable from the root catalog", async () => {
@@ -142,7 +183,11 @@ describe("knowledge_search", () => {
     expect(payload.results.map((row: { file: string }) => row.file)).toEqual(["published.md"]);
     expect(payload.unreachableLabeledPages).toBe(1);
 
-    const catalogResult = await tool.execute("call-reachable-catalog", { listLabels: true, limit: 100 });
+    const catalogResult = await tool.execute("call-reachable-catalog", {
+      listLabels: true,
+      includePages: true,
+      limit: 100,
+    });
     const catalog = JSON.parse((catalogResult.content[0] as { text: string }).text);
     expect(catalog.labels).toEqual([
       expect.objectContaining({ facet: "entity", value: "B300", pages: ["published.md"] }),
@@ -204,6 +249,22 @@ describe("knowledge_search", () => {
     expect(payload.totalLabels).toBe(2);
     expect(payload.hasMore).toBe(false);
     expect(payload.labels).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        facet: "entity",
+        value: "B300",
+        pageCount: 1,
+      }),
+    ]));
+    expect(payload.labels[0]).not.toHaveProperty("pages");
+    expect(payload.labels[0]).not.toHaveProperty("pagesTruncated");
+
+    const expanded = await tool.execute("call-catalog-expanded", {
+      listLabels: true,
+      includePages: true,
+      limit: 100,
+    });
+    const expandedPayload = JSON.parse((expanded.content[0] as { text: string }).text);
+    expect(expandedPayload.labels).toEqual(expect.arrayContaining([
       expect.objectContaining({
         facet: "entity",
         value: "B300",
