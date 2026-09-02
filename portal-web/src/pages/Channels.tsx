@@ -38,6 +38,12 @@ const CONFIG_FIELDS: Record<string, ConfigField[]> = {
   dingtalk: [
     { key: "client_id", label: "Client ID (AppKey)", type: "text", placeholder: "dingxxxxxxxxxx", required: true },
     { key: "client_secret", label: "Client Secret (AppSecret)", type: "password", placeholder: "App secret from console", required: true },
+    { key: "reply_mode", label: "Reply Mode", type: "select", options: [
+      { value: "markdown", label: "Markdown (default)" },
+      { value: "ai_card", label: "AI Card (streaming)" },
+    ]},
+    { key: "card_template_id", label: "AI Card Template ID", type: "text", placeholder: "Required when Reply Mode is AI Card" },
+    { key: "card_stream_interval_ms", label: "Card Update Interval (ms)", type: "text", placeholder: "1000" },
   ],
   slack: [
     { key: "bot_token", label: "Bot Token", type: "password", placeholder: "xoxb-...", required: true },
