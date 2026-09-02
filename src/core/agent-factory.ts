@@ -40,6 +40,8 @@ import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
+import authorityGuardExtension from "./extensions/authority-guard.js";
+import type { AuthorityEnvelopeClaims } from "../shared/authority-envelope.js";
 import setupExtension from "./extensions/setup.js";
 import lsExtension from "./extensions/ls.js";
 import agentExtension from "./extensions/agent.js";
@@ -66,6 +68,12 @@ import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
+
+/** The tool-layer authority contract a governed session runs under. */
+export interface SessionAuthority {
+  claims: AuthorityEnvelopeClaims;
+  consumeReceipt: (receipt: string) => Promise<void>;
+}
 
 export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
@@ -157,6 +165,8 @@ export interface CreateSiclawSessionOpts {
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
   /** Expose `request_input` to this top-level machine-driven session. */
   allowInputRequest?: boolean;
+  /** Verified authority envelope + receipt consumer; enforced per tool call. */
+  authority?: SessionAuthority;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
   /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
@@ -811,6 +821,9 @@ export async function createSiclawSession(
         compactionSafeguardExtension,
         ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
         (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
+        ...(opts?.authority
+          ? [(api: ExtensionAPI) => authorityGuardExtension(api, opts.authority!)]
+          : []),
         (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
         ...cliOnlyFactories,
       ],

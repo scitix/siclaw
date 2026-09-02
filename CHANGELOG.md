@@ -44,6 +44,19 @@ Two paired, per-call opt-ins for management-plane callers (design:
   the original turn (`duplicate: true`) instead of starting a second turn or
   degrading into a steer.
 
+#### Trusted execution: propose_execution + AuthorityEnvelope guard
+
+- New `propose_execution` tool (same availability as `request_input`): a
+  governed turn proposes a write action with its exact diff/resources/risk/
+  rollback, emits a reliable `auth_required` event and ends the turn; the
+  management plane approves and resumes the session with a one-time receipt.
+- `chat.send` may carry a signed `authorityEnvelope`; it is verified locally
+  (shared secret, fail-closed at /api/prompt admission and session build) and
+  enforced per tool call by a new guard extension: denied capabilities are
+  blocked, out-of-list tools require an `approval_receipt` consumed atomically
+  on the management plane (box → `/api/internal/authority/consume`, mTLS).
+  Design: `docs/design/2026-09-02-trusted-execution.md`.
+
 #### Experimental A2A delegation transport (`SICLAW_DELEGATION_TRANSPORT=a2a`)
 
 Opt-in third transport for `delegate_to_agent`: the peer task is submitted to

@@ -98,6 +98,8 @@ import {
   type TierSelectionSource,
 } from "../core/subagent-models.js";
 import type { GatewayClient } from "./gateway-client.js";
+import { verifyAuthorityEnvelope } from "../shared/authority-envelope.js";
+import type { SessionAuthority } from "../core/agent-factory.js";
 import { extractToolResultId } from "../core/message-utils.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -226,6 +228,8 @@ export interface ManagedSession {
   delegation?: DelegationContext;
   /** Whether this session was built with top-level `request_input` available. */
   allowInputRequest: boolean;
+  /** The raw signed authority envelope this session was built under ("" = ungoverned). */
+  authorityEnvelope: string;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -396,6 +400,28 @@ async function abortBrainBestEffort(
   if (outcome === "timeout") {
     console.warn(`[agentbox-session] ${label}: abort did not settle within ${timeoutMs}ms; continuing with timeout result`);
   }
+}
+
+/**
+ * buildSessionAuthority re-verifies the envelope at session build (it was
+ * verified at /api/prompt admission too — TTLs are short and rebuilds happen)
+ * and binds the receipt consumer to the Runtime's internal API. No client =
+ * receipts cannot be consumed = gated calls stay blocked (fail closed).
+ * Returning undefined for an envelope that no longer verifies would run the
+ * turn UNGOVERNED; the caller therefore treats undefined as a build error.
+ */
+function buildSessionAuthority(envelope: string, gatewayClient?: GatewayClient): SessionAuthority {
+  const claims = verifyAuthorityEnvelope(envelope);
+  if (!claims) {
+    throw new Error("authority envelope expired or invalid at session build");
+  }
+  return {
+    claims,
+    consumeReceipt: async (receipt: string) => {
+      if (!gatewayClient) throw new Error("receipt consumption is unavailable in this environment");
+      await gatewayClient.consumeApprovalReceipt(receipt);
+    },
+  };
 }
 
 export class AgentBoxSessionManager {
@@ -3072,6 +3098,7 @@ export class AgentBoxSessionManager {
     delegation?: DelegationContext,
     requestUserId?: string,
     allowInputRequest = false,
+    authorityEnvelope = "",
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
@@ -3117,7 +3144,8 @@ export class AgentBoxSessionManager {
         // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
         // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
         const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
-        const sameInputCapability = existing.allowInputRequest === allowInputRequest;
+        const sameInputCapability = existing.allowInputRequest === allowInputRequest &&
+          existing.authorityEnvelope === authorityEnvelope;
         // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
         // change falls through to a rebuild below), but every delegation turn gets a NEW
         // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
@@ -3351,6 +3379,9 @@ export class AgentBoxSessionManager {
       taskListId: id,
       sessionEventEmitter: emitExtraEvent,
       allowInputRequest,
+      authority: authorityEnvelope
+        ? buildSessionAuthority(authorityEnvelope, this.gatewayClient)
+        : undefined,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
@@ -3409,6 +3440,7 @@ export class AgentBoxSessionManager {
       activeMode,
       delegation,
       allowInputRequest,
+      authorityEnvelope,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,

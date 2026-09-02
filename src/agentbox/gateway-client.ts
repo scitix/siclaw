@@ -88,6 +88,15 @@ export class GatewayClient {
   /**
    * Fetch settings (providers, models, embedding config) from Gateway
    */
+  /**
+   * Consumes a one-time approval receipt on the management plane (atomic,
+   * relayed through the Runtime's internal API). Throws when the receipt was
+   * already consumed, expired, or its proposal changed.
+   */
+  async consumeApprovalReceipt(receipt: string): Promise<void> {
+    await this.request("/api/internal/authority/consume", "POST", { receipt }, 10000);
+  }
+
   async fetchSettings(): Promise<any> {
     return this.request("/api/internal/settings", "GET");
   }
