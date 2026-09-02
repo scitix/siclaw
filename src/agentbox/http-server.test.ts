@@ -26,6 +26,12 @@ const mockConfigState = vi.hoisted(() => ({
   mcpServers: {} as Record<string, unknown>,
 }));
 
+// Captures the options createHttpServer passes when building its per-server
+// knowledge handler, so tests can pin the afterMaterialize wiring.
+const knowledgeHandlerState = vi.hoisted(() => ({
+  lastOptions: null as null | { knowledgeDir?: string; afterMaterialize?: () => void | Promise<void> },
+}));
+
 // Silence metrics auth side effects.
 vi.mock("../shared/metrics.js", () => ({
   checkMetricsAuth: () => true,
@@ -71,12 +77,18 @@ vi.mock("./sync-handlers.js", async (importOriginal) => ({
   getSyncHandler: () => undefined,
   createClusterHandler: () => ({ type: "cluster", fetch: async () => 0, materialize: async (n: number) => n }),
   createHostHandler: () => ({ type: "host", fetch: async () => 0, materialize: async (n: number) => n }),
-  createKnowledgeHandler: () => ({
-    type: "knowledge",
-    fetch: async () => ({ repos: [] }),
-    materialize: async () => 0,
-    getLastKnowledgeSyncStatus: () => null,
-  }),
+  createKnowledgeHandler: (options: { knowledgeDir?: string; afterMaterialize?: () => void | Promise<void> } = {}) => {
+    knowledgeHandlerState.lastOptions = options;
+    return {
+      type: "knowledge",
+      fetch: async () => ({ repos: [] }),
+      // The real handler awaits afterMaterialize on EVERY materialize path
+      // (empty-wipe and normal) — the fake must model that, or the reload
+      // route test cannot see whether the wiring passed the hook at all.
+      materialize: async () => { await options.afterMaterialize?.(); return 0; },
+      getLastKnowledgeSyncStatus: () => null,
+    };
+  },
   createToolsHandler: (target: { allowedToolsState: string[] | null }) => ({
     type: "tools",
     fetch: async () => ({ allowedTools: null }),
@@ -262,6 +274,8 @@ function makeFakeSessionManager() {
     onSessionRelease: undefined as undefined | (() => void),
     credentialBroker: undefined,
     credentialsDir: undefined,
+    // K8s shape: knowledgeDir stays unset (only LocalSpawner assigns it).
+    syncKnowledgeIndex: vi.fn(async () => {}),
   };
 }
 
@@ -1965,6 +1979,20 @@ describe("http-server — reload routes delegate to handlers", () => {
     // short-circuits to 200 count:0 before ever calling the per-box handler.
     expect(r.status).toBe(200);
     expect(r.data).toMatchObject({ ok: true, count: 0, type: "tools" });
+  });
+
+  it("POST /api/reload-knowledge re-syncs the label index even when sessionManager.knowledgeDir is unset (K8s shape)", async () => {
+    // K8s boxes never set sessionManager.knowledgeDir (only LocalSpawner does),
+    // and the per-server knowledge handler used to be gated on it — so a hot
+    // update materialized new files while knowledge_search kept serving the
+    // label index built at pod start. Pin the wiring: the handler exists
+    // without the dir, and its materialize drives syncKnowledgeIndex.
+    process.env.SICLAW_GATEWAY_URL = "http://gateway.test";
+    const r = await getJson(port, "/api/reload-knowledge", "POST");
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ ok: true, type: "knowledge" });
+    expect(knowledgeHandlerState.lastOptions?.knowledgeDir).toBeUndefined();
+    expect(sm.syncKnowledgeIndex).toHaveBeenCalledTimes(1);
   });
 
   it("POST /api/reload-tracing is wired standalone and is a clean no-op without a gateway URL", async () => {
