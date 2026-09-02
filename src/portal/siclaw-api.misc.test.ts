@@ -18,6 +18,8 @@ import { signToken } from "./auth.js";
 import { registerSiclawRoutes, sqlDayKey } from "./siclaw-api.js";
 import { DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
+import { humanPromptPredicate } from "./human-prompt.js";
+import type { Db } from "../gateway/db.js";
 
 const JWT_SECRET = "test-siclaw-misc";
 const USER_TOKEN = signToken("u1", "alice", "user", JWT_SECRET);
@@ -83,7 +85,9 @@ describe("siclaw-api misc routes", () => {
       connectionMap: makeConnMap(),
     });
     query = vi.fn();
-    (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+    // driver is explicit: siclaw-api.ts builds dialect-aware SQL, and a mock
+    // without it silently exercises the SQLite branch of every such helper.
+    (getDb as any).mockReturnValue({ query, getConnection: vi.fn(), driver: "mysql" });
   });
 
   // ── MCP endpoints ─────────────────────────────────────────
@@ -591,7 +595,15 @@ describe("siclaw-api misc routes", () => {
       }));
       expect(status).toBe(200);
       expect(body.totalSessions).toBe(1);
-      expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
+      // Prompts are counted by reading metadata.kind, and ALL synthetic kinds
+      // are excluded rather than delegation_event alone — task_event on its own
+      // outnumbers real questions several times over. Asserted against the
+      // predicate itself, not a pinned SQL string: a pinned string is what let
+      // the origin filter rot for a month, and it would break on the dialect
+      // branch this predicate now carries.
+      const promptSql = query.mock.calls[1][0] as string;
+      expect(promptSql).toContain(humanPromptPredicate({ driver: "mysql" } as Db, "m"));
+      expect(promptSql).not.toContain("LIKE");
       // Desensitized: no raw per-user data on the wire.
       expect(body).not.toHaveProperty("byUser");
       // External-showcase fields present.

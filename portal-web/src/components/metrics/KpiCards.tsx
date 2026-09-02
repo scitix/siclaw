@@ -39,7 +39,7 @@ export function KpiCards(p: Props) {
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
           <KpiCard label="Users" value={fmt(p.distinctUsers)} hint="distinct" icon={<Users className="h-3.5 w-3.5" style={{ color: "#60a5fa" }} />} accent="#60a5fa" />
           <KpiCard label="Sessions" value={fmt(p.totalSessions)} hint="conversations" icon={<Activity className="h-3.5 w-3.5" style={{ color: "#fbbf24" }} />} accent="#fbbf24" />
-          <KpiCard label="Prompts" value={fmt(p.totalPrompts)} hint="user messages" icon={<MessageSquare className="h-3.5 w-3.5" style={{ color: "#34d399" }} />} accent="#34d399" />
+          <KpiCard label="Prompts" value={fmt(p.totalPrompts)} hint="human prompts" icon={<MessageSquare className="h-3.5 w-3.5" style={{ color: "#34d399" }} />} accent="#34d399" />
           <KpiCard label="Tool Calls" value={fmt(p.toolCalls)} hint="executed" icon={<Wrench className="h-3.5 w-3.5" style={{ color: "#a78bfa" }} />} accent="#a78bfa" />
           <KpiCard label="Skills Used" value={fmt(p.skillsUsed)} hint={p.skillsUsedApprox ? "distinct · sampled" : "distinct"} icon={<Zap className="h-3.5 w-3.5" style={{ color: "#f472b6" }} />} accent="#f472b6" />
         </div>

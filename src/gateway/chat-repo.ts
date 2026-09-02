@@ -8,6 +8,7 @@
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
+import type { ChatMessageMetadata } from "../shared/message-kinds.js";
 import type { GroupItemStatus } from "../core/tool-registry.js";
 import {
   sanitizeWireItemStatuses,
@@ -34,7 +35,7 @@ export interface AppendMessageInput {
   /** Runtime-resolved invocation source (registry category, filesystem, or mcp:<server>). */
   toolset?: string | null;
   toolInput?: string | null;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChatMessageMetadata | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
   /** Agent that authored this row when it belongs to a delegated child stream. */
@@ -60,7 +61,7 @@ export interface UpdateMessageInput {
   toolName?: string | null;
   toolset?: string | null;
   toolInput?: string | null;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChatMessageMetadata | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
   delegationId?: string | null;
@@ -71,7 +72,7 @@ export interface UpdateDelegationToolMessageInput {
   toolName: string;
   delegationId: string;
   content: string;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChatMessageMetadata | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
 }
@@ -296,7 +297,7 @@ export async function recordChannelFeedback(params: {
  * parent model as a synthetic user turn.
  */
 export async function appendDelegationEvent(evt: AppendDelegationEventInput): Promise<string> {
-  const metadata: Record<string, unknown> = {
+  const metadata: ChatMessageMetadata = {
     kind: "delegation_event",
     source: "system_notification",
     event_type: `delegation.${evt.status}`,

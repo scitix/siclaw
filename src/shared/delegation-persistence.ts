@@ -3,6 +3,7 @@
 // precisely typed on the wire.
 import type { GroupItemStatus } from "../core/tool-registry.js";
 import type { PersistedTierOutcome } from "../core/subagent-models.js";
+import type { ChatMessageMetadata } from "./message-kinds.js";
 
 export interface DelegationLineagePayload {
   parentSessionId?: string | null;
@@ -18,7 +19,7 @@ export interface DelegationAppendMessagePayload {
   toolName?: string | null;
   toolset?: string | null;
   toolInput?: string | null;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChatMessageMetadata | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
   fromAgentId?: string | null;
@@ -36,7 +37,7 @@ export interface DelegationUpdateMessagePayload {
   toolName?: string | null;
   toolset?: string | null;
   toolInput?: string | null;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChatMessageMetadata | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
   delegationId?: string | null;
@@ -47,7 +48,7 @@ export interface DelegationToolUpdatePayload {
   toolName: string;
   delegationId: string;
   content: string;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChatMessageMetadata | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
 }

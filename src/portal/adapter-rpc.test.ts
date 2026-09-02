@@ -7,6 +7,8 @@ vi.mock("../gateway/db.js", () => ({
 // Must be after vi.mock
 import { getDb } from "../gateway/db.js";
 import { buildAdapterRpcHandlers } from "./adapter.js";
+import { humanPromptPredicate } from "./human-prompt.js";
+import type { Db } from "../gateway/db.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -15,7 +17,10 @@ function mockQuery(...results: any[][]) {
   for (const rows of results) {
     query.mockResolvedValueOnce([rows, []]);
   }
-  (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+  // driver is explicit: adapter.ts builds dialect-aware SQL, and a mock
+  // without it silently exercises the SQLite branch of every such helper
+  // while these mirrors only ever run against MySQL in production.
+  (getDb as any).mockReturnValue({ query, getConnection: vi.fn(), driver: "mysql" });
   return query;
 }
 
@@ -2384,7 +2389,15 @@ describe("metrics.summary", () => {
     expect(result.totalPrompts).toBe(50);
     // byUser was dropped — this mirror must not ship raw per-user data.
     expect(result).not.toHaveProperty("byUser");
-    expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
+    // Prompts are counted by reading metadata.kind, and ALL synthetic kinds are
+    // excluded rather than delegation_event alone — task_event on its own
+    // outnumbers real questions several times over. Asserted against the
+    // predicate itself, not a pinned SQL string: a pinned string is what let
+    // the origin filter rot for a month, and it would break on the dialect
+    // branch this predicate now carries.
+    const promptSql = query.mock.calls[1][0] as string;
+    expect(promptSql).toContain(humanPromptPredicate({ driver: "mysql" } as Db, "m"));
+    expect(promptSql).not.toContain("LIKE");
   });
 
   it("runs only the two scalar queries (no byUser) with a userId filter", async () => {
