@@ -43,6 +43,8 @@ export interface PromptOptions {
   delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
+  /** Signed authority envelope; the box verifies and enforces it per tool call. */
+  authorityEnvelope?: string;
   /** Fail instead of creating a fresh conversation when `sessionId` cannot be restored. */
   requireExistingSession?: boolean;
   /** Model provider to use for this prompt */

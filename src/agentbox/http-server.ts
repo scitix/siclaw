@@ -64,6 +64,7 @@ import {
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
+import { verifyAuthorityEnvelope } from "../shared/authority-envelope.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -91,6 +92,7 @@ interface PromptRequestBody {
   delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
+  authorityEnvelope?: string;
   /** Reject if `sessionId` has no in-memory or persisted conversation context. */
   requireExistingSession?: boolean;
   modelProvider?: string;
@@ -932,6 +934,19 @@ export function createHttpServer(
     // A delegated agent runs under its own configuration; delegation does not
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
+    // Authority envelope: verified HERE, before any session exists. Present
+    // but unverifiable = fail closed — running the turn ungoverned when the
+    // caller asked for governance is the one wrong answer.
+    let authorityEnvelope = "";
+    if (typeof body.authorityEnvelope === "string" && body.authorityEnvelope) {
+      const claims = verifyAuthorityEnvelope(body.authorityEnvelope);
+      if (!claims) {
+        logPromptResponse(403, "rejected", "authority envelope invalid or expired");
+        sendJson(res, 403, { error: { code: "AUTHORITY_ENVELOPE_INVALID", message: "authority envelope invalid or expired", retriable: false, status: 403 } });
+        return;
+      }
+      authorityEnvelope = body.authorityEnvelope;
+    }
     const resumed = sessionManager.hasRestorableSessionContext(body.sessionId);
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
@@ -952,6 +967,7 @@ export function createHttpServer(
       delegation,
       body.userId,
       body.allowInputRequest === true,
+      authorityEnvelope,
     );
     if (managed.mcpManager) {
       observedMcpServers = managed.mcpManager.getServerConnections();
