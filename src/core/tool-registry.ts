@@ -456,6 +456,11 @@ export interface ToolRefs {
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
+  /**
+   * Explicitly exposes `request_input` for a top-level machine-driven turn
+   * (currently A2A). Delegated peer turns use `delegation` instead.
+   */
+  allowInputRequest?: boolean;
   /** Per-session citation registrar sharing successful-read state with Read. */
   knowledgeCitationTool?: ToolDefinition;
   /**

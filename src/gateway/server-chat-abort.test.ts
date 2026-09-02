@@ -61,6 +61,7 @@ const abortSessionCalls: string[] = [];
 const abortSessionTurnIds: Array<string | undefined> = [];
 const promptCalls: unknown[] = [];
 let promptError: Error | undefined;
+let promptResumed: boolean | undefined;
 // Blocks inside prompt() so a test can hold the /api/prompt round-trip open (and
 // then fail it) while the box is already running the turn.
 let promptBlocker: Promise<void> | undefined;
@@ -76,11 +77,15 @@ vi.mock("./agentbox/client.js", () => ({
     constructor(endpoint: string) {
       this.endpoint = endpoint;
     }
-    prompt = vi.fn(async (opts: { sessionId: string }) => {
+    prompt = vi.fn(async (opts: { sessionId: string; allowInputRequest?: boolean; requireExistingSession?: boolean }) => {
       promptCalls.push(opts);
       if (promptBlocker) await promptBlocker;
       if (promptError) throw promptError;
-      return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
+      return {
+        sessionId: opts.sessionId,
+        traceId: "0123456789abcdef0123456789abcdef",
+        ...(typeof promptResumed === "boolean" ? { resumed: promptResumed } : {}),
+      };
     });
     abortSession = vi.fn(async (sessionId: string, turnId?: string) => {
       const attempt = abortSessionCalls.length;
@@ -145,6 +150,7 @@ afterEach(async () => {
   abortSessionCalls.length = 0;
   promptCalls.length = 0;
   promptError = undefined;
+  promptResumed = undefined;
   promptBlocker = undefined;
   abortSessionCalls.length = 0;
   abortSessionTurnIds.length = 0;
@@ -155,6 +161,74 @@ afterEach(async () => {
 });
 
 describe("startRuntime — chat.abort wiring", () => {
+  it("forwards A2A continuation controls and reports whether context was resumed", async () => {
+    promptResumed = true;
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({
+      agentId: "a",
+      userId: "u",
+      text: "the cluster is sh-1",
+      sessionId: "S",
+      allowInputRequest: true,
+      requireExistingSession: true,
+    }, ctx);
+    await waitFor(() => capturedSignal !== undefined);
+
+    expect(promptCalls[0]).toMatchObject({
+      sessionId: "S",
+      allowInputRequest: true,
+      requireExistingSession: true,
+    });
+
+    settleConsumer?.();
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+    expect(ctx.sendEvent.mock.calls.find(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    )?.[1].event).toEqual({ type: "prompt_done", resumed: true });
+  });
+
+  it("preserves SESSION_CONTEXT_UNAVAILABLE from AgentBox and still terminates the turn", async () => {
+    promptError = Object.assign(new Error("The requested session context is unavailable and cannot be resumed"), {
+      code: "SESSION_CONTEXT_UNAVAILABLE",
+      status: 412,
+      retriable: false,
+    });
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({
+      agentId: "a",
+      userId: "u",
+      text: "the cluster is sh-1",
+      sessionId: "missing",
+      requireExistingSession: true,
+    }, ctx);
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+
+    const events = ctx.sendEvent.mock.calls
+      .filter(([channel]) => channel === "chat.event")
+      .map(([, data]) => data.event);
+    expect(events).toContainEqual({
+      type: "stream_error",
+      error: {
+        code: "SESSION_CONTEXT_UNAVAILABLE",
+        message: "The requested session context is unavailable and cannot be resumed",
+        retriable: false,
+        status: 412,
+      },
+    });
+    expect(events).toContainEqual({ type: "prompt_done" });
+    expect(abortSessionCalls).toEqual([]);
+  });
+
   it("acknowledges delegation controls only after a matching source consumer accepts them", async () => {
     const frontendClient = fakeFrontendClient();
     server = await bootRuntime(fakeAgentBoxManager(), frontendClient);

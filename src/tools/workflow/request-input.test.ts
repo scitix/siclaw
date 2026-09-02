@@ -18,13 +18,15 @@ function makeRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
 const text = (r: any) => (r.content[0] as any).text as string;
 
 describe("request_input tool", () => {
-  it("is available ONLY on a delegated turn with an event bus, and is read-only-delegable", () => {
+  it("is available on delegated turns or explicit top-level input requests, and is read-only-delegable", () => {
     const emitter = vi.fn();
     expect(registration.available?.(makeRefs())).toBe(false);
     expect(registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true } }))).toBe(false);
+    expect(registration.available?.(makeRefs({ allowInputRequest: true }))).toBe(false);
     expect(
       registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter })),
     ).toBe(true);
+    expect(registration.available?.(makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }))).toBe(true);
     expect(registration.readOnlyDelegable).toBe(true);
   });
 
@@ -41,6 +43,30 @@ describe("request_input tool", () => {
       question: "Which cluster — sh-1 or sh-2?",
     });
     expect((r.details as any).delivered).toBe(true);
+  });
+
+  it("emits input_required without a delegationId for an opted-in top-level turn", async () => {
+    const emitter = vi.fn();
+    const tool = createRequestInputTool(
+      makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }),
+    );
+    const r = await tool.execute("call-a2a", { question: " Which cluster? " });
+
+    expect(tool.description).toMatch(/external caller/i);
+    expect(emitter).toHaveBeenCalledWith({
+      type: "input_required",
+      question: "Which cluster?",
+    });
+    expect((r.details as any).delivered).toBe(true);
+  });
+
+  it("does not emit when a caller bypasses registration without either opt-in", async () => {
+    const emitter = vi.fn();
+    const tool = createRequestInputTool(makeRefs({ sessionEventEmitter: emitter }));
+    const r = await tool.execute("call-direct", { question: "Which cluster?" });
+
+    expect(emitter).not.toHaveBeenCalled();
+    expect((r.details as any).delivered).toBe(false);
   });
 
   it("rejects an empty question before emitting", async () => {

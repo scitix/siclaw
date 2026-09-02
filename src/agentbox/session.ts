@@ -224,6 +224,8 @@ export interface ManagedSession {
   /** Delegation context this agent was built for (undefined = non-delegated). Drives
    *  rebuild when the delegation tier changes on a reused session id. */
   delegation?: DelegationContext;
+  /** Whether this session was built with top-level `request_input` available. */
+  allowInputRequest: boolean;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -3038,6 +3040,30 @@ export class AgentBoxSessionManager {
     await this.release(sessionId);
   }
 
+  /**
+   * Whether a requested continuation can recover real conversation context.
+   * A resident session is resumable in memory; otherwise the pi-agent JSONL
+   * must contain more than its header. Fail closed when the history is absent
+   * or unreadable so a continuation never starts from an isolated answer.
+   */
+  hasRestorableSessionContext(sessionId?: string): boolean {
+    const id = sessionId?.trim();
+    if (!id) return false;
+    if (this.sessions.has(id)) return true;
+
+    const sessionDir = path.join(this.getBaseSessionDir(), id);
+    if (!fs.existsSync(sessionDir)) return false;
+    try {
+      return SessionManager.continueRecent(process.cwd(), sessionDir).getEntries().some(
+        (entry: { type?: string; message?: { role?: string } }) =>
+          entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant"),
+      );
+    } catch (err) {
+      console.warn(`[agentbox-session] Session context for ${id} is unreadable:`, err);
+      return false;
+    }
+  }
+
   async getOrCreate(
     sessionId?: string,
     mode?: SessionMode,
@@ -3045,6 +3071,7 @@ export class AgentBoxSessionManager {
     activeMode: AgentMode = "normal",
     delegation?: DelegationContext,
     requestUserId?: string,
+    allowInputRequest = false,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
@@ -3084,11 +3111,13 @@ export class AgentBoxSessionManager {
           existing._releaseTimer = null;
           console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
         }
-        // Reuse unless the operating mode OR the delegation tier changed mid-session
+        // Reuse unless the operating mode, delegation tier, or explicit input
+        // capability changed mid-session
         // (e.g. user toggled Deep Investigation, or a reused session id flips between a
         // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
         // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
         const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
+        const sameInputCapability = existing.allowInputRequest === allowInputRequest;
         // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
         // change falls through to a rebuild below), but every delegation turn gets a NEW
         // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
@@ -3109,14 +3138,14 @@ export class AgentBoxSessionManager {
           existing.delegation.parentAgentId = delegation.parentAgentId;
         }
         if (
-          (existing.activeMode === activeMode && sameDelegation && !needsUserIdentityRebuild) ||
+          (existing.activeMode === activeMode && sameDelegation && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
           existing._promptInflight
         ) {
           return existing;
         }
         console.log(
-          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/${effectiveUserId ?? "anonymous"}`,
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
         );
         await this.releaseForRebuild(id, existing);
       }
@@ -3321,6 +3350,7 @@ export class AgentBoxSessionManager {
       // (a fresh random id would orphan the prior in-memory ledger every turn).
       taskListId: id,
       sessionEventEmitter: emitExtraEvent,
+      allowInputRequest,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
@@ -3378,6 +3408,7 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       delegation,
+      allowInputRequest,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,

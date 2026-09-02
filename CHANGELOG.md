@@ -20,6 +20,26 @@ Renamed the KB compile box so operators can tell it apart from chat agentboxes a
 
 ### Added
 
+#### Session resume guarantees and opt-in input requests (`chat.send`)
+
+Two paired, per-call opt-ins for management-plane callers (design:
+`docs/design/2026-09-02-session-resume-and-input-requests.md`):
+
+- **`requireExistingSession`** — a continuation turn must land on a restorable
+  session context (live, or persisted JSONL with real messages) or fail closed
+  with `SESSION_CONTEXT_UNAVAILABLE` (HTTP 412, non-retriable) *before* any
+  session is created; the failure reaches the caller as the standard
+  `stream_error` + `prompt_done` pair, and the Runtime skips its compensating
+  abort for it. AgentBox never silently starts a fresh session for a caller
+  that asked to continue an old one.
+- **`allowInputRequest`** — exposes `request_input` on non-delegated turns so an
+  externally submitted task can pause, ask its caller one question, and resume
+  in the SAME session. Joins the warm-session reuse predicate; never inherited
+  by subagents; the emitted `input_required` carries `delegationId` only on
+  delegated turns.
+- `/api/prompt` 200 acks and `prompt_done` now carry `resumed: boolean` so the
+  caller's control plane can verify the context really came back.
+
 #### Prometheus Observability Layer
 
 Integrated Prometheus metrics via a decoupled event bus architecture. Business code emits diagnostic events; a single prom-client subscriber maps them to 11 Prometheus metrics covering token usage, cost, latency, tool calls, sessions, and health.

@@ -723,6 +723,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // concierge) delegated this turn over the mesh. Forwarded to the agentbox so
     // the worker gates its toolset read-only and stamps the result artifact.
     const delegation = params.delegation as PromptOptions["delegation"];
+    const allowInputRequest = params.allowInputRequest === true;
+    const requireExistingSession = params.requireExistingSession === true;
     // A cross-Runtime delegation session is created by the coordinator Runtime
     // before ControlPlane routes this chat.send to the target Runtime. Re-inserting the
     // session/user row here would overwrite ownership/lineage and duplicate the
@@ -816,6 +818,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       mode: params.mode as string | undefined,
       origin: origin as PromptOptions["origin"],
       delegation,
+      allowInputRequest,
+      requireExistingSession,
       modelConfig,
       modelRouting,
       subagentTiers,
@@ -1042,22 +1046,26 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
             return;
           }
-          // Dispatch outcome UNKNOWN, not "did not happen": AgentBox starts the run
-          // before it acknowledges /api/prompt, so a lost or timed-out ack rejects
-          // here while a real turn is already running with nobody left to consume
-          // it. That leak is not conditional on Stop — an ack lost during an
-          // ordinary send strands the same turn — so compensate on every rejection
-          // rather than only where a Stop is known.
+          // Most dispatch failures have an UNKNOWN outcome, not "did not happen":
+          // AgentBox starts the run before it acknowledges /api/prompt, so a lost
+          // or timed-out ack can leave a real turn running with nobody consuming it.
+          // Compensate those failures even when Stop was never requested.
           //
           // Addressed BY TURN, which is what makes it unconditionally safe: if the box
           // never started this turn the abort is a no-op it cannot confuse with a later
           // one, and if it did start it, this is the only thing that stops it. The
-          // ORIGINAL failure is what the caller must see, so a compensation that cannot
-          // complete is logged loudly rather than substituted for it.
-          try {
-            await client.abortSession(sessionId, turnId);
-          } catch (compensateErr) {
-            console.error(`[runtime] could not stop turn=${turnId} session=${sessionId} after a failed prompt; it may run without a consumer:`, compensateErr);
+          // ORIGINAL failure is what the caller must see, so a compensation that
+          // cannot complete is logged loudly rather than substituted for it.
+          // A 412 continuation rejection is different: AgentBox checked the
+          // durable context before creating the session or starting a prompt,
+          // so an abort would only plant a stale pre-spawn latch for a turn that
+          // can never run.
+          if (summary.code !== ErrorCodes.SESSION_CONTEXT_UNAVAILABLE) {
+            try {
+              await client.abortSession(sessionId, turnId);
+            } catch (compensateErr) {
+              console.error(`[runtime] could not stop turn=${turnId} session=${sessionId} after a failed prompt; it may run without a consumer:`, compensateErr);
+            }
           }
           throw err;
         }
@@ -1068,6 +1076,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
         const abortCtrl = turnAbort;
+        const promptDoneEvent = () => ({
+          type: "prompt_done",
+          ...(typeof promptResult.resumed === "boolean" ? { resumed: promptResult.resumed } : {}),
+        });
         // Register this turn's abort signal so chat.abort can break the consumer
         // (see activeStreamAborts declaration). Placed AFTER prompt() succeeds, on
         // the path that actually consumes: the concurrent-send "already running"
@@ -1115,8 +1127,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             },
           });
           if (!alreadyReported()) {
-            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: { type: "prompt_done" } });
-            reportTerminal({ type: "prompt_done" });
+            const event = promptDoneEvent();
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event });
+            reportTerminal(event);
           }
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
@@ -1133,8 +1146,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
           // Shutdown, or a box removal, already reported this turn before aborting it.
           if (!alreadyReported()) {
-            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: { type: "prompt_done" } });
-            reportTerminal({ type: "prompt_done" });
+            const event = promptDoneEvent();
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event });
+            reportTerminal(event);
           }
         } finally {
           // Only clear if still ours — a fast re-send for the same session would

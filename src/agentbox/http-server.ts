@@ -62,6 +62,7 @@ import {
 } from "../core/subagent-models.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
+import { ErrorCodes } from "../lib/error-envelope.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -87,6 +88,10 @@ interface PromptRequestBody {
   origin?: OriginKind;
   /** Present when a coordinator agent delegated this turn over the mesh. */
   delegation?: DelegationContext;
+  /** Expose `request_input` to a top-level machine-driven turn. */
+  allowInputRequest?: boolean;
+  /** Reject if `sessionId` has no in-memory or persisted conversation context. */
+  requireExistingSession?: boolean;
   modelProvider?: string;
   modelId?: string;
   releaseId?: string;
@@ -908,6 +913,18 @@ export function createHttpServer(
     // A delegated agent runs under its own configuration; delegation does not
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
+    const resumed = sessionManager.hasRestorableSessionContext(body.sessionId);
+    if (body.requireExistingSession === true && !resumed) {
+      const detail = {
+        code: ErrorCodes.SESSION_CONTEXT_UNAVAILABLE,
+        message: "The requested session context is unavailable and cannot be resumed",
+        retriable: false,
+        status: 412,
+      };
+      logPromptResponse(412, "context_unavailable", detail.message);
+      sendJson(res, 412, { error: detail });
+      return;
+    }
     const managed = await sessionManager.getOrCreate(
       body.sessionId,
       body.mode,
@@ -915,6 +932,7 @@ export function createHttpServer(
       activeMode,
       delegation,
       body.userId,
+      body.allowInputRequest === true,
     );
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
@@ -1250,7 +1268,7 @@ export function createHttpServer(
       // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
       actuallyFinish();
       logPromptResponse(200, "aborted_before_start", undefined, managed.id);
-      sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, aborted: true });
+      sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, resumed, aborted: true });
       return;
     }
 
@@ -1372,7 +1390,7 @@ export function createHttpServer(
     });
 
     logPromptResponse(200, "accepted", undefined, managed.id);
-    sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, traceId: tracingRecorder.getRootTraceId(managed.id) });
+    sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, resumed, traceId: tracingRecorder.getRootTraceId(managed.id) });
   });
 
   /**

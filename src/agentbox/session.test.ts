@@ -281,6 +281,39 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(lastCreateSiclawSession.calls[1].activeMode).toBe("dp");
   });
 
+  it("rebuilds when top-level request_input availability changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const first = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, undefined, false);
+    expect(first.allowInputRequest).toBe(false);
+    expect(lastCreateSiclawSession.calls[0].allowInputRequest).toBe(false);
+
+    const rebuilt = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, undefined, true);
+    expect(rebuilt).not.toBe(first);
+    expect(rebuilt.allowInputRequest).toBe(true);
+    expect(lastCreateSiclawSession.calls[1].allowInputRequest).toBe(true);
+  });
+
+  it("detects resumable context in memory or persisted JSONL", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const missingDir = path.join(_cfgUserDataDir, "agent", "sessions", "missing");
+    expect(mgr.hasRestorableSessionContext("missing")).toBe(false);
+    expect(fs.existsSync(missingDir)).toBe(false);
+
+    await mgr.getOrCreate("resident");
+    expect(mgr.hasRestorableSessionContext("resident")).toBe(true);
+
+    const persistedDir = path.join(_cfgUserDataDir, "agent", "sessions", "persisted");
+    fs.mkdirSync(persistedDir, { recursive: true });
+    (globalThis as any).__frameworkEntriesState.entries = [{ type: "session" }];
+    expect(mgr.hasRestorableSessionContext("persisted")).toBe(false);
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "session" },
+      { type: "message", message: { role: "user", content: "first turn" } },
+    ];
+    expect(mgr.hasRestorableSessionContext("persisted")).toBe(true);
+  });
+
   it("refreshes the delegation correlation id on reuse of an IDLE peer session", async () => {
     const mgr = new AgentBoxSessionManager();
     const s1 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d1", readOnly: false });

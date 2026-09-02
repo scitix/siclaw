@@ -242,6 +242,7 @@ function makeFakeSessionManager() {
     subagentStats: () => ({ active: 0, pending: 0, limit: 50 }),
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
+    hasRestorableSessionContext: (id?: string) => Boolean(id && sessions.has(id)),
     stopSessionJobs: vi.fn(() => 0),
     markPendingAbort: vi.fn(),
     consumePendingAbort: vi.fn(() => false),
@@ -253,8 +254,9 @@ function makeFakeSessionManager() {
       activeMode?: unknown,
       _delegation?: unknown,
       userId?: string,
+      allowInputRequest?: boolean,
     ) => {
-      getOrCreateCalls.push({ id, activeMode, userId });
+      getOrCreateCalls.push({ id, activeMode, userId, allowInputRequest });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
@@ -1146,6 +1148,51 @@ describe("http-server — prompt + session lifecycle", () => {
 
     expect(r.status).toBe(200);
     expect(sm.getOrCreateCalls.at(-1)?.userId).toBe("user-42");
+  });
+
+  it("passes allowInputRequest into session creation", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "inspect the cluster",
+      sessionId: "a2a-new",
+      allowInputRequest: true,
+    });
+
+    expect(r.status).toBe(200);
+    expect(r.data.resumed).toBe(false);
+    expect(sm.getOrCreateCalls.at(-1)?.allowInputRequest).toBe(true);
+  });
+
+  it("fails closed when a required session context is unavailable", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "the cluster is sh-1",
+      sessionId: "missing-session",
+      requireExistingSession: true,
+    });
+
+    expect(r.status).toBe(412);
+    expect(r.data.error).toEqual({
+      code: "SESSION_CONTEXT_UNAVAILABLE",
+      message: "The requested session context is unavailable and cannot be resumed",
+      retriable: false,
+      status: 412,
+    });
+    expect(sm.getOrCreateCalls).toHaveLength(0);
+  });
+
+  it("marks an accepted continuation as resumed", async () => {
+    await sm.getOrCreate("existing-session");
+    sm.getOrCreateCalls.length = 0;
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "the cluster is sh-1",
+      sessionId: "existing-session",
+      allowInputRequest: true,
+      requireExistingSession: true,
+    });
+
+    expect(r.status).toBe(200);
+    expect(r.data.resumed).toBe(true);
+    expect(sm.getOrCreateCalls.at(-1)?.allowInputRequest).toBe(true);
   });
 
   it("POST /api/prompt rejects a second prompt while the session is still running", async () => {

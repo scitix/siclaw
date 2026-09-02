@@ -155,6 +155,8 @@ export interface CreateSiclawSessionOpts {
    * frontend can render them in a nested block).
    */
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
+  /** Expose `request_input` to this top-level machine-driven session. */
+  allowInputRequest?: boolean;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
   /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
@@ -527,6 +529,7 @@ export async function createSiclawSession(
       skillScriptResolver,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
+      allowInputRequest: opts?.allowInputRequest === true,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       // Force sub-agents foreground when a detached batch's conclusion would be
