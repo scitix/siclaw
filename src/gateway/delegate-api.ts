@@ -29,6 +29,8 @@ import { consumeAgentSse } from "./sse-consumer.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 import { ensureChatSession, appendMessage, getMessages, bindMessageTraceId, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
+import { a2aTransportConfig, runA2aDelegation, type A2aTransportConfig } from "./delegate-a2a-transport.js";
+import { buildRedactionConfigForModelConfig, redactText } from "./output-redactor.js";
 import { parsePositiveIntEnv } from "../core/subagent-registry.js";
 import type {
   DelegateRequest, DelegateResponse, DelegateArtifact, DelegatesResponse, DelegateRosterMember,
@@ -775,6 +777,39 @@ export async function handleDelegate(
     return {};
   };
 
+  // Experimental A2A transport (SICLAW_DELEGATION_TRANSPORT=a2a): the peer task
+  // runs as a durable A2A task on the management plane's inner profile; this
+  // bridge translates its frames back into the same observePeerEvent vocabulary,
+  // so the coordinator tool experience and the SSE frame protocol are unchanged.
+  // The local peer-session row stays the coordinator-side read model; the final
+  // answer is mirrored into it at terminal so "open full session" still reads.
+  const runA2aTransportDelegation = async (cfg: A2aTransportConfig): Promise<DelegationExecutionOutcome> => {
+    const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig as never);
+    const result = await runA2aDelegation({
+      cfg,
+      peerAgentId,
+      text,
+      localSessionId: peerSessionId,
+      parentSessionId: trustedParent ?? undefined,
+      delegationId,
+      signal: peerAbort.signal,
+      observe: (evt) => observePeerEvent(evt, true),
+      redact: (t) => redactText(t, redactionConfig),
+    });
+    if (result.stopped) return { stopped: true };
+    if (result.error) return { error: result.error };
+    // Mirror the settled answer into the local read-model row (best-effort —
+    // the durable execution transcript lives on the control-plane side).
+    if (finalText) {
+      try {
+        await appendMessage({ sessionId: peerSessionId, role: "assistant", content: finalText });
+      } catch (err) {
+        console.warn("[delegate-api] could not mirror the A2A answer into the peer session row:", err);
+      }
+    }
+    return {};
+  };
+
   const runLocalDelegation = async (): Promise<DelegationExecutionOutcome> => {
     const handle = await deps.agentBoxManager.getOrCreate(peerAgentId, undefined, peerSessionId);
     sessionTurnLocks.noteBox(peerSessionId, handle.boxId, handle.endpoint);
@@ -885,9 +920,12 @@ export async function handleDelegate(
       return;
     }
 
-    const outcome = route.local
-      ? await runLocalDelegation()
-      : await runRemoteDelegation();
+    const a2aCfg = a2aTransportConfig();
+    const outcome = a2aCfg
+      ? await runA2aTransportDelegation(a2aCfg)
+      : route.local
+        ? await runLocalDelegation()
+        : await runRemoteDelegation();
     if (outcome.stopped) {
       finished = true;
       try { res.end(); } catch { /* client already gone */ }

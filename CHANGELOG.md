@@ -44,6 +44,16 @@ Two paired, per-call opt-ins for management-plane callers (design:
   the original turn (`duplicate: true`) instead of starting a second turn or
   degrading into a steer.
 
+#### Experimental A2A delegation transport (`SICLAW_DELEGATION_TRANSPORT=a2a`)
+
+Opt-in third transport for `delegate_to_agent`: the peer task is submitted to
+the management plane's inner A2A profile (durable task, waiting/resume,
+budgets, dispatch retries) and its frames are translated back into the existing
+peer-event vocabulary — tool inputs, coordinator SSE frames and roster
+authorization unchanged. Includes per-leg redaction of model-visible text and
+best-effort remote cancel on abort. Default off (legacy relay); design:
+`docs/design/2026-09-02-a2a-delegation-transport.md`.
+
 #### Prometheus Observability Layer
 
 Integrated Prometheus metrics via a decoupled event bus architecture. Business code emits diagnostic events; a single prom-client subscriber maps them to 11 Prometheus metrics covering token usage, cost, latency, tool calls, sessions, and health.
