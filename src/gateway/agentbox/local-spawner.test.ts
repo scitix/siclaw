@@ -327,6 +327,18 @@ describe("LocalSpawner — tool-capabilities injection", () => {
 });
 
 describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () => {
+  it("locks Product Support to read-only built-ins while preserving its managed type", async () => {
+    dbQueryImpl = async () => [[{ tool_capabilities: JSON.stringify(["run_commands"]), agent_type: "product_support" }], undefined];
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    const handle = await spawner.spawn({ agentId: "a1" });
+    const box = (spawner as any).boxes.get(handle.boxId);
+    expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]),
+    );
+    expect(box.sessionManager.agentTypeState).toBe("product_support");
+    expect(box.sessionManager.harnessResolvedState).toBe(true);
+  });
+
   it("locks a Coordinator's capabilities + persona even with an EMPTY raw tool_capabilities", async () => {
     // The exact bug: a built-in type with no raw tool_capabilities used to resolve
     // to null (unrestricted) + default "custom" persona in local mode. It must now

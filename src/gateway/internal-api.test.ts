@@ -203,6 +203,18 @@ describe("handleMcpServers", () => {
 // ── handleToolCapabilities ────────────────────────────────
 
 describe("handleToolCapabilities", () => {
+  it("resolves product_support as a locked read-only built-in harness", async () => {
+    frontend.responses.set("config.getAgent", { agent_type: "product_support", tool_capabilities: ["run_commands"] });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.agentType).toBe("product_support");
+    expect(new Set(body.allowedTools)).toEqual(
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]),
+    );
+  });
+
   it("resolves the agent's capability groups to a concrete allowedTools list", async () => {
     frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: ["read_files", "search_memory"] });
     const res = new FakeRes();

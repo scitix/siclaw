@@ -46,7 +46,11 @@ vi.mock("./sse-consumer.js", () => ({
   }),
 }));
 
-const promptCalls: Array<{ systemPromptTemplate?: string; sessionId: string }> = [];
+const promptCalls: Array<{
+  systemPromptTemplate?: string;
+  sessionId: string;
+  requiredResultToolName?: string;
+}> = [];
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -64,6 +68,7 @@ vi.mock("./agentbox/client.js", () => ({
 }));
 
 const { startRuntime } = await import("./server.js");
+const { sessionRegistry } = await import("./session-registry.js");
 
 // getAgentResult drives what config.getAgent resolves to (or throws when set to
 // an Error), letting each test model "custom prompt present / absent / lookup
@@ -163,6 +168,39 @@ describe("startRuntime — chat.send custom system prompt", () => {
     expect(getAgentCalls).toEqual([]);
   });
 
+  it("forwards a strict result-tool requirement to AgentBox", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({
+      agentId: "a",
+      userId: "u",
+      text: "hi",
+      sessionId: "strict-result",
+      requiredResultToolName: "mcp__result__submit",
+      requireSessionPersistence: true,
+    }, { sendEvent: vi.fn() }) as { strictResultProtocolVersion?: number };
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0].requiredResultToolName).toBe("mcp__result__submit");
+    expect(ack.strictResultProtocolVersion).toBe(1);
+  });
+
+  it("does not advertise strict protocol support for a partial opt-in", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({
+      agentId: "a",
+      userId: "u",
+      text: "hi",
+      sessionId: "result-without-durable-ack",
+      requiredResultToolName: "mcp__result__submit",
+    }, { sendEvent: vi.fn() }) as { strictResultProtocolVersion?: number };
+
+    expect(ack.strictResultProtocolVersion).toBeUndefined();
+  });
+
   it("falls back to the agent's custom prompt when the caller omits systemPrompt (control-plane web path)", async () => {
     getAgentResult = { system_prompt: "custom agent persona" };
     server = await bootRuntime();
@@ -197,5 +235,36 @@ describe("startRuntime — chat.send custom system prompt", () => {
     await waitFor(() => promptCalls.length > 0);
 
     expect(promptCalls[0].systemPromptTemplate).toBeUndefined();
+  });
+
+  it("rejects a strict persistence ACK before any AgentBox prompt starts", async () => {
+    vi.mocked(chatRepo.ensureChatSession).mockRejectedValueOnce(new Error("database unavailable"));
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await expect(send({
+      agentId: "a",
+      userId: "u",
+      text: "hi",
+      sessionId: "strict-session",
+      requireSessionPersistence: true,
+    }, { sendEvent: vi.fn() })).rejects.toMatchObject({ name: "SessionPersistenceError" });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(promptCalls).toEqual([]);
+    expect(sessionRegistry.peek("strict-session")).toBeUndefined();
+  });
+
+  it("keeps best-effort persistence for ordinary interactive chat", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(chatRepo.ensureChatSession).mockRejectedValueOnce(new Error("database unavailable"));
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await expect(send({ agentId: "a", userId: "u", text: "hi", sessionId: "web-session" }, {
+      sendEvent: vi.fn(),
+    })).resolves.toMatchObject({ ok: true, sessionId: "web-session" });
+    await waitFor(() => promptCalls.length > 0);
+    warn.mockRestore();
   });
 });

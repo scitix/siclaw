@@ -113,6 +113,8 @@ interface PromptRequestBody {
    * lets the box mint nothing can still correlate.
    */
   turnId?: string;
+  /** Trusted control-plane contract for one required structured result tool. */
+  requiredResultToolName?: string;
 }
 
 /**
@@ -876,6 +878,13 @@ export function createHttpServer(
       console.log(`[agentbox-http] /api/prompt result boxId=${process.env.SICLAW_POD_NAME ?? "unknown"} sessionId=${sessionId ?? "pending"} turnId=${body.turnId ?? "unknown"} status=${status} outcome=${outcome} durationMs=${Date.now() - promptStartedAt}${suffix}`);
     };
 
+    if (body.requiredResultToolName !== undefined && typeof body.requiredResultToolName !== "string") {
+      logPromptResponse(400, "rejected", "'requiredResultToolName' must be a string");
+      sendJson(res, 400, { error: "'requiredResultToolName' must be a string" });
+      return;
+    }
+    const requiredResultToolName = body.requiredResultToolName?.trim() || undefined;
+
     const promptMediaValidation = validatePromptMedia(body.images, body.files);
     if (promptMediaValidation.error) {
       logPromptResponse(400, "rejected", promptMediaValidation.error);
@@ -1294,6 +1303,9 @@ export function createHttpServer(
         },
       },
       promptMedia,
+      requiredResultToolName
+        ? { requiredResultToolName }
+        : undefined,
     );
 
     promptPromise.then((result) => {

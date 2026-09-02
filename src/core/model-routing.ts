@@ -1,5 +1,11 @@
 import { modelNeedsRebind } from "./brain-session.js";
-import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptMedia } from "./brain-session.js";
+import type {
+  BrainModelInfo,
+  BrainProviderResponse,
+  BrainSession,
+  PromptMedia,
+  PromptRequirements,
+} from "./brain-session.js";
 import { withResolvedModelCompat } from "./model-compat.js";
 
 export type ModelRouteFailureKind =
@@ -714,9 +720,11 @@ export async function runPromptWithModelRouting(
   state: ModelRouteState,
   options: RunPromptWithModelRoutingOptions = {},
   media?: PromptMedia,
+  requirements?: PromptRequirements,
 ): Promise<ModelRouteRunResult> {
   if (!isModelRoutePolicyEnabled(policy)) {
-    await brain.prompt(text, media);
+    if (requirements) await brain.prompt(text, media, requirements);
+    else await brain.prompt(text, media);
     return { success: true, exhausted: false, attempted: [] };
   }
 
@@ -826,7 +834,7 @@ export async function runPromptWithModelRouting(
     const streamFromStart = optimisticPrimaryStream && i === 0;
     const attemptResult = await runAttempt(
       brain, text, candidate, emitBrainEvent, streamFromStart, media, options.applyCandidateModelParams,
-      options.onEventCaptureChange, options.onAttemptReady,
+      options.onEventCaptureChange, options.onAttemptReady, requirements,
     );
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
@@ -1013,6 +1021,7 @@ async function runAttempt(
   applyCandidateModelParams?: (candidate: ModelRouteCandidate) => void,
   onEventCaptureChange?: (capturing: boolean) => void,
   onAttemptReady?: (candidate: ModelRouteCandidate) => void,
+  requirements?: PromptRequirements,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -1156,7 +1165,8 @@ async function runAttempt(
     // effective model from here on. Publish it before prompting so a tool call
     // made during the prompt (spawn_subagent above all) can read it.
     onAttemptReady?.(candidate);
-    await brain.prompt(text, media);
+    if (requirements) await brain.prompt(text, media, requirements);
+    else await brain.prompt(text, media);
   } catch (err) {
     const message = errorMessage(err);
     return {

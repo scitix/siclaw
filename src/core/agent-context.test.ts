@@ -50,6 +50,23 @@ describe("resolveAgentHarness", () => {
     expect(harness.includeInfrastructureGuidance).toBe(false);
   });
 
+  it("keeps Product Support read-only while exposing its configured result MCP", () => {
+    const harness = resolveAgentHarness({
+      agentType: "product_support",
+      allowedTools: null,
+      memoryConfigured: true,
+    });
+
+    expect(harness.allowedTools).toEqual([
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+    ]);
+    expect(harness.mcpExposure).toBe("configured");
+    expect(harness.memoryEnabled).toBe(false);
+    expect(harness.includeInfrastructureGuidance).toBe(false);
+    expect(harness.includeOperationalSafety).toBe(false);
+    expect(harness.legacyUnrestrictedCustom).toBe(false);
+  });
+
   it("rejects an unknown type instead of normalizing it to unrestricted Custom", () => {
     expect(() => resolveAgentHarness({
       agentType: "future_type",
@@ -91,6 +108,23 @@ describe("resolveAgentHarness", () => {
 });
 
 describe("compileAgentContext", () => {
+  it("uses Product Support's managed persisted prompt without SRE guidance", () => {
+    const context = compileAgentContext({
+      agentType: "product_support",
+      allowedTools: ["read", "knowledge_search", "knowledge_cite"],
+      memoryConfigured: true,
+      mode: "channel",
+      agentPrompt: "Managed product support contract",
+    });
+
+    expect(context.systemPrompt).toContain("Managed product support contract");
+    expect(context.systemPrompt).toContain("product-support agent");
+    expect(context.systemPrompt).toContain("result-submission tool");
+    expect(context.systemPrompt).not.toContain("personal SRE AI assistant");
+    expect(context.systemPrompt).not.toContain("cluster_list");
+    expect(context.harness.mcpExposure).toBe("configured");
+  });
+
   it("gives Knowledge QA a role-clean prompt with no SRE or memory guidance", () => {
     const context = compileAgentContext({
       agentType: "knowledge_qa",

@@ -198,6 +198,18 @@ describe("createToolsHandler", () => {
     expect(target.harnessResolvedState).toBe(true);
   });
 
+  it("accepts the product_support harness and keeps its locked whitelist", async () => {
+    const target = { allowedToolsState: null as string[] | null, harnessResolvedState: false, agentTypeState: "custom" };
+    const handler = createToolsHandler(target, null);
+    await expect(handler.materialize({ allowedTools: ["read", "grep"], agentType: "product_support" })).resolves.toBe(2);
+    expect(target).toEqual({
+      allowedToolsState: ["read", "grep"],
+      harnessResolvedState: true,
+      agentTypeState: "product_support",
+      subagentTierMenuState: null,
+    });
+  });
+
   it("materialize treats null as 'no restriction' (whitelist off), returns 0", async () => {
     const target = { allowedToolsState: ["read"] as string[] | null };
     const handler = createToolsHandler(target, null);
@@ -206,7 +218,7 @@ describe("createToolsHandler", () => {
     expect(target.allowedToolsState).toBeNull();
   });
 
-  it.each(["sre", "coordinator", "knowledge_qa"])(
+  it.each(["sre", "coordinator", "knowledge_qa", "product_support"])(
     "rejects unrestricted tools for built-in agent type %s",
     async (agentType) => {
       const target = {

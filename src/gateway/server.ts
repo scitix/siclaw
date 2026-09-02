@@ -731,6 +731,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Runtime already persisted and sequenced the user row, so the target must
     // not bind or update a second local copy of it.
     const skipInitialPersistence = params.skipInitialPersistence === true && Boolean(delegation?.delegationId);
+    // Machine-facing strict callers cannot safely publish a reusable sessionId
+    // until its session and first user message are durable. Interactive chat
+    // keeps the legacy best-effort behavior; strict /run opts into this ACK.
+    const requireSessionPersistence = params.requireSessionPersistence === true;
+    const requiredResultToolName = typeof params.requiredResultToolName === "string"
+      ? params.requiredResultToolName.trim() || undefined
+      : undefined;
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
     // present; fall back gracefully so direct callers (tests, /run path)
@@ -797,6 +804,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const promptOpts: PromptOptions = {
       sessionId,
       turnId,
+      requiredResultToolName,
       userId,
       text,
       agentId,
@@ -840,9 +848,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // or the process died — the message vanished while the turn ran anyway, so "your
     // message was recorded" was not actually true when we said it.
     //
-    // A failure here does NOT fail the send. The caller loses the row id and falls back
-    // to matching by content; blocking a whole conversation on one database hiccup is the
-    // worse trade.
+    // Interactive callers retain the legacy best-effort behavior: they lose the
+    // row id and fall back to matching by content. A strict machine caller opts
+    // into failing this ACK because it will expose sessionId as a durable handle.
     // Registered before the async ack below, and before the persistence awaits: this
     // closes the cold-start window in which chat.abort had no local cancellation state
     // to update, and it is what makes the shutdown fence airtight — a handler that got
@@ -860,6 +868,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
         await incrementMessageCount(sessionId);
       } catch (persistErr) {
+        if (requireSessionPersistence) {
+          unregisterPendingStart(sessionId, turnAbort);
+          dropLiveTurn(sessionId, turnId);
+          delegatedTurns.delete(turnId);
+          sessionRegistry.forget(sessionId);
+          const err = new Error("chat.send could not durably persist the session before acknowledgement", {
+            cause: persistErr,
+          });
+          err.name = "SessionPersistenceError";
+          throw err;
+        }
         console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
       }
     }
@@ -886,6 +905,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           releaseTurn = await sessionTurnLocks.acquire(sessionId);
         } catch (busyErr) {
           throwIfStoppedBeforePrompt();
+          // A strict machine request is one distinct turn with one distinct
+          // result. Folding it into the running turn as a steer would lose its
+          // required-result contract, so surface busy and let the caller retry.
+          if (requiredResultToolName) throw busyErr;
           const running = sessionTurnLocks.busyOn(sessionId);
           const steered = running ? await new AgentBoxClient(running.endpoint, 10000, agentBoxTlsOptions)
             .steerSession(sessionId, text, { images, files })
@@ -999,6 +1022,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // prompt will fire its own when it actually finishes, and an
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
+            if (requiredResultToolName) throw err;
             const steerResult = await client.steerSession(sessionId, text, { images, files });
             if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             // chat.send persisted this row before it knew the active session would
@@ -1158,7 +1182,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // write above failed.
     // turnId travels back so a supervisor can later abort THIS turn specifically
     // rather than "whatever is running on this session".
-    return { ok: true, sessionId, turnId, ...(promptMessageId ? { messageId: promptMessageId } : {}) };
+    return {
+      ok: true,
+      sessionId,
+      turnId,
+      ...(promptMessageId ? { messageId: promptMessageId } : {}),
+      // Version 1 promises all strict semantics as one capability: durable ACK,
+      // required structured-result repair, and a correlated failure terminal
+      // instead of degrading a concurrent request into the active turn.
+      ...(requireSessionPersistence && requiredResultToolName
+        ? { strictResultProtocolVersion: 1 }
+        : {}),
+    };
   });
 
   // ── Shared capability box client ───────────────────────────────────────────

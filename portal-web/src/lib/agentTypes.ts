@@ -2,7 +2,7 @@
 // capability set and provide an immutable type contract. The Portal edits only
 // an optional Agent Addendum; it never replaces that contract.
 
-export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "custom"
+export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "custom"
 
 export interface AgentTypeOption {
   key: AgentTypeKey
@@ -33,6 +33,13 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "knowledge_qa",
     label: "Knowledge Q&A Agent",
     description: "Researches bound knowledge bases and answers with synthesized, source-backed information.",
+    capabilities: ["read_files"],
+    defaultNoSkills: true,
+  },
+  {
+    key: "product_support",
+    label: "Product Support Agent",
+    description: "Answers product questions and prepares structured customer-support handoffs through its bound result tool.",
     capabilities: ["read_files"],
     defaultNoSkills: true,
   },

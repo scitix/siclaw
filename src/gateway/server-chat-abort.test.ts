@@ -14,6 +14,9 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 
 const bindMessageTraceIdMock = vi.hoisted(() => vi.fn(async () => {}));
 const updateMessageMock = vi.hoisted(() => vi.fn(async () => {}));
+const steerSessionMock = vi.hoisted(() =>
+  vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" })),
+);
 
 vi.mock("./chat-repo.js", async (importOriginal) => ({
   ensureChatSession: vi.fn(async () => {}),
@@ -87,7 +90,7 @@ vi.mock("./agentbox/client.js", () => ({
       if (attempt === 0 && abortFirstAttempt) throw abortFirstAttempt;
       if (abortSessionError) throw abortSessionError;
     });
-    steerSession = vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" }));
+    steerSession = steerSessionMock;
     streamEvents = async function* () {};
   },
 }));
@@ -814,6 +817,66 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(updateMessageMock.mock.invocationCallOrder[0]).toBeLessThan(
       bindMessageTraceIdMock.mock.invocationCallOrder[0],
     );
+  });
+
+  it("does not fold a strict concurrent request into the running turn as a steer", async () => {
+    promptError = new Error("Session is already running");
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const context = { sendEvent: vi.fn() };
+
+    const ack = await send({
+      agentId: "a",
+      userId: "u",
+      text: "one more detail",
+      sessionId: "strict-S",
+      requiredResultToolName: "mcp__result__submit",
+      requireSessionPersistence: true,
+    }, context) as { turnId: string; strictResultProtocolVersion?: number };
+    await waitFor(() => promptCalls.length > 0);
+    await waitFor(() => context.sendEvent.mock.calls.some(([, payload]) =>
+      payload?.turnId === ack.turnId && payload?.event?.type === "prompt_done"
+    ));
+
+    expect(ack.strictResultProtocolVersion).toBe(1);
+    expect(steerSessionMock).not.toHaveBeenCalled();
+    expect(context.sendEvent).toHaveBeenCalledWith("chat.event", expect.objectContaining({
+      sessionId: "strict-S",
+      turnId: ack.turnId,
+      event: expect.objectContaining({ type: "stream_error" }),
+    }));
+    expect(context.sendEvent).toHaveBeenCalledWith("chat.event", {
+      sessionId: "strict-S",
+      turnId: ack.turnId,
+      event: { type: "prompt_done" },
+    });
+  });
+
+  it("does not steer a strict request while the runtime session lock is busy", async () => {
+    let releasePrompt!: () => void;
+    promptBlocker = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    await send({ agentId: "a", userId: "u", text: "first", sessionId: "strict-lock" }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length === 1);
+    await send({
+      agentId: "a",
+      userId: "u",
+      text: "second",
+      sessionId: "strict-lock",
+      requiredResultToolName: "mcp__result__submit",
+    }, { sendEvent: vi.fn() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(promptCalls).toHaveLength(1);
+    expect(steerSessionMock).not.toHaveBeenCalled();
+
+    releasePrompt();
+    promptBlocker = undefined;
+    await waitFor(() => capturedSignal !== undefined);
+    await abort({ agentId: "a", sessionId: "strict-lock" });
   });
 
   it("clears the registration after the turn settles (no leak / no stale abort)", async () => {

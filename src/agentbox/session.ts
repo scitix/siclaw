@@ -461,7 +461,7 @@ export class AgentBoxSessionManager {
    */
   harnessResolvedState = true;
 
-  /** Agent type (sre/coordinator/knowledge_qa/custom), fetched alongside allowedTools.
+  /** Agent type, fetched alongside allowedTools.
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
 

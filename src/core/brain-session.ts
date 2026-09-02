@@ -35,6 +35,16 @@ export interface PromptMedia {
   files?: PromptFile[];
 }
 
+/** Runtime-only completion requirements supplied by a trusted control plane. */
+export interface PromptRequirements {
+  /**
+   * Exact MCP result tool that must succeed before this prompt may finish.
+   * The normal agent run remains unrestricted. If it omits the result, the
+   * runtime performs one bounded, tool-forced repair pass.
+   */
+  requiredResultToolName?: string;
+}
+
 export interface BrainModelInfo {
   id: string;
   name: string;
@@ -158,7 +168,7 @@ export interface BrainSession {
   readonly brainType: BrainType;
 
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
-  prompt(text: string, media?: PromptMedia): Promise<void>;
+  prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void>;
 
   /** Abort the current agent run. */
   abort(): Promise<void>;

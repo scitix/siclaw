@@ -26,6 +26,8 @@ export interface PromptOptions {
    * abort addressed by session alone can land on a successor.
    */
   turnId?: string;
+  /** Exact result tool required by a strict control-plane turn. */
+  requiredResultToolName?: string;
   /** User who initiated this prompt. Forwarded per-request to the trace
    *  recorder as the root span's user.id (mirrors sessionId's per-request
    *  path), so tracing carries the user dimension in every deployment mode. */
