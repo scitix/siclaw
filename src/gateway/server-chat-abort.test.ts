@@ -192,6 +192,32 @@ describe("startRuntime — chat.abort wiring", () => {
     )?.[1].event).toEqual({ type: "prompt_done", resumed: true });
   });
 
+  it("answers a retried dispatchId idempotently without starting a second turn", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+    const base = {
+      agentId: "a", userId: "u", text: "answer", sessionId: "S", dispatchId: "disp-1",
+    };
+
+    const first = await send({ ...base }, ctx);
+    expect(first).toMatchObject({ ok: true, sessionId: "S" });
+    await waitFor(() => capturedSignal !== undefined);
+
+    // The retry of a lost ack: same (sessionId, dispatchId). It must not start
+    // a second turn, must not steer into the running one, and must name the
+    // SAME turn so the caller can correlate.
+    const retry = await send({ ...base }, ctx);
+    expect(retry).toMatchObject({ ok: true, sessionId: "S", turnId: first.turnId, duplicate: true });
+    expect(promptCalls.length).toBe(1);
+
+    // A DIFFERENT dispatchId on the same session is a new dispatch, not a dupe.
+    settleConsumer?.();
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+  });
+
   it("preserves SESSION_CONTEXT_UNAVAILABLE from AgentBox and still terminates the turn", async () => {
     promptError = Object.assign(new Error("The requested session context is unavailable and cannot be resumed"), {
       code: "SESSION_CONTEXT_UNAVAILABLE",
