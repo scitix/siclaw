@@ -39,6 +39,10 @@ Two paired, per-call opt-ins for management-plane callers (design:
   delegated turns.
 - `/api/prompt` 200 acks and `prompt_done` now carry `resumed: boolean` so the
   caller's control plane can verify the context really came back.
+- `chat.send` accepts an optional `dispatchId`: retries of a dispatch whose ack
+  was lost are idempotent per `(sessionId, dispatchId)` — a duplicate returns
+  the original turn (`duplicate: true`) instead of starting a second turn or
+  degrading into a steer.
 
 #### Prometheus Observability Layer
 

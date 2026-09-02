@@ -84,6 +84,23 @@ lost.
 - `agentBoxResponseError` prefers the structured `error.message` from a JSON
   error body, so the 412's message survives to the `stream_error` verbatim.
 
+## Dispatch idempotency (`dispatchId`)
+
+`chat.send` additionally accepts an optional `dispatchId: string`. The
+management plane persists every dispatch in a durable outbox and may re-send
+one whose acknowledgement was lost; the id makes that retry safe:
+
+- Dedup key is `(sessionId, dispatchId)`, held in a process-local map
+  (capacity 2000, 6h TTL). Process-local is the exact semantic: a turn cannot
+  outlive this process, so a fresh process re-running the dispatch is a
+  correct retry, not a duplicate.
+- A duplicate returns `{ ok: true, sessionId, turnId, duplicate: true }` with
+  the ORIGINAL turn's id — it never starts a second turn and, critically,
+  never falls into the busy-session steer fallback (which would inject the
+  same input into the running turn twice).
+- The key is reserved before the first await in the handler, so a concurrent
+  retry cannot slip in mid-persistence.
+
 ## Non-goals
 
 - The built-in A2A gateway (`src/portal/a2a-gateway.ts`) does not adopt either

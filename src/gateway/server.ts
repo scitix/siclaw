@@ -708,6 +708,30 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // still hold those sessions, but nothing is reading them any more.
   frontendClient.setActiveSessionsProvider?.(() => [...activeStreamAborts.keys()]);
 
+  // Accepted dispatches by `${sessionId}:${dispatchId}`, so a management-plane
+  // retry of a dispatch whose ack was lost is idempotent (see chat.send below).
+  // Process-local on purpose: a turn cannot outlive this process, so a fresh
+  // process re-running the dispatch is a correct retry, not a duplicate.
+  const recentDispatches = new Map<string, { turnId: string; at: number }>();
+  const DISPATCH_DEDUPE_TTL_MS = 6 * 60 * 60 * 1000;
+  const DISPATCH_DEDUPE_MAX = 2000;
+  const rememberDispatch = (key: string, turnId: string): void => {
+    const now = Date.now();
+    if (recentDispatches.size >= DISPATCH_DEDUPE_MAX) {
+      for (const [k, v] of recentDispatches) {
+        if (now - v.at > DISPATCH_DEDUPE_TTL_MS) recentDispatches.delete(k);
+      }
+      // Still full after pruning by age: drop the oldest entries (Map preserves
+      // insertion order) rather than grow without bound.
+      while (recentDispatches.size >= DISPATCH_DEDUPE_MAX) {
+        const oldest = recentDispatches.keys().next().value;
+        if (oldest === undefined) break;
+        recentDispatches.delete(oldest);
+      }
+    }
+    recentDispatches.set(key, { turnId, at: now });
+  };
+
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
     const agentId = params.agentId as string;
     const userId = params.userId as string;
@@ -779,6 +803,22 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // dispatch, so a lost acknowledgement still leaves it able to name the turn;
     // ordinary callers let us mint one.
     const turnId = typeof params.turnId === "string" && params.turnId ? params.turnId : crypto.randomUUID();
+
+    // Dispatch idempotency. A caller that lost this RPC's ack cannot know
+    // whether the turn started; retrying with the same dispatchId answers that
+    // question without side effects — the retry NEVER starts a second turn and
+    // NEVER falls into the busy-session steer path (which would inject the same
+    // input into the running turn twice). Reserved before the first await so a
+    // concurrent retry cannot slip in mid-persistence.
+    const dispatchId = typeof params.dispatchId === "string" && params.dispatchId ? params.dispatchId : undefined;
+    const dispatchKey = dispatchId ? `${sessionId}:${dispatchId}` : undefined;
+    if (dispatchKey) {
+      const seen = recentDispatches.get(dispatchKey);
+      if (seen) {
+        return { ok: true, sessionId, turnId: seen.turnId, duplicate: true };
+      }
+      rememberDispatch(dispatchKey, turnId);
+    }
 
     /**
      * Report this turn's own terminal — only a delegated turn has a caller for it.
