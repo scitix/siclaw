@@ -67,8 +67,15 @@ manifest entry at a different original.
   Only the refs that do not resolve fail.
 - Any unresolved `evidence_refs` entry registers zero citations for that
   call. Retry once with only the remaining valid refs. Fail-closed is
-  reserved for unresolved refs — a correctness problem — and no longer
-  fires on breadth (see the cap bullet).
+  reserved for correctness problems — unresolved refs and the two shape
+  rules below — and no longer fires on breadth (see the cap bullet).
+- A present-but-non-array `evidence_refs` or `pages` fails the whole call
+  (pi does not validate tool params against the TypeBox schema; silently
+  coercing to `[]` reported success while dropping the misshapen half).
+- A `pages` item whose trimmed `claim` is outside 4–300 Unicode code points
+  fails the whole call, same as a missing claim — the bounds are enforced
+  at runtime, not advisory schema, or a one-character claim would let
+  padding back in.
 - `evidence_refs` and `pages` may be passed together. Marked pages must use
   `evidence_refs`; `pages` is only for pages with no parsed evidence marker.
   Each `pages` item is `{path, claim}`, where `claim` is the specific

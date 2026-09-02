@@ -87,6 +87,20 @@ describe("knowledge_cite", () => {
       expect(text).toContain("Retry knowledge_cite once");
       expect(output.details).toEqual({ cited: 0 });
     }
+
+    // A broken PATH must be diagnosed as such — "(missing claim)" on a
+    // wrong-key item sends the retry at the wrong field and loops.
+    for (const item of [
+      { page: page, claim: "The runbook documents the GPU reset procedure." },
+      { path: "   ", claim: "The runbook documents the GPU reset procedure." },
+      { path: 42, claim: "The runbook documents the GPU reset procedure." },
+    ]) {
+      const output = await support.tool.execute("call", { pages: [item] } as never);
+      const text = (output.content[0] as { text: string }).text;
+      expect(text).toContain("missing path");
+      expect(text).not.toContain("(missing claim)");
+      expect(output.details).toEqual({ cited: 0 });
+    }
     expect(events).toEqual([]);
   });
 
@@ -190,6 +204,64 @@ describe("knowledge_cite", () => {
     expect(recite.details).toEqual({ cited: 0 });
     expect((recite.content[0] as { text: string }).text).toContain("already registered this turn");
     expect(events).toHaveLength(2);
+
+    // A page that resolves to NOTHING keeps its honest no-sources message
+    // even after earlier successes — "already registered" would falsely
+    // claim it was cited.
+    const unmatched = path.join(dir, "unmatched.md");
+    fs.writeFileSync(unmatched, "---\nsources:\n  - resource: raw/none.md\n---\n# Unmatched\n");
+    readPage(support, unmatched);
+    const unresolvable = await support.tool.execute("call-4", {
+      pages: [{ path: unmatched, claim: "Unmatched page supports a side claim." }],
+    } as never);
+    expect(unresolvable.details).toEqual({ cited: 0 });
+    const unresolvableText = (unresolvable.content[0] as { text: string }).text;
+    expect(unresolvableText).toContain("no trusted clickable original sources");
+    expect(unresolvableText).not.toContain("already registered this turn");
+    expect(events).toHaveLength(2);
+  });
+
+  it("a mid-turn remount drops the registered union with the snapshots", async () => {
+    // After a knowledge hot-swap the old manifest no longer vouches for the
+    // union's originals — and a stale union would also hold the cap hostage
+    // against everything the new mount cites.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-remount-"));
+    dirs.push(dir);
+    const first = path.join(dir, "first.md");
+    const second = path.join(dir, "second.md");
+    fs.writeFileSync(first, "---\nsources:\n  - resource: raw/a.md\n---\n# First\n");
+    fs.writeFileSync(second, "---\nsources:\n  - resource: raw/b.md\n---\n# Second\n");
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({
+      version: 1,
+      repos: [{ id: "repo", root: "", sources: [
+        { resource: "a.md", title: "OLD-A", url: "https://docs.feishu.cn/wiki/old-a" },
+      ] }],
+    }));
+    const events: Array<{ sources: Array<{ title: string }> }> = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event as never),
+    });
+    readPage(support, first);
+    await support.tool.execute("call-old-mount", {
+      pages: [{ path: first, claim: "First page supports the opening claim." }],
+    } as never);
+    expect(events).toHaveLength(1);
+
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({
+      version: 1,
+      repos: [{ id: "repo", root: "", sources: [
+        { resource: "b.md", title: "NEW-B", url: "https://docs.feishu.cn/wiki/new-b" },
+      ] }],
+    }));
+    readPage(support, second);
+    const afterRemount = await support.tool.execute("call-new-mount", {
+      pages: [{ path: second, claim: "Second page supports the follow-up claim." }],
+    } as never);
+    expect(afterRemount.details).toEqual({ cited: 1 });
+    expect(events).toHaveLength(2);
+    expect(events[1].sources.map((source) => source.title)).toEqual(["NEW-B"]);
   });
 
   it.each([
@@ -735,6 +807,19 @@ ${sources.map((source) => `  - id: ${source.id}\n    resource: ${source.resource
     const emitted = (events[0] as { sources: Array<{ title: string }> }).sources;
     expect(emitted).toHaveLength(8);
     expect(emitted.map((source) => source.title)).not.toContain("Extra");
+
+    // With the cap already filled by this turn's citations, a follow-up call
+    // bringing a genuinely NEW source must say the cap is the reason — not
+    // "already registered", which would tell the model the page is cited.
+    const followUp = await support.tool.execute("call-cap-exhausted", {
+      pages: [{ path: legacy, claim: "Extra policy sets the retention window." }],
+    } as never);
+    const followUpText = (followUp.content[0] as { text: string }).text;
+    expect(followUpText).toContain("cap is already filled");
+    expect(followUpText).toContain("Extra");
+    expect(followUpText).not.toContain("already registered this turn");
+    expect(followUp.details).toEqual({ cited: 0 });
+    expect(events).toHaveLength(1);
   });
 
   it("does not treat a fenced example marker as citable evidence", async () => {

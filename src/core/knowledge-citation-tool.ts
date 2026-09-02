@@ -273,15 +273,21 @@ export function createKnowledgeCitationSupport(opts: {
       // Remount landed between the pre-Read receipt and this check.
       // The model already saw the new page bytes; drop earlier snapshots so
       // cite cannot emit the old mount for a path the model just re-read.
+      // The registered union goes with them: the old mount's manifest no
+      // longer vouches for those originals, and a stale union would also
+      // hold the cap hostage against everything the new mount cites.
       readPages.clear();
       pinnedManifest = undefined;
+      registeredThisTurn = [];
       return;
     }
     if (pinnedManifest !== undefined && !sameManifest(pinnedManifest, current)) {
       // A later consistent Read saw the new mount. Drop earlier snapshots so
-      // the model can re-read and cite in this same turn.
+      // the model can re-read and cite in this same turn — the union too,
+      // same reasoning as above.
       readPages.clear();
       pinnedManifest = current;
+      registeredThisTurn = [];
     } else if (pinnedManifest === undefined) {
       pinnedManifest = current;
     }
@@ -360,13 +366,18 @@ export function createKnowledgeCitationSupport(opts: {
           const row = item as Record<string, unknown>;
           const pagePath = typeof row.path === "string" ? row.path.trim() : "";
           const claim = typeof row.claim === "string" ? row.claim.trim() : "";
-          const label = pagePath || JSON.stringify(row).slice(0, 120);
-          if (!pagePath || !claim) {
-            invalidPages.push(`${label} (missing claim)`);
+          // Diagnose the actual broken field: reporting a wrong-key/blank/
+          // non-string path as "missing claim" sends the retry at the wrong
+          // field, which loops — and each iteration discards the call's
+          // valid evidence_refs.
+          if (!pagePath) {
+            invalidPages.push(`${JSON.stringify(row).slice(0, 120)} (missing path — each item needs a string "path" key)`);
+          } else if (!claim) {
+            invalidPages.push(`${pagePath} (missing claim)`);
           } else if ([...claim].length < 4) {
-            invalidPages.push(`${label} (claim too short — a one-word claim is not a binding)`);
+            invalidPages.push(`${pagePath} (claim too short — a one-word claim is not a binding)`);
           } else if ([...claim].length > 300) {
-            invalidPages.push(`${label} (claim too long — max 300 characters)`);
+            invalidPages.push(`${pagePath} (claim too long — max 300 characters)`);
           } else {
             pageArgs.push({ path: pagePath, claim });
           }
@@ -520,6 +531,7 @@ export function createKnowledgeCitationSupport(opts: {
       // The cap applies to the TURN's union: repeated calls cannot raise it.
       const already = new Set(registeredThisTurn.map((citation) => citation.url));
       const fresh = citations.filter((citation) => !already.has(citation.url));
+      const duplicates = citations.length - fresh.length;
       const capacity = Math.max(0, MAX_KNOWLEDGE_CITATIONS - registeredThisTurn.length);
       const overflow = fresh.length > capacity ? fresh.splice(capacity) : [];
       if (fresh.length > 0) {
@@ -533,14 +545,21 @@ export function createKnowledgeCitationSupport(opts: {
           overflow.slice(0, MAX_KNOWLEDGE_CITATIONS).map((citation) => citation.title).join(", ") +
           `${overflow.length > MAX_KNOWLEDGE_CITATIONS ? ` (+${overflow.length - MAX_KNOWLEDGE_CITATIONS} more)` : ""}.` +
           " Further calls cannot raise the ceiling; keep the strongest sources or narrow the answer.";
+      // The zero-new message must state why THIS call added nothing — "already
+      // registered" was previously chosen whenever any earlier call succeeded,
+      // which contradicted a cap-exhausted overflow note in the same string
+      // and falsely claimed unresolvable pages were cited.
+      const zeroFreshMessage = overflow.length > 0
+        ? `No new sources were registered — the ${MAX_KNOWLEDGE_CITATIONS}-source per-answer cap is already filled by this turn's earlier citations.${overflowNote}`
+        : duplicates > 0
+          ? "All resolved sources were already registered this turn; the references list is unchanged."
+          : refs.length > 0
+            ? "The evidence refs resolved but have no unique original-source links."
+            : "The selected pages have no trusted clickable original sources; answer normally without a references section.";
       return result(
         fresh.length > 0
           ? `Registered ${fresh.length} ${refs.length > 0 ? "exact " : ""}trusted original source${fresh.length === 1 ? "" : "s"}; links will be appended automatically.${overflowNote}`
-          : registeredThisTurn.length > 0
-            ? `All resolved sources were already registered this turn; the references list is unchanged.${overflowNote}`
-            : refs.length > 0
-              ? `The evidence refs resolved but have no unique original-source links.${overflowNote}`
-              : `The selected pages have no trusted clickable original sources; answer normally without a references section.${overflowNote}`,
+          : zeroFreshMessage,
         fresh.length,
         refs.length > 0 ? [] : undefined,
       );
