@@ -657,16 +657,19 @@ export function createHttpServer(
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
-  const perServerKnowledgeHandler = sessionManager.knowledgeDir
-    ? options.knowledgeHandler
-      ?? createKnowledgeHandler({
-        knowledgeDir: sessionManager.knowledgeDir,
-        afterMaterialize: () => sessionManager.syncKnowledgeIndex(),
-      })
-    : undefined;
-  if (perServerKnowledgeHandler) {
-    perServerHandlers.knowledge = perServerKnowledgeHandler;
-  }
+  // The knowledge handler is per-server UNCONDITIONALLY — never gated on
+  // sessionManager.knowledgeDir. K8s boxes leave the dir unset (materialize
+  // falls back to config.paths.knowledgeDir, identical to the module-level
+  // handler's resolution), but only this closure carries the afterMaterialize
+  // hook that re-syncs the shared label index. Behind the gate, a K8s
+  // knowledge hot update landed on disk while knowledge_search kept serving
+  // the index built at pod start until the pod recycled.
+  const perServerKnowledgeHandler = options.knowledgeHandler
+    ?? createKnowledgeHandler({
+      knowledgeDir: sessionManager.knowledgeDir,
+      afterMaterialize: () => sessionManager.syncKnowledgeIndex(),
+    });
+  perServerHandlers.knowledge = perServerKnowledgeHandler;
   if (options.mcpHandler) {
     perServerHandlers.mcp = options.mcpHandler;
   } else if (sessionManager.mcpServersState !== undefined) {
