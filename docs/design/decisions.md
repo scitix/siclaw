@@ -705,9 +705,13 @@ The complete root `index.md` is injected into the model prompt as the common
 navigation baseline. AgentBox also derives an in-memory, paginated Label Catalog
 from page frontmatter before the first turn. `knowledge_search` resolves typed
 labels and aliases only; it never searches page bodies, creates a database, or
-opens an embedding provider. It returns page metadata, matched labels, and alias
-reasons, never snippets. Labels and catalog entries never count as answer
-evidence; the Agent must still read and cite supporting pages.
+opens an embedding provider. It returns page metadata, matched labels, alias
+reasons, and one deterministic shortest route from the root catalog to each
+leaf, never snippets. A labeled page outside the root catalog graph is excluded
+and reported as unreachable. The route proves publication and reachability; it
+does not claim that the Agent read every intermediate catalog. Labels and
+catalog entries never count as answer evidence; the Agent reads and cites only
+the supporting leaf pages.
 
 **Consequences**:
 
@@ -715,6 +719,7 @@ evidence; the Agent must still read and cite supporting pages.
 - ✅ Known entities, tasks, versions, and aliases route without FTS, vectors, a database, or an embedding call.
 - ✅ The first QA turn has no content-index hydration dependency.
 - ✅ One page-level contract flows unchanged through compilation and delivery.
+- ✅ Every label result proves its canonical root-to-leaf catalog route; orphan labels cannot bypass publication.
 - ✅ Existing and third-party OKF v0.2 packages without labels navigate through the complete root index.
 - ⚠️ Label quality is a compiler-quality concern and needs later retrieval evaluation.
 - ⚠️ The full root index consumes fixed prompt tokens; KBC must keep entries concise, and any future oversized representation must remain complete rather than head-truncated.

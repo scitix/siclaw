@@ -55,6 +55,10 @@ describe("knowledge_search", () => {
 
   it("routes by page labels and returns navigation metadata instead of page body content", async () => {
     fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [B300 LSTM evaluation](b300-lstm.md) - Giga B300 operator benchmark\n",
+    );
+    fs.writeFileSync(
       path.join(knowledgeDir, "b300-lstm.md"),
       "---\ntype: Benchmark\ntitle: B300 LSTM evaluation\ndescription: Giga B300 operator benchmark\nlabels:\n" +
       "  - facet: entity\n    value: B300\n" +
@@ -77,11 +81,22 @@ describe("knowledge_search", () => {
       expect.objectContaining({ value: "CUDA Graph", matchedBy: "cudagraph" }),
     ]));
     expect(payload.results[0].labels).toHaveLength(3);
+    expect(payload.results[0].routeProof).toEqual({
+      reachable: true,
+      trail: [
+        { file: "index.md", kind: "catalog" },
+        { file: "b300-lstm.md", kind: "leaf", via: "B300 LSTM evaluation" },
+      ],
+    });
     expect(payload.results[0]).not.toHaveProperty("content");
     expect(JSON.stringify(payload)).not.toContain("29.71 ms");
   });
 
   it("ranks a page with more matching labels ahead of a generic page", async () => {
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [B300](generic-b300.md)\n- [Giga B300 LSTM](giga-b300-lstm.md)\n",
+    );
     fs.writeFileSync(
       path.join(knowledgeDir, "generic-b300.md"),
       "---\ntype: Entity\ntitle: B300\nlabels:\n  - facet: entity\n    value: B300\n---\n# B300\n",
@@ -105,7 +120,75 @@ describe("knowledge_search", () => {
     ]);
   });
 
+  it("does not route to a labeled page that is unreachable from the root catalog", async () => {
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [Published B300 guide](published.md)\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "published.md"),
+      "---\ntype: Topic\ntitle: Published B300 guide\nlabels:\n  - facet: entity\n    value: B300\n---\n# Published\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "orphan.md"),
+      "---\ntype: Topic\ntitle: Unpublished scratch page\nlabels:\n  - facet: entity\n    value: B300\n  - facet: task\n    value: LSTM benchmark\n---\n# Scratch\n",
+    );
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const result = await tool.execute("call-reachable", { query: "B300 LSTM benchmark", topK: 5 });
+    const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(payload.results.map((row: { file: string }) => row.file)).toEqual(["published.md"]);
+    expect(payload.unreachableLabeledPages).toBe(1);
+
+    const catalogResult = await tool.execute("call-reachable-catalog", { listLabels: true, limit: 100 });
+    const catalog = JSON.parse((catalogResult.content[0] as { text: string }).text);
+    expect(catalog.labels).toEqual([
+      expect.objectContaining({ facet: "entity", value: "B300", pages: ["published.md"] }),
+    ]);
+    expect(catalog.totalPages).toBe(1);
+    expect(catalog.unreachableLabeledPages).toBe(1);
+  });
+
+  it("returns the canonical multi-library catalog trail without requiring intermediate reads", async () => {
+    fs.mkdirSync(path.join(knowledgeDir, "repos", "gpu", "topics"), { recursive: true });
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [[repos/gpu/index|GPU Wiki]] - GPU evaluation and operations\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "repos", "gpu", "index.md"),
+      "# GPU Wiki\n\n- [B300 LSTM evaluation](topics/b300-lstm.md)\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "repos", "gpu", "topics", "b300-lstm.md"),
+      "---\ntype: Topic\ntitle: B300 LSTM evaluation\nlabels:\n" +
+      "  - facet: entity\n    value: B300\n" +
+      "  - facet: task\n    value: CUDA Graph optimization\n    aliases: [cudagraph]\n---\n# Result\n",
+    );
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const result = await tool.execute("call-multi-repo", { query: "B300 cudagraph" });
+    const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(payload.results[0].routeProof).toEqual({
+      reachable: true,
+      trail: [
+        { file: "index.md", kind: "catalog" },
+        { file: "repos/gpu/index.md", kind: "catalog", via: "GPU Wiki" },
+        {
+          file: "repos/gpu/topics/b300-lstm.md",
+          kind: "leaf",
+          via: "B300 LSTM evaluation",
+        },
+      ],
+    });
+  });
+
   it("lists the complete typed label catalog through the same QA tool", async () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "# Knowledge Index\n\n- [Labels](labels.md)\n");
     fs.writeFileSync(
       path.join(knowledgeDir, "labels.md"),
       "---\ntype: Topic\nlabels:\n  - facet: entity\n    value: B300\n    aliases: [GB300]\n" +

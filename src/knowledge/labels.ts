@@ -3,6 +3,8 @@ import path from "node:path";
 
 import yaml from "js-yaml";
 
+import { buildKnowledgeCatalogRoutes, type KnowledgeRouteProof } from "./catalog-graph.js";
+
 export const KNOWLEDGE_LABEL_FACETS = [
   "entity", "topic", "task", "component", "environment", "version",
 ] as const;
@@ -27,6 +29,7 @@ export interface KnowledgeLabelCatalogResult {
   totalPages: number;
   offset: number;
   hasMore: boolean;
+  unreachableLabeledPages: number;
 }
 
 export interface MatchedKnowledgeLabel {
@@ -42,12 +45,14 @@ export interface KnowledgePageCandidate {
   score: number;
   labels: KnowledgeLabel[];
   matchedLabels: MatchedKnowledgeLabel[];
+  routeProof: KnowledgeRouteProof;
 }
 
 export interface KnowledgeResolutionResult {
   pages: KnowledgePageCandidate[];
   totalPages: number;
   totalLabels: number;
+  unreachableLabeledPages: number;
 }
 
 interface KnowledgePageLabels {
@@ -154,6 +159,7 @@ function matchLabel(query: string, label: KnowledgeLabel): { score: number; matc
 export class KnowledgeLabelIndex {
   private readonly knowledgeDir: string;
   private pages = new Map<string, KnowledgePageLabels>();
+  private routes = new Map<string, KnowledgeRouteProof>();
 
   constructor(knowledgeDir: string) {
     this.knowledgeDir = path.resolve(knowledgeDir);
@@ -184,11 +190,16 @@ export class KnowledgeLabelIndex {
     };
     visit(this.knowledgeDir);
     this.pages = next;
+    this.routes = buildKnowledgeCatalogRoutes(this.knowledgeDir);
   }
 
   search(query: string, topK = 10): KnowledgeResolutionResult {
     const candidates: KnowledgePageCandidate[] = [];
+    let reachableLabeledPages = 0;
     for (const page of this.pages.values()) {
+      const routeProof = this.routes.get(page.file.replaceAll("\\", "/"));
+      if (!routeProof) continue;
+      reachableLabeledPages++;
       const matches = page.labels.flatMap((label) => {
         const match = matchLabel(query, label);
         return match ? [{ facet: label.facet, value: label.value, matchedBy: match.matchedBy, score: match.score }] : [];
@@ -201,19 +212,24 @@ export class KnowledgeLabelIndex {
         score: Math.min(1, Math.max(...matches.map((match) => match.score)) + 0.03 * (matches.length - 1)),
         labels: page.labels,
         matchedLabels: matches.map(({ facet, value, matchedBy }) => ({ facet, value, matchedBy })),
+        routeProof,
       });
     }
     candidates.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
     return {
       pages: candidates.slice(0, topK),
-      totalPages: this.pages.size,
+      totalPages: reachableLabeledPages,
       totalLabels: this.catalog({ limit: 1 }).totalLabels,
+      unreachableLabeledPages: this.pages.size - reachableLabeledPages,
     };
   }
 
   catalog(opts: { query?: string; facet?: string; offset?: number; limit?: number } = {}): KnowledgeLabelCatalogResult {
     const merged = new Map<string, KnowledgeLabelCatalogEntry>();
+    let reachableLabeledPages = 0;
     for (const page of this.pages.values()) {
+      if (!this.routes.has(page.file.replaceAll("\\", "/"))) continue;
+      reachableLabeledPages++;
       for (const label of page.labels) {
         if (opts.facet && label.facet !== opts.facet) continue;
         if (opts.query && !matchLabel(opts.query, label)) continue;
@@ -245,9 +261,10 @@ export class KnowledgeLabelIndex {
     return {
       labels: all.slice(offset, offset + limit),
       totalLabels: all.length,
-      totalPages: this.pages.size,
+      totalPages: reachableLabeledPages,
       offset,
       hasMore: offset + limit < all.length,
+      unreachableLabeledPages: this.pages.size - reachableLabeledPages,
     };
   }
 }

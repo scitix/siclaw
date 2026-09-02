@@ -40,8 +40,10 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
     description:
       "Resolve candidate knowledge pages using typed page labels and aliases only; this tool never searches page bodies. " +
       "Use it when the complete Wiki catalog leaves multiple plausible pages or the question uses alternate names, versions, or task terms. " +
-      "Set listLabels=true to inspect the package's paginated label catalog. Results are navigation metadata, not evidence: " +
-      "Read the complete relevant pages before answering, then use knowledge_cite only for pages actually used.",
+      "Each result includes a canonical routeProof showing that the leaf is reachable from the root catalog. The catalog " +
+      "steps prove navigation only; do not reread them as evidence. Set listLabels=true to inspect the package's paginated " +
+      "label catalog. Results are navigation metadata, not evidence: Read the complete relevant leaf pages before answering, " +
+      "then use knowledge_cite only for pages actually used.",
     parameters: Type.Object({
       query: Type.Optional(Type.String({ description: "Natural-language query, label alias, version, or exact term to retrieve." })),
       topK: Type.Optional(Type.Number({ description: "Maximum candidate pages to return (default 8, maximum 20)." })),
@@ -92,6 +94,7 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
           score: Math.round(page.score * 1000) / 1000,
           labels: page.labels,
           matchedLabels: page.matchedLabels,
+          routeProof: page.routeProof,
         }));
         return {
           content: [{
@@ -104,6 +107,7 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
               } : {}),
               totalPages: result.totalPages,
               totalLabels: result.totalLabels,
+              unreachableLabeledPages: result.unreachableLabeledPages,
             }, null, 2),
           }],
           details: { resultCount: results.length },
