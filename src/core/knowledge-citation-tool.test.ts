@@ -51,16 +51,37 @@ describe("knowledge_cite", () => {
     const turnRef = { current: 1 };
     const support = createKnowledgeCitationSupport({ knowledgeDir: dir, turnRef, sessionEventEmitter: (e) => events.push(e) });
     readPage(support, page);
-    const output = await support.tool.execute("call", { pages: [page] } as never);
+    const output = await support.tool.execute("call", { pages: [{ path: page, claim: "The runbook documents the GPU reset procedure." }] } as never);
     expect(output.details).toEqual({ cited: 1 });
     expect(events).toEqual([{ type: "knowledge_sources", sources: [{
       title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/abc", resource: "feishu/runbook.md", page: "guide.md",
     }] }]);
 
     turnRef.current = 2;
-    const unread = await support.tool.execute("call", { pages: [page] } as never);
+    const unread = await support.tool.execute("call", { pages: [{ path: page, claim: "The runbook documents the GPU reset procedure." }] } as never);
     expect(unread.details).toEqual({ cited: 0 });
     expect(events).toHaveLength(1);
+  });
+
+  it("rejects pages items that are not bound to a concrete claim", async () => {
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    // The legacy bare-string form and an empty claim are the same padding
+    // shape: provenance validates identically for a read-but-unused page, so
+    // the claim is the only cited-vs-read distinction the runtime can demand.
+    for (const pages of [[page], [{ path: page, claim: "" }], [{ path: page, claim: "   " }]]) {
+      const output = await support.tool.execute("call", { pages } as never);
+      expect((output.content[0] as { text: string }).text).toContain("requires { path, claim }");
+      expect(output.details).toEqual({ cited: 0 });
+    }
+    expect(events).toEqual([]);
   });
 
   it.each([
@@ -91,7 +112,9 @@ describe("knowledge_cite", () => {
     });
     readPage(support, page);
 
-    const output = await support.tool.execute("call", { pages: [rel] } as never);
+    const output = await support.tool.execute("call", {
+      pages: [{ path: rel, claim: "Navigation content referenced for routing." }],
+    } as never);
     expect((output.content[0] as { text: string }).text).toContain("Cannot cite navigation page");
     expect(output.details).toMatchObject({ cited: 0 });
     expect(events).toEqual([]);
@@ -286,7 +309,7 @@ sources:
     readPage(support, page);
     fs.rmSync(page);
 
-    await expect(support.tool.execute("call", { pages: [page] } as never)).resolves.toMatchObject({
+    await expect(support.tool.execute("call", { pages: [{ path: page, claim: "The runbook documents the GPU reset procedure." }] } as never)).resolves.toMatchObject({
       details: { cited: 1 },
     });
     expect(events).toHaveLength(1);
@@ -303,7 +326,7 @@ sources:
     readPage(support, page);
     fs.writeFileSync(page, "---\nsources: [\n---\n# Broken\n");
 
-    await expect(support.tool.execute("call", { pages: [page] } as never)).resolves.toMatchObject({
+    await expect(support.tool.execute("call", { pages: [{ path: page, claim: "The runbook documents the GPU reset procedure." }] } as never)).resolves.toMatchObject({
       details: { cited: 1 },
     });
     expect(events).toHaveLength(1);
@@ -334,7 +357,7 @@ sources:
     });
     readPage(support, page);
 
-    await expect(support.tool.execute("call", { pages: [page] } as never)).resolves.toMatchObject({
+    await expect(support.tool.execute("call", { pages: [{ path: page, claim: "The runbook documents the GPU reset procedure." }] } as never)).resolves.toMatchObject({
       details: { cited: 1 },
     });
     expect(events).toEqual([{ type: "knowledge_sources", sources: [{
@@ -456,7 +479,7 @@ sources:
 
     await expect(support.tool.execute("call", {
       evidence_refs: ["guide.md#good"],
-      pages: ["legacy.md"],
+      pages: [{ path: "legacy.md", claim: "This page supports a statement in the answer." }],
     } as never)).resolves.toMatchObject({
       details: { cited: 2, unresolved: [] },
     });
@@ -467,7 +490,7 @@ sources:
         { title: "Policy", page: "legacy.md" },
       ],
     });
-    expect(buildKnowledgeCitationSystemPrompt(dir)).toContain("pass those as `pages` in the same call");
+    expect(buildKnowledgeCitationSystemPrompt(dir)).toContain("pass each as `{path, claim}` in `pages` in the same call");
   });
 
   it("rejects citing a marked page through the legacy pages parameter", async () => {
@@ -500,7 +523,7 @@ sources:
     readPage(support, page);
 
     await expect(support.tool.execute("call", {
-      pages: ["guide.md"],
+      pages: [{ path: "guide.md", claim: "The guide documents the runbook step." }],
     } as never)).resolves.toMatchObject({
       details: { cited: 0 },
     });
@@ -593,7 +616,7 @@ ${sources.map((source) => `  - id: ${source.id}\n    resource: ${source.resource
     // cap now keeps the first 8 in input order and names what it dropped.
     const capped = await support.tool.execute("call", {
       evidence_refs: ["guide.md#all"],
-      pages: ["legacy.md"],
+      pages: [{ path: "legacy.md", claim: "This page supports a statement in the answer." }],
     } as never);
     expect(capped.details).toEqual({ cited: 8, unresolved: [] });
     const text = (capped.content[0] as { text: string }).text;

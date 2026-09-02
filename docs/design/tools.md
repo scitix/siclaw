@@ -611,7 +611,14 @@ are intentionally different:
    versions, aliases, and terms absent from embeddings.
 3. `read` loads the complete selected page before synthesis.
 4. `knowledge_cite` emits citations only for manifest-backed pages actually
-   read during the current turn.
+   read during the current turn. A whole-page (`pages`) citation additionally
+   binds the page to the specific claim it supports: provenance validation
+   cannot distinguish a cited-and-used page from a read-and-discarded one, so
+   the claim is the one materiality demand the runtime can make. Evidence refs
+   are exempt — the `okf:evidence` marker is already claim-scoped. Resolved
+   sources beyond the per-answer cap are registered up to the cap in input
+   order with the overflow named in the result, never silently dropped; only
+   genuinely unresolved refs fail the whole call.
 
 The injected catalog remains a cheap navigation hint; it is not the only
 recall surface. Knowledge materialization explicitly resyncs the index, and

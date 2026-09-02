@@ -209,12 +209,12 @@ Trusted original-source metadata is not available for this knowledge mount. Do n
     return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass those as \`pages\` in the same call. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass each as \`{path, claim}\` in \`pages\` in the same call, where claim is the one statement in your answer that page supports. Cite the minimal set — a page you read but did not use is a citation error, and a page you cannot bind to a concrete claim is a read, not a citation. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
   }
   return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-${MAX_KNOWLEDGE_CITATIONS} knowledge pages you successfully Read this turn and actually used. Do not register an index, catalog, or a page you merely inspected. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-${MAX_KNOWLEDGE_CITATIONS} knowledge pages you successfully Read this turn and actually used, each as \`{path, claim}\` where claim is the one statement in your answer that page supports. Cite the minimal set: do not register an index, catalog, or a page you merely inspected — a page you cannot bind to a concrete claim is a read, not a citation. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`;
 }
 
 function findCitationRepo(manifest: CitationManifest, rel: string): CitationManifestRepo | undefined {
@@ -288,7 +288,9 @@ export function createKnowledgeCitationSupport(opts: {
     renderResult: renderTextResult,
     description:
       "Use only when the current system prompt says knowledge source citations are available. " +
-      "Register the exact evidence refs that materially support your final answer, and unmarked pages if needed. " +
+      "Register the exact evidence refs that materially support your final answer, and unmarked pages if needed — " +
+      "each page bound to the specific claim it supports. Cite the minimal set: a page you read but did not use " +
+      "is a citation error, not thoroughness. " +
       "Call once, immediately before the final answer. If the tool reports unresolved refs, retry once with only the remaining valid refs. " +
       "The runtime validates frozen original-source metadata and appends trusted links; never invent or copy source URLs yourself. " +
       `At most ${MAX_KNOWLEDGE_CITATIONS} unique original sources are registered per call, in the order given; any overflow is named in the result, never silently dropped.`,
@@ -298,10 +300,17 @@ export function createKnowledgeCitationSupport(opts: {
         maxItems: MAX_KNOWLEDGE_CITATIONS,
         description: `Evidence refs from read knowledge sections, in page.md#evidence-id form (1-${MAX_KNOWLEDGE_CITATIONS}).`,
       })),
-      pages: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+      pages: Type.Optional(Type.Array(Type.Object({
+        path: Type.String({ minLength: 1, description: "Knowledge page path actually used." }),
+        claim: Type.String({
+          minLength: 4,
+          maxLength: 300,
+          description: "The specific statement in your final answer that this page supports.",
+        }),
+      }), {
         minItems: 1,
         maxItems: MAX_KNOWLEDGE_CITATIONS,
-        description: `Unmarked knowledge pages actually used (1-${MAX_KNOWLEDGE_CITATIONS}). May be combined with evidence_refs.`,
+        description: `Unmarked knowledge pages actually used (1-${MAX_KNOWLEDGE_CITATIONS}), each bound to the claim it supports. May be combined with evidence_refs.`,
       })),
     }),
     async execute(_toolCallId, rawParams) {
@@ -311,7 +320,35 @@ export function createKnowledgeCitationSupport(opts: {
       if (!manifest) return result("No trusted original-source metadata is available for this knowledge mount.", 0);
       const params = rawParams as { evidence_refs?: unknown; pages?: unknown };
       const refs = Array.isArray(params.evidence_refs) ? params.evidence_refs.map(String) : [];
-      const pageArgs = Array.isArray(params.pages) ? params.pages.map(String) : [];
+      // A whole-page citation is the coarse instrument (evidence refs are
+      // already claim-scoped by their marker), and provenance validation alone
+      // makes padding free — every read-but-unused page validates identically
+      // to a load-bearing one. The one cited-vs-read distinction the runtime
+      // can demand is that the caller states WHAT the page contributed: a page
+      // the model cannot bind to a concrete claim is a read, not a citation.
+      const rawPages = Array.isArray(params.pages) ? params.pages : [];
+      const pageArgs: Array<{ path: string; claim: string }> = [];
+      const claimless: string[] = [];
+      for (const item of rawPages) {
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          const row = item as Record<string, unknown>;
+          const pagePath = typeof row.path === "string" ? row.path.trim() : "";
+          const claim = typeof row.claim === "string" ? row.claim.trim() : "";
+          if (pagePath && claim) {
+            pageArgs.push({ path: pagePath, claim });
+            continue;
+          }
+          claimless.push(pagePath || JSON.stringify(row).slice(0, 120));
+        } else {
+          claimless.push(String(item));
+        }
+      }
+      if (claimless.length > 0) {
+        return result(
+          `Each pages item requires { path, claim } — claim is the specific statement in your final answer that the page supports. Missing or empty claim for: ${claimless.join(", ")}. A page you cannot bind to a concrete claim is a read, not a citation; drop it or use evidence_refs.`,
+          0,
+        );
+      }
       if (refs.length === 0 && pageArgs.length === 0) {
         return result("knowledge_cite requires evidence_refs and/or pages.", 0);
       }
@@ -399,10 +436,8 @@ export function createKnowledgeCitationSupport(opts: {
       }
 
       if (pageArgs.length > 0) {
-        const selected = pageArgs.map((raw) => {
-          const value = String(raw);
-          return path.resolve(path.isAbsolute(value) ? value : path.join(opts.knowledgeDir, value));
-        });
+        const selected = pageArgs.map(({ path: value }) =>
+          path.resolve(path.isAbsolute(value) ? value : path.join(opts.knowledgeDir, value)));
         const unread = selected.find((page) => !readPages.has(page));
         if (unread) return result(`Cannot cite unread knowledge page: ${unread}`, 0);
         const navigationPage = selected.find((page) => {
