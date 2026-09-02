@@ -24,13 +24,69 @@ export function shellEscape(arg: string): string {
   return "'" + arg.replace(/'/g, "'\\''") + "'";
 }
 
+/** One parsed argument, plus whether the shell will rewrite it before the command sees it. */
+export interface ParsedArg {
+  value: string;
+  /**
+   * The first metacharacter that is ACTIVE in this argument — one the shell will act on — or
+   * undefined when the argument reaches the command exactly as written.
+   *
+   * "Active" is a per-character property, not a per-argument one, because quoting is applied per
+   * character: in `'$CRED'/clusters/*` the `$` is inert and the `*` is not. See
+   * `docs/design/2026-09-02-exec-classification-and-operand-quoting.md` for why this is the right
+   * question to ask of a stdin-only command's expression.
+   */
+  expansion?: string;
+}
+
+/** Metacharacters the shell acts on only when they are UNQUOTED. Double quotes suppress all of these. */
+const GLOB_METACHARS = new Set(["*", "?", "[", "]", "{", "}", "~"]);
+
+/**
+ * Would `$` here begin an expansion?
+ *
+ * A `$` is only special when something expandable follows: a name, a brace, a paren, or one of the
+ * special parameters. A trailing `$` is a literal — which matters more than it sounds, because
+ * `grep "error$"` and `grep "^$"` are two of the most common things anyone greps for, and treating
+ * every `$` in double quotes as live refuses both.
+ */
+function beginsExpansion(next: string | undefined): boolean {
+  return next !== undefined && /[A-Za-z_{(@*#?\-$!0-9]/.test(next);
+}
+
+/**
+ * Which metacharacter, if any, is live at this position.
+ *
+ * `inQuote` is the state machine's own mode: `'` and the `$'…'` sentinel suppress everything, while
+ * double quotes suppress globbing but NOT parameter or command substitution — `"$HOME/x"` really
+ * does become a path. Characters reached through a backslash never reach here at all; the caller
+ * appends them directly, which is what makes `"\$HOME"` a literal.
+ */
+function activeMetachar(ch: string, next: string | undefined, inQuote: string | null): string | null {
+  if (inQuote === "'" || inQuote === "\u0001") return null;
+  if (ch === "$") return beginsExpansion(next) ? "$" : null;
+  // Backticks are rejected outright by validateShellOperators, so this arm never fires today. It is
+  // here so the rule reads completely, not as a defence anything relies on.
+  if (ch === "`") return "`";
+  if (GLOB_METACHARS.has(ch)) return inQuote === null ? ch : null;
+  return null;
+}
+
 /**
  * Parse a command string into an array of arguments, respecting quotes.
  * Moved from kubectl.ts to be shared.
+ *
+ * Callers that need to know whether the SHELL will rewrite an argument want
+ * `parseArgsWithExpansion`; this wrapper exists because most callers only want the values.
  */
 export function parseArgs(command: string): string[] {
-  const args: string[] = [];
+  return parseArgsWithExpansion(command).map((a) => a.value);
+}
+
+export function parseArgsWithExpansion(command: string): ParsedArg[] {
+  const args: ParsedArg[] = [];
   let current = "";
+  let expansion: string | undefined;
   let inQuote: string | null = null;
   // An explicitly quoted argument survives even when it is EMPTY. Dropping it silently renumbered
   // every positional after it: `grep "" .siclaw/*/*/*` arrived as ["grep", ".siclaw/*/*/*"], so the
@@ -38,9 +94,10 @@ export function parseArgs(command: string): string[] {
   // passes the empty pattern through and grep prints every line of the files behind the glob.
   let quotedEmpty = false;
   const flush = () => {
-    if (current || quotedEmpty) args.push(current);
+    if (current || quotedEmpty) args.push(expansion === undefined ? { value: current } : { value: current, expansion });
     current = "";
     quotedEmpty = false;
+    expansion = undefined;
   };
   const chars = [...command];
   for (let i = 0; i < chars.length; i++) {
@@ -55,6 +112,7 @@ export function parseArgs(command: string): string[] {
       if (ch === inQuote || (inQuote === "\u0001" && ch === "'")) {
         inQuote = null;
       } else {
+        expansion ??= activeMetachar(ch, chars[i + 1], inQuote) ?? undefined;
         current += ch;
       }
     } else if (ch === "$" && chars[i + 1] === "'") {
@@ -76,6 +134,7 @@ export function parseArgs(command: string): string[] {
     } else if (ch === " " || ch === "\t") {
       flush();
     } else {
+      expansion ??= activeMetachar(ch, chars[i + 1], inQuote) ?? undefined;
       current += ch;
     }
   }
@@ -258,8 +317,26 @@ interface InternalRule {
    * Flags whose value may begin with "-" (a negative number). Only consulted to stop the value being
    * validated as a flag — see the note in validateByRule.
    */
+  /**
+   * Flags after which a value beginning with `-` is a VALUE and not a flag (`journalctl -b -1`).
+   *
+   * Narrower than it sounds, and NOT the same field as `TextExpressionArgs.valueFlags` further down
+   * this file, which answers "how many tokens does this flag consume" for the stdin-only layer. This
+   * one only suppresses the flag-shaped reading of a negative number.
+   */
   valueFlags?: readonly string[];
   blockedFlags?: string[];
+  /**
+   * Values that turn an otherwise-permitted flag into a blocked one.
+   *
+   *
+   * `blockedFlags` names a SWITCH, which is not always where the capability lives: GNU grep spells
+   * recursion both `-r` and `-d recurse`, so blocking only the former left the identical capability
+   * one synonym away — and a recursive grep started at `.` walks into the credential tree without
+   * the command ever naming a path, which is the one thing the stdin-only operand rules exist to
+   * prevent. Keyed by a Map because both the flag and the value come from the caller.
+   */
+  blockedFlagValues?: ReadonlyMap<string, readonly string[]>;
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
   positionals?: "allow" | "block" | number;
@@ -367,9 +444,14 @@ function validateByRule(
     // blockedFlags: explicitly forbidden flags (checked before allowedFlags)
     if (rule.blockedFlags) {
       if (arg.startsWith("--")) {
-        if (rule.blockedFlags.includes(extractFlag(arg))) {
+        const named = extractFlag(arg);
+        const blocked = rule.blockedFlags.includes(named)
+          ? named
+          : blockedLongAbbrev(named, rule.blockedFlags);
+        if (blocked) {
           return JSON.stringify({
-            error: `${cmd} "${extractFlag(arg)}" is not allowed.`,
+            error: `${cmd} "${named}" is not allowed`
+              + (blocked === named ? "." : ` — the shell's option parser reads it as "${blocked}".`),
           }, null, 2);
         }
       } else if (arg.length > 1) {
@@ -380,6 +462,30 @@ function validateByRule(
               error: `${cmd} "-${ch}" is not allowed.`,
             }, null, 2);
           }
+        }
+      }
+    }
+
+    // blockedFlagValues: the flag is fine, this value is not. Handles all three spellings the shell
+    // allows for a value — `--directories=recurse`, `-d recurse` and `-drecurse`.
+    if (rule.blockedFlagValues && arg.startsWith("-")) {
+      const named = extractFlag(arg);
+      const flag = rule.blockedFlagValues.has(named)
+        ? named
+        : blockedLongAbbrev(named, rule.blockedFlagValues.keys()) ?? named;
+      const banned = rule.blockedFlagValues.get(flag);
+      if (banned) {
+        // Sliced by the length of what was WRITTEN, not of the canonical flag it resolves to:
+        // `--di=recurse` is 12 characters and `--directories` is 13, so slicing by the canonical
+        // length yielded "" and the check fell through to the next token. `--directorie=recurse`
+        // happened to survive that bug because the two lengths differed by exactly one.
+        const attached = arg.length > named.length ? arg.slice(named.length).replace(/^=/, "") : "";
+        const value = attached || args[i + 1] || "";
+        if (banned.includes(value.toLowerCase())) {
+          return JSON.stringify({
+            error: `${cmd} "${flag} ${value}" is not allowed — it is the same capability as the blocked `
+              + `flags on this command, spelled differently.`,
+          }, null, 2);
         }
       }
     }
@@ -1078,6 +1184,20 @@ function validateTee(args: string[]): string | null {
  */
 interface TextExpressionArgs {
   /**
+   * Flags that CONSUME following tokens, mapped to how many. Distinct from `shortValueFlags`, which
+   * is about a value ATTACHED inside a short-option cluster (`-ie.`); this is the separated form.
+   *
+   * Not to be confused with `CommandDef.valueFlags` in this same file, which answers a narrower
+   * question — "may a value beginning with `-` follow this flag" — and is consulted by the general
+   * flag validator, not here.
+   *
+   * Without it the value was read as a positional and spent the expression quota: `grep -m 5 PATTERN`
+   * treated `5` as the pattern, so the real pattern was screened as a file operand and every regex
+   * containing a metacharacter was refused. `jq --arg NAME VALUE` consumes two, which is why this is
+   * an arity rather than a set.
+   */
+  valueFlags?: ReadonlyMap<string, number>;
+  /**
    * Single-letter options that CONSUME a value, in getopt terms. Needed because a short-option cluster
    * carries its value inline from the FIRST value-taking letter onward: grep reads `-ie.` as
    * `-i -e '.'`, and `-ifoo` as `-i -f oo` — a pattern FILE, not "-i plus a pattern".
@@ -1099,10 +1219,20 @@ interface TextExpressionArgs {
   fileFlags?: readonly string[];
 }
 
+const GREP_VALUE_FLAGS = new Map<string, number>([
+  ["-m", 1], ["--max-count", 1],
+  ["-A", 1], ["--after-context", 1],
+  ["-B", 1], ["--before-context", 1],
+  ["-C", 1], ["--context", 1],
+  ["-d", 1], ["--directories", 1],
+  ["-D", 1], ["--devices", 1],
+]);
+
 const GREP_EXPRESSION_ARGS: TextExpressionArgs = {
   positionals: 1,
   patternFlags: ["-e", "--regexp"],
   fileFlags: ["-f", "--file"],
+  valueFlags: GREP_VALUE_FLAGS,
   // e=pattern f=pattern-file m=max-count A/B/C=context d=directories D=devices
   shortValueFlags: ["e", "f", "m", "A", "B", "C", "d", "D"],
 };
@@ -1113,8 +1243,10 @@ const TEXT_EXPRESSION_ARGS = new Map<string, TextExpressionArgs>([
   ["grep", GREP_EXPRESSION_ARGS],
   ["egrep", GREP_EXPRESSION_ARGS],
   ["fgrep", GREP_EXPRESSION_ARGS],
-  ["jq", { positionals: 1, fileFlags: ["-f", "--from-file", "--rawfile", "--slurpfile"], shortValueFlags: ["f"] }],
-  ["yq", { positionals: 1, fileFlags: ["--from-file"], shortValueFlags: ["o", "p"] }],
+  ["jq", { positionals: 1, fileFlags: ["-f", "--from-file", "--rawfile", "--slurpfile"], shortValueFlags: ["f"],
+    valueFlags: new Map([["--arg", 2], ["--argjson", 2], ["--indent", 1]]) }],
+  ["yq", { positionals: 1, fileFlags: ["--from-file"], shortValueFlags: ["o", "p"],
+    valueFlags: new Map([["-o", 1], ["--output-format", 1], ["-p", 1], ["--input-format", 1], ["-I", 1], ["--indent", 1]]) }],
   ["wc", { positionals: 0, fileFlags: ["--files0-from"] }],
   ["sort", { positionals: 0, fileFlags: ["--files0-from"] }],
   ["tr", { positionals: 2 }],
@@ -1155,6 +1287,49 @@ const TEXT_EXPRESSION_ARGS = new Map<string, TextExpressionArgs>([
  */
 const TEXT_OPERAND_FORBIDDEN = /[/*?[\]{}~`]|\$/;
 
+/**
+ * An expression the SHELL will rewrite before the command ever sees it.
+ *
+ * The expression slot — grep's pattern, jq's filter, tr's SETs — is exempt from the operand rule
+ * because a regex legitimately contains `$`, `[` and `/`. That exemption was total, so an UNQUOTED
+ * glob placed there was exempt too: a downward glob into the credential tree reaches grep as an
+ * expanded list of paths, the first becoming the pattern and the rest becoming files it reads.
+ *
+ * Quoting is the discriminator, not shape: a quoted `a.*b` cannot expand, a bare glob must. That also
+ * makes the refusal actionable, which is why the hint carries the corrected command rather than a
+ * rule — an unquoted regex is a latent bug in its own right, since a matching filename in the
+ * working directory silently replaces the pattern.
+ */
+function rejectUnquotedExpansion(baseName: string, arg: string, expansion: string | undefined): string | null {
+  if (!expansion) return null;
+  return JSON.stringify({
+    error: `${baseName} expression "${arg}" contains an unquoted "${expansion}", which the shell expands `
+      + `into file names before ${baseName} runs — so this would be a list of paths, not a pattern.`,
+    matched: expansion,
+    rejected_by: "unquoted_expansion",
+    hint: `Quote the expression so the shell passes it through literally: ${baseName} ... '${arg}'`,
+  }, null, 2);
+}
+
+/**
+ * The blocked long option this one abbreviates, if any.
+ *
+ * `getopt_long` accepts any unambiguous PREFIX, so a denylist keyed on full spellings is two
+ * characters away from useless: real GNU grep 3.8 runs `--recursi` as `--recursive` and
+ * `--di=recurse` as `--directories=recurse`. Measured in the agentbox base image, not assumed.
+ *
+ * Resolution is deliberately one-sided — it only ever maps an abbreviation ONTO something already
+ * blocked, so an ambiguous prefix that real grep would refuse anyway is refused here too, while a
+ * prefix that cannot mean a blocked flag (`--reg` for `--regexp`) is untouched.
+ */
+function blockedLongAbbrev(flag: string, blocked: Iterable<string>): string | null {
+  if (!flag.startsWith("--") || flag.length <= 2) return null;
+  for (const candidate of blocked) {
+    if (candidate.startsWith("--") && candidate !== flag && candidate.startsWith(flag)) return candidate;
+  }
+  return null;
+}
+
 function rejectPathishOperand(baseName: string, arg: string, what: string): string | null {
   const bare = arg.replace(/["']/g, "");
   if (!TEXT_OPERAND_FORBIDDEN.test(bare)) return null;
@@ -1172,11 +1347,12 @@ function rejectPathishOperand(baseName: string, arg: string, what: string): stri
  */
 function applyContextPolicy(
   baseName: string,
-  args: string[],
+  parsed: ParsedArg[],
   context: string | undefined,
   piped: boolean | undefined,
 ): string | null {
   if (!context) return null;
+  const args = parsed.map((a) => a.value);
   const def = getCommandDef(baseName);
   if (!def) return null;
   const policy = CONTEXT_POLICIES[context];
@@ -1190,15 +1366,43 @@ function applyContextPolicy(
       }, null, 2);
     }
     // noFilePaths (implicit): no operand, and no flag value, may name a path.
+    //
+    // Two different questions are asked here, of two different sets of arguments, and keeping them
+    // apart is what makes this safe to relax:
+    //
+    //   Q1  will the SHELL turn this into a path?      — asked of the EXPRESSION slot only
+    //   Q2  does this argument name a file?            — asked of everything else, unchanged
+    //
+    // Q1 is new. The expression slot used to be exempt from everything, which is how an unquoted
+    // glob reached grep as a list of files. Q2 is untouched, and needs no Q1 of its own: its
+    // character class is a strict superset of the expansion metacharacters AND it matches after
+    // quotes are stripped, so anything Q1 would catch there is already refused.
     const spec = TEXT_EXPRESSION_ARGS.get(baseName);
     let expressionsLeft = spec?.positionals ?? 0;
     let expressionValueFollows = false;
-    for (let i = 1; i < args.length; i++) {
-      const arg = args[i];
+    let plainValuesLeft = 0;
+    let plainValueFlag = "";
+    for (let i = 1; i < parsed.length; i++) {
+      const { value: arg, expansion } = parsed[i];
 
       // The value of a pattern-supplying flag is an expression, not a path — `grep -e 'foo$bar'`
-      // and `grep -e '/var/log/pods'` are ordinary regexes and must not be screened as operands.
-      if (expressionValueFollows) { expressionValueFollows = false; continue; }
+      // and `grep -e '/var/log/pods'` are ordinary regexes. Exempt from Q2, subject to Q1.
+      if (expressionValueFollows) {
+        expressionValueFollows = false;
+        const err = rejectUnquotedExpansion(baseName, arg, expansion);
+        if (err) return err;
+        continue;
+      }
+
+      // A value-flag's value is neither an expression nor a positional. CONSUMING it is what stops
+      // `grep -m 5 PATTERN` from spending the pattern quota on `5`; SCREENING it is what stops
+      // `grep -m /etc/shadow` from hiding a path there. Both halves are load-bearing.
+      if (plainValuesLeft > 0) {
+        plainValuesLeft--;
+        const err = rejectPathishOperand(baseName, arg, `flag value for "${plainValueFlag}"`);
+        if (err) return err;
+        continue;
+      }
 
       // `-` means stdin, which is the only input these commands are supposed to have.
       if (arg === "-") continue;
@@ -1207,8 +1411,7 @@ function applyContextPolicy(
         // Short options cluster, and the value belongs to the FIRST letter that takes one: grep reads
         // `-ie.` as `-i -e '.'` and `-ifoo` as `-i -f oo`. extractFlag only splits on `=`, and an
         // earlier revision only examined the letter at position 1 — so `-ie.` read as an unknown
-        // boolean, the expression quota stayed unspent, and `grep -ie. .siclaw/*/*/*` was accepted.
-        // It prints every line of the credential files behind that glob.
+        // boolean, the expression quota stayed unspent, and a credential glob behind it was accepted.
         let flag = extractFlag(arg);
         let inlineValue = arg.length > flag.length ? arg.slice(flag.length).replace(/^=/, "") : "";
         if (!inlineValue && !arg.startsWith("--") && arg.length > 2 && spec?.shortValueFlags) {
@@ -1229,7 +1432,17 @@ function applyContextPolicy(
         if (spec?.patternFlags?.includes(flag)) {
           // The pattern came from the flag, so no positional is the expression any more.
           expressionsLeft = 0;
-          if (!inlineValue) expressionValueFollows = true;
+          if (!inlineValue) { expressionValueFollows = true; continue; }
+          // An attached pattern (`-e.siclaw/…`) is still an expression, and still must not expand.
+          const err = rejectUnquotedExpansion(baseName, arg, expansion);
+          if (err) return err;
+          continue;
+        }
+
+        const arity = spec?.valueFlags?.get(flag);
+        if (arity !== undefined && !inlineValue) {
+          plainValuesLeft = arity;
+          plainValueFlag = flag;
           continue;
         }
 
@@ -1242,7 +1455,12 @@ function applyContextPolicy(
         continue;
       }
 
-      if (expressionsLeft > 0) { expressionsLeft--; continue; }
+      if (expressionsLeft > 0) {
+        expressionsLeft--;
+        const err = rejectUnquotedExpansion(baseName, arg, expansion);
+        if (err) return err;
+        continue;
+      }
       const err = rejectPathishOperand(baseName, arg, "file operand");
       if (err) return err;
     }
@@ -1285,7 +1503,7 @@ function applyCommandConstraints(
   args: string[],
   def: CommandDef,
 ): string | null {
-  const hasDeclarative = def.blockedFlags || def.allowedFlags ||
+  const hasDeclarative = def.blockedFlags || def.blockedFlagValues || def.allowedFlags ||
     def.allowedSubcommands || def.positionals || def.requiredFlags || def.valueFlags;
 
   // Custom validator takes priority (escape hatch for complex commands)
@@ -1307,6 +1525,7 @@ function applyCommandConstraints(
   return validateByRule(args, {
     command: baseName,
     blockedFlags: def.blockedFlags,
+    blockedFlagValues: def.blockedFlagValues,
     allowedFlags: def.allowedFlags,
     allowedSubcommands: def.allowedSubcommands,
     positionals: def.positionals,
@@ -1378,7 +1597,8 @@ export function validateCommandRestrictions(
   cmd: string,
   options?: { context?: string; piped?: boolean },
 ): string | null {
-  const args = parseArgs(cmd);
+  const parsed = parseArgsWithExpansion(cmd);
+  const args = parsed.map((a) => a.value);
   if (args.length === 0) return null;
 
   const baseName = args[0].split("/").pop()?.toLowerCase() ?? "";
@@ -1386,7 +1606,7 @@ export function validateCommandRestrictions(
   if (!def) return null;
 
   // 1. Context policy constraints (pipeOnly, categoryBlockedFlags)
-  const ctxErr = applyContextPolicy(baseName, args, options?.context, options?.piped);
+  const ctxErr = applyContextPolicy(baseName, parsed, options?.context, options?.piped);
   if (ctxErr) return ctxErr;
 
   // 2. Write switches, BEFORE any per-command validator or allowedSubcommands match. Both of those
@@ -1785,6 +2005,17 @@ export type CommandCategory =
 export interface CommandDef {
   category: CommandCategory;
   blockedFlags?: string[];
+  /**
+   * Values that turn an otherwise-permitted flag into a blocked one.
+   *
+   *
+   * `blockedFlags` names a SWITCH, which is not always where the capability lives: GNU grep spells
+   * recursion both `-r` and `-d recurse`, so blocking only the former left the identical capability
+   * one synonym away — and a recursive grep started at `.` walks into the credential tree without
+   * the command ever naming a path, which is the one thing the stdin-only operand rules exist to
+   * prevent. Keyed by a Map because both the flag and the value come from the caller.
+   */
+  blockedFlagValues?: ReadonlyMap<string, readonly string[]>;
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
   positionals?: "allow" | "block" | number;
@@ -1805,9 +2036,12 @@ export interface CommandDef {
  */
 export const COMMANDS: Record<string, CommandDef> = {
   // ── text processing ──
-  grep:   { category: "text", blockedFlags: ["-r", "-R", "--recursive"] },
-  egrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"] },
-  fgrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"] },
+  grep:   { category: "text", blockedFlags: ["-r", "-R", "--recursive"],
+    blockedFlagValues: new Map([["-d", ["recurse"]], ["--directories", ["recurse"]]]) },
+  egrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"],
+    blockedFlagValues: new Map([["-d", ["recurse"]], ["--directories", ["recurse"]]]) },
+  fgrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"],
+    blockedFlagValues: new Map([["-d", ["recurse"]], ["--directories", ["recurse"]]]) },
   sort:   { category: "text", allowedFlags: [
     "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
     "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",

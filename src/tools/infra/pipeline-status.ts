@@ -22,16 +22,21 @@
  *
  * WHAT IS NOT COVERED, stated rather than implied: `;` and `&&` chains. PIPESTATUS describes the last
  * pipeline only, so a chain still reports one status. Attributing a chain needs per-command traps, which
- * is a different mechanism.
+ * is a different mechanism — and `alignPipelineStages` therefore refuses to name a stage whenever it
+ * cannot tell which pipeline of such a chain the statuses came from.
  */
+
+import { extractPipeline, type PipelineSegment } from "./command-validator.js";
+import { getCommandBinary } from "./command-sets.js";
 
 /** Unlikely to occur in real output, and checked for before use. */
 const SENTINEL = "__siclaw_pipe_status_9f3c__";
 
 /** Does this command have stages whose individual status is not visible in the exit code? */
 export function hasPipeline(command: string): boolean {
-  // A `|` that is not `||`. Deliberately crude: a `|` inside quotes gives a false positive, and the
-  // cost of that is one harmless extra line of instrumentation, never a changed result.
+  // A `|` that is not `||`. Deliberately crude, and safe to be: a `|` inside quotes gives a false
+  // positive, whose only cost is one harmless extra line of instrumentation. Nothing here decides a
+  // verdict — that is `alignPipelineStages`, which uses the real quote-aware splitter.
   return /(^|[^|])\|([^|]|$)/.test(command);
 }
 
@@ -86,21 +91,101 @@ export function extractPipelineStatus(stdout: string): PipelineStatus {
   return { stdout: head + tail, statuses };
 }
 
-/** Commands that stop reading on purpose, making SIGPIPE upstream the normal end of the pipeline. */
-const EARLY_EXIT_CONSUMERS = new Set(["head", "tail"]);
-
-/** Is stage `i` a SIGPIPE caused by the NEXT stage closing the pipe deliberately? */
-export function isExpectedSigpipe(statuses: number[], index: number, stageCommands: string[]): boolean {
+/**
+ * Is stage `i` a SIGPIPE that the pipeline's own shape explains?
+ *
+ * SIGPIPE reaches a writer only when the READ end closed, so the statuses DOWNSTREAM answer the
+ * question without anyone naming a command: if the pipeline ends in a stage that closed early and
+ * then finished normally, every 141 above it is that closure, which is exactly how `head`, `grep -q`
+ * and `grep -m N` end a pipeline. A non-zero, non-SIGPIPE status down there is the real failure, and
+ * the branch that reports it takes precedence.
+ *
+ * The walk past consecutive 141s is not defensive padding: **SIGPIPE CASCADES.** When the consumer at
+ * the end of a long pipeline stops reading, EVERY stage above it is killed, not just the one feeding
+ * it — `seq … | cat | head -1` and `seq … | grep -v zzz | head -1` both report [141, 141, 0] in real
+ * bash. Looking only at the adjacent stage read the first 141 as an ordinary failure, so
+ * `kubectl logs pod | grep -v noise | head -20` — one of the commonest shapes there is — was reported
+ * as `pipeline_upstream_failed`, carrying the very sentence this change set exists to delete.
+ *
+ * This used to consult the next stage's TEXT and check it against a list of early-exit consumers,
+ * which made a benign SIGPIPE depend on the stage text lining up with `PIPESTATUS` — the alignment
+ * that `alignPipelineStages` cannot always deliver. Deriving it from the statuses alone removes that
+ * dependency: the judgment survives even when the text cannot be attributed at all.
+ */
+export function isBenignSigpipe(statuses: number[], index: number): boolean {
   if (statuses[index] !== 141) return false;
-  const next = stageCommands[index + 1];
-  if (!next) return false;
-  const bin = next.trim().split(/\s+/)[0]?.split("/").pop()?.toLowerCase() ?? "";
-  // `grep -q` and `grep -m N` also stop early; a bare grep reads to the end.
-  if (bin.endsWith("grep")) return /\s-\w*q|\s-m\s*\d/.test(next);
-  return EARLY_EXIT_CONSUMERS.has(bin);
+  let i = index + 1;
+  while (i < statuses.length && statuses[i] === 141) i++;
+  // Running off the end means everything downstream was killed too, so nothing closed the pipe on
+  // purpose — that is the truncation case, and it is not this function's to bless.
+  return i < statuses.length && statuses[i] === 0;
 }
 
-/** Split a command into its pipeline stages. Crude on quoted `|`, and only ever used for labelling. */
-export function pipelineStages(command: string): string[] {
-  return command.split(/(?<!\|)\|(?!\|)/).map((s) => s.trim()).filter(Boolean);
+/** One stage's status together with the command that produced it. */
+export interface AlignedStage {
+  status: number;
+  /** The stage's command text, as written. */
+  command: string;
+  /** Its base binary, lower-cased — `LC_ALL=C /bin/grep -c x` gives `grep`. */
+  binary: string;
+}
+
+/**
+ * Pair each status with the command that produced it, or return null when that cannot be done
+ * honestly.
+ *
+ * `PIPESTATUS` describes ONE pipeline — the last one bash actually executed — while the command text
+ * may hold several, joined by `;`, `&`, `&&` or `||`. Splitting the text on `|` and indexing it with
+ * a status subscript is how a status came to be attributed to a command that never ran: a real trace
+ * reported `stage 1/2 (echo) exited 141` for a pipeline whose stages were `kubectl` and `grep`.
+ *
+ * Alignment therefore has to answer "which pipeline do these statuses belong to", and it can only
+ * ever be sure when one candidate fits:
+ *
+ *   1. Segments come from `extractPipeline`, which respects quotes, `$'…'`, backslash escapes and
+ *      parentheses — so a `|` inside a grep alternation (`'a|b'`) no longer splits anything. That
+ *      one splitter is shared with command validation rather than reimplemented here.
+ *   2. Segments are grouped into pipelines: a segment that was not preceded by `|` starts a new one.
+ *   3. Candidates for "the pipeline that ran last": the final group always is. If a group was
+ *      entered through `&&` or `||`, it may have been short-circuited, so the group before it is a
+ *      candidate too, transitively. `;`, `&` and the start of the command are unconditional, so the
+ *      walk stops there.
+ *   4. Exactly one candidate whose length matches the status count wins. Anything else — no match,
+ *      or two equally plausible ones — is null.
+ *
+ * Returning null is not a failure mode to design around; it is the honest answer, and every caller
+ * must degrade rather than guess. What must NOT be done is taking the last N segments: for
+ * `echo a | grep -q zzz && echo yes` the statuses are `[0, 1]` and the trailing two segments are
+ * `grep -q zzz` and `echo yes`, which has the right LENGTH and the wrong MEANING — the length check
+ * would then certify a mapping that is entirely wrong.
+ */
+export function alignPipelineStages(command: string, statuses: number[]): AlignedStage[] | null {
+  if (statuses.length === 0) return null;
+  const segments = extractPipeline(command);
+  if (segments.length === 0) return null;
+
+  // (2) group by pipeline
+  const groups: PipelineSegment[][] = [];
+  for (const seg of segments) {
+    if (!seg.piped || groups.length === 0) groups.push([seg]);
+    else groups[groups.length - 1].push(seg);
+  }
+
+  // (3) which groups could be the last one executed
+  const candidates: PipelineSegment[][] = [];
+  for (let g = groups.length - 1; g >= 0; g--) {
+    candidates.push(groups[g]);
+    const enteredBy = groups[g][0]?.sep;
+    if (enteredBy !== "&&" && enteredBy !== "||") break;
+  }
+
+  // (4) exactly one of them must fit the status count
+  const fitting = candidates.filter((g) => g.length === statuses.length);
+  if (fitting.length !== 1) return null;
+
+  return fitting[0].map((seg, i) => ({
+    status: statuses[i],
+    command: seg.command,
+    binary: getCommandBinary(seg.command).toLowerCase(),
+  }));
 }

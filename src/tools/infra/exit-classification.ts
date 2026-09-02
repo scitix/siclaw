@@ -21,7 +21,7 @@
  */
 
 import { getCommandBinary } from "./command-sets.js";
-import { isExpectedSigpipe, pipelineStages } from "./pipeline-status.js";
+import { alignPipelineStages, isBenignSigpipe } from "./pipeline-status.js";
 
 export type ExitClass =
   | "success"
@@ -203,20 +203,42 @@ export function classifyExit(opts: {
   // Placed FIRST because it can overturn the exit code in both directions, which is the whole point:
   // the exit code is the last stage's, and the last stage is often not the one that matters.
   if (pipeStatuses && pipeStatuses.length > 1) {
-    const stages = pipelineStages(command);
+    // Statuses paired with their commands, or null when the pairing cannot be made honestly (a
+    // `&&`/`||` chain where two pipelines fit the status count equally well). Null is not an error
+    // path: everything below still works, it just stops NAMING stages and stops applying the
+    // relaxation that depends on knowing which command a status came from.
+    const aligned = alignPipelineStages(command, pipeStatuses);
     const last = pipeStatuses[pipeStatuses.length - 1];
     const label = (i: number) => `stage ${i + 1}/${pipeStatuses.length}`
-      + (stages[i] ? ` (${stages[i].split(/\s+/)[0]})` : "");
-
-    // (1) An upstream stage failed while the pipeline as a whole reported success. Seven high-severity
-    //     findings are this: `kubectl get x | jq .` where kubectl exits 1 and jq exits 0, reported
-    //     success on an empty result — so the agent reads "nothing found" rather than "the query failed".
-    const upstreamFailures = pipeStatuses
+      + (aligned?.[i] ? ` (${aligned[i].binary})` : "");
+    const upstream = pipeStatuses
       .map((code, i) => ({ code, i }))
-      .filter(({ code, i }) => i < pipeStatuses.length - 1 && code !== 0
-        && !isExpectedSigpipe(pipeStatuses, i, stages));
-    if (last === 0 && upstreamFailures.length > 0) {
-      const who = upstreamFailures.map(({ code, i }) => `${label(i)} exited ${code}`).join(", ");
+      .filter(({ i }) => i < pipeStatuses.length - 1);
+
+    // A filter that matched nothing is not an upstream failure. `kubectl logs | grep X | tail -20`
+    // gives PIPESTATUS [0, 1, 0], and reading the middle 1 as a failure produced the single most
+    // reported defect in the review backlog — its annotation told the agent "an empty result means
+    // the EARLIER stage failed, not that nothing matched", which is precisely backwards.
+    //
+    // This is the one judgment that REQUIRES alignment, and requiring it is a safety property, not a
+    // nicety: with the old text split, `echo "a | grep -v x" | kubectl get pods | jq .items` put
+    // `grep` at subscript 1, so relaxing without alignment would silently downgrade kubectl's real
+    // failure to `no_match` — the false success this whole mechanism exists to remove. The binary
+    // comes from `getCommandBinary`, so `LC_ALL=C grep` and `/bin/grep` are recognised too.
+    const noMatchAt = new Set(
+      aligned
+        ? upstream.filter(({ code, i }) => code === 1
+            && EXIT_1_MEANS_NOTHING_FOUND.has(aligned[i].binary)).map(({ i }) => i)
+        : [],
+    );
+
+    // (1) An upstream stage really failed while the pipeline as a whole reported success. Seven
+    //     high-severity findings are this: `kubectl get x | jq .` where kubectl exits 1 and jq
+    //     exits 0, reported success on an empty result.
+    const realFailures = upstream.filter(({ code, i }) => code !== 0
+      && !isBenignSigpipe(pipeStatuses, i) && !noMatchAt.has(i));
+    if (last === 0 && realFailures.length > 0) {
+      const who = realFailures.map(({ code, i }) => `${label(i)} exited ${code}`).join(", ");
       return {
         exitClass: "pipeline_upstream_failed",
         isError: true,
@@ -224,38 +246,47 @@ export function classifyExit(opts: {
           `[pipeline_upstream_failed: ${who}, while the last stage exited 0 — so the pipeline's exit code `
           + "says success and the output above is NOT a complete answer. An empty result here means the "
           + "EARLIER stage failed, not that nothing matched. Fix the failing stage; see STDERR for its "
-          + "error.]",
+          + "error."
+          + (aligned ? "" : " (This command chains pipelines with `&&`/`||`, so which command the status "
+            + "belongs to could not be determined — run the failing pipeline on its own to see it.)")
+          + "]",
       };
     }
 
-    // (2) SIGPIPE is benign ONLY when it happened UPSTREAM of a stage that stopped reading on purpose.
-    //     `seq … | head -3` is that case: stage 1 gets 141, `head` exits 0, and under `pipefail` the
-    //     shell reports 141 for a command that did exactly what was asked.
-    //
-    //     A 141 on the LAST stage is the opposite and must never be called benign: nothing is downstream
-    //     of it, so no consumer could have closed the pipe — it was killed. Read from a real trace
-    //     (ce1bd949): `kubectl logs --tail=-1 | grep -c '…'` returned exit 141 with `(no output)` after
-    //     83 seconds, while the same shape that completed took 11 seconds and printed `0`. A `grep -c`
-    //     that ran to the end always prints a number, so no output means it never got there. Classifying
-    //     that as success would have told the agent an empty result was the answer — the exact false
-    //     success this whole change set exists to remove. My first version of this rule did that.
-    const expectedSigpipes = pipeStatuses
-      .map((code, i) => ({ code, i }))
-      .filter(({ i }) => i < pipeStatuses.length - 1 && isExpectedSigpipe(pipeStatuses, i, stages));
-    if (last === 0 && expectedSigpipes.length > 0) {
-      const at = label(expectedSigpipes[0].i);
+    // (2) Nothing failed; a filter simply matched nothing. Reported as the RESULT it is, so the
+    //     agent stops re-running a query whose answer it already has.
+    if (last === 0 && noMatchAt.size > 0) {
+      const who = [...noMatchAt].map((i) => label(i)).join(", ");
+      return {
+        exitClass: "no_match",
+        isError: false,
+        annotation:
+          `[no_match: ${who} ran and matched nothing, and every other stage exited 0 — so the empty or `
+          + "zero result above IS the answer, not a failure. The source command succeeded; re-running "
+          + "this will return the same thing. If you expected matches, widen the pattern or the time "
+          + "window rather than repeating the call.]",
+      };
+    }
+
+    // (3) SIGPIPE that the pipeline's own shape explains: a stage was ended because the NEXT stage
+    //     stopped reading and then exited 0, which is how `head` and `grep -m N` finish normally.
+    //     Judged from the statuses alone — see `isBenignSigpipe` for why that matters here.
+    const benign = upstream.filter(({ i }) => isBenignSigpipe(pipeStatuses, i));
+    if (last === 0 && benign.length > 0) {
+      const at = label(benign[0].i);
       return {
         exitClass: "success",
         isError: false,
         annotation:
-          `[pipeline_sigpipe: ${at} was ended by SIGPIPE because a later stage stopped reading — which is `
-          + "how `head` and `grep -q` finish a pipeline normally, not a failure. The output above is what "
-          + "was asked for. (The command's own exit code is 141 only when `pipefail` is set.)]",
+          `[pipeline_sigpipe: ${at} was ended by SIGPIPE because the next stage stopped reading and then `
+          + "finished normally — which is how `head` and `grep -m N` end a pipeline, not a failure. The "
+          + "output above is what was asked for. (The command's own exit code is 141 only when "
+          + "`pipefail` is set.)]",
       };
     }
 
-    // (3) The final stage died on SIGPIPE, or was killed. Nothing downstream of it could have closed the
-    //     pipe, so the read is INCOMPLETE and an empty result proves nothing.
+    // (4) The final stage died on SIGPIPE, or was killed. Nothing downstream of it could have closed
+    //     the pipe, so the read is INCOMPLETE and an empty result proves nothing.
     if (last === 141) {
       return {
         exitClass: "output_truncated",
@@ -337,6 +368,49 @@ export function classifyExit(opts: {
         `[dependency_missing: the target reported that the command does not `
         + "exist there (see STDERR). The whitelist admits a command; it cannot make the target have it. "
         + "Do not retry the same command.]",
+    };
+  }
+
+  // The metrics API answering is neither a transport failure nor a missing object, and it was being
+  // reported as both. Checked BEFORE every `Error from server` branch below, which is the whole
+  // point: `ServiceUnavailable` is in CHANNEL_ERROR_MARKERS with no context guard, so
+  // `kubectl top nodes` against a cluster whose metrics-server is down was classified
+  // `channel_error` — "the target never ran the command" — while a NotFound from the same API fell
+  // through to `no_match`, "this object does not exist". Placing this after either of them makes it
+  // dead code.
+  //
+  // Matched by the `metrics.k8s.io` group rather than by enumerating resource kinds, for the same
+  // reason `invalid_arguments` reads the client's own answer instead of a curated flag list: the
+  // string appears as `nodemetrics.metrics.k8s.io`, `podmetrics.metrics.k8s.io` AND
+  // `nodes.metrics.k8s.io` depending on whether the aggregation layer is registered at all, and
+  // enumerating the singular forms missed the plural one — which is the commonest case.
+  // Scoped to `kubectl top`, which is the only caller for which the metrics API's answer is the
+  // WHOLE answer. `kubectl get apiservice v1beta1.metrics.k8s.io` is how an operator checks whether
+  // metrics-server is registered at all, and its NotFound is an ordinary existence answer — reading
+  // it here flipped it from `no_match` to a failure and then advised checking a node name that was
+  // never in question. Forbidden is excluded for the same reason in the other direction: RBAC is a
+  // definite cause, so replacing it with "the object may not exist, or may not be scraped yet" would
+  // be a fresh invention in place of the one being removed.
+  const metricsAnswer = /\bkubectl\s+top\b/.test(command)
+    && !/^Error from server \(Forbidden\)/m.test(stderr)
+    && (/metrics\.k8s\.io/i.test(stderr) || /metrics (?:are |API )?not available/i.test(stderr));
+  if (metricsAnswer) {
+    const apiDown = /Error from server \((?:ServiceUnavailable|Timeout|InternalError|ServerTimeout|GatewayTimeout)\)/m.test(stderr)
+      || /metrics (?:are |API )?not available/i.test(stderr);
+    return {
+      exitClass: "target_reported_failure",
+      isError: true,
+      annotation: apiDown
+        ? "[target_reported_failure: the METRICS API could not answer (see STDERR) — metrics-server is "
+          + "not running, or its APIService is not ready. The cluster itself is reachable: ordinary "
+          + "`kubectl get` calls will still work, so do not re-resolve the target or retry `top`. Read "
+          + "utilisation from another source (node/pod status, cAdvisor, your monitoring stack) or check "
+          + "metrics-server in kube-system.]"
+        : "[target_reported_failure: the metrics API has NO SAMPLE under this name. Two different things "
+          + "produce this one message and it cannot tell them apart: the object may not exist, or it may "
+          + "exist and not have been scraped yet (a new node, or metrics-server behind). Run "
+          + "`kubectl get node <name>` / `kubectl get pod <name> -n <ns>` to settle which — do NOT repeat "
+          + "the same `top` call, it will answer identically.]",
     };
   }
 

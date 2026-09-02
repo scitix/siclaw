@@ -75,8 +75,8 @@ describe("extractPipeline", () => {
     const p = extractPipeline("ls | grep x | wc");
     expect(p).toEqual([
       { command: "ls", piped: false },
-      { command: "grep x", piped: true },
-      { command: "wc", piped: true },
+      { command: "grep x", piped: true, sep: "|" },
+      { command: "wc", piped: true, sep: "|" },
     ]);
   });
 
@@ -99,7 +99,7 @@ describe("extractPipeline", () => {
     const p = extractPipeline("cmd 2>&1 | grep x");
     expect(p).toEqual([
       { command: "cmd 2>&1", piped: false },
-      { command: "grep x", piped: true },
+      { command: "grep x", piped: true, sep: "|" },
     ]);
   });
 });

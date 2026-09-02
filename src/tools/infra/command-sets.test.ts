@@ -2303,3 +2303,128 @@ describe("the eight bypasses from the security review", () => {
     }
   });
 });
+
+describe("quoting decides whether an expression becomes a path", () => {
+  const local = { context: "local", piped: true };
+  const reject = (cmd: string) => expect(validateCommandRestrictions(cmd, local), `should reject: ${cmd}`).not.toBeNull();
+  const allow = (cmd: string) => expect(validateCommandRestrictions(cmd, local), `should allow: ${cmd}`).toBeNull();
+
+  it("keeps the regex idioms that quoting already protects", () => {
+    // Anchors are the highest-frequency thing anyone greps for, and `$` in double quotes is a
+    // LITERAL unless something expandable follows it (`echo "foo$"` prints `foo$`). Reading every
+    // `$` as live refuses all of these. The pre-existing tests for this all used single quotes, so
+    // they could not have caught it.
+    allow(`grep "error$"`);
+    allow(`grep "^$"`);
+    allow(`grep "[0-9]*$"`);
+    allow(`grep 'error$'`);
+    // A backslash escape is inert wherever it appears — including inside double quotes, where the
+    // parser decodes it to a bare `$` that is otherwise indistinguishable from a live one.
+    allow(`grep "\\$HOME"`);
+    allow(`grep \\*literal`);
+  });
+
+  it("refuses an expression the shell would turn into a file list", () => {
+    // The expression slot used to be exempt from everything, so a bare glob placed there reached
+    // grep as expanded paths: the first became the pattern, the rest became files it read.
+    reject("grep .siclaw/*/*/*");
+    reject(`grep "$HOME/x"`);
+    reject(`grep -c "$HOME/x"`);
+    reject("grep '$CRED_DIR'/clusters/*");   // partly quoted: the `*` is still live
+    reject("grep -e .siclaw/*/*/*");         // a pattern FLAG's value is an expression too
+    reject("grep --regexp=.siclaw/*/*/*");
+    reject("grep -e.siclaw/*/*/*");          // attached
+    reject("grep -ie.siclaw/*/*/*");         // attached inside a cluster
+    // Every stdin-only command with an expression slot had the same exemption.
+    reject("jq .siclaw/*/*/*");
+    reject("yq .siclaw/*/*/*");
+    reject("tr .siclaw/*/*/* abc");
+  });
+
+  it("says what was wrong and how to fix it", () => {
+    // The bare refusal it replaces named neither the argument nor a way through, so the agent tried
+    // a different command and was refused again.
+    const err = JSON.parse(validateCommandRestrictions("grep .siclaw/*/*/*", local)!);
+    expect(err.rejected_by).toBe("unquoted_expansion");
+    expect(err.matched).toBe("*");
+    expect(err.hint, "the hint must be copy-pasteable").toContain(`'.siclaw/*/*/*'`);
+  });
+
+  it("leaves the operand slot exactly as it was", () => {
+    // No expansion check is added here, and none is needed: TEXT_OPERAND_FORBIDDEN's character class
+    // is a strict superset of the expansion metacharacters AND it matches after quotes are stripped,
+    // so anything the expansion rule would catch is already refused. That is what makes the relaxation
+    // above safe by construction rather than by test coverage.
+    reject("grep -ie. .siclaw/*/*/*");
+    reject(`grep "" .siclaw/*/*/*`);
+    reject("grep .siclaw/*/*/* /etc/shadow");
+    reject("grep 'pat' /var/log/x");
+    reject(`grep pat "quoted*star"`);
+    reject("head .siclaw/*/*/*");
+    reject("sort .siclaw/*/*/*");
+    reject(`wc -l "$HOME/x"`);
+  });
+});
+
+describe("option arity in the stdin-only layer", () => {
+  const local = { context: "local", piped: true };
+  const reject = (cmd: string) => expect(validateCommandRestrictions(cmd, local), `should reject: ${cmd}`).not.toBeNull();
+  const allow = (cmd: string) => expect(validateCommandRestrictions(cmd, local), `should allow: ${cmd}`).toBeNull();
+
+  it("stops a flag's value from being read as the expression", () => {
+    // Described in this file's own docblock — "`grep -m 5 PATTERN` — `5` is not the pattern" — but
+    // never implemented: `5` spent the pattern quota, so the real pattern was screened as a file
+    // operand and every regex with a metacharacter in it was refused. The attached form `-m8` worked,
+    // which is why this survived.
+    allow("grep -m 8 'a.*b'");
+    allow("grep -m8 'a.*b'");
+    allow("grep -A 5 'error.*timeout'");
+    allow("grep -B 3 'ns/pod'");
+    allow("grep -C 2 'a$'");
+    allow("grep -E -i -m 8 'seed brokers|Operation timed out|failed to flush.*kafka|atmq-.*:9092'");
+    allow("yq -o json '.items[]'");
+    allow("jq --arg x y '.a[]'");      // arity 2
+    allow("jq --indent 2 '.a[]'");
+  });
+
+  it("still screens the value it consumes", () => {
+    // Consuming the token is what frees the pattern quota; screening it is what stops a path hiding
+    // there. Both halves are load-bearing.
+    reject("grep -m /etc/shadow");
+    reject("grep -A /var/lib/kubelet/pki/x");
+  });
+
+  it("cannot be used to smuggle a glob into the pattern slot", () => {
+    // These are refused today only because the value accidentally spent the quota. Fixing the arity
+    // without the expansion check above would turn every one of them into an exempt "pattern".
+    reject("grep -m 5 .siclaw/*/*/*");
+    reject("grep -A 5 .siclaw/*/*/*");
+    reject("yq -o json .siclaw/*/*/*");
+    reject("yq -p json .siclaw/*/*/*");
+  });
+
+  it("refuses recursion by its other spelling", () => {
+    // `blockedFlags` names a switch, and GNU grep spells recursion twice. A recursive grep started at
+    // `.` walks into the credential tree while naming no path at all, which is the one thing the
+    // operand rules exist to prevent.
+    reject("grep -d recurse -l cred .");
+    reject("grep --directories=recurse -l cred .");
+    reject("grep -r pat .");
+    allow("grep -d skip pat");
+    allow("grep --directories=skip pat");
+  });
+
+  it("refuses the abbreviations the option parser accepts", () => {
+    // `getopt_long` takes any unambiguous prefix, so a denylist of full spellings is two characters
+    // from useless — verified against real GNU grep 3.8 in the agentbox base image, where
+    // `--di=recurse` and `--recursi` both recurse.
+    reject("grep --di=recurse -l cred .");
+    reject("grep --dir=recurse -l cred .");
+    reject("grep --di recurse -l cred .");
+    reject("grep --directorie=recurse -l cred .");
+    reject("grep --recursi pat .");   // an abbreviation of the flag that was already blocked
+    // One-sided by design: a prefix that cannot mean a blocked flag is untouched.
+    allow("grep --reg 'a$'");
+    allow("grep --regexp='a$'");
+  });
+});

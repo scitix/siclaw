@@ -403,3 +403,107 @@ describe("a printer the client does not have is a client rejection", () => {
     expect(j.exitClass).toBe("target_reported_failure");
   });
 });
+
+describe("a filter that matched nothing is not an upstream failure", () => {
+  const C = (command: string, pipeStatuses: number[], stdout = "", stderr = "") =>
+    classifyExit({ command, exitCode: 0, stdout, stderr, context: "local", pipeStatuses });
+
+  it("reads a middle-stage grep exit 1 as the result it is", () => {
+    // The single most reported defect in the backlog — 25 findings name `pipeline_upstream_failed`.
+    // Its annotation told the agent "an empty result means the EARLIER stage failed, not that nothing
+    // matched", which for a no-match grep is exactly backwards.
+    const j = C("kubectl logs pod-x | grep -E 'error|fail' | tail -20", [0, 1, 0]);
+    expect(j.exitClass).toBe("no_match");
+    expect(j.isError, "a no-match must not redden the trace").toBe(false);
+    expect(j.annotation).toMatch(/matched nothing/);
+    expect(j.annotation, "must say re-running changes nothing").toMatch(/same thing|same answer/i);
+  });
+
+  it("covers the counting shape too", () => {
+    expect(C("kubectl get pods -A | grep foo | wc -l", [0, 1, 0], "0\n").exitClass).toBe("no_match");
+  });
+
+  it("still reports a real upstream failure", () => {
+    // The false success this whole mechanism exists to remove: kubectl exits 1, jq exits 0.
+    const j = C("kubectl get pods | jq .", [1, 0], "", "Error from server");
+    expect(j.exitClass).toBe("pipeline_upstream_failed");
+    expect(j.isError).toBe(true);
+  });
+
+  it("does not mistake a failing filter for an empty one", () => {
+    // grep exits 2 on a bad regex or an unreadable file. Only 1 means "no match".
+    expect(C("kubectl logs p | grep -E '[' | tail -1", [0, 2, 0]).exitClass).toBe("pipeline_upstream_failed");
+  });
+
+  it("recognises the filter through a prefix or an absolute path", () => {
+    // `label()` used a bare whitespace split, which would have missed both of these and made the
+    // relaxation silently inert.
+    expect(C("kubectl logs p | LC_ALL=C grep -c x | tail -1", [0, 1, 0]).exitClass).toBe("no_match");
+    expect(C("kubectl logs p | /bin/grep -c x | tail -1", [0, 1, 0]).exitClass).toBe("no_match");
+  });
+
+  it("withholds the relaxation when no stage can be attributed at all", () => {
+    // `||` makes two three-stage pipelines equally plausible owners of the statuses, so nothing can
+    // be named — and the relaxation must therefore not fire, even though a `grep` is visibly in the
+    // text. The previous version of this test used a command that ALIGNS successfully, so this
+    // branch had no coverage.
+    const cmd = "kubectl logs p | grep zzz | tail -1 || echo a | cat | cat";
+    const j = C(cmd, [0, 1, 0]);
+    expect(j.exitClass).toBe("pipeline_upstream_failed");
+    expect(j.isError).toBe(true);
+    expect(j.annotation, "must not name a command it cannot attribute").not.toMatch(/\(grep\)|\(echo\)/);
+    expect(j.annotation).toMatch(/could not be determined/);
+  });
+
+  it("still relaxes when the quoted pipe no longer misleads the splitter", () => {
+    // Safety, not tidiness: with the old text split, the quoted `|` below put `grep` at subscript 1,
+    // so relaxing without alignment would downgrade kubectl's real failure to `no_match`.
+    const cmd = `echo "a | grep -v x" | kubectl get pods | jq .items`;
+    const j = C(cmd, [0, 1, 0], "", "Error from server (NotFound)");
+    expect(j.exitClass, "kubectl's failure must survive").toBe("pipeline_upstream_failed");
+    expect(j.isError).toBe(true);
+  });
+});
+
+describe("a missing metric is not a missing object", () => {
+  const top = (stderr: string) =>
+    classifyExit({ command: "kubectl top node css1-g65", exitCode: 1, stdout: "", stderr, context: "local" });
+
+  it("does not claim the node does not exist", () => {
+    // A trace read this node successfully from the API moments earlier, then `top` reported
+    // "this object does not exist".
+    const j = top('Error from server (NotFound): nodemetrics.metrics.k8s.io "css1-g65" not found');
+    expect(j.exitClass).toBe("target_reported_failure");
+    expect(j.annotation, "one message, two causes — it must not pick one").toMatch(/may not exist/i);
+    expect(j.annotation, "must give the discriminating call").toMatch(/kubectl get node/);
+  });
+
+  it("covers the plural resource spelling, which is the commonest form", () => {
+    // Enumerating `nodemetrics`/`podmetrics` missed this one entirely.
+    const j = top("Error from server (NotFound): the server could not find the requested resource (get nodes.metrics.k8s.io)");
+    expect(j.exitClass).toBe("target_reported_failure");
+  });
+
+  it("separates the metrics API being down from a name with no sample", () => {
+    const j = top("Error from server (ServiceUnavailable): the server is currently unable to handle the request (get nodes.metrics.k8s.io)");
+    expect(j.exitClass).toBe("target_reported_failure");
+    expect(j.annotation).toMatch(/metrics-server/);
+    expect(j.annotation, "the cluster is reachable — do not send the agent re-resolving it").toMatch(/reachable/i);
+  });
+
+  it("is checked before the channel markers, or it would be dead code", () => {
+    // `Error from server (ServiceUnavailable)` is in CHANNEL_ERROR_MARKERS with no context guard, so
+    // anything placed after that check never runs. Before this, `kubectl top` against a cluster with
+    // no metrics-server was reported as "the target never ran the command".
+    const j = top("Error from server (ServiceUnavailable): the server is currently unable to handle the request (get nodes.metrics.k8s.io)");
+    expect(j.exitClass).not.toBe("channel_error");
+    expect(j.channelLeg).toBeUndefined();
+  });
+
+  it("leaves non-metrics answers exactly as they were", () => {
+    expect(top('Error from server (NotFound): pods "x" not found').exitClass).toBe("no_match");
+    const su = classifyExit({ command: "kubectl get pods", exitCode: 1, stdout: "", context: "local",
+      stderr: "Error from server (ServiceUnavailable): the server is currently unable to handle the request" });
+    expect(su.exitClass, "a real transport failure is still one").toBe("channel_error");
+  });
+});
