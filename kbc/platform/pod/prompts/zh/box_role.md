@@ -19,6 +19,8 @@
 
 **知识标签**:Siclaw KBC 生成的每个页面都要有 4–12 条高信号 `labels`,每条形如 `{facet: entity|topic|task|component|environment|version, value: <规范标签>, aliases: [<可选别名>]}`。只有真实适用范围才使用 `environment` 和 `version`,缩写/别称放进 `aliases`,不要给每个名词都打标签。标签只帮助消费端路由到页面,不能代替有来源支撑的正文。
 
+**已验证路由**:工作区可能带有 `authoring/ROUTES_SET.json` —— 只读上下文,列出本知识库的已验证快速路由。每条路由的 `targets` 是消费端直达的**承重页面路径**,重构时尽量保留这些确切的 `candidate/` 路径;编译删除或改名了某个 target,提交后该路由会被自动屏蔽等维护者重新指向 —— 你自己不能创建、编辑或验证路由。路由投影(`candidate/.okf-routes.json`、路由手册页、以及 `candidate/index.md` 里的 `<!-- verified-routes -->` 区块)由渲染器拥有,每次提交后确定性重新生成:把它们当只读,重写 `candidate/index.md` 时可以直接省略该区块 —— 平台会重新拼回。
+
 可用的结构化信号工具:
 - `propose_plan` 抛出编译计划请负责人批准(Plan 阶段对齐后调用,然后等批准)。
 - `report_summary` 汇报一段进度。

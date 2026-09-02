@@ -12,10 +12,17 @@ const MAX_TOTAL_UNPACKED_BYTES = 100 * 1024 * 1024;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_FILES = 1000;
 export const OKF_CITATION_SIDECAR = ".okf-citations.json";
+export const OKF_ROUTES_SIDECAR = ".okf-routes.json";
 export const SERVER_CITATION_MANIFEST = ".citation-manifest.json";
 
-const UPLOADER_ONLY_CITATION_FILES = [
+// Producer/control-plane sidecars that must never reach the model-visible
+// knowledge tree. Citations: the import service freezes them server-side.
+// Routes: the runtime consumes only the rendered projections (root-index
+// block + route manual page); the machine contract has zero runtime readers
+// and would be redundant noise the agent could Read.
+const UPLOADER_ONLY_SIDECAR_FILES = [
   OKF_CITATION_SIDECAR,
+  OKF_ROUTES_SIDECAR,
   SERVER_CITATION_MANIFEST,
 ] as const;
 
@@ -108,7 +115,7 @@ export async function extractKnowledgePackageToDir(buf: Buffer, targetDir: strin
     // Package citation metadata is uploader-supplied input. The import service
     // validates and freezes it, then sends canonical citationSources separately.
     // Never expose the uploaded copy to the model-visible knowledge tree.
-    const citationExcludes = UPLOADER_ONLY_CITATION_FILES.flatMap((name) => [
+    const citationExcludes = UPLOADER_ONLY_SIDECAR_FILES.flatMap((name) => [
       `--exclude=${name}`,
       `--exclude=*/${name}`,
     ]);
