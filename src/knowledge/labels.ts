@@ -4,6 +4,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 
 import { buildKnowledgeCatalogRoutes, type KnowledgeRouteProof } from "./catalog-graph.js";
+import { isKnowledgeNavigationPage } from "./page-kind.js";
 
 export const KNOWLEDGE_LABEL_FACETS = [
   "entity", "topic", "task", "component", "environment", "version",
@@ -270,13 +271,21 @@ export class KnowledgeLabelIndex {
         if (lowerName === "index.md" || lowerName === "log.md") continue;
         let markdown: string;
         try { markdown = fs.readFileSync(absolute, "utf8"); } catch { continue; }
+        const file = path.relative(this.knowledgeDir, absolute);
+        // Navigation pages (`_index.md` by path, `type: index` by frontmatter;
+        // plain `index.md` never gets here) must not enter the label index:
+        // citation validation rejects them as evidence, so a labeled navigation
+        // page would hand knowledge_search a candidate whose cite call then
+        // hard-fails the whole turn's citations. Same classifier as citation
+        // validation and the catalog graph, so the layers cannot disagree.
+        // They are routing surfaces, not content pages — no counter increments.
+        if (isKnowledgeNavigationPage(file, markdown)) continue;
         const parsed = parseKnowledgeLabels(markdown);
         if (!parsed) {
           if (declaresKnowledgeLabels(markdown)) invalidLabeledPages++;
           else unlabeledPages++;
           continue;
         }
-        const file = path.relative(this.knowledgeDir, absolute);
         next.set(file, { file, ...parsed });
       }
     };

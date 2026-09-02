@@ -270,6 +270,43 @@ describe("knowledge_search", () => {
     expect(catalog.unlabeledPages).toBe(1);
   });
 
+  it("keeps labeled navigation pages out of the label index", async () => {
+    // Citation validation rejects navigation pages as evidence, so a labeled
+    // navigation page in the index would route the agent to a page it cannot
+    // cite — the search layer must classify pages the same way.
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [Routes](routes-guide.md)\n- [Sub](sub/_index.md)\n- [Topic](topic.md)\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "routes-guide.md"),
+      "---\ntype: index\ntitle: 检索路由\nlabels:\n  - facet: topic\n    value: RouteGuide\n---\n# Routes\n\n- [Topic](topic.md)\n",
+    );
+    fs.mkdirSync(path.join(knowledgeDir, "sub"), { recursive: true });
+    fs.writeFileSync(
+      path.join(knowledgeDir, "sub", "_index.md"),
+      "---\ntype: Catalog\ntitle: Sub\nlabels:\n  - facet: topic\n    value: SubCatalog\n---\n# Sub\n",
+    );
+    fs.writeFileSync(
+      path.join(knowledgeDir, "topic.md"),
+      "---\ntype: Topic\ntitle: B300\nlabels:\n  - facet: entity\n    value: B300\n---\n# B300\n",
+    );
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const search = await tool.execute("call-nav-search", { query: "RouteGuide" });
+    const payload = JSON.parse((search.content[0] as { text: string }).text);
+    expect(payload.results).toEqual([]);
+    expect(payload.totalPages).toBe(1);
+    // Navigation pages are routing surfaces, not content pages missing labels.
+    expect(payload.unlabeledPages).toBe(0);
+    expect(payload.invalidLabeledPages).toBe(0);
+
+    const catalogResult = await tool.execute("call-nav-catalog", { listLabels: true });
+    const catalog = JSON.parse((catalogResult.content[0] as { text: string }).text);
+    expect(catalog.labels.map((label: { value: string }) => label.value)).toEqual(["B300"]);
+  });
+
   it("returns the canonical multi-library catalog trail without requiring intermediate reads", async () => {
     fs.mkdirSync(path.join(knowledgeDir, "repos", "gpu", "topics"), { recursive: true });
     fs.writeFileSync(
