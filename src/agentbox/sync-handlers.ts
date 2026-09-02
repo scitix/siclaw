@@ -781,7 +781,7 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
  */
 interface ToolsPayload {
   allowedTools: string[] | null;
-  /** Agent type (sre/coordinator/knowledge_qa/custom) — drives capabilities and prompt fallback. */
+  /** Agent type — drives capabilities and prompt fallback. */
   agentType: string;
   /**
    * Sub-agent model tier MENU — `{revision, items:[{tier, whenToUse}]}`, credential
@@ -796,7 +796,7 @@ interface ToolsPayload {
   subagentTierMenu?: unknown;
 }
 
-const VALID_AGENT_TYPES = new Set(["sre", "coordinator", "knowledge_qa", "custom"]);
+const VALID_AGENT_TYPES = new Set(["sre", "coordinator", "knowledge_qa", "product_support", "custom"]);
 
 /**
  * Minimal structural target the tools handler writes to. Deliberately NOT the

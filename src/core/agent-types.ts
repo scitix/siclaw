@@ -15,6 +15,9 @@
  *                   No skills by default.
  *   - knowledge_qa — researches bound knowledge bases and synthesizes sourced
  *                    answers. Read-only, no skills by default, and no delegation.
+ *   - product_support — managed front-door customer support. Its persisted
+ *                       prompt and bound MCP define the intake/result contract;
+ *                       built-in filesystem access stays read-only.
  *   - custom      — the legacy free-form agent. Standalone Portal may persist
  *                   an operator's tool_capabilities selection; integrations
  *                   that omit it intentionally retain unrestricted built-ins.
@@ -24,7 +27,7 @@
  * is the built-in type contract; Custom has no built-in contract.
  */
 
-export type AgentType = "sre" | "coordinator" | "knowledge_qa" | "custom";
+export type AgentType = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "custom";
 
 export interface AgentTypeDef {
   label: string;
@@ -236,10 +239,21 @@ const REPLACED_KNOWLEDGE_QA_DEFAULT_PROMPTS = new Set([
   COMPLETE_CATALOG_KNOWLEDGE_QA_DEFAULT_PROMPT,
 ]);
 
+/**
+ * Public runtime invariant for Product Support. The control plane still owns
+ * the released business prompt and result schema; this layer only keeps the
+ * built-in type safe and meaningful when its managed addendum is absent.
+ */
+export const PRODUCT_SUPPORT_DEFAULT_PROMPT =
+  "You are a product-support agent. Answer product questions using the configured tools and resources. " +
+  "When the current turn provides a result-submission tool, call it exactly once with a machine-readable outcome that follows its declared schema. " +
+  "Do not claim that downstream actions such as ticket creation or human handoff succeeded unless the caller confirms them.";
+
 const MATERIALIZED_TYPE_PROMPTS: Record<Exclude<AgentType, "custom">, ReadonlySet<string>> = {
   sre: new Set([SRE_DEFAULT_PROMPT]),
   coordinator: new Set([COORDINATOR_DEFAULT_PROMPT, PREVIOUS_COORDINATOR_DEFAULT_PROMPT]),
   knowledge_qa: REPLACED_KNOWLEDGE_QA_DEFAULT_PROMPTS,
+  product_support: new Set([PRODUCT_SUPPORT_DEFAULT_PROMPT]),
 };
 
 export interface AgentPromptLayers {
@@ -277,6 +291,16 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     defaultPrompt: KNOWLEDGE_QA_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
+  product_support: {
+    label: "Product Support Agent",
+    description: "Answers product questions and prepares structured customer-support handoffs through its bound result tool.",
+    capabilities: ["read_files"],
+    // The control plane owns the managed business prompt and result schema.
+    // This generic runtime contract is deliberately schema-free, so those stay
+    // single-source.
+    defaultPrompt: PRODUCT_SUPPORT_DEFAULT_PROMPT,
+    defaultNoSkills: true,
+  },
   custom: {
     label: "Custom Agent",
     description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
@@ -288,7 +312,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
 
 /** Normalize an unknown stored value to a valid AgentType (default custom). */
 export function normalizeAgentType(v: unknown): AgentType {
-  return v === "sre" || v === "coordinator" || v === "knowledge_qa" ? v : "custom";
+  return v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "product_support" ? v : "custom";
 }
 
 /**
@@ -299,7 +323,7 @@ export function normalizeAgentType(v: unknown): AgentType {
  * tools enter a model session must fail closed when provenance is absent.
  */
 export function requireAgentType(v: unknown): AgentType {
-  if (v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "custom") {
+  if (v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "product_support" || v === "custom") {
     return v;
   }
   throw new Error(`Invalid or missing agent_type: ${String(v)}`);

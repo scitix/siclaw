@@ -16,6 +16,7 @@ import type {
   BrainProviderResponse,
   BrainContextPreflightResult,
   PromptMedia,
+  PromptRequirements,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
 import { rememberPromptFiles } from "../openai-file-payload.js";
@@ -48,6 +49,46 @@ function readCompatBoolean(compat: unknown, key: string): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+/**
+ * Provider-neutral "call this tool" choice. OpenAI chat-completions providers
+ * can name the exact function; providers without a named-tool form still get a
+ * deterministic choice because the repair exposes exactly one tool.
+ */
+export function requiredToolChoice(
+  api: unknown,
+  toolName: string,
+): "any" | "required" | { type: "function"; function: { name: string } } {
+  if (api === "openai-completions") {
+    return { type: "function", function: { name: toolName } };
+  }
+  return api === "anthropic-messages" || api === "bedrock-converse-stream" ||
+    api === "google-generative-ai" || api === "google-vertex"
+    ? "any"
+    : "required";
+}
+
+function requiredResultRepairOptions(
+  model: unknown,
+  options: Record<string, any> | undefined,
+  requiredToolName: string,
+): Record<string, any> {
+  return {
+    ...options,
+    toolChoice: requiredToolChoice(
+      model && typeof model === "object" ? (model as { api?: unknown }).api : undefined,
+      requiredToolName,
+    ),
+  };
+}
+
+function contextHasTool(context: unknown, toolName: string): boolean {
+  if (!context || typeof context !== "object") return false;
+  const tools = (context as { tools?: unknown }).tools;
+  return Array.isArray(tools) && tools.some((tool) =>
+    tool != null && typeof tool === "object" && (tool as { name?: unknown }).name === toolName
+  );
+}
+
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
 
@@ -61,6 +102,9 @@ export class PiAgentBrain implements BrainSession {
   /** True from abort() until the next prompt() starts. Stops the empty-response retry loop from
    *  firing a fresh (un-aborted) re-prompt when Stop lands during the backoff sleep. */
   private aborted = false;
+
+  /** A strict repair owns the session loop; steers must become separate turns. */
+  private requiredResultRepairActive = false;
 
   constructor(
     readonly session: AgentSession,
@@ -101,6 +145,11 @@ export class PiAgentBrain implements BrainSession {
   }
   private static readonly RETRY_DELAY_MS = 2000;
   private static readonly PROMPT_PREFLIGHT_SAFETY_TOKENS = 2048;
+  private static readonly REQUIRED_RESULT_REPAIR_PROMPT =
+    "[System: required-result repair]\n" +
+    "The preceding attempt did not submit the required structured turn result. " +
+    "Call the only available result-submission tool exactly once now, using the conversation and any preceding draft to fill its schema. " +
+    "If validation rejects the call, correct it. After one successful call, give the user the final answer without mentioning this repair, tools, or schemas.";
 
   private emit(event: any): void {
     for (const listener of this.extraListeners) {
@@ -116,10 +165,11 @@ export class PiAgentBrain implements BrainSession {
     });
   }
 
-  async prompt(text: string, media?: PromptMedia): Promise<void> {
+  async prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void> {
     this.aborted = false;
     let lastAssistantHadContent = false;
     let lastAssistantMessage: any = null;
+    const successfulTools = new Set<string>();
 
     const promptOptions = this.promptOptionsForMedia(media);
 
@@ -134,6 +184,17 @@ export class PiAgentBrain implements BrainSession {
         const hasText = content.some((c: any) => c.type === "text" && c.text?.trim());
         const hasToolCalls = content.some((c: any) => c.type === "toolCall");
         if (hasText || hasToolCalls) lastAssistantHadContent = true;
+      }
+      if (
+        event.type === "tool_execution_end" &&
+        typeof event.toolName === "string" &&
+        event.isError !== true &&
+        event.result?.details?.error === undefined &&
+        event.result?.details?.structuredContent !== null &&
+        typeof event.result?.details?.structuredContent === "object" &&
+        !Array.isArray(event.result?.details?.structuredContent)
+      ) {
+        successfulTools.add(event.toolName);
       }
     });
 
@@ -207,8 +268,78 @@ export class PiAgentBrain implements BrainSession {
           `usage=${JSON.stringify(msg?.usage ?? {})}`,
         );
       }
+
+      const requiredResultToolName = requirements?.requiredResultToolName?.trim();
+      if (
+        requiredResultToolName &&
+        !this.aborted &&
+        lastAssistantMessage?.stopReason !== "aborted" &&
+        lastAssistantMessage?.stopReason !== "error" &&
+        !successfulTools.has(requiredResultToolName)
+      ) {
+        await this.repairMissingRequiredResult(requiredResultToolName, successfulTools);
+      }
     } finally {
       unsub();
+    }
+  }
+
+  /**
+   * Perform one bounded repair after the normal agent run omitted its required
+   * result. The repair sees the full session context, but only the contracted
+   * tool is exposed and the first provider request is forced to use a tool.
+   * This turns a prompt convention into a runtime guarantee without forcing
+   * the result tool before the agent has finished knowledge/tool gathering.
+   */
+  private async repairMissingRequiredResult(
+    requiredToolName: string,
+    successfulTools: ReadonlySet<string>,
+  ): Promise<void> {
+    const session = this.session as AgentSession & {
+      getActiveToolNames?: () => string[];
+      setActiveToolsByName?: (names: string[]) => void;
+      agent: AgentSession["agent"] & { streamFn: (...args: any[]) => any };
+    };
+    const activeToolNames = session.getActiveToolNames?.() ?? [];
+    if (!activeToolNames.includes(requiredToolName) || !session.setActiveToolsByName) {
+      console.error(`[pi-agent-brain] Required result tool is not active: ${requiredToolName}`);
+      this.emit({ type: "required_result_repair_start", toolName: requiredToolName });
+      this.emit({
+        type: "required_result_repair_end",
+        toolName: requiredToolName,
+        success: false,
+        reason: "required_tool_inactive",
+      });
+      return;
+    }
+
+    const originalStreamFn = session.agent.streamFn;
+    let forceNextProviderRequest = true;
+    session.agent.streamFn = ((model: any, context: any, options?: Record<string, unknown>) => {
+      // AgentSession can auto-compact before starting the repair turn. Compaction
+      // uses the same streamFn but carries no result tool; do not spend the
+      // one-shot force on that unrelated provider request.
+      const forceThisRequest = forceNextProviderRequest && contextHasTool(context, requiredToolName);
+      if (forceThisRequest) forceNextProviderRequest = false;
+      return originalStreamFn(model, context, forceThisRequest
+        ? requiredResultRepairOptions(model, options, requiredToolName)
+        : options);
+    }) as typeof session.agent.streamFn;
+
+    this.emit({ type: "required_result_repair_start", toolName: requiredToolName });
+    this.requiredResultRepairActive = true;
+    session.setActiveToolsByName([requiredToolName]);
+    try {
+      await session.prompt(PiAgentBrain.REQUIRED_RESULT_REPAIR_PROMPT);
+    } finally {
+      session.agent.streamFn = originalStreamFn;
+      session.setActiveToolsByName(activeToolNames);
+      this.requiredResultRepairActive = false;
+      this.emit({
+        type: "required_result_repair_end",
+        toolName: requiredToolName,
+        success: successfulTools.has(requiredToolName),
+      });
     }
   }
 
@@ -240,6 +371,11 @@ export class PiAgentBrain implements BrainSession {
   }
 
   steer(text: string, media?: PromptMedia): Promise<void> {
+    if (this.requiredResultRepairActive) {
+      const err = new Error("A required-result repair is in progress; submit this input as a new turn");
+      err.name = "RequiredResultRepairInProgress";
+      return Promise.reject(err);
+    }
     const promptOptions = this.promptOptionsForMedia(media);
     if (!promptOptions) {
       return this.session.steer(text);

@@ -642,6 +642,35 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(seen).not.toContain("�");
   });
 
+  it("POST /api/prompt forwards a strict result-tool requirement only when supplied", async () => {
+    const session = await sm.getOrCreate("strict-result");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "strict-result",
+      requiredResultToolName: "mcp__result__submit",
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "hi",
+      undefined,
+      { requiredResultToolName: "mcp__result__submit" },
+    );
+  });
+
+  it("POST /api/prompt rejects a non-string strict result-tool requirement", async () => {
+    const session = await sm.getOrCreate("invalid-strict-result");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "invalid-strict-result",
+      requiredResultToolName: { name: "mcp__result__submit" },
+    });
+
+    expect(r.status).toBe(400);
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+  });
+
   it("POST /api/prompt falls back to a healthy secondary when the bound primary is missing", async () => {
     // The binding is handed to the routing runner as the primary candidate rather
     // than resolved before it, so a primary that cannot be found is an ordinary

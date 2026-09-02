@@ -141,6 +141,17 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
     });
   });
 
+  it("prompt() preserves the strict result-tool requirement", async () => {
+    await client.prompt({
+      text: "hi",
+      requiredResultToolName: "mcp__result__submit",
+    });
+
+    const req = srv.captures[srv.captures.length - 1];
+    expect(req.url).toBe("/api/prompt");
+    expect(JSON.parse(req.body).requiredResultToolName).toBe("mcp__result__submit");
+  });
+
   it("prompt() preserves native PDF files", async () => {
     await client.prompt({
       text: "read this",

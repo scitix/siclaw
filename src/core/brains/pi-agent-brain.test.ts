@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { PiAgentBrain } from "./pi-agent-brain.js";
+import { PiAgentBrain, requiredToolChoice } from "./pi-agent-brain.js";
 
 /** Fake AgentSession providing only what PiAgentBrain touches. */
 function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
   const listeners = new Set<(event: any) => void>();
   const emit = (event: any) => { for (const l of listeners) l(event); };
+  let activeToolNames = ["read", "mcp__result__submit"];
 
   const session: any = {
     prompt: vi.fn(async (_text: string) => {}),
@@ -19,7 +20,13 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 100, percent: 10 })),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 }, cost: 0.001 })),
     model: { id: "m", name: "M", provider: "p", contextWindow: 100, maxTokens: 10, reasoning: false },
-    agent: { onResponse: vi.fn(async () => {}), state: { messages: [] } },
+    agent: {
+      onResponse: vi.fn(async () => {}),
+      state: { messages: [] },
+      streamFn: vi.fn((_model: any, _context: any, _options?: any) => ({})),
+    },
+    getActiveToolNames: vi.fn(() => [...activeToolNames]),
+    setActiveToolsByName: vi.fn((names: string[]) => { activeToolNames = [...names]; }),
     compact: vi.fn(async () => ({ summary: "ok", firstKeptEntryId: "entry-1", tokensBefore: 100 })),
     settingsManager: {
       getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16, keepRecentTokens: 20 })),
@@ -86,6 +93,188 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     await brain.prompt("ask something");
     expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("repairs one missing required result with only that tool and a forced first provider call", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    const originalStreamFn = session.agent.streamFn;
+    let promptCount = 0;
+    session.prompt = vi.fn(async (_text: string) => {
+      promptCount++;
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      if (promptCount === 1) {
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+        });
+        return;
+      }
+
+      expect(session.getActiveToolNames()).toEqual([requiredTool]);
+      session.agent.streamFn(
+        { api: "openai-completions" },
+        { tools: [{ name: requiredTool }] },
+        { reasoning: "high" },
+      );
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(originalStreamFn).toHaveBeenCalledWith(
+      { api: "openai-completions" },
+      { tools: [{ name: requiredTool }] },
+      {
+        reasoning: "high",
+        toolChoice: { type: "function", function: { name: requiredTool } },
+      },
+    );
+    expect(session.getActiveToolNames()).toEqual(["read", requiredTool]);
+    expect(session.agent.streamFn).toBe(originalStreamFn);
+    expect(events).toContainEqual({ type: "required_result_repair_start", toolName: requiredTool });
+    expect(events).toContainEqual({ type: "required_result_repair_end", toolName: requiredTool, success: true });
+  });
+
+  it("does not repair when the required result tool already succeeded", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async () => {
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(session.setActiveToolsByName).not.toHaveBeenCalled();
+  });
+
+  it("repairs a result-tool call that succeeded at transport level without structuredContent", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    let promptCount = 0;
+    session.prompt = vi.fn(async () => {
+      promptCount++;
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: promptCount === 1
+          ? { details: {} }
+          : { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: promptCount === 1 ? "draft" : "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+  });
+
+  it("maps required tool choice to provider-specific values", () => {
+    const toolName = "mcp__result__submit";
+    expect(requiredToolChoice("anthropic-messages", toolName)).toBe("any");
+    expect(requiredToolChoice("google-generative-ai", toolName)).toBe("any");
+    expect(requiredToolChoice("openai-completions", toolName)).toEqual({
+      type: "function",
+      function: { name: toolName },
+    });
+    expect(requiredToolChoice("openai-responses", toolName)).toBe("required");
+  });
+
+  it("does not spend the repair force on pre-prompt compaction", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    const originalStreamFn = session.agent.streamFn;
+    let promptCount = 0;
+    session.prompt = vi.fn(async () => {
+      promptCount++;
+      if (promptCount === 1) {
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+        });
+        return;
+      }
+
+      // AgentSession.prompt may compact before its actual agent request. That
+      // request has no tools and must pass through untouched.
+      session.agent.streamFn({ api: "openai-completions" }, { tools: [] }, { phase: "compaction" });
+      session.agent.streamFn(
+        { api: "openai-completions" },
+        { tools: [{ name: requiredTool }] },
+        { phase: "repair" },
+      );
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(originalStreamFn.mock.calls[0][2]).toEqual({ phase: "compaction" });
+    expect(originalStreamFn.mock.calls[1][2]).toEqual({
+      phase: "repair",
+      toolChoice: { type: "function", function: { name: requiredTool } },
+    });
+  });
+
+  it("reports an inactive required result tool as an observable failed repair", async () => {
+    const session = makeFakeSession();
+    session.getActiveToolNames = vi.fn(() => ["read"]);
+    session.prompt = vi.fn(async () => {
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+
+    await brain.prompt("question", undefined, { requiredResultToolName: "mcp__result__submit" });
+
+    expect(events).toContainEqual({
+      type: "required_result_repair_end",
+      toolName: "mcp__result__submit",
+      success: false,
+      reason: "required_tool_inactive",
+    });
   });
 
   it("prompt maps images to ImageContent and passes them to session.prompt", async () => {
@@ -237,6 +426,45 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     await brain.steer("steer me");
     expect(session.steer).toHaveBeenCalledWith("steer me");
+  });
+
+  it("rejects a steer while a required-result repair owns the session", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    let promptCount = 0;
+    let releaseRepair!: () => void;
+    const repairBlocked = new Promise<void>((resolve) => { releaseRepair = resolve; });
+    session.prompt = vi.fn(async () => {
+      promptCount++;
+      if (promptCount === 1) {
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+        });
+        return;
+      }
+      await repairBlocked;
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+
+    const prompt = brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+    while (promptCount < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(brain.steer("next query")).rejects.toMatchObject({
+      name: "RequiredResultRepairInProgress",
+    });
+    expect(session.steer).not.toHaveBeenCalled();
+    releaseRepair();
+    await prompt;
   });
 
   it("steer forwards images through prompt streaming steer", async () => {

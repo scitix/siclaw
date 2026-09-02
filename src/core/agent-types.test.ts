@@ -5,15 +5,17 @@ import {
   COMPLETE_CATALOG_KNOWLEDGE_QA_DEFAULT_PROMPT,
   LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT,
   PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT,
+  PRODUCT_SUPPORT_DEFAULT_PROMPT,
   normalizeAgentType,
+  requireAgentType,
   effectiveAgentPrompt,
   effectiveCapabilityKeys,
   resolveAgentPromptLayers,
 } from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the four designed types; built-ins lock capabilities and own immutable contracts", () => {
-    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "knowledge_qa", "sre"]);
+  it("has the five designed types; built-ins lock capabilities and own their runtime contracts", () => {
+    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "knowledge_qa", "product_support", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.coordinator.capabilities).toContain("delegate_agents");
@@ -23,6 +25,9 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual(["read_files"]);
     expect(AGENT_TYPES.knowledge_qa.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(true);
+    expect(AGENT_TYPES.product_support.capabilities).toEqual(["read_files"]);
+    expect(AGENT_TYPES.product_support.defaultPrompt).toBe(PRODUCT_SUPPORT_DEFAULT_PROMPT);
+    expect(AGENT_TYPES.product_support.defaultNoSkills).toBe(true);
     expect(AGENT_TYPES.custom.capabilities).toBeNull();
     expect(AGENT_TYPES.custom.defaultPrompt).toBeNull();
   });
@@ -62,15 +67,22 @@ describe("agent-types", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
     expect(normalizeAgentType("coordinator")).toBe("coordinator");
     expect(normalizeAgentType("knowledge_qa")).toBe("knowledge_qa");
+    expect(normalizeAgentType("product_support")).toBe("product_support");
     expect(normalizeAgentType("custom")).toBe("custom");
     expect(normalizeAgentType(undefined)).toBe("custom");
     expect(normalizeAgentType("bogus")).toBe("custom");
+  });
+
+  it("requireAgentType accepts product_support at the fail-closed harness boundary", () => {
+    expect(requireAgentType("product_support")).toBe("product_support");
+    expect(() => requireAgentType("future_type")).toThrow("Invalid or missing agent_type");
   });
 
   it("effectiveCapabilityKeys: built-in types override, custom uses own selection", () => {
     expect(effectiveCapabilityKeys("coordinator", ["run_commands"])).toEqual(AGENT_TYPES.coordinator.capabilities);
     expect(effectiveCapabilityKeys("sre", null)).toEqual(AGENT_TYPES.sre.capabilities);
     expect(effectiveCapabilityKeys("knowledge_qa", ["run_commands"])).toEqual(["read_files"]);
+    expect(effectiveCapabilityKeys("product_support", ["run_commands"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", ["read_files"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", null)).toBeNull();
   });
@@ -86,6 +98,14 @@ describe("agent-types", () => {
     expect(resolveAgentPromptLayers("coordinator", "maintainer truth")).toEqual({
       typeContract: AGENT_TYPES.coordinator.defaultPrompt,
       addendum: "maintainer truth",
+    });
+    expect(resolveAgentPromptLayers("product_support", "Managed business contract")).toEqual({
+      typeContract: PRODUCT_SUPPORT_DEFAULT_PROMPT,
+      addendum: "Managed business contract",
+    });
+    expect(resolveAgentPromptLayers("product_support", "")).toEqual({
+      typeContract: PRODUCT_SUPPORT_DEFAULT_PROMPT,
+      addendum: undefined,
     });
     expect(resolveAgentPromptLayers("custom", "custom truth")).toEqual({ addendum: "custom truth" });
   });
