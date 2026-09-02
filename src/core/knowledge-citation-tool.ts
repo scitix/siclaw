@@ -290,7 +290,8 @@ export function createKnowledgeCitationSupport(opts: {
       "Use only when the current system prompt says knowledge source citations are available. " +
       "Register the exact evidence refs that materially support your final answer, and unmarked pages if needed. " +
       "Call once, immediately before the final answer. If the tool reports unresolved refs, retry once with only the remaining valid refs. " +
-      "The runtime validates frozen original-source metadata and appends trusted links; never invent or copy source URLs yourself.",
+      "The runtime validates frozen original-source metadata and appends trusted links; never invent or copy source URLs yourself. " +
+      `At most ${MAX_KNOWLEDGE_CITATIONS} unique original sources are registered per call, in the order given; any overflow is named in the result, never silently dropped.`,
     parameters: Type.Object({
       evidence_refs: Type.Optional(Type.Array(Type.String({ minLength: 3 }), {
         minItems: 1,
@@ -389,14 +390,11 @@ export function createKnowledgeCitationSupport(opts: {
           navigationRefs,
         );
       }
-      if (unresolved.length > 0 || citations.length > MAX_KNOWLEDGE_CITATIONS) {
-        const failed = unresolved.length > 0 ? unresolved : refs;
+      if (unresolved.length > 0) {
         return result(
-          unresolved.length > 0
-            ? `Unresolved evidence refs: ${unresolved.join(", ")}. No citations were registered. Retry knowledge_cite once with only the remaining valid refs (and any unmarked pages).`
-            : `Evidence resolves to more than ${MAX_KNOWLEDGE_CITATIONS} original sources; split the answer instead of truncating citations.`,
+          `Unresolved evidence refs: ${unresolved.join(", ")}. No citations were registered. Retry knowledge_cite once with only the remaining valid refs (and any unmarked pages).`,
           0,
-          failed,
+          unresolved,
         );
       }
 
@@ -443,19 +441,29 @@ export function createKnowledgeCitationSupport(opts: {
         }
       }
 
-      if (citations.length > MAX_KNOWLEDGE_CITATIONS) {
-        return result(
-          `Evidence resolves to more than ${MAX_KNOWLEDGE_CITATIONS} original sources; split the answer instead of truncating citations.`,
-          0,
-          refs.length > 0 ? refs : undefined,
-        );
-      }
+      // Rejecting an over-cap call registered ZERO citations on exactly the
+      // answers with the most validated support — and reported the resolved
+      // refs as "unresolved", whose retry guidance loops (retrying identical
+      // valid refs fails identically). Cap in input order and NAME the
+      // overflow instead: nothing is dropped silently, and a broad answer
+      // keeps its strongest references. Unresolved refs above still fail the
+      // whole call — that is a correctness problem, not a breadth problem.
+      const overflow = citations.length > MAX_KNOWLEDGE_CITATIONS
+        ? citations.splice(MAX_KNOWLEDGE_CITATIONS)
+        : [];
       if (citations.length > 0) {
         opts.sessionEventEmitter({ type: "knowledge_sources", sources: citations });
       }
+      const overflowNote = overflow.length === 0
+        ? ""
+        : ` ${overflow.length} more source${overflow.length === 1 ? " was" : "s were"} NOT registered ` +
+          `(beyond the ${MAX_KNOWLEDGE_CITATIONS}-source cap): ` +
+          overflow.slice(0, MAX_KNOWLEDGE_CITATIONS).map((citation) => citation.title).join(", ") +
+          `${overflow.length > MAX_KNOWLEDGE_CITATIONS ? ` (+${overflow.length - MAX_KNOWLEDGE_CITATIONS} more)` : ""}.` +
+          " Split very broad answers if every source must appear.";
       return result(
         citations.length > 0
-          ? `Registered ${citations.length} ${refs.length > 0 ? "exact " : ""}trusted original source${citations.length === 1 ? "" : "s"}; links will be appended automatically.`
+          ? `Registered ${citations.length} ${refs.length > 0 ? "exact " : ""}trusted original source${citations.length === 1 ? "" : "s"}; links will be appended automatically.${overflowNote}`
           : refs.length > 0
             ? "The evidence refs resolved but have no unique original-source links."
             : "The selected pages have no trusted clickable original sources; answer normally without a references section.",

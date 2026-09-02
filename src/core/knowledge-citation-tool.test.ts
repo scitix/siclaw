@@ -549,7 +549,7 @@ sources:
     expect(MAX_EVIDENCE_SOURCES_PER_MARKER).toBe(8);
   });
 
-  it("fails closed when mixed pages would add a ninth original source", async () => {
+  it("caps mixed pages at the ceiling and names the overflow instead of failing closed", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-cite-cap-"));
     dirs.push(dir);
     const sources = Array.from({ length: 8 }, (_, index) => ({
@@ -587,17 +587,23 @@ ${sources.map((source) => `  - id: ${source.id}\n    resource: ${source.resource
     });
     readPage(support, marked);
     readPage(support, legacy);
-    await expect(support.tool.execute("call", {
+    // The old contract failed the whole call ("split the answer") and reported
+    // the RESOLVED refs as unresolved — agents answered uncited instead of
+    // splitting, and the retry guidance looped on identical valid refs. The
+    // cap now keeps the first 8 in input order and names what it dropped.
+    const capped = await support.tool.execute("call", {
       evidence_refs: ["guide.md#all"],
       pages: ["legacy.md"],
-    } as never)).resolves.toMatchObject({
-      content: [{
-        type: "text",
-        text: "Evidence resolves to more than 8 original sources; split the answer instead of truncating citations.",
-      }],
-      details: { cited: 0, unresolved: ["guide.md#all"] },
-    });
-    expect(events).toEqual([]);
+    } as never);
+    expect(capped.details).toEqual({ cited: 8, unresolved: [] });
+    const text = (capped.content[0] as { text: string }).text;
+    expect(text).toContain("Registered 8 exact trusted original sources");
+    expect(text).toContain("1 more source was NOT registered");
+    expect(text).toContain("Extra");
+    expect(events).toHaveLength(1);
+    const emitted = (events[0] as { sources: Array<{ title: string }> }).sources;
+    expect(emitted).toHaveLength(8);
+    expect(emitted.map((source) => source.title)).not.toContain("Extra");
   });
 
   it("does not treat a fenced example marker as citable evidence", async () => {
