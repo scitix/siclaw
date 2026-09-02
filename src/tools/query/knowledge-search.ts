@@ -14,6 +14,8 @@ interface KnowledgeSearchParams {
   facet?: string;
   offset?: number;
   limit?: number;
+  includeLabels?: boolean;
+  includePages?: boolean;
 }
 
 function truncateUtf16Safe(value: string, maxLength: number): string {
@@ -40,15 +42,21 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
     description:
       "Resolve candidate knowledge pages using typed page labels and aliases only; this tool never searches page bodies. " +
       "Use it when the complete Wiki catalog leaves multiple plausible pages or the question uses alternate names, versions, or task terms. " +
-      "Set listLabels=true to inspect the package's paginated label catalog. Results are navigation metadata, not evidence: " +
-      "Read the complete relevant pages before answering, then use knowledge_cite only for pages actually used.",
+      "Each result includes a canonical routeProof showing that the leaf is reachable from the root catalog. The catalog " +
+      "steps prove navigation only; do not reread them as evidence. Set listLabels=true to inspect the package's paginated " +
+      "label catalog, but do not enumerate it before a normal search. Full candidate labels and catalog page lists are omitted " +
+      "unless includeLabels/includePages is explicitly requested. Results are navigation metadata, not evidence: Read the complete relevant leaf pages before answering, " +
+      "then use knowledge_cite only for pages actually used. matchedPages counts all query matches before topK truncation; " +
+      "a top score below about 0.7 is normally a weak match, so refine the query or use the complete Wiki catalog.",
     parameters: Type.Object({
       query: Type.Optional(Type.String({ description: "Natural-language query, label alias, version, or exact term to retrieve." })),
-      topK: Type.Optional(Type.Number({ description: "Maximum candidate pages to return (default 8, maximum 20)." })),
+      topK: Type.Optional(Type.Number({ description: "Maximum candidate pages to return (default 3, maximum 20)." })),
       listLabels: Type.Optional(Type.Boolean({ description: "List the typed label catalog instead of searching page content." })),
       facet: Type.Optional(Type.String({ description: "When listing labels, restrict to one facet." })),
       offset: Type.Optional(Type.Number({ description: "When listing labels, zero-based pagination offset." })),
-      limit: Type.Optional(Type.Number({ description: "When listing labels, page size (default 100, maximum 500)." })),
+      limit: Type.Optional(Type.Number({ description: "When listing labels, page size (default 20, maximum 100)." })),
+      includeLabels: Type.Optional(Type.Boolean({ description: "Include every label on each search result; default false because matchedLabels is normally sufficient." })),
+      includePages: Type.Optional(Type.Boolean({ description: "When listing labels, include their page paths; default false." })),
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as KnowledgeSearchParams;
@@ -66,10 +74,17 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
           query: params.query?.trim() || undefined,
           facet: params.facet?.trim() || undefined,
           offset: params.offset,
-          limit: params.limit,
+          limit: Math.min(100, Math.max(1, Math.floor(params.limit ?? 20))),
         });
+        const labels = catalog.labels.map(({ pages, pagesTruncated, ...label }) => ({
+          ...label,
+          ...(params.includePages ? { pages, pagesTruncated } : {}),
+        }));
         return {
-          content: [{ type: "text", text: JSON.stringify({ mode: "label_catalog", ...catalog }, null, 2) }],
+          content: [{
+            type: "text",
+            text: JSON.stringify({ mode: "label_catalog", ...catalog, labels }, null, 2),
+          }],
           details: { resultCount: catalog.labels.length, totalLabels: catalog.totalLabels },
         };
       }
@@ -81,7 +96,7 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
         };
       }
 
-      const topK = Math.min(20, Math.max(1, Math.floor(params.topK ?? 8)));
+      const topK = Math.min(20, Math.max(1, Math.floor(params.topK ?? 3)));
       try {
         const result = resolver.search(query, topK);
         const results = result.pages.map((page, index) => ({
@@ -90,9 +105,15 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
           title: truncateUtf16Safe(page.title, 200),
           description: truncateUtf16Safe(page.description, 700),
           score: Math.round(page.score * 1000) / 1000,
-          labels: page.labels,
+          ...(params.includeLabels ? { labels: page.labels } : {}),
           matchedLabels: page.matchedLabels,
+          routeProof: page.routeProof,
         }));
+        const hasMore = result.matchedPages > results.length;
+        const weakOrAmbiguous = results.length > 0 && (
+          results[0].score < 0.7 ||
+          (hasMore && results.length > 1 && results[0].score - results[1].score < 0.05)
+        );
         return {
           content: [{
             type: "text",
@@ -101,9 +122,16 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
               results,
               ...(results.length === 0 ? {
                 message: "No label-matched knowledge page found. Use the complete Wiki catalog to choose and Read plausible pages, or inspect the label catalog with listLabels=true.",
+              } : weakOrAmbiguous ? {
+                message: "Weak or ambiguous label match. Refine the query with an entity, component, task, environment, or version, or use the complete Wiki catalog before reading a leaf.",
               } : {}),
+              matchedPages: result.matchedPages,
+              hasMore,
               totalPages: result.totalPages,
               totalLabels: result.totalLabels,
+              invalidLabeledPages: result.invalidLabeledPages,
+              unlabeledPages: result.unlabeledPages,
+              unreachableLabeledPages: result.unreachableLabeledPages,
             }, null, 2),
           }],
           details: { resultCount: results.length },

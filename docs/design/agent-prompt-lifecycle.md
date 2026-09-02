@@ -81,10 +81,14 @@ responsibility.
 For Knowledge QA, the complete root `index.md` is the primary navigation map.
 `knowledge_search` resolves typed page labels and aliases only when catalog
 routing is ambiguous; it never searches page bodies or returns answer evidence.
-The Agent must Read the complete relevant leaf pages before answering and may
-cite only leaf content it actually used. This preserves semantic reasoning and
-the Wiki's linked navigation model without adding an embedding or content-index
-cold-start dependency.
+Each candidate includes one deterministic shortest `routeProof` from the root
+catalog to the leaf. The proof establishes that the candidate is published in
+the Wiki's navigation graph; it is not a claim that the Agent already traversed
+or read those pages. Intermediate catalogs do not need to be reread. The Agent
+must Read the complete relevant leaf pages before answering and may cite only
+leaf content it actually used. This preserves semantic reasoning and the Wiki's
+linked navigation model without adding an embedding or content-index cold-start
+dependency.
 
 ## Stored Addendum compatibility
 

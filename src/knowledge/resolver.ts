@@ -23,13 +23,19 @@ export class KnowledgeResolver {
   }
 
   search(query: string, topK = 10): KnowledgeResolutionResult {
-    if (this.closed) return { pages: [], totalPages: 0, totalLabels: 0 };
+    if (this.closed) return {
+      pages: [], matchedPages: 0, totalPages: 0, totalLabels: 0,
+      invalidLabeledPages: 0, unlabeledPages: 0, unreachableLabeledPages: 0,
+    };
     return this.labels.search(query, topK);
   }
 
   catalog(opts: { query?: string; facet?: string; offset?: number; limit?: number } = {}): KnowledgeLabelCatalogResult {
     if (this.closed) {
-      return { labels: [], totalLabels: 0, totalPages: 0, offset: 0, hasMore: false };
+      return {
+        labels: [], totalLabels: 0, totalPages: 0, offset: 0, hasMore: false,
+        invalidLabeledPages: 0, unlabeledPages: 0, unreachableLabeledPages: 0,
+      };
     }
     return this.labels.catalog(opts);
   }
