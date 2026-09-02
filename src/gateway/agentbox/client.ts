@@ -41,6 +41,10 @@ export interface PromptOptions {
   origin?: OriginKind;
   /** Present when a coordinator agent delegated this turn over the mesh. */
   delegation?: DelegationContext;
+  /** Expose `request_input` to a top-level machine-driven turn. */
+  allowInputRequest?: boolean;
+  /** Fail instead of creating a fresh conversation when `sessionId` cannot be restored. */
+  requireExistingSession?: boolean;
   /** Model provider to use for this prompt */
   modelProvider?: string;
   /** Model ID to use for this prompt */
@@ -104,6 +108,8 @@ export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
 export interface PromptResponse {
   ok: boolean;
   sessionId: string;
+  /** True when this prompt continued an in-memory or persisted conversation. */
+  resumed?: boolean;
   /** per-prompt root trace id (OTel 32-hex) echoed from the /api/prompt ack, for
    *  stamping chat_messages.trace_id on this turn's persisted rows. */
   traceId?: string;
@@ -150,11 +156,13 @@ export interface ContextUsageResponse {
 
 function agentBoxResponseError(status: number, body: string): RpcResponseError {
   const metadata: Record<string, unknown> = { status };
+  let structuredMessage: string | undefined;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
     const nested = parsed?.error && typeof parsed.error === "object"
       ? parsed.error as Record<string, unknown>
       : parsed;
+    if (typeof nested.message === "string" && nested.message.trim()) structuredMessage = nested.message;
     if (typeof nested.code === "string") metadata.code = nested.code;
     if (typeof nested.retriable === "boolean") metadata.retriable = nested.retriable;
     if (typeof nested.retryAfterMs === "number") metadata.retryAfterMs = nested.retryAfterMs;
@@ -162,7 +170,7 @@ function agentBoxResponseError(status: number, body: string): RpcResponseError {
   } catch {
     // Non-JSON error bodies still retain their HTTP-derived classification.
   }
-  const message = `AgentBox request failed: ${status}${body ? ` ${body}` : ""}`;
+  const message = structuredMessage ?? `AgentBox request failed: ${status}${body ? ` ${body}` : ""}`;
   return new RpcResponseError(wrapRpcError(Object.assign(new Error(message), metadata)));
 }
 

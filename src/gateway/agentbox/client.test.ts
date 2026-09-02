@@ -408,6 +408,34 @@ describe("AgentBoxClient — error paths", () => {
       });
     } finally { await srv.close(); }
   });
+
+  it("preserves the non-retriable session continuation error", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(412, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          code: "SESSION_CONTEXT_UNAVAILABLE",
+          message: "The requested session context is unavailable and cannot be resumed",
+          retriable: false,
+          status: 412,
+        },
+      }));
+    });
+    try {
+      const client = new AgentBoxClient(`http://127.0.0.1:${srv.port}`);
+      const err = await client.prompt({
+        text: "the cluster is sh-1",
+        sessionId: "missing",
+        requireExistingSession: true,
+      } as any).catch((caught) => caught);
+      expect(err).toMatchObject({
+        status: 412,
+        code: "SESSION_CONTEXT_UNAVAILABLE",
+        message: "The requested session context is unavailable and cannot be resumed",
+        retriable: false,
+      });
+    } finally { await srv.close(); }
+  });
 });
 
 describe("AgentBoxClient — streamEvents (SSE)", () => {
