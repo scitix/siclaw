@@ -27,6 +27,7 @@ import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
 import { resolveAgentModelRouting, resolveAgentSubagentTiers } from "./model-routing-config.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
+import { humanPromptPredicate } from "./human-prompt.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -1969,7 +1970,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ?
         AND ${nonTraceOriginPredicate("s")}
-        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
+        AND ${humanPromptPredicate(db, "m")}`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
     const totalPrompts = Number(pRows[0]?.c ?? 0);
@@ -3335,7 +3336,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ?
         AND ${nonTraceOriginPredicate("s")}
-        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
+        AND ${humanPromptPredicate(db, "m")}`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
     const totalPrompts = Number(pRows[0]?.c ?? 0);

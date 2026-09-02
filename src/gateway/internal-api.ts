@@ -18,6 +18,7 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
+import type { ChatMessageMetadata } from "../shared/message-kinds.js";
 import { sessionRegistry } from "./session-registry.js";
 import {
   deliverBackgroundChannelMessage,
@@ -585,7 +586,7 @@ async function appendDelegationEvent(
   frontendClient: FrontendWsClient,
   evt: DelegationEventPayload,
 ): Promise<string> {
-  const metadata: Record<string, unknown> = {
+  const metadata: ChatMessageMetadata = {
     kind: "delegation_event",
     source: "system_notification",
     event_type: `delegation.${evt.status}`,

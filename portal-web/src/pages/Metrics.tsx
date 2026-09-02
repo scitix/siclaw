@@ -170,7 +170,7 @@ export function Metrics() {
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                       <TrendChart
                         title="Prompts"
-                        subtitle="user messages per day"
+                        subtitle="human prompts per day"
                         color="#34d399"
                         data={summary.dailySeries.map((d) => ({ date: d.date, value: d.prompts }))}
                       />

@@ -1,9 +1,10 @@
 /**
- * Dialect-specific SQL builders for the 3 categories of MySQL/SQLite differences
+ * Dialect-specific SQL builders for the 4 categories of MySQL/SQLite differences
  * that can't be unified at the DDL level:
  *   1. Upsert: `ON DUPLICATE KEY UPDATE` vs `ON CONFLICT DO UPDATE`
  *   2. INSERT IGNORE: `INSERT IGNORE` vs `INSERT OR IGNORE`
  *   3. JSON array ops: `JSON_CONTAINS` / `JSON_TABLE` vs `json_each`
+ *   4. JSON scalar reads: `JSON_UNQUOTE(JSON_EXTRACT(...))` vs `json_extract`
  *
  * Also provides `safeParseJson()` for the three-state JSON column problem
  * (legacy MySQL `JSON` columns are pre-parsed by mysql2 into objects,
@@ -120,6 +121,38 @@ export function jsonArrayFlattenSql(
     joinClause: `${table}, json_each(${jsonColumn}) AS je`,
     valueColumn: "je.value",
   };
+}
+
+/**
+ * Read a scalar out of a JSON text column, as SQL text, or NULL.
+ *
+ *   MySQL:  CASE WHEN JSON_VALID(col) THEN JSON_UNQUOTE(JSON_EXTRACT(col, path)) END
+ *   SQLite: CASE WHEN JSON_VALID(col) THEN json_extract(col, path) END
+ *
+ * The two halves are not cosmetic. MySQL's `JSON_EXTRACT` returns a *JSON*
+ * string — `"task_event"`, quotes included — so a comparison against a plain
+ * literal never matches and `JSON_UNQUOTE` is what makes the predicate mean
+ * anything. SQLite's `json_extract` already yields unquoted text, and
+ * `JSON_UNQUOTE` does not exist there at all: a query carrying it dies with
+ * `no such function`, which is how a MySQL-only predicate reached local mode
+ * once already.
+ *
+ * The `JSON_VALID` guard is load-bearing on BOTH sides and is not an
+ * optimisation: handed a column that is not valid JSON, MySQL raises
+ * ER_INVALID_JSON_TEXT and SQLite raises `malformed JSON`. Neither returns
+ * NULL, so without the guard one unparseable row fails the whole query.
+ *
+ * A missing column, unparseable content, and an absent path all collapse to
+ * NULL — the caller decides what that means.
+ *
+ * `column` and `path` are interpolated: pass literals, never request input.
+ */
+export function jsonScalarOrNull(db: Db, column: string, path: string): string {
+  const extract =
+    db.driver === "mysql"
+      ? `JSON_UNQUOTE(JSON_EXTRACT(${column}, '${path}'))`
+      : `json_extract(${column}, '${path}')`;
+  return `CASE WHEN JSON_VALID(${column}) THEN ${extract} END`;
 }
 
 /**

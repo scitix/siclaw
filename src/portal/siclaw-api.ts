@@ -58,6 +58,7 @@ import {
 } from "./chat-session-fields.js";
 import { normalizeEntry, entrySessionPredicate, entryPromptPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
+import { humanPromptPredicate } from "./human-prompt.js";
 import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
 import {
   assembleExporterHeaders,
@@ -3746,7 +3747,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
         AND ${promptPred}
-        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
+        AND ${humanPromptPredicate(db, "m")}`;
     totalPromptsSql += userChanCond("s", pParams);
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
     const totalPrompts = Number(pRows[0]?.c ?? 0);
@@ -3834,7 +3835,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
         AND ${promptPred}
-        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
+        AND ${humanPromptPredicate(db, "m")}`;
     dailyPromptsSql += userChanCond("s", dpParams);
     dailyPromptsSql += " GROUP BY DATE(m.created_at)";
 

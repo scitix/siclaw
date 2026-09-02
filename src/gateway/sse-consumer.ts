@@ -11,6 +11,7 @@
  * chat_sessions row before invoking.
  */
 
+import type { ChatMessageMetadata } from "../shared/message-kinds.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
@@ -190,7 +191,7 @@ function compactRouteError(value: unknown, redactionConfig: RedactionConfig): st
   return redactText(text, redactionConfig).slice(0, 500);
 }
 
-function modelRouteSwitchMetadata(evt: SseEvent, redactionConfig: RedactionConfig): Record<string, unknown> | null {
+function modelRouteSwitchMetadata(evt: SseEvent, redactionConfig: RedactionConfig): ChatMessageMetadata | null {
   const fromCandidateKey = routeString(evt.fromCandidateKey);
   const toCandidateKey = routeString(evt.toCandidateKey);
   const fromProvider = routeString(evt.fromProvider);
@@ -257,7 +258,7 @@ function modelRouteSuccessMetadata(
   return metadata;
 }
 
-function modelRouteRecoveryMetadata(evt: SseEvent): Record<string, unknown> | null {
+function modelRouteRecoveryMetadata(evt: SseEvent): ChatMessageMetadata | null {
   const recoveredFromCandidateKey = routeString(evt.recoveredFromCandidateKey);
   const recoveredFromProvider = routeString(evt.recoveredFromProvider);
   const recoveredFromModelId = routeString(evt.recoveredFromModelId);
