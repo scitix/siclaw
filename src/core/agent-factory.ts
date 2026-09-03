@@ -59,6 +59,12 @@ import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 import {
+  ToolResultArtifactStore,
+  createToolResultArtifactTools,
+  toolResultArtifactRoot,
+  withToolResultArtifactCapture,
+} from "./tool-result-artifact.js";
+import {
   buildKnowledgeCitationSystemPrompt,
   createKnowledgeCitationSupport,
 } from "./knowledge-citation-tool.js";
@@ -354,11 +360,13 @@ function assertToolPathAllowed(
   absolutePath: string,
   allowedDirs: string[],
   operation: string,
-  blockedMemoryDir: string | null,
+  blockedDirs: Array<{ dir: string; reason: string }>,
 ): void {
   assertPathAllowed(absolutePath, allowedDirs, operation);
-  if (blockedMemoryDir && isPathInsideDir(absolutePath, blockedMemoryDir)) {
-    throw new Error(`${operation} blocked: Siclaw memory is disabled.`);
+  for (const blocked of blockedDirs) {
+    if (isPathInsideDir(absolutePath, blocked.dir)) {
+      throw new Error(`${operation} blocked: ${blocked.reason}`);
+    }
   }
 }
 
@@ -398,6 +406,8 @@ export async function createSiclawSession(
   const userId = opts?.userId ?? "unknown";
   const agentId: string | null = opts?.agentId ?? null;
   const sessionIdRef: { current: string } = { current: "" };
+  const sessionManager = opts?.sessionManager ?? SessionManager.create(process.cwd());
+  const sessionManagerId = sessionManager.getSessionId() || `runtime:${randomUUID()}`;
   // Turn counter for per-attempt tool state; the prompt owner bumps it (see ToolRefs).
   const turnRef: { current: number } = { current: 0 };
   const mode = opts?.mode ?? "web";
@@ -436,6 +446,7 @@ export async function createSiclawSession(
   });
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
+  const toolResultArtifactsDir = toolResultArtifactRoot(sessionManager.getSessionDir());
   const knowledgeDir = opts?.knowledgeDir
     ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
       ? opts.portalKnowledgeDir
@@ -566,6 +577,21 @@ export async function createSiclawSession(
 
   // -- MCP external tools (dynamic discovery, not in registry) --
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
+  const toolResultArtifactStore = new ToolResultArtifactStore({
+    rootDir: toolResultArtifactsDir,
+    getScope: () => ({
+      agentId: agentId ?? `user:${userId}`,
+      sessionId: sessionIdRef.current || sessionManagerId,
+    }),
+  });
+  try {
+    await toolResultArtifactStore.initialize();
+  } catch (error) {
+    console.warn(
+      "[agent-factory] Tool-result artifact storage unavailable; large MCP outputs will use explicit unrecoverable truncation:",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   let mcpManager: McpClientManager | undefined = exposeConfiguredMcp
     ? opts?.mcpManager
     : undefined;
@@ -574,7 +600,7 @@ export async function createSiclawSession(
   if (mcpManager) {
     const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
     if (sharedTools.length > 0) {
-      mcpTools = sharedTools;
+      mcpTools = sharedTools.map((tool) => withToolResultArtifactCapture(tool, toolResultArtifactStore));
       console.log(`[agent-factory] Reusing ${sharedTools.length} shared MCP tools`);
     }
   } else if (mcpServers && Object.keys(mcpServers).length > 0) {
@@ -584,7 +610,7 @@ export async function createSiclawSession(
       const discovered = mcpManager.getTools();
       console.log(`[agent-factory] MCP initialization complete: ${discovered.length} tools discovered`);
       if (discovered.length > 0) {
-        mcpTools = discovered;
+        mcpTools = discovered.map((tool) => withToolResultArtifactCapture(tool, toolResultArtifactStore));
         console.log(`[agent-factory] Added ${discovered.length} MCP tools: ${discovered.map(t => t.name).join(", ")}`);
       }
     } catch (err) {
@@ -605,6 +631,9 @@ export async function createSiclawSession(
   // The whole `mcpTools` array is MCP by construction, so an unconditional push
   // is simpler than and equivalent to skipping by an `mcp__` name prefix.
   customTools.push(...mcpTools);
+  if (mcpTools.length > 0) {
+    customTools.push(...createToolResultArtifactTools(toolResultArtifactStore));
+  }
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
@@ -619,7 +648,15 @@ export async function createSiclawSession(
     ...(opts?.portalSkillsDir ? [opts.portalSkillsDir] : []),
   ];
   const writeAllowedDirs = [userDataDir];
-  const blockedMemoryDir = memoryEnabled ? null : memoryDir;
+  const blockedFileDirs = [
+    {
+      dir: toolResultArtifactsDir,
+      reason: "tool-result artifacts are internal; use tool_result_read or tool_result_search",
+    },
+    ...(memoryEnabled ? [] : [{ dir: memoryDir, reason: "Siclaw memory is disabled" }]),
+  ];
+  const isBlockedFilePath = (candidate: string) =>
+    blockedFileDirs.some((blocked) => isPathInsideDir(candidate, blocked.dir));
 
   // Read-only delegated turn: drop the write file tools (Edit/Write) so a
   // delegated worker cannot mutate even its own scratch dir. Reads (Read/Grep/
@@ -631,7 +668,7 @@ export async function createSiclawSession(
     createReadTool(cwd, {
       operations: {
         readFile: async (p) => {
-          assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir);
+          assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs);
           const start = citationSupport?.captureMount();
           const content = await fsReadFile(p);
           if (citationSupport && start !== undefined) {
@@ -639,48 +676,48 @@ export async function createSiclawSession(
           }
           return content;
         },
-        access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK); },
+        access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
     ...(delegatedReadOnly ? [] : [
       createEditTool(cwd, {
         operations: {
-          readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsReadFile(p); },
-          writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
-          access: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
+          readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedFileDirs); return fsReadFile(p); },
+          writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedFileDirs); return fsWriteFile(p, c, "utf-8"); },
+          access: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedFileDirs); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
         },
       }),
       createWriteTool(cwd, {
         operations: {
-          writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "write", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
-          mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedMemoryDir); await fsMkdir(d, { recursive: true }); },
+          writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "write", blockedFileDirs); return fsWriteFile(p, c, "utf-8"); },
+          mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedFileDirs); await fsMkdir(d, { recursive: true }); },
         },
       }),
     ]),
     createGrepTool(cwd, {
       operations: {
-        isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedMemoryDir); return fs.statSync(p).isDirectory(); },
-        readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedMemoryDir); return fs.readFileSync(p, "utf-8"); },
+        isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.statSync(p).isDirectory(); },
+        readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.readFileSync(p, "utf-8"); },
       },
     }),
     createFindTool(cwd, {
       operations: {
-        exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "find", blockedMemoryDir); return fs.existsSync(p); },
+        exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "find", blockedFileDirs); return fs.existsSync(p); },
         glob: (pattern, searchCwd, options) => {
-          assertToolPathAllowed(searchCwd, readAllowedDirs, "find", blockedMemoryDir);
+          assertToolPathAllowed(searchCwd, readAllowedDirs, "find", blockedFileDirs);
           return globSync(pattern, { cwd: searchCwd, absolute: true, dot: true, ignore: options.ignore })
-            .filter((p) => !blockedMemoryDir || !isPathInsideDir(p, blockedMemoryDir))
+            .filter((p) => !isBlockedFilePath(p))
             .slice(0, options.limit);
         },
       },
     }),
     createLsTool(cwd, {
       operations: {
-        exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedMemoryDir); return fs.existsSync(p); },
-        stat: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedMemoryDir); return fs.statSync(p); },
+        exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedFileDirs); return fs.existsSync(p); },
+        stat: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedFileDirs); return fs.statSync(p); },
         readdir: (p) => {
-          assertToolPathAllowed(p, readAllowedDirs, "ls", blockedMemoryDir);
-          return fs.readdirSync(p).filter((entry) => !blockedMemoryDir || !isPathInsideDir(path.join(p, entry), blockedMemoryDir));
+          assertToolPathAllowed(p, readAllowedDirs, "ls", blockedFileDirs);
+          return fs.readdirSync(p).filter((entry) => !isBlockedFilePath(path.join(p, entry)));
         },
       },
     }),
@@ -859,9 +896,6 @@ export async function createSiclawSession(
   console.log(`[agent-context] ${JSON.stringify(contextManifest)}`);
   const modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest } = {};
   const modelEnvelopeInspectionRef: { current?: ModelEnvelopeInspection } = {};
-
-  const sessionManager =
-    opts?.sessionManager ?? SessionManager.create(process.cwd());
 
   // Resolve the initial model: prefer the user's configured default over pi-agent's built-in
   const configuredModel = defaultLlm

@@ -1,6 +1,18 @@
 import { describe, it, expect, vi } from "vitest";
 import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
 
+function artifactReference(id = "tra_0123456789abcdef0123456789abcdef") {
+  return {
+    version: 1,
+    id,
+    sizeChars: 500_000,
+    sizeBytes: 500_000,
+    sha256: "a".repeat(64),
+    createdAt: "2026-09-03T00:00:00.000Z",
+    expiresAt: "2026-09-04T00:00:00.000Z",
+  };
+}
+
 function createMockSessionManager() {
   const appended: any[] = [];
   return {
@@ -196,5 +208,52 @@ describe("installSessionToolResultGuard", () => {
     const persistedText = persisted.content[0].text;
     expect(persistedText.length).toBeLessThan(450_000);
     expect(persistedText).toContain("[Content truncated");
+  });
+
+  it("persists a recoverable artifact reference for oversized captured results", () => {
+    const sm = createMockSessionManager();
+    installSessionToolResultGuard(sm as any);
+
+    const artifact = artifactReference();
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_1",
+      content: [{ type: "text", text: `head\n${"x".repeat(499_980)}\nroot cause` }],
+      details: { ignored: "large provider details", toolResultArtifact: artifact },
+      timestamp: Date.now(),
+    });
+
+    const persisted = sm._appended[0];
+    const persistedText = persisted.content[0].text;
+    expect(persistedText.length).toBeLessThanOrEqual(16_000);
+    expect(persistedText).toContain(artifact.id);
+    expect(persistedText).toContain("tool_result_search");
+    expect(persistedText).toContain("root cause");
+    expect(persisted.details).toEqual({ toolResultArtifact: artifact });
+  });
+
+  it("makes artifact capture failure explicit when persistence must truncate", () => {
+    const sm = createMockSessionManager();
+    installSessionToolResultGuard(sm as any);
+
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_1",
+      content: [{ type: "text", text: "x".repeat(500_000) }],
+      details: {
+        toolResultArtifactFailure: {
+          version: 1,
+          reason: "write_failed",
+          sizeChars: 500_000,
+          sizeBytes: 500_000,
+        },
+      },
+      timestamp: Date.now(),
+    });
+
+    const persistedText = sm._appended[0].content[0].text;
+    expect(persistedText).toContain("complete artifact is unavailable");
+    expect(persistedText).toContain("cannot be recovered");
+    expect(persistedText).toContain("reason: write_failed");
   });
 });

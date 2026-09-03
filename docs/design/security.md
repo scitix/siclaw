@@ -230,12 +230,16 @@ The `sandbox` user has no write permission on any of these by OS permission alon
 | Path | Owner | Mode | agentbox | sandbox | Notes |
 |------|-------|------|----------|---------|-------|
 | `.siclaw/user-data/` | agentbox:agentbox | 0777 | rwx | rwx | Memory files, PROFILE.md, investigation notes. |
+| `.siclaw/user-data/agent/sessions/<session>/.tool-results/` | agentbox:agentbox | 0700 dirs, 0600 files | rw | -- | Session-scoped MCP output artifacts; opaque tool access only. |
 | `/tmp/` | (any) | 1777 | rw | rw | Temporary files. Sticky bit prevents cross-user deletion. |
 
 The `user-data` directory is the **only** writable area for the sandbox user (besides /tmp).
 This matches the application-level `writeAllowedDirs = [userDataDir]` — but enforced at OS level.
 
-**Critical**: No sensitive files should be placed in `/tmp/` or `user-data/`.
+**Critical**: No sensitive files should be placed directly in `/tmp/` or the
+world-writable part of `user-data/`. A private subtree below `user-data/` must be
+created by the agentbox process before tool execution, use `0700` directories
+and `0600` files, and remain inaccessible through generic file tools.
 
 ### 3.4 Pipeline Compatibility
 
