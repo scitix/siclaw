@@ -1059,3 +1059,50 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(capturedSignal).toBe(firstSignal);
   });
 });
+
+// The envelope's BINDING CONTEXT must reach the box. It is not optional
+// hardening: the box refuses an envelope that names a segment when no segment
+// arrives to compare against, so dropping these fields turns every governed
+// turn into a 403 rather than merely weakening a check.
+//
+// This is the break that only a CROSS-REPO assertion catches. Both sides were
+// individually correct and individually green: the control plane sent the
+// fields, the box read them — and the runtime in between never forwarded them.
+describe("startRuntime — authority binding context", () => {
+  it("forwards segmentId and taskId alongside the envelope", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({
+      agentId: "a",
+      userId: "u",
+      text: "check prod",
+      sessionId: "S",
+      authorityEnvelope: "envelope.token",
+      segmentId: "seg-1",
+      taskId: "task-1",
+    }, ctx);
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0]).toMatchObject({
+      authorityEnvelope: "envelope.token",
+      segmentId: "seg-1",
+      taskId: "task-1",
+    });
+    settleConsumer?.();
+  });
+
+  it("omits both when the caller sends no envelope", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S2" }, ctx);
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0].segmentId).toBeUndefined();
+    expect(promptCalls[0].taskId).toBeUndefined();
+    settleConsumer?.();
+  });
+});
