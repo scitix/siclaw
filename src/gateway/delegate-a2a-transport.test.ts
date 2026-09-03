@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import http from "node:http";
 import { AddressInfo } from "node:net";
 import {
   a2aTransportConfig,
   runA2aDelegation,
+  stableMessageId,
   __resetA2aThreads,
   type A2aTransportConfig,
 } from "./delegate-a2a-transport.js";
@@ -67,16 +68,54 @@ function baseArgs(observe: (evt: Record<string, unknown>) => void, signal?: Abor
 }
 
 describe("a2aTransportConfig", () => {
-  it("is undefined unless the flag AND endpoint AND token are all set", () => {
-    expect(a2aTransportConfig({} as NodeJS.ProcessEnv)).toBeUndefined();
-    expect(a2aTransportConfig({ SICLAW_DELEGATION_TRANSPORT: "a2a" } as NodeJS.ProcessEnv)).toBeUndefined();
-    expect(
-      a2aTransportConfig({
-        SICLAW_DELEGATION_TRANSPORT: "a2a",
-        SICLAW_INNER_A2A_URL: "http://cp:9000/",
-        SICLAW_INNER_A2A_TOKEN: "wk-x",
-      } as NodeJS.ProcessEnv),
-    ).toEqual({ baseUrl: "http://cp:9000", token: "wk-x" });
+  const env = (extra: Record<string, string>) => extra as unknown as NodeJS.ProcessEnv;
+
+  it("is undefined only when the flag is deliberately off", () => {
+    expect(a2aTransportConfig(env({}))).toBeUndefined();
+    expect(a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "legacy" }))).toBeUndefined();
+  });
+
+  it("accepts a fully configured https endpoint", () => {
+    expect(a2aTransportConfig(env({
+      SICLAW_DELEGATION_TRANSPORT: "a2a",
+      SICLAW_INNER_A2A_URL: "https://cp:9000/",
+      SICLAW_INNER_A2A_TOKEN: "wk-x",
+    }))).toEqual({ baseUrl: "https://cp:9000", token: "wk-x" });
+  });
+
+  it("THROWS instead of silently downgrading when the flag is on but incomplete", () => {
+    // The previous behaviour returned undefined and logged a warning, so the
+    // operator who set the flag ran on the legacy relay believing otherwise.
+    expect(() => a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "a2a" }))).toThrow(/requires both/);
+    expect(() => a2aTransportConfig(env({
+      SICLAW_DELEGATION_TRANSPORT: "a2a",
+      SICLAW_INNER_A2A_URL: "https://cp:9000",
+    }))).toThrow(/requires both/);
+    expect(() => a2aTransportConfig(env({
+      SICLAW_DELEGATION_TRANSPORT: "a2a",
+      SICLAW_INNER_A2A_TOKEN: "wk-x",
+    }))).toThrow(/requires both/);
+    expect(() => a2aTransportConfig(env({
+      SICLAW_DELEGATION_TRANSPORT: "a2a",
+      SICLAW_INNER_A2A_URL: "not a url",
+      SICLAW_INNER_A2A_TOKEN: "wk-x",
+    }))).toThrow(/not a valid URL/);
+  });
+
+  it("refuses a plaintext base URL unless the escape hatch is set", () => {
+    const plaintext = {
+      SICLAW_DELEGATION_TRANSPORT: "a2a",
+      SICLAW_INNER_A2A_URL: "http://cp:9000",
+      SICLAW_INNER_A2A_TOKEN: "wk-x",
+    };
+    expect(() => a2aTransportConfig(env(plaintext))).toThrow(/must use https/);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(a2aTransportConfig(env({ ...plaintext, SICLAW_INNER_A2A_ALLOW_PLAINTEXT: "1" })))
+      .toEqual({ baseUrl: "http://cp:9000", token: "wk-x" });
+    // The escape hatch announces itself so it cannot become the silent norm.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("plaintext"));
+    warn.mockRestore();
   });
 });
 
@@ -215,5 +254,248 @@ describe("runA2aDelegation", () => {
     expect(outcome.stopped).toBe(true);
     await new Promise((r) => setTimeout(r, 50));
     expect(cancelHit).toBe(true);
+  });
+
+  // ── #8 fast completion: no subscribe on an already-terminal task ──────────
+  it("short-circuits on a terminal task in the message:send body, without subscribing", async () => {
+    // Park the thread on a question first.
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+
+    // The resume itself answers with the finished task: a short answer settled
+    // before we could attach. Subscribing on a terminal task is answered 400
+    // UNSUPPORTED_OPERATION, which used to be reported as a delegation failure.
+    routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        task: {
+          id: "t1", contextId: "ctx-1",
+          status: { state: "TASK_STATE_COMPLETED" },
+          metadata: { sessionId: "remote-s1" },
+          artifacts: [{ parts: [{ text: "settled instantly" }] }],
+        },
+      }));
+    });
+    const events: Array<Record<string, unknown>> = [];
+    const outcome = await runA2aDelegation({ ...baseArgs((e) => events.push(e)), text: "cluster-a" });
+
+    expect(outcome.error).toBeUndefined();
+    expect(outcome).toMatchObject({ taskId: "t1", remoteSessionId: "remote-s1" });
+    expect((events.at(-1) as any).message.content[0].text).toBe("settled instantly");
+    expect(requests.some((r) => r.path.includes(":subscribe"))).toBe(false);
+  });
+
+  it("falls back to GET /tasks/{id} when subscribe refuses with 400", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+
+    // Resume acks non-terminal, then the task settles in the gap before subscribe.
+    routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ task: { id: "t1", status: { state: "TASK_STATE_WORKING" } } }));
+    });
+    routes.set("/inner/a2a/agents/peer-1/tasks/t1:subscribe", (_req, res) => {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "UNSUPPORTED_OPERATION" } }));
+    });
+    routes.set("/inner/a2a/agents/peer-1/tasks/t1", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        task: {
+          id: "t1", contextId: "ctx-1",
+          status: { state: "TASK_STATE_COMPLETED" },
+          metadata: { sessionId: "remote-s1" },
+          artifacts: [{ parts: [{ text: "read from the durable projection" }] }],
+        },
+      }));
+    });
+    const events: Array<Record<string, unknown>> = [];
+    const outcome = await runA2aDelegation({ ...baseArgs((e) => events.push(e)), text: "cluster-a" });
+
+    expect(outcome.error).toBeUndefined();
+    expect((events.at(-1) as any).message.content[0].text).toBe("read from the durable projection");
+  });
+
+  // ── #9 bridge recovery ────────────────────────────────────────────────────
+  it("sends a STABLE messageId, identical across two attempts with the same input", async () => {
+    let attempt = 0;
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) => {
+      attempt += 1;
+      if (attempt === 1) {
+        // First attempt dies mid-stream, so the caller retries the same open.
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end();
+        return;
+      }
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]);
+    });
+    routes.set("/inner/a2a/agents/peer-1/tasks/t1", (_req, res) => res.writeHead(404).end());
+
+    await runA2aDelegation(baseArgs(() => {}));
+    __resetA2aThreads(); // simulate the retry starting from a cold map
+    await runA2aDelegation(baseArgs(() => {}));
+
+    const opens = requests.filter((r) => r.path.endsWith("message:stream")).map((r) => JSON.parse(r.body));
+    expect(opens).toHaveLength(2);
+    expect(opens[0].message.messageId).toBeTruthy();
+    // Same delegation + same text ⇒ the same idempotency key, so a retried open
+    // cannot create a second task. (The old code sent randomUUID() each time,
+    // which meant the key could never match and replay protection was dead.)
+    expect(opens[0].message.messageId).toBe(opens[1].message.messageId);
+    expect(opens[0].message.messageId).toBe(stableMessageId(["d-1", "open", undefined, "diagnose the payment errors"]));
+  });
+
+  it("uses a stable, task-scoped messageId on a resume too", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+    routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ task: { id: "t1", status: { state: "TASK_STATE_COMPLETED" } } }));
+    });
+    await runA2aDelegation({ ...baseArgs(() => {}), text: "cluster-a" });
+    const resume = JSON.parse(requests.find((r) => r.path.endsWith("message:send"))!.body);
+    expect(resume.message.messageId).toBe(stableMessageId(["d-1", "t1", "cluster-a"]));
+  });
+
+  it("recovers a lost continuation by adopting a parked task from the listing", async () => {
+    // Leg 1 establishes the remote context.
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+
+    // The peer later parked on a question, but this process never saw that frame
+    // (restart, dropped stream). The control plane's listing is authoritative:
+    // parked tasks appear under the `working` filter.
+    routes.set("/inner/a2a/agents/peer-1/tasks?contextId=ctx-1&status=working", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        tasks: [
+          { id: "t-other", status: { state: "TASK_STATE_WORKING" } },
+          { id: "t-parked", status: { state: "TASK_STATE_INPUT_REQUIRED" } },
+        ],
+      }));
+    });
+    routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        task: {
+          id: "t-parked", contextId: "ctx-1",
+          status: { state: "TASK_STATE_COMPLETED" },
+          artifacts: [{ parts: [{ text: "resumed the parked task" }] }],
+        },
+      }));
+    });
+
+    const events: Array<Record<string, unknown>> = [];
+    const outcome = await runA2aDelegation({ ...baseArgs((e) => events.push(e)), text: "cluster-a" });
+
+    expect(outcome.error).toBeUndefined();
+    // It resumed the parked task rather than opening a brand-new one.
+    const resume = requests.find((r) => r.path.endsWith("message:send"));
+    expect(JSON.parse(resume!.body).message.taskId).toBe("t-parked");
+    expect(requests.filter((r) => r.path.endsWith("message:stream"))).toHaveLength(1);
+    expect((events.at(-1) as any).message.content[0].text).toBe("resumed the parked task");
+  });
+
+  it("opens a new task when the listing has nothing parked to adopt", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+    routes.set("/inner/a2a/agents/peer-1/tasks?contextId=ctx-1&status=working", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ tasks: [] }));
+    });
+    const outcome = await runA2aDelegation({ ...baseArgs(() => {}), text: "follow up" });
+    expect(outcome.error).toBeUndefined();
+    expect(requests.filter((r) => r.path.endsWith("message:stream"))).toHaveLength(2);
+    expect(requests.some((r) => r.path.endsWith("message:send"))).toBe(false);
+  });
+
+  it("GETs the task when the stream ends without a terminal frame", async () => {
+    // The comment promised this fallback; the code used to just error out while
+    // the answer sat readable on the durable side.
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), artifact("partial…")]),
+    );
+    routes.set("/inner/a2a/agents/peer-1/tasks/t1", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        task: {
+          id: "t1", contextId: "ctx-1",
+          status: { state: "TASK_STATE_COMPLETED" },
+          metadata: { sessionId: "remote-s1" },
+        },
+      }));
+    });
+    const events: Array<Record<string, unknown>> = [];
+    const outcome = await runA2aDelegation(baseArgs((e) => events.push(e)));
+    expect(outcome.error).toBeUndefined();
+    expect(requests.some((r) => r.path === "/inner/a2a/agents/peer-1/tasks/t1")).toBe(true);
+    // What DID stream is kept rather than discarded.
+    expect((events.at(-1) as any).message.content[0].text).toBe("partial…");
+  });
+
+  it("still reports an error when the stream drops AND the task cannot be read", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) => sse(res, [workingTask("t1")]));
+    routes.set("/inner/a2a/agents/peer-1/tasks/t1", (_req, res) => res.writeHead(503).end());
+    const outcome = await runA2aDelegation(baseArgs(() => {}));
+    expect(outcome.error).toBe("delegation stream ended before a terminal state");
+  });
+
+  // ── #11 on-behalf-of identity + evidence refs ─────────────────────────────
+  it("sends onBehalfOfUserId on BOTH the open and the resume bodies", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
+    );
+    await runA2aDelegation({ ...baseArgs(() => {}), onBehalfOfUserId: "user-42" });
+    routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ task: { id: "t1", status: { state: "TASK_STATE_COMPLETED" } } }));
+    });
+    await runA2aDelegation({ ...baseArgs(() => {}), text: "cluster-a", onBehalfOfUserId: "user-42" });
+
+    const open = JSON.parse(requests.find((r) => r.path.endsWith("message:stream"))!.body);
+    const resume = JSON.parse(requests.find((r) => r.path.endsWith("message:send"))!.body);
+    expect(open.metadata["siclaw.onBehalfOfUserId"]).toBe("user-42");
+    expect(resume.metadata["siclaw.onBehalfOfUserId"]).toBe("user-42");
+  });
+
+  it("OMITS onBehalfOfUserId when the originating user is unknown — never a placeholder", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+    const open = JSON.parse(requests.find((r) => r.path.endsWith("message:stream"))!.body);
+    expect("siclaw.onBehalfOfUserId" in open.metadata).toBe(false);
+  });
+
+  it("carries evidence_refs as a data part, not inlined bytes", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
+    );
+    await runA2aDelegation({ ...baseArgs(() => {}), evidenceRefs: ["trace://t1", "metric://m2"] });
+    const open = JSON.parse(requests.find((r) => r.path.endsWith("message:stream"))!.body);
+    expect(open.message.parts[0]).toEqual({ text: "diagnose the payment errors" });
+    expect(open.message.parts[1]).toEqual({
+      data: { evidence_refs: ["trace://t1", "metric://m2"] },
+      mediaType: "application/vnd.siclaw.context+json",
+    });
+  });
+
+  it("sends only the text part when there are no evidence refs", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+    const open = JSON.parse(requests.find((r) => r.path.endsWith("message:stream"))!.body);
+    expect(open.message.parts).toHaveLength(1);
   });
 });

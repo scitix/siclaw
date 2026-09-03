@@ -351,6 +351,8 @@ Examples:
 
 export const registration: ToolEntry = {
   category: "script-exec",
+  // Effect ceiling (shared/tool-effects.ts): runs a script on real nodes.
+  effect: "external_write",
   create: (refs) =>
     createNodeScriptTool(refs.kubeconfigRef, refs.userId, {
       executor: refs.backgroundExecExecutor,

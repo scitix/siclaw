@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { type ToolRefs } from "../../core/tool-registry.js";
 import { createProposeExecutionTool, registration } from "./propose-execution.js";
+import { actionDigest } from "../../shared/action-digest.js";
 
 function makeRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
   return {
@@ -16,6 +17,8 @@ function makeRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
 }
 
 const validParams = {
+  tool_name: "bash",
+  tool_args: { command: "kubectl scale deploy/payments --replicas=12" },
   effect: "external_write",
   resources: ["deployment://production-a/payments"],
   diff: { replicas: { from: 10, to: 12 } },
@@ -51,7 +54,54 @@ describe("propose_execution tool", () => {
       reason: "scale for the incident",
       risk: "medium",
       rollback: "restore replicas=10",
+      toolName: "bash",
+      toolArgs: { command: "kubectl scale deploy/payments --replicas=12" },
+      actionDigest: actionDigest("bash", { command: "kubectl scale deploy/payments --replicas=12" }),
     });
+  });
+
+  it("binds the proposal to the EXACT call, computing the digest locally", async () => {
+    // The runtime is the only party that computes a digest; the management plane
+    // stores this value opaquely. A different intended call ⇒ a different digest,
+    // which is what stops an approval for one action being spent on another.
+    const emitter = vi.fn();
+    const tool = createProposeExecutionTool(makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }));
+    await tool.execute("call-1", { ...validParams });
+    await tool.execute("call-2", { ...validParams, tool_args: { command: "kubectl delete ns payments" } });
+    const [first, second] = emitter.mock.calls.map((c) => (c[0] as any).actionDigest);
+    expect(first).not.toBe(second);
+    expect(second).toBe(actionDigest("bash", { command: "kubectl delete ns payments" }));
+    // No token of any kind is minted or emitted.
+    for (const call of emitter.mock.calls) {
+      expect(JSON.stringify(call[0])).not.toContain("receipt");
+    }
+  });
+
+  it("refuses a proposal that does not state the exact call", async () => {
+    // An approval that is not bound to an action is the bearer token this design
+    // removes, so the proposal cannot be issued against an intention.
+    const emitter = vi.fn();
+    const tool = createProposeExecutionTool(makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }));
+    for (const broken of [
+      { ...validParams, tool_name: "  " },
+      { ...validParams, tool_name: undefined },
+      { ...validParams, tool_args: undefined },
+    ]) {
+      const r = await tool.execute("call-z", broken as any);
+      expect((r.details as any).delivered).toBe(false);
+    }
+    expect(emitter).not.toHaveBeenCalled();
+  });
+
+  it("carries optional evidence_refs so the approver can check the basis", async () => {
+    const emitter = vi.fn();
+    const tool = createProposeExecutionTool(makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }));
+    await tool.execute("call-e", { ...validParams, evidence_refs: ["trace://t1", "metric://m2"] });
+    expect((emitter.mock.calls[0][0] as any).evidenceRefs).toEqual(["trace://t1", "metric://m2"]);
+    // Absent when not supplied, rather than an empty array.
+    emitter.mockClear();
+    await tool.execute("call-f", { ...validParams });
+    expect((emitter.mock.calls[0][0] as any).evidenceRefs).toBeUndefined();
   });
 
   it("rejects a proposal without its specifics — approvers decide on exact diffs", async () => {

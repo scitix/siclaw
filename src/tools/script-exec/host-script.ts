@@ -288,6 +288,8 @@ Examples (pass the id from host_list; names shown here for readability):
 
 export const registration: ToolEntry = {
   category: "script-exec",
+  // Effect ceiling (shared/tool-effects.ts): runs a script on real hosts.
+  effect: "external_write",
   create: (refs) =>
     createHostScriptTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,

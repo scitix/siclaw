@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { ToolRegistry, type ToolEntry, type ToolRefs } from "./tool-registry.js";
+import { ToolRegistry, TOOL_EFFECTS, effectForTool, type ToolEntry, type ToolRefs } from "./tool-registry.js";
+import { CAPABILITY_GROUPS } from "./tool-capabilities.js";
 
 function stubRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
   return {
@@ -218,5 +219,83 @@ describe("ToolRegistry", () => {
 
     expect(tools.map((t) => t.name)).toEqual(["delegate_to_agent"]);
     expect(tools[0].requiresUserApproval).toBe(true);
+  });
+});
+
+describe("declared tool effects", () => {
+  it("carries a declared effect onto the resolved definition", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "cmd-exec", create: () => stubToolDef("bash"), effect: "external_write" },
+      { category: "query", create: () => stubToolDef("read") },
+    );
+    const tools = reg.resolve({ mode: "web", refs: stubRefs() });
+    expect(tools.find((t) => t.name === "bash")?.effect).toBe("external_write");
+    // Undeclared stays undeclared on the definition; effectForTool supplies the
+    // `observe` default at the point of comparison.
+    expect(tools.find((t) => t.name === "read")?.effect).toBeUndefined();
+  });
+
+  it("preserves the effect after allowedTools filtering", () => {
+    const reg = new ToolRegistry();
+    reg.register({ category: "cmd-exec", create: () => stubToolDef("bash"), effect: "external_write" });
+    const tools = reg.resolve({ mode: "web", refs: stubRefs(), allowedTools: ["bash"] });
+    expect(tools[0].effect).toBe("external_write");
+  });
+
+  it("defaults an unknown tool name to observe", () => {
+    expect(effectForTool("no_such_tool")).toBe("observe");
+    expect(effectForTool("")).toBe("observe");
+  });
+
+  /**
+   * THE GUARD AGAINST A FUTURE MUTATING TOOL DEFAULTING TO `observe`.
+   *
+   * `effectForTool` answers `observe` for anything undeclared, which is only
+   * safe while every mutating tool IS declared. This test is what keeps that
+   * true: add a tool to any capability group below without declaring its effect
+   * and the build fails here, instead of the tool silently running under an
+   * observe-only authority envelope.
+   */
+  it("declares a non-observe effect for every tool in a mutating capability group", () => {
+    // Groups whose members change something: files, real infrastructure, other
+    // agents, or future unattended work.
+    const MUTATING_GROUPS = [
+      "write_sandbox",
+      "run_commands",
+      "run_scripts",
+      "spawn_subagents",
+      "delegate_agents",
+      "scheduling",
+    ];
+    // Read-only members that legitimately sit in a mutating group, each with the
+    // reason. A new name may only be added here with an equally concrete one.
+    const READ_ONLY_MEMBERS: Record<string, string> = {
+      // Grouped under run_commands for round-trip efficiency, but it is a
+      // read-only cluster read (see CAPABILITY_GROUPS' own note).
+      k8s_inspect: "read-only kubectl view",
+      task_output: "reads a background job's output",
+      list_delegates: "reads the delegation roster",
+    };
+
+    const undeclared: string[] = [];
+    for (const group of MUTATING_GROUPS) {
+      const members = CAPABILITY_GROUPS[group];
+      expect(members, `capability group "${group}" no longer exists — update this test`).toBeDefined();
+      for (const name of members) {
+        if (name in READ_ONLY_MEMBERS) continue;
+        if (effectForTool(name) === "observe") undeclared.push(`${group}/${name}`);
+      }
+    }
+    expect(undeclared).toEqual([]);
+  });
+
+  it("keeps every TOOL_EFFECTS value a legal, non-observe effect", () => {
+    // An `observe` entry in the map is dead weight (it is the default) and hints
+    // at a mistaken declaration; anything outside the vocabulary is a typo.
+    const legal = new Set(["local_write", "external_write", "destructive", "credential_read"]);
+    for (const [name, effect] of Object.entries(TOOL_EFFECTS)) {
+      expect(legal.has(effect), `${name} declares "${effect}"`).toBe(true);
+    }
   });
 });

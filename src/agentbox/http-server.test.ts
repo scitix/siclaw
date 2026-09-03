@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
+import { hasAcceptedTurn, readTurnLedger, recordAcceptedTurn, TURN_LEDGER_MAX } from "./turn-ledger.js";
+import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -227,14 +229,21 @@ function makeFakeSession(id: string) {
   };
 }
 
-function makeFakeSessionManager() {
+function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-ledger-"))) {
   const sessions = new Map<string, ReturnType<typeof makeFakeSession>>();
   const getOrCreateCalls: any[] = [];
   return {
     sessions,
     getOrCreateCalls,
+    ledgerDir,
     userId: "u",
     agentId: "a",
+    // The REAL file-backed ledger, so these tests exercise the durability that
+    // the cross-restart de-duplication depends on rather than a stub of it.
+    hasAcceptedTurn: (sessionId: string, turnId: string) =>
+      hasAcceptedTurn(path.join(ledgerDir, sessionId), turnId),
+    recordAcceptedTurn: (sessionId: string, turnId: string) =>
+      recordAcceptedTurn(path.join(ledgerDir, sessionId), turnId),
     agentTypeState: "sre",
     activeCount: () => sessions.size,
     // Resident is not the same as busy — box-status reports both.
@@ -2187,5 +2196,185 @@ describe("http-server — Skill handler wiring", () => {
     const src = fs.readFileSync(path.resolve(__dirname, "http-server.ts"), "utf8");
     expect(src).toContain("createSkillsHandler");
     expect(src).not.toContain("preserveExistingOnEmpty");
+  });
+});
+
+// ── Authority envelope binding + the turn ledger ──────────────────────────────
+
+describe("http-server — authority envelope binding", () => {
+  const SECRET = "test-authority-secret";
+  const origSecret = process.env.SICLAW_AUTHORITY_SECRET;
+
+  function sign(claims: Record<string, unknown>): string {
+    const payload = Buffer.from(JSON.stringify(claims));
+    const sig = createHmac("sha256", SECRET).update(payload).digest("hex");
+    return `${payload.toString("base64url")}.${sig}`;
+  }
+  const baseClaims = (extra: Record<string, unknown> = {}) => ({
+    authorityId: "authz_1",
+    issuer: "control-plane",
+    subject: "workload/w1",
+    targetAgentId: "a", // the fake session manager's own agentId
+    effectCeiling: "observe",
+    expiresAt: Math.floor(Date.now() / 1000) + 600,
+    nonce: "n1",
+    ...extra,
+  });
+
+  let envServer: http.Server | https.Server;
+  let envPort: number;
+  let envSm: ReturnType<typeof makeFakeSessionManager>;
+
+  beforeEach(async () => {
+    process.env.SICLAW_AUTHORITY_SECRET = SECRET;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.SICLAW_CERT_PATH = "/tmp/nonexistent-cert-path-for-siclaw-tests";
+    envSm = makeFakeSessionManager();
+    envServer = createHttpServer(envSm as any);
+    envPort = await startServer(envServer);
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((r) => (envServer as http.Server).close(() => r()));
+    vi.restoreAllMocks();
+    if (origSecret === undefined) delete process.env.SICLAW_AUTHORITY_SECRET;
+    else process.env.SICLAW_AUTHORITY_SECRET = origSecret;
+  });
+
+  it("accepts an envelope issued for THIS agent", async () => {
+    const r = await getJson(envPort, "/api/prompt", "POST", {
+      text: "hi", sessionId: "bound-ok", authorityEnvelope: sign(baseClaims()),
+    });
+    expect(r.status).toBe(200);
+  });
+
+  it("answers 403 AUTHORITY_ENVELOPE_MISBOUND for a wrong-agent envelope", async () => {
+    // The signature verifies — it is a real envelope — but it was minted for
+    // another agent. Without this check a valid envelope for a low-privilege
+    // agent could be replayed on a dispatch to a high-privilege one.
+    const r = await getJson(envPort, "/api/prompt", "POST", {
+      text: "hi", sessionId: "bound-bad",
+      authorityEnvelope: sign(baseClaims({ targetAgentId: "some-other-agent" })),
+    });
+    expect(r.status).toBe(403);
+    expect(r.data.error.code).toBe("AUTHORITY_ENVELOPE_MISBOUND");
+    expect(r.data.error.retriable).toBe(false);
+    expect(envSm.sessions.has("bound-bad")).toBe(false);
+  });
+
+  it("answers 403 MISBOUND on a segment or task the request does not carry", async () => {
+    const segment = await getJson(envPort, "/api/prompt", "POST", {
+      text: "hi", sessionId: "seg-bad", authorityEnvelope: sign(baseClaims({ segmentId: "seg1" })),
+    });
+    expect(segment.status).toBe(403);
+    expect(segment.data.error.code).toBe("AUTHORITY_ENVELOPE_MISBOUND");
+
+    const task = await getJson(envPort, "/api/prompt", "POST", {
+      text: "hi", sessionId: "task-bad", authorityEnvelope: sign(baseClaims({ taskId: "task1" })),
+    });
+    expect(task.status).toBe(403);
+
+    // ...and accepts them when the request DOES carry the matching context.
+    const ok = await getJson(envPort, "/api/prompt", "POST", {
+      text: "hi", sessionId: "seg-ok", segmentId: "seg1", taskId: "task1",
+      authorityEnvelope: sign(baseClaims({ segmentId: "seg1", taskId: "task1" })),
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("still answers 403 INVALID for a tampered envelope", async () => {
+    const r = await getJson(envPort, "/api/prompt", "POST", {
+      text: "hi", sessionId: "bad-sig", authorityEnvelope: `${sign(baseClaims()).slice(0, -2)}zz`,
+    });
+    expect(r.status).toBe(403);
+    expect(r.data.error.code).toBe("AUTHORITY_ENVELOPE_INVALID");
+  });
+
+  it("runs a prompt with no envelope exactly as before", async () => {
+    const r = await getJson(envPort, "/api/prompt", "POST", { text: "hi", sessionId: "ungoverned" });
+    expect(r.status).toBe(200);
+    expect(r.data.ok).toBe(true);
+  });
+});
+
+describe("http-server — turn ledger (cross-restart dispatch idempotency)", () => {
+  let ledgerServer: http.Server | https.Server;
+  let ledgerPort: number;
+  let ledgerSm: ReturnType<typeof makeFakeSessionManager>;
+
+  beforeEach(async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.SICLAW_CERT_PATH = "/tmp/nonexistent-cert-path-for-siclaw-tests";
+    ledgerSm = makeFakeSessionManager();
+    ledgerServer = createHttpServer(ledgerSm as any);
+    ledgerPort = await startServer(ledgerServer);
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((r) => (ledgerServer as http.Server).close(() => r()));
+    vi.restoreAllMocks();
+  });
+
+  it("records an accepted turnId and answers a repeat with duplicate:true, without prompting", async () => {
+    const first = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L1", turnId: "turn-1" });
+    expect(first.status).toBe(200);
+    expect(first.data.duplicate).toBeUndefined();
+    const session = ledgerSm.sessions.get("L1")!;
+    const promptsAfterFirst = session.brain.prompt.mock.calls.length;
+
+    const repeat = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L1", turnId: "turn-1" });
+    expect(repeat.status).toBe(200);
+    expect(repeat.data).toMatchObject({ ok: true, sessionId: "L1", turnId: "turn-1", duplicate: true });
+    // The whole point: no second turn was started.
+    expect(session.brain.prompt.mock.calls.length).toBe(promptsAfterFirst);
+  });
+
+  it("treats a DIFFERENT turnId on the same session as a new turn", async () => {
+    await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L2", turnId: "turn-1" });
+    const other = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L2", turnId: "turn-2" });
+    expect(other.data.duplicate).toBeUndefined();
+  });
+
+  it("survives a fresh session-manager instance — this is the cross-restart case", async () => {
+    await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L3", turnId: "turn-restart" });
+
+    // Everything in memory is gone; only the volume remains. A new manager and a
+    // new server over the SAME session directory must still recognise the turn,
+    // which is exactly what a Runtime restart looks like from the box's side.
+    await new Promise<void>((r) => (ledgerServer as http.Server).close(() => r()));
+    const revivedSm = makeFakeSessionManager(ledgerSm.ledgerDir);
+    ledgerServer = createHttpServer(revivedSm as any);
+    ledgerPort = await startServer(ledgerServer);
+
+    const repeat = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L3", turnId: "turn-restart" });
+    expect(repeat.data).toMatchObject({ duplicate: true, turnId: "turn-restart" });
+    // No session was even created on the revived instance.
+    expect(revivedSm.sessions.has("L3")).toBe(false);
+  });
+
+  it("keeps only the most recent TURN_LEDGER_MAX entries", async () => {
+    const dir = path.join(ledgerSm.ledgerDir, "bounded");
+    for (let i = 0; i < TURN_LEDGER_MAX + 25; i += 1) recordAcceptedTurn(dir, `t-${i}`);
+    const kept = readTurnLedger(dir);
+    expect(kept).toHaveLength(TURN_LEDGER_MAX);
+    expect(kept.at(-1)).toBe(`t-${TURN_LEDGER_MAX + 24}`);
+    // The oldest fell off; the newest are all still recognised.
+    expect(hasAcceptedTurn(dir, "t-0")).toBe(false);
+    expect(hasAcceptedTurn(dir, `t-${TURN_LEDGER_MAX + 24}`)).toBe(true);
+  });
+
+  it("treats a corrupt or missing ledger as empty rather than failing the turn", async () => {
+    const dir = path.join(ledgerSm.ledgerDir, "corrupt");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, ".turn-ledger.json"), "{not json", "utf8");
+    expect(readTurnLedger(dir)).toEqual([]);
+    expect(hasAcceptedTurn(dir, "anything")).toBe(false);
+    // And it recovers: a later record rewrites a valid file.
+    recordAcceptedTurn(dir, "t-after-corruption");
+    expect(hasAcceptedTurn(dir, "t-after-corruption")).toBe(true);
+    // A directory that does not exist at all is simply empty.
+    expect(readTurnLedger(path.join(ledgerSm.ledgerDir, "never-used"))).toEqual([]);
   });
 });

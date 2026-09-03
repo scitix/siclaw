@@ -294,6 +294,8 @@ Common cron patterns:
 
 export const registration: ToolEntry = {
   category: "workflow",
+  // Effect ceiling (shared/tool-effects.ts): persists work that later runs unattended.
+  effect: "external_write",
   create: (refs) => createManageScheduleTool(refs.kubeconfigRef, refs.sessionIdRef),
   modes: ["web", "channel"],
 };
