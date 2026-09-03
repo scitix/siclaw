@@ -26,6 +26,16 @@
     "failed": "failed to delete candidate page {path}: {e}",
     "deleted": "deleted candidate page: {path}"
   },
+  "file_ticket": {
+    "desc": "Open a contradiction ticket. Always file through this tool rather than writing authoring/CONTRADICTIONS.json by hand: a hand-written row has no ticket_kind, lands as 'unclassified' at turn end, and must be re-filed. Call once per unsettled question, after you have already written your best guess into the page and marked it ⚠️. Pass: `ticket_kind` — `source_conflict` when two or more DIFFERENT raw documents genuinely disagree (the fix belongs to the source owner; the wiki only projects it), or `model_gap` when only the owner can settle it: a single source, a tone/scope call based on BRIEF.json, an illegible figure, something you could not understand. The system checks the kind against your `sources`: two+ distinct raw docs with quotes must be source_conflict; anything less must be model_gap — a mismatch is refused and you resubmit with the kind named. `title` (short), `question` (one plain-language line), `sources` ([{doc, quote}] — the passages that disagree or the basis for your call), `options` (2–4 clean candidate values, no 'use X as authoritative' phrasing), `current_value` (what you wrote into the page), `affected_pages` (candidate files carrying the ⚠️). The id is computed from the question + documents: filing the same claim again updates that ticket instead of duplicating it.",
+    "bad_kind": "file_ticket needs `ticket_kind` = one of: {kinds}",
+    "need_args": "file_ticket needs `title`, `question`, non-empty `sources` (each with `doc`), `current_value` and `affected_pages`.",
+    "kind_needs_conflict": "refused: {n} distinct raw documents are quoted ({docs}) — that is a source_conflict (the documents disagree; the source owner must settle it), not a model_gap. Resubmit with ticket_kind=source_conflict.",
+    "kind_needs_gap": "refused: only {n} raw document(s) carry a quote ({docs}) — nothing is in dispute between sources, so this is a model_gap (only the owner can settle it), not a source_conflict. Resubmit with ticket_kind=model_gap.",
+    "failed": "ticket could not be written: {e}",
+    "filed": "ticket {tid} filed ({kind}); keep compiling — do not wait for a ruling",
+    "superseded": "ticket {tid} already existed for this claim and was updated ({kind}); no duplicate was created"
+  },
   "resolve_ticket": {
     "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify. `dispatch_nonce` is stamped by the runtime for the current apply round — pass any string or omit it; the box overwrites it. Outside an apply-rulings turn the runtime stores an empty nonce so the receipt is not matched to a ruling round.",
     "need_id": "resolve_ticket requires ticket_id",

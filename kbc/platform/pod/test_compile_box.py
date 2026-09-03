@@ -6995,6 +6995,7 @@ async def main():
     await test_a_spend_cap_does_not_kill_a_live_session()
     await test_the_runtime_owns_the_dispatch_round_not_the_model()
     await test_typed_authoring_commands()
+    await test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
@@ -7505,6 +7506,100 @@ def test_read_repo_meta_clamps_hand_written_over_cap_and_newlines():
         assert selfcheck.read_repo_meta(td).get("domain") == ok
 
     print("✓ read_repo_meta collapses whitespace and refuses over-cap")
+
+
+async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
+    """§D3: the model may describe a ticket, never classify it. Two distinct raw
+    docs with quotes → the tool refuses model_gap and names source_conflict; one
+    doc / BRIEF → it refuses source_conflict and names model_gap. The id is a
+    claim fingerprint the model never supplies, so the same claim supersedes
+    instead of duplicating; a hand-written row is marked unclassified at turn
+    end and the owner is told."""
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("file-ticket", td, 1)
+        run.locale = "zh"
+        emitted = []
+        async def _emit(ev):
+            emitted.append(ev)
+        run.emit = _emit
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        ft = tools["file_ticket"]
+        assert ft.input_schema["properties"]["ticket_kind"]["enum"] == ["model_gap", "source_conflict"]
+        assert "id" not in ft.input_schema["properties"]  # identity is code-owned
+        base = {"title": "K8s 版本", "question": "当前 K8s 是 1.30.2 还是 1.29?",
+                "options": ["1.30.2", "1.29.0"], "current_value": "1.30.2", "affected_pages": ["cluster.md"]}
+        two = [{"doc": "raw/a.md", "quote": "1.30.2"}, {"doc": "b.md", "quote": "1.29.0"}]
+        one = [{"doc": "raw/a.md", "quote": "1.30.2"}]
+        ledger = Path(td) / "authoring" / "CONTRADICTIONS.json"
+
+        # missing / bad kind
+        r = await ft.handler({**base, "sources": two})
+        assert "ticket_kind" in r and not ledger.exists(), r
+        r = await ft.handler({**base, "sources": two, "ticket_kind": "raw_bug"})
+        assert "ticket_kind" in r and not ledger.exists(), r
+        # missing evidence
+        r = await ft.handler({**base, "sources": [], "ticket_kind": "model_gap"})
+        assert "sources" in r and not ledger.exists(), r
+        # two docs self-filed as model_gap → refused, names source_conflict
+        r = await ft.handler({**base, "sources": two, "ticket_kind": "model_gap"})
+        assert "source_conflict" in r and "已拒" in r and not ledger.exists(), r
+        # one doc self-filed as source_conflict → refused, names model_gap
+        r = await ft.handler({**base, "sources": one, "ticket_kind": "source_conflict"})
+        assert "model_gap" in r and "已拒" in r and not ledger.exists(), r
+        # BRIEF-based tone call with a raw excerpt is still one raw doc → model_gap
+        tone = [{"doc": "authoring/BRIEF.json", "quote": "audience=external"}, {"doc": "a.md", "quote": "内部 IP"}]
+        r = await ft.handler({**base, "sources": tone, "ticket_kind": "source_conflict"})
+        assert "model_gap" in r and "已拒" in r, r
+
+        # accepted: one doc as model_gap
+        r = await ft.handler({**base, "sources": one, "ticket_kind": "model_gap"})
+        assert "已开" in r and "model_gap" in r, r
+        rows = json.loads(ledger.read_text("utf-8"))
+        assert len(rows) == 1
+        tk = rows[0]
+        assert tk["id"].startswith("tk-") and tk["ticket_kind"] == "model_gap" and tk["origin"] == "compile"
+        # legacy chat path: no accepted command → no round stamp (nothing auto-closes)
+        assert tk["filed_operation_id"] == "" and tk["filed_generation"] == 0
+        # a typed command round stamps the round the evidence was seen in, from the
+        # runtime's pinned context — the model has no argument for it
+        run._command_context = ("op-round-2", 3)
+        assert tk["status"] == "open" and tk["answer"] is None and tk["filed_at"]
+        assert tk["sources"] == [{"doc": "a.md", "quote": "1.30.2"}]  # raw/ stripped
+        # a later round finds the second document: same question, more evidence →
+        # the kind flips to source_conflict on a NEW claim id (doc set changed),
+        # while the same claim re-filed supersedes rather than duplicates.
+        r = await ft.handler({**base, "sources": one, "ticket_kind": "model_gap", "current_value": "1.30.2-cks"})
+        assert "已更新" in r, r
+        rows = json.loads(ledger.read_text("utf-8"))
+        assert len(rows) == 1 and rows[0]["current_value"] == "1.30.2-cks"
+        assert rows[0]["filed_operation_id"] == "op-round-2" and rows[0]["filed_generation"] == 3
+        assert rows[0]["filed_at"] == tk["filed_at"]  # first sighting kept; re-filing stamps superseded_at
+        assert rows[0]["superseded_at"]
+        r = await ft.handler({**base, "sources": two, "ticket_kind": "source_conflict"})
+        assert "已开" in r and "source_conflict" in r, r
+        rows = json.loads(ledger.read_text("utf-8"))
+        assert [x["ticket_kind"] for x in rows] == ["model_gap", "source_conflict"]
+
+        # the model hand-writes a row anyway → turn-end backstop marks it unclassified and tells the owner
+        rows.append({"id": "hand-1", "title": "手写", "question": "?", "sources": two,
+                     "affected_pages": ["cluster.md"], "status": "open", "answer": None})
+        ledger.write_text(json.dumps(rows, ensure_ascii=False), "utf-8")
+        await compile_box._normalize_ticket_ledger_after_turn(run, td)
+        rows = {x["id"]: x for x in json.loads(ledger.read_text("utf-8"))}
+        assert rows["hand-1"]["ticket_kind"] == "unclassified"
+        assert any("未分类" in ev.get("text", "") and "file_ticket" in ev.get("text", "") for ev in emitted), emitted
+        # resolve_ticket still closes a file_ticket-opened row by its code-owned id
+        await tools["resolve_ticket"].handler({"ticket_id": tk["id"], "applied_value": "1.30.2",
+                                               "pages_edited": ["cluster.md"], "note": ""})
+        rows = {x["id"]: x for x in json.loads(ledger.read_text("utf-8"))}
+        assert rows[tk["id"]]["status"] == "applied" and rows[tk["id"]]["ticket_kind"] == "model_gap"
+    # both prompt packs steer opening through the tool and forbid Write on the ledger
+    for loc in ("en", "zh"):
+        ts = compile_box._tool_strings(loc)
+        assert "source_conflict" in ts["file_ticket"]["desc"] and "model_gap" in ts["file_ticket"]["desc"]
+        for key in ("kind_needs_conflict", "kind_needs_gap"):
+            assert "{n}" in ts["file_ticket"][key] and "{docs}" in ts["file_ticket"][key]
+    print("✓ file_ticket: evidence picks the kind, code owns the id, hand-written rows land unclassified")
 
 
 async def test_the_runtime_owns_the_dispatch_round_not_the_model():
