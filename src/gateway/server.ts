@@ -791,6 +791,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const authorityEnvelope = typeof params.authorityEnvelope === "string" && params.authorityEnvelope
       ? params.authorityEnvelope
       : undefined;
+    // The envelope's BINDING CONTEXT must travel with it. The box compares the
+    // envelope's targetAgentId / segmentId / taskId against these and refuses a
+    // mismatch (fail closed), which is what stops an envelope observed on one
+    // turn from governing another. Dropping them here does not weaken the
+    // check — it BREAKS it: an envelope that names a segment, arriving with no
+    // segment to compare against, is a mismatch, so every governed turn would
+    // 403 with AUTHORITY_ENVELOPE_MISBOUND.
+    const segmentId = typeof params.segmentId === "string" && params.segmentId ? params.segmentId : undefined;
+    const boundTaskId = typeof params.taskId === "string" && params.taskId ? params.taskId : undefined;
     // A cross-Runtime delegation session is created by the coordinator Runtime
     // before ControlPlane routes this chat.send to the target Runtime. Re-inserting the
     // session/user row here would overwrite ownership/lineage and duplicate the
@@ -905,6 +914,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       allowInputRequest,
       requireExistingSession,
       authorityEnvelope,
+      segmentId,
+      taskId: boundTaskId,
       modelConfig,
       modelRouting,
       subagentTiers,

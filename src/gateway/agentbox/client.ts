@@ -45,6 +45,14 @@ export interface PromptOptions {
   allowInputRequest?: boolean;
   /** Signed authority envelope; the box verifies and enforces it per tool call. */
   authorityEnvelope?: string;
+  /**
+   * The envelope's binding context. The box refuses an envelope whose
+   * segmentId / taskId disagree with these, so an envelope cannot be replayed
+   * onto a different turn. They must accompany every envelope that names them:
+   * an envelope bound to a segment, arriving with no segment, IS a mismatch.
+   */
+  segmentId?: string;
+  taskId?: string;
   /** Fail instead of creating a fresh conversation when `sessionId` cannot be restored. */
   requireExistingSession?: boolean;
   /** Model provider to use for this prompt */
