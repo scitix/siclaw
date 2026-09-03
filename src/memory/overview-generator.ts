@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { modelKnowledgeLocations } from "../knowledge/model-path.js";
+import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-path.js";
+
+const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
+const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -112,6 +115,7 @@ export function buildKnowledgeWikiCatalog(
   if (!index) return "";
 
   const { wikiRoot, indexPath: modelIndexPath } = modelKnowledgeLocations(knowledgeDir);
+  const { catalogIndex, verifiedRoutes } = collectVerifiedRoutes(knowledgeDir, index);
 
   return [
     "# Knowledge Wiki",
@@ -129,8 +133,20 @@ export function buildKnowledgeWikiCatalog(
     (opts.operational === false
       ? "Answer from the most relevant pages, synthesize the evidence, and say when the knowledge is insufficient."
       : "Pages are semantic — translate what you learn into concrete checks using the tools and skills available to you."),
+    ...(verifiedRoutes.length > 0
+      ? [
+          "",
+          "## Verified Fast Routes",
+          "",
+          "These routes are verified shortcuts into the bound knowledge. When the user's intent matches one, " +
+          "read the listed target pages in the stated order before answering. The rewritten links below are " +
+          `resolved against \`${wikiRoot}\`; their destinations can be passed directly to the Read tool.`,
+          "",
+          ...verifiedRoutes,
+        ]
+      : []),
     "",
-    index,
+    catalogIndex,
   ].join("\n");
 }
 
@@ -152,6 +168,99 @@ interface DocEntry {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+interface VerifiedRoutesProjection {
+  catalogIndex: string;
+  verifiedRoutes: string[];
+}
+
+/**
+ * Lift renderer-owned verified-route blocks ahead of the ordinary catalog.
+ *
+ * A single bound library exposes its own index.md at the knowledge root. A
+ * multi-library bundle instead exposes a synthetic root index and nests each
+ * library under repos/<dir>/index.md. Scan only those two materialization
+ * shapes, rewrite nested relative links from the root's point of view, and
+ * remove the root block from the ordinary catalog so it is not injected twice.
+ */
+function collectVerifiedRoutes(knowledgeDir: string, rootIndex: string): VerifiedRoutesProjection {
+  const rootBlock = extractVerifiedRoutesBlock(rootIndex);
+  const verifiedRoutes: string[] = [];
+  let catalogIndex = rootIndex;
+
+  if (rootBlock) {
+    verifiedRoutes.push(rewriteRelativeMarkdownLinks(rootBlock.block, "", knowledgeDir));
+    catalogIndex = rootBlock.withoutBlock;
+  }
+
+  const reposDir = path.join(knowledgeDir, "repos");
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(reposDir, { withFileTypes: true });
+  } catch {
+    return { catalogIndex, verifiedRoutes };
+  }
+
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory()) continue;
+    const relativeIndexPath = path.posix.join("repos", entry.name, "index.md");
+    let nestedIndex: string;
+    try {
+      nestedIndex = fs.readFileSync(path.join(reposDir, entry.name, "index.md"), "utf-8");
+    } catch {
+      continue;
+    }
+    const nestedBlock = extractVerifiedRoutesBlock(nestedIndex);
+    if (!nestedBlock) continue;
+
+    verifiedRoutes.push([
+      `### From \`${relativeIndexPath}\``,
+      "",
+      rewriteRelativeMarkdownLinks(
+        nestedBlock.block,
+        path.posix.dirname(relativeIndexPath),
+        knowledgeDir,
+      ),
+    ].join("\n"));
+  }
+
+  return { catalogIndex, verifiedRoutes };
+}
+
+function extractVerifiedRoutesBlock(index: string): { block: string; withoutBlock: string } | null {
+  const begin = index.indexOf(VERIFIED_ROUTES_BEGIN);
+  if (begin < 0) return null;
+  const end = index.indexOf(VERIFIED_ROUTES_END, begin + VERIFIED_ROUTES_BEGIN.length);
+  if (end < 0) return null;
+
+  const afterEnd = end + VERIFIED_ROUTES_END.length;
+  const block = index.slice(begin, afterEnd).trim();
+  const withoutBlock = [index.slice(0, begin).trimEnd(), index.slice(afterEnd).trimStart()]
+    .filter(Boolean)
+    .join("\n\n");
+  return { block, withoutBlock };
+}
+
+function rewriteRelativeMarkdownLinks(markdown: string, sourceDir: string, knowledgeDir: string): string {
+  return markdown.replace(/\]\(([^)]+)\)/g, (match, destination: string) => {
+    const trimmed = destination.trim();
+    if (
+      !trimmed ||
+      trimmed.startsWith("#") ||
+      trimmed.startsWith("/") ||
+      /^[a-z][a-z0-9+.-]*:/i.test(trimmed)
+    ) {
+      return match;
+    }
+
+    const angleWrapped = trimmed.startsWith("<") && trimmed.endsWith(">");
+    const target = angleWrapped ? trimmed.slice(1, -1) : trimmed;
+    const relativeTarget = path.posix.normalize(path.posix.join(sourceDir, target));
+    if (relativeTarget === ".." || relativeTarget.startsWith("../")) return match;
+    const rewritten = modelKnowledgePath(knowledgeDir, relativeTarget);
+    return `](${angleWrapped ? `<${rewritten}>` : rewritten})`;
+  });
+}
 
 /** Check if a Dirent is a directory, following symlinks. */
 function isDir(parentDir: string, entry: fs.Dirent): boolean {

@@ -336,4 +336,75 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("[招摇 B30X 多厂商评估](topics/招摇B30X.md)");
     expect(out).toContain("B300 LSTM 算子通过 cudagraph 优化");
   });
+
+  it("lifts a root verified-route block ahead of a large catalog without duplicating it", () => {
+    const routeBlock = [
+      "<!-- verified-routes:begin -->",
+      "## 已验证快速路由",
+      "",
+      "- **Diagnose XID** → [gpu/xid.md](gpu/xid.md)",
+      "<!-- verified-routes:end -->",
+    ].join("\n");
+    const largeCatalog = Array.from(
+      { length: 200 },
+      (_, i) => `- [Page ${i}](pages/${i}.md) — ${"description ".repeat(8)}`,
+    ).join("\n");
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), `${largeCatalog}\n\n${routeBlock}\n`);
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    const xidPath = path.join(knowledgeDir, "gpu", "xid.md");
+
+    expect(out.indexOf("## Verified Fast Routes")).toBeLessThan(out.indexOf("- [Page 0]"));
+    expect(out.match(/<!-- verified-routes:begin -->/g)).toHaveLength(1);
+    expect(out).toContain(`[gpu/xid.md](${xidPath})`);
+    expect(out).toContain("- [Page 199]");
+  });
+
+  it("lifts routes from every library in a multi-library materialization", () => {
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [[repos/compute/index]]\n- [[repos/network/index]]\n",
+    );
+    for (const [library, intent, target] of [
+      ["compute", "Diagnose XID", "gpu/xid.md"],
+      ["network", "Diagnose RoCE", "roce/loss.md"],
+    ]) {
+      const libraryDir = path.join(knowledgeDir, "repos", library);
+      fs.mkdirSync(libraryDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(libraryDir, "index.md"),
+        [
+          `# ${library}`,
+          "",
+          "<!-- verified-routes:begin -->",
+          "## 已验证快速路由",
+          "",
+          `- **${intent}** → [${target}](${target})`,
+          "<!-- verified-routes:end -->",
+        ].join("\n"),
+      );
+    }
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+
+    expect(out).toContain("### From `repos/compute/index.md`");
+    expect(out).toContain(`[gpu/xid.md](${path.join(knowledgeDir, "repos", "compute", "gpu", "xid.md")})`);
+    expect(out).toContain("### From `repos/network/index.md`");
+    expect(out).toContain(`[roce/loss.md](${path.join(knowledgeDir, "repos", "network", "roce", "loss.md")})`);
+    expect(out.indexOf("## Verified Fast Routes")).toBeLessThan(out.indexOf("# Knowledge Index"));
+  });
+
+  it("ignores an unterminated verified-route block", () => {
+    const index = [
+      "# Catalog",
+      "<!-- verified-routes:begin -->",
+      "- **Incomplete** → [page](page.md)",
+    ].join("\n");
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+
+    expect(out).not.toContain("## Verified Fast Routes");
+    expect(out).toContain(index);
+  });
 });
