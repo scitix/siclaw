@@ -256,6 +256,18 @@ export function createKnowledgeCitationSupport(opts: {
       registeredThisTurn = [];
     }
   };
+  // A mid-turn remount invalidates the union — the old mount's manifest no
+  // longer vouches for those originals. Both gateway consumers ASSIGN the
+  // knowledge_sources event, so dropping our copy is not enough: without a
+  // fresh emit they keep rendering the stale mount's links even after the next
+  // cite fails or registers nothing. Emit an empty set so they clear too; a
+  // later successful cite re-emits the new mount's union. A no-op when the
+  // union was already empty, so it never emits on the turn-boundary reset.
+  const clearRegisteredUnion = () => {
+    if (registeredThisTurn.length === 0) return;
+    registeredThisTurn = [];
+    opts.sessionEventEmitter({ type: "knowledge_sources", sources: [] });
+  };
   const pinManifest = () => {
     if (pinnedManifest !== undefined) return;
     pinnedManifest = readManifest(opts.knowledgeDir);
@@ -278,7 +290,7 @@ export function createKnowledgeCitationSupport(opts: {
       // hold the cap hostage against everything the new mount cites.
       readPages.clear();
       pinnedManifest = undefined;
-      registeredThisTurn = [];
+      clearRegisteredUnion();
       return;
     }
     if (pinnedManifest !== undefined && !sameManifest(pinnedManifest, current)) {
@@ -287,7 +299,7 @@ export function createKnowledgeCitationSupport(opts: {
       // same reasoning as above.
       readPages.clear();
       pinnedManifest = current;
-      registeredThisTurn = [];
+      clearRegisteredUnion();
     } else if (pinnedManifest === undefined) {
       pinnedManifest = current;
     }
@@ -335,14 +347,29 @@ export function createKnowledgeCitationSupport(opts: {
       // pi does not validate tool params against the TypeBox schema, so shape
       // errors land here. Silently coercing a non-array to [] is the worst
       // answer: the call reports success while the misshapen half is dropped,
-      // and the model ships the answer believing those pages are cited.
-      if (params.evidence_refs !== undefined && !Array.isArray(params.evidence_refs)) {
+      // and the model ships the answer believing those pages are cited. `null`
+      // is the exception — for an optional field it means ABSENT, not
+      // malformed, so `{evidence_refs:[...], pages:null}` must keep the refs
+      // rather than fail the whole call (a failed cite blocks the answer).
+      if (params.evidence_refs != null && !Array.isArray(params.evidence_refs)) {
         return result(
           "evidence_refs must be an ARRAY of page.md#evidence-id strings. No citations were registered. Retry knowledge_cite once with the corrected shape.",
           0,
         );
       }
-      const refs = Array.isArray(params.evidence_refs) ? params.evidence_refs.map(String) : [];
+      const rawRefs = Array.isArray(params.evidence_refs) ? params.evidence_refs : [];
+      // Diagnose non-string ref elements instead of String()-ifying them: an
+      // object slips through as "[object Object]" and is reported as an
+      // unresolved ref, sending the retry at the wrong problem (the same
+      // misdiagnosis the per-field pages branch below exists to avoid).
+      const malformedRefs = rawRefs.filter((ref) => typeof ref !== "string");
+      if (malformedRefs.length > 0) {
+        return result(
+          `evidence_refs must be page.md#evidence-id STRINGS. Non-string entries: ${malformedRefs.map((ref) => JSON.stringify(ref).slice(0, 80)).join(", ")}. No citations were registered. Retry knowledge_cite once with string refs (keeping any pages).`,
+          0,
+        );
+      }
+      const refs = rawRefs as string[];
       // A whole-page citation is the coarse instrument (evidence refs are
       // already claim-scoped by their marker), and provenance validation alone
       // makes padding free — every read-but-unused page validates identically
@@ -352,7 +379,7 @@ export function createKnowledgeCitationSupport(opts: {
       // The schema's 4-300 char claim bounds are enforced HERE for the same
       // no-schema-validation reason: a 1-character claim would let padding
       // back in, and an unbounded one lands unvalidated in durable storage.
-      if (params.pages !== undefined && !Array.isArray(params.pages)) {
+      if (params.pages != null && !Array.isArray(params.pages)) {
         return result(
           "pages must be an ARRAY of { path, claim } objects. No citations were registered. Retry knowledge_cite once with the corrected shape.",
           0,

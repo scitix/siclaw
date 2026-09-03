@@ -407,4 +407,62 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).not.toContain("## Verified Fast Routes");
     expect(out).toContain(index);
   });
+
+  it("leaves scheme, absolute, and anchor links wrapped in angle brackets untouched", () => {
+    // The angle-bracket unwrap must not let a wrapped external URL, absolute
+    // path, or anchor slip past the guards and get rewritten into the mount.
+    const routeBlock = [
+      "<!-- verified-routes:begin -->",
+      "## 已验证快速路由",
+      "",
+      "- **External** → [docs](<https://docs.feishu.cn/wiki/abc>)",
+      "- **Absolute** → [passwd](</etc/passwd>)",
+      "- **Anchor** → [top](<#heading>)",
+      "- **Relative** → [xid](<gpu/xid.md>)",
+      "<!-- verified-routes:end -->",
+    ].join("\n");
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), `# Catalog\n\n${routeBlock}\n`);
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+
+    expect(out).toContain("[docs](<https://docs.feishu.cn/wiki/abc>)");
+    expect(out).toContain("[passwd](</etc/passwd>)");
+    expect(out).toContain("[top](<#heading>)");
+    expect(out).not.toContain("https:/docs.feishu.cn"); // no // → / collapse from a join
+    expect(out).not.toContain(path.join(knowledgeDir, "etc", "passwd"));
+    // A genuinely relative wrapped link is still rewritten to a Read-ready path.
+    expect(out).toContain(`[xid](<${path.join(knowledgeDir, "gpu", "xid.md")}>)`);
+  });
+
+  it("does not treat a fenced example marker as the real route block", () => {
+    // box_role.md teaches the marker to the authoring agent, so a fenced
+    // example carrying a lone :begin is plausible. Matching it and then the
+    // real :end would delete every catalog entry in between.
+    const index = [
+      "# Catalog",
+      "",
+      "How the block looks in a compiled index:",
+      "",
+      "~~~md",
+      "<!-- verified-routes:begin -->",
+      "example only",
+      "~~~",
+      "",
+      "- [Keep me](pages/keep.md) — a catalog entry that must survive",
+      "",
+      "<!-- verified-routes:begin -->",
+      "## 已验证快速路由",
+      "",
+      "- **Real route** → [gpu/xid.md](gpu/xid.md)",
+      "<!-- verified-routes:end -->",
+    ].join("\n");
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), `${index}\n`);
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+
+    expect(out).toContain("## Verified Fast Routes");
+    expect(out).toContain("Real route");
+    expect(out).toContain(`[gpu/xid.md](${path.join(knowledgeDir, "gpu", "xid.md")})`);
+    expect(out).toContain("- [Keep me](pages/keep.md)"); // the catalog was not swallowed
+  });
 });

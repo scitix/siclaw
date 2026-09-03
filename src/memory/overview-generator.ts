@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-path.js";
+import { maskMarkdownCode } from "../core/knowledge-citation-tool.js";
 
 const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
 const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
@@ -139,8 +140,8 @@ export function buildKnowledgeWikiCatalog(
           "## Verified Fast Routes",
           "",
           "These routes are verified shortcuts into the bound knowledge. When the user's intent matches one, " +
-          "read the listed target pages in the stated order before answering. The rewritten links below are " +
-          `resolved against \`${wikiRoot}\`; their destinations can be passed directly to the Read tool.`,
+          "read the listed target pages in the stated order before answering. Each link's destination below is " +
+          "already a complete path — pass it directly to the Read tool, do not resolve it against another directory.",
           "",
           ...verifiedRoutes,
         ]
@@ -228,9 +229,17 @@ function collectVerifiedRoutes(knowledgeDir: string, rootIndex: string): Verifie
 }
 
 function extractVerifiedRoutesBlock(index: string): { block: string; withoutBlock: string } | null {
-  const begin = index.indexOf(VERIFIED_ROUTES_BEGIN);
+  // Locate the markers on a code-masked copy. box_role.md now teaches the
+  // marker to the authoring agent, so a fenced example containing a lone
+  // `:begin` is plausible; matching it and then the real `:end` would delete
+  // every catalog entry between them — the exact silent-catalog-loss the
+  // docstring above calls a correctness contract. maskMarkdownCode blanks
+  // fenced/inline code while preserving length, so offsets map back onto the
+  // original bytes unchanged.
+  const masked = maskMarkdownCode(index);
+  const begin = masked.indexOf(VERIFIED_ROUTES_BEGIN);
   if (begin < 0) return null;
-  const end = index.indexOf(VERIFIED_ROUTES_END, begin + VERIFIED_ROUTES_BEGIN.length);
+  const end = masked.indexOf(VERIFIED_ROUTES_END, begin + VERIFIED_ROUTES_BEGIN.length);
   if (end < 0) return null;
 
   const afterEnd = end + VERIFIED_ROUTES_END.length;
@@ -243,7 +252,13 @@ function extractVerifiedRoutesBlock(index: string): { block: string; withoutBloc
 
 function rewriteRelativeMarkdownLinks(markdown: string, sourceDir: string, knowledgeDir: string): string {
   return markdown.replace(/\]\(([^)]+)\)/g, (match, destination: string) => {
-    const trimmed = destination.trim();
+    const raw = destination.trim();
+    // Unwrap <...> BEFORE the guards: the absolute / scheme / anchor checks
+    // must see the real target, or a wrapped external URL, absolute path, or
+    // anchor (`<https://…>`, `</etc/passwd>`, `<#h>`) slips past every guard
+    // and gets mangled into a knowledge-mount path.
+    const angleWrapped = raw.startsWith("<") && raw.endsWith(">");
+    const trimmed = angleWrapped ? raw.slice(1, -1).trim() : raw;
     if (
       !trimmed ||
       trimmed.startsWith("#") ||
@@ -253,9 +268,7 @@ function rewriteRelativeMarkdownLinks(markdown: string, sourceDir: string, knowl
       return match;
     }
 
-    const angleWrapped = trimmed.startsWith("<") && trimmed.endsWith(">");
-    const target = angleWrapped ? trimmed.slice(1, -1) : trimmed;
-    const relativeTarget = path.posix.normalize(path.posix.join(sourceDir, target));
+    const relativeTarget = path.posix.normalize(path.posix.join(sourceDir, trimmed));
     if (relativeTarget === ".." || relativeTarget.startsWith("../")) return match;
     const rewritten = modelKnowledgePath(knowledgeDir, relativeTarget);
     return `](${angleWrapped ? `<${rewritten}>` : rewritten})`;

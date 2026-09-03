@@ -159,6 +159,52 @@ describe("knowledge_cite", () => {
     expect(events).toEqual([]);
   });
 
+  it("treats a null optional list as absent, not as a malformed shape", async () => {
+    // `null` for an optional field means "not provided". Rejecting the whole
+    // call would discard a valid sibling list and block the answer (a failed
+    // cite must not ship), so null must fall through to the empty-list path.
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    const output = await support.tool.execute("call", {
+      pages: [{ path: page, claim: "The runbook documents the reset procedure." }],
+      evidence_refs: null,
+    } as never);
+    expect(output.details).toEqual({ cited: 1 });
+    const text = (output.content[0] as { text: string }).text;
+    expect(text).not.toContain("must be an ARRAY");
+    expect(events).toHaveLength(1);
+  });
+
+  it("diagnoses a non-string evidence_refs element instead of citing [object Object]", async () => {
+    // A {path, claim} object mistakenly placed in evidence_refs used to become
+    // the ref "[object Object]" and be reported as unresolved, sending the
+    // retry at the wrong problem.
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({
+      knowledgeDir: dir,
+      turnRef: { current: 1 },
+      sessionEventEmitter: (event) => events.push(event),
+    });
+    readPage(support, page);
+
+    const output = await support.tool.execute("call", {
+      evidence_refs: [{ path: page, claim: "misplaced object" }],
+    } as never);
+    const text = (output.content[0] as { text: string }).text;
+    expect(text).toContain("evidence_refs must be page.md#evidence-id STRINGS");
+    expect(text).not.toContain("[object Object]");
+    expect(output.details).toEqual({ cited: 0 });
+    expect(events).toEqual([]);
+  });
+
   it("merges repeated successful calls into one capped union event", async () => {
     // Both gateway consumers ASSIGN the knowledge_sources event, so a second
     // call would overwrite the first call's references. The tool therefore
@@ -256,12 +302,18 @@ describe("knowledge_cite", () => {
       ] }],
     }));
     readPage(support, second);
+    // The remount must RETRACT the stale union at the consumer, which assigns
+    // rather than merges: dropping our own copy is not enough, so the reset
+    // emits an empty-sources event. Without it, a turn that remounts and then
+    // fails/adds-nothing would still render OLD-A's link.
+    expect(events).toHaveLength(2);
+    expect(events[1].sources).toEqual([]);
     const afterRemount = await support.tool.execute("call-new-mount", {
       pages: [{ path: second, claim: "Second page supports the follow-up claim." }],
     } as never);
     expect(afterRemount.details).toEqual({ cited: 1 });
-    expect(events).toHaveLength(2);
-    expect(events[1].sources.map((source) => source.title)).toEqual(["NEW-B"]);
+    expect(events).toHaveLength(3);
+    expect(events[2].sources.map((source) => source.title)).toEqual(["NEW-B"]);
   });
 
   it.each([
