@@ -41,7 +41,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
   delegate_agents: ["delegate_to_agent", "list_delegates"],   // delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage; distinct from spawn
   scheduling:      ["manage_schedule"],
-  session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"],   // IM-channel-visible updates + delegation result artifact + clarification request
+  session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input", "propose_execution"],   // IM-channel-visible updates + delegation result artifact + clarification / write-approval requests
 };
 
 /** Strictly decode the stored/wire selection where null means intentional unrestricted. */

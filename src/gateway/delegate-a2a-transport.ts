@@ -190,7 +190,20 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
       remoteSessionId = String(task.metadata?.sessionId ?? "");
       if (contextId) rememberThread(args.localSessionId, { ...threads.get(args.localSessionId), contextId });
       const state = String(task.status?.state ?? "");
-      if (TERMINALS.has(state)) return settleTerminal(state, task.status?.message, task.metadata?.errorCode);
+      if (TERMINALS.has(state)) {
+        // A terminal SNAPSHOT (the turn finished before our subscribe attached)
+        // carries the whole answer in task.artifacts — no artifactUpdate frames
+        // will follow. Harvest it, but only when nothing streamed, so a normal
+        // flow never double-counts.
+        if (!artifactText) {
+          for (const artifact of task.artifacts ?? []) {
+            for (const part of artifact?.parts ?? []) {
+              if (typeof part?.text === "string") artifactText += part.text;
+            }
+          }
+        }
+        return settleTerminal(state, task.status?.message, task.metadata?.errorCode);
+      }
       return undefined;
     }
     const au = frame?.artifactUpdate;

@@ -63,7 +63,11 @@ export function createProposeExecutionTool(refs: ToolRefs): ToolDefinition {
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as ProposeExecutionParams;
-      if (!refs.sessionEventEmitter || (!refs.delegation && refs.allowInputRequest !== true)) {
+      // ONLY governed turns (allowInputRequest): the approval loop lives on the
+      // management plane's task tracker. A legacy delegated turn has no consumer
+      // for auth_required — the proposal would vanish while the model was told
+      // it was submitted, which is worse than not offering the tool at all.
+      if (!refs.sessionEventEmitter || refs.allowInputRequest !== true) {
         return result("propose_execution is not available in this context.", false);
       }
       const effect = params.effect === "destructive" ? "destructive" : params.effect === "external_write" ? "external_write" : "";
@@ -96,6 +100,10 @@ export function createProposeExecutionTool(refs: ToolRefs): ToolDefinition {
 export const registration: ToolEntry = {
   category: "workflow",
   create: createProposeExecutionTool,
-  available: (refs) => Boolean(refs.sessionEventEmitter && (refs.delegation || refs.allowInputRequest === true)),
+  // Unlike request_input, NOT available on legacy delegated turns: only the
+  // management plane's task tracker consumes auth_required, so the tool exists
+  // only where the loop can actually close. (The A2A delegation transport runs
+  // the peer as a governed turn, so peers keep the tool there.)
+  available: (refs) => Boolean(refs.sessionEventEmitter && refs.allowInputRequest === true),
   readOnlyDelegable: true,
 };
