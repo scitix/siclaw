@@ -49,6 +49,52 @@ export interface McpServersConfig {
   mcpServers: Record<string, McpServerConfig>;
 }
 
+const MCP_STDIO_FORWARDED_ENV = [
+  "SICLAW_VISUAL_EXPORT_URL",
+  "SICLAW_VISUAL_EXPORT_TIMEOUT_MS",
+  "SICLAW_VISUAL_EXPORT_THEME",
+  "SICLAW_VISUAL_EXPORT_CHROMIUM",
+] as const;
+const DEFAULT_VISUAL_EXPORT_TIMEOUT_MS = 30_000;
+const VISUAL_EXPORT_MCP_GRACE_MS = 5_000;
+
+/**
+ * Add the small platform-owned environment contract required by bundled stdio
+ * MCPs. The MCP SDK intentionally inherits only a safe OS baseline, so values
+ * present in the AgentBox process do not otherwise reach the child process.
+ * Explicit per-server configuration wins over the inherited platform value.
+ */
+export function mergeMcpStdioEnv(
+  configuredEnv: Record<string, string> | undefined,
+  parentEnv: Record<string, string | undefined> = process.env,
+): Record<string, string> | undefined {
+  const inherited: Record<string, string> = {};
+  for (const name of MCP_STDIO_FORWARDED_ENV) {
+    const value = parentEnv[name];
+    if (value !== undefined && value !== "") inherited[name] = value;
+  }
+  const merged = { ...inherited, ...configuredEnv };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+export function visualMcpRequestTimeoutMs(
+  serverImplementationName: unknown,
+  toolName: string,
+  env: Record<string, string | undefined> = {},
+): number | undefined {
+  if (
+    serverImplementationName !== "mcp-create-chart" ||
+    !/^render_(?:chart|mermaid|visual_card)$/.test(toolName)
+  ) {
+    return undefined;
+  }
+  const configured = Number(env.SICLAW_VISUAL_EXPORT_TIMEOUT_MS ?? DEFAULT_VISUAL_EXPORT_TIMEOUT_MS);
+  const rendererBudget = Number.isFinite(configured) && configured > 0
+    ? Math.ceil(configured)
+    : DEFAULT_VISUAL_EXPORT_TIMEOUT_MS;
+  return rendererBudget + VISUAL_EXPORT_MCP_GRACE_MS;
+}
+
 interface ManagedMcpClient {
   serverName: string;
   client: any; // Client from @modelcontextprotocol/sdk
@@ -224,12 +270,13 @@ export class McpClientManager {
         const cfg = serverConfig as any;
         const detectedTransport: string = cfg.transport
           ?? (cfg.url ? "streamable-http" : cfg.command ? "stdio" : "");
+        const stdioEnv = detectedTransport === "stdio" ? mergeMcpStdioEnv(cfg.env) : undefined;
         switch (detectedTransport) {
           case "stdio":
             transport = new StdioClientTransport({
               command: cfg.command,
               args: cfg.args,
-              env: cfg.env,
+              env: stdioEnv,
             });
             break;
           case "sse":
@@ -255,13 +302,22 @@ export class McpClientManager {
 
         await client.connect(transport);
         console.log(`[mcp-client] Connected to "${serverName}" (${detectedTransport})`);
+        const serverImplementationName = client.getServerVersion()?.name;
 
         // Discover tools
         const { tools: mcpTools } = await client.listTools();
         console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
 
         for (const mcpTool of mcpTools) {
-          const toolDef = this.createToolDefinition(serverName, cfg.description, mcpTool, client);
+          const toolDef = this.createToolDefinition(
+            serverName,
+            cfg.description,
+            mcpTool,
+            client,
+            detectedTransport === "stdio"
+              ? visualMcpRequestTimeoutMs(serverImplementationName, mcpTool.name, stdioEnv)
+              : undefined,
+          );
           this.tools.push(toolDef);
         }
 
@@ -312,6 +368,7 @@ export class McpClientManager {
     serverDescription: string | undefined,
     mcpTool: { name: string; description?: string; inputSchema?: any },
     client: any,
+    requestTimeoutMs?: number,
   ): ResolvedToolDefinition {
     const fullName = buildMcpToolName(serverName, mcpTool.name);
     const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
@@ -343,10 +400,14 @@ export class McpClientManager {
       parameters,
       execute: async (_toolCallId, args) => {
         try {
-          const result = await client.callTool({
-            name: mcpTool.name,
-            arguments: args ?? {},
-          });
+          const result = await client.callTool(
+            {
+              name: mcpTool.name,
+              arguments: args ?? {},
+            },
+            undefined,
+            requestTimeoutMs === undefined ? undefined : { timeout: requestTimeoutMs },
+          );
 
           const isError = !!result.isError;
           const { content, text } = mcpContentToAgentContent(result.content);
@@ -364,7 +425,7 @@ export class McpClientManager {
           const errorMsg = err?.message ?? String(err);
           return {
             content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
-            details: { error: errorMsg },
+            details: { error: errorMsg, errorKind: "transport" },
           };
         }
       },

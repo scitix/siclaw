@@ -143,4 +143,15 @@ describe("deliverImages", () => {
     expect(count).toBe(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps the running delivery count when one image throws unexpectedly", async () => {
+    uploadImageMediaMock.mockRejectedValueOnce(new Error("upload crashed")).mockResolvedValueOnce("@m-2");
+    fetchMock.mockResolvedValue(okResponse());
+
+    const count = await deliverImages(config, { routeType: "group", openConversationId: "cidG" }, images);
+
+    expect(count).toBe(1);
+    expect(uploadImageMediaMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

@@ -32,6 +32,8 @@ import {
   handleRenderMermaid,
   handleRenderVisualCard,
 } from "./handler.js";
+import { visualToolErrorResponse } from "./tool-error.js";
+import { visualExportConfigurationWarning } from "./visual-export-config.js";
 
 async function main(): Promise<void> {
   const server = new Server(
@@ -72,16 +74,14 @@ async function main(): Promise<void> {
       }
       throw new Error(`Unknown tool: ${req.params.name}`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        isError: true,
-        content: [{ type: "text", text: msg }],
-      };
+      return visualToolErrorResponse(err);
     }
   });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  const configurationWarning = visualExportConfigurationWarning();
+  if (configurationWarning) process.stderr.write(`[mcp-create-chart] warning: ${configurationWarning}\n`);
   process.stderr.write("[mcp-create-chart] ready\n");
 }
 

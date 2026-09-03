@@ -194,6 +194,18 @@ spec:
                   key: {{ .tokenSecret.key | default "ANTHROPIC_AUTH_TOKEN" }}
             {{- end }}
             {{- end }}
+            {{- with .Values.runtime.visualExport }}
+            {{- if .url }}
+            # Visual rendering happens inside AgentBox pods. The Runtime-level
+            # values are forwarded by K8sSpawner when each box is created.
+            - name: SICLAW_VISUAL_EXPORT_URL
+              value: {{ .url | quote }}
+            - name: SICLAW_VISUAL_EXPORT_TIMEOUT_MS
+              value: {{ .timeoutMs | default 30000 | quote }}
+            - name: SICLAW_VISUAL_EXPORT_THEME
+              value: {{ .theme | default "light" | quote }}
+            {{- end }}
+            {{- end }}
             - name: NODE_OPTIONS
               value: {{ printf "--max-old-space-size=%v" (.Values.runtime.nodeMaxOldSpaceMB | default 1024) | quote }}
             # User-supplied env entries come last so callers can override any

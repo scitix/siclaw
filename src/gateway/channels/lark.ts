@@ -57,7 +57,14 @@ import {
   type GroupContextMode,
   type LarkLocale,
 } from "./lark-card.js";
-import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
+import {
+  collectImageAttachments,
+  stripVisualBlocks,
+  visualSourceKindFromToolName,
+  type RenderedReplyImage,
+  type VisualFailureReason,
+  type VisualSourceKind,
+} from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
@@ -66,8 +73,25 @@ import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } fro
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
-  "zh-CN": "已生成图片如下。",
-  "en-US": "Image generated below.",
+  "zh-CN": "报告图片已发送。",
+  "en-US": "The report image was sent.",
+} as const;
+const IMAGE_DELIVERY_BUDGET_MS = 10_000;
+const VISUAL_RENDER_FAILED_NOTICE_BY_LOCALE = {
+  "zh-CN": "报告图片生成失败，请稍后重试。",
+  "en-US": "The report image could not be generated. Please try again.",
+} as const;
+const VISUAL_CONFIGURATION_FAILED_NOTICE_BY_LOCALE = {
+  "zh-CN": "报告图片功能暂不可用，请联系管理员检查配置。",
+  "en-US": "Report images are unavailable. Please ask an administrator to check the configuration.",
+} as const;
+const IMAGE_DELIVERY_FAILED_NOTICE_BY_LOCALE = {
+  "zh-CN": "报告图片发送失败，请稍后重试。",
+  "en-US": "The report image could not be sent. Please try again.",
+} as const;
+const IMAGE_DELIVERY_PARTIAL_NOTICE_BY_LOCALE = {
+  "zh-CN": "部分报告图片发送失败，请稍后重试。",
+  "en-US": "Some report images could not be sent. Please try again.",
 } as const;
 const QUEUE_FULL_NOTICE_BY_LOCALE = {
   "zh-CN": "⏳ 当前会话还有较多消息排队处理中，请稍后再发。",
@@ -1969,6 +1993,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // that closes the agent-execution block below.
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
+  let visualRenderFailures = new Map<VisualSourceKind, VisualFailureReason>();
+  let renderedVisualKinds = new Set<VisualSourceKind>();
+  let unattributedImageCount = 0;
   let assistantMessageId: string | null = null;
   let agentError: Error | null = null;
   let sessionBusy = false;
@@ -2049,6 +2076,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     resultText = collected.text;
     replyImages = collected.images;
     assistantMessageId = collected.assistantMessageId;
+    visualRenderFailures = collected.visualRenderFailures;
+    renderedVisualKinds = collected.renderedVisualKinds;
+    unattributedImageCount = collected.unattributedImageCount;
   } catch (err) {
     if (isSessionBusyError(err)) {
       // Still busy after the retry window — surface a friendly notice, don't clobber.
@@ -2071,23 +2101,57 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       ? AGENT_ERROR_NOTICE_BY_LOCALE[locale]
       : (resultText || EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
   if (agentError || sessionBusy) replyImages = [];
-  const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
-    || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
+
+  // Stop milestone renders before image delivery, otherwise a late coalesced
+  // update can overwrite the terminal card while the Lark media APIs are slow.
+  cardFinalizing = true;
+  if (cardFlushPromise) { try { await cardFlushPromise; } catch { /* logged in flush */ } }
+
+  // Resolve delivery before finalizing the text card. A source fence is stripped
+  // once its renderer returned an image, so the replacement copy must reflect
+  // whether that image actually reached Lark. The shared budget prevents slow
+  // media APIs from holding the primary answer on its typing card indefinitely.
+  const deliveredImageCount = await replyVisualImages(
+    larkClient,
+    messageId,
+    replyImages,
+    replyInThread,
+  );
+  const stripSourceKinds = new Set<VisualSourceKind>([
+    ...renderedVisualKinds,
+    ...visualRenderFailures.keys(),
+  ]);
+  const strippedBody = stripVisualBlocks(finalBody, {
+    ...(unattributedImageCount > 0
+      ? { stripSourceBlocks: true }
+      : { stripSourceKinds }),
+  });
+  let displayBody = strippedBody;
+  if ([...visualRenderFailures.values()].includes("configuration")) {
+    displayBody = appendChannelNotice(
+      displayBody,
+      VISUAL_CONFIGURATION_FAILED_NOTICE_BY_LOCALE[locale],
+    );
+  } else if (visualRenderFailures.size > 0) {
+    displayBody = appendChannelNotice(displayBody, VISUAL_RENDER_FAILED_NOTICE_BY_LOCALE[locale]);
+  }
+  if (replyImages.length > 0 && deliveredImageCount === 0) {
+    displayBody = appendChannelNotice(displayBody, IMAGE_DELIVERY_FAILED_NOTICE_BY_LOCALE[locale]);
+  } else if (deliveredImageCount < replyImages.length) {
+    displayBody = appendChannelNotice(displayBody, IMAGE_DELIVERY_PARTIAL_NOTICE_BY_LOCALE[locale]);
+  }
+  if (!displayBody) displayBody = VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
   // The final card is JUST the conclusion — the live step indicator is replaced
   // entirely, no milestone trail is kept on the card.
   const finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
-
-  // Stop any further coalesced milestone renders and let the in-flight one
-  // settle, so finalizeCard isn't overwritten by a later (higher-sequence)
-  // milestone-only update.
-  cardFinalizing = true;
-  if (cardFlushPromise) { try { await cardFlushPromise; } catch { /* logged in flush */ } }
 
   if (cardSession) {
     // Only solicit 👍/👎 on a real answer — never under an error or
     // empty-result notice, where a click would write a rating against a
     // non-answer and skew the feedback signal Metrics aggregates.
-    const isAnswer = !agentError && resultText.trim().length > 0;
+    const usableAnswer = strippedBody.trim().length > 0
+      || (visualRenderFailures.size === 0 && deliveredImageCount > 0);
+    const isAnswer = !agentError && !sessionBusy && usableAnswer && resultText.trim().length > 0;
     const { ok, contentOk } = await finalizeCard(larkClient, cardSession, finalCardBody,
       isAnswer && assistantMessageId
         ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
@@ -2120,8 +2184,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     await replyToLark(larkClient, messageId, finalCardBody, replyInThread);
     deliveredTextChars = finalCardBody.length;
   }
-
-  await replyVisualImages(larkClient, messageId, replyImages, replyInThread);
 }
 
 async function resolveQueuedBinding(
@@ -3015,17 +3077,50 @@ async function deliverVisibleChannelText(
   return true;
 }
 
-async function replyVisualImages(
+export async function replyVisualImages(
   larkClient: any,
   messageId: string,
   images: RenderedReplyImage[],
   replyInThread: boolean = false,
-): Promise<void> {
+  timeoutMs: number = IMAGE_DELIVERY_BUDGET_MS,
+): Promise<number> {
+  let delivered = 0;
+  const deadline = Date.now() + timeoutMs;
   for (const { kind, image } of images) {
-    const ok = await replyImageToLark(larkClient, messageId, image, replyInThread);
-    if (!ok) {
-      console.warn(`[lark] ${kind} image reply failed for messageId=${messageId}; markdown card remains primary`);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      console.warn(`[lark] image delivery deadline exceeded for messageId=${messageId}`);
+      break;
     }
+    try {
+      const ok = await settleWithin(
+        () => replyImageToLark(larkClient, messageId, image, replyInThread),
+        remaining,
+      );
+      if (ok === undefined) {
+        console.warn(`[lark] ${kind} image reply timed out for messageId=${messageId}`);
+        break;
+      }
+      if (ok) delivered += 1;
+      else console.warn(`[lark] ${kind} image reply failed for messageId=${messageId}; markdown card remains primary`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[lark] ${kind} image reply failed for messageId=${messageId}: ${message}`);
+    }
+  }
+  return delivered;
+}
+
+async function settleWithin<T>(start: () => Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  if (timeoutMs <= 0) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs);
+  });
+  try {
+    return await Promise.race([start(), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -3034,6 +3129,12 @@ async function replyVisualImages(
 export interface CollectedChannelResponse {
   text: string;
   images: RenderedReplyImage[];
+  /** Last observed render failure by visual kind; a later successful retry clears that kind. */
+  visualRenderFailures: Map<VisualSourceKind, VisualFailureReason>;
+  /** Visual kinds that returned an image artifact in this turn. */
+  renderedVisualKinds: Set<VisualSourceKind>;
+  /** Image artifacts collected without an observable render tool kind. */
+  unattributedImageCount: number;
   /** Persisted id of the final assistant turn, or null when audit persistence failed/was disabled. */
   assistantMessageId: string | null;
 }
@@ -3075,6 +3176,9 @@ export async function collectChannelResponse(
   // for the user). pi-agent's agent_end signals the last turn is complete.
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
+  const visualRenderFailures = new Map<VisualSourceKind, VisualFailureReason>();
+  const renderedVisualKinds = new Set<VisualSourceKind>();
+  let unattributedImageCount = 0;
   let pendingKnowledgeSources: unknown = null;
   // URLs already rendered into an assistant reply this stream (= one turn).
   // Append only the not-yet-rendered delta and keep pending, so an intermediate
@@ -3161,9 +3265,28 @@ export async function collectChannelResponse(
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
-        if (options.includeImages) collectImageAttachments(ev.result?.content, images, seenImageKeys);
+        const name = (ev.toolName as string) || (ev.name as string) || "tool";
+        const visualKind = visualSourceKindFromToolName(name);
+        const imageCollection = options.includeImages
+          ? collectImageAttachments(ev.result?.content, images, seenImageKeys)
+          : { found: false, added: 0 };
+        const visualErrorKind = ev.result?.details?.structuredContent?.error_kind
+          ?? ev.result?.details?.errorKind;
+        if (options.includeImages && visualKind) {
+          if (
+            visualErrorKind === "configuration" ||
+            visualErrorKind === "renderer" ||
+            visualErrorKind === "transport"
+          ) {
+            visualRenderFailures.set(visualKind, visualErrorKind);
+          } else if (imageCollection.found) {
+            renderedVisualKinds.add(visualKind);
+            visualRenderFailures.delete(visualKind);
+          }
+        } else if (options.includeImages) {
+          unattributedImageCount += imageCollection.added;
+        }
         if (persist) {
-          const name = (ev.toolName as string) || (ev.name as string) || "tool";
           const resultText = Array.isArray(ev.result?.content)
             ? ev.result.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("")
             : "";
@@ -3189,13 +3312,19 @@ export async function collectChannelResponse(
       }
 
       if (options.includeImages && ev.type === "message_end" && (ev.message?.role === "toolResult" || ev.message?.role === "tool")) {
-        collectImageAttachments(ev.message?.content, images, seenImageKeys);
+        unattributedImageCount += collectImageAttachments(
+          ev.message?.content,
+          images,
+          seenImageKeys,
+        ).added;
       }
       // pi-agent-brain emits the final assistant reply as message_end with
       // a content array of blocks; collect the text blocks only.
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-        if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
+        if (options.includeImages) {
+          unattributedImageCount += collectImageAttachments(blocks, images, seenImageKeys).added;
+        }
         let turnText = contentBlocksToMarkdown(blocks);
         if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error") {
           const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
@@ -3245,7 +3374,18 @@ export async function collectChannelResponse(
       content: redact(text),
     });
   }
-  return { text, images, assistantMessageId: lastAssistantMessageId };
+  return {
+    text,
+    images,
+    visualRenderFailures,
+    renderedVisualKinds,
+    unattributedImageCount,
+    assistantMessageId: lastAssistantMessageId,
+  };
+}
+
+function appendChannelNotice(body: string, notice: string): string {
+  return body.trim() ? `${body.trim()}\n\n${notice}` : notice;
 }
 
 /**

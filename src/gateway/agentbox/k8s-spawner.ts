@@ -629,6 +629,14 @@ export class K8sSpawner implements BoxSpawner {
         "SICLAW_EMBEDDING_MODEL",
         "SICLAW_EMBEDDING_DIMENSIONS",
         "SICLAW_EMBEDDING_API_KEY",
+        // Visual tools execute inside the AgentBox, while their renderer URL is
+        // configured on the Runtime deployment. Forward the complete non-secret
+        // renderer contract so a configured endpoint does not disappear at the
+        // process boundary and fall back to an invented cluster DNS name.
+        "SICLAW_VISUAL_EXPORT_URL",
+        "SICLAW_VISUAL_EXPORT_TIMEOUT_MS",
+        "SICLAW_VISUAL_EXPORT_THEME",
+        "SICLAW_VISUAL_EXPORT_CHROMIUM",
         // Trace deployment environment (Langfuse deployment.environment.name).
         "SICLAW_TRACING_ENVIRONMENT",
       ];

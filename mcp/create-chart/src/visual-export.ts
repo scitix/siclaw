@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser } from "playwright-core";
+import { resolveVisualExportTimeoutMs, resolveVisualExportUrl } from "./visual-export-config.js";
 
 export interface ExportedVisual {
   kind: "chart" | "mermaid" | "visual-card";
@@ -14,30 +15,30 @@ interface VisualExportOptions {
   timeoutMs?: number;
 }
 
-const DEFAULT_EXPORT_URL = "http://visual-export-web:3000/siclaw-visual-export";
-
 export async function exportMarkdownVisualsWithVisualExportWeb(
   markdown: string,
   options: VisualExportOptions = {},
 ): Promise<ExportedVisual[]> {
-  const baseUrl =
-    options.baseUrl ??
-    process.env.SICLAW_VISUAL_EXPORT_URL ??
-    DEFAULT_EXPORT_URL;
-  const timeoutMs = options.timeoutMs ?? Number(process.env.SICLAW_VISUAL_EXPORT_TIMEOUT_MS ?? 30_000);
-  const browser = await launchBrowser();
+  const baseUrl = resolveVisualExportUrl(options.baseUrl);
+  const timeoutMs = resolveVisualExportTimeoutMs(options.timeoutMs);
+  const deadline = Date.now() + timeoutMs;
+  const browser = await launchBrowser(remainingTimeout(deadline, timeoutMs));
   try {
-    const page = await browser.newPage({
-      viewport: { width: 1120, height: 900 },
-      deviceScaleFactor: 1,
-    });
+    const page = await withDeadline(
+      () => browser.newPage({
+        viewport: { width: 1120, height: 900 },
+        deviceScaleFactor: 1,
+      }),
+      deadline,
+      timeoutMs,
+    );
     const payload = base64UrlEncode(JSON.stringify({
       markdown,
       theme: options.theme ?? process.env.SICLAW_VISUAL_EXPORT_THEME ?? "light",
     }));
     await page.goto(`${baseUrl}#${payload}`, {
       waitUntil: "networkidle",
-      timeout: timeoutMs,
+      timeout: remainingTimeout(deadline, timeoutMs),
     });
     await page.waitForFunction(
       () => {
@@ -48,14 +49,18 @@ export async function exportMarkdownVisualsWithVisualExportWeb(
         return Boolean(w.__siclawVisualExportReady && w.__siclawExportVisuals);
       },
       undefined,
-      { timeout: timeoutMs },
+      { timeout: remainingTimeout(deadline, timeoutMs) },
     );
-    const exported = await page.evaluate(async () => {
-      const w = globalThis as typeof globalThis & {
-        __siclawExportVisuals?: () => Promise<unknown>;
-      };
-      return await w.__siclawExportVisuals?.();
-    });
+    const exported = await withDeadline(
+      () => page.evaluate(async () => {
+        const w = globalThis as typeof globalThis & {
+          __siclawExportVisuals?: () => Promise<unknown>;
+        };
+        return await w.__siclawExportVisuals?.();
+      }),
+      deadline,
+      timeoutMs,
+    );
     if (!Array.isArray(exported) || exported.length === 0) {
       throw new Error("ControlPlane visual export returned no images");
     }
@@ -78,7 +83,7 @@ export async function exportMarkdownVisualsWithVisualExportWeb(
   }
 }
 
-async function launchBrowser(): Promise<Browser> {
+async function launchBrowser(timeoutMs: number): Promise<Browser> {
   const executablePath =
     process.env.SICLAW_VISUAL_EXPORT_CHROMIUM ??
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ??
@@ -97,6 +102,7 @@ async function launchBrowser(): Promise<Browser> {
   return await chromium.launch({
     executablePath,
     headless: true,
+    timeout: timeoutMs,
     env: {
       ...process.env,
       HOME: homeDir,
@@ -111,6 +117,31 @@ async function launchBrowser(): Promise<Browser> {
       "--font-render-hinting=none",
     ],
   });
+}
+
+function remainingTimeout(deadline: number, timeoutMs: number): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error(`Visual export timed out after ${timeoutMs}ms`);
+  return remaining;
+}
+
+async function withDeadline<T>(start: () => Promise<T>, deadline: number, timeoutMs: number): Promise<T> {
+  const remaining = remainingTimeout(deadline, timeoutMs);
+  const operation = start();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Visual export timed out after ${timeoutMs}ms`)),
+          remaining,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function pngFromDataUrl(dataUrl: string): Buffer {

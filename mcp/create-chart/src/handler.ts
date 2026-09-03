@@ -1,5 +1,6 @@
 import { exportMarkdownVisualsWithVisualExportWeb } from "./visual-export.js";
 import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
+import { rendererError, VisualToolInputError, VisualToolRendererError } from "./tool-error.js";
 
 const CHART_SPEC_VERSION = 1;
 const VISUAL_SPEC_VERSION = 1;
@@ -115,9 +116,9 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
 
   const spec = JSON.stringify(args);
   const markdownEmbed = "```chart\n" + spec + "\n```";
-  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
+  const exported = await exportVisual(markdownEmbed);
   const visual = exported.find((item) => item.kind === "chart") ?? exported[0];
-  if (!visual?.image) throw new Error("render_chart: ControlPlane Web export returned no chart image");
+  if (!visual?.image) throw new VisualToolRendererError("render_chart: ControlPlane Web export returned no chart image");
   const png = visual.image;
 
   const result: RenderChartResult = {
@@ -161,9 +162,9 @@ export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChart
   const args = validateMermaid(rawArgs);
   const id = newChartId("mermaid");
   const markdownEmbed = "```mermaid\n" + args.source + "\n```";
-  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
+  const exported = await exportVisual(markdownEmbed);
   const visual = exported.find((item) => item.kind === "mermaid") ?? exported[0];
-  if (!visual?.image) throw new Error("render_mermaid: ControlPlane Web export returned no Mermaid image");
+  if (!visual?.image) throw new VisualToolRendererError("render_mermaid: ControlPlane Web export returned no Mermaid image");
 
   const meta = visualMetadata(id, "mermaid", markdownEmbed, visual.image);
 
@@ -193,9 +194,9 @@ export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderCh
   const id = newChartId("visual-card");
   const specJson = JSON.stringify(spec);
   const markdownEmbed = "```visual-card\n" + specJson + "\n```";
-  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
+  const exported = await exportVisual(markdownEmbed);
   const visual = exported.find((item) => item.kind === "visual-card") ?? exported[0];
-  if (!visual?.image) throw new Error("render_visual_card: ControlPlane Web export returned no visual-card image");
+  if (!visual?.image) throw new VisualToolRendererError("render_visual_card: ControlPlane Web export returned no visual-card image");
 
   const meta = visualMetadata(id, "visual-card", markdownEmbed, visual.image);
 
@@ -244,16 +245,16 @@ function visualMetadata(
 
 export function validate(raw: unknown): RenderChartArgs {
   if (!raw || typeof raw !== "object") {
-    throw new Error("render_chart: arguments must be an object");
+    throw new VisualToolInputError("render_chart: arguments must be an object");
   }
   const obj = raw as Record<string, unknown>;
   const type = obj.type;
   if (type !== "pie" && type !== "bar" && type !== "line") {
-    throw new Error("render_chart: type must be pie, bar, or line");
+    throw new VisualToolInputError("render_chart: type must be pie, bar, or line");
   }
   const data = obj.data;
   if (!data || typeof data !== "object") {
-    throw new Error("render_chart: data is required");
+    throw new VisualToolInputError("render_chart: data is required");
   }
   const common: Record<string, unknown> = {};
   for (const k of ["title", "x_label", "y_label"]) {
@@ -266,12 +267,12 @@ export function validate(raw: unknown): RenderChartArgs {
   if (type === "pie") {
     const slices = (data as { slices?: unknown }).slices;
     if (!Array.isArray(slices) || slices.length === 0) {
-      throw new Error("render_chart: pie.data.slices must be a non-empty array");
+      throw new VisualToolInputError("render_chart: pie.data.slices must be a non-empty array");
     }
     const cleaned = slices.map((s, i) => {
       const item = s as { label?: unknown; value?: unknown };
       if (typeof item.value !== "number" || !Number.isFinite(item.value)) {
-        throw new Error(`render_chart: pie slice[${i}].value must be a number`);
+        throw new VisualToolInputError(`render_chart: pie slice[${i}].value must be a number`);
       }
       return { label: String(item.label ?? `slice ${i}`), value: item.value };
     });
@@ -281,19 +282,19 @@ export function validate(raw: unknown): RenderChartArgs {
   if (type === "bar") {
     const d = data as { categories?: unknown; series?: unknown };
     if (!Array.isArray(d.categories) || !d.categories.length) {
-      throw new Error("render_chart: bar.data.categories must be a non-empty array");
+      throw new VisualToolInputError("render_chart: bar.data.categories must be a non-empty array");
     }
     if (!Array.isArray(d.series) || !d.series.length) {
-      throw new Error("render_chart: bar.data.series must be a non-empty array");
+      throw new VisualToolInputError("render_chart: bar.data.series must be a non-empty array");
     }
     const categories = d.categories.map(String);
     const series = d.series.map((s, i) => {
       const item = s as { name?: unknown; values?: unknown };
       if (!Array.isArray(item.values)) {
-        throw new Error(`render_chart: bar series[${i}].values must be an array`);
+        throw new VisualToolInputError(`render_chart: bar series[${i}].values must be an array`);
       }
       if (item.values.length !== categories.length) {
-        throw new Error(
+        throw new VisualToolInputError(
           `render_chart: bar series[${i}].values length (${item.values.length}) must equal categories length (${categories.length})`,
         );
       }
@@ -302,7 +303,7 @@ export function validate(raw: unknown): RenderChartArgs {
         values: item.values.map((v, j) => {
           const n = typeof v === "number" ? v : Number(v);
           if (!Number.isFinite(n)) {
-            throw new Error(
+            throw new VisualToolInputError(
               `render_chart: bar series[${i}].values[${j}] must be a finite number`,
             );
           }
@@ -315,17 +316,17 @@ export function validate(raw: unknown): RenderChartArgs {
 
   const d = data as { series?: unknown };
   if (!Array.isArray(d.series) || !d.series.length) {
-    throw new Error("render_chart: line.data.series must be a non-empty array");
+    throw new VisualToolInputError("render_chart: line.data.series must be a non-empty array");
   }
   const series = d.series.map((s, i) => {
     const item = s as { name?: unknown; points?: unknown };
     if (!Array.isArray(item.points) || !item.points.length) {
-      throw new Error(`render_chart: line series[${i}].points must be a non-empty array`);
+      throw new VisualToolInputError(`render_chart: line series[${i}].points must be a non-empty array`);
     }
     const points = item.points.map((p, j) => {
       const pt = p as { x?: unknown; y?: unknown };
       if (typeof pt.y !== "number" || !Number.isFinite(pt.y)) {
-        throw new Error(`render_chart: line series[${i}].points[${j}].y must be a number`);
+        throw new VisualToolInputError(`render_chart: line series[${i}].points[${j}].y must be a number`);
       }
       const x =
         typeof pt.x === "number" || typeof pt.x === "string"
@@ -340,11 +341,11 @@ export function validate(raw: unknown): RenderChartArgs {
 
 export function validateMermaid(raw: unknown): { source: string; title?: string } {
   if (!raw || typeof raw !== "object") {
-    throw new Error("render_mermaid: arguments must be an object");
+    throw new VisualToolInputError("render_mermaid: arguments must be an object");
   }
   const obj = raw as Record<string, unknown>;
   if (typeof obj.source !== "string" || !obj.source.trim()) {
-    throw new Error("render_mermaid: source is required");
+    throw new VisualToolInputError("render_mermaid: source is required");
   }
   const source = stripFence(obj.source.trim(), "mermaid");
   const out: { source: string; title?: string } = { source };
@@ -354,18 +355,18 @@ export function validateMermaid(raw: unknown): { source: string; title?: string 
 
 export function validateVisualCard(raw: unknown): Record<string, unknown> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("render_visual_card: arguments must be an object");
+    throw new VisualToolInputError("render_visual_card: arguments must be an object");
   }
   const obj = raw as Record<string, unknown>;
   const type = typeof obj.type === "string" ? obj.type : "";
   if (!RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum.includes(type as any)) {
-    throw new Error("render_visual_card: type is required and must be a supported ControlPlane visual-card type");
+    throw new VisualToolInputError("render_visual_card: type is required and must be a supported ControlPlane visual-card type");
   }
   if (typeof obj.title !== "string" || !obj.title.trim()) {
-    throw new Error("render_visual_card: title is required");
+    throw new VisualToolInputError("render_visual_card: title is required");
   }
   if (!hasVisualCardBody(obj)) {
-    throw new Error("render_visual_card: provide conclusion, items, metrics, segments, events, nodes, actions, or sections");
+    throw new VisualToolInputError("render_visual_card: provide conclusion, items, metrics, segments, events, nodes, actions, or sections");
   }
   const allowed = new Set(Object.keys(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties));
   const out: Record<string, unknown> = {};
@@ -387,4 +388,12 @@ function hasVisualCardBody(obj: Record<string, unknown>): boolean {
 function stripFence(source: string, language: string): string {
   const re = new RegExp(`^\\s*\`\`\`${language}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\`\`\`\\s*$`, "i");
   return source.replace(re, "$1").trim();
+}
+
+async function exportVisual(markdown: string) {
+  try {
+    return await exportMarkdownVisualsWithVisualExportWeb(markdown);
+  } catch (err) {
+    throw rendererError(err);
+  }
 }

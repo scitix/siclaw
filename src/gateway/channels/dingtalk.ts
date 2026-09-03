@@ -42,7 +42,12 @@ import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
 import { appendMessage, bindMessageTraceId, ensureChatSession, warnTraceBindFailure } from "../chat-repo.js";
 import { collectChannelResponse } from "./lark.js";
-import type { RenderedReplyImage } from "./visual-image.js";
+import {
+  stripVisualBlocks,
+  type RenderedReplyImage,
+  type VisualFailureReason,
+  type VisualSourceKind,
+} from "./visual-image.js";
 import { deliverImages } from "./dingtalk-image.js";
 import {
   buildMarkdownMessage,
@@ -62,6 +67,12 @@ const TOPIC_ROBOT = "/v1.0/im/bot/messages/get";
  * data-exfiltration channel. Pin replies to the DingTalk OpenAPI domains.
  */
 const ALLOWED_WEBHOOK_HOSTS = new Set(["oapi.dingtalk.com", "api.dingtalk.com"]);
+const VISUAL_ONLY_NOTICE = "报告图片已发送。";
+const VISUAL_RENDER_FAILED_NOTICE = "报告图片生成失败，请稍后重试。";
+const VISUAL_CONFIGURATION_FAILED_NOTICE = "报告图片功能暂不可用，请联系管理员检查配置。";
+const IMAGE_DELIVERY_FAILED_NOTICE = "报告图片发送失败，请稍后重试。";
+const IMAGE_DELIVERY_PARTIAL_NOTICE = "部分报告图片发送失败，请稍后重试。";
+const IMAGE_DELIVERY_UNCONFIGURED_NOTICE = "报告图片无法发送，请联系管理员检查渠道配置。";
 
 function isAllowedWebhookHost(host: string): boolean {
   return ALLOWED_WEBHOOK_HOSTS.has(host) || host.endsWith(".dingtalk.com");
@@ -308,6 +319,8 @@ export async function handleDingTalkMessage(
   // two boxes and both would run — two writers on one transcript.
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
+  let visualRenderFailures = new Map<VisualSourceKind, VisualFailureReason>();
+  let renderedVisualKinds = new Set<VisualSourceKind>();
   let agentError: Error | null = null;
   // Acquired INSIDE the try so a busy session surfaces through the SAME path the
   // AgentBox's 409 already used — the friendly "still working" notice. Outside it the
@@ -387,6 +400,8 @@ export async function handleDingTalkMessage(
     });
     resultText = collected.text;
     replyImages = collected.images;
+    visualRenderFailures = collected.visualRenderFailures;
+    renderedVisualKinds = collected.renderedVisualKinds;
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
@@ -404,40 +419,70 @@ export async function handleDingTalkMessage(
     return;
   }
 
+  // Resolve image delivery before composing the text reply. The source fence is
+  // never safe as an IM fallback, but the text must state when no image reached
+  // the user instead of claiming that an image follows.
+  let deliveredImageCount = 0;
+  if (!agentError && replyImages.length > 0) {
+    if (config) {
+      const target = {
+        routeType,
+        openConversationId: routeType === "group" ? conversationId : undefined,
+        senderStaffId: message.senderStaffId,
+      };
+      try {
+        deliveredImageCount = await deliverImages(config, target, replyImages);
+      } catch (err) {
+        console.error(`[dingtalk] Image delivery failed for session=${sessionId}: ${safeErrorMessage(err)}`);
+      }
+      if (deliveredImageCount < replyImages.length) {
+        console.warn(`[dingtalk] Delivered ${deliveredImageCount}/${replyImages.length} reply images for session=${sessionId}`);
+      }
+    } else {
+      console.warn(`[dingtalk] Image delivery unavailable without channel config for session=${sessionId}`);
+    }
+  }
+  const imageDeliveryUnconfigured = !agentError && replyImages.length > 0 && !config;
+
   // On failure, reply with a generic notice only — the raw error message can
   // leak internal endpoints / infra details to everyone in the chat. The full
   // error was already logged above for operators.
   const finalBody = agentError
     ? AGENT_ERROR_NOTICE
     : (resultText || EMPTY_RESULT_NOTICE);
+  const strippedBody = agentError
+    ? finalBody
+    : stripVisualBlocks(finalBody, {
+        stripSourceKinds: new Set<VisualSourceKind>([
+          ...renderedVisualKinds,
+          ...visualRenderFailures.keys(),
+        ]),
+      });
+  let displayBody = strippedBody;
+  if ([...visualRenderFailures.values()].includes("configuration")) {
+    displayBody = appendChannelNotice(displayBody, VISUAL_CONFIGURATION_FAILED_NOTICE);
+  } else if (visualRenderFailures.size > 0) {
+    displayBody = appendChannelNotice(displayBody, VISUAL_RENDER_FAILED_NOTICE);
+  }
+  if (imageDeliveryUnconfigured) {
+    displayBody = appendChannelNotice(displayBody, IMAGE_DELIVERY_UNCONFIGURED_NOTICE);
+  } else if (replyImages.length > 0 && deliveredImageCount === 0) {
+    displayBody = appendChannelNotice(displayBody, IMAGE_DELIVERY_FAILED_NOTICE);
+  } else if (deliveredImageCount < replyImages.length) {
+    displayBody = appendChannelNotice(displayBody, IMAGE_DELIVERY_PARTIAL_NOTICE);
+  }
+  if (!displayBody) displayBody = VISUAL_ONLY_NOTICE;
 
   // Errors and the empty-result notice go out as plain text; real answers as
   // markdown so formatting (code blocks, lists, bold) renders.
   const body = agentError
-    ? buildTextMessage(finalBody)
-    : (resultText ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));
+    ? buildTextMessage(displayBody)
+    : (resultText ? buildMarkdownMessage(displayBody) : buildTextMessage(displayBody));
   await replyToDingTalk(sessionWebhook, body);
+}
 
-  // Deliver any agent-produced images as separate robot messages (mirrors
-  // Lark's replyVisualImages). Best-effort and post-text: image delivery needs
-  // an access token + robot-send permission (config), and a failed image must
-  // never break the primary reply. Skipped when the agent errored, produced no
-  // images, or the channel config was not threaded through (older callers).
-  if (!agentError && config && replyImages.length > 0) {
-    const target = {
-      routeType,
-      openConversationId: routeType === "group" ? conversationId : undefined,
-      senderStaffId: message.senderStaffId,
-    };
-    try {
-      const delivered = await deliverImages(config, target, replyImages);
-      if (delivered < replyImages.length) {
-        console.warn(`[dingtalk] Delivered ${delivered}/${replyImages.length} reply images for session=${sessionId}`);
-      }
-    } catch (err) {
-      console.error(`[dingtalk] Image delivery failed for session=${sessionId}: ${safeErrorMessage(err)}`);
-    }
-  }
+function appendChannelNotice(body: string, notice: string): string {
+  return body.trim() ? `${body.trim()}\n\n${notice}` : notice;
 }
 
 /**

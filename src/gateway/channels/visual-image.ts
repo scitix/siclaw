@@ -4,8 +4,17 @@ export interface RenderedReplyImage {
   image: Buffer;
 }
 
+export type VisualSourceKind = "chart" | "mermaid" | "visual-card";
+export type VisualFailureReason = "configuration" | "renderer" | "transport";
+
 export interface StripVisualBlocksOptions {
   stripSourceBlocks?: boolean;
+  stripSourceKinds?: Iterable<VisualSourceKind>;
+}
+
+export interface ImageCollectionResult {
+  found: boolean;
+  added: number;
 }
 
 const DATA_IMAGE_URL_PATTERN =
@@ -20,29 +29,42 @@ export function collectImageAttachments(
   content: unknown,
   target: RenderedReplyImage[],
   seenImageKeys: Set<string>,
-): void {
-  if (!Array.isArray(content)) return;
+): ImageCollectionResult {
+  if (!Array.isArray(content)) return { found: false, added: 0 };
+  let found = false;
+  let collected = 0;
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
     const image = imageAttachmentFromBlock(block as Record<string, unknown>);
     if (!image) continue;
+    found = true;
     const key = `${image.mimeType}:${image.image.toString("base64")}`;
     if (seenImageKeys.has(key)) continue;
     seenImageKeys.add(key);
     target.push(image);
+    collected += 1;
   }
+  return { found, added: collected };
 }
 
 export function stripVisualBlocks(markdown: string, options: StripVisualBlocksOptions = {}): string {
   let output = stripDataImages(markdown);
   if (options.stripSourceBlocks) {
-    output = stripFences(output, "chart");
-    output = stripFences(output, "mermaid");
-    output = stripFences(output, "visual-card");
-    output = stripFences(output, "siclaw-card");
-    output = stripFences(output, "conclusion-card");
+    output = stripVisualSourceKind(output, "chart");
+    output = stripVisualSourceKind(output, "mermaid");
+    output = stripVisualSourceKind(output, "visual-card");
+  } else if (options.stripSourceKinds) {
+    for (const kind of new Set(options.stripSourceKinds)) {
+      output = stripVisualSourceKind(output, kind);
+    }
   }
   return cleanupMarkdown(output);
+}
+
+export function visualSourceKindFromToolName(toolName: string): VisualSourceKind | null {
+  const match = toolName.match(/(?:^|[._/-])render_(chart|mermaid|visual_card)$/);
+  if (!match) return null;
+  return match[1] === "visual_card" ? "visual-card" : match[1] as VisualSourceKind;
 }
 
 function imageAttachmentFromBlock(block: Record<string, unknown>): RenderedReplyImage | null {
@@ -115,6 +137,16 @@ function normalizeMimeType(mimeType: string): RenderedReplyImage["mimeType"] | n
 
 function stripFences(markdown: string, language: string): string {
   return markdown.replace(fenceRegex(language), (full, prefix: string) => prefix || "");
+}
+
+function stripVisualSourceKind(markdown: string, kind: VisualSourceKind): string {
+  if (kind === "visual-card") {
+    return stripFences(
+      stripFences(stripFences(markdown, "visual-card"), "siclaw-card"),
+      "conclusion-card",
+    );
+  }
+  return stripFences(markdown, kind);
 }
 
 function fenceRegex(language: string): RegExp {

@@ -14,6 +14,7 @@ import { buildMarkdownMessage, DINGTALK_TITLE, sanitizeMarkdownForDingTalk } fro
 const promptMock = vi.fn();
 const streamEventsMock = vi.fn();
 const closeSessionMock = vi.fn();
+const deliverImagesMock = vi.fn();
 
 vi.mock("../agentbox/client.js", () => ({
   AgentBoxClient: class {
@@ -21,6 +22,10 @@ vi.mock("../agentbox/client.js", () => ({
     streamEvents = streamEventsMock;
     closeSession = closeSessionMock;
   },
+}));
+
+vi.mock("./dingtalk-image.js", () => ({
+  deliverImages: (...args: unknown[]) => deliverImagesMock(...args),
 }));
 
 // Stub channel-manager RPCs so we don't hit frontend-ws in unit tests.
@@ -83,6 +88,8 @@ beforeEach(() => {
   streamEventsMock.mockReset();
   closeSessionMock.mockReset();
   closeSessionMock.mockResolvedValue(undefined);
+  deliverImagesMock.mockReset();
+  deliverImagesMock.mockImplementation(async (_config, _target, images: unknown[]) => images.length);
   resolveBindingMock.mockReset();
   handlePairingCodeMock.mockReset();
   ensureChatSessionMock.mockReset();
@@ -462,6 +469,267 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
     expect(body.msgtype).toBe("text");
     expect(body.text.content).toContain("\u26A0");
+  });
+
+  it("hides visual-card source when its renderer failed", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-visual-failed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {
+            error: "renderer unavailable",
+            structuredContent: { error_kind: "renderer" },
+          },
+          content: [{ type: "text", text: "renderer unavailable" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "```visual-card",
+              JSON.stringify({ type: "report", title: "Cluster diagnosis" }),
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.msgtype).toBe("markdown");
+    expect(body.markdown.text).toContain("报告图片生成失败");
+    expect(body.markdown.text).not.toContain("```visual-card");
+    expect(body.markdown.text).not.toContain("Cluster diagnosis");
+  });
+
+  it("keeps prose and appends a notice when visual rendering fails", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-visual-mixed-failed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_mermaid",
+        result: {
+          details: {
+            error: "renderer unavailable",
+            structuredContent: { error_kind: "renderer" },
+          },
+          content: [{ type: "text", text: "renderer unavailable" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "拓扑如下：\n\n```mermaid\ngraph TD; A-->B\n```" }],
+        },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("拓扑如下");
+    expect(body.markdown.text).toContain("报告图片生成失败");
+    expect(body.markdown.text).not.toContain("```mermaid");
+  });
+
+  it("does not hide source or claim a renderer outage for invalid tool arguments", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-visual-input-error" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {
+            error: "render_visual_card: title is required",
+            structuredContent: { error_kind: "input" },
+          },
+          content: [{ type: "text", text: "render_visual_card: title is required" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\"}\n```" }],
+        },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("```visual-card");
+    expect(body.markdown.text).not.toContain("报告图片生成失败");
+  });
+
+  it("reports image delivery failure instead of claiming an image follows", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    deliverImagesMock.mockResolvedValue(0);
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-image-delivery-failed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {},
+          content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\",\"title\":\"x\"}\n```" }],
+        },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      {} as any,
+    );
+
+    expect(deliverImagesMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("报告图片发送失败");
+    expect(body.markdown.text).not.toContain("图片如下");
+    expect(body.markdown.text).not.toContain("```visual-card");
+  });
+
+  it("reports missing channel configuration as an operator action, not a retry", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-image-config-missing" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_chart",
+        result: { details: {}, content: [{ type: "image", data: "AQ==", mimeType: "image/png" }] },
+      };
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "```chart\n{\"type\":\"bar\"}\n```" }] },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(deliverImagesMock).not.toHaveBeenCalled();
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("请联系管理员检查渠道配置");
+    expect(body.markdown.text).not.toContain("请稍后重试");
+  });
+
+  it("distinguishes partial image delivery from total failure", async () => {
+    deliverImagesMock.mockResolvedValue(1);
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-image-delivery-partial" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_chart",
+        result: { details: {}, content: [
+          { type: "image", data: "AQ==", mimeType: "image/png" },
+          { type: "image", data: "Ag==", mimeType: "image/png" },
+        ] },
+      };
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "```chart\n{\"type\":\"bar\"}\n```" }] },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      {} as any,
+    );
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("部分报告图片发送失败");
+  });
+
+  it("delivers a successful visual before posting an accurate text confirmation", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-image-delivery-ok" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {},
+          content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\",\"title\":\"x\"}\n```" }],
+        },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("hello"),
+      "ch",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      {} as any,
+    );
+
+    expect(deliverImagesMock).toHaveBeenCalledTimes(1);
+    expect(deliverImagesMock.mock.invocationCallOrder[0]).toBeLessThan(fetchMock.mock.invocationCallOrder[0]);
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("报告图片已发送");
+    expect(body.markdown.text).not.toContain("```visual-card");
   });
 });
 

@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+#### Visual export endpoint configuration
+
+Visual rendering no longer assumes an in-cluster `visual-export-web` DNS name. Deployments that enable the bundled `create-chart` MCP must set `runtime.visualExport.url` to a reachable `/siclaw-visual-export` page before upgrading. Runtime forwards the validated URL and one end-to-end timeout budget to AgentBox pods and their stdio MCP process; invalid configuration produces an operator-visible startup warning and a distinct tool error. Lark and DingTalk now suppress only source blocks paired with attempted renders, confirm image delivery before claiming success, and keep usable text fallbacks visible.
+
 #### KB compile box: distinct image name + pod prefix (operations)
 
 Renamed the KB compile box so operators can tell it apart from chat agentboxes at a glance during production troubleshooting (previously every pod was `agentbox-<id>` and the compile box could only be isolated by label/image filter).

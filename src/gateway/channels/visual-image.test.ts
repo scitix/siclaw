@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
+import {
+  collectImageAttachments,
+  stripVisualBlocks,
+  visualSourceKindFromToolName,
+  type RenderedReplyImage,
+} from "./visual-image.js";
 
 const onePixelBase64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
@@ -92,5 +97,33 @@ describe("stripVisualBlocks", () => {
       "",
       "Keep this.",
     ].join("\n"));
+  });
+
+  it("removes only the visual kinds that were rendered or failed", () => {
+    const markdown = [
+      "```chart",
+      "{\"type\":\"bar\"}",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      "A --> B",
+      "```",
+    ].join("\n");
+
+    const display = stripVisualBlocks(markdown, { stripSourceKinds: ["chart"] });
+
+    expect(display).not.toContain("```chart");
+    expect(display).toContain("```mermaid");
+    expect(display).toContain("A --> B");
+  });
+});
+
+describe("visualSourceKindFromToolName", () => {
+  it("maps bundled MCP render tool names to their source fence kinds", () => {
+    expect(visualSourceKindFromToolName("mcp__create-chart__render_chart")).toBe("chart");
+    expect(visualSourceKindFromToolName("mcp__create-chart__render_mermaid")).toBe("mermaid");
+    expect(visualSourceKindFromToolName("mcp__create-chart__render_visual_card")).toBe("visual-card");
+    expect(visualSourceKindFromToolName("mcp__other__query")).toBeNull();
   });
 });

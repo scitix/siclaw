@@ -110,9 +110,14 @@ export async function deliverImages(
 ): Promise<number> {
   let delivered = 0;
   for (const { image, mimeType } of images) {
-    const mediaId = await uploadImageMedia(config, image, mimeType);
-    if (!mediaId) continue;
-    if (await sendImageMessage(config, target, mediaId)) delivered += 1;
+    try {
+      const mediaId = await uploadImageMedia(config, image, mimeType);
+      if (!mediaId) continue;
+      if (await sendImageMessage(config, target, mediaId)) delivered += 1;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[dingtalk-image] unexpected image delivery error: ${redactSecrets(msg)}`);
+    }
   }
   return delivered;
 }

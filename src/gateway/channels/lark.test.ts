@@ -8,6 +8,7 @@ import {
   collectResponse,
   collectChannelResponse,
   extractInbound,
+  replyVisualImages,
   resetLarkBindingQueuesForTest,
 } from "./lark.js";
 import {
@@ -3309,6 +3310,331 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
+  it("hides visual-card source when its renderer failed", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-visual-card-failed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {
+            error: "renderer unavailable",
+            structuredContent: { error_kind: "renderer" },
+          },
+          content: [{ type: "text", text: "renderer unavailable" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "```visual-card",
+              JSON.stringify({
+                type: "report",
+                title: "Cluster diagnosis",
+                conclusion: "One gateway is unhealthy.",
+              }),
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("报告图片生成失败");
+    expect(cardContent).not.toContain("```visual-card");
+    expect(cardContent).not.toContain("Cluster diagnosis");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps prose, appends a render-failure notice, and keeps feedback for the surviving answer", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-visual-card-mixed-failure" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_mermaid",
+        result: {
+          details: {
+            error: "renderer unavailable",
+            structuredContent: { error_kind: "renderer" },
+          },
+          content: [{ type: "text", text: "renderer unavailable" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "拓扑如下：\n\n```mermaid\ngraph TD; A-->B\n```" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("拓扑如下");
+    expect(cardContent).toContain("报告图片生成失败");
+    expect(cardContent).not.toContain("```mermaid");
+    expect(lark.cardkit.v1.cardElement.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a hand-written Mermaid fallback when only chart rendering failed", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-chart-failed-mermaid-fallback" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_chart",
+        result: {
+          details: { error: "renderer unavailable", structuredContent: { error_kind: "renderer" } },
+          content: [{ type: "text", text: "renderer unavailable" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "改用文本拓扑：\n\n```mermaid\ngraph TD; A-->B\n```" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("hello"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("```mermaid");
+    expect(cardContent).toContain("A-->B");
+    expect(cardContent).toContain("报告图片生成失败");
+  });
+
+  it("reports one failed visual kind even when another kind delivered an image", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-mixed-visual-outcomes" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_chart",
+        result: { details: {}, content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }] },
+      };
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_mermaid",
+        result: {
+          details: { error: "renderer unavailable", structuredContent: { error_kind: "renderer" } },
+          content: [{ type: "text", text: "renderer unavailable" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "```chart\n{\"type\":\"bar\"}\n```\n\n```mermaid\ngraph TD; A-->B\n```" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("hello"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("报告图片生成失败");
+    expect(cardContent).not.toContain("```chart");
+    expect(cardContent).not.toContain("```mermaid");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports visual configuration errors without suggesting a retry", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-visual-config-failed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: { error: "missing URL", structuredContent: { error_kind: "configuration" } },
+          content: [{ type: "text", text: "missing URL" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\"}\n```" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("hello"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("请联系管理员检查配置");
+    expect(cardContent).not.toContain("请稍后重试");
+    expect(cardContent).not.toContain("```visual-card");
+  });
+
+  it("does not hide source or claim a renderer outage for invalid tool arguments", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-visual-card-input-error" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {
+            error: "render_visual_card: title is required",
+            structuredContent: { error_kind: "input" },
+          },
+          content: [{ type: "text", text: "render_visual_card: title is required" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\"}\n```" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("```visual-card");
+    expect(cardContent).not.toContain("报告图片生成失败");
+  });
+
+  it("does not claim rendering failed when a later render delivered an image", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-visual-card-retry" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {
+            error: "renderer timeout",
+            structuredContent: { error_kind: "renderer" },
+          },
+          content: [{ type: "text", text: "renderer timeout" }],
+        },
+      };
+      yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {},
+          content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "```visual-card",
+              JSON.stringify({ type: "report", title: "Recovered render" }),
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("报告图片已发送");
+    expect(cardContent).not.toContain("报告图片生成失败");
+    expect(cardContent).not.toContain("```visual-card");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(lark.cardkit.v1.cardElement.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips all visual source blocks when an image has no observable renderer attribution", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-unattributed-image" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "toolResult",
+          content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\",\"title\":\"x\"}\n```" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("报告图片已发送");
+    expect(cardContent).not.toContain("```visual-card");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+  });
+
   it("does not reply with an image when the final answer has no image artifact", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-no-chart" });
@@ -3331,7 +3657,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the markdown card successful when image upload returns no key", async () => {
+  it("reports Lark image delivery failure before finalizing the card", async () => {
     const onePixelBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -3339,13 +3665,18 @@ describe("handleLarkMessage — streaming card flow", () => {
     promptMock.mockResolvedValue({ sessionId: "s-image-fail" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
+        type: "tool_execution_end",
+        toolName: "mcp__create-chart__render_visual_card",
+        result: {
+          details: {},
+          content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }],
+        },
+      };
+      yield {
         type: "message_end",
         message: {
           role: "assistant",
-          content: [
-            { type: "text", text: "图片如下：" },
-            { type: "image", data: onePixelBase64, mimeType: "image/png" },
-          ],
+          content: [{ type: "text", text: "```visual-card\n{\"type\":\"report\",\"title\":\"x\"}\n```" }],
         },
       };
     });
@@ -3365,6 +3696,34 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.image.create).toHaveBeenCalledTimes(1);
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
     expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content;
+    expect(cardContent).toContain("报告图片发送失败");
+    expect(cardContent).not.toContain("图片如下");
+    expect(cardContent).not.toContain("```visual-card");
+    expect(lark.im.image.create.mock.invocationCallOrder[0])
+      .toBeLessThan(lark.cardkit.v1.cardElement.content.mock.invocationCallOrder.at(-1)!);
+  });
+
+  it("bounds Lark image delivery with one total deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const lark = makeCardAwareLarkClient();
+      lark.im.image.create.mockReturnValue(new Promise(() => {}));
+      const delivery = replyVisualImages(
+        lark,
+        "mid-timeout",
+        [{ kind: "image", mimeType: "image/png", image: Buffer.from([1]) }],
+        false,
+        100,
+      );
+      expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(delivery).resolves.toBe(0);
+      expect(lark.im.message.reply).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("falls back to plain text reply when card.create fails (preserves the pre-card UX)", async () => {

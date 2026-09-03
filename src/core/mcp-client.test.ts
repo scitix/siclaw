@@ -1,5 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
-import { jsonSchemaToTypebox, normalizeMcpInputSchema, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
+import {
+  jsonSchemaToTypebox,
+  normalizeMcpInputSchema,
+  buildMcpToolName,
+  isMcpTool,
+  MCP_TOOL_PREFIX,
+  mcpContentToAgentContent,
+  McpClientManager,
+  mergeMcpStdioEnv,
+  visualMcpRequestTimeoutMs,
+} from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
   it("converts string type", () => {
@@ -143,6 +153,56 @@ describe("mcpContentToAgentContent", () => {
   });
 });
 
+describe("mergeMcpStdioEnv", () => {
+  it("forwards the visual export contract into stdio MCP child processes", () => {
+    expect(mergeMcpStdioEnv(undefined, {
+      SICLAW_VISUAL_EXPORT_URL: "https://console.example.com/siclaw-visual-export",
+      SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "15000",
+      SICLAW_VISUAL_EXPORT_THEME: "dark",
+      SICLAW_VISUAL_EXPORT_CHROMIUM: "/opt/chromium",
+      SECRET_NOT_FOR_MCP: "must-not-leak",
+    })).toEqual({
+      SICLAW_VISUAL_EXPORT_URL: "https://console.example.com/siclaw-visual-export",
+      SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "15000",
+      SICLAW_VISUAL_EXPORT_THEME: "dark",
+      SICLAW_VISUAL_EXPORT_CHROMIUM: "/opt/chromium",
+    });
+  });
+
+  it("lets an explicit MCP server config override the inherited value", () => {
+    expect(mergeMcpStdioEnv(
+      { SICLAW_VISUAL_EXPORT_THEME: "light", CUSTOM_MCP_VALUE: "configured" },
+      { SICLAW_VISUAL_EXPORT_THEME: "dark" },
+    )).toEqual({
+      SICLAW_VISUAL_EXPORT_THEME: "light",
+      CUSTOM_MCP_VALUE: "configured",
+    });
+  });
+});
+
+describe("visualMcpRequestTimeoutMs", () => {
+  it("adds transport grace to the configured bundled renderer budget", () => {
+    expect(visualMcpRequestTimeoutMs(
+      "mcp-create-chart",
+      "render_visual_card",
+      { SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "120000" },
+    )).toBe(125_000);
+  });
+
+  it("does not change unrelated MCP request timeouts", () => {
+    expect(visualMcpRequestTimeoutMs("other-renderer", "render_chart", {})).toBeUndefined();
+    expect(visualMcpRequestTimeoutMs("mcp-create-chart", "query", {})).toBeUndefined();
+  });
+
+  it("uses the same merged per-server override that is passed to the child", () => {
+    const childEnv = mergeMcpStdioEnv(
+      { SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "120000" },
+      { SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "10000" },
+    );
+    expect(visualMcpRequestTimeoutMs("mcp-create-chart", "render_chart", childEnv)).toBe(125_000);
+  });
+});
+
 describe("createToolDefinition server description", () => {
   const manager = new McpClientManager({ mcpServers: {} });
   const makeDef = (serverDescription: string | undefined, toolDescription?: string) =>
@@ -189,6 +249,38 @@ describe("createToolDefinition server description", () => {
     await expect(def.execute("call-1", {})).resolves.toMatchObject({
       details: { structuredContent },
     });
+  });
+
+  it("marks MCP call failures as transport errors for channel degradation", async () => {
+    const def = (manager as any).createToolDefinition(
+      "create-chart",
+      undefined,
+      { name: "render_visual_card" },
+      { callTool: vi.fn(async () => { throw new Error("stdio disconnected"); }) },
+    );
+
+    await expect(def.execute("call-1", {})).resolves.toMatchObject({
+      details: { error: "stdio disconnected", errorKind: "transport" },
+    });
+  });
+
+  it("passes a renderer-specific timeout to the MCP SDK call", async () => {
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    const def = (manager as any).createToolDefinition(
+      "create-chart",
+      undefined,
+      { name: "render_visual_card" },
+      { callTool },
+      125_000,
+    );
+
+    await def.execute("call-1", {});
+
+    expect(callTool).toHaveBeenCalledWith(
+      { name: "render_visual_card", arguments: {} },
+      undefined,
+      { timeout: 125_000 },
+    );
   });
 });
 

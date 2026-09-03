@@ -92,6 +92,10 @@ const originalGatewayEnv = {
   SICLAW_GATEWAY_HOSTNAME: process.env.SICLAW_GATEWAY_HOSTNAME,
   SICLAW_INTERNAL_PORT: process.env.SICLAW_INTERNAL_PORT,
   SICLAW_MEMORY_ENABLED: process.env.SICLAW_MEMORY_ENABLED,
+  SICLAW_VISUAL_EXPORT_URL: process.env.SICLAW_VISUAL_EXPORT_URL,
+  SICLAW_VISUAL_EXPORT_TIMEOUT_MS: process.env.SICLAW_VISUAL_EXPORT_TIMEOUT_MS,
+  SICLAW_VISUAL_EXPORT_THEME: process.env.SICLAW_VISUAL_EXPORT_THEME,
+  SICLAW_VISUAL_EXPORT_CHROMIUM: process.env.SICLAW_VISUAL_EXPORT_CHROMIUM,
 };
 
 // Import SUT after mocks.
@@ -341,6 +345,34 @@ describe("K8sSpawner — spawn branches", () => {
     const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
     expect(env.some((e: any) => e.name === "SICLAW_SUBAGENT_MODEL_TIER")).toBe(false);
     expect(env.some((e: any) => e.name === "SICLAW_SUBAGENT_GROUP_ENABLED")).toBe(false);
+  });
+
+  it("forwards the visual export contract from the runtime into the AgentBox", async () => {
+    process.env.SICLAW_VISUAL_EXPORT_URL = "https://console.example.com/siclaw-visual-export";
+    process.env.SICLAW_VISUAL_EXPORT_TIMEOUT_MS = "15000";
+    process.env.SICLAW_VISUAL_EXPORT_THEME = "dark";
+    process.env.SICLAW_VISUAL_EXPORT_CHROMIUM = "/opt/chromium";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "agentbox.example.test", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "default" });
+    const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+    expect(env).toContainEqual({
+      name: "SICLAW_VISUAL_EXPORT_URL",
+      value: "https://console.example.com/siclaw-visual-export",
+    });
+    expect(env).toContainEqual({ name: "SICLAW_VISUAL_EXPORT_TIMEOUT_MS", value: "15000" });
+    expect(env).toContainEqual({ name: "SICLAW_VISUAL_EXPORT_THEME", value: "dark" });
+    expect(env).toContainEqual({ name: "SICLAW_VISUAL_EXPORT_CHROMIUM", value: "/opt/chromium" });
   });
 
   it("kb profile forwards KBC_* runtime env by prefix into the box pod, deduped, skipping empties", async () => {
