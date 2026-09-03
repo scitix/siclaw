@@ -218,6 +218,60 @@ describe("startRuntime — chat.abort wiring", () => {
     ));
   });
 
+  it("RELEASES the reservation when the dispatch fails before the prompt, so a retry re-dispatches", async () => {
+    // The bug: the dispatch key was written before the awaits and no failure
+    // path removed it, so a pre-prompt failure made every retry answer
+    // `duplicate: true` for a turn that never ran — the dispatch was silently
+    // dropped and the user's message never executed.
+    promptError = new Error("agentbox unreachable");
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+    const base = { agentId: "a", userId: "u", text: "answer", sessionId: "S", dispatchId: "disp-fail" };
+
+    const first = await send({ ...base }, ctx);
+    expect(first).toMatchObject({ ok: true, sessionId: "S" });
+    expect(first.duplicate).toBeUndefined();
+    // Wait for the failure to be reported, which is when the release happened.
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "stream_error",
+    ));
+
+    // The retry must actually re-dispatch rather than be told it already ran.
+    promptError = undefined;
+    const retry = await send({ ...base }, ctx);
+    expect(retry.duplicate).toBeUndefined();
+    await waitFor(() => promptCalls.length === 2);
+    expect(promptCalls.length).toBe(2);
+  });
+
+  it("still answers duplicate:true while the original dispatch is IN FLIGHT", async () => {
+    // A pending reservation is not a released one: the original is genuinely on
+    // its way to the box, so a concurrent retry must not start a second turn.
+    let unblock: (() => void) | undefined;
+    promptBlocker = new Promise<void>((r) => { unblock = r; });
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+    const base = { agentId: "a", userId: "u", text: "answer", sessionId: "S", dispatchId: "disp-inflight" };
+
+    const first = await send({ ...base }, ctx);
+    await waitFor(() => promptCalls.length === 1);
+
+    const retry = await send({ ...base }, ctx);
+    expect(retry).toMatchObject({ ok: true, sessionId: "S", turnId: first.turnId, duplicate: true });
+    expect(promptCalls.length).toBe(1);
+
+    unblock?.();
+    await waitFor(() => capturedSignal !== undefined);
+    // And once it has landed, the reservation is CONFIRMED — a later retry is
+    // still a duplicate, not a re-dispatch.
+    const late = await send({ ...base }, ctx);
+    expect(late).toMatchObject({ duplicate: true, turnId: first.turnId });
+    expect(promptCalls.length).toBe(1);
+    settleConsumer?.();
+  });
+
   it("preserves SESSION_CONTEXT_UNAVAILABLE from AgentBox and still terminates the turn", async () => {
     promptError = Object.assign(new Error("The requested session context is unavailable and cannot be resumed"), {
       code: "SESSION_CONTEXT_UNAVAILABLE",

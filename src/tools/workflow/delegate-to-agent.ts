@@ -31,6 +31,7 @@ interface DelegateParams {
   agent_name?: string;
   task?: string;
   session_id?: string;
+  evidence_refs?: string[];
 }
 
 function rosterLine(m: DelegateRosterMember): string {
@@ -70,6 +71,11 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       agent_name: Type.Optional(Type.String({ description: "That agent's name (for display; from the list above)." })),
       task: Type.String({ minLength: 1, description: "The bounded task / question for that agent. Be specific about the target resource." }),
       session_id: Type.Optional(Type.String({ description: "Continue a prior peer session (the session_id a previous delegation to this agent returned) so the peer retains context. Omit to start fresh." })),
+      evidence_refs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+        description:
+          "References to the evidence behind this task — trace ids, metric queries, document URIs — so the peer " +
+          "can check your basis instead of re-deriving it. References only; do not paste file contents here.",
+      })),
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as DelegateParams;
@@ -110,7 +116,13 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
         });
       };
       const continueSessionId = params.session_id?.trim() || undefined;
-      const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId }, onProgress, signal)
+      const evidenceRefs = (params.evidence_refs ?? []).filter((r) => typeof r === "string" && r.trim());
+      const resp = await refs.delegateToAgentExecutor({
+        peerAgentId: member.id,
+        text: task,
+        peerSessionId: continueSessionId,
+        ...(evidenceRefs.length ? { evidenceRefs } : {}),
+      }, onProgress, signal)
         .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, peerTraceId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
 
       // Card-facing shape (portal-web AgentWorkCard reads target from args and
@@ -170,6 +182,8 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
 
 export const registration: ToolEntry = {
   category: "workflow",
+  // Effect ceiling (shared/tool-effects.ts): makes a peer agent act on real resources.
+  effect: "external_write",
   create: createDelegateToAgentTool,
   // Coordinator-only: needs a roster + the executor, and must NOT itself be a
   // delegated turn (one-level recursion guard — a peer can't re-delegate).

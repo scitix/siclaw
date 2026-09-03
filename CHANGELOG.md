@@ -6,6 +6,103 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+#### Trusted execution: enforceable effect ceiling, action-bound approvals, envelope binding
+
+Security review of the AuthorityEnvelope / `propose_execution` path. Design:
+`docs/design/2026-09-03-authority-envelope-and-action-digest.md`.
+
+- **The effect ceiling was unenforceable.** The authority guard gated a tool
+  only when `allowedCapabilities` was non-empty, so an envelope declaring
+  `effectCeiling: "observe"` with no allow-list permitted every tool, `bash`
+  included. Tools now DECLARE their effect (`ToolEntry.effect`, plus
+  `TOOL_EFFECTS` for harness built-ins) and the guard compares it against the
+  ceiling directly; the allow-list narrows further rather than switching
+  enforcement on. `credential_read` is blocked outright and never gated, and an
+  unrecognised ceiling string is treated as `observe`. A test asserts every tool
+  in the mutating capability groups declares a non-`observe` effect, so a future
+  mutating tool cannot default to being treated as a read.
+- **Approvals were bearer tokens.** A signed receipt was minted, delivered
+  inside a natural-language resume message (entering the model context, the
+  transcript and the dispatch outbox), and accepted for ANY gated tool — an
+  approval for "scale A" authorised one call to "delete B". The token is gone:
+  `propose_execution` now states the exact intended call (`tool_name`,
+  `tool_args`), the runtime computes a `sha256` action digest over it, and the
+  guard recomputes that digest from the arguments the tool is about to run with
+  before consuming the approval by id. The management plane stores the digest
+  opaquely and never recomputes it, so there is no cross-language canonical-JSON
+  agreement to drift. RPC params become
+  `{ proposalId, actionDigest, subject? }` (method name unchanged).
+- **A verified envelope was not checked against the request.** A genuine
+  envelope minted for a low-privilege agent could be replayed on a dispatch to a
+  high-privilege one. New `bindingError()` checks `targetAgentId` and, when the
+  issuer stated them, `segmentId` / `taskId` (new claim); `/api/prompt` answers
+  403 `AUTHORITY_ENVELOPE_MISBOUND`. The agent identity compared against is the
+  box's own, never a request-supplied value.
+
+#### Dispatch idempotency: released reservations and a cross-restart turn ledger
+
+- **A pre-prompt failure silently dropped the dispatch.** The `(sessionId,
+  dispatchId)` key was written before the awaits and no failure path removed it,
+  so after a box-spawn / lock / persistence failure every retry was answered
+  `duplicate: true` for a turn that had never run. The reservation is now
+  *pending* → *confirmed* (once `client.prompt()` resolves, or the input is
+  delivered as a steer) → or *released* on every failure path before the error
+  is reported, so a retry re-dispatches.
+- **The same dispatch could execute twice across a Runtime restart**, since the
+  dedupe map is process-local. The AgentBox — which runs the turn and outlives
+  the Runtime — now keeps a bounded per-session ledger of accepted `turnId`s
+  beside the session history; `/api/prompt` answers a known `turnId` with
+  `duplicate: true` without starting a turn. A corrupt or missing ledger reads as
+  empty and never fails a turn.
+
+#### A2A delegation transport: fast completions, bridge recovery, delegated identity
+
+- **A fast task was reported as a failure.** After a successful resume the
+  transport unconditionally issued `tasks/{id}:subscribe`, which the control
+  plane answers 400 `UNSUPPORTED_OPERATION` for a terminal task — while the
+  resume response body (previously discarded) may already carry the terminal
+  Task. The body is now parsed and short-circuits when terminal; a 400/409 on
+  subscribe falls back to `GET /tasks/{id}`.
+- **Replay protection was structurally dead.** Each resume attempt sent a fresh
+  `messageId: randomUUID()`, so the idempotency key could never match. Messages
+  now carry a stable id derived from the logical message
+  (`sha256(delegationId:taskId:text)`), and the initial `message:stream` — which
+  sent none at all — carries one too, so a retried open cannot create a
+  duplicate task.
+- **A lost continuation abandoned a parked peer.** The
+  `localSessionId → waitingTaskId` map is process-local; on a miss the transport
+  now asks the control plane (`GET /tasks?contextId=…&status=working`) and
+  adopts a task in `TASK_STATE_INPUT_REQUIRED` before opening a new one.
+- **An unexpected SSE end errored out** although the code comment promised a
+  `GET` fallback; the documented fallback is now implemented, keeping whatever
+  had already streamed.
+- **Every delegated call ran as the workload's service identity**, collapsing
+  user-level authorization, audit attribution and no-self-approval onto one
+  account. Both the `message:send` and `message:stream` bodies now carry
+  `siclaw.onBehalfOfUserId` — taken only from a validated parent session's owner,
+  and OMITTED rather than substituted when the originating user is unknown.
+- **`SICLAW_DELEGATION_TRANSPORT=a2a` with a missing URL/token downgraded
+  silently** to the legacy transport, so an operator believed they were on the
+  durable path when they were not. It is now a loud startup/dispatch error. A
+  non-`https:` base URL is refused unless `SICLAW_INNER_A2A_ALLOW_PLAINTEXT=1`
+  is set (a long-lived bearer token over plaintext is capturable), and that
+  escape hatch logs a warning every time.
+- `delegate_to_agent` and `propose_execution` accept optional `evidence_refs`;
+  the delegation transport carries them as a structured `data` part
+  (`application/vnd.siclaw.context+json`) so an investigation's basis crosses the
+  agent boundary. References only — no inlined file bytes.
+
+#### Repository hygiene
+
+- Removed a raw NUL byte from `src/gateway/server.ts` (a composite map-key
+  separator, now written as the `\u0000` escape — same runtime string). The NUL
+  made standard tooling treat the file as binary: `grep` silently returned
+  nothing for it and `rg` stopped early, so a reviewer could conclude a pattern
+  was absent when the file was merely unreadable. `src/shared/repo-hygiene.test.ts`
+  now fails on any NUL byte in a tracked `src/**/*.ts`.
+
 ### Changed
 
 #### KB compile box: distinct image name + pod prefix (operations)

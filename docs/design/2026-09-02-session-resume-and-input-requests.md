@@ -91,15 +91,41 @@ management plane persists every dispatch in a durable outbox and may re-send
 one whose acknowledgement was lost; the id makes that retry safe:
 
 - Dedup key is `(sessionId, dispatchId)`, held in a process-local map
-  (capacity 2000, 6h TTL). Process-local is the exact semantic: a turn cannot
-  outlive this process, so a fresh process re-running the dispatch is a
-  correct retry, not a duplicate.
+  (capacity 2000, 6h TTL).
 - A duplicate returns `{ ok: true, sessionId, turnId, duplicate: true }` with
   the ORIGINAL turn's id — it never starts a second turn and, critically,
   never falls into the busy-session steer fallback (which would inject the
   same input into the running turn twice).
 - The key is reserved before the first await in the handler, so a concurrent
   retry cannot slip in mid-persistence.
+
+### Reserve → confirm / release
+
+The reservation is a three-state lifecycle, not a single write:
+
+| State | Meaning | A retry gets |
+|---|---|---|
+| *pending* | reserved before the awaits; dispatch in flight | `duplicate: true` |
+| *confirmed* | `client.prompt()` resolved, or the input was delivered as a steer | `duplicate: true` |
+| *released* | the turn did not run; the key is deleted | a real re-dispatch |
+
+An unconditional write was wrong in one direction that mattered: a failure
+*before* the prompt (box spawn, session lock, persistence) left the key behind
+with nothing to remove it, so every retry was answered `duplicate: true` for a
+turn that had never run — the dispatch was silently dropped. Every failure path
+now releases the reservation *before* the error is reported.
+
+### Cross-restart: the AgentBox turn ledger
+
+The map above is process-local, so after a Runtime restart the same
+`dispatchId` is unknown again and the turn would execute a second time. The
+AgentBox is the authority for that question — it is what actually runs the turn
+and it outlives the Runtime — so `/api/prompt` keeps a small per-session ledger
+of accepted `turnId`s next to the session's JSONL history (bounded to the most
+recent 200; a corrupt or missing file reads as empty and never fails a turn). A
+`turnId` already in the ledger is answered
+`{ ok: true, sessionId, turnId, duplicate: true }` without starting anything.
+See `docs/design/2026-09-03-authority-envelope-and-action-digest.md`.
 
 ## Non-goals
 

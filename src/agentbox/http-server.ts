@@ -63,7 +63,7 @@ import {
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
-import { verifyAuthorityEnvelope } from "../shared/authority-envelope.js";
+import { verifyAuthorityEnvelope, bindingError } from "../shared/authority-envelope.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -92,6 +92,14 @@ interface PromptRequestBody {
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
   authorityEnvelope?: string;
+  /**
+   * Control-plane segment / task this turn belongs to. Optional, and used only
+   * to check that an `authorityEnvelope` naming one was issued for THIS request
+   * (see bindingError). Absent context cannot satisfy an envelope that names a
+   * segment or task, which is the fail-closed direction.
+   */
+  segmentId?: string;
+  taskId?: string;
   /** Reject if `sessionId` has no in-memory or persisted conversation context. */
   requireExistingSession?: boolean;
   modelProvider?: string;
@@ -926,7 +934,33 @@ export function createHttpServer(
         sendJson(res, 403, { error: { code: "AUTHORITY_ENVELOPE_INVALID", message: "authority envelope invalid or expired", retriable: false, status: 403 } });
         return;
       }
+      // An envelope that verifies may still have been minted for someone else.
+      // Without this check a valid envelope issued to a low-privilege agent
+      // could be replayed on a dispatch to a high-privilege one — the signature
+      // proves authenticity, not that it was authentic FOR THIS REQUEST. The
+      // agent identity checked against is the box's OWN, never a value from the
+      // request body, which the presenter could otherwise choose to match.
+      const boxAgentId = sessionManager.agentId ?? "";
+      const misbound = !boxAgentId
+        ? "this AgentBox has no configured agent identity to bind an authority envelope to"
+        : bindingError(claims, { agentId: boxAgentId, segmentId: body.segmentId, taskId: body.taskId });
+      if (misbound) {
+        logPromptResponse(403, "rejected", misbound);
+        sendJson(res, 403, { error: { code: "AUTHORITY_ENVELOPE_MISBOUND", message: misbound, retriable: false, status: 403 } });
+        return;
+      }
       authorityEnvelope = body.authorityEnvelope;
+    }
+
+    // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
+    // dispatch in process memory only, so after a Runtime restart the same turn
+    // would execute twice. This box ran it and outlived that Runtime, so it is
+    // the authority: a turnId already in this session's ledger is answered
+    // WITHOUT starting anything. (See turn-ledger.ts.)
+    if (body.sessionId && body.turnId && sessionManager.hasAcceptedTurn(body.sessionId, body.turnId)) {
+      logPromptResponse(200, "duplicate", undefined, body.sessionId);
+      sendJson(res, 200, { ok: true, sessionId: body.sessionId, turnId: body.turnId, duplicate: true });
+      return;
     }
     const resumed = sessionManager.hasRestorableSessionContext(body.sessionId);
     if (body.requireExistingSession === true && !resumed) {
@@ -998,6 +1032,11 @@ export function createHttpServer(
     // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
     // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
     managed._currentTurnId = body.turnId;
+    // Accepted: the session is claimed and this turn is going to run. Recorded
+    // BEFORE the ack, because a record that landed after it would leave open
+    // exactly the window it exists to close. A 409/412 above returns earlier and
+    // deliberately records nothing — that turn did not run.
+    if (body.turnId) sessionManager.recordAcceptedTurn(managed.id, body.turnId);
     if (sessionManager.consumePendingAbort(managed.id, body.turnId)) {
       managed._aborted = true;
       console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);

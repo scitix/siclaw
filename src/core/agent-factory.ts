@@ -72,7 +72,12 @@ import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateR
 /** The tool-layer authority contract a governed session runs under. */
 export interface SessionAuthority {
   claims: AuthorityEnvelopeClaims;
-  consumeReceipt: (receipt: string) => Promise<void>;
+  /**
+   * Consumes an APPROVED PROPOSAL for one exact action. No token: the proposal
+   * id is an identifier and the action digest is what binds the approval to the
+   * call being attempted (see shared/action-digest.ts).
+   */
+  consumeApproval: (req: { proposalId: string; actionDigest: string }) => Promise<void>;
 }
 
 export interface CreateSiclawSessionOpts {

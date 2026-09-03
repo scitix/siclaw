@@ -515,6 +515,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
+  // Effect ceiling (shared/tool-effects.ts): runs commands on real clusters/nodes.
+  effect: "external_write",
   create: (refs) =>
     createRestrictedBashTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,

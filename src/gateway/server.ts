@@ -95,6 +95,7 @@ import {
   handleMetricsFlush,
 } from "./internal-api.js";
 import { handleDelegate, handleDelegates, isDelegationSettled, salvageDelegationTraceBind } from "./delegate-api.js";
+import { a2aTransportConfig } from "./delegate-a2a-transport.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
@@ -177,6 +178,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── Credential Service ───────────────────────────────────
   if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
   const credentialService = opts.credentialService;
+
+  // ── Delegation transport ─────────────────────────────────
+  // Validated at STARTUP so a misconfigured A2A transport fails here instead of
+  // on the first delegation — and, critically, instead of silently downgrading
+  // to the legacy relay while the operator believes the durable A2A path is in
+  // use. a2aTransportConfig throws on a half-configured or plaintext endpoint;
+  // it returns undefined only when the flag is deliberately off.
+  a2aTransportConfig();
 
   // ── Session Registry resolver ────────────────────────────
   // Cache misses (e.g. async AgentBox callbacks arriving after a Runtime
@@ -710,12 +719,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   // Accepted dispatches by `${sessionId}:${dispatchId}`, so a management-plane
   // retry of a dispatch whose ack was lost is idempotent (see chat.send below).
-  // Process-local on purpose: a turn cannot outlive this process, so a fresh
-  // process re-running the dispatch is a correct retry, not a duplicate.
-  const recentDispatches = new Map<string, { turnId: string; at: number }>();
+  //
+  // RESERVE → CONFIRM / RELEASE, not a single write. The reservation is taken
+  // before the first await (that is what stops a concurrent retry slipping in
+  // mid-persistence), but it starts PENDING and is only CONFIRMED once
+  // client.prompt() has resolved. Every failure path RELEASES it.
+  //
+  // Why the three states matter: a single unconditional write meant a failure
+  // BEFORE the prompt (box spawn, lock, persistence) left the key behind
+  // forever, so the retry was answered `duplicate: true` for a turn that never
+  // ran — the dispatch was silently dropped. A retry that finds a PENDING
+  // reservation is still answered "already accepted", because the original is
+  // genuinely in flight; a retry after a release re-dispatches.
+  //
+  // Process-local, and now backed by the AgentBox's own turn ledger for the
+  // cross-restart case: this map cannot answer for a turn a PREVIOUS Runtime
+  // process dispatched, so the box — which ran it and outlived that process —
+  // is the authority there (see turn-ledger.ts).
+  const recentDispatches = new Map<string, { turnId: string; at: number; pending: boolean }>();
   const DISPATCH_DEDUPE_TTL_MS = 6 * 60 * 60 * 1000;
   const DISPATCH_DEDUPE_MAX = 2000;
-  const rememberDispatch = (key: string, turnId: string): void => {
+  const reserveDispatch = (key: string, turnId: string): void => {
     const now = Date.now();
     if (recentDispatches.size >= DISPATCH_DEDUPE_MAX) {
       for (const [k, v] of recentDispatches) {
@@ -729,7 +753,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         recentDispatches.delete(oldest);
       }
     }
-    recentDispatches.set(key, { turnId, at: now });
+    recentDispatches.set(key, { turnId, at: now, pending: true });
+  };
+  /** The turn reached the box: the reservation now records a real dispatch. */
+  const confirmDispatch = (key: string | undefined): void => {
+    if (!key) return;
+    const entry = recentDispatches.get(key);
+    if (entry) entry.pending = false;
+  };
+  /** The turn never ran: drop the reservation so a retry re-dispatches. */
+  const releaseDispatch = (key: string | undefined): void => {
+    if (!key) return;
+    if (recentDispatches.delete(key)) {
+      console.warn(`[runtime] released dispatch reservation ${key}; a retry will re-dispatch it`);
+    }
   };
 
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
@@ -820,9 +857,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (dispatchKey) {
       const seen = recentDispatches.get(dispatchKey);
       if (seen) {
+        // Pending (still in flight) and confirmed both mean "we already have
+        // this dispatch" — only a RELEASED one is absent and re-dispatchable.
         return { ok: true, sessionId, turnId: seen.turnId, duplicate: true };
       }
-      rememberDispatch(dispatchKey, turnId);
+      reserveDispatch(dispatchKey, turnId);
     }
 
     /**
@@ -966,6 +1005,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             : undefined;
           if (steered) {
             console.log(`[runtime] session=${sessionId} busy; steered into the turn on ${running!.boxId}`);
+            // The input WAS delivered (it rides the in-flight turn), so this
+            // dispatch happened: confirm it rather than leaving it pending.
+            confirmDispatch(dispatchKey);
             if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             if (promptMessageId) await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
               .catch((e) => console.warn(`[runtime] failed to mark steer message session=${sessionId}:`, e));
@@ -1014,6 +1056,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         const promptStartedAt = Date.now();
         try {
           promptResult = await client.prompt(promptOpts);
+          // The box has the turn. THIS is the moment the reservation becomes a
+          // record of a real dispatch; everything before it could still fail
+          // and release, so that a retry re-dispatches instead of being told
+          // a turn ran when it never did.
+          confirmDispatch(dispatchKey);
           console.log(`[runtime] AgentBox prompt result agentId=${agentId} sessionId=${sessionId} turnId=${turnId} boxId=${selectedBoxId} status=200 ok=true durationMs=${Date.now() - promptStartedAt} traceIdPresent=${Boolean(promptResult.traceId)}`);
           // The ack's trace id is gated ONCE and every consumer of it below — the
           // delegated-turn ledger, the prompt-row bind, the consume's row stamp —
@@ -1074,6 +1121,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (err instanceof Error && err.message.includes("Session is already running")) {
             if (requiredResultToolName) throw err;
             const steerResult = await client.steerSession(sessionId, text, { images, files });
+            // Delivered as a steer onto the running turn — the dispatch did
+            // take effect, so it stays recorded (see the busy-degrade path).
+            confirmDispatch(dispatchKey);
             if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             // chat.send persisted this row before it knew the active session would
             // reject a fresh prompt. Once the fallback steer is accepted, label the
@@ -1204,6 +1254,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
         }
       } catch (err) {
+        // This turn did not run (or was compensated away by the abort above), so
+        // drop the reservation BEFORE reporting the error: the caller is about to
+        // learn the dispatch failed, and its retry must actually re-dispatch
+        // instead of being answered `duplicate: true` for a turn nobody ran.
+        releaseDispatch(dispatchKey);
         // Failure before/during agentbox spawn or prompt() — surface as a
         // stream_error so the frontend renders an inline bubble instead of
         // hanging on the spawning state forever.
@@ -2711,16 +2766,21 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
                   req.on("end", () => resolve(buf));
                   req.on("error", reject);
                 });
-                const body = JSON.parse(raw || "{}") as { receipt?: string };
-                if (!body?.receipt) {
+                const body = JSON.parse(raw || "{}") as { proposalId?: string; actionDigest?: string };
+                if (!body?.proposalId || !body?.actionDigest) {
                   res.writeHead(400, { "Content-Type": "application/json" });
-                  res.end(JSON.stringify({ error: "receipt is required" }));
+                  res.end(JSON.stringify({ error: "proposalId and actionDigest are required" }));
                   return;
                 }
                 // Atomic one-time consumption happens on the management plane;
-                // the box's mTLS identity is recorded as the consumer.
+                // the box's mTLS identity is recorded as the consumer. The digest
+                // binds this consumption to ONE action: the management plane
+                // compares it with the value stored when the proposal was made
+                // and refuses an approval granted for anything else. It never
+                // recomputes the digest — only the runtime does that.
                 const result = await frontendClient.request("authority.consumeReceipt", {
-                  receipt: body.receipt,
+                  proposalId: body.proposalId,
+                  actionDigest: body.actionDigest,
                   subject: `box/${identity.boxId ?? identity.agentId ?? "unknown"}`,
                 }, 10_000);
                 res.writeHead(200, { "Content-Type": "application/json" });
@@ -2813,7 +2873,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     httpsServer.on("tlsClientError", (err: Error & { code?: string }, socket: tls.TLSSocket) => {
       const peer = socket.remoteAddress ?? "unknown";
       const code = err.code ?? "unknown";
-      const key = `${peer} ${code}`;
+      const key = `${peer}\u0000${code}`;
       const now = Date.now();
       const last = tlsErrorLastLogged.get(key);
       if (last !== undefined && now - last < TLS_ERROR_LOG_INTERVAL_MS) return;

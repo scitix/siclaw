@@ -35,6 +35,13 @@ export interface DelegateRequest {
    * match) before reusing it; an unowned/unknown id falls back to a new session.
    */
   peerSessionId?: string;
+  /**
+   * References to the evidence behind this task (trace ids, metric queries,
+   * document URIs) so an investigation's basis crosses the agent boundary with
+   * it. REFERENCES ONLY — never inlined file bytes, which would bloat every
+   * delegation body and duplicate data the peer can fetch itself.
+   */
+  evidenceRefs?: string[];
 }
 
 /** gateway → box: outcome of a delegated task. */

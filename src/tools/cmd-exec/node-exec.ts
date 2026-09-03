@@ -517,6 +517,8 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
+  // Effect ceiling (shared/tool-effects.ts): runs commands on real clusters/nodes.
+  effect: "external_write",
   create: (refs) =>
     createNodeExecTool(refs.kubeconfigRef, refs.userId, {
       executor: refs.backgroundExecExecutor,

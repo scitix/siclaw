@@ -10,7 +10,7 @@
 import { describe, it, expect } from "vitest";
 import { allToolEntries } from "../tools/all-entries.js";
 import { CAPABILITY_GROUPS } from "./tool-capabilities.js";
-import type { ToolRefs } from "./tool-registry.js";
+import { effectForTool, type ToolRefs } from "./tool-registry.js";
 
 // Tools deliberately left out of every group, with the reason. Keep EMPTY unless
 // a tool is intentionally ungovernable by capability groups (none today).
@@ -36,5 +36,37 @@ describe("capability-group registry coverage", () => {
     }
 
     expect(missing).toEqual([]);
+  });
+});
+
+/**
+ * TOOL_EFFECTS (the guard's by-name lookup) and ToolEntry.effect (the annotation
+ * carried onto a resolved definition) describe the same fact and must never
+ * disagree — a tool declared external_write on its registration but missing from
+ * the map would be gated in one code path and waved through in the other.
+ *
+ * Lives here rather than in tool-registry.test.ts because reading an entry's
+ * NAME means instantiating it, which needs the heavy allToolEntries graph this
+ * file already imports.
+ */
+describe("declared effect consistency", () => {
+  it("agrees with TOOL_EFFECTS for every registered tool", () => {
+    const stubRefs = {
+      sessionIdRef: { current: "effect-probe" },
+      sessionEventEmitter: () => {},
+      knowledgeCitationTool: { name: "knowledge_cite" },
+    } as unknown as ToolRefs;
+
+    const disagreements: string[] = [];
+    for (const entry of allToolEntries) {
+      const name = entry.create(stubRefs).name;
+      const declared = entry.effect ?? "observe";
+      const mapped = effectForTool(name);
+      if (declared !== mapped) {
+        disagreements.push(`${name}: registration says "${declared}", TOOL_EFFECTS says "${mapped}"`);
+      }
+    }
+
+    expect(disagreements).toEqual([]);
   });
 });

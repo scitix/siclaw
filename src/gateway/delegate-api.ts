@@ -490,6 +490,16 @@ export async function handleDelegate(
   // retained), else a fresh session. Reuse is re-validated to belong to THIS
   // coordinator (parent + target match) — never trust the box's raw id.
   let ownerUserId = coordinatorAgentId; // fallback; parent-link auth still grants the human
+  /**
+   * The GENUINE originating human, set only when the validated parent session
+   * actually named one. Deliberately separate from `ownerUserId`, which falls
+   * back to the coordinator's agent id: that fallback is fine for row ownership
+   * but must NEVER be sent as an on-behalf-of identity, because it would
+   * attribute a person's authority to a service account and satisfy a check
+   * (user-level authorization, audit attribution, no-self-approval) that was
+   * meant to fail when the user is unknown.
+   */
+  let onBehalfOfUserId: string | undefined;
   peerSessionId = randomUUID();
   // The caller-supplied parent is trusted ONLY once bound to THIS coordinator's mTLS
   // identity. Gates user_id adoption, session reuse, AND parent linkage.
@@ -517,7 +527,12 @@ export async function handleDelegate(
       sendJson(res, 403, { error: "parentSessionId does not belong to this coordinator" });
       return;
     }
-    if (parent.user_id) ownerUserId = parent.user_id;
+    if (parent.user_id) {
+      ownerUserId = parent.user_id;
+      // Trusted: the parent session was just bound to this coordinator's mTLS
+      // identity, so its owner is the human this delegation is being run for.
+      onBehalfOfUserId = parent.user_id;
+    }
     parentTrusted = true;
 
     // Recency-bounded reuse: only continue a session among this coordinator
@@ -791,6 +806,9 @@ export async function handleDelegate(
       text,
       localSessionId: peerSessionId,
       parentSessionId: trustedParent ?? undefined,
+      // Omitted when the originating human is unknown — never substituted.
+      onBehalfOfUserId,
+      ...(body.evidenceRefs?.length ? { evidenceRefs: body.evidenceRefs } : {}),
       delegationId,
       signal: peerAbort.signal,
       observe: (evt) => observePeerEvent(evt, true),

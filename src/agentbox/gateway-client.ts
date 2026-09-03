@@ -89,12 +89,17 @@ export class GatewayClient {
    * Fetch settings (providers, models, embedding config) from Gateway
    */
   /**
-   * Consumes a one-time approval receipt on the management plane (atomic,
-   * relayed through the Runtime's internal API). Throws when the receipt was
-   * already consumed, expired, or its proposal changed.
+   * Consumes an APPROVED PROPOSAL for one exact action (atomic, relayed through
+   * the Runtime's internal API). Throws when the proposal was not approved,
+   * was already consumed, expired, or was approved for a DIFFERENT action —
+   * which the management plane decides by comparing the action digest it stored
+   * with the proposal against the one sent here.
+   *
+   * No token crosses this boundary: `proposalId` is an identifier, and holding
+   * it authorises nothing on its own.
    */
-  async consumeApprovalReceipt(receipt: string): Promise<void> {
-    await this.request("/api/internal/authority/consume", "POST", { receipt }, 10000);
+  async consumeApproval(req: { proposalId: string; actionDigest: string }): Promise<void> {
+    await this.request("/api/internal/authority/consume", "POST", req, 10000);
   }
 
   async fetchSettings(): Promise<any> {

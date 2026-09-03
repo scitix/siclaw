@@ -17,6 +17,12 @@ export interface AuthorityEnvelopeClaims {
   subject: string;
   targetAgentId: string;
   segmentId?: string;
+  /**
+   * The control-plane task this envelope was issued for. Optional: an envelope
+   * may be scoped to an agent (and a segment) without naming a task. When
+   * present it is BINDING — see `bindingError`.
+   */
+  taskId?: string;
   resourceScope?: string[];
   effectCeiling: string;
   allowedCapabilities?: string[];
@@ -55,6 +61,44 @@ export function verifyAuthorityEnvelope(
   if (!claims.subject || !claims.targetAgentId || !claims.effectCeiling) return null;
   if (typeof claims.expiresAt !== "number" || Date.now() / 1000 > claims.expiresAt) return null;
   return claims;
+}
+
+/**
+ * Checks that a verified envelope was issued for THIS request, returning a
+ * reason string when it was not (null when the binding holds).
+ *
+ * Kept separate from `verifyAuthorityEnvelope` on purpose: that function proves
+ * the envelope is authentic and unexpired, which needs nothing but the token and
+ * the secret. Binding is a different question — "authentic FOR WHAT" — and it
+ * needs the request context, which the signature check has no business knowing.
+ * Folding the two together would mean every caller had to supply a context, and
+ * a caller with none would end up passing something plausible instead.
+ *
+ * A signed envelope that verifies but was minted for another agent, another
+ * segment or another task is REPLAY: without this check a valid envelope for a
+ * low-privilege agent could be presented on a dispatch to a high-privilege one.
+ * Callers fail closed on a non-null result (`/api/prompt` answers 403
+ * AUTHORITY_ENVELOPE_MISBOUND).
+ *
+ * Absent claims do not bind: `segmentId` / `taskId` are optional, and an
+ * envelope that names neither is checked on `targetAgentId` alone. Only a claim
+ * the ISSUER stated is enforced, so a narrower envelope is never weakened by a
+ * caller that omits context it does not have.
+ */
+export function bindingError(
+  claims: AuthorityEnvelopeClaims,
+  ctx: { agentId: string; segmentId?: string; taskId?: string },
+): string | null {
+  if (claims.targetAgentId !== ctx.agentId) {
+    return `authority envelope targets agent ${claims.targetAgentId}, not ${ctx.agentId}`;
+  }
+  if (claims.segmentId && claims.segmentId !== ctx.segmentId) {
+    return `authority envelope is bound to segment ${claims.segmentId}, not ${ctx.segmentId ?? "(none)"}`;
+  }
+  if (claims.taskId && claims.taskId !== ctx.taskId) {
+    return `authority envelope is bound to task ${claims.taskId}, not ${ctx.taskId ?? "(none)"}`;
+  }
+  return null;
 }
 
 /**

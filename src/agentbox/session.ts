@@ -38,6 +38,7 @@ import type {
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentPodConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getGroupPodShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
 import { buildReduceInput, GroupCircuitBreaker, truncateReduceSummary, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
+import { hasAcceptedTurn, recordAcceptedTurn } from "./turn-ledger.js";
 import { buildNotificationBatch, buildGroupNotificationSummary, summarizeItemStatuses, type TaskNotification } from "../core/task-notification.js";
 import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
@@ -404,11 +405,12 @@ async function abortBrainBestEffort(
 
 /**
  * buildSessionAuthority re-verifies the envelope at session build (it was
- * verified at /api/prompt admission too — TTLs are short and rebuilds happen)
- * and binds the receipt consumer to the Runtime's internal API. No client =
- * receipts cannot be consumed = gated calls stay blocked (fail closed).
- * Returning undefined for an envelope that no longer verifies would run the
- * turn UNGOVERNED; the caller therefore treats undefined as a build error.
+ * verified and bound to the request at /api/prompt admission too — TTLs are
+ * short and rebuilds happen) and binds the approval consumer to the Runtime's
+ * internal API. No client = approvals cannot be consumed = gated calls stay
+ * blocked (fail closed). Returning undefined for an envelope that no longer
+ * verifies would run the turn UNGOVERNED; the caller therefore treats undefined
+ * as a build error.
  */
 function buildSessionAuthority(envelope: string, gatewayClient?: GatewayClient): SessionAuthority {
   const claims = verifyAuthorityEnvelope(envelope);
@@ -417,9 +419,9 @@ function buildSessionAuthority(envelope: string, gatewayClient?: GatewayClient):
   }
   return {
     claims,
-    consumeReceipt: async (receipt: string) => {
-      if (!gatewayClient) throw new Error("receipt consumption is unavailable in this environment");
-      await gatewayClient.consumeApprovalReceipt(receipt);
+    consumeApproval: async (req: { proposalId: string; actionDigest: string }) => {
+      if (!gatewayClient) throw new Error("approval consumption is unavailable in this environment");
+      await gatewayClient.consumeApproval(req);
     },
   };
 }
@@ -788,6 +790,22 @@ export class AgentBoxSessionManager {
       fs.mkdirSync(dir, { recursive: true });
     }
     return dir;
+  }
+
+  /**
+   * Has this session already accepted `turnId`? The AgentBox is the dispatch
+   * de-duplication authority across a Runtime restart, because it is what runs
+   * the turn and it outlives the Runtime. See turn-ledger.ts.
+   */
+  hasAcceptedTurn(sessionId: string, turnId: string): boolean {
+    if (!sessionId || !turnId) return false;
+    return hasAcceptedTurn(this.getSessionDir(sessionId), turnId);
+  }
+
+  /** Records `turnId` as accepted by this session (durable, best-effort). */
+  recordAcceptedTurn(sessionId: string, turnId: string): void {
+    if (!sessionId || !turnId) return;
+    recordAcceptedTurn(this.getSessionDir(sessionId), turnId);
   }
 
   /**
@@ -3292,7 +3310,7 @@ export class AgentBoxSessionManager {
           const pending = new Map<string, { toolName?: string; args?: unknown }>();
           let childSessionId: string | undefined;
           return gc.delegateStream(
-            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId },
+            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId, evidenceRefs: req.evidenceRefs },
             (evt) => {
               const e = evt as any;
               const t = String(e?.type ?? "");
