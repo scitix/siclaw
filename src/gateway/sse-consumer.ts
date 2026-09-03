@@ -16,7 +16,7 @@ import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
-import { appendKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
+import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
 
 // ── Public types ────────────────────────────────────
 
@@ -380,6 +380,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let isRoutingTurn = false;
   let routingCommitted = false;
   let pendingKnowledgeSources: unknown = null;
+  // URLs already rendered into an assistant message THIS TURN. Consumers ASSIGN
+  // (not merge) the knowledge_sources event, and a source must appear exactly
+  // once per turn. Nulling pending after the first ended message lost the
+  // references when the model narrated or re-cited before its final answer
+  // (zero-fresh re-cite emits nothing), and duplicated them across bubbles when
+  // it cited twice. Instead keep pending and append only the not-yet-rendered
+  // delta to each message; reset at the user-message turn boundary.
+  const renderedKnowledgeSourceUrls = new Set<string>();
   const pendingAssistantOps: Array<() => Promise<void>> = [];
   const pendingErrorOps: Array<() => Promise<void>> = [];
   const flushOps = async (ops: Array<() => Promise<void>>) => {
@@ -438,6 +446,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     pendingAssistantOps.length = 0;
     pendingErrorOps.length = 0;
     pendingKnowledgeSources = null;
+    renderedKnowledgeSourceUrls.clear();
     pendingStreamError = null;
     errorMessage = "";
     // The primary's deferred assistant op flipped firstAssistantPersisted when
@@ -739,6 +748,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // once per LLM round-trip: a turn that calls tools emits several, and
           // flushing on those would defeat the in-turn suppression entirely.
           await flushTerminalError();
+          // Same boundary retires the previous turn's citation state, so a
+          // source rendered last turn never suppresses this turn's identical
+          // citation and stale pending never leaks onto the new answer.
+          pendingKnowledgeSources = null;
+          renderedKnowledgeSourceUrls.clear();
         }
         if (message?.role === "user" && onUserMessageStarted) {
           // The echoed text, so the caller can check the echo against the row it expects —
@@ -905,13 +919,20 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           if (pendingKnowledgeSources && message.stopReason !== "error") {
             const base = extracted || currentMsgText || assistantContent;
             if (base.trim()) {
-              const cited = appendKnowledgeSourceCitations(base, pendingKnowledgeSources);
-              if (cited !== base) {
-                extracted = cited;
-                assistantContent = cited;
-                message.content = [{ type: "text", text: cited }];
+              // Append only sources not already rendered this turn, and do NOT
+              // null pending: a later message may carry sources cited after this
+              // one, while the rendered-set stops any source appearing twice.
+              const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
+                .filter((source) => !renderedKnowledgeSourceUrls.has(source.url));
+              if (freshSources.length > 0) {
+                const cited = appendKnowledgeSourceCitations(base, freshSources);
+                if (cited !== base) {
+                  extracted = cited;
+                  assistantContent = cited;
+                  message.content = [{ type: "text", text: cited }];
+                  for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
+                }
               }
-              pendingKnowledgeSources = null;
             }
           }
           resultText = extracted || currentMsgText || resultText;

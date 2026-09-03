@@ -24,6 +24,21 @@ describe("validateKnowledgePackage", () => {
     expect(info.fileCount).toBe(3);
     expect(info.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(info.manifestJson).toEqual({ sourceRepo: "git@example/repo" });
+    expect(info.hasRoutesSidecar).toBe(false);
+  });
+
+  it("reports the verified-routes machine contract as present at any depth", () => {
+    const root = validateKnowledgePackage(makeTarGz([
+      { name: "index.md", content: "# Index\n" },
+      { name: OKF_ROUTES_SIDECAR, content: JSON.stringify({ schema_version: 1, routes: [] }) },
+    ]));
+    expect(root.hasRoutesSidecar).toBe(true);
+
+    const nested = validateKnowledgePackage(makeTarGz([
+      { name: "index.md", content: "# Index\n" },
+      { name: `repos/lib/${OKF_ROUTES_SIDECAR}`, content: "{}" },
+    ]));
+    expect(nested.hasRoutesSidecar).toBe(true);
   });
 
   it("rejects path traversal entries", () => {

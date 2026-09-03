@@ -7,7 +7,10 @@ import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../tools/infra/tool-render.js";
 import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
 import type { SessionEventEmitter } from "./tool-registry.js";
+import { codePointLength } from "./subagent-models.js";
 import {
+  CLAIM_MAX_LENGTH,
+  CLAIM_MIN_LENGTH,
   MAX_EVIDENCE_SOURCES_PER_MARKER,
   MAX_KNOWLEDGE_CITATIONS,
   type KnowledgeSourceCitation,
@@ -328,8 +331,8 @@ export function createKnowledgeCitationSupport(opts: {
       pages: Type.Optional(Type.Array(Type.Object({
         path: Type.String({ minLength: 1, description: "Knowledge page path actually used." }),
         claim: Type.String({
-          minLength: 4,
-          maxLength: 300,
+          minLength: CLAIM_MIN_LENGTH,
+          maxLength: CLAIM_MAX_LENGTH,
           description: "The specific statement in your final answer that this page supports.",
         }),
       }), {
@@ -401,10 +404,10 @@ export function createKnowledgeCitationSupport(opts: {
             invalidPages.push(`${JSON.stringify(row).slice(0, 120)} (missing path — each item needs a string "path" key)`);
           } else if (!claim) {
             invalidPages.push(`${pagePath} (missing claim)`);
-          } else if ([...claim].length < 4) {
+          } else if (codePointLength(claim) < CLAIM_MIN_LENGTH) {
             invalidPages.push(`${pagePath} (claim too short — a one-word claim is not a binding)`);
-          } else if ([...claim].length > 300) {
-            invalidPages.push(`${pagePath} (claim too long — max 300 characters)`);
+          } else if (codePointLength(claim) > CLAIM_MAX_LENGTH) {
+            invalidPages.push(`${pagePath} (claim too long — max ${CLAIM_MAX_LENGTH} characters)`);
           } else {
             pageArgs.push({ path: pagePath, claim });
           }
@@ -414,7 +417,7 @@ export function createKnowledgeCitationSupport(opts: {
       }
       if (invalidPages.length > 0) {
         return result(
-          `Each pages item requires { path, claim } — claim is the specific statement (4-300 characters) in your final answer that the page supports. Invalid: ${invalidPages.join("; ")}. No citations were registered, including any evidence_refs in this call. Retry knowledge_cite once with a concrete claim bound to each page (or drop the unbound pages), keeping your evidence_refs.`,
+          `Each pages item requires { path, claim } — claim is the specific statement (${CLAIM_MIN_LENGTH}-${CLAIM_MAX_LENGTH} characters) in your final answer that the page supports. Invalid: ${invalidPages.join("; ")}. No citations were registered, including any evidence_refs in this call. Retry knowledge_cite once with a concrete claim bound to each page (or drop the unbound pages), keeping your evidence_refs.`,
           0,
         );
       }

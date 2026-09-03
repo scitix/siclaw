@@ -31,6 +31,15 @@ export interface KnowledgePackageInfo {
   fileCount: number;
   totalUnpackedBytes: number;
   manifestJson?: unknown;
+  /**
+   * True when the package carried the renderer's verified-routes machine
+   * contract (`.okf-routes.json`) at any depth. The sidecar itself is stripped
+   * before the model tree (UPLOADER_ONLY_SIDECAR_FILES), but its PRESENCE is
+   * the signal that a `<!-- verified-routes -->` block in index.md is
+   * renderer-produced rather than author-typed — the materializer records it so
+   * only authorized blocks are lifted into the system prompt as verified routes.
+   */
+  hasRoutesSidecar: boolean;
 }
 
 interface TarEntry {
@@ -57,6 +66,7 @@ export function validateKnowledgePackage(buf: Buffer): KnowledgePackageInfo {
   let fileCount = 0;
   let totalUnpackedBytes = 0;
   let hasIndex = false;
+  let hasRoutesSidecar = false;
   let manifestJson: unknown;
 
   for (const entry of entries) {
@@ -83,6 +93,9 @@ export function validateKnowledgePackage(buf: Buffer): KnowledgePackageInfo {
       throw new Error(`Knowledge package unpacked size is too large`);
     }
     if (name === "index.md") hasIndex = true;
+    if (name === OKF_ROUTES_SIDECAR || path.posix.basename(name) === OKF_ROUTES_SIDECAR) {
+      hasRoutesSidecar = true;
+    }
     if (name === "manifest.json") {
       const content = readTarFileContent(tar, entry);
       try {
@@ -101,6 +114,7 @@ export function validateKnowledgePackage(buf: Buffer): KnowledgePackageInfo {
     fileCount,
     totalUnpackedBytes,
     manifestJson,
+    hasRoutesSidecar,
   };
 }
 

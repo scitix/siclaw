@@ -607,6 +607,12 @@ export function createKnowledgeHandler(
     const citationRepos: Array<{
       id: string;
       root: string;
+      // Renderer-ownership signal for the verified-routes lift: true only when
+      // this repo's package carried the `.okf-routes.json` machine contract, so
+      // a `<!-- verified-routes -->` block in its index.md is a real projection
+      // rather than author-typed text. overview-generator lifts a block only for
+      // an authorized repo — closing the uploaded-package prompt-injection path.
+      verifiedRoutes: boolean;
       sources: Array<{ resource: string; title: string; url: string }>;
     }> = [];
 
@@ -624,7 +630,7 @@ export function createKnowledgeHandler(
         }
         syncedRepos.push({ id: repos[0].id, name: repos[0].name, version: repos[0].version,
           sha256: info.sha256, expectedSha256: repos[0].sha256 ?? null, fileCount: info.fileCount, sizeBytes: repos[0].sizeBytes });
-        citationRepos.push({ id: repos[0].id, root: "", sources: repos[0].citationSources ?? [] });
+        citationRepos.push({ id: repos[0].id, root: "", verifiedRoutes: info.hasRoutesSidecar, sources: repos[0].citationSources ?? [] });
       } else {
         const repoRoot = path.join(stagingDir, "repos");
         fs.mkdirSync(repoRoot, { recursive: true });
@@ -666,7 +672,7 @@ export function createKnowledgeHandler(
           }
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
-          citationRepos.push({ id: repo.id, root: `repos/${dirName}`, sources: repo.citationSources ?? [] });
+          citationRepos.push({ id: repo.id, root: `repos/${dirName}`, verifiedRoutes: info.hasRoutesSidecar, sources: repo.citationSources ?? [] });
           // This line is the complete top-level routing surface injected into
           // the prompt. The domain lets the Agent choose a library before it
           // opens that library's complete index; knowledge_search is only the

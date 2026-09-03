@@ -119,7 +119,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * charges 2 for every astral character (emoji, some CJK extensions) and would
  * reject prose that is well within the intended limit.
  */
-function codePointLength(text: string): number {
+export function codePointLength(text: string): number {
   return [...text].length;
 }
 

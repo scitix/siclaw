@@ -95,6 +95,63 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect((seen[1].message.content[0].text as string)).toBe(result.resultText);
   });
 
+  it("renders each source exactly once across a turn's messages, never duplicating the union", async () => {
+    // Consumers assign (not merge) knowledge_sources. Cite A, narrate (that
+    // message renders A), then cite the growing union [A, B]: the final message
+    // must append ONLY B — the old code re-appended [A, B] and A showed twice.
+    const a = "https://docs.feishu.cn/wiki/a";
+    const b = "https://docs.feishu.cn/wiki/b";
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "A", url: a }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "narration" }] } },
+      { type: "knowledge_sources", sources: [{ title: "A", url: a }, { title: "B", url: b }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } },
+    ];
+    const seen: any[] = [];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
+    const narration = seen[1].message.content[0].text as string;
+    const final = seen[3].message.content[0].text as string;
+    expect(narration).toContain(a);
+    expect(narration).not.toContain(b);
+    expect(final).toContain(b);
+    expect(final).not.toContain(a); // A was already rendered on the narration — not repeated
+  });
+
+  it("does not lose references when a zero-fresh re-cite follows an intermediate message", async () => {
+    // Cite A, narrate (renders A), re-cite A right before the final answer.
+    // The source must still be present in the transcript exactly once — the old
+    // code nulled pending on the narration and the re-cite emitted nothing, so
+    // it vanished entirely.
+    const a = "https://docs.feishu.cn/wiki/a";
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "A", url: a }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "narration" }] } },
+      { type: "knowledge_sources", sources: [{ title: "A", url: a }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } },
+    ];
+    const seen: any[] = [];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
+    const combined = `${seen[1].message.content[0].text}\n${seen[3].message.content[0].text}`;
+    expect(combined.split(a).length - 1).toBe(1); // present exactly once, not lost, not doubled
+  });
+
+  it("resets citation state at the user-message turn boundary so a source can re-render next turn", async () => {
+    const a = "https://docs.feishu.cn/wiki/a";
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "A", url: a }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer one" }] } },
+      { type: "message_start", message: { role: "user", content: [{ type: "text", text: "next question" }] } },
+      { type: "knowledge_sources", sources: [{ title: "A", url: a }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer two" }] } },
+    ];
+    const seen: any[] = [];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
+    const answerOne = seen[1].message.content[0].text as string;
+    const answerTwo = seen[4].message.content[0].text as string;
+    expect(answerOne).toContain(a);
+    expect(answerTwo).toContain(a); // new turn — the rendered-set was cleared, so it renders again
+  });
+
   it("accumulates text deltas across message_update events and returns the concatenated result", async () => {
     const events = [
       { type: "message_start" },

@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-path.js";
 import { maskMarkdownCode } from "../core/knowledge-citation-tool.js";
+import { rewriteCatalogLinkPaths } from "../knowledge/catalog-graph.js";
 
 const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
 const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
@@ -175,54 +176,76 @@ interface VerifiedRoutesProjection {
   verifiedRoutes: string[];
 }
 
+const CITATION_MANIFEST = ".citation-manifest.json";
+
+interface CitationManifestRepo {
+  root?: string;
+  verifiedRoutes?: boolean;
+}
+
+/**
+ * Read the materializer's per-repo manifest. It is the authoritative source of
+ * BOTH each library's on-disk root AND whether that library is authorized to
+ * contribute verified routes — so this scan does not hardcode a `repos/` layout
+ * (which the flat TUI+Portal materializer does not produce) and does not trust a
+ * marker pair that any uploaded index.md could carry.
+ */
+function readCitationManifestRepos(knowledgeDir: string): CitationManifestRepo[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(knowledgeDir, CITATION_MANIFEST), "utf-8")) as {
+      repos?: CitationManifestRepo[];
+    };
+    return Array.isArray(parsed?.repos) ? parsed.repos : [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Lift renderer-owned verified-route blocks ahead of the ordinary catalog.
  *
- * A single bound library exposes its own index.md at the knowledge root. A
- * multi-library bundle instead exposes a synthetic root index and nests each
- * library under repos/<dir>/index.md. Scan only those two materialization
- * shapes, rewrite nested relative links from the root's point of view, and
- * remove the root block from the ordinary catalog so it is not injected twice.
+ * The set of libraries and their roots comes from `.citation-manifest.json`,
+ * not a hardcoded directory shape, and a block is lifted ONLY for a repo the
+ * manifest marks `verifiedRoutes` — i.e. whose package carried the renderer's
+ * `.okf-routes.json` machine contract. An uploaded package whose hand-written
+ * index.md merely contains the `<!-- verified-routes -->` marker pair has no
+ * such contract, so its text stays an ordinary (untrusted) catalog entry and is
+ * never presented in the platform's voice as a runtime-verified route.
+ *
+ * The root library (manifest root "") has its block lifted and removed from the
+ * injected catalog so it is not shown twice; nested libraries are read from
+ * their own index.md and labelled by root.
  */
 function collectVerifiedRoutes(knowledgeDir: string, rootIndex: string): VerifiedRoutesProjection {
-  const rootBlock = extractVerifiedRoutesBlock(rootIndex);
   const verifiedRoutes: string[] = [];
   let catalogIndex = rootIndex;
 
-  if (rootBlock) {
-    verifiedRoutes.push(rewriteRelativeMarkdownLinks(rootBlock.block, "", knowledgeDir));
-    catalogIndex = rootBlock.withoutBlock;
-  }
+  const repos = readCitationManifestRepos(knowledgeDir)
+    .filter((repo) => repo.verifiedRoutes === true)
+    .map((repo) => (repo.root ?? "").replace(/^\/+|\/+$/g, ""))
+    .sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
 
-  const reposDir = path.join(knowledgeDir, "repos");
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(reposDir, { withFileTypes: true });
-  } catch {
-    return { catalogIndex, verifiedRoutes };
-  }
-
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!entry.isDirectory()) continue;
-    const relativeIndexPath = path.posix.join("repos", entry.name, "index.md");
-    let nestedIndex: string;
-    try {
-      nestedIndex = fs.readFileSync(path.join(reposDir, entry.name, "index.md"), "utf-8");
-    } catch {
-      continue;
+  for (const root of repos) {
+    const relativeIndexPath = root ? path.posix.join(root, "index.md") : "index.md";
+    let indexText: string;
+    if (!root) {
+      indexText = rootIndex;
+    } else {
+      try {
+        indexText = fs.readFileSync(path.join(knowledgeDir, root, "index.md"), "utf-8");
+      } catch {
+        continue;
+      }
     }
-    const nestedBlock = extractVerifiedRoutesBlock(nestedIndex);
-    if (!nestedBlock) continue;
-
-    verifiedRoutes.push([
-      `### From \`${relativeIndexPath}\``,
-      "",
-      rewriteRelativeMarkdownLinks(
-        nestedBlock.block,
-        path.posix.dirname(relativeIndexPath),
-        knowledgeDir,
-      ),
-    ].join("\n"));
+    const block = extractVerifiedRoutesBlock(indexText);
+    if (!block) continue;
+    const rewritten = rewriteRelativeMarkdownLinks(block.block, root, knowledgeDir);
+    if (!root) {
+      verifiedRoutes.unshift(rewritten);
+      catalogIndex = block.withoutBlock;
+    } else {
+      verifiedRoutes.push([`### From \`${relativeIndexPath}\``, "", rewritten].join("\n"));
+    }
   }
 
   return { catalogIndex, verifiedRoutes };
@@ -244,34 +267,26 @@ function extractVerifiedRoutesBlock(index: string): { block: string; withoutBloc
 
   const afterEnd = end + VERIFIED_ROUTES_END.length;
   const block = index.slice(begin, afterEnd).trim();
-  const withoutBlock = [index.slice(0, begin).trimEnd(), index.slice(afterEnd).trimStart()]
-    .filter(Boolean)
-    .join("\n\n");
+  // Strip only the block plus the blank lines that bracketed it — never
+  // `trimStart()` the remainder, which would dedent an indented continuation
+  // (e.g. a nested list item) and silently reshape the surviving catalog.
+  const before = index.slice(0, begin).replace(/\n+$/, "");
+  const after = index.slice(afterEnd).replace(/^\n+/, "");
+  const withoutBlock = [before, after].filter(Boolean).join("\n\n");
   return { block, withoutBlock };
 }
 
 function rewriteRelativeMarkdownLinks(markdown: string, sourceDir: string, knowledgeDir: string): string {
-  return markdown.replace(/\]\(([^)]+)\)/g, (match, destination: string) => {
-    const raw = destination.trim();
-    // Unwrap <...> BEFORE the guards: the absolute / scheme / anchor checks
-    // must see the real target, or a wrapped external URL, absolute path, or
-    // anchor (`<https://…>`, `</etc/passwd>`, `<#h>`) slips past every guard
-    // and gets mangled into a knowledge-mount path.
-    const angleWrapped = raw.startsWith("<") && raw.endsWith(">");
-    const trimmed = angleWrapped ? raw.slice(1, -1).trim() : raw;
-    if (
-      !trimmed ||
-      trimmed.startsWith("#") ||
-      trimmed.startsWith("/") ||
-      /^[a-z][a-z0-9+.-]*:/i.test(trimmed)
-    ) {
-      return match;
-    }
-
-    const relativeTarget = path.posix.normalize(path.posix.join(sourceDir, trimmed));
-    if (relativeTarget === ".." || relativeTarget.startsWith("../")) return match;
+  // Reuse catalog-graph's single link grammar: it strips <...> wrapping and a
+  // `"title"` suffix, excludes image links, and the callback receives the file
+  // target with any `#fragment` already removed — so a titled link, an anchor,
+  // or an image no longer gets posix-joined into a bogus Read path.
+  return rewriteCatalogLinkPaths(markdown, (fileTarget) => {
+    if (fileTarget.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(fileTarget)) return null;
+    const relativeTarget = path.posix.normalize(path.posix.join(sourceDir, fileTarget.replaceAll("\\", "/")));
+    if (relativeTarget === ".." || relativeTarget.startsWith("../")) return null;
     const rewritten = modelKnowledgePath(knowledgeDir, relativeTarget);
-    return `](${angleWrapped ? `<${rewritten}>` : rewritten})`;
+    return /\s/.test(rewritten) ? `<${rewritten}>` : rewritten;
   });
 }
 
