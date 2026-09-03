@@ -129,6 +129,39 @@ describe("runA2aDelegation", () => {
     expect(parsed.message.parts[0].text).toBe("cluster-a");
   });
 
+  it("harvests the answer from a terminal snapshot when the turn finished before subscribe", async () => {
+    // Leg 1 parks the thread on a question.
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+
+    // Leg 2: the resumed turn completes BEFORE the subscribe attaches — the
+    // stream's only frame is a terminal task snapshot carrying the artifacts.
+    routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ task: { id: "t1", status: { state: "TASK_STATE_WORKING" } } }));
+    });
+    routes.set("/inner/a2a/agents/peer-1/tasks/t1:subscribe", (_req, res) =>
+      sse(res, [
+        {
+          task: {
+            id: "t1", contextId: "ctx-1",
+            status: { state: "TASK_STATE_COMPLETED" },
+            metadata: { sessionId: "remote-s1" },
+            artifacts: [{ parts: [{ text: "fast answer for cluster-a" }] }],
+          },
+        },
+      ]),
+    );
+    const events: Array<Record<string, unknown>> = [];
+    const outcome = await runA2aDelegation({ ...baseArgs((e) => events.push(e)), text: "cluster-a" });
+    expect(outcome.error).toBeUndefined();
+    const done = events.at(-1) as any;
+    expect(done.type).toBe("message_end");
+    expect(done.message.content[0].text).toBe("fast answer for cluster-a");
+  });
+
   it("reuses the remote context for a follow-up on the same peer thread", async () => {
     routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
       sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),

@@ -25,14 +25,16 @@ const validParams = {
 };
 
 describe("propose_execution tool", () => {
-  it("shares request_input's availability: delegated turn or explicit opt-in", () => {
+  it("is available ONLY on governed turns — never on legacy delegated turns", () => {
     const emitter = vi.fn();
     expect(registration.available?.(makeRefs())).toBe(false);
     expect(registration.available?.(makeRefs({ allowInputRequest: true }))).toBe(false);
     expect(registration.available?.(makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }))).toBe(true);
+    // A legacy delegated turn has no consumer for auth_required: offering the
+    // tool there would submit proposals into the void.
     expect(
       registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter })),
-    ).toBe(true);
+    ).toBe(false);
     expect(registration.readOnlyDelegable).toBe(true);
   });
 
