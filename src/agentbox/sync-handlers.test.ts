@@ -1311,11 +1311,43 @@ describe("knowledgeHandler multi-repo identity", () => {
     ];
     await knowledgeHandler.materialize({ version: "v1", repos });
     const manifest = JSON.parse(fs.readFileSync(path.join(knowledgeTmpDir, ".citation-manifest.json"), "utf8"));
+    // verifiedRoutes is false here: neither package carried a .okf-routes.json
+    // machine contract, so overview-generator will not lift a marker block from
+    // their index.md as a platform-verified route.
     expect(manifest).toEqual({ version: 1, repos: [
-      { id: "repo-a", root: `repos/${knowledgeRepoDirName("A", "repo-a")}`, sources: repos[0].citationSources },
-      { id: "repo-b", root: `repos/${knowledgeRepoDirName("B", "repo-b")}`, sources: [] },
+      { id: "repo-a", root: `repos/${knowledgeRepoDirName("A", "repo-a")}`, verifiedRoutes: false, sources: repos[0].citationSources },
+      { id: "repo-b", root: `repos/${knowledgeRepoDirName("B", "repo-b")}`, verifiedRoutes: false, sources: [] },
     ] });
   });
+
+  it("marks a repo verifiedRoutes when its package carried the .okf-routes.json machine contract", async () => {
+    const withRoutes = packageBase64WithRoutes("A");
+    const repos = [
+      { id: "repo-a", name: "A", version: 1, sizeBytes: 10, dataBase64: withRoutes, citationSources: [] },
+      { id: "repo-b", name: "B", version: 1, sizeBytes: 10, dataBase64: packageBase64("b"), citationSources: [] },
+    ];
+    await knowledgeHandler.materialize({ version: "v1", repos });
+    const manifest = JSON.parse(fs.readFileSync(path.join(knowledgeTmpDir, ".citation-manifest.json"), "utf8"));
+    const byId = Object.fromEntries(manifest.repos.map((r: { id: string; verifiedRoutes: boolean }) => [r.id, r.verifiedRoutes]));
+    expect(byId["repo-a"]).toBe(true);
+    expect(byId["repo-b"]).toBe(false);
+    // The sidecar itself is stripped from the model tree; only the signal survives.
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", knowledgeRepoDirName("A", "repo-a"), ".okf-routes.json"))).toBe(false);
+  });
+
+  function packageBase64WithRoutes(title: string): string {
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-package-routes-test-"));
+    const archive = path.join(os.tmpdir(), `knowledge-package-routes-${process.pid}-${Date.now()}-${Math.random()}.tar.gz`);
+    try {
+      fs.writeFileSync(path.join(sourceDir, "index.md"), `# ${title}\n`);
+      fs.writeFileSync(path.join(sourceDir, ".okf-routes.json"), JSON.stringify({ schema_version: 1, routes: [] }));
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "index.md", ".okf-routes.json"]);
+      return fs.readFileSync(archive).toString("base64");
+    } finally {
+      fs.rmSync(sourceDir, { recursive: true, force: true });
+      fs.rmSync(archive, { force: true });
+    }
+  }
 
   it("says the entries are libraries, since the prompt around it says pages", async () => {
     // The system prompt introduces this file as a page catalog — true when one

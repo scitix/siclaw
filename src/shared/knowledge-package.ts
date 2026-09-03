@@ -12,10 +12,17 @@ const MAX_TOTAL_UNPACKED_BYTES = 100 * 1024 * 1024;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_FILES = 1000;
 export const OKF_CITATION_SIDECAR = ".okf-citations.json";
+export const OKF_ROUTES_SIDECAR = ".okf-routes.json";
 export const SERVER_CITATION_MANIFEST = ".citation-manifest.json";
 
-const UPLOADER_ONLY_CITATION_FILES = [
+// Producer/control-plane sidecars that must never reach the model-visible
+// knowledge tree. Citations: the import service freezes them server-side.
+// Routes: the runtime consumes only the rendered projections (root-index
+// block + route manual page); the machine contract has zero runtime readers
+// and would be redundant noise the agent could Read.
+const UPLOADER_ONLY_SIDECAR_FILES = [
   OKF_CITATION_SIDECAR,
+  OKF_ROUTES_SIDECAR,
   SERVER_CITATION_MANIFEST,
 ] as const;
 
@@ -24,6 +31,15 @@ export interface KnowledgePackageInfo {
   fileCount: number;
   totalUnpackedBytes: number;
   manifestJson?: unknown;
+  /**
+   * True when the package carried the renderer's verified-routes machine
+   * contract (`.okf-routes.json`) at any depth. The sidecar itself is stripped
+   * before the model tree (UPLOADER_ONLY_SIDECAR_FILES), but its PRESENCE is
+   * the signal that a `<!-- verified-routes -->` block in index.md is
+   * renderer-produced rather than author-typed — the materializer records it so
+   * only authorized blocks are lifted into the system prompt as verified routes.
+   */
+  hasRoutesSidecar: boolean;
 }
 
 interface TarEntry {
@@ -50,6 +66,7 @@ export function validateKnowledgePackage(buf: Buffer): KnowledgePackageInfo {
   let fileCount = 0;
   let totalUnpackedBytes = 0;
   let hasIndex = false;
+  let hasRoutesSidecar = false;
   let manifestJson: unknown;
 
   for (const entry of entries) {
@@ -76,6 +93,9 @@ export function validateKnowledgePackage(buf: Buffer): KnowledgePackageInfo {
       throw new Error(`Knowledge package unpacked size is too large`);
     }
     if (name === "index.md") hasIndex = true;
+    if (name === OKF_ROUTES_SIDECAR || path.posix.basename(name) === OKF_ROUTES_SIDECAR) {
+      hasRoutesSidecar = true;
+    }
     if (name === "manifest.json") {
       const content = readTarFileContent(tar, entry);
       try {
@@ -94,6 +114,7 @@ export function validateKnowledgePackage(buf: Buffer): KnowledgePackageInfo {
     fileCount,
     totalUnpackedBytes,
     manifestJson,
+    hasRoutesSidecar,
   };
 }
 
@@ -108,7 +129,7 @@ export async function extractKnowledgePackageToDir(buf: Buffer, targetDir: strin
     // Package citation metadata is uploader-supplied input. The import service
     // validates and freezes it, then sends canonical citationSources separately.
     // Never expose the uploaded copy to the model-visible knowledge tree.
-    const citationExcludes = UPLOADER_ONLY_CITATION_FILES.flatMap((name) => [
+    const citationExcludes = UPLOADER_ONLY_SIDECAR_FILES.flatMap((name) => [
       `--exclude=${name}`,
       `--exclude=*/${name}`,
     ]);

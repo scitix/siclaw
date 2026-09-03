@@ -33,6 +33,26 @@ function markdownDestination(raw: string): string {
   return titled ? titled[1].trim() : value;
 }
 
+/**
+ * Rewrite the path portion of every markdown link destination in `markdown`,
+ * reusing the ONE catalog link grammar rather than a second hand-rolled one.
+ * `rewrite` receives the clean file target — angle-bracket wrapping, a `"title"`
+ * suffix, and any `#fragment` / `?query` already stripped — and returns the
+ * replacement destination, or null to leave the link untouched. Image links
+ * (`![alt](...)`) are excluded by the regex; wiki-links are not touched.
+ */
+export function rewriteCatalogLinkPaths(
+  markdown: string,
+  rewrite: (fileTarget: string) => string | null,
+): string {
+  return markdown.replace(MARKDOWN_LINK_RE, (whole: string, text: string, rawDest: string) => {
+    const fileTarget = markdownDestination(rawDest).split("#", 1)[0].split("?", 1)[0].trim();
+    if (!fileTarget) return whole;
+    const replacement = rewrite(fileTarget);
+    return replacement == null ? whole : `[${text}](${replacement})`;
+  });
+}
+
 function resolveMarkdownTarget(catalogFile: string, rawTarget: string): string | null {
   let target = safeDecode(rawTarget).split("#", 1)[0].split("?", 1)[0].trim();
   if (!target || /^[a-z][a-z0-9+.-]*:/i.test(target)) return null;

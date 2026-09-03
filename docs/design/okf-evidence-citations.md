@@ -66,12 +66,39 @@ manifest entry at a different original.
 - One malformed marker does not invalidate other markers on the same page.
   Only the refs that do not resolve fail.
 - Any unresolved `evidence_refs` entry registers zero citations for that
-  call. Retry once with only the remaining valid refs.
+  call. Retry once with only the remaining valid refs. Fail-closed is
+  reserved for correctness problems — unresolved refs and the two shape
+  rules below — and no longer fires on breadth (see the cap bullet).
+- A present-but-non-array `evidence_refs` or `pages` fails the whole call
+  (pi does not validate tool params against the TypeBox schema; silently
+  coercing to `[]` reported success while dropping the misshapen half).
+- A `pages` item whose trimmed `claim` is outside 4–300 Unicode code points
+  fails the whole call, same as a missing claim — the bounds are enforced
+  at runtime, not advisory schema, or a one-character claim would let
+  padding back in.
 - `evidence_refs` and `pages` may be passed together. Marked pages must use
   `evidence_refs`; `pages` is only for pages with no parsed evidence marker.
-- One call never emits more than `MAX_KNOWLEDGE_CITATIONS` (8) originals.
-  Crossing the cap fails closed; it does not truncate. Gateway rendering
-  (`appendKnowledgeSourceCitations`) uses the same cap.
+  Each `pages` item is `{path, claim}`, where `claim` is the specific
+  statement in the final answer the page supports: provenance validation
+  cannot distinguish a cited-and-used page from a read-and-discarded one,
+  so the claim is the one materiality demand the runtime can make. An item
+  with a missing or blank claim (including the legacy bare-string form)
+  registers zero citations for the call. Offline consumers parsing
+  historical `knowledge_cite` tool rows must handle both shapes — `pages`
+  was `string[]` before 2026-09.
+- One answer never carries more than `MAX_KNOWLEDGE_CITATIONS` (8)
+  originals. Crossing the cap no longer fails closed: the first 8 unique
+  sources are registered — evidence refs first, then pages, each in its
+  given order (there is no global order across the two lists, so the cap
+  sacrifices pages first) — and the dropped overflow is NAMED in the tool
+  result. Nothing is silently truncated. (The old reject-whole-call
+  behavior zeroed the citations of exactly the best-supported answers, and
+  its retry guidance looped on identical valid refs.) The cap applies to
+  the TURN's union: gateway consumers ASSIGN the `knowledge_sources` event
+  rather than merging, so the tool emits the deduped, capped union of every
+  successful call this turn — a follow-up call adds to the references list
+  instead of overwriting it, and cannot raise the ceiling. Gateway
+  rendering (`appendKnowledgeSourceCitations`) uses the same cap.
 - A mount that has any `sourceId` in the manifest offers evidence guidance.
   Mixed answers are expressed in one call, not by flipping modes.
 

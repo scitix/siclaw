@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { modelKnowledgeLocations } from "../knowledge/model-path.js";
+import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-path.js";
+import { maskMarkdownCode } from "../core/knowledge-citation-tool.js";
+import { rewriteCatalogLinkPaths } from "../knowledge/catalog-graph.js";
+
+const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
+const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -112,6 +117,7 @@ export function buildKnowledgeWikiCatalog(
   if (!index) return "";
 
   const { wikiRoot, indexPath: modelIndexPath } = modelKnowledgeLocations(knowledgeDir);
+  const { catalogIndex, verifiedRoutes } = collectVerifiedRoutes(knowledgeDir, index);
 
   return [
     "# Knowledge Wiki",
@@ -129,8 +135,20 @@ export function buildKnowledgeWikiCatalog(
     (opts.operational === false
       ? "Answer from the most relevant pages, synthesize the evidence, and say when the knowledge is insufficient."
       : "Pages are semantic — translate what you learn into concrete checks using the tools and skills available to you."),
+    ...(verifiedRoutes.length > 0
+      ? [
+          "",
+          "## Verified Fast Routes",
+          "",
+          "These routes are verified shortcuts into the bound knowledge. When the user's intent matches one, " +
+          "read the listed target pages in the stated order before answering. Each link's destination below is " +
+          "already a complete path — pass it directly to the Read tool, do not resolve it against another directory.",
+          "",
+          ...verifiedRoutes,
+        ]
+      : []),
     "",
-    index,
+    catalogIndex,
   ].join("\n");
 }
 
@@ -152,6 +170,125 @@ interface DocEntry {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+interface VerifiedRoutesProjection {
+  catalogIndex: string;
+  verifiedRoutes: string[];
+}
+
+const CITATION_MANIFEST = ".citation-manifest.json";
+
+interface CitationManifestRepo {
+  root?: string;
+  verifiedRoutes?: boolean;
+}
+
+/**
+ * Read the materializer's per-repo manifest. It is the authoritative source of
+ * BOTH each library's on-disk root AND whether that library is authorized to
+ * contribute verified routes — so this scan does not hardcode a `repos/` layout
+ * (which the flat TUI+Portal materializer does not produce) and does not trust a
+ * marker pair that any uploaded index.md could carry.
+ */
+function readCitationManifestRepos(knowledgeDir: string): CitationManifestRepo[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(knowledgeDir, CITATION_MANIFEST), "utf-8")) as {
+      repos?: CitationManifestRepo[];
+    };
+    return Array.isArray(parsed?.repos) ? parsed.repos : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Lift renderer-owned verified-route blocks ahead of the ordinary catalog.
+ *
+ * The set of libraries and their roots comes from `.citation-manifest.json`,
+ * not a hardcoded directory shape, and a block is lifted ONLY for a repo the
+ * manifest marks `verifiedRoutes` — i.e. whose package carried the renderer's
+ * `.okf-routes.json` machine contract. An uploaded package whose hand-written
+ * index.md merely contains the `<!-- verified-routes -->` marker pair has no
+ * such contract, so its text stays an ordinary (untrusted) catalog entry and is
+ * never presented in the platform's voice as a runtime-verified route.
+ *
+ * The root library (manifest root "") has its block lifted and removed from the
+ * injected catalog so it is not shown twice; nested libraries are read from
+ * their own index.md and labelled by root.
+ */
+function collectVerifiedRoutes(knowledgeDir: string, rootIndex: string): VerifiedRoutesProjection {
+  const verifiedRoutes: string[] = [];
+  let catalogIndex = rootIndex;
+
+  const repos = readCitationManifestRepos(knowledgeDir)
+    .filter((repo) => repo.verifiedRoutes === true)
+    .map((repo) => (repo.root ?? "").replace(/^\/+|\/+$/g, ""))
+    .sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+
+  for (const root of repos) {
+    const relativeIndexPath = root ? path.posix.join(root, "index.md") : "index.md";
+    let indexText: string;
+    if (!root) {
+      indexText = rootIndex;
+    } else {
+      try {
+        indexText = fs.readFileSync(path.join(knowledgeDir, root, "index.md"), "utf-8");
+      } catch {
+        continue;
+      }
+    }
+    const block = extractVerifiedRoutesBlock(indexText);
+    if (!block) continue;
+    const rewritten = rewriteRelativeMarkdownLinks(block.block, root, knowledgeDir);
+    if (!root) {
+      verifiedRoutes.unshift(rewritten);
+      catalogIndex = block.withoutBlock;
+    } else {
+      verifiedRoutes.push([`### From \`${relativeIndexPath}\``, "", rewritten].join("\n"));
+    }
+  }
+
+  return { catalogIndex, verifiedRoutes };
+}
+
+function extractVerifiedRoutesBlock(index: string): { block: string; withoutBlock: string } | null {
+  // Locate the markers on a code-masked copy. box_role.md now teaches the
+  // marker to the authoring agent, so a fenced example containing a lone
+  // `:begin` is plausible; matching it and then the real `:end` would delete
+  // every catalog entry between them — the exact silent-catalog-loss the
+  // docstring above calls a correctness contract. maskMarkdownCode blanks
+  // fenced/inline code while preserving length, so offsets map back onto the
+  // original bytes unchanged.
+  const masked = maskMarkdownCode(index);
+  const begin = masked.indexOf(VERIFIED_ROUTES_BEGIN);
+  if (begin < 0) return null;
+  const end = masked.indexOf(VERIFIED_ROUTES_END, begin + VERIFIED_ROUTES_BEGIN.length);
+  if (end < 0) return null;
+
+  const afterEnd = end + VERIFIED_ROUTES_END.length;
+  const block = index.slice(begin, afterEnd).trim();
+  // Strip only the block plus the blank lines that bracketed it — never
+  // `trimStart()` the remainder, which would dedent an indented continuation
+  // (e.g. a nested list item) and silently reshape the surviving catalog.
+  const before = index.slice(0, begin).replace(/\n+$/, "");
+  const after = index.slice(afterEnd).replace(/^\n+/, "");
+  const withoutBlock = [before, after].filter(Boolean).join("\n\n");
+  return { block, withoutBlock };
+}
+
+function rewriteRelativeMarkdownLinks(markdown: string, sourceDir: string, knowledgeDir: string): string {
+  // Reuse catalog-graph's single link grammar: it strips <...> wrapping and a
+  // `"title"` suffix, excludes image links, and the callback receives the file
+  // target with any `#fragment` already removed — so a titled link, an anchor,
+  // or an image no longer gets posix-joined into a bogus Read path.
+  return rewriteCatalogLinkPaths(markdown, (fileTarget) => {
+    if (fileTarget.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(fileTarget)) return null;
+    const relativeTarget = path.posix.normalize(path.posix.join(sourceDir, fileTarget.replaceAll("\\", "/")));
+    if (relativeTarget === ".." || relativeTarget.startsWith("../")) return null;
+    const rewritten = modelKnowledgePath(knowledgeDir, relativeTarget);
+    return /\s/.test(rewritten) ? `<${rewritten}>` : rewritten;
+  });
+}
 
 /** Check if a Dirent is a directory, following symlinks. */
 function isDir(parentDir: string, entry: fs.Dirent): boolean {

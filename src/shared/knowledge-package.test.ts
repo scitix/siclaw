@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   extractKnowledgePackageToDir,
   OKF_CITATION_SIDECAR,
+  OKF_ROUTES_SIDECAR,
   SERVER_CITATION_MANIFEST,
   validateKnowledgePackage,
 } from "./knowledge-package.js";
@@ -23,6 +24,21 @@ describe("validateKnowledgePackage", () => {
     expect(info.fileCount).toBe(3);
     expect(info.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(info.manifestJson).toEqual({ sourceRepo: "git@example/repo" });
+    expect(info.hasRoutesSidecar).toBe(false);
+  });
+
+  it("reports the verified-routes machine contract as present at any depth", () => {
+    const root = validateKnowledgePackage(makeTarGz([
+      { name: "index.md", content: "# Index\n" },
+      { name: OKF_ROUTES_SIDECAR, content: JSON.stringify({ schema_version: 1, routes: [] }) },
+    ]));
+    expect(root.hasRoutesSidecar).toBe(true);
+
+    const nested = validateKnowledgePackage(makeTarGz([
+      { name: "index.md", content: "# Index\n" },
+      { name: `repos/lib/${OKF_ROUTES_SIDECAR}`, content: "{}" },
+    ]));
+    expect(nested.hasRoutesSidecar).toBe(true);
   });
 
   it("rejects path traversal entries", () => {
@@ -81,6 +97,8 @@ describe("validateKnowledgePackage", () => {
       { name: "index.md", content: "# Index\n" },
       { name: OKF_CITATION_SIDECAR, content: JSON.stringify({ sources: [{ url: "https://docs.feishu.cn/wiki/input" }] }) },
       { name: `nested/${OKF_CITATION_SIDECAR}`, content: "{}" },
+      { name: OKF_ROUTES_SIDECAR, content: JSON.stringify({ schema_version: 1, routes: [] }) },
+      { name: `nested/${OKF_ROUTES_SIDECAR}`, content: "{}" },
       { name: SERVER_CITATION_MANIFEST, content: "{}" },
       { name: `nested/deeper/${SERVER_CITATION_MANIFEST}`, content: "{}" },
     ]);
@@ -92,6 +110,8 @@ describe("validateKnowledgePackage", () => {
       await expect(fs.readFile(path.join(target, "index.md"), "utf8")).resolves.toContain("# Index");
       await expect(fs.stat(path.join(target, OKF_CITATION_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
       await expect(fs.stat(path.join(target, "nested", OKF_CITATION_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(target, OKF_ROUTES_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(target, "nested", OKF_ROUTES_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
       await expect(fs.stat(path.join(target, SERVER_CITATION_MANIFEST))).rejects.toMatchObject({ code: "ENOENT" });
       await expect(fs.stat(path.join(target, "nested", "deeper", SERVER_CITATION_MANIFEST))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {

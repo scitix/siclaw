@@ -62,7 +62,7 @@ import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
-import { appendKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
+import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -3076,6 +3076,11 @@ export async function collectChannelResponse(
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
   let pendingKnowledgeSources: unknown = null;
+  // URLs already rendered into an assistant reply this stream (= one turn).
+  // Append only the not-yet-rendered delta and keep pending, so an intermediate
+  // narration turn no longer steals the references off the final answer, nor
+  // duplicates them across bubbles when the model cites twice.
+  const renderedKnowledgeSourceUrls = new Set<string>();
 
   // ── Audit persistence (opt-in) ──────────────────────────────────────────
   // Mirrors the field mapping in sse-consumer.ts so a channel transcript looks
@@ -3108,6 +3113,7 @@ export async function collectChannelResponse(
 
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
+        renderedKnowledgeSourceUrls.clear();
       }
       if (ev.type === "knowledge_sources") {
         pendingKnowledgeSources = ev.sources;
@@ -3192,8 +3198,14 @@ export async function collectChannelResponse(
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
         let turnText = contentBlocksToMarkdown(blocks);
         if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error") {
-          turnText = appendKnowledgeSourceCitations(turnText, pendingKnowledgeSources);
-          pendingKnowledgeSources = null;
+          const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
+            .filter((source) => !renderedKnowledgeSourceUrls.has(source.url));
+          if (freshSources.length > 0) {
+            turnText = appendKnowledgeSourceCitations(turnText, freshSources);
+            for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
+          }
+          // Keep pending: a later assistant message this turn may carry sources
+          // cited after this one; the rendered-set prevents any double-append.
         }
         if (turnText) {
           // A NEW assistant turn means the PREVIOUS one was an intermediate

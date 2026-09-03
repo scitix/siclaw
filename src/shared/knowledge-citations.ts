@@ -18,6 +18,13 @@ export const MAX_KNOWLEDGE_CITATIONS = 8;
 /** Max `sources` inside one `okf:evidence` marker. Keep equal to selfcheck.py. */
 export const MAX_EVIDENCE_SOURCES_PER_MARKER = 8;
 
+// knowledge_cite `pages[].claim` length bounds, in Unicode CODE POINTS. pi does
+// not validate the TypeBox schema, so the runtime is the real enforcer
+// (`codePointLength`); the schema advertises the same two numbers. One source
+// for both so the advertised and enforced limits cannot drift.
+export const CLAIM_MIN_LENGTH = 4;
+export const CLAIM_MAX_LENGTH = 300;
+
 export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSourceCitation[] {
   if (!Array.isArray(value)) return [];
   const out: KnowledgeSourceCitation[] = [];
