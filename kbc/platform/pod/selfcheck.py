@@ -2803,9 +2803,185 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
         "affected_pages": sorted(pages)[:20],
         "status": "open",
         "answer": None,
+        # A residual ticket asks the owner for an ACTION on the model's own
+        # output; no raw source is in dispute. Code knows that, so code says it.
+        "ticket_kind": TICKET_KIND_MODEL_GAP,
+        "origin": TICKET_ORIGIN_SELFCHECK,
     })
     _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
     return True
+
+
+# ── ticket kind: filed by evidence, never by self-description ────────────────
+# A contradiction ticket has exactly two kinds, decided when it is FILED and
+# re-decided every compile round from the evidence on the ticket itself:
+#   model_gap       — the knowledge is in the owner's head (or the model could
+#                     not read / did not understand); answering closes it.
+#   source_conflict — two raw documents genuinely disagree; the fix lives in
+#                     the source, the wiki only projects it. Remind, never verify.
+# The model may not choose: the gate below reads the ticket's own sources and
+# refuses a kind the evidence does not support. Tickets that predate the field
+# are `unclassified` — never guessed.
+
+CONTRADICTIONS_PATH = "authoring/CONTRADICTIONS.json"
+TICKET_KIND_MODEL_GAP = "model_gap"
+TICKET_KIND_SOURCE_CONFLICT = "source_conflict"
+TICKET_KIND_UNCLASSIFIED = "unclassified"
+TICKET_KINDS = (TICKET_KIND_MODEL_GAP, TICKET_KIND_SOURCE_CONFLICT)
+TICKET_ORIGIN_COMPILE = "compile"
+TICKET_ORIGIN_SELFCHECK = "selfcheck"
+TICKET_ORIGIN_EDGE = "edge"
+TICKET_ORIGINS = (TICKET_ORIGIN_COMPILE, TICKET_ORIGIN_SELFCHECK, TICKET_ORIGIN_EDGE)
+TICKET_CLAIM_ID_PREFIX = "tk-"
+# Evidence that lives under authoring/ (BRIEF, SELFCHECK, ...) is the owner's or
+# the system's framing, not a raw document — it can never make a source conflict.
+_TICKET_NON_RAW_PREFIXES = ("authoring/",)
+
+
+def normalize_ticket_sources(sources) -> list[dict]:
+    """Canonical `[{"doc","quote"}]`: doc stripped of a raw/ prefix, blank rows
+    dropped, order preserved. Anything not a mapping is ignored — a malformed
+    row is not evidence."""
+    out: list[dict] = []
+    if not isinstance(sources, list):
+        return out
+    for row in sources:
+        if not isinstance(row, dict):
+            continue
+        doc = str(row.get("doc", "") or "").strip()
+        quote = str(row.get("quote", "") or "").strip()
+        if not doc:
+            continue
+        if not doc.startswith(_TICKET_NON_RAW_PREFIXES):
+            doc = _strip_source_prefix(doc)
+        out.append({"doc": doc, "quote": quote})
+    return out
+
+
+def ticket_distinct_raw_docs(sources: list[dict]) -> list[str]:
+    """Raw documents that carry a non-empty quote — the only rows that count as
+    contradiction evidence. Sorted, unique."""
+    docs = set()
+    for row in sources:
+        if row.get("quote") and not row["doc"].startswith(_TICKET_NON_RAW_PREFIXES):
+            docs.add(row["doc"])
+    return sorted(docs)
+
+
+def ticket_kind_allowed_by_evidence(sources: list[dict]) -> str:
+    """The ONE kind this evidence supports (§D3 gate).
+
+    ≥2 distinct raw docs, each with a quote → the sources disagree with each
+    other → `source_conflict`. Anything less (one doc, a BRIEF/tone question,
+    an unreadable figure, a system residual) → the model, not the source, is
+    short → `model_gap`. There is deliberately no "either": a multi-source
+    dispute self-filed as model_gap would push a source owner's job onto the
+    answering user, and a single-source doubt self-filed as source_conflict
+    would send the owner to fix a document that is not in dispute."""
+    return (TICKET_KIND_SOURCE_CONFLICT
+            if len(ticket_distinct_raw_docs(sources)) >= 2
+            else TICKET_KIND_MODEL_GAP)
+
+
+def _normalize_claim_text(text: str) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def ticket_claim_id(question: str, sources: list[dict]) -> str:
+    """Stable identity of the CLAIM in dispute — the question plus the set of
+    raw documents it is about. Computed by code so two compile rounds asking
+    the same thing land on the same ticket (supersede, not duplicate), while
+    the kind is free to change as evidence changes."""
+    docs = sorted({row["doc"] for row in sources})
+    digest = hashlib.sha256(
+        (_normalize_claim_text(question) + "\n" + "\n".join(docs)).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{TICKET_CLAIM_ID_PREFIX}{digest}"
+
+
+def _read_ticket_ledger(path: Path):
+    """Ledger rows or an error string. An unreadable ledger is never clobbered."""
+    if not path.is_file():
+        return [], None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"{CONTRADICTIONS_PATH} unreadable: {e}"
+    if not isinstance(data, list):
+        return None, f"{CONTRADICTIONS_PATH} is not a JSON array"
+    return data, None
+
+
+def file_ticket_record(workdir: str, ticket: dict) -> tuple[str, str | None]:
+    """Append or supersede ONE ticket by its claim id. Returns
+    ("filed"|"superseded", None) or ("", error).
+
+    Supersede keeps everything the owner and the runtime own — `status`,
+    `answer`, `agent_report` — and replaces what the evidence owns: kind,
+    sources, options, current_value, affected_pages, title, question. That is
+    what lets a single-source model_gap flip to source_conflict when a later
+    round finds the second document, without a duplicate row."""
+    path = Path(workdir) / CONTRADICTIONS_PATH
+    tickets, err = _read_ticket_ledger(path)
+    if err:
+        return "", err
+    tid = ticket["id"]
+    existing = next((t for t in tickets if isinstance(t, dict) and t.get("id") == tid), None)
+    if existing is None:
+        tickets.append(ticket)
+        status = "filed"
+    else:
+        for key in ("ticket_kind", "title", "question", "sources", "options",
+                    "current_value", "affected_pages", "origin",
+                    "filed_operation_id", "filed_generation"):
+            if key in ticket:
+                existing[key] = ticket[key]
+        existing["superseded_at"] = ticket["filed_at"]
+        status = "superseded"
+    try:
+        _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
+    except OSError as e:
+        return "", f"{CONTRADICTIONS_PATH} write failed: {e}"
+    return status, None
+
+
+def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
+    """Post-turn backstop for the ticket ledger (mirrors normalize_exclusions_file).
+
+    The model is steered to file_ticket, but Write cannot be intercepted at
+    write time, so a hand-written ticket may still land. Every such row is
+    marked `ticket_kind: unclassified` / `origin: compile` — NOT guessed from
+    sources.length (that guess is exactly what the gate exists to forbid).
+    Rows the system filed (`selfcheck-residual-*`) are model_gap by
+    construction and are stamped as such. Returns (rows newly marked
+    unclassified, error)."""
+    path = Path(workdir) / CONTRADICTIONS_PATH
+    tickets, err = _read_ticket_ledger(path)
+    if err:
+        return 0, err
+    changed = False
+    newly_unclassified = 0
+    for t in tickets:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("id", ""))
+        if not t.get("ticket_kind"):
+            if tid.startswith("selfcheck-residual-"):
+                t["ticket_kind"] = TICKET_KIND_MODEL_GAP
+            else:
+                t["ticket_kind"] = TICKET_KIND_UNCLASSIFIED
+                newly_unclassified += 1
+            changed = True
+        if not t.get("origin"):
+            t["origin"] = (TICKET_ORIGIN_SELFCHECK if tid.startswith("selfcheck-residual-")
+                           else TICKET_ORIGIN_COMPILE)
+            changed = True
+    if changed:
+        try:
+            _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
+        except OSError as e:
+            return 0, f"{CONTRADICTIONS_PATH} write failed: {e}"
+    return newly_unclassified, None
 
 
 # ── image re-verification (fresh-eyes numeric check) ─────────────────────────

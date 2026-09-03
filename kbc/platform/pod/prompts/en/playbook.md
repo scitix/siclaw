@@ -67,6 +67,7 @@ The owner is a domain expert who knows the content — and knows nothing about c
 - **Evidence inline** — quote the two or three conflicting passages with their sources;
 - **Pre-classified options** — offer 2–4 candidate rulings, always ending with an "I'm not sure — keep it flagged" escape hatch, and allow "other";
 - **One contradiction, one question.**
+- **Say who can settle it** — `ticket_kind: source_conflict` when two or more different documents disagree (the source owner fixes the source); `ticket_kind: model_gap` when only the owner can answer (one source, a tone call, an unreadable figure). The `file_ticket` tool checks this against your quotes and refuses a mismatch.
 
 ## Collections of records: two layers, not a binary choice
 
