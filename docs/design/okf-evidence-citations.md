@@ -66,11 +66,26 @@ manifest entry at a different original.
 - One malformed marker does not invalidate other markers on the same page.
   Only the refs that do not resolve fail.
 - Any unresolved `evidence_refs` entry registers zero citations for that
-  call. Retry once with only the remaining valid refs.
+  call. Retry once with only the remaining valid refs. Fail-closed is
+  reserved for unresolved refs — a correctness problem — and no longer
+  fires on breadth (see the cap bullet).
 - `evidence_refs` and `pages` may be passed together. Marked pages must use
   `evidence_refs`; `pages` is only for pages with no parsed evidence marker.
+  Each `pages` item is `{path, claim}`, where `claim` is the specific
+  statement in the final answer the page supports: provenance validation
+  cannot distinguish a cited-and-used page from a read-and-discarded one,
+  so the claim is the one materiality demand the runtime can make. An item
+  with a missing or blank claim (including the legacy bare-string form)
+  registers zero citations for the call. Offline consumers parsing
+  historical `knowledge_cite` tool rows must handle both shapes — `pages`
+  was `string[]` before 2026-09.
 - One call never emits more than `MAX_KNOWLEDGE_CITATIONS` (8) originals.
-  Crossing the cap fails closed; it does not truncate. Gateway rendering
+  Crossing the cap no longer fails closed: the first 8 unique sources in
+  input order are registered and the dropped overflow is NAMED in the tool
+  result — nothing is silently truncated, and the model can re-scope or
+  mention what was cut. (The old reject-whole-call behavior zeroed the
+  citations of exactly the best-supported answers, and its retry guidance
+  looped on identical valid refs.) Gateway rendering
   (`appendKnowledgeSourceCitations`) uses the same cap.
 - A mount that has any `sourceId` in the manifest offers evidence guidance.
   Mixed answers are expressed in one call, not by flipping modes.
