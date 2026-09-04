@@ -40,4 +40,17 @@ describe("agent-factory", () => {
     expect(source).toContain("customTools.push(...mcpTools)");
     expect(source).not.toContain("appendAllowedTools(customTools, mcpTools");
   });
+
+  it("captures MCP results as scoped artifacts and exposes intrinsic recovery tools", () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "agent-factory.ts"), "utf8");
+    expect(source).toContain("withToolResultArtifactCapture(tool, toolResultArtifactStore)");
+    expect(source).toContain("customTools.push(...createToolResultArtifactTools(toolResultArtifactStore))");
+    expect(source).not.toMatch(/if \(mcpTools\.length > 0\)[\s\S]{0,120}createToolResultArtifactTools/);
+    expect(source).toContain("toolResultArtifactsDir");
+    expect(source).toMatch(/blockedFileDirs[\s\S]*toolResultArtifactsDir/);
+    expect(source).toContain("isToolResultArtifactPath(absolutePath)");
+    expect(source).toContain("isToolResultArtifactPath(candidate)");
+    expect(source).toContain("sessionId: sessionIdRef.current || sessionManagerId");
+    expect(source).not.toContain('sessionId: sessionIdRef.current || "standalone"');
+  });
 });

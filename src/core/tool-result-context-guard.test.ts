@@ -8,6 +8,18 @@ import {
   PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE,
 } from "./tool-result-context-guard.js";
 
+function artifactReference(id = "tra_0123456789abcdef0123456789abcdef") {
+  return {
+    version: 1,
+    id,
+    sizeChars: 10_000,
+    sizeBytes: 10_000,
+    sha256: "a".repeat(64),
+    createdAt: "2026-09-03T00:00:00.000Z",
+    expiresAt: "2026-09-04T00:00:00.000Z",
+  };
+}
+
 describe("estimateMessageChars", () => {
   it("estimates user text message", () => {
     const msg = { role: "user", content: "hello world", timestamp: Date.now() } as any;
@@ -145,6 +157,107 @@ describe("enforceToolResultContextBudgetInPlace", () => {
         : "";
     expect(text.length).toBeLessThan(longText.length);
     expect(text).toContain("[truncated:");
+  });
+
+  it("replaces an oversized captured result with a recoverable artifact reference", () => {
+    const artifact = artifactReference();
+    const messages = [{
+      role: "toolResult",
+      toolCallId: "call_1",
+      content: [{ type: "text", text: `head\n${"x".repeat(9_900)}\nroot cause` }],
+      details: { providerNoise: "drop me", toolResultArtifact: artifact },
+      timestamp: Date.now(),
+    }] as any[];
+
+    enforceToolResultContextBudgetInPlace({
+      messages,
+      contextBudgetChars: 100_000,
+      maxSingleToolResultChars: 1_000,
+    });
+
+    const text = getToolResultText(messages[0]);
+    expect(text).toContain(artifact.id);
+    expect(text).toContain("tool_result_search");
+    expect(text).toContain("root cause");
+    expect(messages[0].details).toEqual({ toolResultArtifact: artifact });
+  });
+
+  it("keeps artifact recovery instructions when old results are compacted", () => {
+    const artifact = artifactReference();
+    const messages = [
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        content: [{ type: "text", text: "old evidence ".repeat(300) }],
+        details: { toolResultArtifact: artifact },
+        timestamp: Date.now(),
+      },
+      { role: "user", content: "new context ".repeat(300), timestamp: Date.now() },
+    ] as any[];
+
+    enforceToolResultContextBudgetInPlace({
+      messages,
+      contextBudgetChars: 2_000,
+      maxSingleToolResultChars: 20_000,
+    });
+
+    const text = getToolResultText(messages[0]);
+    expect(text).toContain(artifact.id);
+    expect(text).toContain("tool_result_read");
+    expect(text).not.toContain("[compacted:");
+    expect(messages[0].details.toolResultArtifact).toEqual(artifact);
+  });
+
+  it("states when an oversized result cannot be recovered", () => {
+    const messages = [{
+      role: "toolResult",
+      toolCallId: "call_1",
+      content: [{ type: "text", text: "x".repeat(10_000) }],
+      details: {
+        toolResultArtifactFailure: {
+          version: 1,
+          reason: "too_large",
+          sizeChars: 10_000,
+          sizeBytes: 10_000,
+        },
+      },
+      timestamp: Date.now(),
+    }] as any[];
+
+    enforceToolResultContextBudgetInPlace({
+      messages,
+      contextBudgetChars: 100_000,
+      maxSingleToolResultChars: 1_000,
+    });
+
+    const text = getToolResultText(messages[0]);
+    expect(text).toContain("complete artifact is unavailable");
+    expect(text).toContain("cannot be recovered");
+    expect(text).toContain("reason: too_large");
+  });
+
+  it("does not replace a small artifact-tagged result with a larger recovery stub", () => {
+    const artifact = artifactReference();
+    const smallText = "recovered snippet";
+    const messages = [
+      {
+        role: "toolResult",
+        toolCallId: "call_read",
+        content: [{ type: "text", text: smallText }],
+        details: { toolResultArtifact: artifact },
+        timestamp: Date.now(),
+      },
+      { role: "user", content: "new context ".repeat(400), timestamp: Date.now() },
+    ] as any[];
+
+    enforceToolResultContextBudgetInPlace({
+      messages,
+      contextBudgetChars: 2_000,
+      maxSingleToolResultChars: 20_000,
+    });
+
+    expect(getToolResultText(messages[0])).toBe(smallText);
+    expect(messages[0].details.toolResultArtifact).toEqual(artifact);
   });
 
   it("compacts oldest tool results when total context exceeds budget", () => {

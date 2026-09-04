@@ -11,6 +11,13 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ContextGuard } from "./guard-pipeline.js";
+import {
+  formatToolResultArtifactReference,
+  formatUnrecoverableToolResult,
+  getToolResultArtifactDetails,
+  getToolResultArtifactFailure,
+  getToolResultArtifactReference,
+} from "./tool-result-artifact.js";
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -199,10 +206,25 @@ function replaceToolResultText(msg: AgentMessage, text: string): AgentMessage {
 
   const sourceRecord = msg as unknown as Record<string, unknown>;
   const { details: _details, ...rest } = sourceRecord;
+  const artifactDetails = getToolResultArtifactDetails(msg);
   return {
     ...rest,
     content: replacementContent,
+    ...(artifactDetails ? { details: artifactDetails } : {}),
   } as AgentMessage;
+}
+
+function recoverableToolResultText(msg: AgentMessage, preview: string, maxChars: number): string | null {
+  const details = (msg as { details?: unknown }).details;
+  const artifact = getToolResultArtifactReference(details);
+  if (artifact) {
+    return formatToolResultArtifactReference(artifact, preview, maxChars);
+  }
+  const artifactFailure = getToolResultArtifactFailure(details);
+  if (artifactFailure) {
+    return formatUnrecoverableToolResult(artifactFailure, preview, maxChars);
+  }
+  return null;
 }
 
 function truncateToolResultToChars(
@@ -218,7 +240,8 @@ function truncateToolResultToChars(
   const rawText = getToolResultText(msg);
   if (!rawText) return replaceToolResultText(msg, TRUNCATION_NOTICE);
 
-  const truncatedText = truncateTextToBudget(rawText, maxChars);
+  const truncatedText = recoverableToolResultText(msg, rawText, maxChars)
+    ?? truncateTextToBudget(rawText, maxChars);
   return replaceToolResultText(msg, truncatedText);
 }
 
@@ -258,11 +281,13 @@ function compactExistingToolResultsInPlace(params: {
     const before = estimateMessageCharsCached(msg, cache);
     if (before <= COMPACTION_PLACEHOLDER.length) continue;
 
-    const compacted = replaceToolResultText(msg, COMPACTION_PLACEHOLDER);
-    applyMessageMutationInPlace(msg, compacted, cache);
-    const after = estimateMessageCharsCached(msg, cache);
+    const compactedText = recoverableToolResultText(msg, "", 1_024)
+      ?? COMPACTION_PLACEHOLDER;
+    const compacted = replaceToolResultText(msg, compactedText);
+    const after = estimateMessageChars(compacted);
     if (after >= before) continue;
 
+    applyMessageMutationInPlace(msg, compacted, cache);
     reduced += before - after;
     if (reduced >= charsNeeded) break;
   }

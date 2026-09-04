@@ -15,10 +15,18 @@ import { extractToolCallsFromAssistant, extractToolResultId } from "./message-ut
 import { sanitizeToolCallInputs } from "./tool-call-repair.js";
 import type { PersistGuard } from "./guard-pipeline.js";
 import { guardLog } from "./guard-log.js";
+import {
+  formatToolResultArtifactReference,
+  formatUnrecoverableToolResult,
+  getToolResultArtifactDetails,
+  getToolResultArtifactFailure,
+  getToolResultArtifactReference,
+} from "./tool-result-artifact.js";
 
 // ── Tool result truncation ──────────────────────────────────────────────
 
 const HARD_MAX_TOOL_RESULT_CHARS = 400_000;
+const ARTIFACT_PREVIEW_CHARS = 16_000;
 const MIN_KEEP_CHARS = 2_000;
 const TRUNCATION_SUFFIX =
   "\n\n[Content truncated during persistence — original exceeded size limit. " +
@@ -73,6 +81,28 @@ function capToolResultSize(msg: AgentMessage): AgentMessage {
     }
   }
   if (totalChars <= HARD_MAX_TOOL_RESULT_CHARS) return msg;
+
+  const details = (msg as { details?: unknown }).details;
+  const artifact = getToolResultArtifactReference(details);
+  const artifactFailure = getToolResultArtifactFailure(details);
+  if (artifact || artifactFailure) {
+    const fullText = content
+      .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+      .map((block: any) => block.text)
+      .join("\n");
+    const text = artifact
+      ? formatToolResultArtifactReference(artifact, fullText, ARTIFACT_PREVIEW_CHARS)
+      : formatUnrecoverableToolResult(artifactFailure!, fullText, ARTIFACT_PREVIEW_CHARS);
+    const artifactDetails = getToolResultArtifactDetails(msg);
+    return {
+      ...msg,
+      content: [
+        { type: "text", text },
+        ...content.filter((block: any) => block?.type !== "text"),
+      ],
+      ...(artifactDetails ? { details: artifactDetails } : {}),
+    } as unknown as AgentMessage;
+  }
 
   const newContent = content.map((block: any) => {
     if (!block || typeof block !== "object" || block.type !== "text" || typeof block.text !== "string") return block;

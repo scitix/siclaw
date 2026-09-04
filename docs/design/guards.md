@@ -196,17 +196,42 @@ and related maps across events, cleared on `reset()`.
 
 Write-time validation for session history. Sanitizes malformed tool call
 blocks, tracks pending call/result pairing across messages, inserts
-synthetic error results for orphaned calls, truncates results exceeding
-400KB. Stateful — maintains `pending` Map and `droppedToolCallIds` Set.
+synthetic error results for orphaned calls, and caps results exceeding
+400KB. Artifact-backed results are replaced by a bounded preview plus their
+opaque recovery ID; uncaptured results retain the legacy truncation behavior.
+Stateful — maintains `pending` Map and `droppedToolCallIds` Set.
 
 ### Context: context-budget-guard
 
 **File**: `src/core/tool-result-context-guard.ts` (`createContextBudgetGuard`)
 
 Enforces context window budget. Three-tier strategy:
-1. Truncate any single result exceeding 50% of context window
-2. Compact oldest results when total exceeds 75% of window
+1. Replace any single result exceeding 50% of context window with its artifact
+   reference when available, otherwise truncate it
+2. Compact oldest results when total exceeds 75% of window, retaining artifact
+   recovery instructions when available
 3. Throw `PREEMPTIVE_CONTEXT_OVERFLOW` when still exceeding 90%
+
+### MCP tool-result artifacts
+
+**File**: `src/core/tool-result-artifact.ts`
+
+MCP text results of at least 32KiB are captured before the guard pipeline can
+shrink them. The live tool execution still returns the original content. If a
+persist or context guard later needs to reduce that content, the model receives
+an opaque artifact ID, digest, expiry, bounded head/tail preview, and instructions
+to use `tool_result_search` and `tool_result_read`.
+
+Artifacts are scoped to the Agent and session, stored below the framework
+session directory, and unavailable through generic file tools or `restricted_bash` —
+including `.tool-results` trees that belong to sibling sessions on the same AgentBox. The root and
+scope directories use mode `0700`; files use `0600`. The v0 bounds are a 24-hour
+TTL, 64MiB per artifact, and 256MiB or 256 artifacts per session scope with
+oldest-first eviction.
+Reads return at most 32,000 characters and searches are literal,
+case-insensitive, and bounded to 50 matches. A capture failure is carried into
+the guard result explicitly so the model knows the omitted portion cannot be
+recovered and can narrow or paginate the source query.
 
 ---
 
