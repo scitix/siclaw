@@ -1106,3 +1106,54 @@ describe("startRuntime — authority binding context", () => {
     settleConsumer?.();
   });
 });
+
+// The box de-duplicates across a Runtime restart by turnId (turn-ledger.ts).
+// That only works if a RETRY of the same dispatch presents the SAME turnId —
+// minting a fresh uuid per RPC disarms the ledger silently: the reservation is
+// released on any prompt failure or timeout (exactly when the box may still be
+// running the turn), so the retry would arrive with an id the box has never
+// seen and execute the input a second time.
+describe("startRuntime — turnId is derived from the dispatch", () => {
+  it("uses the dispatchId as the turnId so a retry is recognisable to the box", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    const ack = await send(
+      { agentId: "a", userId: "u", text: "hi", sessionId: "S", dispatchId: "disp-42" },
+      ctx,
+    ) as { turnId: string };
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(ack.turnId).toBe("disp-42");
+    expect(promptCalls[0].turnId).toBe("disp-42");
+    settleConsumer?.();
+  });
+
+  it("still honours an explicit turnId from a supervisor", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    const ack = await send(
+      { agentId: "a", userId: "u", text: "hi", sessionId: "S", dispatchId: "disp-1", turnId: "explicit-turn" },
+      ctx,
+    ) as { turnId: string };
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(ack.turnId).toBe("explicit-turn");
+    settleConsumer?.();
+  });
+
+  it("mints one when there is no dispatch to derive it from", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, ctx) as { turnId: string };
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(ack.turnId).toMatch(/^[0-9a-f-]{36}$/);
+    settleConsumer?.();
+  });
+});
