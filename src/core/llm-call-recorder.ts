@@ -4,7 +4,7 @@
  *
  * This is the single source of truth for model-side timing. The gateway
  * (`src/gateway/sse-consumer.ts`) reads `message.llmCall` off `message_end`
- * and persists it verbatim as `chat_messages.metadata.llm_call`; sicore
+ * and persists a redacted copy as `chat_messages.metadata.llm_call`; sicore
  * decodes the linear timeline from those rows. Nothing downstream infers
  * timing from event arrival any more.
  *
@@ -103,6 +103,7 @@ interface InFlightCall {
   toolCallIds: string[];
   modelProvider?: string;
   modelId?: string;
+  sealedEnvelope?: LlmCallEnvelope;
 }
 
 export interface LlmCallRecorderOptions {
@@ -138,6 +139,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
   private attemptStartRound = 0;
   private prevResponseEndAt?: number;
   private pendingAux: LlmCallEnvelope[] = [];
+  private pendingFailedAgentCalls: LlmCallEnvelope[] = [];
 
   constructor(options: LlmCallRecorderOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -159,17 +161,12 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
     this.attemptStarted = false;
     this.prevResponseEndAt = undefined;
     if (this.pendingAux.length > 0) {
-      // Compaction that ran AFTER the prompt's last agent call — the agentbox
-      // defers the SSE close while `isCompacting`, so this is ordinary, not an
-      // anomaly. `aux_calls` only ever ride a LATER agent call, and there is no
-      // later call, so this span has no carrier: it lands in the prompt's tail
-      // and reads as residual. Giving it one would mean a row of its own, which
-      // is a bigger change than this envelope.
-      this.warn(
-        `[llm-call-recorder] ${this.pendingAux.length} trailing aux call(s) had no following agent call ` +
-          `to ride; their span stays in the prompt tail (residual)`,
-      );
+      this.warn(`[llm-call-recorder] dropping ${this.pendingAux.length} aux call(s) left over from the previous prompt`);
       this.pendingAux = [];
+    }
+    if (this.pendingFailedAgentCalls.length > 0) {
+      this.warn(`[llm-call-recorder] dropping ${this.pendingFailedAgentCalls.length} unmatched failed call(s) left over from the previous prompt`);
+      this.pendingFailedAgentCalls = [];
     }
   }
 
@@ -180,6 +177,18 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
     if (this.promptExplicit && !opts?.explicit) return;
     this.promptOpen = false;
     this.promptExplicit = false;
+    if (this.pendingAux.length > 0) {
+      // Compaction can finish after the final agent call while the HTTP layer is
+      // deliberately keeping the prompt open. The current cross-service
+      // contract has no following call on which to carry these aux_calls, so
+      // their span remains visible as the prompt's residual rather than being
+      // mislabelled as another round or another prompt's setup.
+      this.warn(
+        `[llm-call-recorder] ${this.pendingAux.length} trailing aux call(s) had no following agent call ` +
+          `to ride; their span stays in the prompt tail (residual)`,
+      );
+      this.pendingAux = [];
+    }
   }
 
   beginAttempt(attempt?: number): void {
@@ -211,42 +220,42 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
     const recorder = this;
     const wrapped = (model: any, context: any, options: any) => {
       const call = recorder.openCall(model, context);
-      // A request that never produces a message has NO CARRIER: the envelope is
-      // stamped onto the assistant message, and a connection that failed before
-      // one existed has nothing to stamp. So the span is not lost, it is
-      // reattributed — `prevResponseEndAt` is not advanced (only sealCall does
-      // that), so the next call's since_prev_ms spans the failed attempt and it
-      // is counted exactly once, as tool-group or setup time rather than model
-      // time. Wrong bucket, not a double count, and never a negative.
-      //
-      // openCall touches no shared counter either (round advances in sealCall),
-      // so there is nothing to unwind here. The try exists to make that claim
-      // explicit and to keep it true if openCall ever grows a side effect.
+      let maybeStream: any;
       try {
-        const maybeStream = baseFn(model, context, options);
-        if (maybeStream && typeof maybeStream === "object" && typeof (maybeStream as Promise<unknown>).then === "function") {
-          return (maybeStream as Promise<any>).then((stream) => recorder.wrapStream(stream, call));
-        }
-        return recorder.wrapStream(maybeStream, call);
-      } catch (err) {
-        recorder.abandonCall(call, err);
-        throw err;
+        maybeStream = baseFn(model, context, options);
+      } catch (error) {
+        recorder.sealFailedCall(call, error);
+        throw error;
       }
+      if (maybeStream && typeof maybeStream === "object" && typeof (maybeStream as Promise<unknown>).then === "function") {
+        return (maybeStream as Promise<any>).then(
+          (stream) => recorder.wrapStream(stream, call),
+          (error) => {
+            recorder.sealFailedCall(call, error);
+            throw error;
+          },
+        );
+      }
+      return recorder.wrapStream(maybeStream, call);
     };
     return wrapped as unknown as T;
   }
 
   /**
-   * A call that threw before any message existed. Nothing is emitted — there is
-   * no message to stamp — so this only records the fact for diagnosis. See the
-   * comment in wrapStreamFn for why the span still balances.
+   * pi-agent synthesizes a fresh assistant error message when streamFn throws,
+   * so the envelope cannot be stamped directly onto the message at the provider
+   * boundary. Pair that message with the failed call before subscribers see it.
    */
-  private abandonCall(call: InFlightCall, err: unknown): void {
-    const spentMs = Math.max(0, this.now() - call.requestAt);
-    this.warn(
-      `[llm-call-recorder] request failed before any message existed after ${spentMs}ms ` +
-        `(${call.kind}); its span is attributed to the next call's since_prev_ms: ${String(err)}`,
-    );
+  attachPendingFailure(message: unknown): void {
+    if (!message || typeof message !== "object") return;
+    const target = message as Record<string, unknown>;
+    if (target.role !== "assistant" || (target.stopReason !== "error" && target.stopReason !== "aborted")) return;
+    if (llmCallFromMessage(target)) return;
+    const envelope = this.pendingFailedAgentCalls.shift();
+    if (!envelope) return;
+    envelope.stop_reason = target.stopReason;
+    if (typeof target.errorMessage === "string") envelope.error_message = target.errorMessage.slice(0, 500);
+    target.llmCall = envelope;
   }
 
   private openCall(model: any, context: any): InFlightCall {
@@ -275,9 +284,14 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
         const iterator = originalIterator();
         return {
           next: async () => {
-            const result = await iterator.next();
-            if (!result.done && result.value) this.observeEvent(call, result.value);
-            return result;
+            try {
+              const result = await iterator.next();
+              if (!result.done && result.value) this.observeEvent(call, result.value);
+              return result;
+            } catch (error) {
+              this.sealFailedCall(call, error);
+              throw error;
+            }
           },
           return: async (value?: unknown) =>
             iterator.return?.(value) ?? { done: true as const, value: undefined },
@@ -294,10 +308,16 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
         // result() may be awaited more than once (pi-agent awaits it on `done`
         // and again after the loop); the envelope must be built exactly once.
         if (!sealed) {
-          sealed = originalResult().then((message: any) => {
-            this.sealCall(call, message);
-            return message;
-          });
+          sealed = Promise.resolve().then(originalResult).then(
+            (message: any) => {
+              this.sealCall(call, message);
+              return message;
+            },
+            (error: unknown) => {
+              this.sealFailedCall(call, error);
+              throw error;
+            },
+          );
         }
         return sealed;
       };
@@ -405,7 +425,20 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
     call.blocks.push(out);
   }
 
-  private sealCall(call: InFlightCall, message: any): void {
+  private sealFailedCall(call: InFlightCall, error: unknown): void {
+    if (call.sealedEnvelope) return;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const envelope = this.sealCall(call, { stopReason: "error", errorMessage });
+    if (call.kind === "agent") this.pendingFailedAgentCalls.push(envelope);
+  }
+
+  private sealCall(call: InFlightCall, message: any): LlmCallEnvelope {
+    if (call.sealedEnvelope) {
+      if (message && typeof message === "object") {
+        (message as Record<string, unknown>).llmCall = call.sealedEnvelope;
+      }
+      return call.sealedEnvelope;
+    }
     const responseEndAt = this.now();
     // Blocks still open when the stream ended (provider never sent *_end).
     for (const [key, block] of [...call.openBlocks.entries()]) {
@@ -459,6 +492,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
       thinking_visible: thinkingVisible,
       tool_call_ids: call.toolCallIds,
     };
+    call.sealedEnvelope = envelope;
 
     if (call.kind === "aux") {
       this.pendingAux.push(envelope);
@@ -484,6 +518,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
     if (message && typeof message === "object") {
       (message as Record<string, unknown>).llmCall = envelope;
     }
+    return envelope;
   }
 }
 

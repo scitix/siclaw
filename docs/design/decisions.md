@@ -751,8 +751,8 @@ wraps `agent.streamFn` as the innermost layer (before the guard pipeline) and
 records, on the agentbox's own clock: request sent, HTTP headers (`start`), first
 content token, every thinking/text/tool-call block edge, response end, the
 provider's `usage`, and the stop reason. The result is stamped onto the assistant
-message as `llmCall` and travels with `message_end`; the gateway persists it
-verbatim as `chat_messages.metadata.llm_call`.
+message as `llmCall` and travels with `message_end`; the gateway persists a
+redacted copy as `chat_messages.metadata.llm_call`.
 
 Persistence contract (web/api/a2a `sse-consumer.ts` and Lark
 `collectChannelResponse` alike):
@@ -760,8 +760,10 @@ Persistence contract (web/api/a2a `sse-consumer.ts` and Lark
 - **One agent-loop model call ⇒ one assistant row** carrying `metadata.llm_call`,
   even when `content` is empty (tool-only call). Rounds are numbered from 1 per
   prompt; a routing rollback rewinds the counter, and the discarded attempt's
-  envelopes ride the `model_route_notice` row as `discarded_llm_calls`. A failed
-  call's envelope rides the `error_response` row.
+  envelopes ride the `model_route_notice` row as `discarded_llm_calls`. For
+  in-turn provider retries, recovered failures remain as empty model-call rows;
+  if the turn ultimately fails, earlier failures remain empty model-call rows
+  and the final failure's envelope rides the single `error_response` row.
 - **Reasoning text is its own row** (`kind: "thinking"`, `metadata.llm_round`),
   written immediately before the model-call row and linked back via
   `llm_call.thinking_row_id`. Redacted like any other content.
@@ -784,7 +786,7 @@ them**. `turnStartMs` is accepted on the wire and ignored.
 - ✅ Reasoning tokens (`usage.reasoning`) and reasoning text are retained; output tok/s is computable.
 - ✅ Tool-only calls, failed calls and rolled-back attempts all appear on the timeline.
 - ✅ No schema change: envelope in `metadata`, thinking in `content`, grouping keys in `metadata`.
-- ⚠️ One extra row per model call, plus one per call with reasoning text. Hidden in transcripts (`kind: "thinking"`) and excluded from reply counts; sicore must register the kind before this runtime ships.
+- ⚠️ One extra row per model call, plus one per call with reasoning text. Thinking rows and empty model-call carriers are hidden in transcripts, but `chat_sessions.message_count` and the Portal's generic `message_count` metric remain physical-row counts by the existing sicore persistence contract; sicore must register `kind: "thinking"` before this runtime ships.
 - ⚠️ Providers that hide reasoning (`reasoning_tokens` without `reasoning_content`) report `thinking_visible: false`; their reasoning time is inside `net_ttft` and is not guessed at.
 - ❌ Historical rows without `llm_call` have no time accounting — only the wall clock.
 

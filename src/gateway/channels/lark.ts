@@ -63,9 +63,16 @@ import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
 import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
-import { llmCallFromMessage } from "../../core/llm-call-recorder.js";
-import { messageProducedOutput } from "../sse-consumer.js";
-import { buildThinkingRow, isModelCallRowEnvelope } from "../llm-call-rows.js";
+import type { LlmCallEnvelope } from "../../core/llm-call-recorder.js";
+import {
+  buildThinkingRow,
+  eventClock,
+  isModelCallRowEnvelope,
+  LlmCallTimeline,
+  redactLlmCallEnvelope,
+  toolDurationMs,
+} from "../llm-call-rows.js";
+import { modelRouteNoticeContent, modelRouteSwitchMetadata } from "../sse-consumer.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -3103,33 +3110,53 @@ export async function collectChannelResponse(
   const shiftQ = <T,>(m: Map<string, T[]>, k: string): T | undefined => m.get(k)?.shift();
   const toolKey = (ev: Record<string, any>, name: string): string =>
     ev.toolCallId != null ? `id:${String(ev.toolCallId)}` : `name:${name}`;
-  // LLM-call timeline (same contract as sse-consumer.ts): the latest agent-loop
-  // round is stamped onto the tool rows it issued; each model call gets its own
-  // row carrying metadata.llm_call, preceded by a thinking row when there is
-  // reasoning text. message_end and turn_end share one message object.
-  let currentRound = 0;
-  const seenEnvelopes = new WeakSet<object>();
-  // Deferred error row: written at the end of the run, and only if no later
-  // attempt succeeded. See the message_end handler.
-  let pendingErrorRow: (() => Promise<void>) | null = null;
-  // ⚠️ undefined, never Date.now(): this process and the agentbox are different
-  // pods, so subtracting one clock from the other produces a duration made of
-  // clock skew that the Math.max(0, …) below then dresses up as a measurement.
-  // Both ends of an interval come from the same clock or neither does.
-  const eventClock = (ev: Record<string, any>, key: "startedAt" | "endedAt"): number | undefined =>
-    typeof ev[key] === "number" && Number.isFinite(ev[key]) ? ev[key] : undefined;
-  const roundMetaFor = (ev: Record<string, any>): Record<string, unknown> => {
-    const out: Record<string, unknown> = {};
-    if (currentRound > 0) out.llm_round = currentRound;
-    if (typeof ev.toolCallId === "string" && ev.toolCallId) out.tool_call_id = ev.toolCallId;
-    return out;
-  };
+  // Shared with sse-consumer: value-based envelope dedup, current round, and
+  // one-clock tool duration rules must stay identical across persistence paths.
+  const timeline = new LlmCallTimeline();
+  let attemptLlmCalls: LlmCallEnvelope[] = [];
+  let pendingFailedLlmCalls: LlmCallEnvelope[] = [];
+  let pendingError: { content: string; envelope?: LlmCallEnvelope } | null = null;
   const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<string | null> => {
     try { return await appendMessage({ ...msg, traceId: persist?.traceId ?? msg.traceId }); }
     catch (err) {
       console.warn(`[${logPrefix}] audit persist failed session=${sessionId}:`, err);
       return null;
     }
+  };
+  const persistCallOnlyRows = async (envelopes: LlmCallEnvelope[]) => {
+    for (const envelope of envelopes) {
+      await persistRow({
+        sessionId,
+        role: "assistant",
+        content: "",
+        metadata: { llm_call: redactLlmCallEnvelope(envelope, redact) },
+      });
+    }
+  };
+  const flushRecoveredLlmCalls = async () => {
+    const failedCalls = pendingFailedLlmCalls;
+    pendingFailedLlmCalls = [];
+    pendingError = null;
+    await persistCallOnlyRows(failedCalls);
+  };
+  const flushTerminalError = async () => {
+    if (!pendingError) return;
+    const failedCalls = pendingFailedLlmCalls;
+    pendingFailedLlmCalls = [];
+    const terminal = pendingError;
+    pendingError = null;
+    await persistCallOnlyRows(terminal.envelope ? failedCalls.slice(0, -1) : failedCalls);
+    await persistRow({
+      sessionId,
+      role: "assistant",
+      content: terminal.content,
+      metadata: {
+        kind: "error_response",
+        error_code: "MODEL_ERROR",
+        retriable: true,
+        ...(terminal.envelope ? { llm_call: redactLlmCallEnvelope(terminal.envelope, redact) } : {}),
+      },
+    });
   };
 
   try {
@@ -3139,7 +3166,30 @@ export async function collectChannelResponse(
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
         renderedKnowledgeSourceUrls.clear();
+        if (ev.type === "model_route_start") {
+          attemptLlmCalls = [];
+        } else {
+          pendingFailedLlmCalls = [];
+          pendingError = null;
+        }
       }
+      if (ev.type === "model_route_switch" && persist && redaction) {
+        const metadata = modelRouteSwitchMetadata(ev, redaction);
+        if (metadata) {
+          const discarded = attemptLlmCalls;
+          attemptLlmCalls = [];
+          if (discarded.length > 0) {
+            metadata.discarded_llm_calls = discarded.map((call) => redactLlmCallEnvelope(call, redact));
+          }
+          await persistRow({
+            sessionId,
+            role: "assistant",
+            content: modelRouteNoticeContent(metadata),
+            metadata,
+          });
+        }
+      }
+      if (ev.type === "model_route_success") attemptLlmCalls = [];
       if (ev.type === "knowledge_sources") {
         pendingKnowledgeSources = ev.sources;
       }
@@ -3183,7 +3233,7 @@ export async function collectChannelResponse(
         pushQ(toolInputs, key, ev.args ? JSON.stringify(ev.args) : "");
         pushQ(toolStarts, key, { startedAt: eventClock(ev, "startedAt"), localStartMs: Date.now() });
         pushQ(toolsets, key, typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
-        pushQ(toolRounds, key, roundMetaFor(ev));
+        pushQ(toolRounds, key, timeline.toolMetadata(ev));
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
@@ -3203,7 +3253,7 @@ export async function collectChannelResponse(
           const startedAt = start?.startedAt ?? start?.localStartMs;
           const toolset = shiftQ(toolsets, key) ??
             (typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
-          const roundMeta = shiftQ(toolRounds, key) ?? roundMetaFor(ev);
+          const roundMeta = shiftQ(toolRounds, key) ?? timeline.toolMetadata(ev);
           const metadata: Record<string, unknown> = { ...roundMeta };
           if (startedAt != null) metadata.started_at = new Date(startedAt).toISOString();
           await persistRow({
@@ -3214,11 +3264,7 @@ export async function collectChannelResponse(
             toolset: toolset ?? null,
             toolInput: input ? redact(input) : null,
             outcome,
-            durationMs: start
-              ? endedAt !== undefined && start.startedAt !== undefined
-                ? Math.max(0, endedAt - start.startedAt)
-                : Math.max(0, Date.now() - start.localStartMs)
-              : null,
+            durationMs: start ? toolDurationMs(start, endedAt) : null,
             metadata: Object.keys(metadata).length > 0 ? metadata : null,
           });
         }
@@ -3229,43 +3275,29 @@ export async function collectChannelResponse(
       }
       // pi-agent-brain emits the final assistant reply as message_end with
       // a content array of blocks; collect the text blocks only.
+      let envelope: LlmCallEnvelope | undefined;
       if ((ev.type === "message_end" || ev.type === "turn_end") && ev.message?.role === "assistant") {
-        const rawEnvelope = llmCallFromMessage(ev.message);
-        const envelope = rawEnvelope && !seenEnvelopes.has(rawEnvelope) ? rawEnvelope : undefined;
-        if (envelope) {
-          seenEnvelopes.add(envelope);
-          if (envelope.kind === "agent" && envelope.round > 0) currentRound = envelope.round;
-        }
-        // turn_end only contributes round tracking (its text was handled on
-        // message_end). A failed call's envelope rides an error row, as in sse-consumer.
-        // BUFFERED, not written on sight — the same rule sse-consumer follows.
-        // A model-routing primary can 429 and the fallback then succeed, and an
-        // error row written the moment the failure arrived would sit in the Lark
-        // thread above a perfectly good answer, forever. It is flushed only if
-        // the run really ends in failure (see the loop's tail).
-        if (ev.type === "message_end" && persist && rawEnvelope && ev.message?.stopReason === "error") {
-          const failed = rawEnvelope;
-          const errorText = redact(typeof ev.message.errorMessage === "string" ? ev.message.errorMessage : "");
-          pendingErrorRow = async () => {
-            await persistRow({
-              sessionId,
-              role: "assistant",
-              content: errorText,
-              metadata: { kind: "error_response", error_code: "MODEL_ERROR", retriable: true, llm_call: failed },
-            });
+        envelope = timeline.take(ev.message);
+        if (envelope?.kind === "agent") attemptLlmCalls.push(envelope);
+        if (ev.type === "message_end" && ev.message?.stopReason === "error") {
+          if (envelope) pendingFailedLlmCalls.push(envelope);
+          pendingError = {
+            content: redact(typeof ev.message.errorMessage === "string" ? ev.message.errorMessage : ""),
+            ...(envelope ? { envelope } : {}),
           };
-        } else if (pendingErrorRow && ev.type === "message_end" && messageProducedOutput(ev.message)) {
-          // A later attempt produced real output: the earlier failure was
-          // transient and must leave nothing behind.
-          pendingErrorRow = null;
         }
       }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
-        const envelope = llmCallFromMessage(ev.message);
-        const rowEnvelope = isModelCallRowEnvelope(envelope, ev.message?.stopReason) ? envelope : undefined;
+        const rowEnvelope = isModelCallRowEnvelope(envelope, ev.message?.stopReason)
+          ? redactLlmCallEnvelope(envelope, redact)
+          : undefined;
         let turnText = contentBlocksToMarkdown(blocks);
+        const producedOutput = ev.message?.stopReason !== "error" && ev.message?.stopReason !== "aborted" && (
+          turnText.trim().length > 0 || blocks.some((block: any) => block?.type === "toolCall")
+        );
+        if (pendingError && producedOutput) await flushRecoveredLlmCalls();
         if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error") {
           const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
             .filter((source) => !renderedKnowledgeSourceUrls.has(source.url));
@@ -3317,13 +3349,7 @@ export async function collectChannelResponse(
   } catch (err) {
     console.error(`[${logPrefix}] SSE collect error for session=${sessionId}:`, err);
   }
-  // The run is over: a buffered failure that no later attempt recovered is a
-  // real failure, and now gets its row. Written here rather than on sight so a
-  // 429-then-fallback-succeeds turn leaves no error above its own answer.
-  if (pendingErrorRow) {
-    await pendingErrorRow();
-    pendingErrorRow = null;
-  }
+  if (persist) await flushTerminalError();
   // Prefer the last full assistant turn; fall back to streamed deltas if the
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");

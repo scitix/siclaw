@@ -817,7 +817,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
       { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "primary text" } },
-      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429", llmCall: mkEnvelope({ round: 1, attempt: 1, stop_reason: "error" }) } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429 sk-secret123", llmCall: mkEnvelope({ round: 1, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" }) } },
       { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
       { type: "model_route_switch", attempt: 2, fromCandidateKey: "openai/gpt-4", toCandidateKey: "anthropic/claude", fromProvider: "openai", fromModelId: "gpt-4", toProvider: "anthropic", toModelId: "claude", failureKind: "rate_limit" },
       { type: "message_start" },
@@ -825,11 +825,15 @@ describe("consumeAgentSse — routed turn commit gating", () => {
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop", llmCall: mkEnvelope({ round: 1, attempt: 2 }) } },
       { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
     ];
-    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    await consumeAgentSse({
+      client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true,
+      redactionConfig: { patterns: [/sk-[a-z0-9]+/g] },
+    });
     const notice = appendCalls.find((r) => r.metadata?.kind === "model_route_notice");
     expect(notice).toBeDefined();
     expect(notice.metadata.discarded_llm_calls).toHaveLength(1);
     expect(notice.metadata.discarded_llm_calls[0]).toMatchObject({ round: 1, attempt: 1, stop_reason: "error" });
+    expect(notice.metadata.discarded_llm_calls[0].error_message).toBe("primary 429 [REDACTED]");
     const fallbackRow = appendCalls.find((r) => r.role === "assistant" && r.content === "fallback answer");
     expect(fallbackRow.metadata.llm_call).toMatchObject({ round: 1, attempt: 2 });
     // The rolled-back primary text never persists, and its envelope is not duplicated on an error row.
@@ -1094,6 +1098,27 @@ describe("consumeAgentSse — abort finalization", () => {
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     expect(updateCalls.find((u) => u.metadata?.status === "stopped")).toBeUndefined();
   });
+
+  it("attributes a mid-call partial row to the next round", async () => {
+    const controller = new AbortController();
+    const client = {
+      async *streamEvents() {
+        yield { type: "message_end", message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "c1", name: "bash", arguments: {} }],
+          stopReason: "toolUse",
+          llmCall: mkEnvelope({ round: 3 }),
+        } };
+        yield { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "partial next call" } };
+        controller.abort();
+        yield { type: "ignored" };
+      },
+    } as unknown as AgentBoxClient;
+
+    await consumeAgentSse({ client, sessionId: "s", userId: "u", persistMessages: true, signal: controller.signal });
+    const partial = appendCalls.find((row) => row.metadata?.incomplete === true);
+    expect(partial.metadata.llm_round).toBe(4);
+  });
 });
 
 // ── LLM-call timeline (metadata.llm_call / thinking rows / llm_round) ──────────────
@@ -1204,10 +1229,49 @@ describe("consumeAgentSse — llm_call timeline", () => {
     const events = [
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
       { type: "message_end", message },
-      { type: "turn_end", message, toolResults: [] },
+      // AgentBoxClient JSON-parses each SSE frame independently in production.
+      { type: "turn_end", message: JSON.parse(JSON.stringify(message)), toolResults: [] },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     expect(appendCalls.filter((c) => c.role === "assistant")).toHaveLength(1);
+  });
+
+  it("keeps failed internal retries as call-only rows when a later retry succeeds", async () => {
+    const events = [
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "transient",
+        llmCall: mkEnvelope({ round: 1, stop_reason: "error" }),
+      } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "recovered" } },
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop",
+        llmCall: mkEnvelope({ round: 2, request_at: "2026-09-03T08:00:02.000Z", response_end_at: "2026-09-03T08:00:03.000Z" }),
+      } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+
+    const rows = appendCalls.filter((row) => row.role === "assistant");
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.metadata.llm_call.round)).toEqual([1, 2]);
+    expect(rows[0].content).toBe("");
+    expect(rows[0].metadata.llm_call.stop_reason).toBe("error");
+    expect(rows[1].content).toBe("recovered");
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
+  });
+
+  it("redacts provider errors in llm_call metadata", async () => {
+    const secret = "sk-secret123";
+    const events = [{ type: "message_end", message: {
+      role: "assistant", content: [], stopReason: "error", errorMessage: `proxy rejected ${secret}`,
+      llmCall: mkEnvelope({ round: 1, stop_reason: "error", error_message: `url?api_key=${secret}` }),
+    } }];
+    await consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true,
+      redactionConfig: { patterns: [/sk-[a-z0-9]+/g] },
+    });
+    const row = appendCalls.find((entry) => entry.metadata?.kind === "error_response");
+    expect(row.content).not.toContain(secret);
+    expect(row.metadata.llm_call.error_message).toBe("url?api_key=[REDACTED]");
   });
 
   it("puts a failed call's envelope on the error row, not on a separate model-call row", async () => {
@@ -1221,25 +1285,30 @@ describe("consumeAgentSse — llm_call timeline", () => {
     expect(rows[0].metadata.llm_call).toMatchObject({ round: 2, stop_reason: "error" });
   });
 
-  it("keeps the failed call's envelope when turn_end repeats the same message", async () => {
-    // pi-agent delivers a terminal failure as message_end AND then turn_end, on
-    // the SAME message object. The error row is that call's ONLY carrier — a
-    // rollback would have used discarded_llm_calls instead — so if the second
-    // delivery overwrites the queued row with an envelope-less one, the failed
-    // call's time disappears entirely.
+  it("keeps the terminal failure envelope when turn_end repeats message_end", async () => {
     const message = {
-      role: "assistant", content: [], stopReason: "error", errorMessage: "429",
-      llmCall: mkEnvelope({ round: 2, stop_reason: "error" }),
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "terminal 429",
+      llmCall: mkEnvelope({ round: 2, stop_reason: "error", error_message: "terminal 429" }),
     };
-    const events = [
-      { type: "message_end", message },
-      { type: "turn_end", message, toolResults: [] },
-    ];
-    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_end", message },
+        { type: "turn_end", message: JSON.parse(JSON.stringify(message)), toolResults: [] },
+      ]),
+      sessionId: "s",
+      userId: "u",
+      persistMessages: true,
+    });
+
     const rows = appendCalls.filter((c) => c.role === "assistant");
     expect(rows).toHaveLength(1);
-    expect(rows[0].metadata.kind).toBe("error_response");
-    expect(rows[0].metadata.llm_call).toMatchObject({ round: 2, stop_reason: "error" });
+    expect(rows[0].metadata).toMatchObject({
+      kind: "error_response",
+      llm_call: { round: 2, stop_reason: "error" },
+    });
   });
 
   it("keeps the legacy text-only rule for messages without an envelope", async () => {

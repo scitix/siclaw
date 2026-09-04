@@ -196,6 +196,7 @@ export class PiAgentBrain implements BrainSession {
     const promptOptions = this.promptOptionsForMedia(media);
 
     const unsub = this.session.subscribe((event: any) => {
+      if (event?.message?.role === "assistant") this.llmCalls?.attachPendingFailure(event.message);
       if (event.type === "message_start" && event.message?.role === "assistant") {
         lastAssistantHadContent = false;
         lastAssistantMessage = null;
@@ -382,7 +383,10 @@ export class PiAgentBrain implements BrainSession {
   subscribe(listener: (event: any) => void): () => void {
     // Subscribe to both pi-agent events AND our own retry events
     this.extraListeners.add(listener);
-    const unsubSession = this.session.subscribe((event: any) => listener(this.enrichToolEvent(event)));
+    const unsubSession = this.session.subscribe((event: any) => {
+      if (event?.message?.role === "assistant") this.llmCalls?.attachPendingFailure(event.message);
+      listener(this.enrichToolEvent(event));
+    });
     return () => {
       this.extraListeners.delete(listener);
       unsubSession();

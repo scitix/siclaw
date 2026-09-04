@@ -162,6 +162,24 @@ describe("LlmCallRecorder", () => {
     expect(recorder.snapshot().pendingAux).toBe(0);
   });
 
+  it("retires trailing aux calls at the prompt boundary as residual", async () => {
+    const clock = settableClock(0);
+    const warnings: string[] = [];
+    const recorder = new LlmCallRecorder({ now: clock.now, warn: (message) => warnings.push(message) });
+    recorder.beginPrompt(0, { explicit: true });
+    const streamFn = recorder.wrapStreamFn(() => makeStream([], { role: "assistant", content: [{ type: "text", text: "summary" }] }, clock));
+
+    clock.set(100);
+    await drain(streamFn(MODEL, AUX_CTX, {}));
+    expect(recorder.snapshot().pendingAux).toBe(1);
+
+    recorder.endPrompt({ explicit: true });
+    expect(recorder.snapshot().pendingAux).toBe(0);
+    expect(warnings).toEqual([
+      expect.stringContaining("trailing aux call(s) had no following agent call"),
+    ]);
+  });
+
   it("marks hidden reasoning as thinking_visible=false with zero thinking time", async () => {
     const clock = settableClock(0);
     const recorder = new LlmCallRecorder({ now: clock.now, warn: () => {} });
@@ -213,6 +231,51 @@ describe("LlmCallRecorder", () => {
     expect(env.ms.net_ttft).toBe(400);
     expect(env.first_token_at).toBeUndefined();
     expect(env.tool_call_ids).toEqual(["c9"]);
+  });
+
+  it("seals synchronous streamFn failures onto pi-agent's synthetic error message", () => {
+    const clock = settableClock(0);
+    const recorder = new LlmCallRecorder({ now: clock.now, warn: () => {} });
+    const streamFn = recorder.wrapStreamFn(() => { throw new Error("sync boom"); });
+
+    clock.set(100);
+    expect(() => streamFn(MODEL, AGENT_CTX, {})).toThrow("sync boom");
+    clock.set(250);
+    const failure = { role: "assistant", content: [], stopReason: "error", errorMessage: "sync boom" };
+    recorder.attachPendingFailure(failure);
+
+    expect(llmCallFromMessage(failure)).toMatchObject({
+      round: 1,
+      kind: "agent",
+      stop_reason: "error",
+      error_message: "sync boom",
+      ms: { total: 0 },
+    });
+  });
+
+  it("seals rejected stream creation and result promises exactly once", async () => {
+    const clock = settableClock(0);
+    const recorder = new LlmCallRecorder({ now: clock.now, warn: () => {} });
+    const rejectedCreation = recorder.wrapStreamFn(async () => { throw new Error("create boom"); });
+
+    clock.set(100);
+    await expect(rejectedCreation(MODEL, AGENT_CTX, {})).rejects.toThrow("create boom");
+    const first = { role: "assistant", content: [], stopReason: "error", errorMessage: "create boom" };
+    recorder.attachPendingFailure(first);
+    expect(llmCallFromMessage(first)?.round).toBe(1);
+
+    const rejectedResult = recorder.wrapStreamFn(() => ({
+      result: async () => { throw new Error("result boom"); },
+      async *[Symbol.asyncIterator]() { /* no events */ },
+    }));
+    clock.set(200);
+    const stream = rejectedResult(MODEL, AGENT_CTX, {});
+    await expect(stream.result()).rejects.toThrow("result boom");
+    await expect(stream.result()).rejects.toThrow("result boom");
+    const second = { role: "assistant", content: [], stopReason: "error", errorMessage: "result boom" };
+    recorder.attachPendingFailure(second);
+    expect(llmCallFromMessage(second)?.round).toBe(2);
+    expect(recorder.snapshot().round).toBe(2);
   });
 
   it("rewinds rounds on rollbackAttempt and bumps attempt; keeps prev response end", async () => {

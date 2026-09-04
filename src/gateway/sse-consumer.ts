@@ -18,7 +18,14 @@ import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo
 import { redactText, type RedactionConfig } from "./output-redactor.js";
 import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
 import { llmCallFromMessage, type LlmCallEnvelope } from "../core/llm-call-recorder.js";
-import { buildThinkingRow, isModelCallRowEnvelope } from "./llm-call-rows.js";
+import {
+  buildThinkingRow,
+  eventClock,
+  isModelCallRowEnvelope,
+  LlmCallTimeline,
+  redactLlmCallEnvelope,
+  toolDurationMs,
+} from "./llm-call-rows.js";
 
 // ── Public types ────────────────────────────────────
 
@@ -81,46 +88,6 @@ export interface SseConsumptionResult {
 // ── Implementation ──────────────────────────────────
 
 const EMPTY_REDACTION: RedactionConfig = { patterns: [] };
-
-/**
- * Agentbox-clock timestamp carried on a tool event (`startedAt` / `endedAt`,
- * stamped by PiAgentBrain.enrichToolEvent), or undefined when the runtime
- * predates the stamp.
- *
- * ⚠️ NEVER default a missing stamp to the local clock. The gateway and the
- * agentbox are different pods: subtracting one clock from the other yields a
- * duration made of clock skew, and because the result is clamped at 0 it comes
- * out looking like a plausible measurement rather than an error. Both ends of an
- * interval must come from the SAME clock — see toolDurationMs.
- */
-function eventClock(evt: SseEvent, key: "startedAt" | "endedAt"): number | undefined {
-  const v = evt[key];
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
-}
-
-/**
- * One tool's execution time, measured end-to-end on a single clock: the
- * agentbox's when both stamps are present, the gateway's otherwise. Mixing them
- * is the failure this function exists to prevent.
- */
-function toolDurationMs(pending: PendingToolCall, endedAt: number | undefined): number {
-  if (endedAt !== undefined && pending.startedAt !== undefined) {
-    return Math.max(0, endedAt - pending.startedAt);
-  }
-  return Math.max(0, Date.now() - pending.localStartMs);
-}
-
-/**
- * Per-round markers stamped onto tool rows so a reader can group them into the
- * tool group of the model call that issued them without touching a clock.
- */
-function toolRoundMetadata(evt: SseEvent, round: number): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (round > 0) out.llm_round = round;
-  const id = evt.toolCallId;
-  if (typeof id === "string" && id) out.tool_call_id = id;
-  return out;
-}
 
 /**
  * Strip pi-agent's `(Empty response: {...})` diagnostic markers that get
@@ -202,7 +169,7 @@ function compactRouteError(value: unknown, redactionConfig: RedactionConfig): st
   return redactText(text, redactionConfig).slice(0, 500);
 }
 
-function modelRouteSwitchMetadata(evt: SseEvent, redactionConfig: RedactionConfig): ChatMessageMetadata | null {
+export function modelRouteSwitchMetadata(evt: SseEvent, redactionConfig: RedactionConfig): ChatMessageMetadata | null {
   const fromCandidateKey = routeString(evt.fromCandidateKey);
   const toCandidateKey = routeString(evt.toCandidateKey);
   const fromProvider = routeString(evt.fromProvider);
@@ -292,7 +259,7 @@ function modelRouteRecoveryMetadata(evt: SseEvent): ChatMessageMetadata | null {
   };
 }
 
-function modelRouteNoticeContent(metadata: Record<string, unknown>): string {
+export function modelRouteNoticeContent(metadata: Record<string, unknown>): string {
   const eventType = routeString(metadata.event_type);
   const toProvider = routeString(metadata.to_provider) ?? "unknown";
   const toModelId = routeString(metadata.to_model_id) ?? "unknown";
@@ -462,6 +429,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const discardRoutedAttempt = () => {
     pendingAssistantOps.length = 0;
     pendingErrorOps.length = 0;
+    pendingFailedLlmCalls = [];
     pendingKnowledgeSources = null;
     renderedKnowledgeSourceUrls.clear();
     pendingStreamError = null;
@@ -470,23 +438,43 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let lastToolName = "";
 
   // ── LLM-call timeline bookkeeping ──
-  // currentRound: the round of the latest agent-loop model call, stamped onto
-  //   the tool rows it issued (metadata.llm_round). pi-agent emits message_end
-  //   before that turn's tool_execution_start, so "latest" is always right.
+  // timeline: value-based envelope dedup plus the latest agent-loop round,
+  //   stamped onto the tool rows it issued (metadata.llm_round). pi-agent emits
+  //   message_end before that turn's tool_execution_start, so "latest" is right.
   // attemptLlmCalls: envelopes of the model calls made by the routing attempt
   //   in flight. A failed attempt's rows are dropped (rollback / never
   //   committed), but the calls happened and their time is real — they are
   //   carried onto the model_route_notice row as `discarded_llm_calls` instead.
-  // seenEnvelopes: message_end AND turn_end carry the same assistant message
-  //   object; the model-call row must be written once per envelope.
-  let currentRound = 0;
+  // pendingFailedLlmCalls: in-turn provider retries are revocable as user-facing
+  //   errors, but their calls still belong in the timing timeline. They are
+  //   written as empty model-call rows if a later retry recovers, or all but the
+  //   final one are written before the terminal error row.
+  const timeline = new LlmCallTimeline();
   let attemptLlmCalls: LlmCallEnvelope[] = [];
-  const seenEnvelopes = new WeakSet<object>();
+  let pendingFailedLlmCalls: LlmCallEnvelope[] = [];
   const takeDiscardedLlmCalls = (): LlmCallEnvelope[] | undefined => {
     if (attemptLlmCalls.length === 0) return undefined;
     const drained = attemptLlmCalls;
     attemptLlmCalls = [];
     return drained;
+  };
+  const persistCallOnlyRows = async (envelopes: LlmCallEnvelope[]) => {
+    for (const envelope of envelopes) {
+      await appendRow({
+        sessionId,
+        role: "assistant",
+        content: "",
+        metadata: { llm_call: redactLlmCallEnvelope(envelope, (text) => redactText(text, redactionConfig)) },
+      });
+    }
+  };
+  const commitRecoveredLlmCalls = async () => {
+    const recovered = pendingFailedLlmCalls;
+    pendingFailedLlmCalls = [];
+    if (recovered.length === 0 || !persist) return;
+    const op = () => persistCallOnlyRows(recovered);
+    if (isRoutingTurn && !routingCommitted) pendingAssistantOps.push(op);
+    else await op();
   };
 
   // In-flight tool calls awaiting their tool_execution_end. Keyed by the
@@ -600,7 +588,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // were (or will be) discarded, but the time they took is part of the
           // prompt's timeline and the survivor's since_prev_ms spans it.
           const discarded = takeDiscardedLlmCalls();
-          if (discarded) metadata.discarded_llm_calls = discarded;
+          if (discarded) {
+            metadata.discarded_llm_calls = discarded.map((call) =>
+              redactLlmCallEnvelope(call, (text) => redactText(text, redactionConfig))
+            );
+          }
           if (persist) {
             dbMessageId = await appendRow({
               sessionId,
@@ -689,7 +681,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const detailsMeta = extractPersistableDetails(toolResult?.details, redactionConfig);
         // Re-stamp the round markers — extractPersistableDetails only looks at
         // the tool *result*, and updateMessage REPLACES metadata wholesale.
-        const roundMeta = pendingCall?.roundMeta ?? toolRoundMetadata(evt, currentRound);
+        const roundMeta = pendingCall?.roundMeta ?? timeline.toolMetadata(evt);
         const merged: Record<string, unknown> = { ...(detailsMeta ?? {}), ...roundMeta };
         // started_at survives onto the final row (it did not before: updateMessage
         // replaces metadata) so the parallel view can place the bar without a join.
@@ -790,7 +782,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         // Which model call issued this tool: the latest round. Captured at start
         // so the end handler re-stamps the same markers after a rollback rewinds
         // the round counter.
-        const roundMeta = toolRoundMetadata(evt, currentRound);
+        const roundMeta = timeline.toolMetadata(evt);
         const pendingCall: PendingToolCall = {
           toolName: startToolName,
           ...(typeof evt.toolset === "string" && evt.toolset.length > 0 ? { toolset: evt.toolset } : {}),
@@ -834,15 +826,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const message = evt.message as Record<string, unknown> | undefined;
         if (message?.role === "assistant") {
           // ── LLM-call envelope: the timing source of truth ──
-          // Stamped by LlmCallRecorder at the streamFn boundary; message_end and
-          // turn_end deliver the same object, so seenEnvelopes keeps the row
-          // single. Only agent-loop calls carry a round; aux (compaction) calls
-          // never surface here — they ride the next agent call's `aux_calls`.
+          // Stamped by LlmCallRecorder at the streamFn boundary. message_end and
+          // turn_end arrive as separately parsed JSON values, so the shared
+          // timeline deduplicates by envelope values rather than object identity.
+          // Aux (compaction) calls ride the next agent call's `aux_calls`.
           const rawEnvelope = llmCallFromMessage(message);
-          const envelope = rawEnvelope && !seenEnvelopes.has(rawEnvelope) ? rawEnvelope : undefined;
+          const envelope = timeline.take(message);
           if (envelope) {
-            seenEnvelopes.add(envelope);
-            if (envelope.kind === "agent" && envelope.round > 0) currentRound = envelope.round;
             if (isRoutingTurn && !routingCommitted) attemptLlmCalls.push(envelope);
             // Surface on the live event so the frontend renders badges immediately.
             (evt as Record<string, unknown>).llmCall = envelope;
@@ -868,19 +858,21 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             // nothing about the failure reaches the database. One row per consume
             // run, carrying the LAST error — the reload must not disagree with
             // the bubble the operator was just looking at.
-            if (persist) {
+            // pi-agent emits the same failed assistant message through both
+            // message_end and turn_end. The timeline consumes its envelope on
+            // the first event; replacing the buffered write on the duplicate
+            // would therefore throw away the terminal call's llm_call.
+            if (persist && (!rawEnvelope || envelope)) {
               const errorContent = redactText(errorMessage, redactionConfig);
-              // rawEnvelope, NOT the deduplicated `envelope`. A terminal failure is
-              // delivered twice — message_end then turn_end, on the same message
-              // object — and `envelope` is undefined on the second pass because
-              // seenEnvelopes has already claimed it. Since the queue below is
-              // last-one-wins, binding the deduplicated value would replace the
-              // good row with an envelope-less one and lose the call's time
-              // outright: this row is its ONLY carrier (a rollback would have used
-              // discarded_llm_calls instead). Dedup exists to keep the MODEL-CALL
-              // row single; it has no business gating the error row's contents.
-              const errorEnvelope = rawEnvelope;
+              // Failed calls remain timing facts even though their user-facing
+              // error is revocable. If a retry recovers they become empty call
+              // rows; if the turn fails, the final call rides the error row.
+              if (envelope) pendingFailedLlmCalls.push(envelope);
               const persistError = async () => {
+                const failedCalls = pendingFailedLlmCalls;
+                pendingFailedLlmCalls = [];
+                const errorEnvelope = envelope;
+                await persistCallOnlyRows(errorEnvelope ? failedCalls.slice(0, -1) : failedCalls);
                 await appendRow({
                   sessionId,
                   role: "assistant",
@@ -889,7 +881,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                     kind: "error_response",
                     error_code: ErrorCodes.MODEL_ERROR,
                     retriable: true,
-                    ...(errorEnvelope ? { llm_call: errorEnvelope } : {}),
+                    ...(errorEnvelope
+                      ? { llm_call: redactLlmCallEnvelope(errorEnvelope, (text) => redactText(text, redactionConfig)) }
+                      : {}),
                   },
                 });
                 await incrementMessageCount(sessionId);
@@ -916,6 +910,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             pendingStreamError = null;
             pendingErrorOps.length = 0;
             errorMessage = "";
+            await commitRecoveredLlmCalls();
           }
 
           // Extract text for resultText
@@ -962,7 +957,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // Rows without an envelope (runtime predating the recorder, or a
           // duplicate turn_end delivery) keep the old rule: text or nothing.
           const cleaned = assistantContent ? stripEmptyResponseMarkers(assistantContent) : "";
-          const rowEnvelope = isModelCallRowEnvelope(envelope, message.stopReason) ? envelope : undefined;
+          const rowEnvelope = isModelCallRowEnvelope(envelope, message.stopReason)
+            ? redactLlmCallEnvelope(envelope, (text) => redactText(text, redactionConfig))
+            : undefined;
           if (persist && (cleaned.length > 0 || rowEnvelope)) {
             const assistantRowContent = cleaned.length > 0 ? redactText(cleaned, redactionConfig) : "";
             const thinkingRow = rowEnvelope
@@ -1084,7 +1081,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             sessionId,
             role: "assistant",
             content: redactText(cleaned, redactionConfig),
-            metadata: { incomplete: true, ...(currentRound > 0 ? { llm_round: currentRound } : {}) },
+            metadata: { incomplete: true, llm_round: timeline.nextRound() },
           });
           await incrementMessageCount(sessionId);
         } catch (err) {

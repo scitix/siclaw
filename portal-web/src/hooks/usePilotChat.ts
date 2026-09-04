@@ -394,6 +394,33 @@ function timingFromLlmCall(llmCall: unknown): import("../components/chat/types")
   return t
 }
 
+/** Attach a live call only to the bubble produced by that call. Tool-only calls
+ * have no streaming assistant bubble and therefore stay as hidden rows after
+ * reload instead of overwriting the previous visible answer's timing. */
+export function attachLiveAssistantCall(
+  messages: PilotMessage[],
+  timing?: import("../components/chat/types").MessageTiming,
+  route?: ModelRouteMetadata | null,
+): PilotMessage[] {
+  if (!timing && !route) return messages
+  const idx = findLastMessageIndex(messages, (m) =>
+    m.role === "assistant" &&
+    m.metadata?.kind !== "model_route_notice" &&
+    m.metadata?.kind !== "delegation_status_notice",
+  )
+  if (idx < 0) return messages
+  const current = messages[idx]
+  const applyTiming = timing && current.isStreaming
+  if (!applyTiming && !route) return messages
+  const mergedTiming = applyTiming ? { ...(current.timing ?? {}), ...timing } : current.timing
+  const next = {
+    ...current,
+    ...(mergedTiming && Object.keys(mergedTiming).length > 0 ? { timing: mergedTiming } : {}),
+    ...(route ? { metadata: { ...(current.metadata ?? {}), model_route: route } } : {}),
+  }
+  return [...messages.slice(0, idx), next, ...messages.slice(idx + 1)]
+}
+
 function extractTiming(metadata: Record<string, unknown> | undefined, durationMs: number | null | undefined): import("../components/chat/types").MessageTiming | undefined {
   // Assistant model-call rows: metadata.llm_call.ms (measured at the provider
   // boundary by the runtime). Tool rows: duration_ms is its own column.
@@ -1879,35 +1906,7 @@ export function usePilotChat({ agentId, sessionId, forceLive }: UsePilotChatOpti
             currentModelRouteRef.current = evtRoute
           }
           if (endMsg?.role === "assistant" && (evtTiming || evtRoute)) {
-            setMessages((prev) => {
-              const idx = findLastMessageIndex(prev, (m) =>
-                m.role === "assistant" &&
-                m.metadata?.kind !== "model_route_notice" &&
-                m.metadata?.kind !== "delegation_status_notice",
-              )
-              if (idx < 0) return prev
-              const current = prev[idx]
-              // ⚠️ Timing goes ONLY onto the bubble this call is still streaming
-              // into. A live bubble is created from text (see `agent_message`), so
-              // a call that produced only tool calls has none — and the search
-              // above would land on the PREVIOUS call's finished bubble, badging
-              // it with a partition that is not its own. On reload the tool-only
-              // call is its own (hidden) row and the older bubble gets its own
-              // envelope back, so the live view would disagree with the reloaded
-              // one for exactly as long as the turn lasts.
-              //
-              // isStreaming is still true here: this case clears it further down.
-              // The route attach is deliberately NOT gated — it targeted the last
-              // visible assistant before the llm_call work and still should.
-              const applyTiming = evtTiming && current.isStreaming
-              const timing = applyTiming ? { ...(current.timing ?? {}), ...evtTiming } : current.timing
-              const next = {
-                ...current,
-                ...(timing && Object.keys(timing).length > 0 ? { timing } : {}),
-                ...(evtRoute ? { metadata: { ...(current.metadata ?? {}), model_route: evtRoute } } : {}),
-              }
-              return [...prev.slice(0, idx), next, ...prev.slice(idx + 1)]
-            })
+            setMessages((prev) => attachLiveAssistantCall(prev, evtTiming, evtRoute))
           }
           if (endMsg?.role === "toolResult" && endMsg.details && Object.keys(endMsg.details).length > 0) {
             // Pi-agent brain: tool result details arrive via message_end (not tool_execution_end).
