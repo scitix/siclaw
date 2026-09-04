@@ -21,7 +21,7 @@
  */
 
 import { getCommandBinary } from "./command-sets.js";
-import { alignPipelineStages, isBenignSigpipe } from "./pipeline-status.js";
+import { alignPipelineStages, isBenignSigpipe, hasConditionalChain } from "./pipeline-status.js";
 
 export type ExitClass =
   | "success"
@@ -247,8 +247,12 @@ export function classifyExit(opts: {
           + "says success and the output above is NOT a complete answer. An empty result here means the "
           + "EARLIER stage failed, not that nothing matched. Fix the failing stage; see STDERR for its "
           + "error."
-          + (aligned ? "" : " (This command chains pipelines with `&&`/`||`, so which command the status "
-            + "belongs to could not be determined — run the failing pipeline on its own to see it.)")
+          + (aligned ? ""
+            : hasConditionalChain(command)
+              ? " (This command chains pipelines with `&&`/`||`, so which of them these statuses came "
+                + "from could not be determined — run the failing pipeline on its own to see it.)"
+              : " (Which command this status belongs to could not be determined — run the pipeline on "
+                + "its own to see it.)")
           + "]",
       };
     }
@@ -257,14 +261,21 @@ export function classifyExit(opts: {
     //     agent stops re-running a query whose answer it already has.
     if (last === 0 && noMatchAt.size > 0) {
       const who = [...noMatchAt].map((i) => label(i)).join(", ");
+      // "every other stage exited 0" is not true when a downstream consumer closed the pipe and
+      // SIGPIPE'd the stages above it — `… | cat | head -3 | grep zzz | wc -l` gives [141,141,0,1,0]
+      // and lands here. The VERDICT is still right (the closure was deliberate), so only the
+      // supporting clause has to change: say no stage FAILED, and name the closure when there was one.
+      const closed = upstream.some(({ i }) => isBenignSigpipe(pipeStatuses, i));
       return {
         exitClass: "no_match",
         isError: false,
         annotation:
-          `[no_match: ${who} ran and matched nothing, and every other stage exited 0 — so the empty or `
-          + "zero result above IS the answer, not a failure. The source command succeeded; re-running "
-          + "this will return the same thing. If you expected matches, widen the pattern or the time "
-          + "window rather than repeating the call.]",
+          `[no_match: ${who} ran and matched nothing, and no other stage failed`
+          + (closed ? " (an earlier stage was ended by SIGPIPE because a later one stopped reading on "
+            + "purpose, which is how `head` finishes a pipeline)" : "")
+          + " — so the empty or zero result above IS the answer, not a failure. Re-running this will "
+          + "return the same thing. If you expected matches, widen the pattern or the time window "
+          + "rather than repeating the call.]",
       };
     }
 

@@ -465,6 +465,29 @@ describe("a filter that matched nothing is not an upstream failure", () => {
   });
 });
 
+describe("a degraded annotation states only what it observed", () => {
+  const C = (command: string, pipeStatuses: number[]) =>
+    classifyExit({ command, exitCode: 0, stdout: "", stderr: "", context: "local", pipeStatuses });
+
+  it("names `&&`/`||` only when the command actually has one", () => {
+    // Alignment fails two ways: two candidates fit (which needs a conditional), or none does. The
+    // second is reachable with no `&&`/`||` anywhere, and asserting one there is its own untruth.
+    expect(C("a; b | c", [1, 0, 0]).annotation).toMatch(/could not be determined/);
+    expect(C("a; b | c", [1, 0, 0]).annotation).not.toMatch(/&&/);
+    expect(C("false | true || echo x | true", [1, 0]).annotation).toMatch(/chains pipelines/);
+  });
+
+  it("does not claim every other stage exited 0 when one was SIGPIPE'd", () => {
+    // `… | cat | head -3 | grep zzz | wc -l` gives [141,141,0,1,0] and lands in the no_match branch.
+    // The verdict is right — the closure was deliberate — but the supporting clause was not.
+    const j = C("seq 1 200000 | cat | head -3 | grep zzz | wc -l", [141, 141, 0, 1, 0]);
+    expect(j.exitClass).toBe("no_match");
+    expect(j.isError).toBe(false);
+    expect(j.annotation).not.toMatch(/every other stage exited 0/);
+    expect(j.annotation, "the closure should be named, not hidden").toMatch(/SIGPIPE/);
+  });
+});
+
 describe("a missing metric is not a missing object", () => {
   const top = (stderr: string) =>
     classifyExit({ command: "kubectl top node css1-g65", exitCode: 1, stdout: "", stderr, context: "local" });

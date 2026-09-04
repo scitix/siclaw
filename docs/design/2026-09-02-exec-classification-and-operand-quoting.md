@@ -115,6 +115,12 @@ legitimately contains `$`, `[` and `/`; everything else is screened for path sha
   everything, so an unquoted glob placed there reached the command as an expanded list of paths — the
   first becoming the pattern, the rest becoming files it reads. This applied to every command with an
   expression slot and to pattern-supplying flags (`-e`, `--regexp`), attached or separated.
+- **Position matters as much as quoting.** bash tilde-expands only at the START of a word and
+  brace-expands only with a matching opener, so `~`, `}` and `]` mid-word are literals — `echo a~b`
+  prints `a~b`. Judging them by presence alone refused `grep a~b` and told the agent the shell would
+  turn it into file names. `*`, `?`, `[` and `{` stay unconditional: an unmatched `[` is literal in
+  bash, but `jq .items[]` and `grep -E 'a{2,3}'` are exactly the shapes that do expand, and erring
+  toward the refusal keeps the rule teachable.
 - **Quoting is the discriminator, and it is per character.** In `'$CRED'/clusters/*` the `$` is inert
   and the `*` is not. Single quotes and `$'…'` suppress everything; double quotes suppress globbing
   but **not** parameter substitution — `"$HOME/x"` really does become a path. A `$` is only live when
@@ -129,9 +135,12 @@ legitimately contains `$`, `[` and `/`; everything else is screened for path sha
   argument also contains `/` — would couple a security rule to the fact that credentials currently sit
   two levels below the working directory, and would fail silently if that ever changed. It also
   refuses `grep '^/var/log/.*$'`, an ordinary regex.
-- The refusal is machine-readable (`rejected_by: "unquoted_expansion"`, `matched`, `hint`) and the
-  hint carries the corrected command. An unquoted regex is a latent bug in its own right: a matching
-  filename in the working directory silently replaces the pattern.
+- The refusal is machine-readable (`rejected_by: "unquoted_expansion"`, `matched`, `hint`). The hint
+  offers the **literal form**, escaped through `shellEscape`, and does not claim to be the command
+  the caller meant: the value it quotes is the PARSED one, so re-quoting `"$HOME/x"` yields a pattern
+  matching the characters `$HOME/x` rather than the path that was intended. Naming the intent is the
+  caller's job. An unquoted regex is a latent bug in its own right — a matching filename in the
+  working directory silently replaces the pattern.
 - **`blockedFlags` names a switch, which is not always where the capability lives.** GNU grep spells
   recursion both `-r` and `-d recurse`; blocking only the former left the identical capability one
   synonym away, and a recursive grep started at `.` walks the working directory while naming no path
@@ -150,6 +159,20 @@ legitimately contains `$`, `[` and `/`; everything else is screened for path sha
   that cannot mean a blocked flag (`--reg` for `--regexp`) is unaffected, and an ambiguous one that
   real grep would refuse anyway is refused here too.
 
+  One-sidedness has a corollary: **a spelling that is never listed is never reached.** `-R` was
+  blocked while its long form `--dereference-recursive` was not, so the capability stayed one synonym
+  away; every spelling of a blocked capability has to be named.
+
+  And the reverse: **an exact option is not an abbreviation of anything.** `getopt_long` prefers an
+  exact match, so `dmidecode --dump` (SMBIOS to stdout) is `--dump` and never `--dump-bin`. A command
+  whose legitimate option is a prefix of a blocked one must declare it (`exactFlags`), or resolution
+  refuses a working command *and* explains it with a shell behaviour that does not exist.
+
+- **A short cluster carries its value from the first value-taking letter, and splitting on `=` does
+  not see that.** `-id recurse` is `-i -d recurse` to getopt, taking the value from the next argv, so
+  a check that reads the token as one flag misses the map entirely. Cluster decomposition is not an
+  optimisation here; it is the difference between the check running and not running.
+
 ## Agent-visible changes
 
 Annotation text and outcome change for these shapes. Anything reading tool outcomes should expect
@@ -164,6 +187,7 @@ fewer failures, not different ones.
 | `grep -A 5 '<regex>'`, `yq -o json '<filter>'`, `jq --arg k v '<filter>'` | refused as a file operand | runs |
 | Unquoted glob in an expression slot | ran, reading files | refused with a corrected command |
 | Unquoted `jq`/`yq` filter containing brackets (`jq .items[]`, `.items[0]`, `.spec.containers[].name`) | ran | refused; quote the filter |
+| `grep a~b`, `grep a}b` (metacharacter where bash does not expand) | refused | runs |
 | `… \| grep -v X \| head -N` (cascaded SIGPIPE) | `pipeline_upstream_failed`, error | `success` |
 | `grep -d recurse` | ran | refused |
 
@@ -178,6 +202,9 @@ fewer failures, not different ones.
 - Bracketless unquoted filters (`jq .metadata.name`, `jq -r .status.phase`) are unaffected; only a
   filter carrying an expansion metacharacter is refused. This is the highest-frequency shape in the
   new refusals, which is why it is named in the table above rather than left to be discovered.
+- A degraded annotation names `&&`/`||` only when the command has one. Alignment also fails when no
+  candidate fits at all (a brace group, `|&`, any construct whose segment count disagrees with what
+  bash forked), and asserting a chain there is its own untruth.
 - `grep -D read` is left alone: `-d read` on a directory fails at the source, so it is not the same
   vector as `-d recurse`.
 - Option arity is now declared in two places for two different questions — whether a value beginning

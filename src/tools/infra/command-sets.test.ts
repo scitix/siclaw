@@ -2341,6 +2341,20 @@ describe("quoting decides whether an expression becomes a path", () => {
     reject("tr .siclaw/*/*/* abc");
   });
 
+  it("judges a metacharacter by position, not by presence", () => {
+    // bash tilde-expands only at the start of a word and brace-expands only with a matching opener,
+    // so a `~`, `}` or `]` mid-word is a literal — `echo a~b` prints `a~b`. Refusing those told the
+    // agent something untrue about its own command.
+    allow("grep a~b");
+    allow("grep a}b");
+    allow("grep a]b");
+    // The ones that really do expand stay refused.
+    reject("grep ~/x");
+    reject("grep a{2,3}");
+    reject("jq .items[]");
+    reject("grep .siclaw/*/*/*");
+  });
+
   it("says what was wrong and how to fix it", () => {
     // The bare refusal it replaces named neither the argument nor a way through, so the agent tried
     // a different command and was refused again.
@@ -2348,6 +2362,10 @@ describe("quoting decides whether an expression becomes a path", () => {
     expect(err.rejected_by).toBe("unquoted_expansion");
     expect(err.matched).toBe("*");
     expect(err.hint, "the hint must be copy-pasteable").toContain(`'.siclaw/*/*/*'`);
+    // Escaped through shellEscape, not wrapped in bare quotes: an expression containing a `'` would
+    // otherwise be handed back with an unterminated quote.
+    const withQuote = JSON.parse(validateCommandRestrictions(`grep "a'b"*`, local)!);
+    expect(withQuote.hint).toContain(`'a'\\''b*'`);
   });
 
   it("leaves the operand slot exactly as it was", () => {
@@ -2412,6 +2430,44 @@ describe("option arity in the stdin-only layer", () => {
     reject("grep -r pat .");
     allow("grep -d skip pat");
     allow("grep --directories=skip pat");
+  });
+
+  it("decomposes a short cluster, which is where the value actually hides", () => {
+    // `extractFlag` splits on `=` and nothing else, so a cluster arrived whole and missed the map:
+    // getopt reads `-id recurse` as `-i -d recurse`, taking the value from the next argv.
+    reject("grep -id recurse -l cred .");
+    reject("grep -in -d recurse -l cred .");
+    reject("grep -idrecurse -l cred .");
+    allow("grep -id skip pat");
+  });
+
+  it("refuses the long spelling of an already-blocked short flag", () => {
+    // `-R` was blocked but `--dereference-recursive` was not, and prefix resolution is one-sided —
+    // it maps an abbreviation ONTO something blocked, so a spelling that is never listed is never
+    // reached.
+    reject("grep --dereference-recursive -l cred .");
+    reject("grep --deref pat .");
+  });
+
+  it("does not read an exact option as an abbreviation of a blocked one", () => {
+    // getopt_long prefers an exact match, so `dmidecode --dump` (SMBIOS to stdout) is `--dump` and
+    // never `--dump-bin`. Resolving it refused a working command AND explained it with a shell
+    // behaviour that does not exist.
+    const L = undefined;
+    expect(validateCommandRestrictions("dmidecode --dump", L)).toBeNull();
+    expect(validateCommandRestrictions("dmidecode --dump -t 1", L)).toBeNull();
+    expect(validateCommandRestrictions("dmidecode -u", L)).toBeNull();
+    expect(validateCommandRestrictions("dmidecode --dump-bin /tmp/x", L)).not.toBeNull();
+    expect(validateCommandRestrictions("dmidecode --dump-b /tmp/x", L)).not.toBeNull();
+  });
+
+  it("still screens a consumed value for a file-reading flag", () => {
+    // Consuming the token freed the pattern quota but also stopped it being read as a flag, so the
+    // `-f` refusal was lost. Today's grep rejects `-m -f` itself, so this is a floor being restored
+    // rather than a live hole closed.
+    reject("grep -m -f /etc/shadow");
+    reject("grep -A 5 -f /etc/shadow");
+    allow("grep -m 5 'a.*b'");
   });
 
   it("refuses the abbreviations the option parser accepts", () => {

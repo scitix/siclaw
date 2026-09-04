@@ -121,6 +121,18 @@ export function isBenignSigpipe(statuses: number[], index: number): boolean {
   return i < statuses.length && statuses[i] === 0;
 }
 
+/**
+ * Did the command join pipelines with a separator that can SHORT-CIRCUIT?
+ *
+ * `alignPipelineStages` returns null for two different reasons — two candidates fit equally well
+ * (which needs `&&`/`||`), or no candidate fits at all (a brace group, `|&`, anything whose segment
+ * count disagrees with what bash forked). A caller explaining the degradation may only name the
+ * first when it is actually true, so it has to ask.
+ */
+export function hasConditionalChain(command: string): boolean {
+  return extractPipeline(command).some((seg) => seg.sep === "&&" || seg.sep === "||");
+}
+
 /** One stage's status together with the command that produced it. */
 export interface AlignedStage {
   status: number;

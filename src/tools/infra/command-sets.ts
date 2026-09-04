@@ -39,8 +39,20 @@ export interface ParsedArg {
   expansion?: string;
 }
 
-/** Metacharacters the shell acts on only when they are UNQUOTED. Double quotes suppress all of these. */
-const GLOB_METACHARS = new Set(["*", "?", "[", "]", "{", "}", "~"]);
+/**
+ * Metacharacters the shell acts on only when they are UNQUOTED, and only where POSITION allows.
+ *
+ * `*` and `?` are live anywhere. The rest are not, and treating them as unconditional produced
+ * refusals whose stated reason was false: bash tilde-expands only at the START of a word and
+ * brace-expands only with a matching opener, so `echo a~b` prints `a~b` and `grep a~b` was being
+ * told the shell would turn it into file names.
+ *
+ * `[` and `{` stay unconditional on purpose — an unmatched one is literal in bash, but `jq .items[]`
+ * and `grep -E 'a{2,3}'` are exactly the shapes that DO expand, and erring toward the refusal keeps
+ * the rule teachable ("quote the expression").
+ */
+const GLOB_ALWAYS = new Set(["*", "?", "[", "{"]);
+const GLOB_CLOSERS = new Map([["}", "{"], ["]", "["]]);
 
 /**
  * Would `$` here begin an expansion?
@@ -62,13 +74,23 @@ function beginsExpansion(next: string | undefined): boolean {
  * does become a path. Characters reached through a backslash never reach here at all; the caller
  * appends them directly, which is what makes `"\$HOME"` a literal.
  */
-function activeMetachar(ch: string, next: string | undefined, inQuote: string | null): string | null {
+function activeMetachar(
+  ch: string,
+  next: string | undefined,
+  inQuote: string | null,
+  atWordStart: boolean,
+  unquotedOpeners: Set<string>,
+): string | null {
   if (inQuote === "'" || inQuote === "\u0001") return null;
   if (ch === "$") return beginsExpansion(next) ? "$" : null;
   // Backticks are rejected outright by validateShellOperators, so this arm never fires today. It is
   // here so the rule reads completely, not as a defence anything relies on.
   if (ch === "`") return "`";
-  if (GLOB_METACHARS.has(ch)) return inQuote === null ? ch : null;
+  if (inQuote !== null) return null;
+  if (GLOB_ALWAYS.has(ch)) return ch;
+  if (ch === "~") return atWordStart ? "~" : null;
+  const opener = GLOB_CLOSERS.get(ch);
+  if (opener) return unquotedOpeners.has(opener) ? ch : null;
   return null;
 }
 
@@ -87,6 +109,8 @@ export function parseArgsWithExpansion(command: string): ParsedArg[] {
   const args: ParsedArg[] = [];
   let current = "";
   let expansion: string | undefined;
+  // Openers seen UNQUOTED in the argument so far, so `}` and `]` can be judged against one.
+  let openers = new Set<string>();
   let inQuote: string | null = null;
   // An explicitly quoted argument survives even when it is EMPTY. Dropping it silently renumbered
   // every positional after it: `grep "" .siclaw/*/*/*` arrived as ["grep", ".siclaw/*/*/*"], so the
@@ -98,6 +122,7 @@ export function parseArgsWithExpansion(command: string): ParsedArg[] {
     current = "";
     quotedEmpty = false;
     expansion = undefined;
+    openers = new Set();
   };
   const chars = [...command];
   for (let i = 0; i < chars.length; i++) {
@@ -112,7 +137,7 @@ export function parseArgsWithExpansion(command: string): ParsedArg[] {
       if (ch === inQuote || (inQuote === "\u0001" && ch === "'")) {
         inQuote = null;
       } else {
-        expansion ??= activeMetachar(ch, chars[i + 1], inQuote) ?? undefined;
+        expansion ??= activeMetachar(ch, chars[i + 1], inQuote, current.length === 0, openers) ?? undefined;
         current += ch;
       }
     } else if (ch === "$" && chars[i + 1] === "'") {
@@ -134,7 +159,8 @@ export function parseArgsWithExpansion(command: string): ParsedArg[] {
     } else if (ch === " " || ch === "\t") {
       flush();
     } else {
-      expansion ??= activeMetachar(ch, chars[i + 1], inQuote) ?? undefined;
+      expansion ??= activeMetachar(ch, chars[i + 1], inQuote, current.length === 0, openers) ?? undefined;
+      if (inQuote === null && (ch === "{" || ch === "[")) openers.add(ch);
       current += ch;
     }
   }
@@ -337,6 +363,16 @@ interface InternalRule {
    * prevent. Keyed by a Map because both the flag and the value come from the caller.
    */
   blockedFlagValues?: ReadonlyMap<string, readonly string[]>;
+  /**
+   * Complete option spellings that happen to be a PREFIX of a blocked one.
+   *
+   * `getopt_long` prefers an exact match over an abbreviation, so `dmidecode --dump` is `--dump` and
+   * never `--dump-bin`. Prefix resolution cannot know that on its own — it sees only the denylist —
+   * so a command whose legitimate option is a prefix of a blocked one has to say so here. Without
+   * it, resolution refuses a working command AND explains it with a shell behaviour that does not
+   * exist, which is the failure mode this file exists to remove.
+   */
+  exactFlags?: readonly string[];
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
   positionals?: "allow" | "block" | number;
@@ -447,11 +483,11 @@ function validateByRule(
         const named = extractFlag(arg);
         const blocked = rule.blockedFlags.includes(named)
           ? named
-          : blockedLongAbbrev(named, rule.blockedFlags);
+          : blockedLongAbbrev(named, rule.blockedFlags, rule.exactFlags ?? rule.allowedFlags);
         if (blocked) {
           return JSON.stringify({
             error: `${cmd} "${named}" is not allowed`
-              + (blocked === named ? "." : ` — the shell's option parser reads it as "${blocked}".`),
+              + (blocked === named ? "." : ` — the option parser accepts it as an abbreviation of "${blocked}".`),
           }, null, 2);
         }
       } else if (arg.length > 1) {
@@ -466,20 +502,37 @@ function validateByRule(
       }
     }
 
-    // blockedFlagValues: the flag is fine, this value is not. Handles all three spellings the shell
-    // allows for a value — `--directories=recurse`, `-d recurse` and `-drecurse`.
+    // blockedFlagValues: the flag is fine, this value is not.
+    //
+    // Every spelling the shell allows has to be reached, and `extractFlag` alone reaches only two of
+    // them: it splits on `=` and nothing else, so a SHORT CLUSTER arrives whole. `-id recurse` is
+    // `-i -d recurse` to getopt — the value comes from the next argv — and reading the token as the
+    // single flag `-id` missed the map entirely. An earlier revision of this comment claimed
+    // `-drecurse` was covered; it was not, and only the per-letter `blockedFlags` scan above caught
+    // it, by accident, through the `r` inside the word `recurse`. A banned value without an `r` in it
+    // went straight through.
     if (rule.blockedFlagValues && arg.startsWith("-")) {
       const named = extractFlag(arg);
-      const flag = rule.blockedFlagValues.has(named)
+      const resolved = rule.blockedFlagValues.has(named)
         ? named
-        : blockedLongAbbrev(named, rule.blockedFlagValues.keys()) ?? named;
+        : blockedLongAbbrev(named, rule.blockedFlagValues.keys(), rule.exactFlags ?? rule.allowedFlags) ?? named;
+      // (flag, attached-value) candidates: the long/`=` reading first, then each letter of a short
+      // cluster from the position where a value-taking one appears.
+      const candidates: Array<[string, string]> = [
+        [resolved, arg.length > named.length ? arg.slice(named.length).replace(/^=/, "") : ""],
+      ];
+      if (!arg.startsWith("--") && arg.length > 2) {
+        for (let c = 1; c < arg.length; c++) {
+          const short = `-${arg[c]}`;
+          if (rule.blockedFlagValues.has(short)) candidates.push([short, arg.slice(c + 1)]);
+        }
+      }
+      for (const [flag, attached] of candidates) {
       const banned = rule.blockedFlagValues.get(flag);
       if (banned) {
-        // Sliced by the length of what was WRITTEN, not of the canonical flag it resolves to:
-        // `--di=recurse` is 12 characters and `--directories` is 13, so slicing by the canonical
-        // length yielded "" and the check fell through to the next token. `--directorie=recurse`
-        // happened to survive that bug because the two lengths differed by exactly one.
-        const attached = arg.length > named.length ? arg.slice(named.length).replace(/^=/, "") : "";
+        // The value is whatever was attached after the flag, else the next token. Attached is sliced
+        // by what was WRITTEN, not by the canonical flag a prefix resolved to: `--di=recurse` is
+        // shorter than `--directories`, so slicing by the canonical length yielded "".
         const value = attached || args[i + 1] || "";
         if (banned.includes(value.toLowerCase())) {
           return JSON.stringify({
@@ -487,6 +540,7 @@ function validateByRule(
               + `flags on this command, spelled differently.`,
           }, null, 2);
         }
+      }
       }
     }
 
@@ -1307,7 +1361,13 @@ function rejectUnquotedExpansion(baseName: string, arg: string, expansion: strin
       + `into file names before ${baseName} runs — so this would be a list of paths, not a pattern.`,
     matched: expansion,
     rejected_by: "unquoted_expansion",
-    hint: `Quote the expression so the shell passes it through literally: ${baseName} ... '${arg}'`,
+    // shellEscape, not bare quotes: an expression containing a `'` would otherwise be handed back
+    // with an unterminated quote. And this is offered as the LITERAL form, not as "the command you
+    // meant" — `arg` is the parsed value, so re-quoting `"$HOME/x"` yields a pattern that matches the
+    // three characters `$HO…` rather than the path the caller was after. Naming the intent is the
+    // caller's job; ours is to say what would stop the shell rewriting it.
+    hint: `The shell rewrites this before ${baseName} sees it. To match it literally, quote it: `
+      + `${shellEscape(arg)}. If you meant a file, ${baseName} cannot read one here — use the file tools.`,
   }, null, 2);
 }
 
@@ -1322,8 +1382,14 @@ function rejectUnquotedExpansion(baseName: string, arg: string, expansion: strin
  * blocked, so an ambiguous prefix that real grep would refuse anyway is refused here too, while a
  * prefix that cannot mean a blocked flag (`--reg` for `--regexp`) is untouched.
  */
-function blockedLongAbbrev(flag: string, blocked: Iterable<string>): string | null {
+function blockedLongAbbrev(
+  flag: string,
+  blocked: Iterable<string>,
+  exact?: readonly string[],
+): string | null {
   if (!flag.startsWith("--") || flag.length <= 2) return null;
+  // An exact option wins over any abbreviation, as it does in getopt_long.
+  if (exact?.includes(flag)) return null;
   for (const candidate of blocked) {
     if (candidate.startsWith("--") && candidate !== flag && candidate.startsWith(flag)) return candidate;
   }
@@ -1399,6 +1465,16 @@ function applyContextPolicy(
       // `grep -m /etc/shadow` from hiding a path there. Both halves are load-bearing.
       if (plainValuesLeft > 0) {
         plainValuesLeft--;
+        // Screened as a file-reading FLAG as well as for path shape. Consuming the token is what
+        // frees the pattern quota, but it also stopped the token being read as a flag at all — so
+        // `grep -m -f /etc/shadow` lost the `-f` refusal it used to get. Today's grep rejects that
+        // combination itself (`invalid max count`), which makes this a weakened floor rather than a
+        // live hole; restoring it costs nothing.
+        if (spec?.fileFlags?.includes(extractFlag(arg))) {
+          return JSON.stringify({
+            error: `${baseName} "${extractFlag(arg)}" reads a file, which is not allowed here — ${baseName} may only process piped input. Use the dedicated file tools to read a file.`,
+          }, null, 2);
+        }
         const err = rejectPathishOperand(baseName, arg, `flag value for "${plainValueFlag}"`);
         if (err) return err;
         continue;
@@ -1526,6 +1602,7 @@ function applyCommandConstraints(
     command: baseName,
     blockedFlags: def.blockedFlags,
     blockedFlagValues: def.blockedFlagValues,
+    exactFlags: def.exactFlags,
     allowedFlags: def.allowedFlags,
     allowedSubcommands: def.allowedSubcommands,
     positionals: def.positionals,
@@ -2016,6 +2093,16 @@ export interface CommandDef {
    * prevent. Keyed by a Map because both the flag and the value come from the caller.
    */
   blockedFlagValues?: ReadonlyMap<string, readonly string[]>;
+  /**
+   * Complete option spellings that happen to be a PREFIX of a blocked one.
+   *
+   * `getopt_long` prefers an exact match over an abbreviation, so `dmidecode --dump` is `--dump` and
+   * never `--dump-bin`. Prefix resolution cannot know that on its own — it sees only the denylist —
+   * so a command whose legitimate option is a prefix of a blocked one has to say so here. Without
+   * it, resolution refuses a working command AND explains it with a shell behaviour that does not
+   * exist, which is the failure mode this file exists to remove.
+   */
+  exactFlags?: readonly string[];
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
   positionals?: "allow" | "block" | number;
@@ -2036,11 +2123,11 @@ export interface CommandDef {
  */
 export const COMMANDS: Record<string, CommandDef> = {
   // ── text processing ──
-  grep:   { category: "text", blockedFlags: ["-r", "-R", "--recursive"],
+  grep:   { category: "text", blockedFlags: ["-r", "-R", "--recursive", "--dereference-recursive"],
     blockedFlagValues: new Map([["-d", ["recurse"]], ["--directories", ["recurse"]]]) },
-  egrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"],
+  egrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive", "--dereference-recursive"],
     blockedFlagValues: new Map([["-d", ["recurse"]], ["--directories", ["recurse"]]]) },
-  fgrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"],
+  fgrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive", "--dereference-recursive"],
     blockedFlagValues: new Map([["-d", ["recurse"]], ["--directories", ["recurse"]]]) },
   sort:   { category: "text", allowedFlags: [
     "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
@@ -2139,7 +2226,10 @@ export const COMMANDS: Record<string, CommandDef> = {
   lscpu:     { category: "hardware" },
   lsmem:     { category: "hardware" },
   lshw:      { category: "hardware" },
-  dmidecode: { category: "hardware", blockedFlags: ["--dump-bin"] }, // --dump-bin <file> writes SMBIOS binary to an arbitrary file → blocked; -u/--dump (stdout) kept
+  // --dump-bin <file> writes SMBIOS binary to an arbitrary file → blocked; -u/--dump (stdout) kept.
+  // `--dump` must be declared exact: it is a prefix of the blocked spelling, and abbreviation
+  // resolution would otherwise refuse the very flag this comment says is kept.
+  dmidecode: { category: "hardware", blockedFlags: ["--dump-bin"], exactFlags: ["--dump"] },
   // ── storage / sensor / topology health (added, read-only) ──
   smartctl:  { category: "hardware", allowedFlags: SMARTCTL_FLAGS }, // default-deny: -t (self-test) / -s (set) rejected
   nvme:      { category: "hardware", allowedSubcommands: { position: 0, allowed: NVME_READ_SUBCMDS } }, // format/sanitize/write/set-feature/fw-* rejected
