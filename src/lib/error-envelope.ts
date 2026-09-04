@@ -1,6 +1,8 @@
 // Error envelope — see docs/design/error-envelope.md.
 // Wire-compatible with the management server's ErrorDetail (pkg/model/response.go).
 
+import { SESSION_CONTEXT_UNAVAILABLE_CODE } from "../shared/session-context.js";
+
 export type ErrorDetail = {
   code: string;
   message: string;
@@ -33,7 +35,9 @@ export const ErrorCodes = {
 
   AGENT_NOT_FOUND: "AGENT_NOT_FOUND",
   AGENTBOX_FAILED: "AGENTBOX_FAILED",
-  SESSION_CONTEXT_UNAVAILABLE: "SESSION_CONTEXT_UNAVAILABLE",
+  // 值来自 shared/session-context —— AgentBox 那半边只能 import shared(见那里的
+  // 注释),所以常量的归属在 shared,这里引用它而不是各写一份字面量。
+  SESSION_CONTEXT_UNAVAILABLE: SESSION_CONTEXT_UNAVAILABLE_CODE,
 
   MODEL_RATE_LIMIT: "MODEL_RATE_LIMIT",
   MODEL_OVERLOADED: "MODEL_OVERLOADED",
