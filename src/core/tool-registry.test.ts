@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { ToolRegistry, TOOL_EFFECTS, effectForTool, type ToolEntry, type ToolRefs } from "./tool-registry.js";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { ToolRegistry, TOOL_EFFECTS, effectForTool, recordMcpToolEffect, resetMcpToolEffects, type ToolEntry, type ToolRefs } from "./tool-registry.js";
 import { CAPABILITY_GROUPS } from "./tool-capabilities.js";
 
 function stubRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
@@ -243,9 +243,51 @@ describe("declared tool effects", () => {
     expect(tools[0].effect).toBe("external_write");
   });
 
-  it("defaults an unknown tool name to observe", () => {
+  it("defaults an unknown STATIC tool name to observe", () => {
+    // 静态名字落到 observe 是安全的,因为每个会改东西的内建工具都登记在 TOOL_EFFECTS
+    // 里,下面那条测试钉着这一点。动态名字(MCP)不适用 —— 见再下面那一组。
     expect(effectForTool("no_such_tool")).toBe("observe");
     expect(effectForTool("")).toBe("observe");
+  });
+
+  /**
+   * 🔴 **MCP 工具不落到 observe —— 未登记时按 external_write（P0 修复）。**
+   *
+   * ⚠️ 这一条钉的是一个**真实存在过的绕过**：MCP 工具的名字是动态的
+   * （`mcp__server__tool`），按定义登记不进 TOOL_EFFECTS，于是 `effectForTool` 对它们
+   * 一律返回 `observe`。结果是在只读调查里（ceiling=observe），**任意 MCP 写工具都能
+   * 直接执行** —— guard 认为它是读。
+   *
+   * ⚠️ TOOL_EFFECTS 的注释当时已经写明了这个洞，并指向 Envelope 的
+   * `allowedCapabilities` 作为缓解 —— 而 Sicore 侧从来没有签发过 allow-list
+   * （gate.go 明确注释说不签）。**一条只存在于注释里的控制等于没有控制。**
+   *
+   * 现在：服务器声明 readOnlyHint 才是 observe，其余一律 external_write。
+   */
+  describe("MCP 工具的 effect", () => {
+    beforeEach(() => resetMcpToolEffects());
+
+    it("没登记过的 MCP 工具按 external_write，不按 observe", () => {
+      expect(effectForTool("mcp__grafana__delete_dashboard")).toBe("external_write");
+    });
+
+    it("服务器声明 readOnlyHint 才降到 observe", () => {
+      recordMcpToolEffect("mcp__grafana__get_panel", true);
+      expect(effectForTool("mcp__grafana__get_panel")).toBe("observe");
+    });
+
+    it("readOnlyHint 缺席或为假一律 external_write", () => {
+      recordMcpToolEffect("mcp__k8s__apply", false);
+      recordMcpToolEffect("mcp__k8s__patch", undefined);
+      expect(effectForTool("mcp__k8s__apply")).toBe("external_write");
+      expect(effectForTool("mcp__k8s__patch")).toBe("external_write");
+    });
+
+    it("静态登记优先于动态记录 —— 同名内建不会被 MCP 记录覆盖", () => {
+      // 防御一种边角:某个 MCP 服务器起了个和内建重名的工具。静态声明是平台自己写的,
+      // 它说了算。
+      expect(effectForTool("bash")).toBe("external_write");
+    });
   });
 
   /**
