@@ -64,7 +64,9 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       "First use list_delegates(query=<target cluster/host/node>) to confirm WHICH agent covers the target " +
       "(the coverage is not listed here — only counts). To continue an earlier line of work with the SAME " +
       "specialist, pass the `session_id` that a prior delegation returned (the peer keeps its context); omit " +
-      "it to start a fresh session for an unrelated task.\n\n" +
+      "it to start a fresh session for an unrelated task. " +
+      "The peer's report is shown to the user on its own card, so do not repeat it back — add your judgement, " +
+      "the next step, or a synthesis across peers.\n\n" +
       "Agents you may delegate to:\n" + (rosterMd || "(none)"),
     parameters: Type.Object({
       agent_id: Type.String({ description: "The id of the agent to delegate to — the [id: …] value from the list above." }),
@@ -199,8 +201,26 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // Surface the peer session id in the TEXT (not just details) so the model can
       // pass it back as session_id to continue this peer thread on a follow-up.
       const cont = resp.peerSessionId ? `\n\n(To continue with ${member.name}, delegate again with session_id="${resp.peerSessionId}".)` : "";
+      // ⚠️ The user ALREADY SEES this report. It is rendered on the delegation
+      // card — the conclusion on the collapsed card, the peer's own full message
+      // and every tool it ran when expanded. Without this line the model does
+      // what it does with any tool result: paraphrase it. Observed in the test
+      // environment, the paraphrase silently dropped the peer's table and its
+      // whole "how this was counted" caveat, so the version the user read by
+      // default was the LOSSY one while the complete answer sat one click away.
+      //
+      // Deliberately not "say nothing": a turn still has to end with an
+      // assistant message, and a model told to be silent produces either an
+      // empty turn or a bare "done". It is given something short and legitimate
+      // to say instead. And the instruction is CONDITIONAL — synthesising across
+      // several peers, or adding its own judgement, is the coordinator's actual
+      // job and must not be suppressed.
+      const dontRestate =
+        `\n\n[The user can already read this report on the delegation card. Do NOT repeat or re-summarise ` +
+        `${member.name}'s findings — a paraphrase only loses detail. Reply with your own contribution instead: ` +
+        `the next step, a judgement call, or a synthesis if you delegated to several peers. One or two lines is enough.]`;
       return {
-        content: [{ type: "text" as const, text: `Result from ${member.name}:\n${full}${cont}` }],
+        content: [{ type: "text" as const, text: `Result from ${member.name}:\n${full}${cont}${dontRestate}` }],
         details: { ...cardBase, status: "done", summary, full_summary: full },
       };
     },
