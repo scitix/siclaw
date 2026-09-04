@@ -1068,8 +1068,8 @@ describe("startRuntime — chat.abort wiring", () => {
 // This is the break that only a CROSS-REPO assertion catches. Both sides were
 // individually correct and individually green: the control plane sent the
 // fields, the box read them — and the runtime in between never forwarded them.
-describe("startRuntime — authority binding context", () => {
-  it("forwards segmentId and taskId alongside the envelope", async () => {
+describe("startRuntime — binding context", () => {
+  it("forwards segmentId and taskId with the dispatch", async () => {
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;
     const ctx = { sendEvent: vi.fn() };
@@ -1079,14 +1079,12 @@ describe("startRuntime — authority binding context", () => {
       userId: "u",
       text: "check prod",
       sessionId: "S",
-      authorityEnvelope: "envelope.token",
       segmentId: "seg-1",
       taskId: "task-1",
     }, ctx);
     await waitFor(() => promptCalls.length > 0);
 
     expect(promptCalls[0]).toMatchObject({
-      authorityEnvelope: "envelope.token",
       segmentId: "seg-1",
       taskId: "task-1",
     });

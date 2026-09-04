@@ -17,7 +17,6 @@ import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./su
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
-import type { ToolEffect } from "../shared/tool-effects.js";
 
 export type { SessionMode };
 
@@ -31,12 +30,6 @@ export type { SessionMode };
 export type ResolvedToolDefinition = ToolDefinition & {
   /** When true, runtime must obtain explicit user approval before execution. */
   requiresUserApproval?: boolean;
-  /**
-   * How far this tool can go, carried from its registration so the authority
-   * guard can compare it against the envelope's effect ceiling. Absent =
-   * `observe` (see TOOL_EFFECTS).
-   */
-  effect?: ToolEffect;
   /**
    * Stable invocation classification emitted with tool lifecycle events.
    * Registry tools use their declarative category; tools created outside the
@@ -560,21 +553,6 @@ export interface ToolEntry {
    */
   requiresUserApproval?: boolean;
 
-  /**
-   * How far this tool can go — compared against the authority envelope's effect
-   * ceiling by the authority guard (see shared/tool-effects.ts).
-   *
-   * DECLARE IT ON EVERY TOOL THAT CAN MUTATE ANYTHING. Omitting it means
-   * `observe`, so a new mutating tool that forgets this line would run freely
-   * under an observe-only ceiling. `tool-registry.test.ts` asserts that every
-   * tool in the mutating capability groups declares a non-observe effect, which
-   * is what turns "remember to declare it" into a build failure.
-   *
-   * Must agree with TOOL_EFFECTS (a test pins that too): this field annotates
-   * the resolved ToolDefinition, while TOOL_EFFECTS is the by-name lookup the
-   * guard uses for tools that never pass through this registry.
-   */
-  effect?: ToolEffect;
 
   /**
    * Runtime availability check. Return false to skip this tool (create is not called).
@@ -615,114 +593,6 @@ export interface ToolEntry {
  * Add new modes here (and resolve them where the active mode is computed).
  */
 export type AgentMode = "normal" | "dp";
-
-/**
- * Tool name → declared effect, for the authority guard's by-name lookup.
- *
- * Why a map next to the per-entry `effect` declarations: the guard sees a NAME,
- * and not every name it sees comes from a ToolEntry. `write` and `edit` are
- * pi-agent harness built-ins with no registration here, yet they mutate the
- * workspace and must be governed by the ceiling like everything else. So this
- * map is the lookup, `ToolEntry.effect` is the resolved-definition annotation,
- * and a test asserts the two never disagree for a registered tool.
- *
- * ⚠️ DEFAULT FOR AN UNDECLARED TOOL IS `observe`. That is only safe because
- * every mutating BUILT-IN is listed here, and a test enforces it for the
- * mutating capability groups. A new tool that can change anything — inside or
- * outside this repo — MUST be added here; if it is not, the effect ceiling will
- * treat it as a read and let it run under `observe`.
- *
- * ⚠️ **动态名字（MCP）不走这个默认值。** 它们登记不进这张表，`effectForTool` 对
- * `mcp__` 前缀单独判：服务器声明 readOnlyHint 才算 observe，其余按 external_write。
- * 见下面 MCP_TOOL_EFFECTS。
- *
- * 这一段原先写的是"动态工具解析成 observe，用 envelope 的 allowedCapabilities /
- * deniedCapabilities 去约束它们" —— **那条缓解从来没有被签发过**（Sicore 侧 gate.go
- * 明确注释说不签 scope），于是只读调查里任意 MCP 写工具都能直接执行。一条只存在于
- * 注释里的控制等于没有控制，所以改成在这里 fail closed。
- */
-export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = Object.freeze({
-  // Harness built-ins (no ToolEntry): sandbox/workspace writes.
-  write: "local_write",
-  edit: "local_write",
-  // Skill authoring writes into the session's skill workspace.
-  skill_preview: "local_write",
-  // Command execution — reaches real nodes, pods and hosts.
-  bash: "external_write",
-  node_exec: "external_write",
-  pod_exec: "external_write",
-  host_exec: "external_write",
-  // Script execution — same reach, larger payload.
-  node_script: "external_write",
-  pod_script: "external_write",
-  local_script: "external_write",
-  host_script: "external_write",
-  // Amplification: each of these makes ANOTHER agent act, so its own effect is
-  // at least that of what it can start.
-  spawn_subagent: "external_write",
-  delegate_to_agent: "external_write",
-  // Scheduling persists future work that runs without a human in the loop.
-  manage_schedule: "external_write",
-  // Stops a background job this agent started: runtime state, not a real resource.
-  job_stop: "local_write",
-} satisfies Record<string, ToolEffect>);
-
-/**
- * The effect declared for a tool name; `observe` when nothing is declared.
- *
- * Fail-closed reasoning lives in TOOL_EFFECTS above: the permissive default is
- * deliberate and is held safe by the completeness of that map plus the
- * assertion test, not by hoping every ceiling is generous.
- */
-/**
- * MCP 工具的 effect —— **由发现时的 annotations 决定，缺省不是 observe。**
- *
- * ⚠️ **这是 P0 修复。** 之前 `effectForTool` 对任何未登记的名字返回 `observe`，而 MCP
- * 工具的名字是动态的、按定义登记不进 TOOL_EFFECTS。于是一个只读调查（ceiling=observe）
- * 里，**任意 MCP 写工具都能直接执行** —— guard 认为它是读，Envelope 又没有签发
- * allow-list（Sicore 侧 gate.go 刻意不签，注释里说"runtime 在工具名这一层执行"）。
- * TOOL_EFFECTS 的注释当时已经写明了这个洞并指向 allowedCapabilities 作为缓解，
- * 但那条缓解从来没有被签发过 —— 一条只存在于注释里的控制。
- *
- * 现在的判据：
- *   - MCP 服务器声明了 `annotations.readOnlyHint: true` → observe
- *   - 其余一律 external_write（它按定义要连到外部服务器上去）
- *
- * ⚠️ **readOnlyHint 是服务器自报的**，所以这不是密码学意义上的保证。它的信任级别等同于
- * "一个已注册的 skill 自己声明 effect"：MCP 服务器由平台管理员注册，在信任边界之内。
- * 真正的收紧手段是 Envelope 上的 allowed/deniedCapabilities，那是平台说了算的。
- *
- * ⚠️ **默认必须是 external_write 而不是 observe。** 不认识的工具不是"读"——
- * 它只是没被分类。安全判据在不确定时只能往严的一侧倒。
- */
-const MCP_TOOL_EFFECTS = new Map<string, ToolEffect>();
-
-/**
- * 记下一个 MCP 工具的 effect。发现工具时调用（McpClientManager）。
- *
- * ⚠️ 键是**全名**（`mcp__server__tool`），与 guard 看到的名字一致 —— guard 只拿得到
- * 名字，拿不到 ToolDefinition。
- */
-export function recordMcpToolEffect(fullName: string, readOnlyHint: boolean | undefined): void {
-  MCP_TOOL_EFFECTS.set(fullName, readOnlyHint === true ? "observe" : "external_write");
-}
-
-/** 测试用：清空已记录的 MCP 工具 effect。 */
-export function resetMcpToolEffects(): void {
-  MCP_TOOL_EFFECTS.clear();
-}
-
-export function effectForTool(name: string): ToolEffect {
-  const declared = TOOL_EFFECTS[name];
-  if (declared) return declared;
-  // ⚠️ **动态名字（MCP）不落回 observe。** 见 MCP_TOOL_EFFECTS 上面那段。
-  // 没记录过的 MCP 工具同样按 external_write 处理：发现流程没跑到、或者工具是后来
-  // 才出现的，都不构成"它是只读的"的理由。
-  if (name.startsWith(MCP_TOOL_PREFIX)) {
-    return MCP_TOOL_EFFECTS.get(name) ?? "external_write";
-  }
-  return "observe";
-}
 
 export class ToolRegistry {
   private entries: ToolEntry[] = [];
@@ -768,12 +638,6 @@ export class ToolRegistry {
       def.toolset = e.category;
       if (e.requiresUserApproval) {
         def.requiresUserApproval = true;
-      }
-      // Carry the declared effect onto the resolved definition, the same way
-      // requiresUserApproval is carried, so the authority guard can read how far
-      // this tool goes without a second lookup.
-      if (e.effect) {
-        def.effect = e.effect;
       }
       return def;
     });

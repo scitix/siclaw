@@ -182,8 +182,6 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
 
 export const registration: ToolEntry = {
   category: "workflow",
-  // Effect ceiling (shared/tool-effects.ts): makes a peer agent act on real resources.
-  effect: "external_write",
   create: createDelegateToAgentTool,
   // Coordinator-only: needs a roster + the executor, and must NOT itself be a
   // delegated turn (one-level recursion guard — a peer can't re-delegate).

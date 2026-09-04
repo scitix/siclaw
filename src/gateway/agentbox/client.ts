@@ -43,13 +43,10 @@ export interface PromptOptions {
   delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
-  /** Signed authority envelope; the box verifies and enforces it per tool call. */
-  authorityEnvelope?: string;
   /**
-   * The envelope's binding context. The box refuses an envelope whose
-   * segmentId / taskId disagree with these, so an envelope cannot be replayed
-   * onto a different turn. They must accompany every envelope that names them:
-   * an envelope bound to a segment, arriving with no segment, IS a mismatch.
+   * The control-plane segment / task this turn belongs to. They travel with the
+   * dispatch so the turn can be correlated back to the ledger, and so a retried
+   * dispatch is recognizable as the same turn rather than a new one.
    */
   segmentId?: string;
   taskId?: string;

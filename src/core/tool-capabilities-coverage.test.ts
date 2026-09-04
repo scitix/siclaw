@@ -49,24 +49,3 @@ describe("capability-group registry coverage", () => {
  * NAME means instantiating it, which needs the heavy allToolEntries graph this
  * file already imports.
  */
-describe("declared effect consistency", () => {
-  it("agrees with TOOL_EFFECTS for every registered tool", () => {
-    const stubRefs = {
-      sessionIdRef: { current: "effect-probe" },
-      sessionEventEmitter: () => {},
-      knowledgeCitationTool: { name: "knowledge_cite" },
-    } as unknown as ToolRefs;
-
-    const disagreements: string[] = [];
-    for (const entry of allToolEntries) {
-      const name = entry.create(stubRefs).name;
-      const declared = entry.effect ?? "observe";
-      const mapped = effectForTool(name);
-      if (declared !== mapped) {
-        disagreements.push(`${name}: registration says "${declared}", TOOL_EFFECTS says "${mapped}"`);
-      }
-    }
-
-    expect(disagreements).toEqual([]);
-  });
-});

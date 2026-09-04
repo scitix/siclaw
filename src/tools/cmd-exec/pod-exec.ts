@@ -312,8 +312,6 @@ Examples:
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
-  // Effect ceiling (shared/tool-effects.ts): runs commands on real clusters/nodes.
-  effect: "external_write",
   create: (refs) =>
     createPodExecTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,

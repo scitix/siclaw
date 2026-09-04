@@ -302,8 +302,6 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  // Effect ceiling (shared/tool-effects.ts): runs a script with the workload's own reach.
-  effect: "external_write",
   create: (refs) =>
     createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef, refs.userId, refs.agentId, {
       executor: refs.backgroundExecExecutor,

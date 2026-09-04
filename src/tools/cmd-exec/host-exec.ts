@@ -414,8 +414,6 @@ Examples (pass the id from host_list; names shown here for readability):
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
-  // Effect ceiling (shared/tool-effects.ts): runs commands on real hosts.
-  effect: "external_write",
   create: (refs) =>
     createHostExecTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,

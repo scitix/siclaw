@@ -44,9 +44,6 @@ export function createJobStopTool(
 
 export const registration: ToolEntry = {
   category: "workflow",
-  // Effect ceiling (shared/tool-effects.ts): terminates work this agent started.
-  // Local rather than external — it changes runtime state, not a real resource.
-  effect: "local_write",
   create: (refs) => createJobStopTool(refs),
   modes: ["web", "channel", "cli"],
   // Available once either background mode is on AND the runtime injected a stop executor

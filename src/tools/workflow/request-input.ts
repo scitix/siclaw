@@ -1,7 +1,7 @@
 /**
  * request_input — an agent signals that it needs human clarification before it
  * can continue. It is available either to a delegated peer or to a top-level
- * machine-driven turn that explicitly opts in (currently Sicore A2A).
+ * machine-driven turn that explicitly opts in (an A2A caller, say).
  *
  * Transport model (turn-based, no suspend primitive): the tool emits an
  * `input_required` event onto the session's extra-event bus, which the runtime
