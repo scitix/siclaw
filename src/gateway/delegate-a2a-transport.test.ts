@@ -76,17 +76,14 @@ function baseArgs(observe: (evt: Record<string, unknown>) => void, signal?: Abor
 describe("a2aTransportConfig", () => {
   const env = (extra: Record<string, string>) => extra as unknown as NodeJS.ProcessEnv;
 
-  // A2A 是默认,legacy 是显式退出 —— 这就是切换本身,同时也是回滚手段:
-  // 设 SICLAW_DELEGATION_TRANSPORT=legacy 即回到旧路径,不需要重新部署别的东西。
-  it("is undefined ONLY for an explicit legacy opt-out", () => {
-    expect(a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "legacy" }))).toBeUndefined();
-  });
-
-  it("defaults to A2A when the Runtime is configured at all", () => {
-    expect(a2aTransportConfig(env({
-      SICLAW_SERVER_URL: "http://control-plane-adapter:8081",
-      SICLAW_PORTAL_SECRET: "s",
-    }))).toEqual({ baseUrl: "http://control-plane-adapter:8081", token: "s" });
+  // ⚠️ 没有开关,也没有 optional 返回。A2A 是唯一的委托传输,它替掉的私有中继
+  // 已经删除 —— 没有可回退的东西,也就没有可选的余地。返回 undefined 曾经表示
+  // "走 legacy",那个含义不再存在;把返回值留成 optional 会引诱调用方去重新
+  // 发明一条背后没有实现的回退路径。
+  it("throws rather than returning undefined when the Runtime is unconfigured", () => {
+    expect(() => a2aTransportConfig(env({}))).toThrow(/requires the Runtime/);
+    // 连 legacy 也不再是逃生门。
+    expect(() => a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "legacy" }))).toThrow(/requires the Runtime/);
   });
 
   it("reuses the Runtime's OWN endpoint and adapter secret", () => {
@@ -95,7 +92,6 @@ describe("a2aTransportConfig", () => {
     // stale token. It used to demand three variables of its own because the
     // entrance authenticated a separate workload identity; that identity is gone.
     expect(a2aTransportConfig(env({
-      SICLAW_DELEGATION_TRANSPORT: "a2a",
       SICLAW_SERVER_URL: "http://control-plane-adapter:8081/",
       SICLAW_PORTAL_SECRET: "adapter-secret",
     }))).toEqual({ baseUrl: "http://control-plane-adapter:8081", token: "adapter-secret" });
@@ -106,26 +102,22 @@ describe("a2aTransportConfig", () => {
     // TLS here while the control-plane WS runs over the same plain channel would
     // have been theatre whose only real effect was an env var people set.
     expect(a2aTransportConfig(env({
-      SICLAW_DELEGATION_TRANSPORT: "a2a",
       SICLAW_SERVER_URL: "http://control-plane-adapter:8081",
       SICLAW_PORTAL_SECRET: "s",
     }))).toEqual({ baseUrl: "http://control-plane-adapter:8081", token: "s" });
   });
 
-  it("THROWS instead of silently downgrading when the flag is on but the Runtime is unconfigured", () => {
+  it("THROWS on a half-configured or invalid endpoint", () => {
     // The previous behaviour returned undefined and logged a warning, so the
     // operator who set the flag ran on the legacy relay believing otherwise.
     expect(() => a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "a2a" }))).toThrow(/requires the Runtime/);
     expect(() => a2aTransportConfig(env({
-      SICLAW_DELEGATION_TRANSPORT: "a2a",
       SICLAW_SERVER_URL: "http://cp:8081",
     }))).toThrow(/requires the Runtime/);
     expect(() => a2aTransportConfig(env({
-      SICLAW_DELEGATION_TRANSPORT: "a2a",
       SICLAW_PORTAL_SECRET: "s",
     }))).toThrow(/requires the Runtime/);
     expect(() => a2aTransportConfig(env({
-      SICLAW_DELEGATION_TRANSPORT: "a2a",
       SICLAW_SERVER_URL: "not a url",
       SICLAW_PORTAL_SECRET: "s",
     }))).toThrow(/not a valid URL/);
