@@ -38,6 +38,26 @@ function result(text: string, cited: number, unresolved?: string[]) {
   };
 }
 
+/**
+ * Resolve a page path the model passed to knowledge_cite against the pages it
+ * actually read this turn. Models copy paths from their own read calls, which
+ * may carry the mount prefix (".siclaw/knowledge/repos/…", "./repos/…") or be
+ * absolute; a literal join against knowledgeDir then misses and the cite fails
+ * for a page that was demonstrably read. Strip leading segments until the path
+ * lands on a read page; never resolve to anything that was not read.
+ */
+export function resolveCitedPagePath(value: string, knowledgeDir: string, wasRead: (absolute: string) => boolean): string {
+  const trimmed = value.trim().replaceAll("\\", "/");
+  const literal = path.resolve(path.isAbsolute(trimmed) ? trimmed : path.join(knowledgeDir, trimmed));
+  if (wasRead(literal) || path.isAbsolute(trimmed)) return literal;
+  const segments = path.posix.normalize(trimmed).split("/").filter((segment) => segment !== "" && segment !== ".");
+  for (let i = 1; i < segments.length; i++) {
+    const candidate = path.resolve(path.join(knowledgeDir, segments.slice(i).join("/")));
+    if (wasRead(candidate)) return candidate;
+  }
+  return literal;
+}
+
 /** Match selfcheck._norm_source_entry: strip raw/ or drop/, keep a leading slash. */
 export function normalizedResource(value: string): string {
   let entry = path.posix.normalize(value.trim().replaceAll("\\", "/"));
@@ -435,7 +455,7 @@ export function createKnowledgeCitationSupport(opts: {
         const pageValue = hash > 0 ? ref.slice(0, hash) : "";
         const evidenceId = hash > 0 ? ref.slice(hash + 1) : "";
         const page = pageValue
-          ? path.resolve(path.isAbsolute(pageValue) ? pageValue : path.join(opts.knowledgeDir, pageValue))
+          ? resolveCitedPagePath(pageValue, opts.knowledgeDir, (absolute) => readPages.has(absolute))
           : "";
         const root = path.resolve(opts.knowledgeDir);
         const snapshot = page ? readPages.get(page) : undefined;
@@ -510,7 +530,7 @@ export function createKnowledgeCitationSupport(opts: {
 
       if (pageArgs.length > 0) {
         const selected = pageArgs.map(({ path: value }) =>
-          path.resolve(path.isAbsolute(value) ? value : path.join(opts.knowledgeDir, value)));
+          resolveCitedPagePath(value, opts.knowledgeDir, (absolute) => readPages.has(absolute)));
         // The validated claim rides on the citation for attribution (feedback →
         // which statement, which page); it is not rendered.
         const claimByPage = new Map(selected.map((page, i) => [page, pageArgs[i].claim]));
