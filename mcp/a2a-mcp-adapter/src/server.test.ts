@@ -50,6 +50,10 @@ describe("MCP server", () => {
 
     expect(client.getInstructions()).toContain("call siclaw_wait_task");
     expect(client.getInstructions()).toContain("Never resubmit the same question");
+    expect(client.getInstructions()).toContain("self-contained brief");
+    expect(client.getInstructions()).toContain("Siclaw owns investigation scoping");
+    expect(client.getInstructions()).not.toContain("first ask it to list its bound clusters");
+    expect(client.getInstructions()).not.toContain("submit independent hypotheses concurrently");
 
     const listed = await client.listTools();
     expect(listed.tools.map((tool) => tool.name)).toEqual([
