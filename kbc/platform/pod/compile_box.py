@@ -1518,6 +1518,10 @@ _COMMAND_ACTIONS = {
     "compile.repair_test",
     # Full-library domain write/update only — not a scoped incremental turn.
     "compile.refresh_domain",
+    # An APPROVED brief proposal (KB feedback loop): a scoped repair the owner
+    # reviewed on the platform; parameters are derived server-side from the
+    # proposal row, never typed by the caller.
+    "compile.apply_proposal",
 }
 _FULL_COMPILE_ACTIONS = {
     "compile.generate", "compile.regenerate", "compile.approve_plan", "compile.resume",
@@ -1688,6 +1692,17 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
             "verdict": _bounded_string(parameters.get("verdict"), "parameters.verdict", required=True, limit=128),
             "judge_note": _bounded_string(parameters.get("judge_note"), "parameters.judge_note", limit=4000),
         }
+    elif action == "compile.apply_proposal":
+        pages = parameters.get("affected_pages") or []
+        if not isinstance(pages, list) or len(pages) > 50:
+            raise CommandRejected("parameters.affected_pages must be a list of at most 50 pages", 400)
+        parameters = {**parameters,
+            "proposal_id": _bounded_string(parameters.get("proposal_id"), "parameters.proposal_id", required=True, limit=128),
+            "title": _bounded_string(parameters.get("title"), "parameters.title", required=True, limit=512),
+            "instruction": _bounded_string(parameters.get("instruction"), "parameters.instruction", required=True, limit=16000),
+            "rationale": _bounded_string(parameters.get("rationale"), "parameters.rationale", limit=16000),
+            "affected_pages": [_bounded_string(p, f"parameters.affected_pages[{i}]", required=True, limit=512) for i, p in enumerate(pages)],
+        }
 
     return command_id, {
         "version": 1,
@@ -1728,6 +1743,14 @@ def _render_command(run: "CompileRun", command: dict) -> str:
             reference_answer=params["reference_answer"] or "(not set)",
             verdict=params["verdict"],
             judge_note=params["judge_note"] or "(none)",
+        )
+    if action == "compile.apply_proposal":
+        pages = params.get("affected_pages") or []
+        return strings[action].format(
+            title=params["title"],
+            brief=params["instruction"],
+            rationale=params.get("rationale") or "(none)",
+            pages=", ".join(pages) if pages else "(the pages the brief names)",
         )
     rendered = strings[action]
     renew = params.get("renew")

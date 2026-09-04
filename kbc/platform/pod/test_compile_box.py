@@ -6996,6 +6996,7 @@ async def main():
     await test_the_runtime_owns_the_dispatch_round_not_the_model()
     await test_typed_authoring_commands()
     await test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind()
+    await test_apply_proposal_command_renders_the_reviewed_brief()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
@@ -7600,6 +7601,41 @@ async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
         for key in ("kind_needs_conflict", "kind_needs_gap"):
             assert "{n}" in ts["file_ticket"][key] and "{docs}" in ts["file_ticket"][key]
     print("✓ file_ticket: evidence picks the kind, code owns the id, hand-written rows land unclassified")
+
+
+async def test_apply_proposal_command_renders_the_reviewed_brief():
+    """compile.apply_proposal: the box accepts only the server-derived shape and
+    renders exactly the reviewed brief — title, change, rationale, page scope —
+    in the run's locale. Missing brief/title fail closed."""
+    with tempfile.TemporaryDirectory() as td:
+        for locale, needle in (("en", "owner-approved repair proposal"), ("zh", "已批准的一条修复提案")):
+            run = compile_box.CompileRun(f"prop-{locale}", td, 1)
+            run.locale = locale
+            command_id, command = compile_box._normalize_command({
+                "command_id": f"cmd-{locale}",
+                "command": {
+                    "version": 1, "action": "compile.apply_proposal", "operation_id": "op-1", "generation": 1,
+                    "parameters": {
+                        "proposal_id": "prop-1", "title": "Fix the K8s version", "instruction": "Set the version to 1.30.2-cks on cluster-baseline.md",
+                        "rationale": "the page copied the older acceptance sheet", "affected_pages": ["cluster-baseline.md"],
+                        "smuggled": "ignored by the renderer",
+                    },
+                },
+            })
+            assert command["action"] == "compile.apply_proposal"
+            assert command["parameters"]["affected_pages"] == ["cluster-baseline.md"]
+            text = compile_box._render_command(run, command)
+            assert needle in text and "Fix the K8s version" in text and "1.30.2-cks" in text and "cluster-baseline.md" in text, text
+            assert "smuggled" not in text
+        for broken in ({"proposal_id": "p", "title": "t"}, {"proposal_id": "p", "instruction": "b"}, {"proposal_id": "p", "title": "t", "instruction": "b", "affected_pages": "x"}):
+            try:
+                compile_box._normalize_command({"command_id": "c", "command": {
+                    "version": 1, "action": "compile.apply_proposal", "operation_id": "op", "generation": 1, "parameters": broken}})
+            except compile_box.CommandRejected:
+                pass
+            else:
+                raise AssertionError(f"should reject {broken}")
+    print("✓ compile.apply_proposal renders the reviewed brief and fails closed on a malformed shape")
 
 
 async def test_the_runtime_owns_the_dispatch_round_not_the_model():
