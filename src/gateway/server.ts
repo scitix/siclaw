@@ -853,7 +853,19 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A supervisor that will need to abort this turn later supplies it BEFORE the
     // dispatch, so a lost acknowledgement still leaves it able to name the turn;
     // ordinary callers let us mint one.
-    const turnId = typeof params.turnId === "string" && params.turnId ? params.turnId : crypto.randomUUID();
+    //
+    // A dispatchId, when present, IS that id: one dispatch is one turn attempt,
+    // and the two are 1:1. Minting a fresh uuid instead would quietly disarm the
+    // box's cross-restart turn ledger (turn-ledger.ts), which de-duplicates by
+    // turnId: a retry of the same dispatch would present an id the box has never
+    // seen and run the input a second time. That is the exact case the ledger
+    // exists for — the in-process reservation cannot span a Runtime restart, and
+    // it is also released whenever a prompt fails or times out, which is precisely
+    // when the box may nonetheless be running the turn.
+    const dispatchIdParam = typeof params.dispatchId === "string" && params.dispatchId ? params.dispatchId : undefined;
+    const turnId = typeof params.turnId === "string" && params.turnId
+      ? params.turnId
+      : (dispatchIdParam ?? crypto.randomUUID());
 
     // Dispatch idempotency. A caller that lost this RPC's ack cannot know
     // whether the turn started; retrying with the same dispatchId answers that
@@ -861,7 +873,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // NEVER falls into the busy-session steer path (which would inject the same
     // input into the running turn twice). Reserved before the first await so a
     // concurrent retry cannot slip in mid-persistence.
-    const dispatchId = typeof params.dispatchId === "string" && params.dispatchId ? params.dispatchId : undefined;
+    const dispatchId = dispatchIdParam;
     const dispatchKey = dispatchId ? `${sessionId}:${dispatchId}` : undefined;
     if (dispatchKey) {
       const seen = recentDispatches.get(dispatchKey);
