@@ -278,6 +278,44 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
       }
       return undefined;
     }
+    // ── the tool record ─────────────────────────────────────────────────────
+    //
+    // The control plane sends one `toolCall` frame per CHANGE to a call, keyed
+    // by toolCallId and already de-duplicated on its side (a replayed runtime
+    // event produces no frame at all). Translate each into the peer-event shape
+    // the box-side translator already parses, so the delegation card gets the
+    // same fidelity the legacy relay gave it: name, arguments, result, outcome
+    // and duration.
+    //
+    // ⚠️ `phase` is what distinguishes a start from an end. This used to be
+    // impossible: the only tool signal was a WORKING statusUpdate whose
+    // metadata carried a bare tool name, emitted TWICE per call and identical
+    // both times, and this transport turned both into `tool_execution_end`. A
+    // coordinator therefore saw every tool twice, both times as finished, and a
+    // tool that hung looked complete.
+    const tc = frame?.toolCall?.call;
+    if (tc && typeof tc.toolCallId === "string") {
+      const running = tc.phase === "running";
+      args.observe(running
+        ? {
+            type: "tool_execution_start",
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            // The control plane canonicalises arguments to a string; the box
+            // translator accepts either form.
+            args: tc.input,
+          }
+        : {
+            type: "tool_execution_end",
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            isError: tc.phase === "error",
+            durationMs: typeof tc.durationMs === "number" ? tc.durationMs : undefined,
+            result: tc.output ? { content: [{ type: "text", text: redact(String(tc.output)) }] } : undefined,
+          });
+      return undefined;
+    }
+
     const au = frame?.artifactUpdate;
     if (au?.artifact?.parts) {
       for (const part of au.artifact.parts) {
@@ -290,10 +328,15 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
     const state = String(su.status?.state ?? "");
     const statusText = String(su.status?.message?.parts?.[0]?.text ?? "");
     if (state === "TASK_STATE_WORKING") {
-      const tool = su.metadata?.currentTool;
-      if (typeof tool === "string" && tool) {
-        args.observe({ type: "tool_execution_end", toolName: tool });
-      }
+      // Deliberately NOT translated into a tool event any more. `currentTool`
+      // is coarse progress that fires on both the start and the end of a call
+      // with no way to tell them apart — turning it into `tool_execution_end`
+      // is what made every tool appear twice and always finished. The real
+      // record arrives as `toolCall` frames above.
+      //
+      // Kept as a no-op rather than deleted: an older control plane sends only
+      // these, and a delegation against one should degrade to "no step detail"
+      // rather than to "every tool ran twice".
       return undefined;
     }
     if (state === "TASK_STATE_INPUT_REQUIRED") return parkOnInputRequired(statusText);

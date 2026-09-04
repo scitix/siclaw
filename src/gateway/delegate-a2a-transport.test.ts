@@ -140,7 +140,12 @@ describe("runA2aDelegation", () => {
 
     expect(outcome).toMatchObject({ taskId: "t1", remoteSessionId: "remote-s1" });
     expect(outcome.error).toBeUndefined();
-    expect(events[0]).toEqual({ type: "tool_execution_end", toolName: "kubectl" });
+    // ⚠️ A WORKING statusUpdate is NO LONGER a tool event. It fires on both the
+    // start and the end of a call and is identical both times, so translating it
+    // into `tool_execution_end` made every tool appear twice and always
+    // finished. Against a control plane that sends only these, a delegation now
+    // degrades to "no step detail" rather than to "each tool ran twice".
+    expect(events.filter((e) => String(e.type).startsWith("tool_execution"))).toEqual([]);
     const done = events.at(-1) as any;
     expect(done.type).toBe("message_end");
     expect(done.message.content[0].text).toBe("root cause: PCIe link flap");
@@ -465,6 +470,63 @@ describe("runA2aDelegation", () => {
   //
   // 控制面侧的对应实现也一并删掉了 —— 它允许同组织内任意成员被冒充,
   // 而那正是它被拿掉的原因之一。
+  // 新的保真路径:控制面按 toolCallId 去重后,每次"变化"发一帧 toolCall,
+  // 传输把它翻译成 box 侧翻译器已经能解析的那套富事件。
+  it("translates toolCall frames into rich start/end events", async () => {
+    const toolCall = (call: Record<string, unknown>) => ({ toolCall: { taskId: "t1", call } });
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [
+        workingTask("t1"),
+        toolCall({ toolCallId: "c1", toolName: "kubectl", phase: "running", input: '{"ns":"default"}' }),
+        toolCall({ toolCallId: "c1", toolName: "kubectl", phase: "success", output: "5 nodes", durationMs: 1200 }),
+        statusUpdate("TASK_STATE_COMPLETED", "done"),
+      ]),
+    );
+    const events: Array<Record<string, unknown>> = [];
+    await runA2aDelegation(baseArgs((e) => events.push(e)));
+
+    const tools = events.filter((e) => String(e.type).startsWith("tool_execution"));
+    // 一次调用两帧 → 一个 start + 一个 end,配对靠 toolCallId。
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({
+      type: "tool_execution_start", toolCallId: "c1", toolName: "kubectl", args: '{"ns":"default"}',
+    });
+    expect(tools[1]).toMatchObject({
+      type: "tool_execution_end", toolCallId: "c1", toolName: "kubectl", isError: false, durationMs: 1200,
+    });
+    // 结果文本是 box 侧翻译器构造 DelegateStep.content 的来源。
+    expect((tools[1] as any).result.content[0].text).toBe("5 nodes");
+  });
+
+  // 失败的工具必须显示为失败,而不是中性完成。
+  it("marks a failed tool call as an error", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [
+        workingTask("t1"),
+        { toolCall: { taskId: "t1", call: { toolCallId: "c1", toolName: "bash", phase: "error", output: "boom" } } },
+        statusUpdate("TASK_STATE_COMPLETED", "done"),
+      ]),
+    );
+    const events: Array<Record<string, unknown>> = [];
+    await runA2aDelegation(baseArgs((e) => events.push(e)));
+    const end = events.find((e) => e.type === "tool_execution_end") as any;
+    expect(end.isError).toBe(true);
+  });
+
+  // 工具结果也过脱敏 —— 它和参数是链路上风险最高的载荷。
+  it("redacts tool output before the coordinator's model sees it", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [
+        workingTask("t1"),
+        { toolCall: { taskId: "t1", call: { toolCallId: "c1", toolName: "bash", phase: "success", output: "key=sk-secret123" } } },
+        statusUpdate("TASK_STATE_COMPLETED", "done"),
+      ]),
+    );
+    const events: Array<Record<string, unknown>> = [];
+    await runA2aDelegation({ ...baseArgs((e) => events.push(e)), redact: (t) => t.replace(/sk-\S+/g, "[redacted]") });
+    expect(JSON.stringify(events)).not.toContain("sk-secret123");
+  });
+
   it("carries the delegation marker on BOTH the open and the resume", async () => {
     routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
       sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
