@@ -76,9 +76,17 @@ function baseArgs(observe: (evt: Record<string, unknown>) => void, signal?: Abor
 describe("a2aTransportConfig", () => {
   const env = (extra: Record<string, string>) => extra as unknown as NodeJS.ProcessEnv;
 
-  it("is undefined only when the flag is deliberately off", () => {
-    expect(a2aTransportConfig(env({}))).toBeUndefined();
+  // A2A 是默认,legacy 是显式退出 —— 这就是切换本身,同时也是回滚手段:
+  // 设 SICLAW_DELEGATION_TRANSPORT=legacy 即回到旧路径,不需要重新部署别的东西。
+  it("is undefined ONLY for an explicit legacy opt-out", () => {
     expect(a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "legacy" }))).toBeUndefined();
+  });
+
+  it("defaults to A2A when the Runtime is configured at all", () => {
+    expect(a2aTransportConfig(env({
+      SICLAW_SERVER_URL: "http://control-plane-adapter:8081",
+      SICLAW_PORTAL_SECRET: "s",
+    }))).toEqual({ baseUrl: "http://control-plane-adapter:8081", token: "s" });
   });
 
   it("reuses the Runtime's OWN endpoint and adapter secret", () => {

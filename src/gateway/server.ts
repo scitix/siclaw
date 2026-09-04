@@ -180,12 +180,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   const credentialService = opts.credentialService;
 
   // ── Delegation transport ─────────────────────────────────
-  // Validated at STARTUP so a misconfigured A2A transport fails here instead of
-  // on the first delegation — and, critically, instead of silently downgrading
-  // to the legacy relay while the operator believes the durable A2A path is in
-  // use. a2aTransportConfig throws on a half-configured or plaintext endpoint;
-  // it returns undefined only when the flag is deliberately off.
-  a2aTransportConfig();
+  // Probed at startup so a misconfigured transport is NAMED here rather than
+  // discovered on the first delegation. Non-fatal on purpose: A2A is now the
+  // default, and a Runtime that never delegates should not fail to boot over
+  // delegation configuration it does not use.
+  //
+  // ⚠️ The dispatch path still THROWS. That is what rules out the failure this
+  // check was originally written for — silently running on the legacy relay
+  // while the operator believes A2A is in use. A delegation with a broken
+  // config fails loudly at the point of use; it does not quietly downgrade.
+  try {
+    a2aTransportConfig();
+  } catch (err) {
+    console.warn(
+      "[runtime] delegation transport is not usable:",
+      err instanceof Error ? err.message : String(err),
+      "— delegations will fail until this is fixed. Set SICLAW_DELEGATION_TRANSPORT=legacy to use the legacy relay deliberately.",
+    );
+  }
 
   // ── Session Registry resolver ────────────────────────────
   // Cache misses (e.g. async AgentBox callbacks arriving after a Runtime

@@ -45,7 +45,18 @@ const CONTEXT_MEDIA_TYPE = "application/vnd.siclaw.context+json";
  * mistaken belief about which transport is in use is not.
  */
 export function a2aTransportConfig(env: NodeJS.ProcessEnv = process.env): A2aTransportConfig | undefined {
-  if (env.SICLAW_DELEGATION_TRANSPORT !== "a2a") return undefined;
+  // ⚠️ A2A IS THE DEFAULT. `legacy` is the explicit opt-out.
+  //
+  // The flag used to default to the private relay and opt IN to A2A. Flipping it
+  // is the switch — the legacy code is still present and still tested, so this
+  // is also the rollback: set SICLAW_DELEGATION_TRANSPORT=legacy and the old
+  // path is back, with no redeploy of anything else.
+  //
+  // Deleting that code is mechanical cleanup with no behaviour change, and it
+  // comes AFTER this default has been verified in a real environment. Removing
+  // the fallback first would mean discovering any problem with nothing to fall
+  // back to.
+  if (env.SICLAW_DELEGATION_TRANSPORT === "legacy") return undefined;
   // ⚠️ REUSES THE CREDENTIAL AND ENDPOINT THE RUNTIME ALREADY HAS.
   //
   // This used to require three variables of its own — SICLAW_INNER_A2A_URL,
