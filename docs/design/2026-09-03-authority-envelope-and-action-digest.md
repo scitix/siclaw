@@ -266,3 +266,38 @@ lifecycle; see `2026-09-02-session-resume-and-input-requests.md`.
 A prompt with no `authorityEnvelope` behaves exactly as it did: no binding
 check, no guard extension, no gating. Everything above activates only for a
 governed dispatch.
+
+## Digest stability under the call path's own coercion
+
+The two digests are computed over objects that reach the runtime by different
+routes, and that asymmetry needs one accommodation:
+
+- **Proposal time** — `propose_execution` receives the intended call as an
+  opaque `Type.Unknown()`. Nothing coerces its contents.
+- **Call time** — the invocation has already been through the target tool's
+  schema. The agent core runs TypeBox's `Value.Convert` over the arguments
+  before any extension sees them, so a model-written `"60"` arrives as `60`.
+
+Digesting the raw representation would therefore produce two different digests
+whenever a model writes a scalar as a string — which models do often enough
+that this coercion exists in the first place. The visible failure is bad and
+hard to diagnose: a human approves, the re-invocation is refused as "not the
+action that was approved", the agent proposes again, and the write can never
+execute no matter how many times it is approved.
+
+`canonicalJson` therefore encodes numbers and booleans by their string form.
+This is not a weakening of the binding: the tool coerces both representations
+to the same value, so `{"replicas": 12}` and `{"replicas": "12"}` **are** the
+same action, and the digest should say so. `null` keeps its own encoding and
+strings keep theirs — the only thing erased is a representation difference the
+tool itself erases.
+
+**Residual risk, and what must verify it.** `Value.Convert` is not the only
+transformation on that path (`prepareToolCallArguments` can rewrite arguments
+for a tool that defines `prepareArguments`, and `coerceWithJsonSchema` may run
+after Convert). No shipped tool declares a JSON-Schema `default`, so default
+injection is not a factor today, but a future tool that adds one — or a
+`prepareArguments` that rewrites its input — would reintroduce the mismatch.
+A unit test cannot catch this: it builds `event.input` by hand and so never
+exercises the transformations. **The propose → approve → re-invoke round trip
+on a real agent is the gate that does**, and it belongs in the PoC.

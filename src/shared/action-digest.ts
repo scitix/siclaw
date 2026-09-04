@@ -45,6 +45,30 @@ export const DIGEST_STRIPPED_ARGS = ["approval_proposal_id", "approval_receipt"]
  * ways. Byte order is the encoding-independent choice.
  */
 function canonicalJson(value: unknown): string {
+  // Numbers and booleans are encoded by their STRING form, on purpose.
+  //
+  // The two digests are computed over two objects that reach us by different
+  // routes: `propose_execution` receives the intended call as an opaque
+  // `Unknown` (so nothing coerces its contents), while the real invocation has
+  // already been through the target tool's schema — the agent core runs
+  // TypeBox's `Value.Convert` over it, which turns a model-written `"60"` into
+  // `60`. Digesting the raw representation would therefore make the two differ
+  // whenever the model writes a scalar as a string, which models do often
+  // enough that this coercion exists at all.
+  //
+  // The failure that would cause is nasty and silent: the human approves, the
+  // re-invocation is refused as "not the action that was approved", the agent
+  // proposes again, and the write can never execute no matter how many times it
+  // is approved.
+  //
+  // Collapsing the distinction is not a weakening. The tool coerces both forms
+  // to the same value, so `{"replicas": 12}` and `{"replicas": "12"}` ARE the
+  // same action; the digest should say so. `null` keeps its own encoding, and
+  // strings keep theirs — the only thing erased is a representation difference
+  // the tool itself erases.
+  if (typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(String(value));
+  }
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) {
     // Array order is part of the action ([a, b] is not [b, a]), so it is kept.
