@@ -82,3 +82,31 @@ describe("actionDigest", () => {
     expect(actionDigest("k8s_scale", { replicas: 12 })).toBe(digest);
   });
 });
+
+// The two digests are computed over objects that arrive by different routes:
+// the proposal's copy is opaque (`Type.Unknown`), while the real invocation has
+// been through the target tool's schema, where the agent core runs TypeBox's
+// Value.Convert. A model that writes "60" instead of 60 would otherwise produce
+// two different digests — and the visible symptom is a human approving a change
+// that can never execute, forever.
+describe("actionDigest — stable under the coercion the call path applies", () => {
+  it("treats a string-written scalar as the number the tool will coerce it to", () => {
+    expect(actionDigest("k8s_scale", { replicas: "12" }))
+      .toBe(actionDigest("k8s_scale", { replicas: 12 }));
+    expect(actionDigest("pod_exec", { timeout_seconds: "60", cmd: "ls" }))
+      .toBe(actionDigest("pod_exec", { timeout_seconds: 60, cmd: "ls" }));
+  });
+
+  it("treats a string-written boolean the same way", () => {
+    expect(actionDigest("t", { force: "true" })).toBe(actionDigest("t", { force: true }));
+  });
+
+  it("collapses the representation, not the value", () => {
+    expect(actionDigest("t", { replicas: 12 })).not.toBe(actionDigest("t", { replicas: 13 }));
+    expect(actionDigest("t", { force: true })).not.toBe(actionDigest("t", { force: false }));
+    // null keeps its own identity — it is not the string "null".
+    expect(actionDigest("t", { x: null })).not.toBe(actionDigest("t", { x: "null" }));
+    // and nesting is not flattened away
+    expect(actionDigest("t", { a: { b: 1 } })).not.toBe(actionDigest("t", { a: { b: 2 } }));
+  });
+});
