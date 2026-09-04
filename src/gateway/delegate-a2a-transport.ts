@@ -260,12 +260,64 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
     return { error: redact(detail), taskId, remoteSessionId };
   };
 
+  /**
+   * Translate ONE tool record into the peer-event shapes the box-side
+   * translator already parses, so the delegation card gets name, arguments,
+   * result, outcome and duration.
+   *
+   * ⚠️ `phase` is what distinguishes a start from an end. This used to be
+   * impossible: the only tool signal was a WORKING statusUpdate whose metadata
+   * carried a bare tool name, emitted TWICE per call and identical both times,
+   * and this transport turned both into `tool_execution_end`. A coordinator
+   * therefore saw every tool twice, both times as finished, and a tool that
+   * hung looked complete.
+   *
+   * Idempotent per (toolCallId, phase): the same record reaches us from the
+   * live frame AND from a snapshot replay, and a card that showed a tool twice
+   * is the exact failure this whole path exists to fix.
+   */
+  const seenToolPhases = new Map<string, string>();
+  const emitToolRecord = (tc: any): void => {
+    if (!tc || typeof tc.toolCallId !== "string") return;
+    const phase = String(tc.phase ?? "");
+    if (seenToolPhases.get(tc.toolCallId) === phase) return;
+    seenToolPhases.set(tc.toolCallId, phase);
+    args.observe(phase === "running"
+      ? {
+          type: "tool_execution_start",
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          // The control plane canonicalises arguments to a string; the box
+          // translator accepts either form.
+          args: tc.input,
+        }
+      : {
+          type: "tool_execution_end",
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          isError: phase === "error",
+          durationMs: typeof tc.durationMs === "number" ? tc.durationMs : undefined,
+          result: tc.output ? { content: [{ type: "text", text: redact(String(tc.output)) }] } : undefined,
+        });
+  };
+
   const handleFrame = (frame: any): A2aDelegationOutcome | undefined => {
     const task = frame?.task;
     if (task?.id) {
       taskId = String(task.id);
       remoteSessionId = String(task.metadata?.sessionId ?? "");
       const state = String(task.status?.state ?? "");
+      // ⚠️ Recover the step history from the SNAPSHOT, not only from the live
+      // frames. The stream reaches attached subscribers only, so a delegation
+      // whose SSE dropped and came back through `GET /tasks/{id}` — or one that
+      // finished before our subscribe attached — would otherwise produce a card
+      // with the answer and no steps at all. That is precisely why the control
+      // plane persists the trace and puts it on every snapshot.
+      //
+      // Replayed through the SAME dedupe as the live frames, so the normal flow
+      // (snapshot first, then live frames for the same calls) emits each record
+      // exactly once.
+      for (const tc of task.metadata?.toolTrace ?? []) emitToolRecord(tc);
       if (TERMINALS.has(state)) {
         // A terminal SNAPSHOT (the turn finished before our subscribe attached)
         // carries the whole answer in task.artifacts — no artifactUpdate frames
@@ -292,37 +344,10 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
     //
     // The control plane sends one `toolCall` frame per CHANGE to a call, keyed
     // by toolCallId and already de-duplicated on its side (a replayed runtime
-    // event produces no frame at all). Translate each into the peer-event shape
-    // the box-side translator already parses, so the delegation card gets the
-    // same fidelity the legacy relay gave it: name, arguments, result, outcome
-    // and duration.
-    //
-    // ⚠️ `phase` is what distinguishes a start from an end. This used to be
-    // impossible: the only tool signal was a WORKING statusUpdate whose
-    // metadata carried a bare tool name, emitted TWICE per call and identical
-    // both times, and this transport turned both into `tool_execution_end`. A
-    // coordinator therefore saw every tool twice, both times as finished, and a
-    // tool that hung looked complete.
+    // event produces no frame at all).
     const tc = frame?.toolCall?.call;
     if (tc && typeof tc.toolCallId === "string") {
-      const running = tc.phase === "running";
-      args.observe(running
-        ? {
-            type: "tool_execution_start",
-            toolCallId: tc.toolCallId,
-            toolName: tc.toolName,
-            // The control plane canonicalises arguments to a string; the box
-            // translator accepts either form.
-            args: tc.input,
-          }
-        : {
-            type: "tool_execution_end",
-            toolCallId: tc.toolCallId,
-            toolName: tc.toolName,
-            isError: tc.phase === "error",
-            durationMs: typeof tc.durationMs === "number" ? tc.durationMs : undefined,
-            result: tc.output ? { content: [{ type: "text", text: redact(String(tc.output)) }] } : undefined,
-          });
+      emitToolRecord(tc);
       return undefined;
     }
 
