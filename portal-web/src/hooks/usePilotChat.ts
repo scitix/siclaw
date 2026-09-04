@@ -382,26 +382,49 @@ export function dropFailedAttemptOutput(messages: PilotMessage[]): PilotMessage[
   return [...head, ...tailHidden];
 }
 
-function extractTiming(metadata: Record<string, unknown> | undefined, durationMs: number | null | undefined): import("../components/chat/types").MessageTiming | undefined {
-  // Tool rows: duration_ms (⚙️ exec) is its own column; pre_thinking_ms
-  // (💭 model-thinking-before-this-tool) lives at metadata.pre_thinking_ms.
-  // Assistant rows: timing sub-object inside metadata holds ⏳ ttft, 💭
-  // thinking-before-text, and turn-total.
+/** Map a runtime `llm_call.ms` partition onto the chat's MessageTiming shape. */
+function timingFromLlmCall(llmCall: unknown): import("../components/chat/types").MessageTiming {
   const t: import("../components/chat/types").MessageTiming = {}
-  const rawTiming = metadata?.timing as Record<string, unknown> | undefined
-  if (rawTiming) {
-    if (typeof rawTiming.ttft_ms === "number") t.ttftMs = rawTiming.ttft_ms
-    if (typeof rawTiming.thinking_ms === "number") t.thinkingMs = rawTiming.thinking_ms
-    if (typeof rawTiming.output_ms === "number") t.outputMs = rawTiming.output_ms
-    if (typeof rawTiming.turn_total_ms === "number") t.turnTotalMs = rawTiming.turn_total_ms
+  const ms = (llmCall as { ms?: Record<string, unknown> } | undefined)?.ms
+  if (!ms || typeof ms !== "object") return t
+  if (typeof ms.net_ttft === "number") t.netTtftMs = ms.net_ttft
+  if (typeof ms.thinking === "number") t.thinkingMs = ms.thinking
+  if (typeof ms.output === "number") t.outputMs = ms.output
+  if (typeof ms.total === "number") t.totalMs = ms.total
+  return t
+}
+
+/** Attach a live call only to the bubble produced by that call. Tool-only calls
+ * have no streaming assistant bubble and therefore stay as hidden rows after
+ * reload instead of overwriting the previous visible answer's timing. */
+export function attachLiveAssistantCall(
+  messages: PilotMessage[],
+  timing?: import("../components/chat/types").MessageTiming,
+  route?: ModelRouteMetadata | null,
+): PilotMessage[] {
+  if (!timing && !route) return messages
+  const idx = findLastMessageIndex(messages, (m) =>
+    m.role === "assistant" &&
+    m.metadata?.kind !== "model_route_notice" &&
+    m.metadata?.kind !== "delegation_status_notice",
+  )
+  if (idx < 0) return messages
+  const current = messages[idx]
+  const applyTiming = timing && current.isStreaming
+  if (!applyTiming && !route) return messages
+  const mergedTiming = applyTiming ? { ...(current.timing ?? {}), ...timing } : current.timing
+  const next = {
+    ...current,
+    ...(mergedTiming && Object.keys(mergedTiming).length > 0 ? { timing: mergedTiming } : {}),
+    ...(route ? { metadata: { ...(current.metadata ?? {}), model_route: route } } : {}),
   }
-  // Pre-tool thinking gets surfaced as the same `thinkingMs` field — it's
-  // semantically the same emoji (💭 model reasoning) just attached to a
-  // tool row instead of a text row. UI uses one badge code path either way.
-  // No threshold: a 0/small 💭 on the 2nd-Nth tool of a batch is the visible
-  // proof that they came from one thinking burst (not N independent ones).
-  const preThinking = metadata?.pre_thinking_ms
-  if (typeof preThinking === "number") t.thinkingMs = preThinking
+  return [...messages.slice(0, idx), next, ...messages.slice(idx + 1)]
+}
+
+function extractTiming(metadata: Record<string, unknown> | undefined, durationMs: number | null | undefined): import("../components/chat/types").MessageTiming | undefined {
+  // Assistant model-call rows: metadata.llm_call.ms (measured at the provider
+  // boundary by the runtime). Tool rows: duration_ms is its own column.
+  const t = timingFromLlmCall(metadata?.llm_call)
   if (typeof durationMs === "number" && durationMs >= 0) t.durationMs = durationMs
   return Object.keys(t).length > 0 ? t : undefined
 }
@@ -556,6 +579,11 @@ export function toPilotMessage(m: ChatMessage): PilotMessage {
   // A background exec job's completion marker — folded into the launching tool's box
   // (annotateExecJobCompletions), never shown as its own row.
   const isExecJobEvent = metadata?.kind === "exec_job_event"
+  // A model call's reasoning text — its own row, folded into the timeline, never a bubble.
+  const isThinkingRow = metadata?.kind === "thinking"
+  // A model call that produced only tool calls still gets a row (it carries the
+  // call's timing/tokens in metadata.llm_call); there is nothing to render for it.
+  const isEmptyModelCallRow = m.role === "assistant" && !m.content?.trim() && metadata?.llm_call != null
   const staleRunning = isStaleRunningTool(m)
   const toolIsDelegation = isDelegationTool(m.tool_name)
   const toolStatus = toolStatusFromMessage(m)
@@ -598,7 +626,7 @@ export function toPilotMessage(m: ChatMessage): PilotMessage {
     toolDetails: m.role === "tool" ? (recoveredMetadata ?? undefined) : undefined,
     metadata: recoveredMetadata,
     timing,
-    hidden: m.hidden || isDelegationEvent || isTaskEvent || isTaskNotification || isExecJobEvent || isTaskTool(m.tool_name),
+    hidden: m.hidden || isDelegationEvent || isTaskEvent || isTaskNotification || isExecJobEvent || isThinkingRow || isEmptyModelCallRow || isTaskTool(m.tool_name),
     fromAgentId: m.from_agent_id ?? null,
     parentSessionId: m.parent_session_id ?? null,
     delegationId: m.delegation_id ?? null,
@@ -1710,11 +1738,6 @@ export function usePilotChat({ agentId, sessionId, forceLive }: UsePilotChatOpti
           const toolInput = formatToolInput(toolName ?? "", args)
           const hidden = toolName === "update_plan" || isTaskTool(toolName)
           const dbMessageId = evt.dbMessageId as string | undefined
-          // 💭 Pre-tool thinking time (gap from previous tool_end / turn-start
-          // to now). Server-stamped; matches the value persisted in the row's
-          // metadata.pre_thinking_ms, so live and reload render identically.
-          const preThinkingMs = typeof evt.preThinkingMs === "number" ? evt.preThinkingMs : undefined
-          const showThinking = preThinkingMs != null
 
           setMessages((prev) => [
             ...prev,
@@ -1730,7 +1753,6 @@ export function usePilotChat({ agentId, sessionId, forceLive }: UsePilotChatOpti
               timestamp: timeNow(),
               isStreaming: true,
               hidden,
-              ...(showThinking ? { timing: { thinkingMs: preThinkingMs } } : {}),
             },
           ])
           break
@@ -1875,38 +1897,16 @@ export function usePilotChat({ agentId, sessionId, forceLive }: UsePilotChatOpti
           const endMsg = evt.message as
             | { role?: string; toolName?: string; details?: Record<string, unknown> }
             | undefined
-          // ⏳/💭/✍️ Server-stamped per-message timing block, attached to
-          // the event by sse-consumer right before persistence.
-          const evtTiming = evt.timing as
-            | { ttft_ms?: number; thinking_ms?: number; output_ms?: number; turn_total_ms?: number }
-            | undefined
+          // The model call's timing partition, stamped by the runtime at the
+          // provider boundary and attached to the event by sse-consumer; the same
+          // values land in the row's metadata.llm_call, so live and reload agree.
+          const evtTiming = evt.llmCall ? timingFromLlmCall(evt.llmCall) : undefined
           const evtRoute = endMsg?.role === "assistant" ? (modelRouteFromEvent(evt) ?? currentModelRouteRef.current) : null
           if (endMsg?.role === "assistant" && evtRoute) {
             currentModelRouteRef.current = evtRoute
           }
           if (endMsg?.role === "assistant" && (evtTiming || evtRoute)) {
-            setMessages((prev) => {
-              const idx = findLastMessageIndex(prev, (m) =>
-                m.role === "assistant" &&
-                m.metadata?.kind !== "model_route_notice" &&
-                m.metadata?.kind !== "delegation_status_notice",
-              )
-              if (idx < 0) return prev
-              const current = prev[idx]
-              const timing = {
-                ...(current.timing ?? {}),
-                ...(typeof evtTiming?.ttft_ms === "number" ? { ttftMs: evtTiming.ttft_ms } : {}),
-                ...(typeof evtTiming?.thinking_ms === "number" ? { thinkingMs: evtTiming.thinking_ms } : {}),
-                ...(typeof evtTiming?.output_ms === "number" ? { outputMs: evtTiming.output_ms } : {}),
-                ...(typeof evtTiming?.turn_total_ms === "number" ? { turnTotalMs: evtTiming.turn_total_ms } : {}),
-              }
-              const next = {
-                ...current,
-                ...(Object.keys(timing).length > 0 ? { timing } : {}),
-                ...(evtRoute ? { metadata: { ...(current.metadata ?? {}), model_route: evtRoute } } : {}),
-              }
-              return [...prev.slice(0, idx), next, ...prev.slice(idx + 1)]
-            })
+            setMessages((prev) => attachLiveAssistantCall(prev, evtTiming, evtRoute))
           }
           if (endMsg?.role === "toolResult" && endMsg.details && Object.keys(endMsg.details).length > 0) {
             // Pi-agent brain: tool result details arrive via message_end (not tool_execution_end).

@@ -753,6 +753,32 @@ describe("handleDelegate — cross-Runtime routing", () => {
     expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable aries result" });
   });
 
+  it("does not include persisted thinking text in a recovered delegation result", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "private chain of thought", delegationId: null, metadata: { kind: "thinking" } },
+          { role: "assistant", content: "durable answer", delegationId: null, metadata: { llm_call: { v: 1 } } },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable answer" });
+  });
+
   it("marks a finished remote delegation settled so a re-sent terminal is acknowledged", async () => {
     // Reliable control delivery retries until the source acknowledges. Once the
     // consumer has finished there is nobody to accept a re-sent terminal, and

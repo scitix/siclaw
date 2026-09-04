@@ -727,3 +727,71 @@ the supporting leaf pages.
 
 **Files**: `kbc/platform/pod/selfcheck.py`, `src/knowledge/labels.ts`,
 `src/knowledge/resolver.ts`, `src/tools/query/knowledge-search.ts`
+
+---
+
+## ADR-018: Model Timing Is Measured at the Provider Boundary, One Row per Model Call
+
+**Status**: Active
+
+**Context**:
+Model timing used to be inferred in the gateway from the arrival times of SSE
+events: `pre_thinking_ms` on tool rows (previous boundary → tool start),
+`timing.{ttft_ms, thinking_ms, output_ms, turn_total_ms}` on assistant rows, a
+`NOISE_FLOOR` heuristic to stop `ttft` and `thinking` double-counting, and a
+portal-supplied `turnStartMs` anchor on another pod's clock. A model call that
+returned only tool calls had no row at all, so its time was parked on the tool
+rows; reasoning text was dropped; the provider's `usage` (including reasoning
+tokens) never reached the database. Downstream time accounting had to
+carry a page of caveats about which field to add when.
+
+**Decision**:
+Measure every provider request where it happens. `src/core/llm-call-recorder.ts`
+wraps `agent.streamFn` as the innermost layer (before the guard pipeline) and
+records, on the agentbox's own clock: request sent, HTTP headers (`start`), first
+content token, every thinking/text/tool-call block edge, response end, the
+provider's `usage`, and the stop reason. The result is stamped onto the assistant
+message as `llmCall` and travels with `message_end`; the gateway persists a
+redacted copy as `chat_messages.metadata.llm_call`.
+
+Persistence contract (web/api/a2a `sse-consumer.ts` and Lark
+`collectChannelResponse` alike):
+
+- **One agent-loop model call ⇒ one assistant row** carrying `metadata.llm_call`,
+  even when `content` is empty (tool-only call). Rounds are numbered from 1 per
+  prompt; a routing rollback rewinds the counter, and the discarded attempt's
+  envelopes ride the `model_route_notice` row as `discarded_llm_calls`. For
+  in-turn provider retries, recovered failures remain as empty model-call rows;
+  if the turn ultimately fails, earlier failures remain empty model-call rows
+  and the final failure's envelope rides the single `error_response` row.
+- **Reasoning text is its own row** (`kind: "thinking"`, `metadata.llm_round`),
+  written immediately before the model-call row and linked back via
+  `llm_call.thinking_row_id`. Redacted like any other content.
+- **Tool rows carry `metadata.llm_round` and `metadata.tool_call_id`**; their
+  `duration_ms` and `started_at` come from `startedAt`/`endedAt` stamped by
+  `PiAgentBrain.enrichToolEvent` on the same clock. Two consecutive model calls
+  bound a *tool group*; its span is the next call's `since_prev_ms`.
+- Compaction / summarisation calls share `streamFn` but consume no round; they
+  are folded into the next agent call's `aux_calls`.
+- The prompt boundary is explicit (`brain.llmCalls.beginPrompt` at HTTP receipt,
+  `endPrompt` in `actuallyFinish`) so round 1's `since_prev_ms` is the setup time;
+  paths that bypass the HTTP layer open it implicitly on the first call.
+
+The old fields are **not written any more and readers must not fall back to
+them**. `turnStartMs` is accepted on the wire and ignored.
+
+**Consequences**:
+
+- ✅ `net_ttft + thinking + output == total` per call, and `setup + Σ call + Σ tool group ≈ wall` per prompt — a partition that can be audited instead of a set of overlapping badges.
+- ✅ Reasoning tokens (`usage.reasoning`) and reasoning text are retained; output tok/s is computable.
+- ✅ Tool-only calls, failed calls and rolled-back attempts all appear on the timeline.
+- ✅ No schema change: envelope in `metadata`, thinking in `content`, grouping keys in `metadata`.
+- ⚠️ One extra row per model call, plus one per call with reasoning text. Thinking rows and empty model-call carriers are hidden in transcripts, but `chat_sessions.message_count` and the Portal's generic `message_count` metric remain physical-row counts by the existing persistence contract. Any reader of `chat_messages` must treat `kind: "thinking"` as a hidden assistant kind before this runtime ships, or a call's own reasoning counts as a reply.
+- ⚠️ Providers that hide reasoning (`reasoning_tokens` without `reasoning_content`) report `thinking_visible: false`; their reasoning time is inside `net_ttft` and is not guessed at.
+- ❌ Historical rows without `llm_call` have no time accounting — only the wall clock.
+
+**Files**: `src/core/llm-call-recorder.ts`, `src/core/agent-factory.ts`,
+`src/core/brains/pi-agent-brain.ts`, `src/agentbox/http-server.ts`,
+`src/gateway/sse-consumer.ts`, `src/gateway/llm-call-rows.ts`,
+`src/gateway/channels/lark.ts`, `src/portal/metrics-timing.ts`,
+`src/shared/message-kinds.ts`

@@ -58,6 +58,7 @@ import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryE
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
+import { LlmCallRecorder } from "./llm-call-recorder.js";
 import {
   ToolResultArtifactStore,
   createToolResultArtifactTools,
@@ -958,6 +959,13 @@ export async function createSiclawSession(
     return finalPayload;
   };
 
+  // ── LLM call recorder: innermost streamFn wrap, BEFORE the guard pipeline ──
+  // Installed closest to the network so guard transforms and context work land
+  // in setup / tool-group time, not in net_ttft. Stamps `message.llmCall`,
+  // which the gateway persists as metadata.llm_call (the timing source of truth).
+  const llmCallRecorder = new LlmCallRecorder();
+  session.agent.streamFn = llmCallRecorder.wrapStreamFn(session.agent.streamFn);
+
   // ── Guard pipeline: unified guard registration and installation ──
   const contextWindow = configuredModel?.contextWindow ?? 128_000;
   const guardRegistry = createGuardRegistry(contextWindow);
@@ -969,7 +977,7 @@ export async function createSiclawSession(
       return toolset ? [[tool.name, toolset] as const] : [];
     }),
   );
-  const brain: BrainSession = new PiAgentBrain(session, toolsetsByName);
+  const brain: BrainSession = new PiAgentBrain(session, toolsetsByName, llmCallRecorder);
   const getSkillSnapshot = () => {
     const currentSkills = loader.getSkills().skills;
     const skillNames = currentSkills.map((skill) => skill.name).sort();
