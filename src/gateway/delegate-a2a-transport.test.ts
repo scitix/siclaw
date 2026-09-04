@@ -38,7 +38,12 @@ beforeEach(async () => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      requests.push({ path: req.url ?? "", body, auth: req.headers.authorization });
+      requests.push({
+        path: req.url ?? "",
+        body,
+        auth: req.headers["x-auth-token"] as string | undefined,
+        caller: req.headers["x-siclaw-caller-agent"] as string | undefined,
+      });
       const route = routes.get(req.url ?? "");
       if (!route) {
         res.writeHead(404).end();
@@ -58,6 +63,7 @@ afterEach(async () => {
 function baseArgs(observe: (evt: Record<string, unknown>) => void, signal?: AbortSignal) {
   return {
     cfg,
+    coordinatorAgentId: "coord-1",
     peerAgentId: "peer-1",
     text: "diagnose the payment errors",
     localSessionId: "local-s1",
@@ -75,47 +81,46 @@ describe("a2aTransportConfig", () => {
     expect(a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "legacy" }))).toBeUndefined();
   });
 
-  it("accepts a fully configured https endpoint", () => {
+  it("reuses the Runtime's OWN endpoint and adapter secret", () => {
+    // The point of this shape: there is nothing delegation-specific to
+    // configure, so it cannot be pointed at the wrong control plane or handed a
+    // stale token. It used to demand three variables of its own because the
+    // entrance authenticated a separate workload identity; that identity is gone.
     expect(a2aTransportConfig(env({
       SICLAW_DELEGATION_TRANSPORT: "a2a",
-      SICLAW_INNER_A2A_URL: "https://cp:9000/",
-      SICLAW_INNER_A2A_TOKEN: "wk-x",
-    }))).toEqual({ baseUrl: "https://cp:9000", token: "wk-x" });
+      SICLAW_SERVER_URL: "http://control-plane-adapter:8081/",
+      SICLAW_PORTAL_SECRET: "adapter-secret",
+    }))).toEqual({ baseUrl: "http://control-plane-adapter:8081", token: "adapter-secret" });
   });
 
-  it("THROWS instead of silently downgrading when the flag is on but incomplete", () => {
+  it("accepts plain HTTP: the adapter listener is ClusterIP-only and the WS already rides it", () => {
+    // There is deliberately no https requirement and no escape hatch. Demanding
+    // TLS here while the control-plane WS runs over the same plain channel would
+    // have been theatre whose only real effect was an env var people set.
+    expect(a2aTransportConfig(env({
+      SICLAW_DELEGATION_TRANSPORT: "a2a",
+      SICLAW_SERVER_URL: "http://control-plane-adapter:8081",
+      SICLAW_PORTAL_SECRET: "s",
+    }))).toEqual({ baseUrl: "http://control-plane-adapter:8081", token: "s" });
+  });
+
+  it("THROWS instead of silently downgrading when the flag is on but the Runtime is unconfigured", () => {
     // The previous behaviour returned undefined and logged a warning, so the
     // operator who set the flag ran on the legacy relay believing otherwise.
-    expect(() => a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "a2a" }))).toThrow(/requires both/);
+    expect(() => a2aTransportConfig(env({ SICLAW_DELEGATION_TRANSPORT: "a2a" }))).toThrow(/requires the Runtime/);
     expect(() => a2aTransportConfig(env({
       SICLAW_DELEGATION_TRANSPORT: "a2a",
-      SICLAW_INNER_A2A_URL: "https://cp:9000",
-    }))).toThrow(/requires both/);
+      SICLAW_SERVER_URL: "http://cp:8081",
+    }))).toThrow(/requires the Runtime/);
     expect(() => a2aTransportConfig(env({
       SICLAW_DELEGATION_TRANSPORT: "a2a",
-      SICLAW_INNER_A2A_TOKEN: "wk-x",
-    }))).toThrow(/requires both/);
+      SICLAW_PORTAL_SECRET: "s",
+    }))).toThrow(/requires the Runtime/);
     expect(() => a2aTransportConfig(env({
       SICLAW_DELEGATION_TRANSPORT: "a2a",
-      SICLAW_INNER_A2A_URL: "not a url",
-      SICLAW_INNER_A2A_TOKEN: "wk-x",
+      SICLAW_SERVER_URL: "not a url",
+      SICLAW_PORTAL_SECRET: "s",
     }))).toThrow(/not a valid URL/);
-  });
-
-  it("refuses a plaintext base URL unless the escape hatch is set", () => {
-    const plaintext = {
-      SICLAW_DELEGATION_TRANSPORT: "a2a",
-      SICLAW_INNER_A2A_URL: "http://cp:9000",
-      SICLAW_INNER_A2A_TOKEN: "wk-x",
-    };
-    expect(() => a2aTransportConfig(env(plaintext))).toThrow(/must use https/);
-
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(a2aTransportConfig(env({ ...plaintext, SICLAW_INNER_A2A_ALLOW_PLAINTEXT: "1" })))
-      .toEqual({ baseUrl: "http://cp:9000", token: "wk-x" });
-    // The escape hatch announces itself so it cannot become the silent norm.
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("plaintext"));
-    warn.mockRestore();
   });
 });
 
@@ -139,7 +144,10 @@ describe("runA2aDelegation", () => {
     const done = events.at(-1) as any;
     expect(done.type).toBe("message_end");
     expect(done.message.content[0].text).toBe("root cause: PCIe link flap");
-    expect(requests[0].auth).toBe("Bearer wk-test");
+    // 认证换成 Runtime 自己的 adapter secret,并显式声明是哪个 coordinator 在调 ——
+    // 后者是断言,由控制面对着 siclaw_agents.runtime_id 校验,再由它决定名册问题。
+    expect(requests[0].auth).toBe("wk-test");
+    expect(requests[0].caller).toBe("coord-1");
   });
 
   it("pauses on INPUT_REQUIRED and resumes the SAME task on the next leg", async () => {
@@ -451,30 +459,29 @@ describe("runA2aDelegation", () => {
   });
 
   // ── #11 on-behalf-of identity + evidence refs ─────────────────────────────
-  it("sends onBehalfOfUserId on BOTH the open and the resume bodies", async () => {
+  // ⚠️ on-behalf-of 整个概念已经没了。它当初是为被删掉的 workload 身份服务的:
+  // 一个平台组件代表某个人发起委托,所以要声明"这一轮算谁头上"。现在发起方**就是
+  // 一个 agent**,归属由 coordinator 自身携带,不需要也不接受这个断言。
+  //
+  // 控制面侧的对应实现也一并删掉了 —— 它允许同组织内任意成员被冒充,
+  // 而那正是它被拿掉的原因之一。
+  it("carries the delegation marker on BOTH the open and the resume", async () => {
     routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
       sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_INPUT_REQUIRED", "Which cluster?")]),
     );
-    await runA2aDelegation({ ...baseArgs(() => {}), onBehalfOfUserId: "user-42" });
+    await runA2aDelegation(baseArgs(() => {}));
     routes.set("/inner/a2a/agents/peer-1/message:send", (_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ task: { id: "t1", status: { state: "TASK_STATE_COMPLETED" } } }));
     });
-    await runA2aDelegation({ ...baseArgs(() => {}), text: "cluster-a", onBehalfOfUserId: "user-42" });
+    await runA2aDelegation({ ...baseArgs(() => {}), text: "cluster-a" });
 
     const open = JSON.parse(requests.find((r) => r.path.endsWith("message:stream"))!.body);
     const resume = JSON.parse(requests.find((r) => r.path.endsWith("message:send"))!.body);
-    expect(open.metadata["siclaw.onBehalfOfUserId"]).toBe("user-42");
-    expect(resume.metadata["siclaw.onBehalfOfUserId"]).toBe("user-42");
-  });
-
-  it("OMITS onBehalfOfUserId when the originating user is unknown — never a placeholder", async () => {
-    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
-      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
-    );
-    await runA2aDelegation(baseArgs(() => {}));
-    const open = JSON.parse(requests.find((r) => r.path.endsWith("message:stream"))!.body);
-    expect("siclaw.onBehalfOfUserId" in open.metadata).toBe(false);
+    // 续跑也必须带 —— 只在首轮带的话,peer 的第二轮就不再是委托 turn,
+    // report_findings / request_input 随之失效。
+    expect(open.metadata["siclaw.delegationId"]).toBe("d-1");
+    expect(resume.metadata["siclaw.delegationId"]).toBe("d-1");
   });
 
   it("carries evidence_refs as a data part, not inlined bytes", async () => {
