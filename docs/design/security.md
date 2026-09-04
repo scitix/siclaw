@@ -73,10 +73,11 @@ them into the sandbox would be a separate change with its own migration.
 
 ### 1.4 Browser-Engine Attack Surface (visual export)
 
-The `mcp/create-chart` tools (`render_chart`, `render_mermaid`, `render_visual_card`)
-launch headless Chromium **inside the AgentBox container** (`Dockerfile.agentbox`
-installs `chromium`) to rasterize LLM-generated markdown — chart JSON, Mermaid
-source, and visual-card JSON — into PNGs for IM channel replies.
+The `mcp/create-chart` tools (`render_chart`, `render_mermaid`) launch headless
+Chromium **inside the AgentBox container** (`Dockerfile.agentbox` installs
+`chromium`) to rasterize LLM-generated chart JSON and Mermaid source into PNGs
+for IM channel replies. Visuals are optional attachments; final conclusions
+remain natural-language answers.
 
 Chromium runs with `--no-sandbox --disable-setuid-sandbox`
 (`mcp/create-chart/src/visual-export.ts`). This is the standard workaround for

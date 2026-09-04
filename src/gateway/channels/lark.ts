@@ -1923,7 +1923,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   };
   registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
     if ("text" in backgroundMessage) {
-      const display = stripVisualBlocks(backgroundMessage.text);
+      const display = stripVisualBlocks(backgroundMessage.text, { stripSourceBlocks: true })
+        || (backgroundMessage.kind === "final" ? EMPTY_RESULT_NOTICE_BY_LOCALE[locale] : "");
       if (!display || !display.trim()) return true;
 
       if (backgroundMessage.kind === "final") {
@@ -1945,7 +1946,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       return true;
     }
 
-    const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
+    const display = stripVisualBlocks(backgroundMessage.content, { stripSourceBlocks: true })
+      || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
     if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
     const md = buildMilestoneCardMarkdown({ milestones: [], finalText: display });
     if (cardSession) {
@@ -2065,14 +2067,16 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
 
   // Session-busy and other errors both get a sanitized notice \u2014 the raw error (internal
   // endpoints, 409 JSON) must never reach the chat; it was logged above.
-  const finalBody = sessionBusy
+  if (agentError || sessionBusy) replyImages = [];
+  const sanitizedResultBody = stripVisualBlocks(resultText, { stripSourceBlocks: replyImages.length > 0 });
+  const displayBody = sessionBusy
     ? SESSION_BUSY_NOTICE_BY_LOCALE[locale]
     : agentError
       ? AGENT_ERROR_NOTICE_BY_LOCALE[locale]
-      : (resultText || EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
-  if (agentError || sessionBusy) replyImages = [];
-  const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
-    || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
+      : sanitizedResultBody
+        || (replyImages.length > 0
+          ? VISUAL_ONLY_NOTICE_BY_LOCALE[locale]
+          : EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
   // The final card is JUST the conclusion — the live step indicator is replaced
   // entirely, no milestone trail is kept on the card.
   const finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
@@ -2087,7 +2091,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // Only solicit 👍/👎 on a real answer — never under an error or
     // empty-result notice, where a click would write a rating against a
     // non-answer and skew the feedback signal Metrics aggregates.
-    const isAnswer = !agentError && resultText.trim().length > 0;
+    const isAnswer = !agentError
+      && !sessionBusy
+      && (sanitizedResultBody.trim().length > 0 || replyImages.length > 0);
     const { ok, contentOk } = await finalizeCard(larkClient, cardSession, finalCardBody,
       isAnswer && assistantMessageId
         ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
@@ -3254,7 +3260,11 @@ export async function collectChannelResponse(
  * code/bold pass through so chips still render.
  */
 function condenseMilestone(text: string): string {
-  const firstLine = text.split("\n").map((s) => s.trim()).find(Boolean) ?? "";
+  // Intermediate assistant turns share the same IM output boundary as final
+  // replies. Strip renderer source before selecting the first visible line so
+  // a tool-result echo can never become a transient live-card milestone.
+  const visibleText = stripVisualBlocks(text, { stripSourceBlocks: true });
+  const firstLine = visibleText.split("\n").map((s) => s.trim()).find(Boolean) ?? "";
   const clean = firstLine.replace(/^#{1,6}\s+/, "").trim();
   if (!clean) return "";
   return clean.length > 90 ? `${clean.slice(0, 88)}…` : clean;
@@ -3283,7 +3293,8 @@ function channelActivityMilestone(activity: string, locale?: LarkLocale): string
   if (/^Waiting for a free slot/i.test(clean)) {
     return locale === "en-US" ? "Waiting for a free sub-agent slot…" : "排队等待子任务空位…";
   }
-  return condenseMilestone(clean) || clean;
+  return condenseMilestone(clean)
+    || stripVisualBlocks(clean, { stripSourceBlocks: true }).trim();
 }
 
 function contentBlocksToMarkdown(blocks: unknown[]): string {

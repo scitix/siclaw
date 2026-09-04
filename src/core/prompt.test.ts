@@ -75,19 +75,22 @@ describe("buildSreSystemPrompt output guidance", () => {
     expect(prompt).not.toContain("render_chart");
   });
 
-  it("adds channel-only guidance for visual Feishu replies and conclusion cards", () => {
+  it("adds channel-only guidance for natural-language answers with optional visuals", () => {
     const prompt = buildSreSystemPrompt("channel");
 
     expect(prompt).toContain("# Channel Reply Format");
     expect(prompt).toContain("render_mermaid");
-    expect(prompt).toContain("render_visual_card");
-    expect(prompt).toContain("```visual-card");
+    expect(prompt).toContain("render_chart");
+    expect(prompt).not.toContain("render_visual_card");
+    expect(prompt).not.toContain("```visual-card");
     expect(prompt).not.toContain("```siclaw-card");
     expect(prompt).toContain("structured image content blocks");
+    expect(prompt).toContain("Visuals are optional supporting material, never the answer container");
+    expect(prompt).toContain("do not paste renderer source, metadata, or tool output");
+    expect(prompt).toContain("If visual rendering fails, continue with the complete natural-language answer");
     expect(prompt).toContain("Do not inline `data:image/...");
     expect(prompt).toContain("forwards structured image artifacts");
     expect(prompt).toContain("channel adapter");
-    expect(prompt).toContain("Source-only ```chart`, Mermaid, and ```visual-card` blocks remain markdown text");
     expect(prompt).toContain("Use normal Markdown for direct answers");
     expect(prompt).toContain("Treat the latest channel message as the current request");
     expect(prompt).toContain("Do not force details from a previous incident into the new answer");

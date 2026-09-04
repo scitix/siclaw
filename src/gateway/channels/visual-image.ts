@@ -35,12 +35,15 @@ export function collectImageAttachments(
 
 export function stripVisualBlocks(markdown: string, options: StripVisualBlocksOptions = {}): string {
   let output = stripDataImages(markdown);
+  // These legacy report containers are no longer authored by Siclaw. Existing
+  // web readers may remain tolerant, but never expose their JSON source in an
+  // IM channel when an older session or skill still produces one.
+  output = stripFences(output, "visual-card");
+  output = stripFences(output, "siclaw-card");
+  output = stripFences(output, "conclusion-card");
   if (options.stripSourceBlocks) {
     output = stripFences(output, "chart");
     output = stripFences(output, "mermaid");
-    output = stripFences(output, "visual-card");
-    output = stripFences(output, "siclaw-card");
-    output = stripFences(output, "conclusion-card");
   }
   return cleanupMarkdown(output);
 }

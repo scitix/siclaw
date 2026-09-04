@@ -5,12 +5,10 @@ import {
   RENDER_CHART_DESCRIPTION,
   RENDER_MERMAID_DESCRIPTION,
   RENDER_MERMAID_INPUT_SCHEMA,
-  RENDER_VISUAL_CARD_DESCRIPTION,
-  RENDER_VISUAL_CARD_INPUT_SCHEMA,
   validate,
   validateMermaid,
-  validateVisualCard,
   handleRenderChart,
+  handleRenderMermaid,
 } from "./handler.js";
 
 vi.mock("./visual-export.js", () => {
@@ -18,11 +16,7 @@ vi.mock("./visual-export.js", () => {
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
   return {
     exportMarkdownVisualsWithVisualExportWeb: vi.fn(async (markdown: string) => {
-      const kind = markdown.startsWith("```mermaid")
-        ? "mermaid"
-        : markdown.startsWith("```visual-card")
-          ? "visual-card"
-          : "chart";
+      const kind = markdown.startsWith("```mermaid") ? "mermaid" : "chart";
       return [{ kind, image: Buffer.from(png, "base64") }];
     }),
   };
@@ -42,13 +36,12 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     }
   });
 
-  it("description tells the model to paste the READY_TO_PASTE block exactly", () => {
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/```chart/);
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
+  it("describes the web embed and supporting channel image without renderer metadata", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/PNG image artifact/);
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/ControlPlane Web's own chart renderer\/export path/);
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/natural-language/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/In web replies, include the returned chart block/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/IM channel sessions/);
+    expect(RENDER_CHART_DESCRIPTION).not.toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/画图/);
@@ -70,17 +63,9 @@ describe("visual image tool schemas", () => {
     expect(RENDER_MERMAID_INPUT_SCHEMA.additionalProperties).toBe(false);
     expect(RENDER_MERMAID_DESCRIPTION).toMatch(/ControlPlane Web's own Mermaid renderer\/export path/);
     expect(RENDER_MERMAID_DESCRIPTION).toMatch(/image\/png/);
-    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/READY_TO_PASTE/);
-    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/```mermaid/);
-  });
-
-  it("registers visual-card export as a ControlPlane Web image artifact tool", () => {
-    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.required).toEqual(["type", "title"]);
-    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("report");
-    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("root_cause_chain");
-    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/ControlPlane Web's own visual-card renderer\/export path/);
-    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/image\/png/);
-    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/```visual-card/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/natural-language/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/In web replies, include the returned Mermaid block/);
+    expect(RENDER_MERMAID_DESCRIPTION).not.toMatch(/READY_TO_PASTE/);
   });
 });
 
@@ -233,31 +218,6 @@ describe("validateMermaid", () => {
   });
 });
 
-describe("validateVisualCard", () => {
-  it("keeps ControlPlane visual-card specs and strips unknown keys", () => {
-    const out = validateVisualCard({
-      type: "report",
-      title: "诊断结论",
-      tone: "danger",
-      conclusion: "api pods are restarting.",
-      items: [{ label: "Affected pods", status: "danger", value: "3" }],
-      extra: "drop",
-    });
-    expect(out).toMatchObject({
-      type: "report",
-      title: "诊断结论",
-      tone: "danger",
-      conclusion: "api pods are restarting.",
-    });
-    expect(out).not.toHaveProperty("extra");
-  });
-
-  it("rejects unsupported or empty visual-card specs", () => {
-    expect(() => validateVisualCard({ type: "unknown", title: "x", conclusion: "y" })).toThrow(/supported/);
-    expect(() => validateVisualCard({ type: "report", title: "x" })).toThrow(/provide conclusion/);
-  });
-});
-
 describe("handleRenderChart", () => {
   beforeEach(() => {
     vi.mocked(exportMarkdownVisualsWithVisualExportWeb).mockClear();
@@ -265,13 +225,7 @@ describe("handleRenderChart", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
-  function splitEnvelope(text: string): { ready: string; meta: Record<string, unknown> } {
-    const m = text.match(/^READY_TO_PASTE:\n([\s\S]*?)\n\nMETADATA_JSON:\n([\s\S]*)$/);
-    if (!m) throw new Error(`unexpected envelope: ${text.slice(0, 80)}…`);
-    return { ready: m[1], meta: JSON.parse(m[2]) };
-  }
-
-  it("returns a content array with a parseable result envelope and PNG image artifact", async () => {
+  it("returns a web-renderable block and PNG image artifact", async () => {
     const res = await handleRenderChart({
       type: "pie",
       data: { slices: [{ label: "ok", value: 1 }] },
@@ -281,30 +235,16 @@ describe("handleRenderChart", () => {
     expect(res.content[1].type).toBe("image");
     expect(res.content[1].mimeType).toBe("image/png");
     expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
-    const { ready, meta } = splitEnvelope(res.content[0].text);
-    expect(ready.startsWith("```chart\n")).toBe(true);
-    expect(ready.endsWith("\n```")).toBe(true);
-    // The READY_TO_PASTE block must be the unescaped fenced markdown — no
-    // backslash-escaped quotes, no surrounding JSON quotes. This is the whole
-    // point of the envelope: agents copy this verbatim. METADATA_JSON carries
-    // no embed string field, so there is no escaped form for the model to pick
-    // up and mangle.
-    expect(ready).not.toMatch(/\\"/);
-    expect(meta.type).toBe("pie");
-    expect(meta.schema_version).toBe(1);
-    expect(meta.artifact_kind).toBe("chart_spec");
-    expect(typeof meta.chart_id).toBe("string");
-    expect((meta.chart_id as string).startsWith("pie-")).toBe(true);
-    expect(typeof meta.bytes).toBe("number");
-    expect(meta.bytes as number).toBeGreaterThan(0);
-    expect(meta.renderer).toBe("visual-export-web");
-    expect(meta).not.toHaveProperty("markdown_embed");
-    expect(meta).not.toHaveProperty("markdown_embed_raw");
-    expect(meta.embed_instructions).toMatch(/READY_TO_PASTE/);
-    expect(exportMarkdownVisualsWithVisualExportWeb).toHaveBeenCalledWith(ready);
+    expect(res.content[0].text).toBe(
+      '```chart\n{"type":"pie","data":{"slices":[{"label":"ok","value":1}]}}\n```',
+    );
+    expect(res.content[0].text).not.toContain("READY_TO_PASTE");
+    expect(exportMarkdownVisualsWithVisualExportWeb).toHaveBeenCalledWith(
+      '```chart\n{"type":"pie","data":{"slices":[{"label":"ok","value":1}]}}\n```',
+    );
   });
 
-  it("embeds the validated spec (not the raw input) inside the chart fence", async () => {
+  it("returns only the validated spec in the web embed", async () => {
     const res = await handleRenderChart({
       type: "bar",
       data: {
@@ -314,31 +254,24 @@ describe("handleRenderChart", () => {
       title: "Demo",
       extra_garbage: "stripped",
     } as Record<string, unknown>);
-    const { ready, meta } = splitEnvelope(res.content[0].text);
-    const inner = ready.replace(/^```chart\n/, "").replace(/\n```$/, "");
+    const rendered = vi.mocked(exportMarkdownVisualsWithVisualExportWeb).mock.calls[0][0];
+    const inner = rendered.replace(/^```chart\n/, "").replace(/\n```$/, "");
     const spec = JSON.parse(inner);
     expect(spec.type).toBe("bar");
     expect(spec).not.toHaveProperty("schema_version");
     expect(spec.data.series[0].values).toEqual([10, 20]);
     expect(spec.title).toBe("Demo");
     expect(spec).not.toHaveProperty("extra_garbage");
-    expect(meta).not.toHaveProperty("markdown_embed");
+    expect(res.content[0].text).toBe(rendered);
+    expect(res.content[0].text).not.toContain("METADATA_JSON");
   });
 
-  it("does not rely on local AgentBox files for artifact delivery", async () => {
-    const res = await handleRenderChart({
-      type: "line",
-      data: { series: [{ name: "s", points: [{ x: 1, y: 2 }] }] },
-    });
-    const { ready, meta } = splitEnvelope(res.content[0].text);
-    expect(meta.svg_path).toBe("");
-    expect(meta.spec_path).toBe("");
-    expect(meta.png_path).toBe("");
-    expect(meta.image_mime).toBe("image/png");
-    expect(meta.image_bytes as number).toBeGreaterThan(0);
-    expect(res.content[1].type).toBe("image");
-    expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
-    expect(meta.bytes as number).toBeGreaterThan(0);
-    expect(ready.startsWith("```chart\n")).toBe(true);
+  it("returns Mermaid as a web embed and image attachment", async () => {
+    const res = await handleRenderMermaid({ source: "flowchart TD\nA --> B" });
+    expect(res.content[0].text).toBe("```mermaid\nflowchart TD\nA --> B\n```");
+    expect(res.content[1]).toMatchObject({ type: "image", mimeType: "image/png" });
+    expect(exportMarkdownVisualsWithVisualExportWeb).toHaveBeenCalledWith(
+      "```mermaid\nflowchart TD\nA --> B\n```",
+    );
   });
 });

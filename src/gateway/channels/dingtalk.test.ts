@@ -307,6 +307,42 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     sessionRegistry.forget(sessionId as string);
   });
 
+  it("never sends legacy visual-card JSON to the channel", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-7", bindingId: "b1" });
+    promptMock.mockResolvedValue({ sessionId: "remote-session-visual" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "结论：请求体过大是主要原因。",
+              "",
+              "```visual-card",
+              '{"type":"report","title":"internal shape","conclusion":"do not leak"}',
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+
+    await handleDingTalkMessage(
+      makeDownstream("诊断一下"),
+      "ch",
+      makeAgentBoxManager("agent-7") as any,
+      undefined,
+      {} as any,
+    );
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
+    expect(body.markdown.text).toContain("请求体过大");
+    expect(body.markdown.text).not.toContain("visual-card");
+    expect(body.markdown.text).not.toContain("internal shape");
+  });
+
   it("audits the session: persists origin=channel + user/assistant/tool rows when the binding has an owner", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "agent-7", bindingId: "b1", createdBy: "owner-1" });
     promptMock.mockResolvedValue({ sessionId: "remote-7", traceId: "0123456789abcdef0123456789abcdef" });

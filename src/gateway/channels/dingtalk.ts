@@ -42,7 +42,7 @@ import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
 import { appendMessage, bindMessageTraceId, ensureChatSession, warnTraceBindFailure } from "../chat-repo.js";
 import { collectChannelResponse } from "./lark.js";
-import type { RenderedReplyImage } from "./visual-image.js";
+import { stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { deliverImages } from "./dingtalk-image.js";
 import {
   buildMarkdownMessage,
@@ -407,15 +407,16 @@ export async function handleDingTalkMessage(
   // On failure, reply with a generic notice only — the raw error message can
   // leak internal endpoints / infra details to everyone in the chat. The full
   // error was already logged above for operators.
+  const sanitizedResult = stripVisualBlocks(resultText, { stripSourceBlocks: replyImages.length > 0 });
   const finalBody = agentError
     ? AGENT_ERROR_NOTICE
-    : (resultText || EMPTY_RESULT_NOTICE);
+    : (sanitizedResult || (replyImages.length > 0 ? "图片已生成。" : EMPTY_RESULT_NOTICE));
 
   // Errors and the empty-result notice go out as plain text; real answers as
   // markdown so formatting (code blocks, lists, bold) renders.
   const body = agentError
     ? buildTextMessage(finalBody)
-    : (resultText ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));
+    : (sanitizedResult ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));
   await replyToDingTalk(sessionWebhook, body);
 
   // Deliver any agent-produced images as separate robot messages (mirrors

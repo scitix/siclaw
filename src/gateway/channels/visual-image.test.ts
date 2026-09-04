@@ -39,12 +39,16 @@ describe("collectImageAttachments", () => {
 });
 
 describe("stripVisualBlocks", () => {
-  it("removes only data images from display markdown by default", () => {
+  it("removes data images and legacy report-card source by default", () => {
     const markdown = [
       "Summary",
       "",
       "```chart",
       "{\"type\":\"bar\"}",
+      "```",
+      "",
+      "```visual-card",
+      "{\"type\":\"report\",\"title\":\"internal shape\"}",
       "```",
       "",
       `![chart](${onePixelPng})`,
@@ -55,6 +59,8 @@ describe("stripVisualBlocks", () => {
     const display = stripVisualBlocks(markdown);
 
     expect(display).toContain("```chart");
+    expect(display).not.toContain("```visual-card");
+    expect(display).not.toContain("internal shape");
     expect(display).not.toContain("data:image/png");
     expect(display).toContain("Keep this.");
   });
