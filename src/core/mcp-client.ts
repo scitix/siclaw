@@ -9,7 +9,7 @@
 
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { recordMcpToolEffect, type ResolvedToolDefinition } from "./tool-registry.js";
+import { type ResolvedToolDefinition } from "./tool-registry.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -323,13 +323,6 @@ export class McpClientManager {
     client: any,
   ): ResolvedToolDefinition {
     const fullName = buildMcpToolName(serverName, mcpTool.name);
-    // ⚠️ **必须在这里记下 effect。** authority guard 只拿得到工具**名字**，拿不到
-    // 这个 ToolDefinition —— 而 MCP 工具的名字是动态的，登记不进 TOOL_EFFECTS。
-    // 不记的话它会落到 external_write（fail closed），只读的 MCP 工具就用不了了。
-    //
-    // ⚠️ readOnlyHint 是服务器自报的，信任级别等同于"已注册的 skill 自己声明 effect"。
-    // 真正收紧要靠 Envelope 上的 allowed/deniedCapabilities。
-    recordMcpToolEffect(fullName, mcpTool.annotations?.readOnlyHint);
     const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
     // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
     // into a @sinclair/typebox TSchema. The pi runtime validates and coerces tool

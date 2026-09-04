@@ -265,8 +265,6 @@ Examples:
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  // Effect ceiling (shared/tool-effects.ts): runs a script inside real pods.
-  effect: "external_write",
   create: (refs) =>
     createPodScriptTool(refs.kubeconfigRef, {
       executor: refs.backgroundExecExecutor,

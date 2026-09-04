@@ -63,7 +63,6 @@ import {
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
-import { verifyAuthorityEnvelope, bindingError } from "../shared/authority-envelope.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -91,12 +90,9 @@ interface PromptRequestBody {
   delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
-  authorityEnvelope?: string;
   /**
-   * Control-plane segment / task this turn belongs to. Optional, and used only
-   * to check that an `authorityEnvelope` naming one was issued for THIS request
-   * (see bindingError). Absent context cannot satisfy an envelope that names a
-   * segment or task, which is the fail-closed direction.
+   * Control-plane segment / task this turn belongs to. Carried so the turn can
+   * be correlated back to the control plane's ledger.
    */
   segmentId?: string;
   taskId?: string;
@@ -923,35 +919,6 @@ export function createHttpServer(
     // A delegated agent runs under its own configuration; delegation does not
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
-    // Authority envelope: verified HERE, before any session exists. Present
-    // but unverifiable = fail closed — running the turn ungoverned when the
-    // caller asked for governance is the one wrong answer.
-    let authorityEnvelope = "";
-    if (typeof body.authorityEnvelope === "string" && body.authorityEnvelope) {
-      const claims = verifyAuthorityEnvelope(body.authorityEnvelope);
-      if (!claims) {
-        logPromptResponse(403, "rejected", "authority envelope invalid or expired");
-        sendJson(res, 403, { error: { code: "AUTHORITY_ENVELOPE_INVALID", message: "authority envelope invalid or expired", retriable: false, status: 403 } });
-        return;
-      }
-      // An envelope that verifies may still have been minted for someone else.
-      // Without this check a valid envelope issued to a low-privilege agent
-      // could be replayed on a dispatch to a high-privilege one — the signature
-      // proves authenticity, not that it was authentic FOR THIS REQUEST. The
-      // agent identity checked against is the box's OWN, never a value from the
-      // request body, which the presenter could otherwise choose to match.
-      const boxAgentId = sessionManager.agentId ?? "";
-      const misbound = !boxAgentId
-        ? "this AgentBox has no configured agent identity to bind an authority envelope to"
-        : bindingError(claims, { agentId: boxAgentId, segmentId: body.segmentId, taskId: body.taskId });
-      if (misbound) {
-        logPromptResponse(403, "rejected", misbound);
-        sendJson(res, 403, { error: { code: "AUTHORITY_ENVELOPE_MISBOUND", message: misbound, retriable: false, status: 403 } });
-        return;
-      }
-      authorityEnvelope = body.authorityEnvelope;
-    }
-
     // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
     // dispatch in process memory only, so after a Runtime restart the same turn
     // would execute twice. This box ran it and outlived that Runtime, so it is
@@ -982,7 +949,6 @@ export function createHttpServer(
       delegation,
       body.userId,
       body.allowInputRequest === true,
-      authorityEnvelope,
     );
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may

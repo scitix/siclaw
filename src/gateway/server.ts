@@ -786,11 +786,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const delegation = params.delegation as PromptOptions["delegation"];
     const allowInputRequest = params.allowInputRequest === true;
     const requireExistingSession = params.requireExistingSession === true;
-    // Signed authority envelope (trusted-execution contract): forwarded opaque;
-    // the AgentBox verifies it locally and enforces it at the tool layer.
-    const authorityEnvelope = typeof params.authorityEnvelope === "string" && params.authorityEnvelope
-      ? params.authorityEnvelope
-      : undefined;
     // The envelope's BINDING CONTEXT must travel with it. The box compares the
     // envelope's targetAgentId / segmentId / taskId against these and refuses a
     // mismatch (fail closed), which is what stops an envelope observed on one
@@ -925,7 +920,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       delegation,
       allowInputRequest,
       requireExistingSession,
-      authorityEnvelope,
       segmentId,
       taskId: boundTaskId,
       modelConfig,
@@ -2779,43 +2773,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
           // Agent-to-agent delegation — coordinator delegates a bounded read-only
           // task to a peer agent; gateway prompts the peer + returns its artifact.
-          if (url === "/api/internal/authority/consume" && method === "POST") {
-            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            void (async () => {
-              try {
-                const raw = await new Promise<string>((resolve, reject) => {
-                  let buf = "";
-                  req.on("data", (c) => { buf += c; if (buf.length > 64 * 1024) reject(new Error("body too large")); });
-                  req.on("end", () => resolve(buf));
-                  req.on("error", reject);
-                });
-                const body = JSON.parse(raw || "{}") as { proposalId?: string; actionDigest?: string };
-                if (!body?.proposalId || !body?.actionDigest) {
-                  res.writeHead(400, { "Content-Type": "application/json" });
-                  res.end(JSON.stringify({ error: "proposalId and actionDigest are required" }));
-                  return;
-                }
-                // Atomic one-time consumption happens on the management plane;
-                // the box's mTLS identity is recorded as the consumer. The digest
-                // binds this consumption to ONE action: the management plane
-                // compares it with the value stored when the proposal was made
-                // and refuses an approval granted for anything else. It never
-                // recomputes the digest — only the runtime does that.
-                const result = await frontendClient.request("authority.consumeReceipt", {
-                  proposalId: body.proposalId,
-                  actionDigest: body.actionDigest,
-                  subject: `box/${identity.boxId ?? identity.agentId ?? "unknown"}`,
-                }, 10_000);
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify(result ?? { ok: true }));
-              } catch (err) {
-                res.writeHead(409, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
-              }
-            })();
-            return;
-          }
-
           if (url === "/api/internal/delegate" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient, shutdownGate });

@@ -136,8 +136,6 @@ description: >-
 
 export const registration: ToolEntry = {
   category: "workflow",
-  // Effect ceiling (shared/tool-effects.ts): writes skill files into the session workspace.
-  effect: "local_write",
   create: (_refs) => createSkillPreviewTool(),
   modes: ["web", "channel"],
 };

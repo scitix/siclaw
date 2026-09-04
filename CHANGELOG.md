@@ -8,39 +8,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-#### Trusted execution: enforceable effect ceiling, action-bound approvals, envelope binding
-
-Security review of the AuthorityEnvelope / `propose_execution` path. Design:
-`docs/design/2026-09-03-authority-envelope-and-action-digest.md`.
-
-- **The effect ceiling was unenforceable.** The authority guard gated a tool
-  only when `allowedCapabilities` was non-empty, so an envelope declaring
-  `effectCeiling: "observe"` with no allow-list permitted every tool, `bash`
-  included. Tools now DECLARE their effect (`ToolEntry.effect`, plus
-  `TOOL_EFFECTS` for harness built-ins) and the guard compares it against the
-  ceiling directly; the allow-list narrows further rather than switching
-  enforcement on. `credential_read` is blocked outright and never gated, and an
-  unrecognised ceiling string is treated as `observe`. A test asserts every tool
-  in the mutating capability groups declares a non-`observe` effect, so a future
-  mutating tool cannot default to being treated as a read.
-- **Approvals were bearer tokens.** A signed receipt was minted, delivered
-  inside a natural-language resume message (entering the model context, the
-  transcript and the dispatch outbox), and accepted for ANY gated tool — an
-  approval for "scale A" authorised one call to "delete B". The token is gone:
-  `propose_execution` now states the exact intended call (`tool_name`,
-  `tool_args`), the runtime computes a `sha256` action digest over it, and the
-  guard recomputes that digest from the arguments the tool is about to run with
-  before consuming the approval by id. The management plane stores the digest
-  opaquely and never recomputes it, so there is no cross-language canonical-JSON
-  agreement to drift. RPC params become
-  `{ proposalId, actionDigest, subject? }` (method name unchanged).
-- **A verified envelope was not checked against the request.** A genuine
-  envelope minted for a low-privilege agent could be replayed on a dispatch to a
-  high-privilege one. New `bindingError()` checks `targetAgentId` and, when the
-  issuer stated them, `segmentId` / `taskId` (new claim); `/api/prompt` answers
-  403 `AUTHORITY_ENVELOPE_MISBOUND`. The agent identity compared against is the
-  box's own, never a request-supplied value.
-
 #### Dispatch idempotency: released reservations and a cross-restart turn ledger
 
 - **A pre-prompt failure silently dropped the dispatch.** The `(sessionId,
@@ -89,7 +56,7 @@ Security review of the AuthorityEnvelope / `propose_execution` path. Design:
   non-`https:` base URL is refused unless `SICLAW_INNER_A2A_ALLOW_PLAINTEXT=1`
   is set (a long-lived bearer token over plaintext is capturable), and that
   escape hatch logs a warning every time.
-- `delegate_to_agent` and `propose_execution` accept optional `evidence_refs`;
+- `delegate_to_agent` accepts optional `evidence_refs`;
   the delegation transport carries them as a structured `data` part
   (`application/vnd.siclaw.context+json`) so an investigation's basis crosses the
   agent boundary. References only — no inlined file bytes.
@@ -140,19 +107,6 @@ Two paired, per-call opt-ins for management-plane callers (design:
   was lost are idempotent per `(sessionId, dispatchId)` — a duplicate returns
   the original turn (`duplicate: true`) instead of starting a second turn or
   degrading into a steer.
-
-#### Trusted execution: propose_execution + AuthorityEnvelope guard
-
-- New `propose_execution` tool (same availability as `request_input`): a
-  governed turn proposes a write action with its exact diff/resources/risk/
-  rollback, emits a reliable `auth_required` event and ends the turn; the
-  management plane approves and resumes the session with a one-time receipt.
-- `chat.send` may carry a signed `authorityEnvelope`; it is verified locally
-  (shared secret, fail-closed at /api/prompt admission and session build) and
-  enforced per tool call by a new guard extension: denied capabilities are
-  blocked, out-of-list tools require an `approval_receipt` consumed atomically
-  on the management plane (box → `/api/internal/authority/consume`, mTLS).
-  Design: `docs/design/2026-09-02-trusted-execution.md`.
 
 #### Experimental A2A delegation transport (`SICLAW_DELEGATION_TRANSPORT=a2a`)
 

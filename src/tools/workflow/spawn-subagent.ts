@@ -459,8 +459,6 @@ function toToolOutput(
 
 export const registration: ToolEntry = {
   category: "workflow",
-  // Effect ceiling (shared/tool-effects.ts): starts another agent, which can act.
-  effect: "external_write",
   create: (refs) => createSpawnSubagentTool(refs),
   modes: ["web", "channel", "cli"],
   // Hidden unless the runtime injected an executor (same "never show a non-working tool" contract;
