@@ -103,18 +103,24 @@ describe("subagentTiers reaches every binding forwarding site", () => {
     // Guards the scanner itself: if a refactor breaks the pattern this drops and
     // the assertion above starts passing vacuously.
     //
-    // 12 lines in the tree match `modelRouting` as a property. Two are the
+    // 10 lines in the tree match `modelRouting` as a property. Two are the
     // vision-capability check (lark, chat-gateway), one is the excluded TUI, and
-    // the remaining 9 are forwarding sites: chat-gateway ×2, delegate-api ×2
-    // (remote + local), a2a-gateway, task-coordinator (cron), lark, dingtalk, and
-    // server.ts (chat.send). Bump DELIBERATELY when adding an entry path, and add
-    // the field there in the same change.
+    // the remaining 7 are forwarding sites: chat-gateway ×2, a2a-gateway,
+    // task-coordinator (cron), lark, dingtalk, and server.ts (chat.send). Bump
+    // DELIBERATELY when adding an entry path, and add the field there in the
+    // same change.
+    //
+    // ⚠️ Was 9. delegate-api's two sites (remote + local) are gone: delegation
+    // goes over A2A and the control plane dispatches the peer, so this process
+    // no longer forwards a model binding to a peer box at all. The remaining
+    // count dropping is the correct signal — a delegation's tiers now ride the
+    // control plane's own chat.send (server.ts), which is already on this list.
     //
     // The previous, list-driven version of this test counted 8 — the missing one
     // was server.ts, and that single gap was the whole feature under a control
     // plane.
     const sites = scanForwardingSites();
-    expect(sites.length).toBe(9);
+    expect(sites.length).toBe(7);
 
     // Named explicitly, because it is the one that shipped broken: a refactor that
     // moves chat.send's forwarding must not be able to drop it silently again.

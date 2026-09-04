@@ -20,12 +20,35 @@ const consumeAgentSse = vi.fn(async (opts: any) => {
   return consumeReturn;
 });
 vi.mock("./sse-consumer.js", () => ({ consumeAgentSse: (o: any) => consumeAgentSse(o) }));
+// ⚠️ 这些用例测的是**派发之前**的行为 —— 父会话身份绑定、名册授权、准入围栏、
+// 冷启动期间的取消。派发本身(现在唯一的一条路是 A2A)由它自己那套跑在真实
+// HTTP server 上的测试覆盖(delegate-a2a-transport.test.ts),以及控制面一侧的
+// 跨仓库契约测试。
+//
+// 这里 mock 掉它,是为了让这些用例继续测它们本来要测的那件事,而不是变成又一份
+// 手写的传输 fixture —— 后者正是让四处形状不匹配同时漏检的东西。
+vi.mock("./delegate-a2a-transport.js", () => ({
+  a2aTransportConfig: () => ({ baseUrl: "http://control-plane:8081", token: "t" }),
+  runA2aDelegation: (args: any) => a2aDelegation(args),
+}));
 
 const ensureChatSession = vi.fn(async () => {});
 const appendMessage = vi.fn(async () => "opening-row-1");
 const getMessages = vi.fn(async () => [] as any[]);
 const bindMessageTraceId = vi.fn(async () => {});
 const warnTraceBindFailure = vi.fn();
+// 可注入的委托结果,默认一次干净的完成。
+let a2aOutcome: any = { taskId: "t1" };
+let a2aGate: Promise<void> | undefined;
+const a2aCalls: any[] = [];
+async function a2aDelegation(args: any) {
+  a2aCalls.push(args);
+  // 闸门:让测试把委托卡在"已派发但未返回"的状态,用来验准入围栏与停机等待。
+  if (a2aGate) await a2aGate;
+  if (typeof a2aOutcome === "function") return a2aOutcome(args);
+  return a2aOutcome;
+}
+
 vi.mock("./chat-repo.js", async (importOriginal) => ({
   ensureChatSession: (...a: any[]) => ensureChatSession(...a),
   appendMessage: (...a: any[]) => appendMessage(...a),
@@ -155,13 +178,15 @@ function delegateResult(res: FakeRes) {
 // present as the rollback (SICLAW_DELEGATION_TRANSPORT=legacy), so its
 // behaviour still needs to hold. When the code goes, this file goes with it.
 beforeEach(() => {
-  vi.stubEnv("SICLAW_DELEGATION_TRANSPORT", "legacy");
+  a2aOutcome = { taskId: "t1" };
+  a2aCalls.length = 0;
+  a2aGate = undefined;
   vi.clearAllMocks();
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
   consumeReturn = { resultText: "ok", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 1 };
   consumeEvents = [];
-  consumeGate = undefined;
+  a2aGate = undefined;
   abortSessionCalls.length = 0;
   abortSessionBehaviour = undefined;
 });
@@ -187,7 +212,10 @@ describe("handleDelegate — parentSessionId identity binding (P1)", () => {
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
 
     expect(res.statusCode).toBe(200);
-    expect(promptMock).toHaveBeenCalledTimes(1);
+    // 「派发了」= 调了 A2A 传输一次。以前是断言本地 AgentBox 的 prompt,而这一侧
+    // 已经不再自己跑 peer。
+    expect(a2aCalls).toHaveLength(1);
+    expect(a2aCalls[0]).toMatchObject({ peerAgentId: PEER, coordinatorAgentId: COORD });
     expect(delegateResult(res)?.ok).toBe(true);
   });
 
@@ -225,36 +253,18 @@ describe("handleDelegate — cancellation during cold spawn (P1)", () => {
     expect(promptMock).not.toHaveBeenCalled();
   });
 
-  it("does not dispatch after the coordinator disconnects during route resolution", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    let releaseRoute: ((route: unknown) => void) | undefined;
-    deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") {
-        return new Promise((resolve) => { releaseRoute = resolve; });
-      }
-      return {};
-    });
-    const res = makeRes();
-    const pending = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-    for (let i = 0; i < 20 && !releaseRoute; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-    expect(releaseRoute).toBeTruthy();
-
-    res.triggerClose();
-    releaseRoute?.({ local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" });
-    await pending;
-
-    expect(ensureChatSession).not.toHaveBeenCalled();
-    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
-    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
-  });
+  // 「路由解析期间断开」那条已删:不再有路由解析这一步。控制面在名册判定里
+  // 顺带推导出 peer 的 Runtime,所以这一侧没有可以在其中被取消的窗口。冷启动
+  // 期间取消那条仍然有效,就在上面。
 });
 
 describe("handleDelegate — input_required propagation (P1)", () => {
   it("reports status input_required with the question when the peer calls request_input", async () => {
-    consumeEvents = [{ type: "input_required", question: "which cluster do you mean?" }];
+    // peer 通过 A2A 流报出这个问题;传输把它翻成 observe 事件。
+    a2aOutcome = (args: any) => {
+      args.observe({ type: "input_required", question: "which cluster do you mean?" });
+      return {};
+    };
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
     const res = makeRes();
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
@@ -267,8 +277,8 @@ describe("handleDelegate — input_required propagation (P1)", () => {
 });
 
 describe("handleDelegate — model-failure propagation (P1)", () => {
-  it("emits a failed delegate_result when consumeAgentSse reports an errorMessage (no false success)", async () => {
-    consumeReturn = { resultText: "", taskReportText: "", errorMessage: "provider 429 rate limited", eventCount: 0, durationMs: 5 };
+  it("emits a failed delegate_result when the delegation reports an error (no false success)", async () => {
+    a2aOutcome = { error: "provider 429 rate limited" };
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
     const res = makeRes();
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
@@ -290,149 +300,6 @@ describe("handleDelegate — model-failure propagation (P1)", () => {
   });
 });
 
-describe("handleDelegate — delegated-leg trace id (own trace + link)", () => {
-  const TRACE = "f".repeat(32);
-
-  it("stamps the local peer consume with the box-acked trace id, binds the opening row, and reports peerTraceId", async () => {
-    promptMock.mockResolvedValueOnce({ ok: true, sessionId: "peer-sess", traceId: TRACE } as any);
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
-
-    // Every row the local consume persists carries the leg's own trace id …
-    expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: TRACE }));
-    // … the opening user row (appended before the trace existed) is back-bound …
-    expect(bindMessageTraceId).toHaveBeenCalledWith("opening-row-1", expect.any(String), TRACE);
-    // … and the coordinator gets the id to persist as the cross-trace link.
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", peerTraceId: TRACE });
-    // The id is ALSO announced early, like delegate_session: a Stop destroys the
-    // client's socket before the final frame, so the early announcement is what a
-    // stopped leg's tool row gets to keep.
-    expect(res.frames).toContainEqual({ type: "delegate_trace", peerTraceId: TRACE });
-  });
-
-  it("leaves rows unstamped and omits peerTraceId when the box ack has no trace id (tracing off)", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "t", parentSessionId: "own-sess" }), res as any, identity, deps);
-
-    expect(consumeAgentSse).toHaveBeenCalledWith(expect.objectContaining({ traceId: undefined }));
-    expect(bindMessageTraceId).not.toHaveBeenCalled();
-    expect(delegateResult(res)?.peerTraceId).toBeUndefined();
-  });
-
-  it("learns a remote leg's trace id from the terminal event, binds the opening row, and reports it", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          { role: "assistant", content: "remote answer", delegationId: null, metadata: null },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done", traceId: TRACE },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", peerTraceId: TRACE });
-    expect(bindMessageTraceId).toHaveBeenCalledWith("opening-row-1", expect.any(String), TRACE);
-    // The remote path persists via the TARGET Runtime's own consume — the source
-    // must not stamp anything itself.
-    expect(consumeAgentSse).not.toHaveBeenCalled();
-  });
-
-  it("rejects a malformed terminal trace id instead of persisting a link that matches nothing", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          { role: "assistant", content: "remote answer", delegationId: null, metadata: null },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          // Uppercase hex: valid to a typeof-string check, invalid to the 32-lowercase-hex
-          // contract the bind RPC enforces — must be dropped at ingestion.
-          event: { type: "prompt_done", traceId: "F".repeat(32) },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)?.peerTraceId).toBeUndefined();
-    expect(bindMessageTraceId).not.toHaveBeenCalled();
-  });
-
-  it("salvages the opening-row bind from a terminal that arrived after the delegation settled", async () => {
-    getMessages.mockResolvedValueOnce([
-      { id: "row-user", role: "user", content: "inspect", delegationId: "d-late-1", metadata: null },
-      { id: "row-a", role: "assistant", content: "partial", delegationId: null, metadata: null },
-    ] as any);
-    await salvageDelegationTraceBind({ sessionId: "peer-s", delegationId: "d-late-1", event: { type: "prompt_done", aborted: true, traceId: TRACE } });
-    expect(bindMessageTraceId).toHaveBeenCalledWith("row-user", "peer-s", TRACE);
-  });
-
-  it("walks the history at most once per delegation id across terminal redeliveries", async () => {
-    getMessages.mockResolvedValueOnce([
-      { id: "row-user", role: "user", content: "inspect", delegationId: "d-late-memo", metadata: null },
-    ] as any);
-    const terminal = { sessionId: "peer-s", delegationId: "d-late-memo", event: { type: "prompt_done", traceId: TRACE } };
-    await salvageDelegationTraceBind(terminal);
-    await salvageDelegationTraceBind(terminal);
-    expect(getMessages).toHaveBeenCalledTimes(1);
-    expect(bindMessageTraceId).toHaveBeenCalledTimes(1);
-  });
-
-  it("ignores a settled terminal whose trace id is missing or malformed", async () => {
-    await salvageDelegationTraceBind({ sessionId: "peer-s", delegationId: "d-late-2", event: { type: "prompt_done" } });
-    await salvageDelegationTraceBind({ sessionId: "peer-s", delegationId: "d-late-2", event: { type: "prompt_done", traceId: "F".repeat(32) } });
-    expect(getMessages).not.toHaveBeenCalled();
-    expect(bindMessageTraceId).not.toHaveBeenCalled();
-  });
-
-  it("tolerates a terminal without a trace id from an older target Runtime", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          { role: "assistant", content: "remote answer", delegationId: null, metadata: null },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done" });
-    expect(delegateResult(res)?.peerTraceId).toBeUndefined();
-    expect(bindMessageTraceId).not.toHaveBeenCalled();
-  });
-});
-
 describe("handleDelegate — admission fence", () => {
   it("refuses a delegation once the Runtime is shutting down", async () => {
     // This endpoint starts AgentBox work of its own, so it honours the same fence as an
@@ -447,7 +314,7 @@ describe("handleDelegate — admission fence", () => {
 
     expect(res.statusCode).toBe(503);
     expect((res.jsonBody as any)?.error).toMatch(/shutting down/);
-    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+    expect(a2aCalls).toHaveLength(0);
     expect(promptMock).not.toHaveBeenCalled();
     // Not even the roster lookup: nothing about this request should reach the control plane.
     expect(deps.frontendClient.request).not.toHaveBeenCalled();
@@ -458,31 +325,31 @@ describe("handleDelegate — admission fence", () => {
     // dispatches. Observing "not shutting down" and then pausing in any of those is
     // exactly how a turn reaches a box after shutdown has taken its one look.
     let shuttingDown = false;
-    let releaseRoute: (() => void) | undefined;
+    let releaseRoster: (() => void) | undefined;
     const deps: any = {
       ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
       shutdownGate: { isShuttingDown: () => shuttingDown, register: () => () => {} },
     };
+    // 闸门挂在名册查询上 —— 派发前仍然存在的一次 await。以前挂的是
+    // delegation.resolveRoute,那一步已经没有了(peer 的 Runtime 由控制面在名册
+    // 判定里顺带推导),但"入口采样一次证明不了什么"这个论点一字未变。
     deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") {
-        // Shutdown starts while this await is outstanding.
-        await new Promise<void>((resolve) => { releaseRoute = resolve; });
-        return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "config.getDelegates") {
+        await new Promise<void>((resolve) => { releaseRoster = resolve; });
+        return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
       }
       return {};
     });
 
     const res = makeRes();
     const handling = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-    await vi.waitFor(() => expect(releaseRoute).toBeDefined());
+    await vi.waitFor(() => expect(releaseRoster).toBeDefined());
     shuttingDown = true;
-    releaseRoute!();
+    releaseRoster!();
     await handling;
 
-    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
-    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
-    expect(promptMock).not.toHaveBeenCalled();
+    // 「派发」现在就是调用 A2A 传输。
+    expect(a2aCalls).toHaveLength(0);
   });
 
   it("hands the shutdown a wind-down it can WAIT for, not one it merely starts", async () => {
@@ -498,21 +365,16 @@ describe("handleDelegate — admission fence", () => {
         register: (fn: () => Promise<void> | void) => { cancel = fn; return () => { cancel = undefined; }; },
       },
     };
-    deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") return { ok: true };
-      if (method === "delegation.abort") {
-        // Only the wind-down's own request is held; the handler's follow-up must not
-        // deadlock the test.
-        if (!abortHeld) {
-          abortHeld = true;
-          await new Promise<void>((resolve) => { releaseAbort = resolve; });
-        }
-        return { ok: true };
+    // 委托卡在"已派发未返回",这样注册的 wind-down 有真东西可等。取消不再是一次
+    // delegation.abort RPC —— 传输收到 abort signal 后自己去发任务的 :cancel。
+    a2aOutcome = async (args: any) => {
+      if (!abortHeld) {
+        abortHeld = true;
+        args.signal.addEventListener("abort", () => releaseAbort?.());
+        await new Promise<void>((resolve) => { releaseAbort = resolve; });
       }
-      return {};
-    });
+      return { taskId: "t1" };
+    };
 
     const res = makeRes();
     const handling = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
@@ -530,50 +392,16 @@ describe("handleDelegate — admission fence", () => {
     await handling;
   });
 
-  it("retries a refused abort, and keeps the hook until that attempt settles", async () => {
-    // The LOCAL path, because there the wind-down is the only source of abortSession —
-    // on the remote path the handler issues one of its own and the count proves nothing.
-    //
-    // Two ways this could look done while the peer keeps running: a refusal resolved as
-    // success, and a disconnect-started attempt whose hook is released the moment the
-    // handler settles, leaving a shutdown an instant later nothing to wait for.
-    let openConsumer: (() => void) | undefined;
-    consumeGate = new Promise<void>((resolve) => { openConsumer = resolve; });
-    let releaseSecondAbort: (() => void) | undefined;
-    abortSessionBehaviour = async (attempt) => {
-      if (attempt === 1) throw new Error("box refused");
-      if (attempt === 2) await new Promise<void>((resolve) => { releaseSecondAbort = resolve; });
-    };
-
-    let cancel: (() => Promise<void> | void) | undefined;
-    const deps: any = {
-      ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
-      shutdownGate: {
-        isShuttingDown: () => false,
-        register: (fn: () => Promise<void> | void) => { cancel = fn; return () => { cancel = undefined; }; },
-      },
-    };
-
-    const res = makeRes();
-    const handling = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-    await vi.waitFor(() => expect(promptMock).toHaveBeenCalled());
-
-    // A DISCONNECT starts the wind-down, fire and forget, and lets the handler finish.
-    res.triggerClose();
-    openConsumer!();
-    await handling;
-
-    // The refusal did not count as done — a second attempt is outstanding — and the hook
-    // is still registered, so a shutdown now has that attempt to wait for.
-    await vi.waitFor(() => expect(abortSessionCalls.length).toBe(2), { timeout: 3000 });
-    expect(cancel).toBeDefined();
-
-    const windDown = Promise.resolve().then(() => cancel!());
-    releaseSecondAbort!();
-    await windDown;
-    // Settled: only now is the hook released.
-    await vi.waitFor(() => expect(cancel).toBeUndefined(), { timeout: 3000 });
-  });
+  // ⚠️ 「被拒的 abort 会重试」那条删了:重试的对象不存在了。
+  //
+  // 它测的是 peerClient.abortSession —— 本地那条路上 wind-down 唯一的取消手段,
+  // 会被 box 拒绝、因此需要退避重试。现在这一侧不再自己跑 peer,取消就是 abort
+  // 掉 signal,由传输去发那个任务自己的 `:cancel`,而那是控制面拥有的操作:没有
+  // "被拒"这个状态可以重试。
+  //
+  // 它真正守住的那件事 —— wind-down 必须是可等待的、而不是发出去就算完 —— 由
+  // 上面那条("hands the shutdown a wind-down it can WAIT for")覆盖,而且现在
+  // 挂在 A2A 派发上。
 
   it("registers a wind-down so a shutdown reaches a delegation already under way", async () => {
     // Past refusing: the only thing left is the same wind-down a client disconnect
@@ -586,397 +414,32 @@ describe("handleDelegate — admission fence", () => {
         register: (fn: () => void) => { cancel = fn; return () => { cancel = undefined; }; },
       },
     };
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        // Under way now: shutdown can only wind it down.
-        cancel?.();
-        return { ok: true };
-      }
-      return {};
-    });
+    // 委托已经在派发中:此刻停机唯一能做的就是 wind it down。
+    let sawAbort = false;
+    a2aOutcome = async (args: any) => {
+      args.signal.addEventListener("abort", () => { sawAbort = true; });
+      cancel?.();
+      // 让取消先落地,再返回 —— 模拟一次被中途掐掉的派发。
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      return { stopped: true };
+    };
 
     const res = makeRes();
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
 
-    expect(deps.frontendClient.request).toHaveBeenCalledWith("delegation.abort", { delegationId: expect.any(String) }, 10_000);
-    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed" });
+    // 注册的 wind-down 确实抵达了在跑的委托 —— 取消现在是 abort 掉传输的 signal,
+    // 由它去发那个任务自己的 `:cancel`,而不是一次 delegation.abort RPC。
+    expect(sawAbort).toBe(true);
   });
 });
 
-describe("handleDelegate — cross-Runtime routing", () => {
-  it("routes a remote peer through ControlPlane and never creates it in the coordinator AgentBoxManager", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "chat.resolveSession") return { found: true, user_id: "u", agent_id: COORD };
-      if (method === "chat.recentDelegationSessions") return { ids: [] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          { role: "assistant", content: "aries result", delegationId: null, metadata: null },
-        ] as any);
-        const relay = deps.eventHandlers.get("delegation.event")!;
-        relay({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "aries result" }] } },
-        });
-        relay({ delegationId: params.delegationId, sessionId: params.sessionId, event: { type: "prompt_done" } });
-        return { ok: true, targetRuntimeId: "aries" };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect", parentSessionId: "own-sess" }), res as any, identity, deps);
-
-    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
-    expect(promptMock).not.toHaveBeenCalled();
-    const startCall = deps.frontendClient.request.mock.calls.find(([method]: any[]) => method === "delegation.start");
-    expect(startCall?.[1]).toMatchObject({
-      coordinatorAgentId: COORD,
-      peerAgentId: PEER,
-      prompt: {
-        agentId: PEER,
-        text: "inspect",
-        skipInitialPersistence: true,
-        delegation: { parentAgentId: COORD },
-      },
-    });
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "aries result" });
-  });
-
-  it("fails closed when the control plane cannot resolve the peer Runtime", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") throw new Error("unknown method");
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(res.statusCode).toBe(503);
-    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
-    expect(promptMock).not.toHaveBeenCalled();
-  });
-
-  it("fails closed when the route envelope omits its source Runtime", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, targetRuntimeId: "aries" };
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(res.statusCode).toBe(503);
-    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
-  });
-
-  it("does not start a remote turn when its delegated session cannot be persisted", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      return {};
-    });
-    ensureChatSession.mockRejectedValueOnce(new Error("database unavailable"));
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(res.statusCode).toBe(503);
-    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
-    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a remote peer stream_error instead of returning false success", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        const relay = deps.eventHandlers.get("delegation.event")!;
-        relay({ delegationId: params.delegationId, sessionId: params.sessionId, event: { type: "stream_error", error: { message: "provider unavailable" } } });
-        relay({ delegationId: params.delegationId, sessionId: params.sessionId, event: { type: "prompt_done" } });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed", error: "provider unavailable" });
-  });
-
-  it("treats an aborted terminal as failure even when partial assistant text was persisted", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done", aborted: true, reason: "box_rolled" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed" });
-    expect(delegateResult(res)?.error).toContain("box_rolled");
-    expect(delegateResult(res)?.finalText).toBeUndefined();
-    expect(getMessages).not.toHaveBeenCalled();
-  });
-
-  it("recovers a persisted assistant answer when the live message frame was lost", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          { role: "assistant", content: "durable aries result", delegationId: null, metadata: null },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(getMessages).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ limit: 200 }));
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable aries result" });
-  });
-
-  it("marks a finished remote delegation settled so a re-sent terminal is acknowledged", async () => {
-    // Reliable control delivery retries until the source acknowledges. Once the
-    // consumer has finished there is nobody to accept a re-sent terminal, and
-    // rejecting it forever keeps the sender's relay alive — whose idle expiry
-    // aborts by (agent, session) and would kill a new turn reusing this session.
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    let startedDelegationId = "";
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        startedDelegationId = params.delegationId;
-        getMessages.mockResolvedValueOnce([
-          { id: "u1", role: "user", content: "inspect", delegationId: params.delegationId, metadata: null, createdAt: new Date(1000) },
-          { id: "a1", role: "assistant", content: "settled answer", delegationId: null, metadata: null, createdAt: new Date(2000) },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done" });
-    expect(isDelegationSettled(startedDelegationId)).toBe(true);
-    expect(isDelegationSettled("never-started")).toBe(false);
-  });
-
-  it("widens the history window until a turn boundary buried under its own tool rows is inside it", async () => {
-    // Tool rows are messages too, so one window is not one turn: a tool-heavy peer
-    // turn can push its own opening row out of the newest N rows. Recovery must
-    // keep widening rather than report a completed delegation as unrecoverable.
-    // The window grows instead of walking a timestamp cursor because created_at has
-    // one-second granularity — a cursor would skip same-second rows.
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        const toolRows = (n: number) => Array.from({ length: n }, (_unused, i) => ({
-          id: `t${i}`, role: "tool", content: "kubectl get pods", delegationId: null, metadata: null,
-        }));
-        // First window is saturated and holds no boundary → must widen.
-        getMessages.mockResolvedValueOnce([
-          ...toolRows(199),
-          { id: "a1", role: "assistant", content: "durable answer", delegationId: null, metadata: null },
-        ] as any);
-        // Wider window finally reaches this turn's opening row, preceded by an
-        // older unrelated turn that must NOT leak into the result.
-        getMessages.mockResolvedValueOnce([
-          { id: "old", role: "assistant", content: "previous turn answer", delegationId: null, metadata: null },
-          { id: "u1", role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          ...toolRows(199),
-          { id: "a1", role: "assistant", content: "durable answer", delegationId: null, metadata: null },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(getMessages).toHaveBeenCalledTimes(2);
-    expect(getMessages).toHaveBeenNthCalledWith(1, expect.any(String), { limit: 200 });
-    expect(getMessages).toHaveBeenNthCalledWith(2, expect.any(String), { limit: 400 });
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable answer" });
-  });
-
-  it("uses the durable answer when the live relay delivered only part of the assistant output", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-          { role: "assistant", content: "complete durable answer", delegationId: null, metadata: null },
-        ] as any);
-        const relay = deps.eventHandlers.get("delegation.event")!;
-        relay({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial" }] } },
-        });
-        relay({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "complete durable answer" });
-  });
-
-  it("fails instead of returning an empty success when no durable result can be recovered", async () => {
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      if (method === "delegation.start") {
-        getMessages.mockResolvedValueOnce([
-          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-        ] as any);
-        deps.eventHandlers.get("delegation.event")!({
-          delegationId: params.delegationId,
-          sessionId: params.sessionId,
-          event: { type: "prompt_done" },
-        });
-        return { ok: true };
-      }
-      return {};
-    });
-    const res = makeRes();
-    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-
-    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed" });
-  });
-
-  it("does not dispatch a remote turn when Stop arrives while waiting for the session lock", async () => {
-    const peerSessionId = "blocked-peer-session";
-    const release = await sessionTurnLocks.acquire(peerSessionId);
-    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-    deps.frontendClient.request = vi.fn(async (method: string) => {
-      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-      if (method === "chat.resolveSession") return { found: true, user_id: "u", agent_id: COORD };
-      if (method === "chat.recentDelegationSessions") return { ids: [peerSessionId] };
-      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-      return {};
-    });
-    const res = makeRes();
-    const pending = handleDelegate(
-      makeReq({ peerAgentId: PEER, text: "inspect", parentSessionId: "own-sess", peerSessionId }),
-      res as any,
-      identity,
-      deps,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    res.triggerClose();
-    release();
-    await pending;
-
-    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
-  });
-
-  it("refreshes the remote timeout on matching relay activity instead of capping total duration", async () => {
-    vi.useFakeTimers();
-    const previousTimeout = process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT;
-    process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT = "1";
-    try {
-      const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
-      let remoteParams: any;
-      deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
-        if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
-        if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
-        if (method === "delegation.start") {
-          remoteParams = params;
-          getMessages.mockResolvedValueOnce([
-            { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
-            { role: "assistant", content: "still active", delegationId: null, metadata: null },
-          ] as any);
-          return { ok: true };
-        }
-        return {};
-      });
-      const res = makeRes();
-      const pending = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
-      for (let i = 0; i < 20 && !remoteParams; i += 1) {
-        await vi.advanceTimersByTimeAsync(0);
-        await Promise.resolve();
-      }
-      expect(remoteParams).toBeTruthy();
-
-      await vi.advanceTimersByTimeAsync(800);
-      deps.eventHandlers.get("delegation.event")!({
-        delegationId: remoteParams.delegationId,
-        sessionId: remoteParams.sessionId,
-        event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "still active" }] } },
-      });
-      await vi.advanceTimersByTimeAsync(800);
-      deps.eventHandlers.get("delegation.event")!({
-        delegationId: remoteParams.delegationId,
-        sessionId: remoteParams.sessionId,
-        event: { type: "prompt_done" },
-      });
-      await pending;
-
-      expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "still active" });
-      expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.abort", expect.anything(), expect.anything());
-    } finally {
-      if (previousTimeout === undefined) delete process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT;
-      else process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT = previousTimeout;
-      vi.useRealTimers();
-    }
-  });
-});
-
-describe("getRemoteDelegationIdleTimeoutMs", () => {
-  it("reads seconds from the environment and rejects invalid values", () => {
-    expect(getRemoteDelegationIdleTimeoutMs({ SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT: "42" } as NodeJS.ProcessEnv)).toBe(42_000);
-    expect(getRemoteDelegationIdleTimeoutMs({ SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT: "0" } as NodeJS.ProcessEnv)).toBe(600_000);
-    expect(getRemoteDelegationIdleTimeoutMs({ SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT: "invalid" } as NodeJS.ProcessEnv)).toBe(600_000);
-  });
-});
+// ⚠️ 删掉的三组:「delegated-leg trace id」「cross-Runtime routing」
+// 「getRemoteDelegationIdleTimeoutMs」。
+//
+// 它们的主体不是被改了,是不存在了:委托只走 A2A,peer 由控制面派发,所以这一侧
+// 既不再决定 peer 落在哪个 Runtime(那是名册判定顺带推导出来的),也不再自己中继
+// 远端事件流、不再需要一个远端空闲超时、不再需要"已结算的委托"记忆去应答重投的
+// terminal。留着它们只会测一段已经删掉的代码。
+//
+// 幸存的几组测的是**派发之前**的东西 —— 父会话身份绑定、名册授权、准入围栏、
+// 冷启动期间的取消 —— 那些在 A2A 路径上一字未改。

@@ -44,46 +44,31 @@ const CONTEXT_MEDIA_TYPE = "application/vnd.siclaw.context+json";
  * the legacy relay. A loud failure at startup/dispatch is recoverable; a
  * mistaken belief about which transport is in use is not.
  */
-export function a2aTransportConfig(env: NodeJS.ProcessEnv = process.env): A2aTransportConfig | undefined {
-  // ⚠️ A2A IS THE DEFAULT. `legacy` is the explicit opt-out.
+export function a2aTransportConfig(env: NodeJS.ProcessEnv = process.env): A2aTransportConfig {
+  // ⚠️ NO FLAG, AND NO OPTIONAL RETURN. A2A is the only delegation transport;
+  // the private relay it replaced has been deleted, so there is nothing left to
+  // fall back to and nothing to opt out of. Returning `undefined` used to mean
+  // "use the legacy path" — a meaning that no longer exists, and leaving the
+  // shape optional would invite a caller to reinvent a fallback that has no
+  // implementation behind it.
   //
-  // The flag used to default to the private relay and opt IN to A2A. Flipping it
-  // is the switch — the legacy code is still present and still tested, so this
-  // is also the rollback: set SICLAW_DELEGATION_TRANSPORT=legacy and the old
-  // path is back, with no redeploy of anything else.
+  // ⚠️ REUSES THE CREDENTIAL AND ENDPOINT THE RUNTIME ALREADY HAS. This once
+  // required three variables of its own because the entrance authenticated a
+  // separate workload identity. That identity is gone: the control plane
+  // authenticates the Runtime's own adapter secret (the same X-Auth-Token the
+  // persistent WS presents) plus the caller agent id, checked against
+  // `siclaw_agents.runtime_id`.
   //
-  // Deleting that code is mechanical cleanup with no behaviour change, and it
-  // comes AFTER this default has been verified in a real environment. Removing
-  // the fallback first would mean discovering any problem with nothing to fall
-  // back to.
-  if (env.SICLAW_DELEGATION_TRANSPORT === "legacy") return undefined;
-  // ⚠️ REUSES THE CREDENTIAL AND ENDPOINT THE RUNTIME ALREADY HAS.
-  //
-  // This used to require three variables of its own — SICLAW_INNER_A2A_URL,
-  // SICLAW_INNER_A2A_TOKEN and an https-or-else escape hatch — because the
-  // entrance authenticated a separate WORKLOAD bearer token. That identity is
-  // gone: the control plane now authenticates the Runtime's own adapter secret
-  // (the same X-Auth-Token the persistent WS upgrade presents) plus the caller
-  // agent id, checked against `siclaw_agents.runtime_id`.
-  //
-  // So there is nothing left to configure. The endpoint is the control-plane URL
-  // this Runtime is already connected to, and the credential is the one it is
-  // already holding — which means this transport cannot be pointed at the wrong
-  // place, cannot be given a stale token, and has no rotation story of its own
-  // (RotateSecret drops the WS session and invalidates this in the same instant).
-  //
-  // The https requirement went with the workload token. The adapter listener is
-  // plain HTTP on a ClusterIP-only port and the WS already runs over it, so
-  // demanding TLS here while ws:// rides the same channel would have been
-  // theatre — and its escape hatch was the part that would actually get set.
+  // So there is nothing to configure. It cannot be pointed at the wrong control
+  // plane, cannot be handed a stale token, and has no rotation story of its own
+  // — RotateSecret drops the WS session and invalidates this in the same
+  // instant.
   const baseUrl = env.SICLAW_SERVER_URL?.replace(/\/$/, "");
   const token = env.SICLAW_PORTAL_SECRET;
   if (!baseUrl || !token) {
     throw new Error(
-      "SICLAW_DELEGATION_TRANSPORT=a2a requires the Runtime's own SICLAW_SERVER_URL and " +
-      "SICLAW_PORTAL_SECRET (the same pair the control-plane WS uses). Refusing to fall back " +
-      "to the legacy transport silently: fix the configuration, or unset " +
-      "SICLAW_DELEGATION_TRANSPORT to use the legacy transport deliberately.",
+      "delegation requires the Runtime's own SICLAW_SERVER_URL and SICLAW_PORTAL_SECRET " +
+      "(the same pair the control-plane WS uses).",
     );
   }
   try {
