@@ -101,6 +101,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // render details.steps live) — same path spawn_subagent uses.
       let lastSteps: unknown[] = [];
       let liveChildSessionId: string | undefined;
+      const startedAt = Date.now();
       const onProgress = (p: { toolCalls: number; steps: unknown[]; activity?: string; childSessionId?: string }) => {
         lastSteps = p.steps;
         if (p.childSessionId) liveChildSessionId = p.childSessionId;
@@ -111,7 +112,24 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
             content: p.activity ? [{ type: "text", text: p.activity }] : [],
             // child_session_id surfaced live (known at start) → the card's
             // "open full session" affordance appears while the peer is still running.
-            details: { status: "running", agent_id: member.id, agent_name: member.name, toolCalls: p.toolCalls, steps: p.steps, ...(liveChildSessionId ? { child_session_id: liveChildSessionId } : {}) },
+            //
+            // `activity` and `duration_ms` are ALSO in details, not only in content.
+            // The card reads what the peer is doing right now from details (the same
+            // field spawn_subagent uses), and content is a plain string the frontend
+            // has to guess the shape of — a delegation whose activity happened to
+            // look like JSON would be parsed as a result object. Emitting elapsed on
+            // every tick is what lets the card show a running clock without holding a
+            // timer of its own.
+            details: {
+              status: "running",
+              agent_id: member.id,
+              agent_name: member.name,
+              toolCalls: p.toolCalls,
+              steps: p.steps,
+              duration_ms: Date.now() - startedAt,
+              ...(p.activity ? { activity: p.activity } : {}),
+              ...(liveChildSessionId ? { child_session_id: liveChildSessionId } : {}),
+            },
           },
         });
       };
@@ -139,7 +157,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // fallback with no peerSessionId, and the failed/stopped legs are exactly
       // the ones a review needs to open.
       const childSessionId = resp.peerSessionId ?? liveChildSessionId;
-      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
+      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, duration_ms: Date.now() - startedAt, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
 
       // Stopped by the coordinator (turn aborted): the relay was torn down and
       // the peer turn cancelled. Report a clean stop, not a scary error.
