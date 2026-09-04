@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
-import { sessionRegistry } from "./session-registry.js";
+import { sessionRegistry, type SessionRecord } from "./session-registry.js";
 import {
   deliverBackgroundChannelMessage,
   deliverChannelVisibleMessage,
@@ -58,10 +58,111 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
+/**
+ * Does `sessionId` belong to the calling certificate's agent? Unknown sessions
+ * degrade to `true` (the caller cannot be shown to be lying); a known session
+ * passes when the caller either OWNS it or is the peer it was DELEGATED TO.
+ *
+ * The delegation arm exists because a delegated leg is the one session whose
+ * owner is deliberately not its executor: the coordinator that created the leg
+ * stays the owner (so it keeps the conversation), while the turn runs in the
+ * delegated peer's AgentBox, whose certificate names the peer. Everything that
+ * box persists FOR that leg — a spawned sub-agent's session and transcript,
+ * task-ledger events — therefore arrived with an identity that could not match
+ * the row's owner and was refused, while the pointers to those rows, written by
+ * the coordinator-side stream, went through. The result was a leg advertising
+ * sub-agent sessions that had never been created.
+ *
+ * Accepting the target does not widen attribution: `target_agent_id` is the box
+ * the leg was handed to, so a box still cannot claim a session delegated to
+ * anyone else, and a top-level session has no target to fall back on.
+ */
 async function sessionBelongsToIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
   if (!sessionId) return true;
   const owner = await sessionRegistry.get(sessionId);
-  return !owner || owner.agentId === identity.agentId;
+  if (!owner) return true;
+  if (owner.agentId === identity.agentId) return true;
+  if (owner.targetAgentId) return owner.targetAgentId === identity.agentId;
+  // No target on the record — authoritative only if the record came from the row
+  // itself. The 3-arg `rememberSession` callers know nothing about delegation
+  // fields, so whichever of them runs first after a restart or an eviction caches
+  // the leg owner-only, and a cache hit never re-reads: refusing on the strength
+  // of such an entry would silently reinstate the data loss this arm exists to
+  // fix, for as long as the entry survived. Production runs more than one
+  // Runtime, so the first caller is not reliably the one that knows the target.
+  //
+  // Re-read once, on the about-to-refuse path only. The refreshed record is
+  // marked as row-sourced, so a repeat attempt costs nothing.
+  if (owner.authoritative) return false;
+  // The re-read must not be able to make things worse than the refusal it is
+  // trying to avoid. This is the only I/O on the about-to-refuse path, and an
+  // exception here would reach the handler's outer catch as a 500 — telling a box
+  // that swallows persistence failures nothing it can act on, and hiding "not
+  // your session" behind "the platform is broken". Nothing is written either way,
+  // so a failed re-read simply leaves the refusal standing.
+  let refreshed: SessionRecord | undefined;
+  try {
+    refreshed = await sessionRegistry.refresh(sessionId);
+  } catch (err) {
+    console.warn(`[internal-api] could not re-read session ${sessionId} before refusing: ${String(err)}`);
+    return false;
+  }
+  return Boolean(refreshed?.targetAgentId) && refreshed?.targetAgentId === identity.agentId;
+}
+
+/**
+ * Strict owner-only variant, for a session a request claims to CREATE, REWRITE
+ * or SPEAK AS rather than merely write into. Unlike the arm above, the delegation
+ * target buys nothing here: appending is additive, whereas these three verbs act
+ * on rows and channels the coordinator owns.
+ *
+ * The owner is taken from the ROW, never from a cached record of unknown
+ * provenance. A leg relayed to another Runtime is dispatched there by
+ * `chat.send`, which caches it under the PEER's agent — so a cache-only owner
+ * check would hand the peer exactly the rewrite access this gate withholds, and
+ * would do so only in the multi-Runtime deployment where it matters least to
+ * notice. One extra read per session per cache lifetime; nothing once the record
+ * is authoritative.
+ *
+ * Note the re-read is NOT confined to the about-to-refuse path, unlike
+ * `sessionBelongsToIdentity`. There, a stale record can only wrongly refuse; here
+ * it can wrongly ACCEPT, so provenance has to be settled before the comparison
+ * rather than after it fails.
+ *
+ * An UNREACHABLE row is a REFUSAL, not a fallback to the cached owner. Falling
+ * back reads like the available-first choice, and it is wrong here for a specific
+ * reason: on a leg relayed to this Runtime, `chat.send` wrote the PEER into that
+ * cache entry, so the fallback would trust the one value this gate exists to
+ * distrust — and would do it precisely while the source of truth is unavailable to
+ * contradict it. The asymmetry settles it: a refused `channel.deliver_message`
+ * drops a progress card during an outage in which nothing else is persisting
+ * either, while a wrongly-admitted `update_message` forges conversation content
+ * and cannot be undone.
+ *
+ * Every `true` this returns is therefore either "no such session" or a comparison
+ * against a row-sourced record. There is no third source.
+ */
+async function sessionOwnedByIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
+  if (!sessionId) return true;
+  const cached = await sessionRegistry.get(sessionId);
+  if (!cached) return true;
+  if (cached.authoritative) return cached.agentId === identity.agentId;
+
+  let fromRow: SessionRecord | undefined;
+  try {
+    fromRow = await sessionRegistry.refresh(sessionId);
+  } catch (err) {
+    // Nothing is written either way, so this must not reach the handler's outer
+    // catch as a 500: that would tell a box reading its own logs that the platform
+    // is broken when the answer is simply unavailable.
+    console.warn(`[internal-api] could not re-read session ${sessionId} for an owner-only check: ${String(err)}`);
+  }
+  if (fromRow?.authoritative) return fromRow.agentId === identity.agentId;
+  // Distinct from "not your session": an operator reading these needs to tell a
+  // real attribution mismatch from a window where the row simply could not be
+  // reached, because the second one clears up on its own and the first does not.
+  console.warn(`[internal-api] refusing an owner-only write on session ${sessionId}: ownership could not be established from the row`);
+  return false;
 }
 
 /**
@@ -72,6 +173,17 @@ async function sessionBelongsToIdentity(sessionId: string | null | undefined, id
  *
  * Unknown sessions degrade gracefully (`ok: true`, `userId: ""`); only an
  * explicit ownership mismatch trips the gate.
+ *
+ * Deliberately NARROWER than `sessionBelongsToIdentity`: it does not accept a
+ * session's delegation target. These routes mutate cron schedules, so allowing
+ * them from inside a delegated leg would let a peer bind a long-lived schedule
+ * to itself off the back of one delegated turn — a product question about who
+ * may own a schedule, not the attribution gap the other helper closes.
+ *
+ * That narrowness is NOT a routing-independent guarantee: a leg relayed to
+ * another Runtime is dispatched there by `chat.send`, which caches the leg under
+ * the PEER's agent, so the owner check already passes for it. Only a leg run by
+ * the Runtime that created it is refused here.
  */
 async function resolveUserForIdentity(
   sessionId: string | null | undefined,
@@ -88,6 +200,40 @@ function agentMatchesIdentity(agentId: string | null | undefined, identity: Cert
   return !agentId || agentId === identity.agentId;
 }
 
+/**
+ * The sessions a refusal was about, for the log line. Which field carries them
+ * differs per event type, and a refusal can be about the PARENT rather than the
+ * subject — the error string says which check failed, this says on what.
+ */
+function delegationEventSessions(event: DelegationPersistenceEvent): string {
+  const parts: string[] = [];
+  const push = (label: string, id?: string | null): void => {
+    if (id) parts.push(`${label}=${id}`);
+  };
+  switch (event.type) {
+    case "delegation.ensure_session":
+      push("session", event.sessionId);
+      push("parent", event.lineage?.parentSessionId);
+      break;
+    case "delegation.append_message":
+      push("session", event.message.sessionId);
+      push("parent", event.message.parentSessionId);
+      break;
+    case "delegation.update_message":
+    case "delegation.update_tool_message":
+    case "channel.deliver_message":
+      push("session", event.message.sessionId);
+      break;
+    case "delegation.append_event":
+      push("parent", event.event.parentSessionId);
+      break;
+    case "delegation.emit_chat_event":
+      push("session", event.sessionId);
+      break;
+  }
+  return parts.join(" ");
+}
+
 async function validateDelegationEventActor(
   event: DelegationPersistenceEvent,
   identity: CertificateIdentity,
@@ -102,7 +248,9 @@ async function validateDelegationEventActor(
       // them in parallel — the unhappy path wastes one extra RPC but the
       // happy path's latency is halved.
       const [own, parentOwn] = await Promise.all([
-        sessionBelongsToIdentity(event.sessionId, identity),
+        // Subject: owner-only (this call upserts the row) — see sessionOwnedByIdentity.
+        sessionOwnedByIdentity(event.sessionId, identity),
+        // Parent: a delegated leg's peer legitimately writes beneath it.
         sessionBelongsToIdentity(event.lineage?.parentSessionId, identity),
       ]);
       if (!own) return { status: 403, error: "delegation session mismatch" };
@@ -122,7 +270,14 @@ async function validateDelegationEventActor(
     }
     case "delegation.update_message":
     case "delegation.update_tool_message": {
-      if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
+      // Owner-only, NOT the delegation arm. These take a message id and rewrite
+      // that row, and nothing in the payload scopes the rewrite to rows the
+      // caller wrote — so the arm that lets a peer's box APPEND its sub-agent
+      // transcript would also let it rewrite what the coordinator said. Appending
+      // at worst adds rows attributed to the peer; rewriting forges the
+      // conversation. No caller reaches this today (row updates run on the
+      // coordinator side), which is exactly why it costs nothing to hold shut.
+      if (!(await sessionOwnedByIdentity(event.message.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
       return null;
     }
     case "delegation.append_event": {
@@ -138,7 +293,13 @@ async function validateDelegationEventActor(
     }
     case "channel.deliver_message": {
       if (!agentMatchesIdentity(event.message.fromAgentId, identity)) return { status: 403, error: "channel source agent mismatch" };
-      if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "channel session mismatch" };
+      // Owner-only, unlike the delegation persistence events above. This carries
+      // no delegated state: the `channel_update` tool behind it is suppressed on a
+      // delegated turn by design (a delegated worker's output flows back through
+      // the coordinator, which owns the single visible identity), so a leg has no
+      // legitimate route here. The arm that lets a peer's box persist a sub-agent
+      // transcript should not double as a key to the conversation's channel.
+      if (!(await sessionOwnedByIdentity(event.message.sessionId, identity))) return { status: 403, error: "channel session mismatch" };
       return null;
     }
     default:
@@ -652,6 +813,26 @@ export async function handleDelegationEvents(
     const event = await readJsonBody(req) as DelegationPersistenceEvent;
     const actorError = await validateDelegationEventActor(event, identity);
     if (actorError) {
+      const where = delegationEventSessions(event);
+      const suffix = where ? ` (${where})` : "";
+      if (actorError.status === 403) {
+        // Log it: an AgentBox treats persistence as best-effort and swallows the
+        // failure, so a refusal here is otherwise invisible — and the rows it drops
+        // are the ones a delegated leg's sub-agent transcript is made of. A Portal
+        // that does not report a session's delegation target shows up as a steady
+        // stream of these rather than as silently missing history. The session ids
+        // are what tie such a stream to the conversations that lost content.
+        console.warn(
+          `[internal-api] refused ${event.type} for agent ${identity.agentId}: ${actorError.error}${suffix}`,
+        );
+      } else {
+        // A malformed payload is the caller's own bug, not a missing delegation
+        // target. Kept off the wording above so a stream of real refusals stays
+        // legible.
+        console.warn(
+          `[internal-api] rejected malformed ${event.type} from agent ${identity.agentId}: ${actorError.error}${suffix}`,
+        );
+      }
       sendJson(res, actorError.status, { error: actorError.error });
       return;
     }

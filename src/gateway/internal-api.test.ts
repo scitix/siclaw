@@ -549,9 +549,425 @@ describe("handleDelegationEvents", () => {
     });
   });
 
+  it("accepts a delegated leg's own box, whose cert names the target rather than the owner", async () => {
+    // A delegated leg stays owned by the coordinator that created it (agent-2) while
+    // the turn runs in the delegated peer's box (agent-1 == the calling cert). Its
+    // sub-agent transcript and task-ledger rows used to be refused outright here,
+    // which is what left the leg pointing at sub-agent sessions that never existed.
+    sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "child-1",
+        agentId: "agent-1",
+        userId: "user-1",
+        origin: "subagent",
+        lineage: {
+          parentSessionId: "parent-1",
+          parentAgentId: "agent-1",
+          delegationId: "delegation-1",
+          targetAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(frontend.calls[0].method).toBe("chat.ensureSession");
+  });
+
+  it("refuses ensure_session ON a leg row it only executes, not owns", async () => {
+    // parent-1 is the leg: owned by agent-2, delegated to agent-1 (the caller).
+    // Writing BENEATH that leg is allowed; upserting the leg row ITSELF is not,
+    // or a Portal whose upsert touches more than last_active_at would let the
+    // peer re-point the leg's agent/parent/origin at itself.
+    sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "parent-1",
+        agentId: "agent-1",
+        userId: "user-1",
+        origin: "subagent",
+        lineage: {
+          parentSessionId: "root-unknown",
+          parentAgentId: "agent-1",
+          delegationId: "delegation-1",
+          targetAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toBe("delegation session mismatch");
+    expect(frontend.calls.find((c) => c.method === "chat.ensureSession")).toBeUndefined();
+  });
+
+  it("still refuses a session delegated to some other agent", async () => {
+    // Neither the owner (agent-2) nor the target (agent-3) is the caller (agent-1):
+    // accepting the target must not become a way to claim anyone else's session.
+    sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-3");
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "child-1",
+        agentId: "agent-1",
+        userId: "user-1",
+        origin: "subagent",
+        lineage: {
+          parentSessionId: "parent-1",
+          parentAgentId: "agent-1",
+          delegationId: "delegation-1",
+          targetAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(403);
+    expect(frontend.calls.find((c) => c.method === "chat.ensureSession")).toBeUndefined();
+  });
+
+  it("re-reads a leg cached before its target was known, instead of refusing for the entry's lifetime", async () => {
+    // The state a Runtime restart or eviction can pin: whichever 3-arg caller runs
+    // first (chat.send, a channel, a scheduled task) caches the leg owner-only.
+    // A cache hit never consults the row again, so refusing on the strength of
+    // that entry silently reinstates the data loss this arm exists to fix — and
+    // production runs two Runtimes, so the first caller is not always the one
+    // that knows the delegation fields.
+    sessionRegistry.remember("parent-1", "user-1", "agent-2");
+    const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
+    sessionRegistry.setResolver(resolver);
+    try {
+      for (const attempt of [1, 2]) {
+        const res = new FakeRes();
+        await handleDelegationEvents(
+          asReq(new FakeReq(JSON.stringify({
+            type: "delegation.append_message",
+            message: {
+              sessionId: "parent-1",
+              role: "assistant",
+              content: "written by the delegated peer's box",
+              fromAgentId: "agent-1",
+            },
+          }))),
+          asRes(res),
+          identity,
+          frontend as unknown as FrontendWsClient,
+        );
+        expect(res.statusCode, `attempt ${attempt}`).toBe(200);
+      }
+      // Bounded to one extra read: the refreshed record records that the row has
+      // been consulted, so the second attempt is answered from cache.
+      expect(resolver).toHaveBeenCalledTimes(1);
+    } finally {
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("still refuses cleanly when the re-read itself fails", async () => {
+    // The re-read is on the about-to-refuse path, so a transient upstream failure
+    // there must not turn a 403 into a 500: the handler's outer catch would report
+    // one, and a box reading its own logs could not tell "not your session" from
+    // "the platform is broken". Nothing is written either way.
+    sessionRegistry.remember("parent-1", "user-1", "agent-2");
+    const resolver = vi.fn(async () => { throw new Error("upstream unavailable") });
+    sessionRegistry.setResolver(resolver);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.append_message",
+          message: { sessionId: "parent-1", role: "assistant", content: "x", fromAgentId: "agent-1" },
+        }))),
+        asRes(res),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(res.statusCode).toBe(403);
+      expect(resolver).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("does not re-read the row when a resolver-sourced record already says there is no target", async () => {
+    // A top-level session genuinely has no delegation target. Refusing must not
+    // cost an RPC every time some other agent's box writes to it.
+    const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2" }));
+    sessionRegistry.setResolver(resolver);
+    try {
+      const res = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.append_message",
+          message: { sessionId: "parent-1", role: "assistant", content: "x", fromAgentId: "agent-1" },
+        }))),
+        asRes(res),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(res.statusCode).toBe(403);
+      // One read to populate the cache miss; the refusal itself adds none.
+      expect(resolver).toHaveBeenCalledTimes(1);
+    } finally {
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("lets a delegated leg's box append to the leg but not rewrite its history", async () => {
+    // The asymmetry the append arm must not smuggle in: append_message adds a row
+    // attributed to the peer, while update_message takes a message id and rewrites
+    // THAT row — including rows the coordinator wrote — and nothing in the payload
+    // scopes the rewrite to the caller's own. So the arm that exists to persist a
+    // sub-agent transcript stops short of the conversation's history.
+    sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
+    const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
+    sessionRegistry.setResolver(resolver);
+    try {
+      const appended = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.append_message",
+          message: { sessionId: "parent-1", role: "assistant", content: "peer's own row", fromAgentId: "agent-1" },
+        }))),
+        asRes(appended),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(appended.statusCode).toBe(200);
+
+      for (const type of ["delegation.update_message", "delegation.update_tool_message"]) {
+        const res = new FakeRes();
+        await handleDelegationEvents(
+          asReq(new FakeReq(JSON.stringify({
+            type,
+            message: { sessionId: "parent-1", messageId: "msg-1", content: "rewritten by the peer" },
+          }))),
+          asRes(res),
+          identity,
+          frontend as unknown as FrontendWsClient,
+        );
+        expect(res.statusCode, type).toBe(403);
+      }
+    } finally {
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("does not trust a relayed leg cached under the peer when checking ownership", async () => {
+    // On a Runtime the leg was RELAYED to, `chat.send` caches it under the peer's
+    // own agent — so a cache-only owner check would read back "the peer owns it"
+    // and hand the peer the rewrite access the check exists to withhold, in
+    // exactly the multi-Runtime deployment where nobody is watching one box's
+    // swallowed persistence errors. Ownership therefore comes from the row.
+    sessionRegistry.remember("parent-1", "user-1", "agent-1");
+    const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
+    sessionRegistry.setResolver(resolver);
+    try {
+      const rewrite = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.update_message",
+          message: { sessionId: "parent-1", messageId: "msg-1", content: "rewritten by the peer" },
+        }))),
+        asRes(rewrite),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(rewrite.statusCode).toBe(403);
+      expect(resolver, "the cached record must not answer an ownership question").toHaveBeenCalledTimes(1);
+
+      // The append arm is unaffected: that is the write this whole change exists
+      // to let through, and the refreshed record now names the target.
+      const appended = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.append_message",
+          message: { sessionId: "parent-1", role: "assistant", content: "peer's own row", fromAgentId: "agent-1" },
+        }))),
+        asRes(appended),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(appended.statusCode).toBe(200);
+    } finally {
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("still refuses a rewrite after a relay re-cached the leg under the peer", async () => {
+    // The sequence that reopened this gate once already: the row is read and cached
+    // authoritatively as the coordinator's, then the Runtime the leg was relayed to
+    // handles `chat.send` and re-remembers it under the PEER. If provenance rode
+    // along with that rewrite, the entry would assert the peer as an authoritative
+    // owner and this gate would skip the re-read that catches it.
+    const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
+    sessionRegistry.setResolver(resolver);
+    try {
+      // 1. Row-sourced: the coordinator owns it.
+      expect(await sessionRegistry.get("parent-1")).toMatchObject({ agentId: "agent-2", authoritative: true });
+      // 2. The relay's own view of the same session.
+      sessionRegistry.remember("parent-1", "user-1", "agent-1");
+      expect(sessionRegistry.peek("parent-1")).toMatchObject({ agentId: "agent-1" });
+
+      const res = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.update_message",
+          message: { sessionId: "parent-1", messageId: "msg-1", content: "rewritten by the peer" },
+        }))),
+        asRes(res),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(res.statusCode).toBe(403);
+      // The re-read is what caught it: once for the initial get, once because the
+      // rewritten entry no longer carries provenance.
+      expect(resolver).toHaveBeenCalledTimes(2);
+    } finally {
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("refuses an owner-only write when the row cannot be re-read", async () => {
+    // The cached owner does not stand in for the row, not even when it names the
+    // caller. A cache entry says "this Runtime is running the session for agent X",
+    // which on a relayed leg is the PEER — so an entry that happens to agree with
+    // the caller is not evidence, it is the same unverified claim. And the moment
+    // this matters is exactly the moment the row cannot contradict it.
+    sessionRegistry.remember("parent-1", "user-1", "agent-1");
+    const resolver = vi.fn(async () => { throw new Error("portal unavailable") });
+    sessionRegistry.setResolver(resolver);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.update_message",
+          message: { sessionId: "parent-1", messageId: "msg-1", content: "unprovable" },
+        }))),
+        asRes(res),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(res.statusCode).toBe(403);
+      expect(resolver).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("refuses a relayed leg's rewrite while the row is unreachable", async () => {
+    // The whole sequence, in order, because each step is individually correct and
+    // the exposure only appears once they are composed:
+    //   1. the row is read — the coordinator owns the leg, the peer executes it;
+    //   2. this Runtime handles chat.send for the relayed leg and re-remembers it
+    //      under the PEER, correctly dropping provenance but keeping the target;
+    //   3. Portal goes away, so the gate cannot ask the row;
+    //   4. the peer asks to rewrite a row in the coordinator's conversation.
+    // Trusting the cache at step 4 hands over the permission, and hands it over
+    // specifically while the source of truth is unavailable to object.
+    const rowResolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
+    sessionRegistry.setResolver(rowResolver);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await sessionRegistry.get("parent-1")).toMatchObject({ agentId: "agent-2", authoritative: true });
+      sessionRegistry.remember("parent-1", "user-1", "agent-1");
+      expect(sessionRegistry.peek("parent-1")).toMatchObject({ agentId: "agent-1", targetAgentId: "agent-1" });
+      expect(sessionRegistry.peek("parent-1")?.authoritative).toBeUndefined();
+
+      sessionRegistry.setResolver(async () => { throw new Error("portal unavailable") });
+      const res = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.update_message",
+          message: { sessionId: "parent-1", messageId: "msg-1", content: "rewritten by the peer" },
+        }))),
+        asRes(res),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(res.statusCode).toBe(403);
+      expect(frontend.calls).toHaveLength(0);
+    } finally {
+      warnSpy.mockRestore();
+      sessionRegistry.setResolver(undefined);
+      sessionRegistry.forget("parent-1");
+    }
+  });
+
+  it("names the session in an ownership refusal, and keeps payload errors off that signal", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // A box treats persistence as best-effort and swallows the failure, so this
+      // line is the only trace a dropped write leaves. Without the session id it
+      // cannot be tied to the conversation whose history went missing.
+      sessionRegistry.remember("parent-other", "user-1", "agent-2", "agent-3");
+      const refused = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.append_message",
+          message: { sessionId: "parent-other", role: "assistant", content: "x", fromAgentId: "agent-1" },
+        }))),
+        asRes(refused),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(refused.statusCode).toBe(403);
+      const refusal = warnSpy.mock.calls.map((c) => String(c[0])).find((m) => m.includes("refused"));
+      expect(refusal).toContain("parent-other");
+
+      warnSpy.mockClear();
+      // A malformed payload is the caller's own bug, not a Portal that stopped
+      // reporting delegation targets. Mixing the two makes a steady stream of
+      // real refusals unreadable.
+      const malformed = new FakeRes();
+      await handleDelegationEvents(
+        asReq(new FakeReq(JSON.stringify({
+          type: "delegation.ensure_session", sessionId: "child-1", agentId: "agent-1", userId: "",
+        }))),
+        asRes(malformed),
+        identity,
+        frontend as unknown as FrontendWsClient,
+      );
+      expect(malformed.statusCode).toBe(400);
+      expect(warnSpy.mock.calls.map((c) => String(c[0])).some((m) => m.includes("refused"))).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+      sessionRegistry.forget("parent-other");
+    }
+  });
+
   it("forwards toolset through the AgentBox persistence append/update bridge", async () => {
     sessionRegistry.remember("child-1", "user-1", "agent-1");
     sessionRegistry.remember("parent-1", "user-1", "agent-1");
+    // A resolver is always installed in production (startRuntime wires one), and
+    // `update_message` is owner-only against the ROW — so a test that cached the
+    // session by hand has to be able to confirm it, or it is asserting the
+    // behaviour of a Runtime that cannot exist.
+    sessionRegistry.setResolver(async () => ({ userId: "user-1", agentId: "agent-1" }));
 
     const appendRes = new FakeRes();
     await handleDelegationEvents(
@@ -600,6 +1016,7 @@ describe("handleDelegationEvents", () => {
       method: "chat.updateMessage",
       params: { tool_name: "read", toolset: "filesystem" },
     });
+    sessionRegistry.setResolver(undefined);
   });
 
   it("rejects delegated session creation without an explicit userId", async () => {
@@ -806,6 +1223,9 @@ describe("handleDelegationEvents", () => {
 
   it("delivers explicit channel messages through the registered channel callback without Portal writes", async () => {
     sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");
+    // Same reason as the append/update bridge above: channel delivery is owner-only
+    // against the row, and production always has a resolver to ask.
+    sessionRegistry.setResolver(async () => ({ userId: "lark:oc_1", agentId: "agent-1" }));
     const delivered: Array<{ kind: string; text: string }> = [];
     registerBackgroundChannelDelivery("channel-1", async (message) => {
       if ("text" in message) delivered.push({ kind: message.kind, text: message.text });
@@ -832,6 +1252,7 @@ describe("handleDelegationEvents", () => {
     expect(JSON.parse(res.body)).toEqual({ ok: true });
     expect(delivered).toEqual([{ kind: "milestone", text: "已完成节点列表检查。" }]);
     expect(frontend.calls).toHaveLength(0);
+    sessionRegistry.setResolver(undefined);
   });
 
   it("rejects explicit channel messages from another agent identity", async () => {
@@ -862,6 +1283,53 @@ describe("handleDelegationEvents", () => {
     expect(JSON.parse(res.body).error).toContain("source agent mismatch");
     expect(delivered).toHaveLength(0);
     expect(frontend.calls).toHaveLength(0);
+  });
+
+  it("does not let a delegated leg deliver to the conversation's channel", async () => {
+    // Channel delivery is owner-only, unlike the delegation persistence events.
+    // The `channel_update` tool that produces these is suppressed on a delegated
+    // turn by design — a delegated worker's output flows back through the
+    // coordinator, which owns the single visible identity — so a leg has no
+    // legitimate way to reach here, and the ownership arm that lets a peer's box
+    // persist a sub-agent's transcript should not double as a channel key.
+    // Two cache states, one verdict. The second is the one a cache-only owner
+    // check would get wrong: on the Runtime a leg was relayed to, `chat.send`
+    // caches it under the PEER, so "who owns this" has to come from the row.
+    for (const [label, cachedOwner] of [["cached under the coordinator", "agent-2"], ["cached under the peer by a relay", "agent-1"]] as const) {
+      sessionRegistry.remember("channel-1", "lark:oc_1", cachedOwner, "agent-1");
+      const resolver = vi.fn(async () => ({ userId: "lark:oc_1", agentId: "agent-2", targetAgentId: "agent-1" }));
+      sessionRegistry.setResolver(resolver);
+      const delivered: string[] = [];
+      registerBackgroundChannelDelivery("channel-1", async (message) => {
+        if ("text" in message) delivered.push(message.text);
+        return true;
+      });
+      const res = new FakeRes();
+
+      try {
+        await handleDelegationEvents(
+          asReq(new FakeReq(JSON.stringify({
+            type: "channel.deliver_message",
+            message: {
+              sessionId: "channel-1",
+              kind: "milestone",
+              text: "should not reach the channel",
+              fromAgentId: "agent-1",
+            },
+          }))),
+          asRes(res),
+          identity,
+          frontend as unknown as FrontendWsClient,
+        );
+
+        expect(res.statusCode, label).toBe(403);
+        expect(delivered, label).toHaveLength(0);
+        expect(frontend.calls, label).toHaveLength(0);
+      } finally {
+        sessionRegistry.setResolver(undefined);
+        sessionRegistry.forget("channel-1");
+      }
+    }
   });
 });
 

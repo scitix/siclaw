@@ -9,6 +9,127 @@ describe("SessionRegistry", () => {
     expect(await reg.get("s1")).toMatchObject({ userId: "alice", agentId: "agent-a" });
   });
 
+  it("keeps a delegated leg's target agent, the only field naming its executor", async () => {
+    const reg = new SessionRegistry();
+    reg.remember("leg-1", "alice", "coordinator-a", "peer-b");
+    expect(await reg.get("leg-1")).toMatchObject({ agentId: "coordinator-a", targetAgentId: "peer-b" });
+    // A top-level session has no target to fall back on.
+    reg.remember("top-1", "alice", "agent-a");
+    expect((await reg.get("top-1"))?.targetAgentId).toBeUndefined();
+  });
+
+  it("keeps the target when a 3-arg caller re-remembers the same session", async () => {
+    const reg = new SessionRegistry();
+    reg.remember("leg-1", "alice", "coordinator-a", "peer-b");
+    // chat.send, scheduled tasks and the channel entry points all use the 3-arg
+    // form. Letting one of them blank the target would re-close the ownership
+    // gate on the delegated peer until the entry was evicted.
+    reg.remember("leg-1", "alice", "coordinator-a");
+    expect(await reg.get("leg-1")).toMatchObject({ targetAgentId: "peer-b" });
+  });
+
+  it("back-fills the target agent from the resolver, so a cache miss does not lose it", async () => {
+    const reg = new SessionRegistry();
+    reg.setResolver(async () => ({ userId: "alice", agentId: "coordinator-a", targetAgentId: "peer-b" }));
+    // First read goes through the resolver; the second is served from cache and
+    // must still carry the target (the back-fill used to drop it).
+    expect(await reg.get("leg-1")).toMatchObject({ targetAgentId: "peer-b" });
+    expect(reg.peek("leg-1")).toMatchObject({ agentId: "coordinator-a", targetAgentId: "peer-b" });
+  });
+
+  it("treats an empty target as 'not supplied' rather than as a instruction to clear", async () => {
+    const reg = new SessionRegistry();
+    reg.remember("leg-1", "alice", "coordinator-a", "peer-b");
+    // `??` only falls through on null/undefined, so an empty string used to reach
+    // the record and blank the target — the opposite of what preservation means.
+    reg.remember("leg-1", "alice", "coordinator-a", "");
+    expect(await reg.get("leg-1")).toMatchObject({ targetAgentId: "peer-b" });
+  });
+
+  it("refresh re-reads a session that was cached before its target was known", async () => {
+    const reg = new SessionRegistry();
+    // The state a Runtime restart can pin: whichever 3-arg caller runs first
+    // (chat.send, a channel, a scheduled task) caches the leg owner-only, and
+    // every later read is served from that entry without consulting the row.
+    reg.remember("leg-1", "alice", "coordinator-a");
+    expect((await reg.get("leg-1"))?.targetAgentId).toBeUndefined();
+
+    const resolver = vi.fn(async () => ({
+      userId: "alice",
+      agentId: "coordinator-a",
+      targetAgentId: "peer-b",
+    }));
+    reg.setResolver(resolver);
+    expect(await reg.refresh("leg-1")).toMatchObject({ targetAgentId: "peer-b" });
+    // Back-filled, so the next reader sees the target without another read.
+    expect(reg.peek("leg-1")).toMatchObject({ targetAgentId: "peer-b" });
+    expect(resolver).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks a record read from the row, so an absent target is answerable from cache", async () => {
+    const reg = new SessionRegistry();
+    const resolver = vi.fn(async () => ({ userId: "alice", agentId: "agent-a" }));
+    reg.setResolver(resolver);
+    // A top-level session genuinely has no target. Recording where that answer
+    // came from is what lets a caller distinguish "no target" from "target not
+    // known yet" — and so stop re-reading the row on every refusal.
+    expect(await reg.get("top-1")).toMatchObject({ authoritative: true });
+    // A 3-arg caller knows nothing about delegation fields and must not unlearn it.
+    reg.remember("top-1", "alice", "agent-a");
+    expect(reg.peek("top-1")).toMatchObject({ authoritative: true });
+  });
+
+  it("drops provenance when a 3-arg caller rewrites the owner it was read with", async () => {
+    const reg = new SessionRegistry();
+    reg.setResolver(async () => ({ userId: "alice", agentId: "coordinator", targetAgentId: "peer" }));
+    expect(await reg.get("leg-1")).toMatchObject({ agentId: "coordinator", authoritative: true });
+
+    // The Runtime the leg was RELAYED to handles chat.send and caches it under the
+    // peer. Nothing adversarial about it — but the flag certifies the fields it was
+    // read with, and this call has replaced them. Keeping it would leave the entry
+    // asserting the peer as an AUTHORITATIVE owner, which is the one assertion the
+    // owner-only gate skips its re-read on.
+    reg.remember("leg-1", "alice", "peer");
+    const poisoned = reg.peek("leg-1");
+    expect(poisoned).toMatchObject({ agentId: "peer" });
+    expect(poisoned?.authoritative).toBeUndefined();
+    // The target survives: a 3-arg caller has no reason to know it, and losing it
+    // would re-close the append arm on the peer's own box.
+    expect(poisoned).toMatchObject({ targetAgentId: "peer" });
+  });
+
+  it("drops provenance when the user is rewritten too, not just the agent", async () => {
+    const reg = new SessionRegistry();
+    reg.setResolver(async () => ({ userId: "alice", agentId: "agent-a" }));
+    expect(await reg.get("s-rebind")).toMatchObject({ authoritative: true });
+    reg.remember("s-rebind", "bob", "agent-a");
+    expect(reg.peek("s-rebind")?.authoritative).toBeUndefined();
+  });
+
+  it("coalesces concurrent refreshes of one session into a single read", async () => {
+    const reg = new SessionRegistry();
+    reg.remember("leg-1", "alice", "coordinator-a");
+    let release: ((v: { userId: string; agentId: string; targetAgentId: string }) => void) | undefined;
+    const resolver = vi.fn(() => new Promise<{ userId: string; agentId: string; targetAgentId: string }>(r => { release = r; }));
+    reg.setResolver(resolver);
+
+    // A restart delivers a burst of buffered callbacks at once; each refusal must
+    // not become its own RPC.
+    const first = reg.refresh("leg-1");
+    const second = reg.refresh("leg-1");
+    release?.({ userId: "alice", agentId: "coordinator-a", targetAgentId: "peer-b" });
+    expect(await first).toMatchObject({ targetAgentId: "peer-b" });
+    expect(await second).toMatchObject({ targetAgentId: "peer-b" });
+    expect(resolver).toHaveBeenCalledTimes(1);
+  });
+
+  it("refresh without a resolver leaves the cached record alone", async () => {
+    const reg = new SessionRegistry();
+    reg.remember("leg-1", "alice", "coordinator-a");
+    expect(await reg.refresh("leg-1")).toBeUndefined();
+    expect(reg.peek("leg-1")).toMatchObject({ agentId: "coordinator-a" });
+  });
+
   it("returns empty string for unknown sessionId so callers never NPE", async () => {
     const reg = new SessionRegistry();
     expect(await reg.resolveUser("missing")).toBe("");
