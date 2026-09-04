@@ -2231,6 +2231,10 @@ export const CONTAINER_SENSITIVE_PATHS: RegExp[] = [
   /\.mysql_history/,
   /\.psql_history/,
   /\.node_repl_history/,
+  // Session-scoped MCP artifacts. File tools already refuse every `.tool-results`
+  // tree; this keeps restricted_bash from `cat`-ing sibling sessions on a shared
+  // LocalSpawner filesystem.
+  /\.tool-results(\/|$)/,
 ];
 
 /**
@@ -2283,4 +2287,5 @@ export const SENSITIVE_PATH_EXAMPLES: readonly string[] = [
   "/root/.mysql_history",
   "/root/.psql_history",
   "/root/.node_repl_history",
+  "/app/.siclaw/user-data/agent/sessions/s1/.tool-results/abc/tra_x.txt",
 ];

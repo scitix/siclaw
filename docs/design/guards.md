@@ -223,8 +223,8 @@ an opaque artifact ID, digest, expiry, bounded head/tail preview, and instructio
 to use `tool_result_search` and `tool_result_read`.
 
 Artifacts are scoped to the Agent and session, stored below the framework
-session directory, and unavailable through generic file tools — including
-`.tool-results` trees that belong to sibling sessions on the same AgentBox. The root and
+session directory, and unavailable through generic file tools or `restricted_bash` —
+including `.tool-results` trees that belong to sibling sessions on the same AgentBox. The root and
 scope directories use mode `0700`; files use `0600`. The v0 bounds are a 24-hour
 TTL, 64MiB per artifact, and 256MiB or 256 artifacts per session scope with
 oldest-first eviction.

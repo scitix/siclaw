@@ -59,6 +59,7 @@ describe("CONTAINER_SENSITIVE_PATHS pattern matching", () => {
     "cat ~/.mysql_history",
     "cat ~/.psql_history",
     "cat ~/.node_repl_history",
+    "cat .siclaw/user-data/agent/sessions/other/.tool-results/abc/tra_x.txt",
   ];
 
   for (const cmd of blocked) {
@@ -100,6 +101,7 @@ describe("validateCommand blocks sensitive paths in all contexts", () => {
     "head /root/.ssh/id_rsa",
     "ls /root/.aws/credentials",
     "grep password /proc/1/cmdline",
+    "cat .siclaw/user-data/agent/sessions/other/.tool-results/abc/tra_x.txt",
   ];
 
   for (const ctx of contexts) {

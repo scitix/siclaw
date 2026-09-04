@@ -7,6 +7,7 @@ import {
   ToolResultArtifactStore,
   createToolResultArtifactTools,
   formatToolResultArtifactReference,
+  formatUnrecoverableToolResult,
   getToolResultArtifactReference,
   isToolResultArtifactPath,
   withToolResultArtifactCapture,
@@ -262,21 +263,47 @@ describe("isToolResultArtifactPath", () => {
   });
 });
 
+function artifactRef(sizeChars: number) {
+  return {
+    version: 1 as const,
+    id: "tra_0123456789abcdef0123456789abcdef",
+    sizeChars,
+    sizeBytes: sizeChars,
+    sha256: "a".repeat(64),
+    createdAt: "2026-09-03T00:00:00.000Z",
+    expiresAt: "2026-09-04T00:00:00.000Z",
+  };
+}
+
 describe("formatToolResultArtifactReference", () => {
   it("keeps the artifact id, digest, and bounded head/tail preview", () => {
     const text = `HEAD-${"m".repeat(2_000)}-TAIL`;
-    const rendered = formatToolResultArtifactReference({
-      version: 1,
-      id: "tra_0123456789abcdef0123456789abcdef",
-      sizeChars: text.length,
-      sizeBytes: text.length,
-      sha256: "a".repeat(64),
-      createdAt: "2026-09-03T00:00:00.000Z",
-      expiresAt: "2026-09-04T00:00:00.000Z",
-    }, text, 1_000);
+    const rendered = formatToolResultArtifactReference(artifactRef(text.length), text, 1_000);
     expect(rendered.length).toBeLessThanOrEqual(1_000);
     expect(rendered).toContain("tra_0123456789abcdef0123456789abcdef");
     expect(rendered).toContain("HEAD-");
     expect(rendered).toContain("-TAIL");
+  });
+
+  it("does not invert the bound when the tail budget is zero", () => {
+    const text = "x".repeat(500_000);
+    const rendered = formatToolResultArtifactReference(artifactRef(text.length), text, 396);
+    expect(rendered.length).toBeLessThanOrEqual(396);
+  });
+});
+
+describe("formatUnrecoverableToolResult", () => {
+  it("keeps a bounded head and tail when the omitted portion cannot be recovered", () => {
+    const text = `HEAD-${"m".repeat(50_000)}-TAIL_ERROR`;
+    const rendered = formatUnrecoverableToolResult({
+      version: 1,
+      reason: "write_failed",
+      sizeChars: text.length,
+      sizeBytes: text.length,
+    }, text, 1_000);
+    expect(rendered.length).toBeLessThanOrEqual(1_000);
+    expect(rendered).toContain("cannot be recovered");
+    expect(rendered).toContain("HEAD-");
+    expect(rendered).toContain("-TAIL_ERROR");
   });
 });

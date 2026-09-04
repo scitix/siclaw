@@ -174,6 +174,20 @@ export function getToolResultArtifactDetails(message: unknown): Record<string, u
   return null;
 }
 
+function boundedHeadTailPreview(preview: string, budget: number): string {
+  if (budget <= 0) return "";
+  if (preview.length <= budget) return preview;
+
+  const omission = "\n\n[... preview middle omitted ...]\n\n";
+  const remaining = Math.max(0, budget - omission.length);
+  if (remaining === 0) return preview.slice(0, budget);
+  const headChars = Math.ceil(remaining * 0.7);
+  const tailChars = remaining - headChars;
+  const head = preview.slice(0, headChars);
+  const tail = tailChars > 0 ? preview.slice(-tailChars) : "";
+  return head + omission + tail;
+}
+
 export function formatToolResultArtifactReference(
   reference: ToolResultArtifactReference,
   preview: string,
@@ -191,13 +205,7 @@ export function formatToolResultArtifactReference(
   const separator = "\n\nPreview:\n";
   const previewBudget = Math.max(0, maxChars - header.length - separator.length);
   if (previewBudget === 0) return header.slice(0, Math.max(0, maxChars));
-  if (preview.length <= previewBudget) return header + separator + preview;
-
-  const omission = "\n\n[... preview middle omitted ...]\n\n";
-  const remaining = Math.max(0, previewBudget - omission.length);
-  const headChars = Math.ceil(remaining * 0.7);
-  const tailChars = remaining - headChars;
-  return header + separator + preview.slice(0, headChars) + omission + preview.slice(-tailChars);
+  return header + separator + boundedHeadTailPreview(preview, previewBudget);
 }
 
 export function formatUnrecoverableToolResult(
@@ -213,7 +221,7 @@ export function formatUnrecoverableToolResult(
     "The omitted portion cannot be recovered. Rerun the source tool with narrower filters or pagination.",
   ].join("\n");
   const budget = Math.max(0, maxChars - notice.length - 2);
-  return `${notice}\n\n${preview.slice(0, budget)}`.slice(0, maxChars);
+  return `${notice}\n\n${boundedHeadTailPreview(preview, budget)}`.slice(0, maxChars);
 }
 
 export class ToolResultArtifactStore {

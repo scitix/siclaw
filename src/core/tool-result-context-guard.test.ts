@@ -236,6 +236,30 @@ describe("enforceToolResultContextBudgetInPlace", () => {
     expect(text).toContain("reason: too_large");
   });
 
+  it("does not replace a small artifact-tagged result with a larger recovery stub", () => {
+    const artifact = artifactReference();
+    const smallText = "recovered snippet";
+    const messages = [
+      {
+        role: "toolResult",
+        toolCallId: "call_read",
+        content: [{ type: "text", text: smallText }],
+        details: { toolResultArtifact: artifact },
+        timestamp: Date.now(),
+      },
+      { role: "user", content: "new context ".repeat(400), timestamp: Date.now() },
+    ] as any[];
+
+    enforceToolResultContextBudgetInPlace({
+      messages,
+      contextBudgetChars: 2_000,
+      maxSingleToolResultChars: 20_000,
+    });
+
+    expect(getToolResultText(messages[0])).toBe(smallText);
+    expect(messages[0].details.toolResultArtifact).toEqual(artifact);
+  });
+
   it("compacts oldest tool results when total context exceeds budget", () => {
     // Create many tool results that together exceed budget
     const messages = Array.from({ length: 20 }, (_, i) => ({

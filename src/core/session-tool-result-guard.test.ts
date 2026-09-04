@@ -239,7 +239,7 @@ describe("installSessionToolResultGuard", () => {
     sm.appendMessage({
       role: "toolResult",
       toolCallId: "call_1",
-      content: [{ type: "text", text: "x".repeat(500_000) }],
+      content: [{ type: "text", text: `HEAD-${"x".repeat(499_980)}-TAIL_ERROR` }],
       details: {
         toolResultArtifactFailure: {
           version: 1,
@@ -252,8 +252,11 @@ describe("installSessionToolResultGuard", () => {
     });
 
     const persistedText = sm._appended[0].content[0].text;
+    expect(persistedText.length).toBeLessThanOrEqual(16_000);
     expect(persistedText).toContain("complete artifact is unavailable");
     expect(persistedText).toContain("cannot be recovered");
     expect(persistedText).toContain("reason: write_failed");
+    expect(persistedText).toContain("HEAD-");
+    expect(persistedText).toContain("-TAIL_ERROR");
   });
 });

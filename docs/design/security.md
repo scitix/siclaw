@@ -230,7 +230,7 @@ The `sandbox` user has no write permission on any of these by OS permission alon
 | Path | Owner | Mode | agentbox | sandbox | Notes |
 |------|-------|------|----------|---------|-------|
 | `.siclaw/user-data/` | agentbox:agentbox | 0777 | rwx | rwx | Memory files, PROFILE.md, investigation notes. |
-| `.siclaw/user-data/agent/sessions/<session>/.tool-results/` | agentbox:agentbox | 0700 dirs, 0600 files | rw | -- | Session-scoped MCP output artifacts; opaque tool access only. |
+| `.siclaw/user-data/agent/sessions/<session>/.tool-results/` | agentbox:agentbox | 0700 dirs, 0600 files | rw | -- | Session-scoped MCP output artifacts; opaque tool access only. File tools and `restricted_bash` both refuse any `.tool-results` tree. |
 | `/tmp/` | (any) | 1777 | rw | rw | Temporary files. Sticky bit prevents cross-user deletion. |
 
 The `user-data` directory is the **only** writable area for the sandbox user (besides /tmp).

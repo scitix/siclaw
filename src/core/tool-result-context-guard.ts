@@ -284,10 +284,10 @@ function compactExistingToolResultsInPlace(params: {
     const compactedText = recoverableToolResultText(msg, "", 1_024)
       ?? COMPACTION_PLACEHOLDER;
     const compacted = replaceToolResultText(msg, compactedText);
-    applyMessageMutationInPlace(msg, compacted, cache);
-    const after = estimateMessageCharsCached(msg, cache);
+    const after = estimateMessageChars(compacted);
     if (after >= before) continue;
 
+    applyMessageMutationInPlace(msg, compacted, cache);
     reduced += before - after;
     if (reduced >= charsNeeded) break;
   }

@@ -635,9 +635,10 @@ export async function createSiclawSession(
   // The whole `mcpTools` array is MCP by construction, so an unconditional push
   // is simpler than and equivalent to skipping by an `mcp__` name prefix.
   customTools.push(...mcpTools);
-  if (mcpTools.length > 0) {
-    customTools.push(...createToolResultArtifactTools(toolResultArtifactStore));
-  }
+  // Recovery tools stay available even when this rebuild discovered no MCP
+  // tools. Persisted history and the context guard still tell the model to
+  // call them for artifacts captured earlier in the same session.
+  customTools.push(...createToolResultArtifactTools(toolResultArtifactStore));
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
