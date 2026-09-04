@@ -1965,6 +1965,410 @@ def _body_source_files(text: str) -> list[str]:
     return _body_source_references(text)[0]
 
 
+# ── Evidence attribution: statement tags → section markers (mechanical) ───────
+#
+# Runtime citations resolve a page in two granularities: a section that carries
+# an ``okf:evidence`` marker cites exactly the marker's sources; a page without
+# markers cites its whole frontmatter ``sources`` (13 originals for one bullet,
+# in the live case that motivated this). The compile agent's only provenance
+# duty is prose-level: tag each statement with ``(source: X)``. Everything
+# machine-shaped is stamped here, deterministically, at the turn seam —
+# ``sources[].id`` (the frozen manifest id beside each managed resource) and one
+# single-line marker per answerable section, derived from the tags inside it.
+# Markers the agent authored itself (any id without the ``kbc-`` prefix) own
+# their section and are never touched; machine markers are regenerated on every
+# pass so they track edits and the pass is idempotent.
+#
+# A section with no tag on a multi-source page falls back to the page's sources
+# and is reported as ``fallback`` — an advisory the repair prompt relays and the
+# publish card shows as the attribution ratio, never a gate: an unattributed
+# section still answers, it just cites wide.
+
+AUTHORING_MANIFEST_PATH = "authoring/manifest.yaml"
+MACHINE_EVIDENCE_PREFIX = "kbc-"
+# A page compiled from more raw files than this is a page-organisation smell
+# (one live comparison page carried 265 sources; every citation of it drowns).
+# Surfaced as a metric and as guidance to the model, never as a gate.
+PAGE_SOURCES_SOFT_CAP = 30
+_ATTRIBUTION_LIST_CAP = 40
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
+_LINK_ONLY_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*+]|\d+[.)])?[ \t]*\[[^\]]*\]\([^)]*\)[ \t]*(?:[-—–:：].*)?$")
+_THEMATIC_BREAK_RE = re.compile(r"^(?:-[ \t]*){3,}$|^(?:\*[ \t]*){3,}$|^(?:_[ \t]*){3,}$")
+
+
+def load_manifest_source_ids(workdir: str) -> dict[str, str]:
+    """raw-relative path → frozen source id, from ``authoring/manifest.yaml``.
+
+    The control plane materializes this file from the frozen source manifest
+    before any compile turn, and its ids are the only ids the publish gate
+    accepts inside an evidence marker. An absent or unparseable manifest yields
+    an empty map: the attribution pass then has nothing to bind to and stays
+    out of the way (pages keep citing page-wide, exactly as before).
+    """
+    path = Path(workdir) / AUTHORING_MANIFEST_PATH
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {}
+    out: dict[str, str] = {}
+    rows = data.get("sources") if isinstance(data, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        source_id, raw_path = row.get("id"), row.get("path")
+        if not isinstance(source_id, str) or not isinstance(raw_path, str):
+            continue
+        source_id = source_id.strip()
+        entry = _norm_source_entry(raw_path)
+        if source_id and entry and _EVIDENCE_ID_RE.fullmatch(source_id):
+            out[entry] = source_id
+    return out
+
+
+def _stamp_source_ids_text(
+    text: str, manifest_ids: dict[str, str],
+) -> tuple[str, dict[str, str]] | None:
+    """Return ``(text with sources[].id stamped, resource → id)``.
+
+    ``None`` means the frontmatter cannot be rewritten losslessly (flow-style
+    rows, invalid YAML, no block ``sources`` sequence); such a page is left for
+    the normal OKF lint and keeps page-wide citations. An existing id that
+    agrees with the manifest is kept; one that disagrees is replaced — the
+    frozen manifest, not the model, owns source ids, and a stray id would fail
+    the publish gate's trusted-mapping check. Unmanaged (external) resources
+    keep whatever id the author wrote.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or not _is_frontmatter_start(lines[0]):
+        return None
+    end = next((i for i, line in enumerate(lines[1:], start=1)
+                if _is_frontmatter_end(line)), None)
+    if end is None:
+        return None
+    frontmatter = "".join(lines[1:end])
+    try:
+        root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(root, yaml.MappingNode) or root.flow_style:
+        return None
+    sources_node = next((value for key, value in root.value
+                         if isinstance(key, yaml.ScalarNode) and key.value == "sources"), None)
+    if not isinstance(sources_node, yaml.SequenceNode) or sources_node.flow_style:
+        return None
+    newline = "\r\n" if "\r\n" in text else "\n"
+    ids: dict[str, str] = {}
+    edits: list[tuple[int, int, str]] = []
+    for item in sources_node.value:
+        if not isinstance(item, yaml.MappingNode) or item.flow_style:
+            return None
+        resource_pair = id_pair = None
+        for key, value in item.value:
+            if not isinstance(key, yaml.ScalarNode):
+                continue
+            if key.value == "resource":
+                resource_pair = (key, value)
+            elif key.value == "id":
+                id_pair = (key, value)
+        if resource_pair is None or not isinstance(resource_pair[1], yaml.ScalarNode):
+            continue
+        entry = _norm_source_entry(resource_pair[1].value)
+        wanted = manifest_ids.get(entry)
+        existing = None
+        if id_pair is not None and isinstance(id_pair[1], yaml.ScalarNode):
+            candidate = id_pair[1].value.strip()
+            if _EVIDENCE_ID_RE.fullmatch(candidate):
+                existing = candidate
+        if wanted is None:
+            if existing and entry:
+                ids[entry] = existing
+            continue
+        if id_pair is not None and not isinstance(id_pair[1], yaml.ScalarNode):
+            # `id: [x]` — not ours to rewrite losslessly, and a marker must not
+            # cite an id the frontmatter does not declare (the OKF lint on the
+            # row tells the model what to fix). Leave the row out of the map.
+            continue
+        ids[entry] = wanted
+        if id_pair is None:
+            key_node, value_node = resource_pair
+            finish = max(_yaml_terminal_end(key_node), _yaml_terminal_end(value_node))
+            line_end = frontmatter.find("\n", finish)
+            insert_at = len(frontmatter) if line_end < 0 else line_end + 1
+            indent = " " * key_node.start_mark.column
+            edits.append((insert_at, insert_at, f"{indent}id: {json.dumps(wanted)}{newline}"))
+        elif existing != wanted:
+            start, finish = id_pair[1].start_mark.index, id_pair[1].end_mark.index
+            replacement = json.dumps(wanted)
+            # A bare `id:` (null scalar) has a zero-width span right after the
+            # colon; splicing there would write `id:"…"`, which is not YAML.
+            if start == finish or (start > 0 and frontmatter[start - 1] == ":"):
+                replacement = " " + replacement
+            edits.append((start, finish, replacement))
+    for start, finish, replacement in sorted(edits, key=lambda edit: edit[0], reverse=True):
+        frontmatter = frontmatter[:start] + replacement + frontmatter[finish:]
+    if edits:
+        text = lines[0] + frontmatter + "".join(lines[end:])
+    return text, ids
+
+
+def _marker_id(marker_json: str) -> str | None:
+    try:
+        marker = json.loads(marker_json)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(marker, dict) and isinstance(marker.get("id"), str):
+        return marker["id"].strip()
+    return None
+
+
+def _is_machine_marker_line(prose_line: str) -> bool:
+    match = _EVIDENCE_MARKER_RE.fullmatch(prose_line.strip())
+    if not match:
+        return False
+    marker_id = _marker_id(match.group(1))
+    return bool(marker_id) and marker_id.startswith(MACHINE_EVIDENCE_PREFIX)
+
+
+def _substantive_line(raw: str) -> bool:
+    """A body line that carries content a reader could ask about."""
+    stripped = raw.strip()
+    if not stripped or _EVIDENCE_MARKER_START_RE.match(stripped):
+        return False
+    if _HEADING_LINE_RE.match(stripped) or _THEMATIC_BREAK_RE.match(stripped):
+        return False
+    return not _LINK_ONLY_LINE_RE.match(stripped)
+
+
+def _lf_lines(text: str) -> list[str]:
+    """Split on "\n" only, keeping the newline. ``str.splitlines`` also splits
+    on lone CR, FF, VT and U+2028, which ``_mask_span`` turns into spaces — so
+    pairing raw lines with masked prose by ``splitlines`` fell out of step and
+    the zip dropped the page tail (review repro). "\n" survives masking, so a
+    "\n"-only split is the one that stays aligned."""
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+_SETEXT_UNDERLINE_RE = re.compile(r"^[ ]{0,3}(=+|-+)[ \t]*$")
+
+
+def _attribute_page_text(
+    text: str, ids_by_resource: dict[str, str],
+) -> tuple[str, dict[str, int], list[str]]:
+    """Regenerate machine evidence markers for one page.
+
+    Returns ``(rewritten text, stats, unattributed section headings)``. Sections
+    are ATX-heading spans plus the preamble; a marker whose next non-blank line
+    is a heading belongs to that heading's section (the compile agent's own
+    convention), so an authored marker keeps guarding the section below it.
+    Machine markers are emitted on the line directly above the heading (top of
+    the body for the preamble) so removal and regeneration are byte-stable.
+    """
+    lines = _lf_lines(text)
+    fm_end = None
+    if lines and _is_frontmatter_start(lines[0]):
+        fm_end = next((i for i, line in enumerate(lines[1:], start=1)
+                       if _is_frontmatter_end(line)), None)
+    stats = {"sections": 0, "attributed": 0, "fallback": 0, "authored": 0}
+    if fm_end is None:
+        return text, stats, []
+    prose_lines = _lf_lines(_markdown_prose(text))
+    if len(prose_lines) != len(lines):
+        # Masking is byte-aligned by construction; if the pairing ever breaks,
+        # leave the page alone rather than rewrite it against the wrong lines.
+        return text, stats, []
+    body: list[str] = []
+    prose: list[str] = []
+    for raw, masked in zip(lines[fm_end + 1:], prose_lines[fm_end + 1:]):
+        if _is_machine_marker_line(masked):
+            continue
+        body.append(raw)
+        prose.append(masked)
+
+    # Section boundaries: the heading line (ATX, or a setext paragraph line whose
+    # next line is an ===/--- underline), pulled back over blank lines onto an
+    # immediately preceding marker line. `skip` is the setext underline index.
+    boundaries: list[tuple[int, int, str, int]] = []  # (start, heading_idx, heading, skip)
+    index = 0
+    while index < len(prose):
+        masked = prose[index].rstrip("\r\n")
+        heading = _HEADING_LINE_RE.match(masked)
+        title, skip = None, -1
+        if heading:
+            title = heading.group(2)
+        elif (index + 1 < len(prose) and masked.strip()
+              and not _EVIDENCE_MARKER_START_RE.match(masked.strip())
+              and not _LINK_ONLY_LINE_RE.match(masked)
+              and not re.match(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]", masked)
+              and _SETEXT_UNDERLINE_RE.match(prose[index + 1].rstrip("\r\n"))
+              and (index == 0 or not prose[index - 1].strip())):
+            title, skip = masked.strip(), index + 1
+        if title is None:
+            index += 1
+            continue
+        start = index
+        probe = index - 1
+        while probe >= 0 and not prose[probe].strip():
+            probe -= 1
+        if probe >= 0 and _EVIDENCE_MARKER_RE.fullmatch(prose[probe].strip()):
+            start = probe
+        boundaries.append((start, index, title, skip))
+        index = skip + 1 if skip >= 0 else index + 1
+    sections: list[tuple[str | None, int, int, int, int]] = []  # (heading, start, heading_idx, end, skip)
+    cursor = 0
+    for start, heading_idx, heading, skip in boundaries:
+        if start < cursor:
+            start = cursor
+        if sections:
+            previous = sections[-1]
+            sections[-1] = (previous[0], previous[1], previous[2], start, previous[4])
+        elif start > 0:
+            sections.append((None, 0, -1, start, -1))
+        sections.append((heading, start, heading_idx, len(body), skip))
+        cursor = start
+    if not sections:
+        sections.append((None, 0, -1, len(body), -1))
+
+    page_ids = list(dict.fromkeys(ids_by_resource.values()))
+    basename_ids: dict[str, set[str]] = {}
+    for resource, source_id in ids_by_resource.items():
+        basename_ids.setdefault(posixpath.basename(resource), set()).add(source_id)
+    markers: dict[int, str] = {}  # insertion index in body (-1 = top) → marker line
+    unattributed: list[str] = []
+    ordinal = 0
+    for heading, start, heading_idx, end, skip in sections:
+        section_prose = prose[start:end]
+        content = [raw for idx, raw in enumerate(body[start:end], start=start) if idx not in (heading_idx, skip)]
+        if any(_EVIDENCE_MARKER_START_RE.search(masked) for masked in section_prose):
+            stats["sections"] += 1
+            stats["authored"] += 1
+            continue
+        if not any(_substantive_line(raw) for raw in content):
+            continue
+        stats["sections"] += 1
+        ordinal += 1
+        found: list[str] = []
+        for cited in _body_source_files("".join(section_prose)):
+            # The live convention chains tags inside one pair of parentheses
+            # (`source: a.md；source: b.md`); the grammar keeps the second
+            # `source:` as filename punctuation, so peel it before matching.
+            cited = _norm_source_entry(re.sub(r"^source[ \t]*[:：][ \t]*", "", cited))
+            source_id = ids_by_resource.get(cited)
+            if source_id is None:
+                candidates = basename_ids.get(posixpath.basename(cited), set())
+                source_id = next(iter(candidates)) if len(candidates) == 1 else None
+            if source_id and source_id not in found:
+                found.append(source_id)
+        if found:
+            chosen = found[:_MAX_EVIDENCE_SOURCES]
+            stats["attributed"] += 1
+        elif len(page_ids) == 1:
+            chosen = page_ids
+            stats["attributed"] += 1
+        elif page_ids:
+            chosen = page_ids[:_MAX_EVIDENCE_SOURCES]
+            stats["fallback"] += 1
+            unattributed.append(heading or "(intro)")
+        else:
+            continue
+        digest = hashlib.sha1((heading or "").encode("utf-8")).hexdigest()[:8]
+        marker = {"id": f"{MACHINE_EVIDENCE_PREFIX}{ordinal}-{digest}", "sources": chosen}
+        markers[heading_idx] = f"<!-- okf:evidence {json.dumps(marker, separators=(',', ':'))} -->"
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    out = list(lines[:fm_end + 1])
+    if -1 in markers:
+        out.append(markers[-1] + newline)
+    for index, raw in enumerate(body):
+        if index in markers:
+            out.append(markers[index] + newline)
+        out.append(raw)
+    return "".join(out), stats, unattributed
+
+
+def attribute_evidence_sections(
+    workdir: str,
+    allowed_pages: set[str] | None = None,
+) -> list[dict[str, object]]:
+    """Stamp ``sources[].id`` and machine evidence markers on candidate pages.
+
+    Runs at the same seam and under the same page scope as
+    ``normalize_body_source_annotations``: incremental turns touch only pages
+    already editable, so this can never become a whole-library rewrite behind
+    an owner's scoped edit. Returns one audit record per rewritten page.
+    """
+    fixes: list[dict[str, object]] = []
+    candidate = Path(workdir) / "candidate"
+    manifest_ids = load_manifest_source_ids(workdir)
+    if not manifest_ids or not candidate.is_dir():
+        return fixes
+    managed_sources = set(source_inventory(workdir))
+    for path in sorted(candidate.rglob("*.md")):
+        rel = path.relative_to(candidate).as_posix()
+        if _is_reserved_page(rel) or (allowed_pages is not None and rel not in allowed_pages):
+            continue
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        sources, derived, _ = parse_okf_sources(text, managed_sources)
+        if derived or not sources:
+            continue
+        stamped = _stamp_source_ids_text(text, manifest_ids)
+        if stamped is None or not stamped[1]:
+            continue
+        updated, stats, _ = _attribute_page_text(stamped[0], stamped[1])
+        if updated == text:
+            continue
+        _write_text_atomic(path, updated)
+        fixes.append({"rule": "evidence_section_attributed", "page": rel, **stats})
+    return fixes
+
+
+def evidence_attribution(workdir: str, pages: dict[str, dict]) -> dict:
+    """Read-only attribution ledger over the candidate tree for SELFCHECK.json.
+
+    ``ratio`` = sections whose marker was derived from in-section tags or
+    authored by the agent ÷ answerable sections. ``fallback`` sections cite the
+    whole page. ``findings`` name them for the repair prompt (advisory); the
+    publish card shows the ratio. ``oversized_pages`` lists pages above
+    ``PAGE_SOURCES_SOFT_CAP`` raw files — a split hint, not a gate.
+    """
+    manifest_ids = load_manifest_source_ids(workdir)
+    result: dict = {
+        "available": bool(manifest_ids),
+        "pages": 0, "sections": 0, "attributed": 0, "authored": 0, "fallback": 0,
+        "ratio": None, "findings": [], "oversized_pages": [],
+    }
+    for rel in sorted(pages):
+        page = pages[rel]
+        if "error" in page or _is_reserved_page(rel):
+            continue
+        if len(page["sources"]) > PAGE_SOURCES_SOFT_CAP and len(result["oversized_pages"]) < _ATTRIBUTION_LIST_CAP:
+            result["oversized_pages"].append({"page": rel, "sources": len(page["sources"])})
+        if not manifest_ids or page["derived"] or not page["sources"]:
+            continue
+        stamped = _stamp_source_ids_text(page["text"], manifest_ids)
+        if stamped is None or not stamped[1]:
+            continue
+        _, stats, unattributed = _attribute_page_text(stamped[0], stamped[1])
+        result["pages"] += 1
+        for key in ("sections", "attributed", "authored", "fallback"):
+            result[key] += stats[key]
+        for heading in unattributed:
+            if len(result["findings"]) < _ATTRIBUTION_LIST_CAP:
+                result["findings"].append({"page": rel, "section": heading, "sources": len(stamped[1])})
+    if result["sections"]:
+        result["ratio"] = round((result["attributed"] + result["authored"]) / result["sections"], 4)
+    return result
+
+
 def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
     """Resolved intra-wiki edges out of one page (md links + wikilinks)."""
     base = Path(rel).parent
@@ -2464,6 +2868,9 @@ def run_layer1(workdir: str) -> dict:
         "candidate_tree_hash": candidate_tree_hash(workdir),
         "coverage": cov,
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
+        # Attribution ledger (advisory, never a gate): how many answerable
+        # sections cite their own originals rather than the whole page.
+        "attribution": evidence_attribution(workdir, pages),
         # Box-side compile heuristic (NOT part of the coverage accounting
         # contract): over-broad exclusion patterns flagged for a human, never
         # blocking. Report-level so coverage() stays byte-identical to control-plane's.
@@ -2665,6 +3072,19 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines.append(f"\nLint issues ({len(lint['violations'])}):")
             lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
                       for v in lint["violations"][:_REPAIR_LIST_CAP]]
+        attribution = report.get("attribution") or {}
+        if attribution.get("findings"):
+            findings = attribution["findings"]
+            lines.append(f"\nSections without any (source: X) tag on a multi-source page ({len(findings)}) — "
+                         "they currently cite the WHOLE page's originals instead of their own; while you are in "
+                         "these pages, tag each statement in the section with the file it came from "
+                         "(never write okf:evidence markers or sources[].id yourself — the system stamps both):")
+            lines += [f"- {f['page']} › {f['section']} (page has {f['sources']} sources)"
+                      for f in findings[:_REPAIR_LIST_CAP]]
+        if attribution.get("oversized_pages"):
+            lines.append(f"\nPages compiled from more than {PAGE_SOURCES_SOFT_CAP} raw files "
+                         f"({len(attribution['oversized_pages'])}) — a split-by-topic candidate, not a blocker:")
+            lines += [f"- {o['page']} — {o['sources']} sources" for o in attribution["oversized_pages"][:_REPAIR_LIST_CAP]]
         return "\n".join(lines)
     lines = ["【系统自检 · 覆盖账本】本轮机械核对发现以下问题,请处理(不要因此重写无关页面):"]
     if cov["unaccounted"]:
@@ -2697,6 +3117,18 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines.append(f"\nlint 问题({len(lint['violations'])} 处):")
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
                   for v in lint["violations"][:_REPAIR_LIST_CAP]]
+    attribution = report.get("attribution") or {}
+    if attribution.get("findings"):
+        findings = attribution["findings"]
+        lines.append(f"\n多源页里没有任何 (source: X) 标注的段落({len(findings)} 处)——"
+                     "这些段现在只能引到整页的全部原文,引不到自己那几篇;顺手改这些页时,给段内每条事实补上它来自的文件"
+                     "(不要自己写 okf:evidence 标记或 sources[].id,这两样由系统盖):")
+        lines += [f"- {f['page']} › {f['section']}(本页 {f['sources']} 个来源)"
+                  for f in findings[:_REPAIR_LIST_CAP]]
+    if attribution.get("oversized_pages"):
+        lines.append(f"\n编自超过 {PAGE_SOURCES_SOFT_CAP} 个 raw 文件的页({len(attribution['oversized_pages'])} 页)"
+                     "——按主题拆页的候选,不是阻塞项:")
+        lines += [f"- {o['page']} — {o['sources']} 个来源" for o in attribution["oversized_pages"][:_REPAIR_LIST_CAP]]
     return "\n".join(lines)
 
 
@@ -2803,9 +3235,224 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
         "affected_pages": sorted(pages)[:20],
         "status": "open",
         "answer": None,
+        # A residual ticket asks the owner for an ACTION on the model's own
+        # output; no raw source is in dispute. Code knows that, so code says it.
+        "ticket_kind": TICKET_KIND_MODEL_GAP,
+        "origin": TICKET_ORIGIN_SELFCHECK,
     })
     _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
     return True
+
+
+# ── ticket kind: filed by evidence, never by self-description ────────────────
+# A contradiction ticket has exactly two kinds, decided when it is FILED and
+# re-decided every compile round from the evidence on the ticket itself:
+#   model_gap       — the knowledge is in the owner's head (or the model could
+#                     not read / did not understand); answering closes it.
+#   source_conflict — two raw documents genuinely disagree; the fix lives in
+#                     the source, the wiki only projects it. Remind, never verify.
+# The model may not choose: the gate below reads the ticket's own sources and
+# refuses a kind the evidence does not support. Tickets that predate the field
+# are `unclassified` — never guessed.
+
+CONTRADICTIONS_PATH = "authoring/CONTRADICTIONS.json"
+TICKET_KIND_MODEL_GAP = "model_gap"
+TICKET_KIND_SOURCE_CONFLICT = "source_conflict"
+TICKET_KIND_UNCLASSIFIED = "unclassified"
+TICKET_KINDS = (TICKET_KIND_MODEL_GAP, TICKET_KIND_SOURCE_CONFLICT)
+TICKET_ORIGIN_COMPILE = "compile"
+TICKET_ORIGIN_SELFCHECK = "selfcheck"
+TICKET_ORIGIN_EDGE = "edge"
+TICKET_ORIGINS = (TICKET_ORIGIN_COMPILE, TICKET_ORIGIN_SELFCHECK, TICKET_ORIGIN_EDGE)
+TICKET_CLAIM_ID_PREFIX = "tk-"
+# Evidence that lives under authoring/ (BRIEF, SELFCHECK, ...) is the owner's or
+# the system's framing, not a raw document — it can never make a source conflict.
+_TICKET_NON_RAW_PREFIXES = ("authoring/",)
+
+
+def normalize_ticket_sources(sources) -> list[dict]:
+    """Canonical `[{"doc","quote"}]`: doc stripped of a raw/ prefix, blank rows
+    dropped, order preserved. Anything not a mapping is ignored — a malformed
+    row is not evidence."""
+    out: list[dict] = []
+    if not isinstance(sources, list):
+        return out
+    for row in sources:
+        if not isinstance(row, dict):
+            continue
+        doc = str(row.get("doc", "") or "").strip().replace("\\", "/")
+        quote = str(row.get("quote", "") or "").strip()
+        if not doc:
+            continue
+        if not doc.startswith(_TICKET_NON_RAW_PREFIXES):
+            doc = _strip_source_prefix(doc)
+        # `a.md`, `./a.md` and `raw/./a.md` are one document; the claim id
+        # hashes the doc set, so spelling drift must not split one ticket into three.
+        doc = posixpath.normpath(doc)
+        if doc in ("", "."):
+            continue
+        out.append({"doc": doc, "quote": quote})
+    return out
+
+
+# authoring/ evidence is also cited bare by the prompts ("based on BRIEF.json"):
+# these basenames are the owner's/system's framing wherever they are spelled.
+_TICKET_NON_RAW_BASENAMES = {
+    "BRIEF.json", "SELFCHECK.json", "EXCLUSIONS.json", "CONTRADICTIONS.json",
+    "INTENT.md", "PLAN.md", "QUESTIONS.md", "LEDGER.md", "AGENTS.md", "CHANGESET.json",
+}
+
+
+def _ticket_doc_is_raw(doc: str) -> bool:
+    return (not doc.startswith(_TICKET_NON_RAW_PREFIXES)
+            and posixpath.basename(doc) not in _TICKET_NON_RAW_BASENAMES)
+
+
+def ticket_distinct_raw_docs(sources: list[dict]) -> list[str]:
+    """Raw documents that carry a non-empty quote — the only rows that count as
+    contradiction evidence. Sorted, unique. A bare basename (`manual.md`) is
+    the same document as the one pathed row it matches (`docs/manual.md`), the
+    spelling the body-tag convention accepts; two pathed rows that merely share
+    a basename stay distinct, and an ambiguous basename stays its own row."""
+    quoted = [row["doc"] for row in sources if row.get("quote") and _ticket_doc_is_raw(row["doc"])]
+    pathed = {doc for doc in quoted if "/" in doc}
+    by_basename: dict[str, set[str]] = {}
+    for doc in pathed:
+        by_basename.setdefault(posixpath.basename(doc), set()).add(doc)
+    docs = set()
+    for doc in quoted:
+        if "/" not in doc and len(by_basename.get(doc, ())) == 1:
+            docs.add(next(iter(by_basename[doc])))
+        else:
+            docs.add(doc)
+    return sorted(docs)
+
+
+def ticket_kind_allowed_by_evidence(sources: list[dict]) -> str:
+    """The ONE kind this evidence supports (§D3 gate).
+
+    ≥2 distinct raw docs, each with a quote → the sources disagree with each
+    other → `source_conflict`. Anything less (one doc, a BRIEF/tone question,
+    an unreadable figure, a system residual) → the model, not the source, is
+    short → `model_gap`. There is deliberately no "either": a multi-source
+    dispute self-filed as model_gap would push a source owner's job onto the
+    answering user, and a single-source doubt self-filed as source_conflict
+    would send the owner to fix a document that is not in dispute."""
+    return (TICKET_KIND_SOURCE_CONFLICT
+            if len(ticket_distinct_raw_docs(sources)) >= 2
+            else TICKET_KIND_MODEL_GAP)
+
+
+def _normalize_claim_text(text: str) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def ticket_claim_id(question: str, sources: list[dict] | None = None) -> str:
+    """Stable identity of the CLAIM in dispute — the question alone. Computed
+    by code so two compile rounds asking the same thing land on the same ticket
+    (supersede, not duplicate) while the kind and the evidence are free to
+    change: a single-source model_gap that later finds the disagreeing second
+    document must flip in place, which is impossible if the document set is
+    part of the id (review repro: it filed a duplicate and left the stale
+    model_gap open). `sources` is accepted for call-site compatibility and
+    deliberately not hashed."""
+    digest = hashlib.sha256(_normalize_claim_text(question).encode("utf-8")).hexdigest()[:12]
+    return f"{TICKET_CLAIM_ID_PREFIX}{digest}"
+
+
+def _read_ticket_ledger(path: Path):
+    """Ledger rows or an error string. An unreadable ledger is never clobbered."""
+    if not path.is_file():
+        return [], None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"{CONTRADICTIONS_PATH} unreadable: {e}"
+    if not isinstance(data, list):
+        return None, f"{CONTRADICTIONS_PATH} is not a JSON array"
+    return data, None
+
+
+def file_ticket_record(workdir: str, ticket: dict) -> tuple[str, str | None]:
+    """Append or supersede ONE ticket by its claim id. Returns
+    ("filed"|"superseded", None) or ("", error).
+
+    Supersede keeps everything the owner and the runtime own — `status`,
+    `answer`, `agent_report` — and replaces what the evidence owns: kind,
+    sources, options, current_value, affected_pages, title, question. That is
+    what lets a single-source model_gap flip to source_conflict when a later
+    round finds the second document, without a duplicate row."""
+    path = Path(workdir) / CONTRADICTIONS_PATH
+    tickets, err = _read_ticket_ledger(path)
+    if err:
+        return "", err
+    tid = ticket["id"]
+    existing = next((t for t in tickets if isinstance(t, dict) and t.get("id") == tid), None)
+    if existing is None:
+        tickets.append(ticket)
+        status = "filed"
+    else:
+        for key in ("ticket_kind", "title", "question", "sources", "options",
+                    "current_value", "affected_pages", "origin",
+                    "filed_operation_id", "filed_generation"):
+            if key in ticket:
+                existing[key] = ticket[key]
+        existing["superseded_at"] = ticket["filed_at"]
+        status = "superseded"
+    try:
+        _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
+    except OSError as e:
+        return "", f"{CONTRADICTIONS_PATH} write failed: {e}"
+    return status, None
+
+
+def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
+    """Post-turn backstop for the ticket ledger (mirrors normalize_exclusions_file).
+
+    The model is steered to file_ticket, but Write cannot be intercepted at
+    write time, so a hand-written ticket may still land. Every such row is
+    marked `ticket_kind: unclassified` / `origin: compile` — NOT guessed from
+    sources.length (that guess is exactly what the gate exists to forbid), and
+    NOT trusted from a `ticket_kind` the model typed either: a row is the
+    tool's only if its id is the claim fingerprint file_ticket computes from
+    the row's own question and document set (review: a hand-written
+    `ticket_kind: source_conflict` used to sail through). Rows the system filed
+    (`selfcheck-residual-*`) are model_gap by construction; rows another door
+    filed (origin edge) are left alone. Returns (rows newly marked
+    unclassified, error)."""
+    path = Path(workdir) / CONTRADICTIONS_PATH
+    tickets, err = _read_ticket_ledger(path)
+    if err:
+        return 0, err
+    changed = False
+    newly_unclassified = 0
+    for t in tickets:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("id", ""))
+        if tid.startswith("selfcheck-residual-"):
+            if t.get("ticket_kind") != TICKET_KIND_MODEL_GAP:
+                t["ticket_kind"] = TICKET_KIND_MODEL_GAP
+                changed = True
+        elif t.get("origin") not in (TICKET_ORIGIN_SELFCHECK, TICKET_ORIGIN_EDGE):
+            filed_by_tool = (
+                t.get("ticket_kind") in TICKET_KINDS
+                and tid == ticket_claim_id(str(t.get("question", "")), normalize_ticket_sources(t.get("sources")))
+            )
+            if not filed_by_tool and t.get("ticket_kind") != TICKET_KIND_UNCLASSIFIED:
+                t["ticket_kind"] = TICKET_KIND_UNCLASSIFIED
+                newly_unclassified += 1
+                changed = True
+        if not t.get("origin"):
+            t["origin"] = (TICKET_ORIGIN_SELFCHECK if tid.startswith("selfcheck-residual-")
+                           else TICKET_ORIGIN_COMPILE)
+            changed = True
+    if changed:
+        try:
+            _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
+        except OSError as e:
+            return 0, f"{CONTRADICTIONS_PATH} write failed: {e}"
+    return newly_unclassified, None
 
 
 # ── image re-verification (fresh-eyes numeric check) ─────────────────────────

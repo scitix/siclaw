@@ -67,6 +67,7 @@ The owner is a domain expert who knows the content — and knows nothing about c
 - **Evidence inline** — quote the two or three conflicting passages with their sources;
 - **Pre-classified options** — offer 2–4 candidate rulings, always ending with an "I'm not sure — keep it flagged" escape hatch, and allow "other";
 - **One contradiction, one question.**
+- **Say who can settle it** — `ticket_kind: source_conflict` when two or more different documents disagree (the source owner fixes the source); `ticket_kind: model_gap` when only the owner can answer (one source, a tone call, an unreadable figure). The `file_ticket` tool checks this against your quotes and refuses a mismatch.
 
 ## Collections of records: two layers, not a binary choice
 
@@ -179,7 +180,7 @@ generated:
   by: process:siclaw-kbc
 status: stable
 ---
-<Body. Every statement cites (source: filename). Ruled contradictions become conclusions that keep their sources; unruled ones are marked "⚠️ 存疑: …">
+<Body. Every statement cites (source: filename) — the system derives per-section okf:evidence markers from these tags, so an untagged fact can only be cited page-wide. Ruled contradictions become conclusions that keep their sources; unruled ones are marked "⚠️ 存疑: …">
 ```
 
 These are OKF v0.2 concept documents: the YAML must parse and `type` must be a non-empty string. `sources` is a list of mappings and every row has a non-empty `resource`. Stamp agent-authored pages with `generated.by: process:siclaw-kbc` and `status: stable`. Never write `verified`; only a real reviewer or verification process may add it. Preserve unknown OKF fields when revising an existing page.

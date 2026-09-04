@@ -12,5 +12,6 @@
   "compile.apply_rulings_header": "应用以下结构化裁决。只修改点名的 candidate 页面，去掉已解决处的存疑标记；每条裁决处理完调一次 resolve_ticket 登记。回修后继续此前未完成的任务：",
   "compile.apply_rulings_value": "- ticket {ticket_id}（影响页：{pages}）：改为「{value}」",
   "compile.apply_rulings_suspect": "- ticket {ticket_id}（影响页：{pages}）：接受存疑并保留双源，不改值，只调用 resolve_ticket 登记",
-  "compile.repair_test": "测试回归失败。请只依据原料修复相关 candidate 页面。问题：{question}\n人工核准参考答案：{reference_answer}\n判分：{verdict}\n判语：{judge_note}\n若原料没有支撑，不得编造，直接报告来源缺口。修复后继续此前未完成的任务。"
+  "compile.repair_test": "测试回归失败。请只依据原料修复相关 candidate 页面。问题：{question}\n人工核准参考答案：{reference_answer}\n判分：{verdict}\n判语：{judge_note}\n若原料没有支撑，不得编造，直接报告来源缺口。修复后继续此前未完成的任务。",
+  "compile.apply_proposal": "负责人已批准的一条修复提案。标题:{title}\n要改什么:{brief}\n为什么:{rationale}\n只动这些 candidate 页:{pages}。只改提案要求的内容,且必须有原文依据;原文没有的不要编,如实报告缺口。原文之间有分歧照常用 file_ticket 开票。回修完成后继续此前未完成的任务。"
 }

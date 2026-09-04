@@ -34,7 +34,7 @@ import {
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
-import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback, warnTraceBindFailure } from "../chat-repo.js";
+import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback, updateMessage, warnTraceBindFailure } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
@@ -62,7 +62,12 @@ import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
-import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
+import {
+  appendKnowledgeSourceCitations,
+  knowledgeCitationsMetadata,
+  normalizeKnowledgeSourceCitations,
+  type KnowledgeSourceCitation,
+} from "../../shared/knowledge-citations.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -3081,7 +3086,12 @@ export async function collectChannelResponse(
   // for the user). pi-agent's agent_end signals the last turn is complete.
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
+  // Exact text persisted on lastAssistantMessageId (updateMessage requires content).
+  let lastRowContent = "";
   let pendingKnowledgeSources: unknown = null;
+  // Same contract as sse-consumer: the citations appended to THIS assistant row
+  // ride on its metadata for feedback attribution.
+  let pendingRowCitations: KnowledgeSourceCitation[] = [];
   // URLs already rendered into an assistant reply this stream (= one turn).
   // Append only the not-yet-rendered delta and keep pending, so an intermediate
   // narration turn no longer steals the references off the final answer, nor
@@ -3120,6 +3130,27 @@ export async function collectChannelResponse(
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
         renderedKnowledgeSourceUrls.clear();
+        pendingRowCitations = [];
+      }
+      if (ev.type === "model_route_rollback" && lastAssistantMessageId && persist) {
+        // Lark persists every assistant turn as it lands (sse-consumer buffers
+        // until the routed turn commits), so the failed primary's row already
+        // exists — and may carry knowledge_citations. Feedback on it must not
+        // attribute to a discarded attempt: strip the citations and mark the
+        // row, then forget it so the fallback answer gets its own row.
+        const discardedId = lastAssistantMessageId;
+        lastAssistantMessageId = null;
+        lastAssistantText = "";
+        try {
+          await updateMessage({
+            messageId: discardedId,
+            sessionId,
+            content: redact(lastRowContent),
+            metadata: { discarded_route_attempt: true },
+          });
+        } catch (err) {
+          console.warn(`[${logPrefix}] discard rolled-back assistant row failed session=${sessionId}:`, err);
+        }
       }
       if (ev.type === "knowledge_sources") {
         pendingKnowledgeSources = ev.sources;
@@ -3209,6 +3240,7 @@ export async function collectChannelResponse(
           if (freshSources.length > 0) {
             turnText = appendKnowledgeSourceCitations(turnText, freshSources);
             for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
+            pendingRowCitations = freshSources;
           }
           // Keep pending: a later assistant message this turn may carry sources
           // cited after this one; the rendered-set prevents any double-append.
@@ -3228,8 +3260,18 @@ export async function collectChannelResponse(
           // tool row in the transcript.
           // Replace the id even when this write fails: retaining an earlier
           // narration id would link the final card to the wrong assistant turn.
+          const rowCitations = pendingRowCitations;
+          pendingRowCitations = [];
+          lastRowContent = turnText;
           lastAssistantMessageId = persist
-            ? await persistRow({ sessionId, role: "assistant", content: redact(turnText) })
+            ? await persistRow({
+                sessionId,
+                role: "assistant",
+                content: redact(turnText),
+                ...(rowCitations.length > 0
+                  ? { metadata: { knowledge_citations: knowledgeCitationsMetadata(rowCitations) } }
+                  : {}),
+              })
             : null;
         }
       }

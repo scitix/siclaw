@@ -55,12 +55,53 @@ describe("knowledge_cite", () => {
     expect(output.details).toEqual({ cited: 1 });
     expect(events).toEqual([{ type: "knowledge_sources", sources: [{
       title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/abc", resource: "feishu/runbook.md", page: "guide.md",
+      // Attribution rides along: which repo, and the statement the page supports.
+      repoId: "repo", claim: "The runbook documents the GPU reset procedure.",
     }] }]);
 
     turnRef.current = 2;
     const unread = await support.tool.execute("call", { pages: [{ path: page, claim: "The runbook documents the GPU reset procedure." }] } as never);
     expect(unread.details).toEqual({ cited: 0 });
     expect(events).toHaveLength(1);
+  });
+
+  it("tolerates a mount-prefixed relative path copied from the model's own read call", async () => {
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({ knowledgeDir: dir, turnRef: { current: 1 }, sessionEventEmitter: (e) => events.push(e) });
+    readPage(support, page);
+    // The model echoes the mount prefix it saw in its read tool call.
+    const prefixed = `.siclaw/knowledge/${path.basename(page)}`;
+    const output = await support.tool.execute("call", { pages: [{ path: prefixed, claim: "The runbook documents the GPU reset procedure." }] } as never);
+    expect(output.details).toEqual({ cited: 1 });
+    expect(events).toHaveLength(1);
+    // Stripping never invents a read: an unread page stays unread however it is spelled.
+    const unread = await support.tool.execute("call", { pages: [{ path: ".siclaw/knowledge/other.md", claim: "The runbook documents the GPU reset procedure." }] } as never);
+    expect(unread.details).toEqual({ cited: 0 });
+    expect(JSON.stringify(unread)).toContain("Cannot cite unread knowledge page");
+    // …and never collapses an unread spelling onto a DIFFERENT page that was
+    // read: only a mount prefix is stripped, so a same-named page elsewhere or
+    // a parent-relative path stays unread instead of borrowing guide.md's read.
+    for (const spelling of [`repos/other/${path.basename(page)}`, `../${path.basename(page)}`, `x/${path.basename(page)}`]) {
+      const collision = await support.tool.execute("call", { pages: [{ path: spelling, claim: "The runbook documents the GPU reset procedure." }] } as never);
+      expect(collision.details, spelling).toEqual({ cited: 0 });
+    }
+    expect(events).toHaveLength(1);
+  });
+
+  it("keeps every claim when two entries resolve to the same page", async () => {
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({ knowledgeDir: dir, turnRef: { current: 1 }, sessionEventEmitter: (e) => events.push(e) });
+    readPage(support, page);
+    const output = await support.tool.execute("call", { pages: [
+      { path: page, claim: "The runbook documents the GPU reset procedure." },
+      { path: `.siclaw/knowledge/${path.basename(page)}`, claim: "The runbook lists the on-call rotation." },
+    ] } as never);
+    expect(output.details).toEqual({ cited: 1 });
+    const sources = (events[0] as { sources: Array<{ claim?: string }> }).sources;
+    expect(sources[0].claim).toContain("GPU reset procedure");
+    expect(sources[0].claim).toContain("on-call rotation");
   });
 
   it("rejects pages items that are not bound to a concrete claim", async () => {
@@ -444,6 +485,7 @@ The rack power budget and port inventory come from the ASUS sales kit.
       sourceId: "src-asus-sales-kit",
       page: "entities/GB-supernode.md",
       evidence: "ev.gb300.asus.rack-power-ports",
+      repoId: "repo",
     }] }]);
   });
 
@@ -597,6 +639,8 @@ sources:
       url: "https://example.com/specific",
       resource: "runbook.md",
       page: "repos/specific/guide.md",
+      repoId: "specific",
+      claim: expect.any(String),
     }] }]);
   });
 

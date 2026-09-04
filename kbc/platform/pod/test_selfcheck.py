@@ -775,6 +775,123 @@ def test_code_body_source_annotations_are_first_class_provenance():
     print("OK  code body citations: source files, Dockerfile variants, and Makefile")
 
 
+MANIFEST_TWO = """schema: kb-authoring-manifest/v1
+fingerprint: "f"
+folders: []
+sources:
+  - id: "0612b522-b508-49a3-8517-9252a22ff35c"
+    path: "docs/验收单.md"
+  - id: "416a801b-4e15-4e77-8456-1c94d9b88dbd"
+    path: "docs/手册.md"
+"""
+_ID_A = "0612b522-b508-49a3-8517-9252a22ff35c"
+_ID_B = "416a801b-4e15-4e77-8456-1c94d9b88dbd"
+
+
+def test_attribute_evidence_sections_derives_markers_from_statement_tags():
+    """The model tags statements; the seam stamps ids + one marker per section."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", MANIFEST_TWO)
+        _mk(base, "raw/docs/验收单.md")
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [B](baseline.md) - 基线\n- [S](single.md) - 单源\n")
+        page = (
+            "---\ntype: 基线\ntitle: 基线\nsources:\n"
+            "  - resource: raw/docs/验收单.md\n"
+            "  - resource: raw/docs/手册.md\n    id: wrong-id\n---\n"
+            "\n## 控制面\n\n- 节点 52 台(source: raw/docs/验收单.md)\n"
+            "\n## 网络\n\n- RoCE 网段 10.208.64.0/20(source: 验收单.md;source: 手册.md)\n"
+            "\n## 备份\n\n- etcd 每 6 小时快照\n"
+            "```\n## not a heading\n<!-- okf:evidence {\"id\":\"kbc-9-deadbeef\",\"sources\":[\"x\"]} -->\n```\n"
+            "\n<!-- okf:evidence {\"id\":\"baseline.owner\",\"sources\":[\"" + _ID_B + "\"]} -->\n"
+            "\n## 值班\n\n- 值班电话见手册\n"
+            "\n## 参考\n\n- [手册](../raw/docs/手册.md)\n"
+        )
+        _mk(base, "candidate/baseline.md", page)
+        _mk(base, "candidate/single.md",
+            "---\ntype: 单源\ntitle: 单源\nsources:\n  - resource: raw/docs/手册.md\n---\n"
+            "开头一句。\n\n## 只有一段\n\n- 没有标注的事实\n")
+
+        fixes = selfcheck.attribute_evidence_sections(td)
+        assert [f["page"] for f in fixes] == ["baseline.md", "single.md"], fixes
+        text = (base / "candidate" / "baseline.md").read_text()
+        # ids: missing one stamped, wrong one replaced by the manifest id
+        assert f"  - resource: raw/docs/验收单.md\n    id: \"{_ID_A}\"\n" in text, text
+        assert f"    id: \"{_ID_B}\"" in text and "wrong-id" not in text, text
+        # one machine marker directly above each unguarded heading
+        ctrl = f'<!-- okf:evidence {{"id":"kbc-1-{hashlib.sha1("控制面".encode()).hexdigest()[:8]}","sources":["{_ID_A}"]}} -->\n## 控制面\n'
+        assert ctrl in text, text
+        net = f'"sources":["{_ID_A}","{_ID_B}"]}} -->\n## 网络\n'
+        assert net in text, text
+        # untagged section on a multi-source page falls back to the whole page
+        backup = f'"sources":["{_ID_A}","{_ID_B}"]}} -->\n## 备份\n'
+        assert backup in text, text
+        # the authored marker keeps its section; no machine marker is added there
+        assert text.count("## 值班") == 1 and "-->\n## 值班" not in text, text
+        assert '"id":"baseline.owner"' in text
+        # a link-only section is navigation, not evidence; code fences are inert
+        assert "-->\n## 参考" not in text and "kbc-9-deadbeef" in text, text
+        single = (base / "candidate" / "single.md").read_text()
+        assert single.startswith("---\ntype: 单源\ntitle: 单源\nsources:\n  - resource: raw/docs/手册.md\n    id: \"" + _ID_B + "\"\n---\n<!-- okf:evidence "), single
+        assert single.count("okf:evidence") == 2, single  # intro + one section, both the single source
+
+        # Idempotent: a second pass is byte-identical and reports nothing.
+        before = (base / "candidate" / "baseline.md").read_bytes()
+        assert selfcheck.attribute_evidence_sections(td) == []
+        assert (base / "candidate" / "baseline.md").read_bytes() == before
+
+        report = selfcheck.run_layer1(td)
+        assert not [v for v in report["lint"]["violations"] if v["kind"].startswith("okf_")], report["lint"]
+        attribution = report["attribution"]
+        assert attribution["available"] and attribution["pages"] == 2
+        # baseline: 控制面/网络 attributed, 备份 fallback, 值班 authored; single: intro + 只有一段
+        assert (attribution["sections"], attribution["attributed"], attribution["authored"], attribution["fallback"]) == (6, 4, 1, 1), attribution
+        assert attribution["ratio"] == round(5 / 6, 4)
+        assert attribution["findings"] == [{"page": "baseline.md", "section": "备份", "sources": 2}], attribution
+        prompt = selfcheck.build_repair_prompt(report)
+        assert "baseline.md › 备份" in prompt and "okf:evidence" in prompt, prompt
+        assert "备份" in selfcheck.build_repair_prompt(report, "en")
+
+        # Scope: a page outside allowed_pages is never rewritten.
+        _mk(base, "candidate/scoped.md",
+            "---\ntype: t\ntitle: t\nsources:\n  - resource: raw/docs/手册.md\n---\n## 段\n\n事实\n")
+        untouched = (base / "candidate" / "scoped.md").read_bytes()
+        assert selfcheck.attribute_evidence_sections(td, allowed_pages={"baseline.md"}) == []
+        assert (base / "candidate" / "scoped.md").read_bytes() == untouched
+    print("OK  evidence attribution: ids stamped, markers derived, authored kept, idempotent")
+
+
+def test_attribute_evidence_sections_without_manifest_is_inert():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [P](p.md) - p\n")
+        original = "---\ntype: t\ntitle: t\nsources:\n  - resource: raw/docs/手册.md\n---\n## 段\n\n事实\n"
+        _mk(base, "candidate/p.md", original)
+        assert selfcheck.attribute_evidence_sections(td) == []
+        assert (base / "candidate" / "p.md").read_text() == original
+        attribution = selfcheck.run_layer1(td)["attribution"]
+        assert attribution["available"] is False and attribution["sections"] == 0, attribution
+    print("OK  evidence attribution: no frozen manifest → nothing stamped")
+
+
+def test_attribution_reports_oversized_pages():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        n = selfcheck.PAGE_SOURCES_SOFT_CAP + 1
+        rows = "".join(f"  - resource: raw/s{i}.md\n" for i in range(n))
+        for i in range(n):
+            _mk(base, f"raw/s{i}.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [B](big.md) - big\n")
+        _mk(base, "candidate/big.md", f"---\ntype: t\ntitle: big\nsources:\n{rows}---\n## 段\n\n事实\n")
+        report = selfcheck.run_layer1(td)
+        assert report["attribution"]["oversized_pages"] == [{"page": "big.md", "sources": n}], report["attribution"]
+        assert "big.md — " in selfcheck.build_repair_prompt(report), selfcheck.build_repair_prompt(report)
+    print("OK  evidence attribution: oversized page surfaced as a split hint")
+
+
 def test_deterministic_body_source_normalization():
     """Exact, unique aliases repair mechanically; ambiguity and code stay put."""
     with tempfile.TemporaryDirectory() as td:
@@ -1017,6 +1134,112 @@ def test_dangling_alone_blocks_closed():
         print("OK  dangling alone blocks closed (bidirectional ledger) + narration names it")
 
 
+def test_ticket_kind_gate_and_claim_identity():
+    """§D3/D4: the kind a ticket may carry is decided by its own evidence, its id
+    by the claim it is about. Two distinct raw docs with quotes → source_conflict
+    only; one doc / BRIEF / no quote → model_gap only. Same question + same docs
+    → same id regardless of wording noise; a second doc changes the id."""
+    two = selfcheck.normalize_ticket_sources([
+        {"doc": "raw/a.md", "quote": "1.30.2"},
+        {"doc": "b.md", "quote": "1.29.0"},
+    ])
+    assert [r["doc"] for r in two] == ["a.md", "b.md"]  # raw/ prefix stripped
+    assert selfcheck.ticket_kind_allowed_by_evidence(two) == "source_conflict"
+    one = selfcheck.normalize_ticket_sources([{"doc": "a.md", "quote": "1.30.2"}])
+    assert selfcheck.ticket_kind_allowed_by_evidence(one) == "model_gap"
+    # two rows, same doc → still one document → model_gap
+    same_doc = selfcheck.normalize_ticket_sources([
+        {"doc": "a.md", "quote": "x"}, {"doc": "raw/a.md", "quote": "y"}])
+    assert selfcheck.ticket_kind_allowed_by_evidence(same_doc) == "model_gap"
+    # a quote-less second doc is not evidence of a dispute
+    no_quote = selfcheck.normalize_ticket_sources([
+        {"doc": "a.md", "quote": "x"}, {"doc": "b.md", "quote": ""}])
+    assert selfcheck.ticket_kind_allowed_by_evidence(no_quote) == "model_gap"
+    # BRIEF / authoring evidence never makes a source conflict
+    brief = selfcheck.normalize_ticket_sources([
+        {"doc": "a.md", "quote": "x"}, {"doc": "authoring/BRIEF.json", "quote": "audience=external"}])
+    assert selfcheck.ticket_kind_allowed_by_evidence(brief) == "model_gap"
+    # malformed rows are dropped, not counted
+    assert selfcheck.normalize_ticket_sources([None, "a.md", {"quote": "x"}]) == []
+
+    tid = selfcheck.ticket_claim_id("Which  K8s version is current?", two)
+    assert tid.startswith("tk-") and len(tid) == 3 + 12
+    assert selfcheck.ticket_claim_id("which k8s version is current?", list(reversed(two))) == tid
+    # The claim is the question: finding the second document must land on the
+    # SAME ticket so the kind can flip in place instead of filing a duplicate.
+    assert selfcheck.ticket_claim_id("Which K8s version is current?", one) == tid
+    assert selfcheck.ticket_claim_id("Which etcd snapshot cadence applies?", one) != tid
+    # Spellings: a bare basename is the pathed row it matches; authoring/
+    # framing never counts as a raw document however it is spelled.
+    assert selfcheck.ticket_distinct_raw_docs(selfcheck.normalize_ticket_sources(
+        [{"doc": "manual.md", "quote": "a"}, {"doc": "docs/manual.md", "quote": "b"}])) == ["docs/manual.md"]
+    assert selfcheck.ticket_kind_allowed_by_evidence(selfcheck.normalize_ticket_sources(
+        [{"doc": "BRIEF.json", "quote": "tone"}, {"doc": "a.md", "quote": "x"}])) == selfcheck.TICKET_KIND_MODEL_GAP
+    assert selfcheck.ticket_distinct_raw_docs(selfcheck.normalize_ticket_sources(
+        [{"doc": "x/manual.md", "quote": "a"}, {"doc": "y/manual.md", "quote": "b"}])) == ["x/manual.md", "y/manual.md"]
+    print("✓ ticket kind is gated by evidence; claim id is stable across wording/order")
+
+
+def test_file_ticket_record_supersedes_by_claim_and_normalizer_never_guesses():
+    """Filing the same claim twice updates the row (kind may flip as evidence
+    grows) and keeps what the owner/runtime own; the post-turn normalizer marks
+    hand-written rows unclassified — never inferred from sources.length — and
+    stamps system residual tickets model_gap by construction."""
+    def tk(kind, sources, question="Which version?"):
+        src = selfcheck.normalize_ticket_sources(sources)
+        return {
+            "id": selfcheck.ticket_claim_id(question, src), "title": "v", "question": question,
+            "sources": src, "options": ["1", "2"], "current_value": "1", "affected_pages": ["p.md"],
+            "status": "open", "answer": None, "ticket_kind": kind, "origin": "compile",
+            "filed_at": "2026-09-03T00:00:00Z",
+        }
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        one = tk("model_gap", [{"doc": "a.md", "quote": "1"}])
+        assert selfcheck.file_ticket_record(td, one) == ("filed", None)
+        # owner rules meanwhile; the runtime writes a receipt
+        rows = json.loads((base / "authoring/CONTRADICTIONS.json").read_text("utf-8"))
+        rows[0]["agent_report"] = {"pages_edited": ["p.md"], "at": "2026-09-03T01:00:00Z"}
+        rows[0]["status"] = "applied"
+        (base / "authoring/CONTRADICTIONS.json").write_text(json.dumps(rows), "utf-8")
+        # same claim (same question, same doc set) with a new quote → superseded, not duplicated
+        again = tk("model_gap", [{"doc": "raw/a.md", "quote": "1.30"}])
+        assert again["id"] == one["id"]
+        assert selfcheck.file_ticket_record(td, again) == ("superseded", None)
+        rows = json.loads((base / "authoring/CONTRADICTIONS.json").read_text("utf-8"))
+        assert len(rows) == 1 and rows[0]["sources"][0]["quote"] == "1.30"
+        assert rows[0]["status"] == "applied" and rows[0]["agent_report"]["pages_edited"] == ["p.md"]
+        assert rows[0]["superseded_at"] == "2026-09-03T00:00:00Z"
+        # a hand-written row + a system residual row land in the same ledger
+        rows.append({"id": "hand-1", "title": "手写", "sources": [{"doc": "a.md", "quote": "x"}, {"doc": "b.md", "quote": "y"}],
+                     "affected_pages": ["p.md"], "status": "open", "answer": None})
+        # A hand-written row that TYPES a kind is no more trusted: its id is not
+        # the claim fingerprint file_ticket would have computed.
+        rows.append({"id": "hand-2", "title": "手写带 kind", "question": "q", "ticket_kind": "source_conflict",
+                     "sources": [{"doc": "a.md", "quote": "x"}], "affected_pages": ["p.md"], "status": "open", "answer": None})
+        rows.append({"id": "selfcheck-residual-abcd1234", "title": "残留", "status": "open", "answer": None})
+        (base / "authoring/CONTRADICTIONS.json").write_text(json.dumps(rows, ensure_ascii=False), "utf-8")
+        assert selfcheck.normalize_contradictions_file(td) == (2, None)
+        rows = {r["id"]: r for r in json.loads((base / "authoring/CONTRADICTIONS.json").read_text("utf-8"))}
+        assert rows["hand-1"]["ticket_kind"] == "unclassified"  # two docs, still NOT guessed
+        assert rows["hand-2"]["ticket_kind"] == "unclassified"  # typed kind, still not the tool's row
+        assert rows["hand-1"]["origin"] == "compile"
+        assert rows["selfcheck-residual-abcd1234"]["ticket_kind"] == "model_gap"
+        assert rows["selfcheck-residual-abcd1234"]["origin"] == "selfcheck"
+        assert rows[one["id"]]["ticket_kind"] == "model_gap"
+        # idempotent: second pass changes nothing and reports nothing new
+        assert selfcheck.normalize_contradictions_file(td) == (0, None)
+        # unreadable ledger → error, file untouched
+        (base / "authoring/CONTRADICTIONS.json").write_text("[{", "utf-8")
+        n, err = selfcheck.normalize_contradictions_file(td)
+        assert n == 0 and err and "unreadable" in err
+        assert (base / "authoring/CONTRADICTIONS.json").read_text("utf-8") == "[{"
+        assert selfcheck.file_ticket_record(td, one)[0] == ""  # refuses to clobber
+    with tempfile.TemporaryDirectory() as td:
+        assert selfcheck.normalize_contradictions_file(td) == (0, None)  # no ledger, no-op
+    print("✓ file_ticket_record supersedes by claim; normalizer marks unclassified without guessing")
+
+
 def test_file_residual_ticket():
     """L2: budget spent with residuals → CODE files ONE ticket in the owner's
     queue (model schema, stable content-fingerprint id). Dedupes on repeat,
@@ -1039,6 +1262,7 @@ def test_file_residual_ticket():
         assert "未入账源: snap/two.md" in t["sources"][0]["quote"]
         assert sorted(t["affected_pages"]) == ["c.md", "p1.md"]
         assert t["options"] and t["current_value"]
+        assert t["ticket_kind"] == "model_gap" and t["origin"] == "selfcheck"
         # same residuals again → dedupe, no second ticket
         assert selfcheck.file_residual_ticket(td, report, "zh") is False
         assert len(json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))) == 2
@@ -2625,6 +2849,9 @@ def main():
     test_body_source_annotations()
     test_code_body_source_annotations_are_first_class_provenance()
     test_deterministic_body_source_normalization()
+    test_attribute_evidence_sections_derives_markers_from_statement_tags()
+    test_attribute_evidence_sections_without_manifest_is_inert()
+    test_attribution_reports_oversized_pages()
     test_spaced_markdown_links()
     test_media_verify_helpers()
     test_media_verify_content_identity_and_attempt_reset()
@@ -2668,8 +2895,61 @@ def main():
     test_converge_phase_helper()
     test_office_original_and_its_render_account_together()
     test_deck_images_attach_through_the_render_the_original_paired_in()
+    test_ticket_kind_gate_and_claim_identity()
+    test_file_ticket_record_supersedes_by_claim_and_normalizer_never_guesses()
     print("ALL OK  test_selfcheck")
 
 
 if __name__ == "__main__":
     main()
+
+
+def test_attribution_pairs_lines_by_newline_and_keeps_the_page_tail():
+    """A lone CR inside a fenced block splits str.splitlines but not the masked
+    prose; pairing by "\n" keeps every line and the tail (review repro)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", MANIFEST_TWO)
+        _mk(base, "raw/docs/验收单.md")
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [P](p.md) - p\n")
+        page = (
+            "---\ntype: t\ntitle: t\nsources:\n  - resource: raw/docs/验收单.md\n  - resource: raw/docs/手册.md\n---\n"
+            "## 命令\n\n```\nout\rput\n```\n\n- 事实 (source: raw/docs/验收单.md)\n\n## 尾段\n\nlast line (source: raw/docs/手册.md)\n"
+        )
+        _mk(base, "candidate/p.md", page)
+        selfcheck.attribute_evidence_sections(td)
+        text = (base / "candidate" / "p.md").read_bytes().decode("utf-8")  # read_text would fold the CR
+        assert "last line (source: raw/docs/手册.md)\n" in text and "out\rput" in text, text
+        assert text.count("okf:evidence") == 2 and f'"sources":["{_ID_B}"]}} -->\n## 尾段' in text, text
+        # Setext headings are sections too: the marker lands above the title line.
+        _mk(base, "candidate/s.md",
+            "---\ntype: t\ntitle: s\nsources:\n  - resource: raw/docs/手册.md\n---\n"
+            "Intro line.\n\n第一节\n=====\n\n- 事实一 (source: raw/docs/手册.md)\n\n第二节\n------\n\n- 事实二\n")
+        selfcheck.attribute_evidence_sections(td)
+        text = (base / "candidate" / "s.md").read_text()
+        assert text.count("okf:evidence") == 3, text
+        assert "-->\n第一节\n=====\n" in text and "-->\n第二节\n------\n" in text, text
+    print("OK  evidence attribution: newline pairing keeps the tail; setext headings are sections")
+
+
+def test_source_id_stamping_handles_bare_and_non_scalar_ids():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", MANIFEST_TWO)
+        _mk(base, "raw/docs/验收单.md")
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [P](p.md) - p\n- [Q](q.md) - q\n")
+        # A bare `id:` (null scalar) must gain a SPACE before the spliced value.
+        _mk(base, "candidate/p.md",
+            "---\ntype: t\ntitle: p\nsources:\n  - resource: raw/docs/验收单.md\n    id:\n---\n## 段\n\n事实 (source: raw/docs/验收单.md)\n")
+        # A non-scalar id is left alone AND no marker cites the manifest id for it.
+        _mk(base, "candidate/q.md",
+            "---\ntype: t\ntitle: q\nsources:\n  - resource: raw/docs/手册.md\n    id: [x]\n---\n## 段\n\n事实\n")
+        selfcheck.attribute_evidence_sections(td)
+        p = (base / "candidate" / "p.md").read_text()
+        fm, _, err = selfcheck.parse_okf_frontmatter(p)
+        assert err is None and fm["sources"][0]["id"] == _ID_A, p
+        q = (base / "candidate" / "q.md").read_text()
+        assert "id: [x]" in q and "okf:evidence" not in q, q
+    print("OK  source id stamping: bare id gets a space; non-scalar id is not cited")

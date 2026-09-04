@@ -9,6 +9,11 @@ remaining 10% is the kbc moat — custom tools that make the agent emit explicit
 structured signals:
   - report_summary  → SSE `summary` (compile progress, for the verify UI)
   - propose_plan    → SSE `plan_proposed` (Plan→Execute alignment)
+  - file_ticket     → the ONLY sanctioned way to open a contradiction ticket in
+                      authoring/CONTRADICTIONS.json; ticket_kind is gated by the
+                      ticket's own evidence (model_gap / source_conflict), the
+                      id is a code-computed claim fingerprint (same claim →
+                      supersede, never duplicate)
   - resolve_ticket  → writes agent_report into authoring/CONTRADICTIONS.json
                       (contradiction-ticket patch registration; never blocks)
 
@@ -1513,6 +1518,10 @@ _COMMAND_ACTIONS = {
     "compile.repair_test",
     # Full-library domain write/update only — not a scoped incremental turn.
     "compile.refresh_domain",
+    # An APPROVED brief proposal (KB feedback loop): a scoped repair the owner
+    # reviewed on the platform; parameters are derived server-side from the
+    # proposal row, never typed by the caller.
+    "compile.apply_proposal",
 }
 _FULL_COMPILE_ACTIONS = {
     "compile.generate", "compile.regenerate", "compile.approve_plan", "compile.resume",
@@ -1683,6 +1692,24 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
             "verdict": _bounded_string(parameters.get("verdict"), "parameters.verdict", required=True, limit=128),
             "judge_note": _bounded_string(parameters.get("judge_note"), "parameters.judge_note", limit=4000),
         }
+    elif action == "compile.apply_proposal":
+        # The box is the last door: a proposal execution carries exactly the
+        # reviewed shape and nothing else. A `brief` here would be written to
+        # authoring/BRIEF.json by _prepare_command and silently replace the
+        # compile brief (audience / redaction / knowledge_type) — refuse it,
+        # and drop every key the renderer does not read.
+        if "brief" in parameters or "renew" in parameters:
+            raise CommandRejected("compile.apply_proposal does not accept brief or renew parameters", 400)
+        pages = parameters.get("affected_pages") or []
+        if not isinstance(pages, list) or len(pages) > 50:
+            raise CommandRejected("parameters.affected_pages must be a list of at most 50 pages", 400)
+        parameters = {
+            "proposal_id": _bounded_string(parameters.get("proposal_id"), "parameters.proposal_id", required=True, limit=128),
+            "title": _bounded_string(parameters.get("title"), "parameters.title", required=True, limit=512),
+            "instruction": _bounded_string(parameters.get("instruction"), "parameters.instruction", required=True, limit=16000),
+            "rationale": _bounded_string(parameters.get("rationale"), "parameters.rationale", limit=16000),
+            "affected_pages": [_bounded_string(p, f"parameters.affected_pages[{i}]", required=True, limit=512) for i, p in enumerate(pages)],
+        }
 
     return command_id, {
         "version": 1,
@@ -1723,6 +1750,14 @@ def _render_command(run: "CompileRun", command: dict) -> str:
             reference_answer=params["reference_answer"] or "(not set)",
             verdict=params["verdict"],
             judge_note=params["judge_note"] or "(none)",
+        )
+    if action == "compile.apply_proposal":
+        pages = params.get("affected_pages") or []
+        return strings[action].format(
+            title=params["title"],
+            brief=params["instruction"],
+            rationale=params.get("rationale") or "(none)",
+            pages=", ".join(pages) if pages else "(the pages the brief names)",
         )
     rendered = strings[action]
     renew = params.get("renew")
@@ -1969,6 +2004,70 @@ def _compile_engine_tools(
             return rx["not_found"].format(path=rel, hint=hint)
         return rx["done"].format(path=rel, count=removed)
 
+    async def file_ticket(args):
+        """Open (or supersede) ONE contradiction ticket, model-free on every field
+        that carries judgment about the ledger itself.
+
+        The model supplies the CONTENT (question, evidence, options, its
+        best-guess, affected pages) and a claimed `ticket_kind`. Code supplies
+        the id (claim fingerprint) and DECIDES whether the kind matches the
+        evidence: two or more distinct raw documents with quotes is a source
+        conflict and nothing else; anything less is a model gap and nothing
+        else. A mismatch is refused with the kind the evidence supports, so the
+        model resubmits — it cannot talk its way past the gate (§D3)."""
+        ft = ts["file_ticket"]
+        kind = str(args.get("ticket_kind", "")).strip()
+        title = str(args.get("title", "")).strip()
+        question = str(args.get("question", "")).strip()
+        current_value = str(args.get("current_value", "")).strip()
+        sources = [
+            {"doc": row["doc"][:512], "quote": row["quote"][:1000]}
+            for row in selfcheck.normalize_ticket_sources(args.get("sources"))
+        ]
+        options = [str(o).strip()[:500] for o in (args.get("options") or []) if str(o).strip()]
+        pages = [str(p).strip()[:512] for p in (args.get("affected_pages") or []) if str(p).strip()]
+        if kind not in selfcheck.TICKET_KINDS:
+            return ft["bad_kind"].format(kinds=", ".join(selfcheck.TICKET_KINDS))
+        if not title or not question or not current_value or not sources or not pages:
+            return ft["need_args"]
+        allowed = selfcheck.ticket_kind_allowed_by_evidence(sources)
+        if kind != allowed:
+            docs = selfcheck.ticket_distinct_raw_docs(sources)
+            key = "kind_needs_conflict" if allowed == selfcheck.TICKET_KIND_SOURCE_CONFLICT else "kind_needs_gap"
+            return ft[key].format(docs=", ".join(docs) or "-", n=len(docs))
+        # Id from the STORED values: the post-turn normalizer re-derives it
+        # from the row to tell a tool-filed ticket from a hand-written one.
+        question = question[:2000]
+        sources = sources[:16]
+        tid = selfcheck.ticket_claim_id(question, sources)
+        ticket = {
+            "id": tid,
+            "title": title[:200],
+            "question": question,
+            "sources": sources,
+            "options": options[:8],
+            "current_value": current_value[:2000],
+            "affected_pages": pages[:50],
+            "status": "open",
+            "answer": None,
+            "ticket_kind": kind,
+            "origin": selfcheck.TICKET_ORIGIN_COMPILE,
+            "filed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            # The compile round this evidence was seen in — a control-plane
+            # fact the runtime holds (the accepted authoring command), never
+            # read back from the model, same discipline as dispatch_nonce. The
+            # server compares it with the operation it is promoting: a
+            # source_conflict the box did NOT re-file in a round that covered
+            # its documents is "not re-detected" and closes itself. Empty on the
+            # legacy chat path, where no operation exists and nothing auto-closes.
+            "filed_operation_id": (run._command_context or ("", 0))[0],
+            "filed_generation": (run._command_context or ("", 0))[1],
+        }
+        status, err = selfcheck.file_ticket_record(run.workdir, ticket)
+        if err:
+            return ft["failed"].format(e=err)
+        return ft[status].format(tid=tid, kind=kind)
+
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
         tid = str(args.get("ticket_id", "")).strip()
@@ -2058,6 +2157,31 @@ def _compile_engine_tools(
                 "required": ["path"],
             },
             remove_exclusion,
+        ),
+        EngineTool(
+            "file_ticket",
+            ts["file_ticket"]["desc"],
+            {
+                "type": "object",
+                "properties": {
+                    "ticket_kind": {"type": "string", "enum": list(selfcheck.TICKET_KINDS)},
+                    "title": {"type": "string"},
+                    "question": {"type": "string"},
+                    "sources": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"doc": {"type": "string"}, "quote": {"type": "string"}},
+                            "required": ["doc", "quote"],
+                        },
+                    },
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "current_value": {"type": "string"},
+                    "affected_pages": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["ticket_kind", "title", "question", "sources", "current_value", "affected_pages"],
+            },
+            file_ticket,
         ),
         EngineTool(
             "resolve_ticket",
@@ -2748,6 +2872,7 @@ async def _post_turn_selfcheck(run) -> str | None:
             run,
             f"Exclusion ledger could not be normalized: {norm_err}",
             f"豁免清单无法规范化:{norm_err}")})
+    await _normalize_ticket_ledger_after_turn(run, workdir)
     turn_start_key = getattr(run, "_turn_selfcheck_key", None)
     run._turn_selfcheck_key = None
     turn_format_guard = getattr(run, "_turn_format_guard", None)
@@ -2842,6 +2967,11 @@ async def _post_turn_selfcheck(run) -> str | None:
         mechanical_allowed = set(incremental.changed_pages(
             turn_format_guard.get("before") or {}, current))
     mechanical_fixes = selfcheck.normalize_body_source_annotations(
+        workdir, allowed_pages=mechanical_allowed)
+    # Same seam, same scope: stamp sources[].id from the frozen manifest and
+    # derive one okf:evidence marker per section from the (source:) tags the
+    # model wrote, so knowledge_cite lands on a section's own originals.
+    mechanical_fixes = mechanical_fixes + selfcheck.attribute_evidence_sections(
         workdir, allowed_pages=mechanical_allowed)
     if mechanical_fixes:
         mechanically_changed = {item["page"] for item in mechanical_fixes}
@@ -3133,6 +3263,33 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 await _set_converge_phase(run, "settled")
 
 
+async def _normalize_ticket_ledger_after_turn(run, workdir: str) -> None:
+    """Ticket-ledger backstop, run wherever the exclusion normalizer runs.
+
+    file_ticket is the sanctioned way in, but a Write to the ledger cannot be
+    intercepted at write time; so after every turn any row without a
+    `ticket_kind` is stamped `unclassified` (never inferred) and the owner is
+    told how many landed that way. Fail-open like its sibling: the seam must
+    never break the turn."""
+    try:
+        unclassified, err = selfcheck.normalize_contradictions_file(workdir)
+    except Exception as e:  # noqa: BLE001 — turn seam, §4.5 fail-open
+        unclassified, err = 0, f"{type(e).__name__}: {e}"
+    if err:
+        _print_compile_lifecycle("tickets.normalize_failed", run, extra="code=ticket_ledger_normalize_failed")
+        await run.emit({"type": "summary", "text": _loc(
+            run,
+            f"Ticket ledger could not be normalized: {err}",
+            f"工单账本无法规范化:{err}")})
+        return
+    if unclassified:
+        _print_compile_lifecycle("tickets.unclassified", run, extra=f"count={unclassified}")
+        await run.emit({"type": "summary", "text": _loc(
+            run,
+            f"{unclassified} ticket(s) were written by hand without a ticket_kind and were marked unclassified; open tickets with the file_ticket tool.",
+            f"{unclassified} 条工单未经 file_ticket 直接写入、缺 ticket_kind,已标为「未分类」;开单请用 file_ticket 工具。")})
+
+
 # Default tool whitelist for a kb-compile session, used when the runtime profile
 # declares no allowed_tools (profile.allowedTools = null → box default). A profile
 # that DOES declare a list (e.g. kb-test) overrides this.
@@ -3142,6 +3299,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__delete_candidate_page",
+    "mcp__compile__file_ticket",
     "mcp__compile__resolve_ticket",
     # The exclusion-ledger tools MUST be listed: every prompt steers exclusions
     # through them, so an allowlist that omits them would leave a model with no
@@ -3724,6 +3882,23 @@ def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = No
     return _batch_plan_resumable(_load_batch_plan(run))
 
 
+def _arm_proposal_scope_guard(run: "CompileRun", pages: list[str]) -> None:
+    """An owner-approved brief names the pages it may touch; make that a
+    byte-integrity guard, not an honor-system line in the prompt. Same closing
+    gate as an incremental round: pages outside affected_pages ∪ ADDED_TARGETS
+    ∪ index are restored byte-exact from this snapshot (review finding: the
+    scope used to render prompt text only)."""
+    (Path(run.workdir) / incremental.ADDED_TARGETS_PATH).unlink(missing_ok=True)
+    run._incr_pending = {
+        "before": incremental.page_hashes(run.workdir),
+        "before_bytes": incremental.page_bytes(run.workdir),
+        "baseline_format_violations": selfcheck.format_violation_keys(
+            selfcheck.candidate_pages(run.workdir)),
+        "changeset": {"added": [], "modified": [], "deleted": [], "affected_pages": list(pages),
+                      "scope": "proposal"},
+    }
+
+
 async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = False) -> None:
     """Scoped incremental kickoff: materialize the model-facing CHANGESET from
     the consumer's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
@@ -4080,6 +4255,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                 run,
                 f"Exclusion ledger could not be normalized: {norm_err}",
                 f"豁免清单无法规范化:{norm_err}")})
+        await _normalize_ticket_ledger_after_turn(run, run.workdir)
 
 
 def _drain_batch_notes(run: "CompileRun") -> str:
@@ -7316,6 +7492,7 @@ async def _dispatch_authoring_turn(
     run: CompileRun,
     text: str,
     action: str | None = None,
+    scope_pages: list[str] | None = None,
     *,
     apply_dispatch_nonce: str = "",
 ) -> dict:
@@ -7394,6 +7571,8 @@ async def _dispatch_authoring_turn(
     run.apply_dispatch_nonce = (
         apply_dispatch_nonce if action == "compile.apply_rulings" else ""
     )
+    if action == "compile.apply_proposal" and scope_pages:
+        _arm_proposal_scope_guard(run, scope_pages)
     run._begin_turn(
         text,
         # A normal owner edit may touch one page without conscripting untouched
@@ -7495,6 +7674,11 @@ async def handle_command(request: web.Request):
                     command["parameters"]["dispatch_nonce"]
                     if command["action"] == "compile.apply_rulings"
                     else ""
+                ),
+                scope_pages=(
+                    command["parameters"].get("affected_pages")
+                    if command["action"] == "compile.apply_proposal"
+                    else None
                 ),
             )
         except BaseException:

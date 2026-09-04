@@ -1249,3 +1249,47 @@ describe("consumeAgentSse — onEvent callback", () => {
     expect(seen[1].dbMessageId).toBe(seen[0].dbMessageId);
   });
 });
+
+describe("consumeAgentSse — knowledge citation attribution", () => {
+  it("persists the cited repos/pages on the assistant row that rendered them, exactly once per turn", async () => {
+    const a = "https://docs.feishu.cn/wiki/a";
+    const b = "https://docs.feishu.cn/wiki/b";
+    const events = [
+      { type: "message_start", message: { role: "user", content: [{ type: "text", text: "q" }] } },
+      { type: "message_end", message: { role: "user", content: [{ type: "text", text: "q" }] } },
+      { type: "knowledge_sources", sources: [
+        { title: "A", url: a, page: "repos/kb-1/a.md", repoId: "repo-1", claim: "A says so." },
+      ] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }] } },
+      { type: "knowledge_sources", sources: [
+        { title: "A", url: a, page: "repos/kb-1/a.md", repoId: "repo-1", claim: "A says so." },
+        { title: "B", url: b, page: "repos/kb-2/b.md", repoId: "repo-2", evidence: "ev.b" },
+      ] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "second" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const rows = appendCalls.filter((r) => r.role === "assistant");
+    expect(rows).toHaveLength(2);
+    // First row carries A; second row carries only the delta (B). Attribution
+    // mirrors the rendered text: each source lands on exactly one row.
+    expect(rows[0].metadata.knowledge_citations).toEqual({
+      repo_ids: ["repo-1"],
+      pages: [{ repo_id: "repo-1", page: "repos/kb-1/a.md", url: a, claim: "A says so." }],
+    });
+    expect(rows[1].metadata.knowledge_citations).toEqual({
+      repo_ids: ["repo-2"],
+      pages: [{ repo_id: "repo-2", page: "repos/kb-2/b.md", url: b, evidence: "ev.b" }],
+    });
+    // A row without citations carries no attribution key at all.
+    const plain = [
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "no cite" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "no cite" }] } },
+    ];
+    appendCalls.length = 0;
+    await consumeAgentSse({ client: mkClient(plain), sessionId: "sid", userId: "u", persistMessages: true });
+    const plainRows = appendCalls.filter((r) => r.role === "assistant");
+    expect(plainRows).toHaveLength(1);
+    expect(plainRows[0].metadata).not.toHaveProperty("knowledge_citations");
+  });
+});

@@ -26,6 +26,16 @@
     "failed": "删除 candidate 页面 {path} 失败: {e}",
     "deleted": "已删除 candidate 页面: {path}"
   },
+  "file_ticket": {
+    "desc": "开一张矛盾工单。一律通过本工具开单,不要手写 authoring/CONTRADICTIONS.json:手写的票没有 ticket_kind,轮末会落成「未分类」并需要重新开单。每个搞不定的问题调一次,且必须在你已把 best-guess 写进页面并标了 ⚠️ 之后。参数:`ticket_kind` —— 两份以上【不同】raw 文档确实互相矛盾时填 `source_conflict`(该修的是原文,wiki 只是投影,由原文负责人处理);只有负责人能拍板的填 `model_gap`:单一来源、基于 BRIEF.json 的定调/范围问题、图读不清、你理解不了的地方。系统会拿你的 `sources` 核对 kind:两个及以上不同 raw 文档且都有引文 → 只能是 source_conflict;不足两个 → 只能是 model_gap;对不上会被拒并告知应填哪个,你按提示重提即可。`title`(短标题)、`question`(一句大白话)、`sources`([{doc, quote}],互相矛盾的原文段落或你判断的依据)、`options`(2–4 个干净的候选值,不要写「以…为准」)、`current_value`(你写进页面的值)、`affected_pages`(带 ⚠️ 的 candidate 文件)。id 由 question + 涉及文档算出:同一问题再提会更新那张票,不会重复开。",
+    "bad_kind": "file_ticket 需要 `ticket_kind`,取值之一:{kinds}",
+    "need_args": "file_ticket 需要 `title`、`question`、非空 `sources`(每条带 `doc`)、`current_value` 和 `affected_pages`。",
+    "kind_needs_conflict": "已拒:引用了 {n} 份不同的 raw 文档({docs})—— 这是 source_conflict(文档之间打架,该由原文负责人统一口径),不是 model_gap。请按 ticket_kind=source_conflict 重提。",
+    "kind_needs_gap": "已拒:只有 {n} 份 raw 文档带引文({docs})—— 来源之间没有分歧,这是 model_gap(只有负责人能拍板),不是 source_conflict。请按 ticket_kind=model_gap 重提。",
+    "failed": "工单写入失败:{e}",
+    "filed": "工单 {tid} 已开({kind});继续编译,不要等裁决",
+    "superseded": "同一问题的工单 {tid} 已存在,已更新({kind});未重复开单"
+  },
   "resolve_ticket": {
     "desc": "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。`dispatch_nonce` 由运行时按当前裁决轮盖章——你可传任意字符串或省略,盒子会覆盖写入。非「应用裁决」轮次运行时会存空 nonce,使回执不对到任何裁决轮。",
     "need_id": "resolve_ticket 需要 ticket_id",

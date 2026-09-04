@@ -50,6 +50,7 @@
 - **证据内联** —— 把冲突的两三处原文连同出处引出来;
 - **预分类选项** —— 给 2–4 个候选裁法,末尾永远留一个"我也不确定→先标存疑"逃生口,并允许"其他";
 - **一个矛盾,一个问题。**
+- **说清谁能拍板** —— `ticket_kind: source_conflict`:两份以上不同文档互相矛盾(该由原文负责人改原文);`ticket_kind: model_gap`:只有负责人能回答(单一来源、定调、图读不清)。`file_ticket` 工具会拿你的引文核对,对不上会拒。
 
 ## 记录集合型源料:分层,不是二选一
 
@@ -116,7 +117,7 @@ generated:
   by: process:siclaw-kbc
 status: stable
 ---
-<正文。每条陈述都标(源:文件名)。已裁的矛盾写成保留其来源的结论;未裁的标"⚠️ 存疑:…">
+<正文。每条陈述都标 (source: 文件名)——系统按段从这些标注推导 okf:evidence 标记,没标注的事实只能被整页引用。已裁的矛盾写成保留其来源的结论;未裁的标"⚠️ 存疑:…">
 ```
 
 这些页面是 OKF v0.2 concept document:YAML 必须可解析,`type` 必须是非空字符串。`sources` 是 mapping 列表,每项都含非空 `resource`;agent 产出的页面写 `generated.by: process:siclaw-kbc` 和 `status: stable`。绝不代替真人或验证流程写 `verified`;修改已有页面时保留不认识的 OKF 字段。

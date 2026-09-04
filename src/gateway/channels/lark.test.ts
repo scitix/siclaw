@@ -78,6 +78,7 @@ const appendMessageMock = vi.fn();
 const bindMessageTraceIdMock = vi.fn();
 
 const recordChannelFeedbackMock = vi.fn();
+const updateMessageMock = vi.fn();
 
 vi.mock("../chat-repo.js", () => ({
   validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
@@ -86,6 +87,7 @@ vi.mock("../chat-repo.js", () => ({
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
   bindMessageTraceId: (...args: unknown[]) => bindMessageTraceIdMock(...args),
   recordChannelFeedback: (...args: unknown[]) => recordChannelFeedbackMock(...args),
+  updateMessage: (...args: unknown[]) => updateMessageMock(...args),
 }));
 
 // ── Existing behaviour: degraded boot when SDK missing (kept from old suite) ─
@@ -3859,6 +3861,36 @@ describe("collectResponse — SSE event flattening", () => {
     const text = await collectResponse(fakeClient(events), "s-citations-fallback");
     expect(text).toBe("answer from fallback");
     expect(text).not.toContain("Primary Runbook");
+  });
+
+  it("strips citations off a persisted primary row when the route rolls back", async () => {
+    // Lark persists each assistant turn as it lands, so a primary that cited and
+    // then failed already has a row carrying knowledge_citations. The fallback
+    // answer must get its own row and the discarded one must not keep the
+    // attribution feedback would otherwise land on.
+    appendMessageMock.mockReset();
+    updateMessageMock.mockReset();
+    appendMessageMock.mockResolvedValueOnce("row-primary").mockResolvedValueOnce("row-fallback");
+    updateMessageMock.mockResolvedValue(undefined);
+    const events = [
+      { type: "model_route_start", candidateCount: 2 },
+      { type: "knowledge_sources", sources: [{ title: "Primary Runbook", url: "https://example.com/primary", resource: "r.md", page: "p.md" }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial primary answer" }], stopReason: "stop" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    const result = await collectChannelResponse(fakeClient(events), "s-rollback-row", "test", { persist: { agentId: "a" } as never });
+    expect(result.text).toBe("answer from fallback");
+    expect(result.assistantMessageId).toBe("row-fallback");
+    // The primary row was written with citations, then marked discarded without them.
+    expect(appendMessageMock.mock.calls[0][0].metadata).toHaveProperty("knowledge_citations");
+    expect(updateMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      messageId: "row-primary", metadata: { discarded_route_attempt: true },
+    }));
+    expect(updateMessageMock.mock.calls[0][0].metadata).not.toHaveProperty("knowledge_citations");
+    // The fallback row carries no leftover citations from the discarded attempt.
+    expect(appendMessageMock.mock.calls[1][0].metadata ?? {}).not.toHaveProperty("knowledge_citations");
   });
 
   it("falls back to streamed content_block_delta when no message_end arrives", async () => {

@@ -115,6 +115,7 @@ parameters. Unknown versions and unknown actions fail closed.
 | `compile.submit_decisions` | `decisions[]` | Apply owner decisions and propose the resulting plan |
 | `compile.apply_rulings` | `dispatch_nonce`, `rulings[]` | Apply contradiction rulings and emit per-ticket receipts |
 | `compile.repair_test` | `question`, `reference_answer`, `verdict` | Repair the minimum draft scope for a failed test |
+| `compile.apply_proposal` | `proposal_id`, `title`, `instruction`; optional `rationale`, `affected_pages` | Execute an owner-approved brief proposal; `brief`/`renew` and unknown keys are refused |
 
 The optional brief uses stable identifiers. In particular,
 `intent=understand|execute|troubleshoot` selects whether the compiled structure

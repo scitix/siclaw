@@ -102,6 +102,37 @@ manifest entry at a different original.
 - A mount that has any `sourceId` in the manifest offers evidence guidance.
   Mixed answers are expressed in one call, not by flipping modes.
 
+## Compiler emission (kbc)
+
+The compile agent authors provenance at one level only: a `(source: X)` tag on
+each statement. `selfcheck.attribute_evidence_sections` runs at the turn seam
+(same scope as `normalize_body_source_annotations`) and stamps the machine
+shapes:
+
+- `sources[].id` — copied from `authoring/manifest.yaml` (the frozen source
+  manifest the control plane materializes). A missing id is inserted; an id
+  that disagrees with the manifest is replaced, because only manifest ids pass
+  `validateAuthoringEvidence` at publish. Unmanaged resources keep the author's id.
+- One marker per answerable section (ATX or setext heading spans plus the
+  preamble), placed on the line directly above the heading; the answering
+  prompt states that convention (a marker above a heading belongs to the
+  section below it). Raw and masked lines are paired on `\n` only, so a lone
+  CR / FF / U+2028 inside a code fence cannot shift the pairing. Sources = the tags inside the
+  section, in order of first appearance, capped at 8; a single-source page binds
+  every section to that source; a multi-source section with no tag falls back to
+  the page's sources and is reported as `fallback`.
+- Machine markers carry the `kbc-` id prefix and are regenerated on every pass
+  (idempotent). A marker with any other id is authored: its section is left
+  alone. A marker whose next non-blank line is a heading belongs to that
+  heading's section, matching the agent's own convention.
+
+`SELFCHECK.json.attribution` carries `{pages, sections, attributed, authored,
+fallback, ratio, findings[], oversized_pages[]}`. It is advisory: the repair
+prompt relays `findings` while a repair turn is running anyway, the publish
+card shows the ratio, and nothing gates on it — an unattributed section still
+answers, it just cites wide. `oversized_pages` lists pages above 30 sources as
+a split hint.
+
 ## Deploy
 
 The 3→8 render cap lives in `src/shared/knowledge-citations.ts` and is used

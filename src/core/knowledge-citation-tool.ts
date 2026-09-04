@@ -38,6 +38,44 @@ function result(text: string, cited: number, unresolved?: string[]) {
   };
 }
 
+/**
+ * Resolve a page path the model passed to knowledge_cite against the pages it
+ * actually read this turn. Models copy paths from their own read calls, which
+ * may carry the mount prefix (".siclaw/knowledge/repos/…", "./repos/…") or be
+ * absolute; a literal join against knowledgeDir then misses and the cite fails
+ * for a page that was demonstrably read. Strip leading segments until the path
+ * lands on a read page; never resolve to anything that was not read.
+ */
+/** The mount as the model sees it in its own read calls, relative to the session cwd. */
+export const KNOWLEDGE_MOUNT_PREFIX = ".siclaw/knowledge";
+
+/**
+ * Resolve a cited page path. Only a MOUNT prefix may be stripped — the
+ * `.siclaw/knowledge/` spelling the model copies from its read call, or the
+ * trailing segments of knowledgeDir itself. Nothing else is rewritten: an
+ * unread spelling (`repos/other/guide.md`, `../guide.md`) must stay unread
+ * rather than collapse onto some other page that happened to be read, because
+ * the resolved page is what attribution (repoId, claim) is written against.
+ */
+export function resolveCitedPagePath(value: string, knowledgeDir: string, wasRead: (absolute: string) => boolean): string {
+  const trimmed = value.trim().replaceAll("\\", "/");
+  if (path.isAbsolute(trimmed)) return path.resolve(trimmed);
+  const literal = path.resolve(path.join(knowledgeDir, trimmed));
+  if (wasRead(literal)) return literal;
+  const segments = path.posix.normalize(trimmed).split("/").filter((segment) => segment !== "" && segment !== ".");
+  const dirSegments = path.resolve(knowledgeDir).split(path.sep).filter(Boolean);
+  const prefixes: string[][] = [KNOWLEDGE_MOUNT_PREFIX.split("/")];
+  for (let k = Math.min(dirSegments.length, segments.length - 1); k >= 1; k--) {
+    prefixes.push(dirSegments.slice(dirSegments.length - k));
+  }
+  for (const prefix of prefixes) {
+    if (prefix.length >= segments.length) continue;
+    if (!prefix.every((segment, index) => segment === segments[index])) continue;
+    return path.resolve(path.join(knowledgeDir, segments.slice(prefix.length).join("/")));
+  }
+  return literal;
+}
+
 /** Match selfcheck._norm_source_entry: strip raw/ or drop/, keep a leading slash. */
 export function normalizedResource(value: string): string {
   let entry = path.posix.normalize(value.trim().replaceAll("\\", "/"));
@@ -212,7 +250,7 @@ Trusted original-source metadata is not available for this knowledge mount. Do n
     return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass each as \`{path, claim}\` in \`pages\` in the same call, where claim is the one statement in your answer that page supports. Cite the minimal set — a page you read but did not use is a citation error, and a page you cannot bind to a concrete claim is a read, not a citation. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. A marker on the line directly above a heading belongs to the section under that heading; a marker before the first heading covers the page's introduction. If the answer also uses unmarked pages, pass each as \`{path, claim}\` in \`pages\` in the same call, where claim is the one statement in your answer that page supports. Cite the minimal set — a page you read but did not use is a citation error, and a page you cannot bind to a concrete claim is a read, not a citation. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
   }
   return `
 ## Knowledge source citations
@@ -435,7 +473,7 @@ export function createKnowledgeCitationSupport(opts: {
         const pageValue = hash > 0 ? ref.slice(0, hash) : "";
         const evidenceId = hash > 0 ? ref.slice(hash + 1) : "";
         const page = pageValue
-          ? path.resolve(path.isAbsolute(pageValue) ? pageValue : path.join(opts.knowledgeDir, pageValue))
+          ? resolveCitedPagePath(pageValue, opts.knowledgeDir, (absolute) => readPages.has(absolute))
           : "";
         const root = path.resolve(opts.knowledgeDir);
         const snapshot = page ? readPages.get(page) : undefined;
@@ -481,6 +519,7 @@ export function createKnowledgeCitationSupport(opts: {
             sourceId,
             page: rel,
             evidence: evidenceId,
+            repoId: repo.id,
           });
         }
         if (!refResolved) {
@@ -509,7 +548,16 @@ export function createKnowledgeCitationSupport(opts: {
 
       if (pageArgs.length > 0) {
         const selected = pageArgs.map(({ path: value }) =>
-          path.resolve(path.isAbsolute(value) ? value : path.join(opts.knowledgeDir, value)));
+          resolveCitedPagePath(value, opts.knowledgeDir, (absolute) => readPages.has(absolute)));
+        // The validated claim rides on the citation for attribution (feedback →
+        // which statement, which page); it is not rendered.
+        // Two entries may resolve to one page (`guide.md` and `.siclaw/knowledge/guide.md`):
+        // keep every claim, or feedback on the first statement would point at nothing.
+        const claimByPage = new Map<string, string>();
+        selected.forEach((page, i) => {
+          const previous = claimByPage.get(page);
+          claimByPage.set(page, previous ? `${previous} | ${pageArgs[i].claim}` : pageArgs[i].claim);
+        });
         const unread = selected.find((page) => !readPages.has(page));
         if (unread) return result(`Cannot cite unread knowledge page: ${unread}`, 0);
         const navigationPage = selected.find((page) => {
@@ -543,7 +591,14 @@ export function createKnowledgeCitationSupport(opts: {
             const source = sourceByResource.get(resource);
             if (!source || seenURLs.has(source.url)) continue;
             seenURLs.add(source.url);
-            citations.push({ title: source.title, url: source.url, resource: source.resource, page: rel });
+            citations.push({
+              title: source.title,
+              url: source.url,
+              resource: source.resource,
+              page: rel,
+              repoId: repo.id,
+              claim: claimByPage.get(page),
+            });
           }
         }
       }
