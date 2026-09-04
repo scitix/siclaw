@@ -960,6 +960,10 @@ export function createHttpServer(
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
+    // LLM-call timeline: the prompt is accepted NOW. Everything between here and
+    // the first provider request (model setup, media preflight, language
+    // detection, routing preflight) is round 1's `since_prev_ms` (= setup).
+    managed.brain.llmCalls?.beginPrompt(Date.now(), { explicit: true });
     // Pre-spawn Stop: a /abort that arrived before this session existed recorded a pending abort.
     // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
     // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
@@ -1006,6 +1010,7 @@ export function createHttpServer(
       console.error(`[agentbox-http] Prompt setup failed for session ${managed.id}:`, err);
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
+      managed.brain.llmCalls?.endPrompt({ explicit: true });
       if (managed._bufferUnsub) {
         managed._bufferUnsub();
         managed._bufferUnsub = null;
@@ -1141,6 +1146,7 @@ export function createHttpServer(
     const actuallyFinish = () => {
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
+      managed.brain.llmCalls?.endPrompt({ explicit: true });
       clearTurnTierState(managed);
 
       // Emit prompt metrics via diagnostic event bus
@@ -1235,6 +1241,17 @@ export function createHttpServer(
     };
 
     const emitRouteEvent = (event: ModelRouteEvent): void => {
+      // Round numbering must survive a live-primary rollback: the discarded
+      // attempt's rounds are rewound so the surviving candidate's first call is
+      // round 1 again (attempt +1). See LlmCallRecorder.rollbackAttempt.
+      if (event.type === "model_route_attempt" && event.status === "started") {
+        managed.brain.llmCalls?.beginAttempt(event.attempt);
+      } else if (
+        (event.type === "model_route_attempt" && event.status === "failed") ||
+        event.type === "model_route_rollback"
+      ) {
+        managed.brain.llmCalls?.rollbackAttempt();
+      }
       emitSessionExtraEvent({ ...event, sessionId: managed.id });
     };
 
