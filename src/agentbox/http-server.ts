@@ -62,7 +62,7 @@ import {
 } from "../core/subagent-models.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
-import { ErrorCodes } from "../lib/error-envelope.js";
+import { SESSION_CONTEXT_UNAVAILABLE_CODE, SESSION_CONTEXT_UNAVAILABLE_STATUS } from "../shared/session-context.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -938,13 +938,13 @@ export function createHttpServer(
     const resumed = sessionManager.hasRestorableSessionContext(body.sessionId);
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
-        code: ErrorCodes.SESSION_CONTEXT_UNAVAILABLE,
+        code: SESSION_CONTEXT_UNAVAILABLE_CODE,
         message: "The requested session context is unavailable and cannot be resumed",
         retriable: false,
-        status: 412,
+        status: SESSION_CONTEXT_UNAVAILABLE_STATUS,
       };
-      logPromptResponse(412, "context_unavailable", detail.message);
-      sendJson(res, 412, { error: detail });
+      logPromptResponse(SESSION_CONTEXT_UNAVAILABLE_STATUS, "context_unavailable", detail.message);
+      sendJson(res, SESSION_CONTEXT_UNAVAILABLE_STATUS, { error: detail });
       return;
     }
     const managed = await sessionManager.getOrCreate(
