@@ -205,9 +205,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         }),
       ]) as
         | { found: false }
-        | { found: true; user_id: string; agent_id: string };
+        | { found: true; user_id: string; agent_id: string; target_agent_id?: string | null };
       if (!data.found) return null;
-      return { userId: data.user_id, agentId: data.agent_id };
+      // target_agent_id names the peer that executes a delegated leg; dropping it
+      // here left the registry unable to tell that peer from an unrelated agent.
+      // A non-delegated session reports it as null or "", so guard on truthiness
+      // rather than presence. A Portal that omits the field entirely degrades to
+      // the pre-change behaviour — refusals, logged by internal-api, not silence.
+      return {
+        userId: data.user_id,
+        agentId: data.agent_id,
+        ...(data.target_agent_id ? { targetAgentId: data.target_agent_id } : {}),
+      };
     } catch (err) {
       console.error("[session-registry] resolveSession RPC failed:", err);
       return null;
