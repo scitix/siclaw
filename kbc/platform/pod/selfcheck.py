@@ -3234,12 +3234,17 @@ def normalize_ticket_sources(sources) -> list[dict]:
     for row in sources:
         if not isinstance(row, dict):
             continue
-        doc = str(row.get("doc", "") or "").strip()
+        doc = str(row.get("doc", "") or "").strip().replace("\\", "/")
         quote = str(row.get("quote", "") or "").strip()
         if not doc:
             continue
         if not doc.startswith(_TICKET_NON_RAW_PREFIXES):
             doc = _strip_source_prefix(doc)
+        # `a.md`, `./a.md` and `raw/./a.md` are one document; the claim id
+        # hashes the doc set, so spelling drift must not split one ticket into three.
+        doc = posixpath.normpath(doc)
+        if doc in ("", "."):
+            continue
         out.append({"doc": doc, "quote": quote})
     return out
 
@@ -3337,9 +3342,13 @@ def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
     The model is steered to file_ticket, but Write cannot be intercepted at
     write time, so a hand-written ticket may still land. Every such row is
     marked `ticket_kind: unclassified` / `origin: compile` — NOT guessed from
-    sources.length (that guess is exactly what the gate exists to forbid).
-    Rows the system filed (`selfcheck-residual-*`) are model_gap by
-    construction and are stamped as such. Returns (rows newly marked
+    sources.length (that guess is exactly what the gate exists to forbid), and
+    NOT trusted from a `ticket_kind` the model typed either: a row is the
+    tool's only if its id is the claim fingerprint file_ticket computes from
+    the row's own question and document set (review: a hand-written
+    `ticket_kind: source_conflict` used to sail through). Rows the system filed
+    (`selfcheck-residual-*`) are model_gap by construction; rows another door
+    filed (origin edge) are left alone. Returns (rows newly marked
     unclassified, error)."""
     path = Path(workdir) / CONTRADICTIONS_PATH
     tickets, err = _read_ticket_ledger(path)
@@ -3351,13 +3360,19 @@ def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
         if not isinstance(t, dict):
             continue
         tid = str(t.get("id", ""))
-        if not t.get("ticket_kind"):
-            if tid.startswith("selfcheck-residual-"):
+        if tid.startswith("selfcheck-residual-"):
+            if t.get("ticket_kind") != TICKET_KIND_MODEL_GAP:
                 t["ticket_kind"] = TICKET_KIND_MODEL_GAP
-            else:
+                changed = True
+        elif t.get("origin") not in (TICKET_ORIGIN_SELFCHECK, TICKET_ORIGIN_EDGE):
+            filed_by_tool = (
+                t.get("ticket_kind") in TICKET_KINDS
+                and tid == ticket_claim_id(str(t.get("question", "")), normalize_ticket_sources(t.get("sources")))
+            )
+            if not filed_by_tool and t.get("ticket_kind") != TICKET_KIND_UNCLASSIFIED:
                 t["ticket_kind"] = TICKET_KIND_UNCLASSIFIED
                 newly_unclassified += 1
-            changed = True
+                changed = True
         if not t.get("origin"):
             t["origin"] = (TICKET_ORIGIN_SELFCHECK if tid.startswith("selfcheck-residual-")
                            else TICKET_ORIGIN_COMPILE)

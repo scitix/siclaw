@@ -46,14 +46,32 @@ function result(text: string, cited: number, unresolved?: string[]) {
  * for a page that was demonstrably read. Strip leading segments until the path
  * lands on a read page; never resolve to anything that was not read.
  */
+/** The mount as the model sees it in its own read calls, relative to the session cwd. */
+export const KNOWLEDGE_MOUNT_PREFIX = ".siclaw/knowledge";
+
+/**
+ * Resolve a cited page path. Only a MOUNT prefix may be stripped — the
+ * `.siclaw/knowledge/` spelling the model copies from its read call, or the
+ * trailing segments of knowledgeDir itself. Nothing else is rewritten: an
+ * unread spelling (`repos/other/guide.md`, `../guide.md`) must stay unread
+ * rather than collapse onto some other page that happened to be read, because
+ * the resolved page is what attribution (repoId, claim) is written against.
+ */
 export function resolveCitedPagePath(value: string, knowledgeDir: string, wasRead: (absolute: string) => boolean): string {
   const trimmed = value.trim().replaceAll("\\", "/");
-  const literal = path.resolve(path.isAbsolute(trimmed) ? trimmed : path.join(knowledgeDir, trimmed));
-  if (wasRead(literal) || path.isAbsolute(trimmed)) return literal;
+  if (path.isAbsolute(trimmed)) return path.resolve(trimmed);
+  const literal = path.resolve(path.join(knowledgeDir, trimmed));
+  if (wasRead(literal)) return literal;
   const segments = path.posix.normalize(trimmed).split("/").filter((segment) => segment !== "" && segment !== ".");
-  for (let i = 1; i < segments.length; i++) {
-    const candidate = path.resolve(path.join(knowledgeDir, segments.slice(i).join("/")));
-    if (wasRead(candidate)) return candidate;
+  const dirSegments = path.resolve(knowledgeDir).split(path.sep).filter(Boolean);
+  const prefixes: string[][] = [KNOWLEDGE_MOUNT_PREFIX.split("/")];
+  for (let k = Math.min(dirSegments.length, segments.length - 1); k >= 1; k--) {
+    prefixes.push(dirSegments.slice(dirSegments.length - k));
+  }
+  for (const prefix of prefixes) {
+    if (prefix.length >= segments.length) continue;
+    if (!prefix.every((segment, index) => segment === segments[index])) continue;
+    return path.resolve(path.join(knowledgeDir, segments.slice(prefix.length).join("/")));
   }
   return literal;
 }

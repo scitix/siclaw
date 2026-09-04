@@ -7624,9 +7624,23 @@ async def test_apply_proposal_command_renders_the_reviewed_brief():
             })
             assert command["action"] == "compile.apply_proposal"
             assert command["parameters"]["affected_pages"] == ["cluster-baseline.md"]
+            # Unknown keys are dropped at the door, not merely ignored by the renderer.
+            assert set(command["parameters"]) == {"proposal_id", "title", "instruction", "rationale", "affected_pages"}
             text = compile_box._render_command(run, command)
             assert needle in text and "Fix the K8s version" in text and "1.30.2-cks" in text and "cluster-baseline.md" in text, text
             assert "smuggled" not in text
+            # A smuggled brief would rewrite authoring/BRIEF.json; the box refuses it.
+            try:
+                compile_box._normalize_command({"command_id": "cmd-brief", "command": {
+                    "version": 1, "action": "compile.apply_proposal", "operation_id": "op-2", "generation": 1,
+                    "parameters": {"proposal_id": "p", "title": "t", "instruction": "i", "affected_pages": ["a.md"],
+                                   "brief": {"knowledge_type": "code", "audience": "external", "redaction": "external"}}}})
+            except compile_box.CommandRejected:
+                pass
+            else:
+                raise AssertionError("apply_proposal must refuse a brief")
+            compile_box._prepare_command(run, command)
+            assert not (Path(td) / "authoring" / "BRIEF.json").exists()
         for broken in ({"proposal_id": "p", "title": "t"}, {"proposal_id": "p", "instruction": "b"}, {"proposal_id": "p", "title": "t", "instruction": "b", "affected_pages": "x"}):
             try:
                 compile_box._normalize_command({"command_id": "c", "command": {

@@ -79,6 +79,14 @@ describe("knowledge_cite", () => {
     const unread = await support.tool.execute("call", { pages: [{ path: ".siclaw/knowledge/other.md", claim: "The runbook documents the GPU reset procedure." }] } as never);
     expect(unread.details).toEqual({ cited: 0 });
     expect(JSON.stringify(unread)).toContain("Cannot cite unread knowledge page");
+    // …and never collapses an unread spelling onto a DIFFERENT page that was
+    // read: only a mount prefix is stripped, so a same-named page elsewhere or
+    // a parent-relative path stays unread instead of borrowing guide.md's read.
+    for (const spelling of [`repos/other/${path.basename(page)}`, `../${path.basename(page)}`, `x/${path.basename(page)}`]) {
+      const collision = await support.tool.execute("call", { pages: [{ path: spelling, claim: "The runbook documents the GPU reset procedure." }] } as never);
+      expect(collision.details, spelling).toEqual({ cited: 0 });
+    }
+    expect(events).toHaveLength(1);
   });
 
   it("rejects pages items that are not bound to a concrete claim", async () => {

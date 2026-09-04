@@ -1693,10 +1693,17 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
             "judge_note": _bounded_string(parameters.get("judge_note"), "parameters.judge_note", limit=4000),
         }
     elif action == "compile.apply_proposal":
+        # The box is the last door: a proposal execution carries exactly the
+        # reviewed shape and nothing else. A `brief` here would be written to
+        # authoring/BRIEF.json by _prepare_command and silently replace the
+        # compile brief (audience / redaction / knowledge_type) — refuse it,
+        # and drop every key the renderer does not read.
+        if "brief" in parameters or "renew" in parameters:
+            raise CommandRejected("compile.apply_proposal does not accept brief or renew parameters", 400)
         pages = parameters.get("affected_pages") or []
         if not isinstance(pages, list) or len(pages) > 50:
             raise CommandRejected("parameters.affected_pages must be a list of at most 50 pages", 400)
-        parameters = {**parameters,
+        parameters = {
             "proposal_id": _bounded_string(parameters.get("proposal_id"), "parameters.proposal_id", required=True, limit=128),
             "title": _bounded_string(parameters.get("title"), "parameters.title", required=True, limit=512),
             "instruction": _bounded_string(parameters.get("instruction"), "parameters.instruction", required=True, limit=16000),
@@ -2013,9 +2020,12 @@ def _compile_engine_tools(
         title = str(args.get("title", "")).strip()
         question = str(args.get("question", "")).strip()
         current_value = str(args.get("current_value", "")).strip()
-        sources = selfcheck.normalize_ticket_sources(args.get("sources"))
-        options = [str(o).strip() for o in (args.get("options") or []) if str(o).strip()]
-        pages = [str(p).strip() for p in (args.get("affected_pages") or []) if str(p).strip()]
+        sources = [
+            {"doc": row["doc"][:512], "quote": row["quote"][:1000]}
+            for row in selfcheck.normalize_ticket_sources(args.get("sources"))
+        ]
+        options = [str(o).strip()[:500] for o in (args.get("options") or []) if str(o).strip()]
+        pages = [str(p).strip()[:512] for p in (args.get("affected_pages") or []) if str(p).strip()]
         if kind not in selfcheck.TICKET_KINDS:
             return ft["bad_kind"].format(kinds=", ".join(selfcheck.TICKET_KINDS))
         if not title or not question or not current_value or not sources or not pages:
@@ -2025,12 +2035,16 @@ def _compile_engine_tools(
             docs = selfcheck.ticket_distinct_raw_docs(sources)
             key = "kind_needs_conflict" if allowed == selfcheck.TICKET_KIND_SOURCE_CONFLICT else "kind_needs_gap"
             return ft[key].format(docs=", ".join(docs) or "-", n=len(docs))
+        # Id from the STORED values: the post-turn normalizer re-derives it
+        # from the row to tell a tool-filed ticket from a hand-written one.
+        question = question[:2000]
+        sources = sources[:16]
         tid = selfcheck.ticket_claim_id(question, sources)
         ticket = {
             "id": tid,
             "title": title[:200],
-            "question": question[:2000],
-            "sources": sources[:16],
+            "question": question,
+            "sources": sources,
             "options": options[:8],
             "current_value": current_value[:2000],
             "affected_pages": pages[:50],

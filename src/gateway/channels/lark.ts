@@ -34,7 +34,7 @@ import {
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
-import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback, warnTraceBindFailure } from "../chat-repo.js";
+import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback, updateMessage, warnTraceBindFailure } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
@@ -3080,6 +3080,8 @@ export async function collectChannelResponse(
   // for the user). pi-agent's agent_end signals the last turn is complete.
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
+  // Exact text persisted on lastAssistantMessageId (updateMessage requires content).
+  let lastRowContent = "";
   let pendingKnowledgeSources: unknown = null;
   // Same contract as sse-consumer: the citations appended to THIS assistant row
   // ride on its metadata for feedback attribution.
@@ -3122,6 +3124,27 @@ export async function collectChannelResponse(
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
         renderedKnowledgeSourceUrls.clear();
+        pendingRowCitations = [];
+      }
+      if (ev.type === "model_route_rollback" && lastAssistantMessageId && persist) {
+        // Lark persists every assistant turn as it lands (sse-consumer buffers
+        // until the routed turn commits), so the failed primary's row already
+        // exists — and may carry knowledge_citations. Feedback on it must not
+        // attribute to a discarded attempt: strip the citations and mark the
+        // row, then forget it so the fallback answer gets its own row.
+        const discardedId = lastAssistantMessageId;
+        lastAssistantMessageId = null;
+        lastAssistantText = "";
+        try {
+          await updateMessage({
+            messageId: discardedId,
+            sessionId,
+            content: redact(lastRowContent),
+            metadata: { discarded_route_attempt: true },
+          });
+        } catch (err) {
+          console.warn(`[${logPrefix}] discard rolled-back assistant row failed session=${sessionId}:`, err);
+        }
       }
       if (ev.type === "knowledge_sources") {
         pendingKnowledgeSources = ev.sources;
@@ -3233,6 +3256,7 @@ export async function collectChannelResponse(
           // narration id would link the final card to the wrong assistant turn.
           const rowCitations = pendingRowCitations;
           pendingRowCitations = [];
+          lastRowContent = turnText;
           lastAssistantMessageId = persist
             ? await persistRow({
                 sessionId,

@@ -1202,11 +1202,16 @@ def test_file_ticket_record_supersedes_by_claim_and_normalizer_never_guesses():
         # a hand-written row + a system residual row land in the same ledger
         rows.append({"id": "hand-1", "title": "手写", "sources": [{"doc": "a.md", "quote": "x"}, {"doc": "b.md", "quote": "y"}],
                      "affected_pages": ["p.md"], "status": "open", "answer": None})
+        # A hand-written row that TYPES a kind is no more trusted: its id is not
+        # the claim fingerprint file_ticket would have computed.
+        rows.append({"id": "hand-2", "title": "手写带 kind", "question": "q", "ticket_kind": "source_conflict",
+                     "sources": [{"doc": "a.md", "quote": "x"}], "affected_pages": ["p.md"], "status": "open", "answer": None})
         rows.append({"id": "selfcheck-residual-abcd1234", "title": "残留", "status": "open", "answer": None})
         (base / "authoring/CONTRADICTIONS.json").write_text(json.dumps(rows, ensure_ascii=False), "utf-8")
-        assert selfcheck.normalize_contradictions_file(td) == (1, None)
+        assert selfcheck.normalize_contradictions_file(td) == (2, None)
         rows = {r["id"]: r for r in json.loads((base / "authoring/CONTRADICTIONS.json").read_text("utf-8"))}
         assert rows["hand-1"]["ticket_kind"] == "unclassified"  # two docs, still NOT guessed
+        assert rows["hand-2"]["ticket_kind"] == "unclassified"  # typed kind, still not the tool's row
         assert rows["hand-1"]["origin"] == "compile"
         assert rows["selfcheck-residual-abcd1234"]["ticket_kind"] == "model_gap"
         assert rows["selfcheck-residual-abcd1234"]["origin"] == "selfcheck"
