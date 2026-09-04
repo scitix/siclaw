@@ -350,34 +350,15 @@ const LEDGER_AUTOCLEAR_MS = 5_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
 
-/**
- * System-prompt addendum for a read-only DELEGATED worker turn (a peer agent
- * dispatched by a coordinator over the mesh). Mirrors the general-purpose
- * sub-agent persona (core/subagent-registry.ts) but tailored: read-only tier +
- * the structured `report_findings` hand-off contract. The coordinator relays the
- * worker's stream to the user as one assistant identity, so the worker writes a
- * concise human-readable narrative AND calls report_findings once at the end.
- */
-const DELEGATED_READONLY_PERSONA =
-  "You are handling ONE bounded diagnostic task delegated to you by a coordinator agent. " +
-  "This is a READ-ONLY investigation: inspect and gather evidence only. You have read-only " +
-  "tools — kubectl read commands (get/describe/logs/top/events) and shell text tools via bash, " +
-  "cluster/host lookups, and memory search — but NO write or remediation tools; do not attempt " +
-  "to change any infrastructure. Do exactly the task described, then END by calling the " +
-  "`report_findings` tool once with a compact structured result (findings / actions_taken / " +
-  "residual_state). Keep your visible narrative concise — the user sees it directly. Do not ask " +
-  "for confirmation; if blocked, report what you found and what's missing in report_findings.";
-
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Rebuild key for the delegation tier: "none" (non-delegated) | "ro" | "rw".
- *  Only the tier (not the ids) affects the resolved toolset, so a re-delegation
- *  of the same session at the same tier reuses the built agent. */
-function delegationSignature(d: DelegationContext | undefined): "none" | "ro" | "rw" {
-  if (!d) return "none";
-  return d.readOnly ? "ro" : "rw";
+ *  The ids do not affect the resolved toolset, so a re-delegation of the same
+ *  session reuses the built agent. */
+function delegationSignature(d: DelegationContext | undefined): "none" | "delegated" {
+  return d ? "delegated" : "none";
 }
 
 async function abortBrainBestEffort(
@@ -3354,12 +3335,9 @@ export class AgentBoxSessionManager {
       // the model knows to end with report_findings.
       delegation,
       // Built-in types compile their immutable contract plus this persisted
-      // Agent addendum. Delegated read-only is an exclusive runtime constraint:
-      // composing it with an SRE or Coordinator contract would instruct the
-      // model to use tools that the read-only gate deliberately removed.
-      systemPromptAppend: delegation?.readOnly
-        ? DELEGATED_READONLY_PERSONA
-        : systemPromptTemplate,
+      // Agent addendum. A delegated peer keeps its OWN contract — being called
+      // by a coordinator does not change who it is.
+      systemPromptAppend: systemPromptTemplate,
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,

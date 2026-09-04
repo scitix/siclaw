@@ -753,7 +753,6 @@ export async function handleDelegate(
             delegationId,
             parentSessionId: body.parentSessionId,
             parentAgentId: coordinatorAgentId,
-            readOnly: false,
           },
         },
       });
@@ -860,13 +859,6 @@ export async function handleDelegate(
         delegationId,
         parentSessionId: body.parentSessionId,
         parentAgentId: coordinatorAgentId,
-        // The coordinator does NOT constrain the peer: a delegated agent runs
-        // under ITS OWN configuration (capabilities, persona, model) — the two
-        // agents manage their own permissions independently. The marker exists
-        // for the result-artifact contract, anti-recursion, and audit, not to
-        // downgrade the peer. (An explicit read-only delegation tier is a future
-        // opt-in; it is not imposed here.)
-        readOnly: false,
       },
     });
 

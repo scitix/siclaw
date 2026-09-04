@@ -477,19 +477,25 @@ function resolveActiveMode(
  *
  * A delegated agent runs under ITS OWN configuration — the coordinator and the
  * worker manage their own permissions independently, so delegation does NOT
- * downgrade the worker's toolset or persona. `readOnly` is therefore EXPLICIT
- * opt-in only (default false); it is honored when a caller sets it true (a
- * future read-only delegation tier), but never forced on by origin or by
- * omission. The marker's real jobs are the result-artifact contract,
- * one-level anti-recursion, and audit — not permission degradation.
+ * downgrade the worker's toolset or persona, and there is no dial here that
+ * could. The marker's jobs are the result-artifact contract, one-level
+ * anti-recursion, and audit.
  */
 export function resolveDelegation(
   delegation: DelegationContext | undefined,
   _origin: OriginKind | undefined,
 ): DelegationContext | undefined {
   if (!delegation || !delegation.delegationId) return undefined;
-  const readOnly = delegation.readOnly === true;
-  return { ...delegation, readOnly };
+  // Built field by field, NOT spread: this marker arrives in the request body,
+  // so a spread would let a caller smuggle through any property the type gains
+  // later — including one meant to modulate the peer. There is no such property
+  // today and there should not be one; constructing explicitly is what keeps
+  // that true without anyone having to remember it.
+  return {
+    delegationId: delegation.delegationId,
+    ...(delegation.parentSessionId ? { parentSessionId: delegation.parentSessionId } : {}),
+    ...(delegation.parentAgentId ? { parentAgentId: delegation.parentAgentId } : {}),
+  };
 }
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -917,7 +923,7 @@ export function createHttpServer(
 
     const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
     // A delegated agent runs under its own configuration; delegation does not
-    // downgrade it. readOnly is honored only when explicitly set true.
+    // downgrade it.
     const delegation = resolveDelegation(body.delegation, body.origin);
     // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
     // dispatch in process memory only, so after a Runtime restart the same turn

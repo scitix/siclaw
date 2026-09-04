@@ -165,5 +165,4 @@ to use rather than guessing.`,
 export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createClusterListTool(refs.kubeconfigRef),
-  readOnlyDelegable: true,
 };

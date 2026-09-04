@@ -2165,29 +2165,26 @@ describe("http-server — idle self-destruct", () => {
   });
 });
 
-describe("resolveDelegation (worker autonomy — readOnly is explicit opt-in)", () => {
+describe("resolveDelegation (worker autonomy)", () => {
   it("returns undefined for a non-delegated turn", () => {
     expect(resolveDelegation(undefined, "web")).toBeUndefined();
     // A malformed marker without a delegationId is treated as non-delegated.
-    expect(resolveDelegation({ delegationId: "", readOnly: false }, "web")).toBeUndefined();
+    expect(resolveDelegation({ delegationId: "" }, "web")).toBeUndefined();
   });
 
-  it("does NOT downgrade the worker: readOnly=false survives from ANY origin", () => {
-    expect(resolveDelegation({ delegationId: "d1", readOnly: false }, "web")).toEqual({ delegationId: "d1", readOnly: false });
-    // Non-interactive origins no longer force read-only — the worker runs under its own config.
-    for (const origin of ["task", "a2a", "api", "channel"] as const) {
-      expect(resolveDelegation({ delegationId: "d1", readOnly: false }, origin)?.readOnly).toBe(false);
+  // 委托不降级被委托方 —— 它带回来的就是它自己,没有可供调用方拨动的档位。
+  // 这条曾经是 `readOnly` 开关:调用方一句话就能砍掉 peer 的工具表**并换掉它的
+  // persona**,于是"委托给 agent Y"拿到的根本不是 Y。只读是 agent 自己的角色配置
+  // (能力组),不是每次调用的参数。
+  it("carries the marker through unchanged from ANY origin", () => {
+    for (const origin of ["web", "task", "a2a", "api", "channel"] as const) {
+      expect(resolveDelegation({ delegationId: "d1" }, origin)).toEqual({ delegationId: "d1" });
     }
   });
 
-  it("defaults to NOT read-only when the flag is omitted (worker autonomous)", () => {
-    expect(resolveDelegation({ delegationId: "d1" } as any, "web")?.readOnly).toBe(false);
-    expect(resolveDelegation({ delegationId: "d1" } as any, "api")?.readOnly).toBe(false);
-  });
-
-  it("honors an EXPLICIT read-only=true opt-in (future read-only tier)", () => {
-    expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "web")?.readOnly).toBe(true);
-    expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "api")?.readOnly).toBe(true);
+  it("has no permission dial a caller could set", () => {
+    const resolved = resolveDelegation({ delegationId: "d1", readOnly: true } as any, "web");
+    expect(resolved).toEqual({ delegationId: "d1" });
   });
 });
 

@@ -562,15 +562,6 @@ export interface ToolEntry {
    */
   available?: (refs: ToolRefs) => boolean;
 
-  /**
-   * True on tools safe to expose in a READ-ONLY DELEGATED turn (queries, reads,
-   * the result-artifact reporter). When `refs.delegation?.readOnly` is set,
-   * `resolve()` keeps ONLY tools with this flag — every exec/script/mutation tool
-   * drops out, so a delegated worker physically cannot write. Omit = not exposed
-   * under read-only delegation. Orthogonal to `allowedTools` (per-agent capability
-   * whitelist) — both filters apply. See docs/design/agent-delegation.md §8.
-   */
-  readOnlyDelegable?: boolean;
 
   /**
    * Operating modes that expose this tool. Omit = available in every mode (the
@@ -616,19 +607,11 @@ export class ToolRegistry {
   }): ResolvedToolDefinition[] {
     const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // Read-only delegated turn: the worker was delegated a bounded task by a
-    // coordinator over the mesh, at the read-only tier (design §8). Keep ONLY
-    // tools tagged readOnlyDelegable — this drops every exec/script/mutation
-    // tool, so the worker physically cannot write. Non-delegated turns and
-    // write-tier delegation (P1) are unaffected.
-    const delegatedReadOnly = refs.delegation?.readOnly === true;
-
     // 1. session-mode + operating-mode + delegation + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&
         (!e.availableModes || e.availableModes.includes(activeMode)) &&
-        (!delegatedReadOnly || e.readOnlyDelegable === true) &&
         (!e.available || e.available(refs)),
     );
 

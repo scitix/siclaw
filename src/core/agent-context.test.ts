@@ -75,17 +75,21 @@ describe("resolveAgentHarness", () => {
     })).toThrow("Invalid or missing agent_type");
   });
 
-  it("removes MCP and memory from delegated read-only work", () => {
-    const harness = resolveAgentHarness({
-      agentType: "sre",
+  // 被委托的 turn 跟直接调用解析出同一套 harness。这条曾经断言相反:委托会摘掉
+  // peer 的 MCP、memory 和操作安全段。那是调用方在削被调 agent 的能力,而能力是
+  // 那个 agent 自己的事。
+  it("resolves a delegated turn exactly like a direct one", () => {
+    const input = {
+      agentType: "sre" as const,
       allowedTools: ["read", "memory_search", "cluster_list"],
       memoryConfigured: true,
-      delegation: { delegationId: "d1", readOnly: true },
-    });
+    };
+    const delegated = resolveAgentHarness({ ...input, delegation: { delegationId: "d1" } });
+    const direct = resolveAgentHarness(input);
 
-    expect(harness.mcpExposure).toBe("none");
-    expect(harness.memoryEnabled).toBe(false);
-    expect(harness.includeOperationalSafety).toBe(false);
+    expect(delegated.mcpExposure).toBe(direct.mcpExposure);
+    expect(delegated.memoryEnabled).toBe(direct.memoryEnabled);
+    expect(delegated.includeOperationalSafety).toBe(direct.includeOperationalSafety);
   });
 
   it("adds the automated-task report tool without broadening interactive capabilities", () => {
