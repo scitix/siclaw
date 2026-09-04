@@ -83,27 +83,41 @@ export function a2aTransportConfig(env: NodeJS.ProcessEnv = process.env): A2aTra
   return { baseUrl, token };
 }
 
-interface ThreadState {
-  contextId: string;
-  waitingTaskId?: string;
+// contextIdFor derives the remote A2A conversation handle from the LOCAL peer
+// session id, deterministically.
+//
+// ⚠️ THE HANDLE USED TO LIVE ONLY IN PROCESS MEMORY, which gave a continuation
+// three ways to vanish: a Runtime restart, the 500-entry cap's first-key
+// eviction, and any gateway process that had not opened the thread. Losing it
+// did not fail loudly — the next leg opened a task on a FRESH context, so a peer
+// parked mid-question was abandoned and the human's answer went to a new turn.
+//
+// Deriving it needs no storage: the same peer session always yields the same
+// handle, so any process addresses the same remote thread. The read boundary is
+// (agent, principal, contextId), so a derived handle can only ever reach this
+// coordinator's own threads.
+function contextIdFor(localSessionId: string): string {
+  return `deleg-${localSessionId}`;
 }
 
-// localPeerSessionId → remote thread. Bounded: delegation reuse is already
-// recency-bounded upstream, so a small LRU-ish cap is plenty.
-const threads = new Map<string, ThreadState>();
-const THREADS_MAX = 500;
+// localPeerSessionId → the task it parked on. A HINT ONLY: every resume falls
+// back to asking the control plane (recoverParkedTask), so an empty map after a
+// restart costs one GET rather than a duplicate task. Bounded, and eviction is
+// harmless for the same reason.
+const parkHints = new Map<string, string>();
+const PARK_HINTS_MAX = 500;
 
-function rememberThread(localSessionId: string, state: ThreadState): void {
-  if (threads.size >= THREADS_MAX && !threads.has(localSessionId)) {
-    const oldest = threads.keys().next().value;
-    if (oldest !== undefined) threads.delete(oldest);
+function rememberPark(localSessionId: string, taskId: string): void {
+  if (parkHints.size >= PARK_HINTS_MAX && !parkHints.has(localSessionId)) {
+    const oldest = parkHints.keys().next().value;
+    if (oldest !== undefined) parkHints.delete(oldest);
   }
-  threads.set(localSessionId, state);
+  parkHints.set(localSessionId, taskId);
 }
 
-/** Test hook. */
+/** Test hook: clears the hint, so a test can exercise the listing fallback. */
 export function __resetA2aThreads(): void {
-  threads.clear();
+  parkHints.clear();
 }
 
 /**
@@ -170,7 +184,8 @@ const TERMINALS = new Set(["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_ST
 export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDelegationOutcome> {
   const { cfg, peerAgentId, signal } = args;
   const redact = args.redact ?? ((t: string) => t);
-  const thread = threads.get(args.localSessionId);
+  const contextId = contextIdFor(args.localSessionId);
+  const parkHint = parkHints.get(args.localSessionId);
 
   // The Runtime's own adapter secret, in the SAME header the WS upgrade uses,
   // plus the id of the agent this delegation is on behalf of. The caller agent
@@ -252,9 +267,7 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
     const task = frame?.task;
     if (task?.id) {
       taskId = String(task.id);
-      const contextId = String(task.contextId ?? "");
       remoteSessionId = String(task.metadata?.sessionId ?? "");
-      if (contextId) rememberThread(args.localSessionId, { ...threads.get(args.localSessionId), contextId });
       const state = String(task.status?.state ?? "");
       if (TERMINALS.has(state)) {
         // A terminal SNAPSHOT (the turn finished before our subscribe attached)
@@ -350,10 +363,8 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
    * the SAME task (and therefore the same remote session).
    */
   function parkOnInputRequired(question: string): A2aDelegationOutcome {
-    rememberThread(args.localSessionId, {
-      contextId: threads.get(args.localSessionId)?.contextId ?? "",
-      waitingTaskId: taskId,
-    });
+    // A hint for the common case; correctness does not depend on it.
+    rememberPark(args.localSessionId, taskId);
     args.observe({ type: "input_required", question: redact(question) });
     return {}; // turn over; the delegate result reports input_required
   }
@@ -380,7 +391,12 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
   const recoverParkedTask = async (contextId: string): Promise<string | undefined> => {
     if (!contextId) return undefined;
     try {
-      const url = `${agentBase}/tasks?contextId=${encodeURIComponent(contextId)}&status=working`;
+      // ⚠️ `TASK_STATE_INPUT_REQUIRED`, not `working`. The control plane validates
+      // this against a closed allowlist of proto3-JSON spellings, so the short
+      // form was a 400 — swallowed by the `!res.ok` guard below, which is why
+      // this recovery path silently never fired. Ask for exactly the state we
+      // are looking for rather than filtering a broader list client-side.
+      const url = `${agentBase}/tasks?contextId=${encodeURIComponent(contextId)}&status=TASK_STATE_INPUT_REQUIRED`;
       const res = await fetch(url, { method: "GET", headers, signal });
       if (!res.ok) return undefined;
       const body = (await res.json()) as any;
@@ -398,11 +414,13 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
   // A waiting thread resumes its ORIGINAL task (message:send with taskId), then
   // follows the same task's stream; anything else opens a new task on the
   // thread's remote context (or a fresh one) via message:stream.
-  let waitingTaskId = thread?.waitingTaskId;
-  if (!waitingTaskId && thread?.contextId) {
-    // No local continuation, but this thread HAS a remote context: ask before
-    // opening a new task, or a parked peer is abandoned mid-question.
-    waitingTaskId = await recoverParkedTask(thread.contextId);
+  // The hint first, then ALWAYS the control plane. The fallback is no longer
+  // conditional on having remembered a context — a derived handle is always
+  // available, so a restarted process recovers the parked task instead of
+  // opening a duplicate.
+  let waitingTaskId = parkHint;
+  if (!waitingTaskId) {
+    waitingTaskId = await recoverParkedTask(contextId);
     if (signal.aborted) return { stopped: true };
   }
 
@@ -428,7 +446,7 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
         return { error: `resume rejected by the control plane (${resumeRes.status}): ${await safeText(resumeRes)}` };
       }
       taskId = waitingTaskId;
-      if (thread) thread.waitingTaskId = undefined;
+      parkHints.delete(args.localSessionId);
 
       // FAST COMPLETION. The resume response may already carry the terminal
       // Task — a short answer can finish before we could subscribe. Reading it
@@ -471,10 +489,13 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
         body: JSON.stringify({
           message: {
             role: "ROLE_USER",
-            ...(thread?.contextId ? { contextId: thread.contextId } : {}),
+            // Sent on EVERY open, including the first — unlike the remembered
+            // value, which was absent until a task frame had come back. So the
+            // thread has a stable identity from the start.
+            contextId,
             // Stable for THIS delegation leg, so a retried open cannot create a
             // second task for one logical request.
-            messageId: stableMessageId([args.delegationId, "open", thread?.contextId, args.text]),
+            messageId: stableMessageId([args.delegationId, "open", contextId, args.text]),
             parts: messageParts(),
           },
           metadata: messageMetadata(),
