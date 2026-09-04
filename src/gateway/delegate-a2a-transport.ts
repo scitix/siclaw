@@ -29,21 +29,19 @@ import { createHash } from "node:crypto";
 
 export interface A2aTransportConfig {
   baseUrl: string; // e.g. https://<internal-a2a-service>:<port>
-  token: string; // workload bearer credential
+  token: string; // the Runtime's own adapter secret — see a2aTransportConfig
 }
 
 /** Media type for the structured context part carried alongside the task text. */
 const CONTEXT_MEDIA_TYPE = "application/vnd.siclaw.context+json";
 
 /**
- * Reads the feature flag; undefined = legacy transport.
+ * The transport's endpoint and credential, or a THROW.
  *
- * THROWS rather than downgrading when the flag is on but the endpoint is
- * unusable. A silent fallback here was the worst possible outcome: the operator
- * who set the flag believes delegations are running on the durable A2A path —
- * with its task state, budgets and retries — while they are quietly still on
- * the legacy relay. A loud failure at startup/dispatch is recoverable; a
- * mistaken belief about which transport is in use is not.
+ * There is no flag and no fallback — see the body. It throws rather than
+ * returning something optional because the only way this can fail is a Runtime
+ * missing the server URL or adapter secret it needs for everything else too,
+ * and a delegation that quietly does nothing is worse than one that says why.
  */
 export function a2aTransportConfig(env: NodeJS.ProcessEnv = process.env): A2aTransportConfig {
   // ⚠️ NO FLAG, AND NO OPTIONAL RETURN. A2A is the only delegation transport;
@@ -173,6 +171,18 @@ export interface A2aDelegationOutcome {
   taskId?: string;
   /** The control-plane runtime session actually executing the peer turn. */
   remoteSessionId?: string;
+  /**
+   * The delegated leg's OWN trace id, stored by the coordinator as the tool
+   * row's `child_trace_id` — the one hop a trace-keyed review follows into the
+   * peer's leg.
+   *
+   * ⚠️ This link went missing once already: it used to ride the private relay's
+   * terminal event, and when that relay was deleted the field stayed declared,
+   * stayed read into every result frame, and was never assigned again. Nothing
+   * failed — it was simply always absent, which is the only way a missing link
+   * ever presents.
+   */
+  peerTraceId?: string;
 }
 
 const TERMINALS = new Set(["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"]);
@@ -242,9 +252,17 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
   //    the resume RESPONSE or from a GET, not only from the stream) ───────────
   let artifactText = "";
   let remoteSessionId = "";
+  let peerTraceId = "";
   let outcome: A2aDelegationOutcome | undefined;
 
-  const settleTerminal = (state: string, message: any, errorCode: unknown): A2aDelegationOutcome => {
+  const settleTerminal = (state: string, message: any, errorCode: unknown, meta?: any): A2aDelegationOutcome => {
+    // The control plane resolves this at terminal and puts it on BOTH the
+    // terminal statusUpdate and the task snapshot, so the streaming path and the
+    // `GET /tasks/{id}` fallback agree. Only the first non-empty one wins: a
+    // later frame must not blank a link we already have.
+    if (typeof meta?.peerTraceId === "string" && meta.peerTraceId && !peerTraceId) {
+      peerTraceId = meta.peerTraceId;
+    }
     if (state === "TASK_STATE_COMPLETED") {
       const text = redact(artifactText.trim());
       if (text) {
@@ -253,11 +271,11 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
           message: { role: "assistant", content: [{ type: "text", text }] },
         });
       }
-      return { taskId, remoteSessionId };
+      return { taskId, remoteSessionId, ...(peerTraceId ? { peerTraceId } : {}) };
     }
     const detail = String(message?.parts?.[0]?.text ?? "") || String(errorCode ?? "") || state;
     args.observe({ type: "stream_error", error: { message: redact(detail) } });
-    return { error: redact(detail), taskId, remoteSessionId };
+    return { error: redact(detail), taskId, remoteSessionId, ...(peerTraceId ? { peerTraceId } : {}) };
   };
 
   /**
@@ -330,7 +348,7 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
             }
           }
         }
-        return settleTerminal(state, task.status?.message, task.metadata?.errorCode);
+        return settleTerminal(state, task.status?.message, task.metadata?.errorCode, task.metadata);
       }
       if (state === "TASK_STATE_INPUT_REQUIRED") {
         // A PARKED snapshot: reached when a task settles into a wait before we
@@ -375,7 +393,7 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
       return undefined;
     }
     if (state === "TASK_STATE_INPUT_REQUIRED") return parkOnInputRequired(statusText);
-    if (TERMINALS.has(state)) return settleTerminal(state, su.status?.message, su.metadata?.errorCode);
+    if (TERMINALS.has(state)) return settleTerminal(state, su.status?.message, su.metadata?.errorCode, su.metadata);
     return undefined;
   };
 
