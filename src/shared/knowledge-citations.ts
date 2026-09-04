@@ -5,6 +5,38 @@ export interface KnowledgeSourceCitation {
   sourceId?: string;
   page?: string;
   evidence?: string;
+  /** Knowledge repo UUID the cited page belongs to (attribution, not rendering). */
+  repoId?: string;
+  /** The answer statement the model bound to this page (pages path only). */
+  claim?: string;
+}
+
+/**
+ * Per-message attribution record persisted in chat-message metadata under
+ * `knowledge_citations`. It exists so a reader's feedback on an answer can be
+ * traced back to the knowledge repo(s) and pages that answer cited — the
+ * runtime's self-report, a prefill a human confirms, never authority.
+ */
+export interface KnowledgeCitationsMetadata {
+  repo_ids: string[];
+  pages: Array<{ repo_id?: string; page?: string; url: string; source_id?: string; evidence?: string; claim?: string }>;
+}
+
+export function knowledgeCitationsMetadata(citations: KnowledgeSourceCitation[]): KnowledgeCitationsMetadata {
+  const repoIds: string[] = [];
+  const pages: KnowledgeCitationsMetadata["pages"] = [];
+  for (const c of citations.slice(0, MAX_KNOWLEDGE_CITATIONS)) {
+    if (c.repoId && !repoIds.includes(c.repoId)) repoIds.push(c.repoId);
+    pages.push({
+      ...(c.repoId ? { repo_id: c.repoId } : {}),
+      ...(c.page ? { page: c.page } : {}),
+      url: c.url,
+      ...(c.sourceId ? { source_id: c.sourceId } : {}),
+      ...(c.evidence ? { evidence: c.evidence } : {}),
+      ...(c.claim ? { claim: c.claim } : {}),
+    });
+  }
+  return { repo_ids: repoIds, pages };
 }
 
 // Shared ceiling for one knowledge_cite result, the tool's evidence_refs /
@@ -46,6 +78,10 @@ export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSour
       sourceId: typeof row.sourceId === "string" ? row.sourceId : undefined,
       page: typeof row.page === "string" ? row.page : undefined,
       evidence: typeof row.evidence === "string" ? row.evidence : undefined,
+      repoId: typeof row.repoId === "string" && row.repoId.trim() ? row.repoId.trim().slice(0, 64) : undefined,
+      claim: typeof row.claim === "string" && row.claim.trim()
+        ? Array.from(row.claim.trim()).slice(0, CLAIM_MAX_LENGTH).join("")
+        : undefined,
     });
     if (out.length >= MAX_KNOWLEDGE_CITATIONS) break;
   }

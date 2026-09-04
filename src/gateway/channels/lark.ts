@@ -62,7 +62,12 @@ import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
-import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
+import {
+  appendKnowledgeSourceCitations,
+  knowledgeCitationsMetadata,
+  normalizeKnowledgeSourceCitations,
+  type KnowledgeSourceCitation,
+} from "../../shared/knowledge-citations.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -3076,6 +3081,9 @@ export async function collectChannelResponse(
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
   let pendingKnowledgeSources: unknown = null;
+  // Same contract as sse-consumer: the citations appended to THIS assistant row
+  // ride on its metadata for feedback attribution.
+  let pendingRowCitations: KnowledgeSourceCitation[] = [];
   // URLs already rendered into an assistant reply this stream (= one turn).
   // Append only the not-yet-rendered delta and keep pending, so an intermediate
   // narration turn no longer steals the references off the final answer, nor
@@ -3203,6 +3211,7 @@ export async function collectChannelResponse(
           if (freshSources.length > 0) {
             turnText = appendKnowledgeSourceCitations(turnText, freshSources);
             for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
+            pendingRowCitations = freshSources;
           }
           // Keep pending: a later assistant message this turn may carry sources
           // cited after this one; the rendered-set prevents any double-append.
@@ -3222,8 +3231,17 @@ export async function collectChannelResponse(
           // tool row in the transcript.
           // Replace the id even when this write fails: retaining an earlier
           // narration id would link the final card to the wrong assistant turn.
+          const rowCitations = pendingRowCitations;
+          pendingRowCitations = [];
           lastAssistantMessageId = persist
-            ? await persistRow({ sessionId, role: "assistant", content: redact(turnText) })
+            ? await persistRow({
+                sessionId,
+                role: "assistant",
+                content: redact(turnText),
+                ...(rowCitations.length > 0
+                  ? { metadata: { knowledge_citations: knowledgeCitationsMetadata(rowCitations) } }
+                  : {}),
+              })
             : null;
         }
       }

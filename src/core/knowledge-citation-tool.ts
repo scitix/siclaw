@@ -481,6 +481,7 @@ export function createKnowledgeCitationSupport(opts: {
             sourceId,
             page: rel,
             evidence: evidenceId,
+            repoId: repo.id,
           });
         }
         if (!refResolved) {
@@ -510,6 +511,9 @@ export function createKnowledgeCitationSupport(opts: {
       if (pageArgs.length > 0) {
         const selected = pageArgs.map(({ path: value }) =>
           path.resolve(path.isAbsolute(value) ? value : path.join(opts.knowledgeDir, value)));
+        // The validated claim rides on the citation for attribution (feedback →
+        // which statement, which page); it is not rendered.
+        const claimByPage = new Map(selected.map((page, i) => [page, pageArgs[i].claim]));
         const unread = selected.find((page) => !readPages.has(page));
         if (unread) return result(`Cannot cite unread knowledge page: ${unread}`, 0);
         const navigationPage = selected.find((page) => {
@@ -543,7 +547,14 @@ export function createKnowledgeCitationSupport(opts: {
             const source = sourceByResource.get(resource);
             if (!source || seenURLs.has(source.url)) continue;
             seenURLs.add(source.url);
-            citations.push({ title: source.title, url: source.url, resource: source.resource, page: rel });
+            citations.push({
+              title: source.title,
+              url: source.url,
+              resource: source.resource,
+              page: rel,
+              repoId: repo.id,
+              claim: claimByPage.get(page),
+            });
           }
         }
       }

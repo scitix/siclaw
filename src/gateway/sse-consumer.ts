@@ -16,7 +16,12 @@ import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
-import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
+import {
+  appendKnowledgeSourceCitations,
+  knowledgeCitationsMetadata,
+  normalizeKnowledgeSourceCitations,
+  type KnowledgeSourceCitation,
+} from "../shared/knowledge-citations.js";
 
 // ── Public types ────────────────────────────────────
 
@@ -380,6 +385,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let isRoutingTurn = false;
   let routingCommitted = false;
   let pendingKnowledgeSources: unknown = null;
+  // Citations rendered into the assistant row being committed — persisted on
+  // that row's metadata as `knowledge_citations`, so feedback on the row can be
+  // attributed to the cited repos/pages. Exactly the delta appended to the text.
+  let pendingRowCitations: KnowledgeSourceCitation[] = [];
   // URLs already rendered into an assistant message THIS TURN. Consumers ASSIGN
   // (not merge) the knowledge_sources event, and a source must appear exactly
   // once per turn. Nulling pending after the first ended message lost the
@@ -447,6 +456,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     pendingErrorOps.length = 0;
     pendingKnowledgeSources = null;
     renderedKnowledgeSourceUrls.clear();
+    pendingRowCitations = [];
     pendingStreamError = null;
     errorMessage = "";
     // The primary's deferred assistant op flipped firstAssistantPersisted when
@@ -753,6 +763,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // citation and stale pending never leaks onto the new answer.
           pendingKnowledgeSources = null;
           renderedKnowledgeSourceUrls.clear();
+          pendingRowCitations = [];
         }
         if (message?.role === "user" && onUserMessageStarted) {
           // The echoed text, so the caller can check the echo against the row it expects —
@@ -931,6 +942,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                   assistantContent = cited;
                   message.content = [{ type: "text", text: cited }];
                   for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
+                  pendingRowCitations = freshSources;
                 }
               }
             }
@@ -993,7 +1005,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               const assistantRowMetadata = {
                 timing,
                 ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
+                ...(pendingRowCitations.length > 0
+                  ? { knowledge_citations: knowledgeCitationsMetadata(pendingRowCitations) }
+                  : {}),
               };
+              pendingRowCitations = [];
               const persistAssistant = async () => {
                 // Fold in the context-usage snapshot if agent_end already arrived
                 // (the routed/default order — agent_end precedes this commit). The

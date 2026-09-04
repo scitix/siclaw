@@ -55,6 +55,8 @@ describe("knowledge_cite", () => {
     expect(output.details).toEqual({ cited: 1 });
     expect(events).toEqual([{ type: "knowledge_sources", sources: [{
       title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/abc", resource: "feishu/runbook.md", page: "guide.md",
+      // Attribution rides along: which repo, and the statement the page supports.
+      repoId: "repo", claim: "The runbook documents the GPU reset procedure.",
     }] }]);
 
     turnRef.current = 2;
@@ -444,6 +446,7 @@ The rack power budget and port inventory come from the ASUS sales kit.
       sourceId: "src-asus-sales-kit",
       page: "entities/GB-supernode.md",
       evidence: "ev.gb300.asus.rack-power-ports",
+      repoId: "repo",
     }] }]);
   });
 
@@ -597,6 +600,8 @@ sources:
       url: "https://example.com/specific",
       resource: "runbook.md",
       page: "repos/specific/guide.md",
+      repoId: "specific",
+      claim: expect.any(String),
     }] }]);
   });
 
