@@ -214,14 +214,35 @@ describe("runA2aDelegation", () => {
     expect(done.message.content[0].text).toBe("fast answer for cluster-a");
   });
 
-  it("reuses the remote context for a follow-up on the same peer thread", async () => {
+  // 远端 thread 的句柄现在从**本地 peer session id 推导**,不再是"等控制面回一帧
+  // task 才知道、然后记在进程内"。差别有两处可观测:
+  //   1. 第一次 open 就带 contextId(以前第一段是空的);
+  //   2. 重启后仍是同一个句柄,所以 parked task 找得回来 —— 而以前会开一个新
+  //      context,把 peer 撂在半个问题上。
+  it("addresses the same derived context on the FIRST open and on a follow-up", async () => {
     routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
       sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
     );
     await runA2aDelegation(baseArgs(() => {}));
     await runA2aDelegation({ ...baseArgs(() => {}), text: "follow up" });
-    const second = JSON.parse(requests.at(-1)!.body);
-    expect(second.message.contextId).toBe("ctx-1");
+
+    const opens = requests.filter((r) => r.path.endsWith("message:stream")).map((r) => JSON.parse(r.body));
+    expect(opens).toHaveLength(2);
+    expect(opens[0].message.contextId).toBe("deleg-local-s1");
+    expect(opens[1].message.contextId).toBe("deleg-local-s1");
+  });
+
+  // 推导的句柄不随进程状态变化 —— 这条才是"重启不丢"的直接证据。
+  it("derives the same context after the process forgets everything", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [workingTask("t1"), statusUpdate("TASK_STATE_COMPLETED")]),
+    );
+    await runA2aDelegation(baseArgs(() => {}));
+    __resetA2aThreads(); // 模拟 Runtime 重启:提示全丢
+    await runA2aDelegation({ ...baseArgs(() => {}), text: "after restart" });
+
+    const opens = requests.filter((r) => r.path.endsWith("message:stream")).map((r) => JSON.parse(r.body));
+    expect(opens[1].message.contextId).toBe(opens[0].message.contextId);
   });
 
   it("surfaces FAILED as a stream_error with the machine-readable detail", async () => {
@@ -349,7 +370,7 @@ describe("runA2aDelegation", () => {
     routes.set("/inner/a2a/agents/peer-1/tasks/t1", (_req, res) => res.writeHead(404).end());
 
     await runA2aDelegation(baseArgs(() => {}));
-    __resetA2aThreads(); // simulate the retry starting from a cold map
+    __resetA2aThreads(); // 冷启动:提示丢了,但推导的 contextId 不变,所以 key 仍相同
     await runA2aDelegation(baseArgs(() => {}));
 
     const opens = requests.filter((r) => r.path.endsWith("message:stream")).map((r) => JSON.parse(r.body));
@@ -359,7 +380,7 @@ describe("runA2aDelegation", () => {
     // cannot create a second task. (The old code sent randomUUID() each time,
     // which meant the key could never match and replay protection was dead.)
     expect(opens[0].message.messageId).toBe(opens[1].message.messageId);
-    expect(opens[0].message.messageId).toBe(stableMessageId(["d-1", "open", undefined, "diagnose the payment errors"]));
+    expect(opens[0].message.messageId).toBe(stableMessageId(["d-1", "open", "deleg-local-s1", "diagnose the payment errors"]));
   });
 
   it("uses a stable, task-scoped messageId on a resume too", async () => {
@@ -386,7 +407,12 @@ describe("runA2aDelegation", () => {
     // The peer later parked on a question, but this process never saw that frame
     // (restart, dropped stream). The control plane's listing is authoritative:
     // parked tasks appear under the `working` filter.
-    routes.set("/inner/a2a/agents/peer-1/tasks?contextId=ctx-1&status=working", (_req, res) => {
+    // 提示清空 = 这个进程从没见过那帧 park(重启 / 流断)。控制面的 listing 是
+    // 权威来源,而且现在用的是它真正接受的 TASK_STATE_* 拼写 —— 旧代码发
+    // `status=working`,被 400 拒掉后又被 `if (!res.ok) return undefined` 吞掉,
+    // 于是这条恢复路径静默地从未生效过。
+    __resetA2aThreads();
+    routes.set(`/inner/a2a/agents/peer-1/tasks?contextId=deleg-local-s1&status=TASK_STATE_INPUT_REQUIRED`, (_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         tasks: [
