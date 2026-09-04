@@ -2717,6 +2717,96 @@ describe("handleLarkMessage — streaming card flow", () => {
     clearBackgroundChannelDelivery(sessionId);
   });
 
+  it("surfaces an empty-result notice when a background final contains only a legacy visual card", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-background-legacy-card" });
+    let releaseStream: () => void = () => {};
+    const streamGate = new Promise<void>((resolve) => { releaseStream = resolve; });
+    streamEventsMock.mockImplementation(async function* () {
+      await streamGate;
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "最终结论。" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+    const handlePromise = handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+    const sessionId = promptMock.mock.calls[0][0].sessionId;
+    try {
+      await expect(deliverChannelVisibleMessage({
+        sessionId,
+        kind: "final",
+        text: '```visual-card\n{"type":"report","title":"legacy"}\n```',
+      })).resolves.toBe(true);
+
+      const delivered = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content as string;
+      expect(delivered).toContain("⚠");
+      expect(delivered).not.toContain("visual-card");
+    } finally {
+      releaseStream();
+      await handlePromise;
+      clearBackgroundChannelDelivery(sessionId);
+    }
+  });
+
+  it("never exposes chart or Mermaid source from background delivery", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-background-visual-source" });
+    let releaseStream: () => void = () => {};
+    const streamGate = new Promise<void>((resolve) => { releaseStream = resolve; });
+    streamEventsMock.mockImplementation(async function* () {
+      await streamGate;
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "最终结论。" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+    const handlePromise = handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+    const sessionId = promptMock.mock.calls[0][0].sessionId;
+    try {
+      const updatesBeforeMilestone = lark.cardkit.v1.cardElement.content.mock.calls.length;
+      await expect(deliverChannelVisibleMessage({
+        sessionId,
+        kind: "milestone",
+        text: "```mermaid\nflowchart TD\nA --> B\n```",
+      })).resolves.toBe(true);
+      expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
+
+      await deliverBackgroundChannelMessage({
+        sessionId,
+        role: "assistant",
+        content: '```chart\n{"type":"bar","data":[1,2]}\n```',
+      });
+      const delivered = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content as string;
+      expect(delivered).toContain("⚠");
+      expect(delivered).not.toContain("```chart");
+      expect(delivered).not.toContain('"type":"bar"');
+    } finally {
+      releaseStream();
+      await handlePromise;
+      clearBackgroundChannelDelivery(sessionId);
+    }
+  });
+
   it("surfaces foreground sub-agent progress (tool_execution_update) as a live card step", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-fg-progress" });
@@ -2780,6 +2870,31 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(contentCalls.some((c) => c.includes("Ran "))).toBe(false);
     expect(contentCalls.some((c) => c.includes("正在核对 conntrack 会话时间线"))).toBe(true);
     expect(contentCalls.at(-1)).toContain("结论：公网入口丢包。");
+  });
+
+  it("never restores renderer source through the activity milestone fallback", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-tool-visual-source" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_update",
+        toolCallId: "t1",
+        partialResult: {
+          content: [{ type: "text", text: '```chart\n{"type":"bar","data":[1,2]}\n```' }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "结论：请求已恢复。" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("排查"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls.map((c: any) => c[0].data.content as string);
+    expect(contentCalls.some((c) => c.includes("```chart") || c.includes('"type":"bar"'))).toBe(false);
+    expect(contentCalls.at(-1)).toContain("结论：请求已恢复。");
   });
 
   it("localizes the sub-agent slot wait instead of leaking its English source text", async () => {
@@ -3262,7 +3377,42 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps ControlPlane visual-card source as markdown when no PNG artifact is available", async () => {
+  it("keeps feedback available for an image-only rendered answer", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-image-only-feedback" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "render_chart",
+        result: { content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }] },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: '```chart\n{"type":"bar","data":[1,2]}\n```' }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content).toContain("图片");
+    expect(lark.cardkit.v1.cardElement.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips legacy visual-card source even when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-visual-card" });
     streamEventsMock.mockImplementation(async function* () {
@@ -3303,10 +3453,42 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("api pods");
-    expect(cardContent).toContain("```visual-card");
-    expect(cardContent).toContain("CrashLoopBackOff in prod");
+    expect(cardContent).not.toContain("```visual-card");
+    expect(cardContent).not.toContain("CrashLoopBackOff in prod");
     expect(lark.im.image.create).not.toHaveBeenCalled();
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not attach feedback to a legacy visual-card-only empty result", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-visual-card-only" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: '```visual-card\n{"type":"report","title":"legacy"}\n```',
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("⚠");
+    expect(cardContent).not.toContain("visual-card");
+    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
   });
 
   it("does not reply with an image when the final answer has no image artifact", async () => {
@@ -3624,6 +3806,7 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const contentText = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(contentText).toContain("\u26A0");  // warning emoji in EMPTY_RESULT_NOTICE
+    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
   });
 });
 
@@ -3724,6 +3907,45 @@ describe("collectResponse — SSE event flattening", () => {
     expect(milestones).toEqual(["先看 node 状态", "node 正常,继续查 `sichek`"]);
     // The final turn is the answer, not a milestone.
     expect(collected.text).toBe("结论:GPU#3 fatal,建议换卡。");
+  });
+
+  it("never exposes renderer source in intermediate channel milestones", async () => {
+    const events = [
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: "```chart\n{\"type\":\"bar\",\"data\":[1,2]}\n```\n继续核对指标",
+          }],
+        },
+      },
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: "```visual-card\n{\"type\":\"report\"}\n```",
+          }],
+        },
+      },
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "最终结论" }],
+        },
+      },
+    ];
+    const milestones: string[] = [];
+    const collected = await collectChannelResponse(fakeClient(events), "s-ms-visual", "lark", {
+      onMilestone: (m) => milestones.push(m),
+    });
+
+    expect(milestones).toEqual(["继续核对指标"]);
+    expect(collected.text).toBe("最终结论");
   });
 
   it("ignores non-text blocks (e.g. tool_use blocks) inside an assistant message", async () => {

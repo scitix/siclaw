@@ -1,5 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
-import { jsonSchemaToTypebox, normalizeMcpInputSchema, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
+import {
+  jsonSchemaToTypebox,
+  normalizeMcpInputSchema,
+  buildMcpToolName,
+  isMcpTool,
+  MCP_TOOL_PREFIX,
+  mcpContentToAgentContent,
+  McpClientManager,
+  isBundledCreateChartCommand,
+  mergeMcpStdioEnv,
+  visualMcpRequestTimeoutMs,
+} from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
   it("converts string type", () => {
@@ -140,6 +151,80 @@ describe("mcpContentToAgentContent", () => {
     expect(result.content).toEqual([
       { type: "image", data: "aW1n", mimeType: "image/jpeg" },
     ]);
+  });
+});
+
+describe("mergeMcpStdioEnv", () => {
+  it("forwards only the visual export contract into stdio MCP child processes", () => {
+    expect(mergeMcpStdioEnv(undefined, {
+      SICLAW_VISUAL_EXPORT_URL: "https://console.example.com/siclaw-visual-export",
+      SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "15000",
+      SICLAW_VISUAL_EXPORT_THEME: "dark",
+      SICLAW_VISUAL_EXPORT_CHROMIUM: "/opt/chromium",
+      SECRET_NOT_FOR_MCP: "must-not-leak",
+    }, true)).toEqual({
+      SICLAW_VISUAL_EXPORT_URL: "https://console.example.com/siclaw-visual-export",
+      SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "15000",
+      SICLAW_VISUAL_EXPORT_THEME: "dark",
+      SICLAW_VISUAL_EXPORT_CHROMIUM: "/opt/chromium",
+    });
+  });
+
+  it("lets explicit MCP configuration override an inherited value", () => {
+    expect(mergeMcpStdioEnv(
+      { SICLAW_VISUAL_EXPORT_THEME: "light", CUSTOM_MCP_VALUE: "configured" },
+      { SICLAW_VISUAL_EXPORT_THEME: "dark" },
+      true,
+    )).toEqual({
+      SICLAW_VISUAL_EXPORT_THEME: "light",
+      CUSTOM_MCP_VALUE: "configured",
+    });
+  });
+
+  it("does not inherit renderer configuration into unrelated stdio MCPs", () => {
+    expect(mergeMcpStdioEnv(undefined, {
+      SICLAW_VISUAL_EXPORT_URL: "https://console.example.com/siclaw-visual-export",
+    })).toBeUndefined();
+    expect(mergeMcpStdioEnv(
+      { CUSTOM_MCP_VALUE: "configured" },
+      { SICLAW_VISUAL_EXPORT_URL: "https://console.example.com/siclaw-visual-export" },
+    )).toEqual({ CUSTOM_MCP_VALUE: "configured" });
+  });
+});
+
+describe("isBundledCreateChartCommand", () => {
+  it("recognizes supported direct and wrapper forms of the bundled chart renderer", () => {
+    expect(isBundledCreateChartCommand("mcp-create-chart")).toBe(true);
+    expect(isBundledCreateChartCommand("/usr/local/bin/mcp-create-chart")).toBe(true);
+    expect(isBundledCreateChartCommand("/usr/bin/env", ["mcp-create-chart"])).toBe(true);
+    expect(isBundledCreateChartCommand("node", ["/app/mcp/create-chart/dist/index.js"])).toBe(true);
+    expect(isBundledCreateChartCommand("other-mcp")).toBe(false);
+    expect(isBundledCreateChartCommand("node", ["/app/mcp/other/dist/index.js"])).toBe(false);
+    expect(isBundledCreateChartCommand(undefined)).toBe(false);
+  });
+});
+
+describe("visualMcpRequestTimeoutMs", () => {
+  it("uses the full default renderer budget plus transport grace", () => {
+    expect(visualMcpRequestTimeoutMs(
+      "mcp-create-chart",
+      "render_chart",
+      { SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "" },
+    )).toBe(65_000);
+  });
+
+  it("adds transport grace to the configured renderer budget", () => {
+    expect(visualMcpRequestTimeoutMs(
+      "mcp-create-chart",
+      "render_mermaid",
+      { SICLAW_VISUAL_EXPORT_TIMEOUT_MS: "120000" },
+    )).toBe(125_000);
+  });
+
+  it("does not change removed or unrelated MCP tool timeouts", () => {
+    expect(visualMcpRequestTimeoutMs("other-renderer", "render_chart", {})).toBeUndefined();
+    expect(visualMcpRequestTimeoutMs("mcp-create-chart", "render_visual_card", {})).toBeUndefined();
+    expect(visualMcpRequestTimeoutMs("mcp-create-chart", "query", {})).toBeUndefined();
   });
 });
 

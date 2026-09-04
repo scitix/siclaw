@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+#### IM visual output contract
+
+- Removed `render_visual_card` from the bundled `create-chart` MCP. Conclusions
+  remain natural-language answers; charts and Mermaid diagrams are optional PNG
+  attachments rather than report containers.
+- Removed renderer metadata and retained only the web-renderable chart/Mermaid
+  block plus its PNG; IM channels hide paired source blocks and legacy
+  visual-card source.
+- Replaced the assumed visual-export service DNS with an explicit
+  `runtime.visualExport.url` contract forwarded from Runtime to AgentBox and the
+  bundled stdio MCP process. Deployments that enable `create-chart` must point
+  this value at a reachable `/siclaw-visual-export` page.
+
 #### KB compile box: distinct image name + pod prefix (operations)
 
 Renamed the KB compile box so operators can tell it apart from chat agentboxes at a glance during production troubleshooting (previously every pod was `agentbox-<id>` and the compile box could only be isolated by label/image filter).

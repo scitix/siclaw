@@ -1,8 +1,5 @@
 import { exportMarkdownVisualsWithVisualExportWeb } from "./visual-export.js";
-import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
-
-const CHART_SPEC_VERSION = 1;
-const VISUAL_SPEC_VERSION = 1;
+import type { RenderChartArgs, RenderChartToolResponse } from "./types.js";
 
 export const RENDER_CHART_INPUT_SCHEMA = {
   type: "object",
@@ -31,9 +28,9 @@ export const RENDER_CHART_INPUT_SCHEMA = {
 export const RENDER_CHART_DESCRIPTION =
   [
     "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
-    "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
+    "For qualitative diagrams, workflows, topology, or decision trees, use render_mermaid instead; xychart-beta is suitable for simple bar charts.",
     "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
-    "The tool renders through ControlPlane Web's own chart renderer/export path and returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
+    "After a successful render, the tool returns a web-renderable ```chart block plus a PNG image artifact. In web replies, include the returned chart block so the UI can render it. In IM channel sessions, preserve the image artifact and follow the channel instructions not to paste source. On every surface, make the natural-language answer complete on its own and never expose renderer metadata.",
   ].join(" ");
 
 export const RENDER_MERMAID_INPUT_SCHEMA = {
@@ -54,64 +51,13 @@ export const RENDER_MERMAID_INPUT_SCHEMA = {
 } as const;
 
 export const RENDER_MERMAID_DESCRIPTION = [
-  "Render a Mermaid diagram through ControlPlane Web's own Mermaid renderer/export path and return a PNG image artifact.",
+  "Render a Mermaid diagram through ControlPlane Web's own Mermaid renderer/export path and return an image/png artifact.",
   "Use this in Feishu/Lark channel replies whenever the user asks for a flowchart, sequence diagram, timeline, topology, remediation flow, or Mermaid diagram image.",
-  "Arguments must contain Mermaid source only, not fenced markdown. The tool returns READY_TO_PASTE ```mermaid markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
+  "Arguments must contain Mermaid source only, not fenced markdown. After a successful render, the tool returns a web-renderable ```mermaid block plus an image/png artifact. In web replies, include the returned Mermaid block so the UI can render it. In IM channel sessions, preserve the image artifact and follow the channel instructions not to paste source. On every surface, make the natural-language answer complete on its own and never expose renderer metadata.",
 ].join(" ");
-
-export const RENDER_VISUAL_CARD_INPUT_SCHEMA = {
-  type: "object",
-  required: ["type", "title"],
-  properties: {
-    type: {
-      type: "string",
-      enum: [
-        "report",
-        "final_report",
-        "health_check",
-        "incident_timeline",
-        "root_cause_chain",
-        "metric_snapshot",
-        "status_distribution",
-        "action_plan",
-      ],
-      description: "ControlPlane Web visual-card type.",
-    },
-    title: { type: "string" },
-    label: { type: "string" },
-    subtitle: { type: "string" },
-    conclusion: { type: "string" },
-    summary: { type: "string", description: "Alias accepted by ControlPlane Web as conclusion." },
-    tone: { type: "string" },
-    status: { type: "string" },
-    footer: { type: "string" },
-    items: { type: "array" },
-    events: { type: "array" },
-    nodes: { type: "array" },
-    root_cause: { type: "string" },
-    rootCause: { type: "string" },
-    metrics: { type: "array" },
-    segments: { type: "array" },
-    total: { type: "number" },
-    actions: { type: "array" },
-    sections: { type: "array" },
-  },
-  additionalProperties: false,
-} as const;
-
-export const RENDER_VISUAL_CARD_DESCRIPTION = [
-  "Render a ControlPlane Web visual-card conclusion card through ControlPlane Web's own visual-card renderer/export path and return a PNG image artifact.",
-  "Use this for Feishu/Lark final diagnosis cards, health checks, root-cause summaries, incident timelines, metric snapshots, status distributions, and action plans when the group needs a conclusion-card image.",
-  "Arguments must be one visual-card JSON object, not Markdown and not a JSON string. The tool returns READY_TO_PASTE ```visual-card markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
-].join(" ");
-
-function newChartId(type: string): string {
-  return `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
 
 export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartToolResponse> {
   const args = validate(rawArgs);
-  const id = newChartId(args.type);
 
   const spec = JSON.stringify(args);
   const markdownEmbed = "```chart\n" + spec + "\n```";
@@ -120,33 +66,11 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
   if (!visual?.image) throw new Error("render_chart: ControlPlane Web export returned no chart image");
   const png = visual.image;
 
-  const result: RenderChartResult = {
-    schema_version: CHART_SPEC_VERSION,
-    chart_id: id,
-    type: args.type,
-    artifact_kind: "chart_spec",
-    spec_path: "",
-    svg_path: "",
-    png_path: "",
-    bytes: Buffer.byteLength(spec, "utf8"),
-    image_bytes: png.byteLength,
-    image_mime: "image/png",
-    renderer: "visual-export-web",
-    embed_instructions:
-      "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear, and preserve the returned image artifact. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
-  };
-
   return {
     content: [
       {
         type: "text",
-        text: [
-          "READY_TO_PASTE:",
-          markdownEmbed,
-          "",
-          "METADATA_JSON:",
-          JSON.stringify(result, null, 2),
-        ].join("\n"),
+        text: markdownEmbed,
       },
       {
         type: "image",
@@ -159,25 +83,16 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
 
 export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChartToolResponse> {
   const args = validateMermaid(rawArgs);
-  const id = newChartId("mermaid");
   const markdownEmbed = "```mermaid\n" + args.source + "\n```";
   const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
   const visual = exported.find((item) => item.kind === "mermaid") ?? exported[0];
   if (!visual?.image) throw new Error("render_mermaid: ControlPlane Web export returned no Mermaid image");
 
-  const meta = visualMetadata(id, "mermaid", markdownEmbed, visual.image);
-
   return {
     content: [
       {
         type: "text",
-        text: [
-          "READY_TO_PASTE:",
-          markdownEmbed,
-          "",
-          "METADATA_JSON:",
-          JSON.stringify(meta, null, 2),
-        ].join("\n"),
+        text: markdownEmbed,
       },
       {
         type: "image",
@@ -185,60 +100,6 @@ export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChart
         data: visual.image.toString("base64"),
       },
     ],
-  };
-}
-
-export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderChartToolResponse> {
-  const spec = validateVisualCard(rawArgs);
-  const id = newChartId("visual-card");
-  const specJson = JSON.stringify(spec);
-  const markdownEmbed = "```visual-card\n" + specJson + "\n```";
-  const exported = await exportMarkdownVisualsWithVisualExportWeb(markdownEmbed);
-  const visual = exported.find((item) => item.kind === "visual-card") ?? exported[0];
-  if (!visual?.image) throw new Error("render_visual_card: ControlPlane Web export returned no visual-card image");
-
-  const meta = visualMetadata(id, "visual-card", markdownEmbed, visual.image);
-
-  return {
-    content: [
-      {
-        type: "text",
-        text: [
-          "READY_TO_PASTE:",
-          markdownEmbed,
-          "",
-          "METADATA_JSON:",
-          JSON.stringify(meta, null, 2),
-        ].join("\n"),
-      },
-      {
-        type: "image",
-        mimeType: "image/png",
-        data: visual.image.toString("base64"),
-      },
-    ],
-  };
-}
-
-function visualMetadata(
-  id: string,
-  kind: "mermaid" | "visual-card",
-  markdownEmbed: string,
-  image: Buffer,
-): Record<string, unknown> {
-  return {
-    schema_version: VISUAL_SPEC_VERSION,
-    visual_id: id,
-    type: kind,
-    artifact_kind: `${kind}_spec`,
-    spec_path: "",
-    png_path: "",
-    bytes: Buffer.byteLength(markdownEmbed, "utf8"),
-    image_bytes: image.byteLength,
-    image_mime: "image/png",
-    renderer: "visual-export-web",
-    embed_instructions:
-      "Paste the READY_TO_PASTE block above verbatim into your reply and preserve the returned image artifact. Do not expose escaped JSON or describe Feishu upload mechanics.",
   };
 }
 
@@ -350,38 +211,6 @@ export function validateMermaid(raw: unknown): { source: string; title?: string 
   const out: { source: string; title?: string } = { source };
   if (typeof obj.title === "string" && obj.title.trim()) out.title = obj.title.trim();
   return out;
-}
-
-export function validateVisualCard(raw: unknown): Record<string, unknown> {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("render_visual_card: arguments must be an object");
-  }
-  const obj = raw as Record<string, unknown>;
-  const type = typeof obj.type === "string" ? obj.type : "";
-  if (!RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum.includes(type as any)) {
-    throw new Error("render_visual_card: type is required and must be a supported ControlPlane visual-card type");
-  }
-  if (typeof obj.title !== "string" || !obj.title.trim()) {
-    throw new Error("render_visual_card: title is required");
-  }
-  if (!hasVisualCardBody(obj)) {
-    throw new Error("render_visual_card: provide conclusion, items, metrics, segments, events, nodes, actions, or sections");
-  }
-  const allowed = new Set(Object.keys(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties));
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (allowed.has(key)) out[key] = value;
-  }
-  return out;
-}
-
-function hasVisualCardBody(obj: Record<string, unknown>): boolean {
-  if (typeof obj.conclusion === "string" && obj.conclusion.trim()) return true;
-  if (typeof obj.summary === "string" && obj.summary.trim()) return true;
-  return ["items", "metrics", "segments", "events", "nodes", "actions", "sections"].some((key) => {
-    const value = obj[key];
-    return Array.isArray(value) && value.length > 0;
-  });
 }
 
 function stripFence(source: string, language: string): string {
