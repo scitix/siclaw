@@ -344,16 +344,10 @@ export async function handleDelegate(
   // retained), else a fresh session. Reuse is re-validated to belong to THIS
   // coordinator (parent + target match) — never trust the box's raw id.
   let ownerUserId = coordinatorAgentId; // fallback; parent-link auth still grants the human
-  /**
-   * The GENUINE originating human, set only when the validated parent session
-   * actually named one. Deliberately separate from `ownerUserId`, which falls
-   * back to the coordinator's agent id: that fallback is fine for row ownership
-   * but must NEVER be sent as an on-behalf-of identity, because it would
-   * attribute a person's authority to a service account and satisfy a check
-   * (user-level authorization, audit attribution, no-self-approval) that was
-   * meant to fail when the user is unknown.
-   */
-  let onBehalfOfUserId: string | undefined;
+  // ⚠️ No on-behalf-of identity is derived here any more. The peer executes as
+  // ITS OWN owner, resolved control-plane side from the peer agent's row, so
+  // this leg has nobody's authority to lend. `ownerUserId` below is row
+  // ownership for the local peer-session record and nothing else.
   peerSessionId = randomUUID();
   // The caller-supplied parent is trusted ONLY once bound to THIS coordinator's mTLS
   // identity. Gates user_id adoption, session reuse, AND parent linkage.
@@ -383,9 +377,6 @@ export async function handleDelegate(
     }
     if (parent.user_id) {
       ownerUserId = parent.user_id;
-      // Trusted: the parent session was just bound to this coordinator's mTLS
-      // identity, so its owner is the human this delegation is being run for.
-      onBehalfOfUserId = parent.user_id;
     }
     parentTrusted = true;
 
@@ -523,10 +514,10 @@ export async function handleDelegate(
   writeFrame({ type: "delegate_session", peerSessionId });
 
 
-  // Experimental A2A transport (SICLAW_DELEGATION_TRANSPORT=a2a): the peer task
-  // runs as a durable A2A task on the management plane's inner profile; this
-  // bridge translates its frames back into the same observePeerEvent vocabulary,
-  // so the coordinator tool experience and the SSE frame protocol are unchanged.
+  // The peer task runs as a durable A2A task on the management plane's internal
+  // entrance; this bridge translates its frames back into the same
+  // observePeerEvent vocabulary, so the coordinator tool experience and the SSE
+  // frame protocol are unchanged.
   // The local peer-session row stays the coordinator-side read model; the final
   // answer is mirrored into it at terminal so "open full session" still reads.
   const runA2aTransportDelegation = async (cfg: A2aTransportConfig): Promise<DelegationExecutionOutcome> => {
