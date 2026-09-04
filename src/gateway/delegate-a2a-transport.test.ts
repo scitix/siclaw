@@ -524,6 +524,70 @@ describe("runA2aDelegation", () => {
     expect((tools[1] as any).result.content[0].text).toBe("5 nodes");
   });
 
+  // ⚠️ 流断了之后,步骤历史必须从快照里回来。
+  //
+  // 流只到已挂上的订阅者,所以 SSE 掉线后靠 `GET /tasks/{id}` 收尾的那次委托,
+  // 会拿到答案却一个步骤都没有 —— 控制面把轨迹持久化并挂在每个快照上,正是
+  // 为了这一刻。这条测试模拟"订阅挂上之前 task 就跑完了":终态快照里带着
+  // 轨迹,而流上没有任何 toolCall 帧。
+  it("recovers the step history from a terminal snapshot when no frame streamed", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [
+        {
+          task: {
+            id: "t1", contextId: "ctx-1",
+            status: { state: "TASK_STATE_COMPLETED", message: { parts: [{ text: "done" }] } },
+            artifacts: [{ parts: [{ text: "5 nodes" }] }],
+            metadata: {
+              sessionId: "remote-s1",
+              toolTrace: [
+                { toolCallId: "c1", toolName: "kubectl", phase: "running", input: '{"ns":"default"}' },
+                { toolCallId: "c2", toolName: "bash", phase: "error", output: "boom", durationMs: 30 },
+              ],
+            },
+          },
+        },
+      ]),
+    );
+    const events: Array<Record<string, unknown>> = [];
+    await runA2aDelegation(baseArgs((e) => events.push(e)));
+
+    const tools = events.filter((e) => String(e.type).startsWith("tool_execution"));
+    expect(tools).toHaveLength(2);
+    // 只有 running、没有 end 的那次调用,要显示为进行中而不是已完成。
+    expect(tools[0]).toMatchObject({ type: "tool_execution_start", toolCallId: "c1", toolName: "kubectl" });
+    expect(tools[1]).toMatchObject({ type: "tool_execution_end", toolCallId: "c2", isError: true, durationMs: 30 });
+  });
+
+  // 快照 + 实时帧同时到达同一次调用时,只能出现一次。streamTask 就是先发快照
+  // 再发实时帧,所以这是**正常路径**,不是边缘情况 —— 卡片上一个工具显示两次
+  // 正是这整条路要修的那个故障。
+  it("does not double-count a call that arrives in both the snapshot and a frame", async () => {
+    routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
+      sse(res, [
+        {
+          task: {
+            id: "t1", contextId: "ctx-1", status: { state: "TASK_STATE_WORKING" },
+            metadata: {
+              sessionId: "remote-s1",
+              toolTrace: [{ toolCallId: "c1", toolName: "kubectl", phase: "running", input: "{}" }],
+            },
+          },
+        },
+        // 同一次调用的实时帧:running 是重复(不再发一次),success 是新变化。
+        { toolCall: { taskId: "t1", call: { toolCallId: "c1", toolName: "kubectl", phase: "running", input: "{}" } } },
+        { toolCall: { taskId: "t1", call: { toolCallId: "c1", toolName: "kubectl", phase: "success", output: "5 nodes", durationMs: 1200 } } },
+        statusUpdate("TASK_STATE_COMPLETED", "done"),
+      ]),
+    );
+    const events: Array<Record<string, unknown>> = [];
+    await runA2aDelegation(baseArgs((e) => events.push(e)));
+
+    const tools = events.filter((e) => String(e.type).startsWith("tool_execution"));
+    expect(tools.map((e) => e.type)).toEqual(["tool_execution_start", "tool_execution_end"]);
+    expect(tools[1]).toMatchObject({ toolCallId: "c1", durationMs: 1200 });
+  });
+
   // 失败的工具必须显示为失败,而不是中性完成。
   it("marks a failed tool call as an error", async () => {
     routes.set("/inner/a2a/agents/peer-1/message:stream", (_req, res) =>
