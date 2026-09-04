@@ -12,7 +12,7 @@ import { MCP_TOOL_PREFIX } from "./mcp-client.js";
 import type {
   SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
 } from "./types.js";
-import type { DelegateResponse, DelegateRosterMember } from "../shared/agent-delegate.js";
+import type { DelegateResponse, DelegateRosterMember, DelegateStep } from "../shared/agent-delegate.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
@@ -386,20 +386,11 @@ export interface BackgroundExecWiring {
  */
 export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
-/** A single live step of a delegated peer's turn — same shape the spawn_subagent
- *  card renders (assistant reasoning line, or a tool call with its result). */
-export interface DelegateStep {
-  kind: "assistant" | "tool";
-  text?: string;
-  toolName?: string;
-  toolInput?: string;
-  content?: string;
-  outcome?: "success" | "error";
-  durationMs?: number | null;
-}
-
 /** Live progress of a delegated turn, emitted as the peer streams. Mirrors the
  *  spawn_subagent progress shape so the coordinator card updates identically. */
+export type { DelegateStep };
+
+/** Live progress of a delegated turn. */
 export interface DelegateProgress {
   toolCalls: number;
   steps: DelegateStep[];

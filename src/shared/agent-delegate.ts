@@ -13,6 +13,27 @@
  * increment on the same shapes.
  */
 
+/**
+ * One step of a peer's turn, in the SHAPE THE CARD RENDERS (the same one
+ * spawn_subagent produces).
+ *
+ * ⚠️ This used to be a bare `string[]` of tool names on the producing side even
+ * though `DelegateStep` was already declared elsewhere with this shape. The card
+ * reads `kind` to decide how to draw a row, so a plain string fell through to the
+ * tool branch with no name, no input and no result — a column of empty "tool"
+ * rows. Nobody noticed because the delegate card did not render steps at all;
+ * they only ever went into a length count.
+ */
+export interface DelegateStep {
+  kind: "assistant" | "tool";
+  text?: string;
+  toolName?: string;
+  toolInput?: string;
+  content?: string;
+  outcome?: "success" | "error";
+  durationMs?: number | null;
+}
+
 /** The peer's structured result (mirrors report_findings / delegation_artifact). */
 export interface DelegateArtifact {
   findings: string;
@@ -60,8 +81,8 @@ export interface DelegateResponse {
   inputQuestion?: string;
   /** The peer's structured artifact, if it called report_findings. */
   artifact?: DelegateArtifact | null;
-  /** Human-meaningful step labels the peer took (for the progress card). */
-  steps: string[];
+  /** The steps the peer took, in card-render shape. */
+  steps: DelegateStep[];
   /** The peer's final assistant narrative (fallback when no artifact). */
   finalText?: string;
   /**

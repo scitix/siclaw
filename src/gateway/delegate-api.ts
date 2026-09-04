@@ -33,8 +33,7 @@ import { a2aTransportConfig, runA2aDelegation, type A2aTransportConfig } from ".
 import { buildRedactionConfigForModelConfig, redactText } from "./output-redactor.js";
 import { parsePositiveIntEnv } from "../core/subagent-registry.js";
 import type {
-  DelegateRequest, DelegateResponse, DelegateArtifact, DelegatesResponse, DelegateRosterMember,
-} from "../shared/agent-delegate.js";
+  DelegateRequest, DelegateResponse, DelegateArtifact, DelegatesResponse, DelegateRosterMember, DelegateStep } from "../shared/agent-delegate.js";
 
 /**
  * How many of the coordinator conversation's most-recent delegations to a given
@@ -586,7 +585,7 @@ export async function handleDelegate(
   }
   if (cancelled()) return;
 
-  const steps: string[] = [];
+  const steps: DelegateStep[] = [];
   let artifact: DelegateArtifact | null = null;
   let finalText = "";
   // Set when the peer calls request_input (emits an `input_required` event) and ends
@@ -642,7 +641,16 @@ export async function handleDelegate(
     const t = String(e?.type ?? "");
     if (t === "tool_execution_end") {
       const label = e.toolName ?? e.tool ?? e.name ?? e.title;
-      if (typeof label === "string" && label) steps.push(label);
+      if (typeof label === "string" && label) {
+        // Card-render shape, not a bare name: `kind` is what the card branches on.
+        // A peer's spawn_subagent shows up here like any other tool — the sub-agent's
+        // OWN execution lives in the peer's session, reachable by opening it.
+        steps.push({
+          kind: "tool",
+          toolName: label,
+          ...(typeof e.durationMs === "number" ? { durationMs: e.durationMs } : {}),
+        });
+      }
     }
     if (t === "message_end" && e.message?.role === "assistant") {
       const parts: Array<{ type?: string; text?: string }> = e.message.content ?? [];
