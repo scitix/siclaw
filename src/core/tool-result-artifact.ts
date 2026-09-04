@@ -25,6 +25,11 @@ export function toolResultArtifactRoot(sessionDir: string): string {
   return path.join(path.resolve(sessionDir), ".tool-results");
 }
 
+/** True for any path under a `.tool-results` directory, including sibling sessions. */
+export function isToolResultArtifactPath(candidate: string): boolean {
+  return path.resolve(candidate).split(path.sep).includes(".tool-results");
+}
+
 export interface ToolResultArtifactScope {
   agentId: string;
   sessionId: string;

@@ -47,6 +47,8 @@ describe("agent-factory", () => {
     expect(source).toContain("customTools.push(...createToolResultArtifactTools(toolResultArtifactStore))");
     expect(source).toContain("toolResultArtifactsDir");
     expect(source).toMatch(/blockedFileDirs[\s\S]*toolResultArtifactsDir/);
+    expect(source).toContain("isToolResultArtifactPath(absolutePath)");
+    expect(source).toContain("isToolResultArtifactPath(candidate)");
     expect(source).toContain("sessionId: sessionIdRef.current || sessionManagerId");
     expect(source).not.toContain('sessionId: sessionIdRef.current || "standalone"');
   });

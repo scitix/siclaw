@@ -61,6 +61,7 @@ import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 import {
   ToolResultArtifactStore,
   createToolResultArtifactTools,
+  isToolResultArtifactPath,
   toolResultArtifactRoot,
   withToolResultArtifactCapture,
 } from "./tool-result-artifact.js";
@@ -363,6 +364,9 @@ function assertToolPathAllowed(
   blockedDirs: Array<{ dir: string; reason: string }>,
 ): void {
   assertPathAllowed(absolutePath, allowedDirs, operation);
+  if (isToolResultArtifactPath(absolutePath)) {
+    throw new Error(`${operation} blocked: tool-result artifacts are internal; use tool_result_read or tool_result_search`);
+  }
   for (const blocked of blockedDirs) {
     if (isPathInsideDir(absolutePath, blocked.dir)) {
       throw new Error(`${operation} blocked: ${blocked.reason}`);
@@ -656,7 +660,8 @@ export async function createSiclawSession(
     ...(memoryEnabled ? [] : [{ dir: memoryDir, reason: "Siclaw memory is disabled" }]),
   ];
   const isBlockedFilePath = (candidate: string) =>
-    blockedFileDirs.some((blocked) => isPathInsideDir(candidate, blocked.dir));
+    isToolResultArtifactPath(candidate)
+    || blockedFileDirs.some((blocked) => isPathInsideDir(candidate, blocked.dir));
 
   // Read-only delegated turn: drop the write file tools (Edit/Write) so a
   // delegated worker cannot mutate even its own scratch dir. Reads (Read/Grep/

@@ -8,6 +8,7 @@ import {
   createToolResultArtifactTools,
   formatToolResultArtifactReference,
   getToolResultArtifactReference,
+  isToolResultArtifactPath,
   withToolResultArtifactCapture,
 } from "./tool-result-artifact.js";
 
@@ -50,8 +51,14 @@ describe("ToolResultArtifactStore", () => {
     expect(first.nextOffset).toBe(32_000);
     expect(first.complete).toBe(false);
 
-    const rest = await artifacts.read(captured.reference.id, first.nextOffset!, 32_000);
-    expect(rest.offset).toBe(32_000);
+    let assembled = first.text;
+    let cursor = first.nextOffset;
+    while (cursor !== null) {
+      const page = await artifacts.read(captured.reference.id, cursor, 32_000);
+      assembled += page.text;
+      cursor = page.nextOffset;
+    }
+    expect(assembled).toBe(text);
     expect((await fs.stat(rootDir)).mode & 0o777).toBe(0o700);
   });
 
@@ -242,6 +249,16 @@ describe("tool-result artifact tools", () => {
     } finally {
       await fs.rm(rootDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("isToolResultArtifactPath", () => {
+  it("blocks the current session tree and sibling session trees", () => {
+    expect(isToolResultArtifactPath("/app/.siclaw/user-data/agent/sessions/s1/.tool-results")).toBe(true);
+    expect(isToolResultArtifactPath("/app/.siclaw/user-data/agent/sessions/s1/.tool-results/abc/tra_1.txt")).toBe(true);
+    expect(isToolResultArtifactPath("/app/.siclaw/user-data/agent/sessions/other/.tool-results/abc/tra_1.txt")).toBe(true);
+    expect(isToolResultArtifactPath("/app/.siclaw/user-data/agent/sessions/s1/session.jsonl")).toBe(false);
+    expect(isToolResultArtifactPath("/app/.siclaw/user-data/memory/notes.md")).toBe(false);
   });
 });
 
