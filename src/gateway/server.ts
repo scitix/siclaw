@@ -463,43 +463,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   /**
-   * Hand a delegated turn's terminal to the control plane with an acknowledgement.
-   *
-   * The chat.event lane is fire-and-forget, which a human-facing turn survives: the
-   * frontend refetches. A delegated turn has a machine waiting on it and nobody to
-   * retry, so a terminal lost here strands the caller until its idle window elapses
-   * and it then reports a failure for a turn that in fact finished.
-   *
-   * The budget has to outlast a WS reconnect, which cannot complete faster than its
-   * own backoff. A control plane that does not implement the method (standalone, or
-   * older) is not retried at all.
-   */
-  const deliverDelegationTerminal = async (
-    delegationId: string,
-    sessionId: string,
-    turnId: string,
-    event: Record<string, unknown>,
-  ): Promise<void> => {
-    // A single reconnect can take the client's whole backoff cap plus jitter (30s +
-    // 2s), so a shorter budget gives up while the only route back is still being
-    // re-established.
-    const backoffMs = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
-    for (let attempt = 0; attempt <= backoffMs.length; attempt += 1) {
-      try {
-        await frontendClient.request("delegation.terminal", { delegationId, sessionId, turnId, event }, 10_000);
-        return;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (/unknown method/i.test(message)) return;
-        if (attempt === backoffMs.length) {
-          console.error(`[runtime] could not confirm delivery of the terminal for delegation=${delegationId} session=${sessionId}:`, message);
-          return;
-        }
-        await new Promise((r) => setTimeout(r, backoffMs[attempt]));
-      }
-    }
-  };
-  /**
    * Each live turn's cancellation, addressable on its own.
    *
    * Session-keyed controllers cannot express "cancel B": aborting the session's
@@ -612,23 +575,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           console.warn(`[runtime] could not report interrupted turn session=${sessionId} turn=${turnId ?? "pending"}:`, err);
         }
       }
-      // A delegated turn's caller is a machine that will otherwise wait out its idle
-      // window and report a failure. Same terminal, but acknowledged — detached,
-      // because this runs on the shutdown path and must not hold it open.
-      for (const turnId of unreported) {
-        const delegated = delegatedTurns.get(turnId);
-        if (!delegated) continue;
-        const delivery = deliverDelegationTerminal(delegated.delegationId, sessionId, turnId, {
-          type: "prompt_done",
-          aborted: true,
-          reason,
-          // The interrupted leg's rows were already persisted under this trace by the
-          // consume that just got cut short — an aborted terminal without it would
-          // leave exactly the legs a review drills into unlinked.
-          ...(delegated.traceId ? { traceId: delegated.traceId } : {}),
-        });
-        started.push(trackForShutdown(delivery));
-      }
+      // ⚠️ 关机时这里以前会给每个被委托 turn 补发一条 `delegation.terminal`,
+      // 理由是"委托方是台机器,不然要干等到 idle 窗口到期才报失败"。那条路随
+      // 私有中继一起删了(见 reportTerminal 上的说明)。
+      //
+      // A2A 之下委托方不会干等:流断了传输就走它自己的 `GET /tasks/{id}` 兜底,
+      // 而控制面的 task 有过期收敛。所以这里不再需要单独的通知路径。
+      for (const turnId of unreported) delegatedTurns.delete(turnId);
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
       // EVERY live turn, not only the streaming one: a turn queued behind the session
@@ -894,27 +847,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
 
     /**
-     * Report this turn's own terminal — only a delegated turn has a caller for it.
+     * A delegated turn's terminal.
      *
-     * Detached on purpose: the delivery may retry for as long as a reconnect takes,
-     * and the turn must not stay open for that. Deregistering the turn here is what
-     * makes it safe: the supervisor will not also report it, so a shutdown during
-     * the retries cannot turn a finished turn into an interrupted one.
+     * ⚠️ **这里以前会往控制面回一条 `delegation.terminal`,现在只清账本。**
+     * 那条 RPC 属于私有委托中继的监管层:控制面用它结束一次 relay 的监管。委托
+     * 切到 A2A 之后 relay 永远不会被注册(start 已零调用方),所以那次调用必然
+     * 走 `rel == nil` 分支、永远返回 `alreadyFinished` —— 每个被委托 turn 一次
+     * 白跑的往返,外加一整套为它而存在的重试退避。控制面侧的监管层已整个删除。
+     *
+     * 现在 A2A 从哪知道这一轮结束:peer 的 `prompt_done` / `done` 是 ws control
+     * 帧,tracker 订阅 `chat.event` 直接收到并收敛 task —— 与这条路无关,e2e 里
+     * 也正是这么跑通的。
+     *
+     * ⚠️ 连带丢的是 `traceId`:它以前搭这条终态事件回到发起方 Runtime,存成工具
+     * 行的 `child_trace_id`。补法不在这里 —— 见 delegate-a2a-transport 从 task
+     * 快照读 `peerTraceId`。
      */
-    // Riding the trace id on the terminal event is what hands it to the SOURCE
-    // Runtime: chat.send acks in milliseconds (before the trace exists) and
-    // chat.getMessages does not project trace_id, so the terminal is the one channel
-    // the coordinator side can learn which trace this leg's rows were persisted
-    // under — the value it stores as the tool row's `child_trace_id` link. The id is
-    // read from the delegatedTurns ledger entry (recorded at prompt ack), the same
-    // place the supervisor path reads it, so the two producers cannot disagree.
-    const reportTerminal = (event: Record<string, unknown>): void => {
-      const delegationId = delegation?.delegationId;
-      if (!delegationId) return;
-      const traceId = delegatedTurns.get(turnId)?.traceId;
+    const reportTerminal = (_event: Record<string, unknown>): void => {
+      if (!delegation?.delegationId) return;
       delegatedTurns.delete(turnId);
-      const terminal = traceId ? { ...event, traceId } : event;
-      void trackForShutdown(deliverDelegationTerminal(delegationId, sessionId, turnId, terminal));
     };
     const promptOpts: PromptOptions = {
       sessionId,

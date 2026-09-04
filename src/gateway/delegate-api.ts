@@ -10,13 +10,25 @@
  *   GET  /api/internal/delegates  — the coordinator's roster (authorization +
  *                                    manifest), proxied from Portal.
  *
- * Authorization is by mTLS cert identity: the calling box's cert IS the
- * coordinator agent. The gateway re-validates that the requested peer is in the
- * coordinator's roster (defense in depth — never trust the box's own claim).
+ * The calling box's mTLS cert IS the coordinator agent — that is what this
+ * process authenticates, and it is what it asserts to the control plane as
+ * `X-Siclaw-Caller-Agent`. It still checks the roster here so a box cannot
+ * name a peer it has no business naming, but that check is no longer the
+ * decision: the control plane checks the pair itself, and derives which Runtime
+ * the peer runs on from the peer's own row.
  *
- * Transport is synchronous-collect (P0): same-Runtime peers reuse the local
- * AgentBox path; cross-Runtime peers are routed through the management plane
- * and their live events are collected over the reverse Runtime event lane.
+ * Transport: ONE, over the internal A2A entrance (delegate-a2a-transport.ts).
+ * Same-Runtime and cross-Runtime peers take the identical path — this process
+ * no longer distinguishes them, because it no longer routes. The private
+ * start/event/control relay that used to do both, and the local AgentBox
+ * shortcut beside it, are deleted along with the control-plane supervision
+ * layer they needed.
+ *
+ * What stays owned here: the local peer-session row (ownership, lineage, reuse
+ * policy) and the SSE frame protocol to the coordinator box
+ * (`delegate_session` / `peer_event` / `delegate_trace` / `delegate_result`),
+ * which is unchanged — the box-side translator and the delegation card were
+ * never touched by the switch.
  */
 
 import http from "node:http";
@@ -42,17 +54,6 @@ import type {
  * back" in a long-running (never-switched) conversation.
  */
 const RECENT_DELEGATION_LIMIT = 8;
-const DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
-/**
- * Recovery reads a GROWING window of the newest rows rather than walking a
- * timestamp cursor. `created_at` has one-second granularity (see migrate.ts —
- * TIMESTAMP(3) is not portable across both engines), so a cursor set to a page's
- * oldest timestamp silently skips every other row written in that same second,
- * which is most of a busy turn. Re-reading a slightly larger window costs one
- * extra query per step and cannot skip anything.
- */
-const REMOTE_RESULT_WINDOW_START = 200;
-const REMOTE_RESULT_WINDOW_MAX = 20_000;
 
 // Trace ids from another process (the box's prompt ack, a remote terminal event) are
 // gated through chat-repo's validTraceId at ingestion: a malformed id from a buggy or
@@ -60,41 +61,6 @@ const REMOTE_RESULT_WINDOW_MAX = 20_000;
 // child_trace_id (a link that matches nothing) while the opening-row bind for the same
 // value fails on the server's stricter check — a half-written link.
 
-/**
- * The control plane keeps its own relay lease and tears the relay down when it
- * goes idle for longer. Waiting past that point cannot succeed — the events we
- * are waiting for have no route left — so an operator raising the window above it
- * would only convert a clean timeout into a longer one. Clamp instead, loudly.
- */
-const MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
-
-
-interface DelegationRoute {
-  local: boolean;
-  sourceRuntimeId: string;
-  targetRuntimeId: string;
-}
-
-interface DelegationRelayEnvelope {
-  delegationId?: string;
-  sessionId?: string;
-  event?: Record<string, unknown>;
-}
-
-/**
- * Delegations whose consumer has already gone away *because it finished*.
- *
- * Reliable control delivery is retried until the source acknowledges it, and the
- * acknowledgement means "this Runtime no longer needs the frame". A terminal that
- * was consumed and then re-delivered (its first ack lost) satisfies that, but a
- * live-consumer-only check would reject it and leave the control plane retrying
- * forever — which keeps its relay alive, and a relay that later expires aborts by
- * (agent, session), killing whatever new turn is reusing that peer session.
- *
- * Bounded and insertion-ordered: only the recent tail can plausibly be re-sent.
- */
-const SETTLED_DELEGATION_MEMORY = 512;
-const settledDelegations = new Set<string>();
 
 
 
@@ -148,10 +114,6 @@ async function fetchRoster(
   return data.members ?? [];
 }
 
-type DurableRemoteResult =
-  | { status: "found"; finalText: string }
-  | { status: "empty" }
-  | { status: "failed"; error: string };
 
 
 
@@ -225,11 +187,18 @@ export async function handleDelegate(
   let delegationId = "";
   let peerSessionId = "";
   let remoteStartRequested = false;
-  // The peer turn's own root trace id, once the runtime serving it reports one
-  // (local: the box's prompt ack; remote: the terminal event). A delegated turn
-  // is its OWN trace, so this is what the delegate_result carries back for the
-  // coordinator to persist as the cross-trace link — and what the opening user
-  // row below is bound to, since that row is appended before the trace exists.
+  // The peer turn's own root trace id, reported by the control plane on the A2A
+  // terminal (statusUpdate metadata, repeated on the task snapshot for the GET
+  // fallback). A delegated turn is its OWN trace, so this is what delegate_result
+  // carries back for the coordinator to persist as the cross-trace link — and
+  // what the opening user row is bound to, since that row is appended before the
+  // trace exists.
+  //
+  // ⚠️ **This was silently absent for a while.** Its two producers were the box
+  // prompt ack and the private relay's terminal event; both went with the relay,
+  // and the variable stayed declared and read into every result frame with
+  // nothing ever assigning it. Nothing failed — the link was just never there,
+  // which is the only way a missing link ever shows up.
   let peerTraceId: string | undefined;
   // The opening user row's id, kept so peerTraceId can be bound to it later.
   let openingMessageId = "";
@@ -538,6 +507,12 @@ export async function handleDelegate(
       observe: (evt) => observePeerEvent(evt, true),
       redact: (t) => redactText(t, redactionConfig),
     });
+    // Before the early returns: a FAILED leg still persisted rows under its
+    // trace, and failed legs are exactly the ones a review drills into.
+    if (result.peerTraceId) {
+      peerTraceId = result.peerTraceId;
+      bindOpeningRowTrace(peerTraceId);
+    }
     if (result.stopped) return { stopped: true };
     if (result.error) return { error: result.error };
     // Mirror the settled answer into the local read-model row (best-effort —

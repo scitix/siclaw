@@ -471,67 +471,36 @@ describe("startRuntime — chat.abort wiring", () => {
     await expect(abort({ agentId: "a", sessionId: "S" })).rejects.toThrow(/box unreachable/);
   });
 
-  it("reports a delegated turn's terminal over an acknowledged RPC, and retries it", async () => {
-    // The chat.event lane is fire-and-forget. A human-facing turn survives losing its
-    // terminal (the frontend refetches); a delegated turn has a machine waiting on it
-    // and nobody to retry, so the terminal gets an acknowledgement of its own.
+  // ⚠️ 这里曾有两个用例,钉住"被委托 turn 的终态要经一条带确认的 RPC 回控制面、
+  // 失败要重试",以及"终态要捎上这条腿自己的 traceId"。
+  //
+  // 那条 RPC(`delegation.terminal`)属于私有委托中继的监管层,已随中继一起删除:
+  // 委托切到 A2A 之后控制面永远不会注册 relay,那次调用必然走 rel == nil 分支、
+  // 永远返回 alreadyFinished —— 每个被委托 turn 一次白跑的往返,外加一整套为它
+  // 而存在的重试退避。
+  //
+  // 两件事各自的新归属:
+  //   - 终态:peer 的 prompt_done / done 是 ws control 帧,控制面的 tracker 订阅
+  //     chat.event 直接收到并收敛 task;
+  //   - traceId:控制面在终态时自己解析,放进 statusUpdate.metadata.peerTraceId
+  //     与 task 快照,由传输读回(delegate-a2a-transport)。
+  //
+  // 留下这条是为了钉住**没有人再发它** —— 悄悄回来一个每轮白跑的 RPC,是这类
+  // 删除最容易被撤销的方式。
+  it("no longer reports a delegated turn's terminal to the control plane", async () => {
     const frontendClient = fakeFrontendClient();
-    let terminalAttempts = 0;
-    frontendClient.request = vi.fn(async (method: string) => {
-      if (method !== "delegation.terminal") return { found: false };
-      terminalAttempts += 1;
-      if (terminalAttempts === 1) throw new Error("write failed");
-      return { ok: true };
-    });
-
-    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
-    const send = server.rpcMethods.get("chat.send")!;
-    const abort = server.rpcMethods.get("chat.abort")!;
-    const ctx = { sendEvent: vi.fn() };
-
-    const ack = await send({
-      agentId: "a", userId: "u", text: "inspect", sessionId: "delegated",
-      delegation: { delegationId: "d1", parentAgentId: "coord", readOnly: false },
-    }, ctx) as { turnId?: string };
-    await waitFor(() => capturedSignal !== undefined);
-    await abort({ agentId: "a", sessionId: "delegated" });
-
-    await waitFor(() => terminalAttempts >= 2);
-    const call = frontendClient.request.mock.calls.find(([method]: any[]) => method === "delegation.terminal");
-    expect(call?.[1]).toMatchObject({
-      delegationId: "d1",
-      sessionId: "delegated",
-      turnId: ack.turnId,
-      event: { type: "prompt_done" },
-    });
-  });
-
-  it("carries the delegated turn's own trace id on its terminal event", async () => {
-    // The terminal is the ONE channel the coordinator Runtime can learn which
-    // trace this leg's rows were persisted under: chat.send acks before the
-    // trace exists and chat.getMessages does not project trace_id. The source
-    // stores it as the tool row's child_trace_id — the cross-trace link.
-    const frontendClient = fakeFrontendClient();
-    frontendClient.request = vi.fn(async (method: string) =>
-      method === "delegation.terminal" ? { ok: true } : { found: false });
-
     server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
     const send = server.rpcMethods.get("chat.send")!;
 
     await send({
       agentId: "a", userId: "u", text: "inspect", sessionId: "delegated",
-      delegation: { delegationId: "d2", parentAgentId: "coord", readOnly: false },
+      delegation: { delegationId: "d1", parentAgentId: "coord" },
     }, { sendEvent: vi.fn() });
     await waitFor(() => settleConsumer !== undefined);
-    settleConsumer!(); // the turn finishes normally
+    settleConsumer!();
+    await new Promise((r) => setTimeout(r, 20));
 
-    await waitFor(() =>
-      frontendClient.request.mock.calls.some(([method]: any[]) => method === "delegation.terminal"));
-    const call = frontendClient.request.mock.calls.find(([method]: any[]) => method === "delegation.terminal");
-    expect(call?.[1]).toMatchObject({
-      delegationId: "d2",
-      event: { type: "prompt_done", traceId: "0123456789abcdef0123456789abcdef" },
-    });
+    expect(frontendClient.request.mock.calls.some(([m]: any[]) => m === "delegation.terminal")).toBe(false);
   });
 
   it("does not ask for an acknowledgement on an ordinary turn", async () => {
@@ -589,47 +558,6 @@ describe("startRuntime — chat.abort wiring", () => {
 
     await abort({ agentId: "a", sessionId: "supplied", turnId: "chosen-by-caller" });
     expect(abortSessionTurnIds).toEqual(["chosen-by-caller"]);
-  });
-
-  it("reports a supervisor-interrupted delegated turn with an acknowledgement", async () => {
-    // Shutdown and box removal bypass the turn's own reporting, so without this the
-    // one terminal a delegated caller cannot do without went out fire-and-forget on
-    // exactly the path where the transport is about to disappear.
-    const frontendClient = fakeFrontendClient();
-    const terminals: any[] = [];
-    frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "delegation.terminal") {
-        terminals.push(params);
-        return { ok: true };
-      }
-      return { found: false };
-    });
-
-    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
-    const send = server.rpcMethods.get("chat.send")!;
-    const ack = await send({
-      agentId: "a", userId: "u", text: "inspect", sessionId: "interrupted",
-      delegation: { delegationId: "d9", parentAgentId: "coord", readOnly: false },
-    }, { sendEvent: vi.fn() }) as { turnId?: string };
-    await waitFor(() => capturedSignal !== undefined);
-
-    // Shutdown must settle the delivery BEFORE it closes the connection it needs.
-    await server.close();
-    server = undefined;
-
-    expect(terminals).toHaveLength(1);
-    expect(terminals[0]).toMatchObject({
-      delegationId: "d9",
-      sessionId: "interrupted",
-      turnId: ack.turnId,
-      // The interrupted leg's rows were persisted under the trace the prompt ack
-      // named; the supervisor terminal must carry it (from the delegatedTurns ledger
-      // entry) or exactly the legs a review drills into lose their link.
-      event: { type: "prompt_done", aborted: true, reason: "runtime_restart", traceId: "0123456789abcdef0123456789abcdef" },
-    });
-    expect(frontendClient.close).toHaveBeenCalled();
-    expect(frontendClient.request.mock.invocationCallOrder[0])
-      .toBeLessThan(frontendClient.close.mock.invocationCallOrder[0]);
   });
 
   it("does not touch the running turn's consumer when the abort names a queued turn", async () => {
@@ -696,85 +624,45 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(abortSessionTurnIds).toEqual([ack.turnId]);
   });
 
-  it("waits for a box-roll terminal that is still being delivered when shutdown starts", async () => {
-    // endTurns' return value is ignored by the box-roll callback, so unless the
-    // delivery is tracked centrally a shutdown right after sees no live turn and no
-    // pending delivery, and closes the transport the terminal needs.
-    const frontendClient = fakeFrontendClient();
-    let releaseTerminal: (() => void) | undefined;
-    const terminals: any[] = [];
-    frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method !== "delegation.terminal") return { found: false };
-      terminals.push(params);
-      await new Promise<void>((resolve) => { releaseTerminal = resolve; });
-      return { ok: true };
-    });
-
-    const manager = fakeAgentBoxManager();
-    let terminator: ((ids: string[], reason: string) => unknown) | undefined;
-    manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
-    server = await bootRuntime(manager, frontendClient);
-    const send = server.rpcMethods.get("chat.send")!;
-
-    await send({
-      agentId: "a", userId: "u", text: "inspect", sessionId: "rolled",
-      delegation: { delegationId: "d-roll", parentAgentId: "coord", readOnly: false },
-    }, { sendEvent: vi.fn() });
-    await waitFor(() => capturedSignal !== undefined);
-
-    // A box removed under the turn — the callback discards whatever endTurns returns.
-    terminator!(["rolled"], "box_rolled");
-    await waitFor(() => terminals.length === 1);
-    expect(terminals[0]).toMatchObject({ event: { aborted: true, reason: "box_rolled" } });
-
-    const closing = server.close();
-    server = undefined;
-    // Shutdown must still be waiting on that delivery rather than having closed the
-    // connection out from under it.
-    await new Promise((r) => setTimeout(r, 50));
-    expect(frontendClient.close).not.toHaveBeenCalled();
-    releaseTerminal?.();
-    await closing;
-    expect(frontendClient.close).toHaveBeenCalled();
-  });
-
   it("reports a supervisor-interrupted turn once, keeping the first cause", async () => {
     // A turn stays live until its consumer settles, and a real consumer settles only
     // on its next event — so a box removal followed by a shutdown reaches the same
-    // turn twice. Two authoritative terminals with different reasons would then race,
-    // and the retry winner would name the cause.
+    // turn twice. Two terminals with different reasons would then race, and the
+    // later one would rename the cause.
+    //
+    // ⚠️ 观察点从 `delegation.terminal` 换成了 chat.event。那条 RPC 随私有中继
+    // 一起删了,但**这条不变式与委托无关**:去重靠的是 supervisorEndedTurns,它
+    // 守的是所有 turn 的终态,委托与否都一样。所以这里改用普通 turn + 它本来就
+    // 走的那条 chat.event 通道,不变式照钉。
     consumerIgnoresAbort = true;
     const frontendClient = fakeFrontendClient();
-    const terminals: any[] = [];
-    frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method === "delegation.terminal") {
-        terminals.push(params);
-        return { ok: true };
-      }
-      return { found: false };
-    });
-
     const manager = fakeAgentBoxManager();
     let terminator: ((ids: string[], reason: string) => unknown) | undefined;
     manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
     server = await bootRuntime(manager, frontendClient);
     const send = server.rpcMethods.get("chat.send")!;
 
-    await send({
-      agentId: "a", userId: "u", text: "inspect", sessionId: "twice",
-      delegation: { delegationId: "d-twice", parentAgentId: "coord", readOnly: false },
-    }, { sendEvent: vi.fn() });
+    const ctx = { sendEvent: vi.fn() };
+    await send({ agentId: "a", userId: "u", text: "inspect", sessionId: "twice" }, ctx);
     await waitFor(() => capturedSignal !== undefined);
 
+    const terminals = () => [
+      ...ctx.sendEvent.mock.calls,
+      ...frontendClient.emitEvent.mock.calls,
+    ].filter(([channel, data]: any[]) =>
+      channel === "chat.event" && (data?.event?.type ?? data?.type) === "prompt_done");
+
     terminator!(["twice"], "box_rolled");
-    await waitFor(() => terminals.length === 1);
+    await waitFor(() => terminals().length === 1);
 
     // Shutdown sees the turn still live, because its consumer never settled.
     await server.close();
     server = undefined;
 
-    expect(terminals).toHaveLength(1);
-    expect(terminals[0].event).toMatchObject({ aborted: true, reason: "box_rolled" });
+    const seen = terminals();
+    expect(seen).toHaveLength(1);
+    const body = seen[0][1]?.event ?? seen[0][1];
+    expect(body).toMatchObject({ aborted: true, reason: "box_rolled" });
   });
 
   it("stops the box turn on a box roll too, since the box is not reliably gone yet", async () => {
@@ -836,32 +724,26 @@ describe("startRuntime — chat.abort wiring", () => {
   });
 
   it("admits no new turn once shutdown has taken stock", async () => {
-    // Producers outlive the drain: the command lane stays open so terminals can still be
-    // delivered, the servers are still listening, and the manager's loops run until
-    // later. A turn admitted during the wait would register after the drain had looked
-    // — the fence is what makes one look sufficient.
+    // Producers outlive the drain: the command lane stays open, the servers are still
+    // listening, and the manager's loops run until later. A turn admitted during the
+    // wait would register after the drain had looked — the fence is what makes one
+    // look sufficient.
+    //
+    // ⚠️ 卡住 shutdown 的手段从"一次挂起的 delegation.terminal 投递"换成了挂起的
+    // abort(abortSessionBlocker,这个用例本来就在用它)。那条终态 RPC 随私有中继
+    // 一起删了,而**围栏本身与委托无关**:它守的是 shutdown 取过一次快照之后不再
+    // 接新 turn。用普通 turn 就够,少一层与主题无关的脚手架。
     consumerIgnoresAbort = true;
     let releaseAbort: (() => void) | undefined;
     abortSessionBlocker = new Promise<void>((resolve) => { releaseAbort = resolve; });
-    let releaseTerminal: (() => void) | undefined;
-    const terminals: any[] = [];
     const frontendClient = fakeFrontendClient();
-    frontendClient.request = vi.fn(async (method: string, params: any) => {
-      if (method !== "delegation.terminal") return { found: false };
-      terminals.push(params);
-      await new Promise<void>((resolve) => { releaseTerminal = resolve; });
-      return { ok: true };
-    });
 
     const manager = fakeAgentBoxManager();
     manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
     server = await bootRuntime(manager, frontendClient);
     const send = server.rpcMethods.get("chat.send")!;
 
-    await send({
-      agentId: "a", userId: "u", text: "inspect", sessionId: "fenced",
-      delegation: { delegationId: "d-fenced", parentAgentId: "coord", readOnly: false },
-    }, { sendEvent: vi.fn() });
+    await send({ agentId: "a", userId: "u", text: "inspect", sessionId: "fenced" }, { sendEvent: vi.fn() });
     await waitFor(() => capturedSignal !== undefined);
 
     const closing = server.close();
@@ -874,14 +756,9 @@ describe("startRuntime — chat.abort wiring", () => {
       .rejects.toThrow(/shutting down/);
     expect(promptCalls.some((c: any) => c.sessionId === "late")).toBe(false);
 
-    // The interruption is reported over the acknowledged path and shutdown is holding
-    // the transport open for it.
-    await waitFor(() => terminals.length === 1);
-    expect(terminals[0]).toMatchObject({ delegationId: "d-fenced", event: { aborted: true } });
+    // Shutdown is still holding the transport open for the outstanding abort.
     expect(frontendClient.close).not.toHaveBeenCalled();
     releaseAbort?.();
-
-    releaseTerminal?.();
     await closed;
     expect(frontendClient.close).toHaveBeenCalled();
   });
