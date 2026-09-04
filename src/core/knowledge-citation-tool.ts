@@ -250,7 +250,7 @@ Trusted original-source metadata is not available for this knowledge mount. Do n
     return `
 ## Knowledge source citations
 
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. If the answer also uses unmarked pages, pass each as \`{path, claim}\` in \`pages\` in the same call, where claim is the one statement in your answer that page supports. Cite the minimal set — a page you read but did not use is a citation error, and a page you cannot bind to a concrete claim is a read, not a citation. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Prefer \`evidence_refs\` for sections that contain an \`okf:evidence\` marker: pass only refs you successfully Read and actually used, in \`page.md#evidence-id\` form. A marker on the line directly above a heading belongs to the section under that heading; a marker before the first heading covers the page's introduction. If the answer also uses unmarked pages, pass each as \`{path, claim}\` in \`pages\` in the same call, where claim is the one statement in your answer that page supports. Cite the minimal set — a page you read but did not use is a citation error, and a page you cannot bind to a concrete claim is a read, not a citation. Never cite an index, catalog, or other navigation page. The runtime resolves each evidence ref to its exact frozen original and fails closed if any evidence ref is unresolved — retry once with only the remaining valid refs; do not ship the answer after a failed cite. Never invent or manually copy source URLs.`;
   }
   return `
 ## Knowledge source citations
@@ -551,7 +551,13 @@ export function createKnowledgeCitationSupport(opts: {
           resolveCitedPagePath(value, opts.knowledgeDir, (absolute) => readPages.has(absolute)));
         // The validated claim rides on the citation for attribution (feedback →
         // which statement, which page); it is not rendered.
-        const claimByPage = new Map(selected.map((page, i) => [page, pageArgs[i].claim]));
+        // Two entries may resolve to one page (`guide.md` and `.siclaw/knowledge/guide.md`):
+        // keep every claim, or feedback on the first statement would point at nothing.
+        const claimByPage = new Map<string, string>();
+        selected.forEach((page, i) => {
+          const previous = claimByPage.get(page);
+          claimByPage.set(page, previous ? `${previous} | ${pageArgs[i].claim}` : pageArgs[i].claim);
+        });
         const unread = selected.find((page) => !readPages.has(page));
         if (unread) return result(`Cannot cite unread knowledge page: ${unread}`, 0);
         const navigationPage = selected.find((page) => {

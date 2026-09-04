@@ -2086,6 +2086,11 @@ def _stamp_source_ids_text(
             if existing and entry:
                 ids[entry] = existing
             continue
+        if id_pair is not None and not isinstance(id_pair[1], yaml.ScalarNode):
+            # `id: [x]` — not ours to rewrite losslessly, and a marker must not
+            # cite an id the frontmatter does not declare (the OKF lint on the
+            # row tells the model what to fix). Leave the row out of the map.
+            continue
         ids[entry] = wanted
         if id_pair is None:
             key_node, value_node = resource_pair
@@ -2094,8 +2099,14 @@ def _stamp_source_ids_text(
             insert_at = len(frontmatter) if line_end < 0 else line_end + 1
             indent = " " * key_node.start_mark.column
             edits.append((insert_at, insert_at, f"{indent}id: {json.dumps(wanted)}{newline}"))
-        elif existing != wanted and isinstance(id_pair[1], yaml.ScalarNode):
-            edits.append((id_pair[1].start_mark.index, id_pair[1].end_mark.index, json.dumps(wanted)))
+        elif existing != wanted:
+            start, finish = id_pair[1].start_mark.index, id_pair[1].end_mark.index
+            replacement = json.dumps(wanted)
+            # A bare `id:` (null scalar) has a zero-width span right after the
+            # colon; splicing there would write `id:"…"`, which is not YAML.
+            if start == finish or (start > 0 and frontmatter[start - 1] == ":"):
+                replacement = " " + replacement
+            edits.append((start, finish, replacement))
     for start, finish, replacement in sorted(edits, key=lambda edit: edit[0], reverse=True):
         frontmatter = frontmatter[:start] + replacement + frontmatter[finish:]
     if edits:
@@ -2131,6 +2142,22 @@ def _substantive_line(raw: str) -> bool:
     return not _LINK_ONLY_LINE_RE.match(stripped)
 
 
+def _lf_lines(text: str) -> list[str]:
+    """Split on "\n" only, keeping the newline. ``str.splitlines`` also splits
+    on lone CR, FF, VT and U+2028, which ``_mask_span`` turns into spaces — so
+    pairing raw lines with masked prose by ``splitlines`` fell out of step and
+    the zip dropped the page tail (review repro). "\n" survives masking, so a
+    "\n"-only split is the one that stays aligned."""
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+_SETEXT_UNDERLINE_RE = re.compile(r"^[ ]{0,3}(=+|-+)[ \t]*$")
+
+
 def _attribute_page_text(
     text: str, ids_by_resource: dict[str, str],
 ) -> tuple[str, dict[str, int], list[str]]:
@@ -2143,7 +2170,7 @@ def _attribute_page_text(
     Machine markers are emitted on the line directly above the heading (top of
     the body for the preamble) so removal and regeneration are byte-stable.
     """
-    lines = text.splitlines(keepends=True)
+    lines = _lf_lines(text)
     fm_end = None
     if lines and _is_frontmatter_start(lines[0]):
         fm_end = next((i for i, line in enumerate(lines[1:], start=1)
@@ -2151,7 +2178,11 @@ def _attribute_page_text(
     stats = {"sections": 0, "attributed": 0, "fallback": 0, "authored": 0}
     if fm_end is None:
         return text, stats, []
-    prose_lines = _markdown_prose(text).splitlines(keepends=True)
+    prose_lines = _lf_lines(_markdown_prose(text))
+    if len(prose_lines) != len(lines):
+        # Masking is byte-aligned by construction; if the pairing ever breaks,
+        # leave the page alone rather than rewrite it against the wrong lines.
+        return text, stats, []
     body: list[str] = []
     prose: list[str] = []
     for raw, masked in zip(lines[fm_end + 1:], prose_lines[fm_end + 1:]):
@@ -2160,12 +2191,26 @@ def _attribute_page_text(
         body.append(raw)
         prose.append(masked)
 
-    # Section boundaries: index of the heading line, pulled back over blank
-    # lines onto an immediately preceding marker line.
-    boundaries: list[tuple[int, int, str]] = []  # (start, heading_idx, heading)
-    for index, masked in enumerate(prose):
-        heading = _HEADING_LINE_RE.match(masked.rstrip("\r\n"))
-        if not heading:
+    # Section boundaries: the heading line (ATX, or a setext paragraph line whose
+    # next line is an ===/--- underline), pulled back over blank lines onto an
+    # immediately preceding marker line. `skip` is the setext underline index.
+    boundaries: list[tuple[int, int, str, int]] = []  # (start, heading_idx, heading, skip)
+    index = 0
+    while index < len(prose):
+        masked = prose[index].rstrip("\r\n")
+        heading = _HEADING_LINE_RE.match(masked)
+        title, skip = None, -1
+        if heading:
+            title = heading.group(2)
+        elif (index + 1 < len(prose) and masked.strip()
+              and not _EVIDENCE_MARKER_START_RE.match(masked.strip())
+              and not _LINK_ONLY_LINE_RE.match(masked)
+              and not re.match(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]", masked)
+              and _SETEXT_UNDERLINE_RE.match(prose[index + 1].rstrip("\r\n"))
+              and (index == 0 or not prose[index - 1].strip())):
+            title, skip = masked.strip(), index + 1
+        if title is None:
+            index += 1
             continue
         start = index
         probe = index - 1
@@ -2173,21 +2218,22 @@ def _attribute_page_text(
             probe -= 1
         if probe >= 0 and _EVIDENCE_MARKER_RE.fullmatch(prose[probe].strip()):
             start = probe
-        boundaries.append((start, index, heading.group(2)))
-    sections: list[tuple[str | None, int, int, int]] = []  # (heading, start, heading_idx, end)
+        boundaries.append((start, index, title, skip))
+        index = skip + 1 if skip >= 0 else index + 1
+    sections: list[tuple[str | None, int, int, int, int]] = []  # (heading, start, heading_idx, end, skip)
     cursor = 0
-    for start, heading_idx, heading in boundaries:
+    for start, heading_idx, heading, skip in boundaries:
         if start < cursor:
             start = cursor
         if sections:
             previous = sections[-1]
-            sections[-1] = (previous[0], previous[1], previous[2], start)
+            sections[-1] = (previous[0], previous[1], previous[2], start, previous[4])
         elif start > 0:
-            sections.append((None, 0, -1, start))
-        sections.append((heading, start, heading_idx, len(body)))
+            sections.append((None, 0, -1, start, -1))
+        sections.append((heading, start, heading_idx, len(body), skip))
         cursor = start
     if not sections:
-        sections.append((None, 0, -1, len(body)))
+        sections.append((None, 0, -1, len(body), -1))
 
     page_ids = list(dict.fromkeys(ids_by_resource.values()))
     basename_ids: dict[str, set[str]] = {}
@@ -2196,9 +2242,9 @@ def _attribute_page_text(
     markers: dict[int, str] = {}  # insertion index in body (-1 = top) → marker line
     unattributed: list[str] = []
     ordinal = 0
-    for heading, start, heading_idx, end in sections:
+    for heading, start, heading_idx, end, skip in sections:
         section_prose = prose[start:end]
-        content = [raw for idx, raw in enumerate(body[start:end], start=start) if idx != heading_idx]
+        content = [raw for idx, raw in enumerate(body[start:end], start=start) if idx not in (heading_idx, skip)]
         if any(_EVIDENCE_MARKER_START_RE.search(masked) for masked in section_prose):
             stats["sections"] += 1
             stats["authored"] += 1
@@ -3249,13 +3295,36 @@ def normalize_ticket_sources(sources) -> list[dict]:
     return out
 
 
+# authoring/ evidence is also cited bare by the prompts ("based on BRIEF.json"):
+# these basenames are the owner's/system's framing wherever they are spelled.
+_TICKET_NON_RAW_BASENAMES = {
+    "BRIEF.json", "SELFCHECK.json", "EXCLUSIONS.json", "CONTRADICTIONS.json",
+    "INTENT.md", "PLAN.md", "QUESTIONS.md", "LEDGER.md", "AGENTS.md", "CHANGESET.json",
+}
+
+
+def _ticket_doc_is_raw(doc: str) -> bool:
+    return (not doc.startswith(_TICKET_NON_RAW_PREFIXES)
+            and posixpath.basename(doc) not in _TICKET_NON_RAW_BASENAMES)
+
+
 def ticket_distinct_raw_docs(sources: list[dict]) -> list[str]:
     """Raw documents that carry a non-empty quote — the only rows that count as
-    contradiction evidence. Sorted, unique."""
+    contradiction evidence. Sorted, unique. A bare basename (`manual.md`) is
+    the same document as the one pathed row it matches (`docs/manual.md`), the
+    spelling the body-tag convention accepts; two pathed rows that merely share
+    a basename stay distinct, and an ambiguous basename stays its own row."""
+    quoted = [row["doc"] for row in sources if row.get("quote") and _ticket_doc_is_raw(row["doc"])]
+    pathed = {doc for doc in quoted if "/" in doc}
+    by_basename: dict[str, set[str]] = {}
+    for doc in pathed:
+        by_basename.setdefault(posixpath.basename(doc), set()).add(doc)
     docs = set()
-    for row in sources:
-        if row.get("quote") and not row["doc"].startswith(_TICKET_NON_RAW_PREFIXES):
-            docs.add(row["doc"])
+    for doc in quoted:
+        if "/" not in doc and len(by_basename.get(doc, ())) == 1:
+            docs.add(next(iter(by_basename[doc])))
+        else:
+            docs.add(doc)
     return sorted(docs)
 
 
@@ -3278,15 +3347,16 @@ def _normalize_claim_text(text: str) -> str:
     return " ".join(str(text or "").split()).casefold()
 
 
-def ticket_claim_id(question: str, sources: list[dict]) -> str:
-    """Stable identity of the CLAIM in dispute — the question plus the set of
-    raw documents it is about. Computed by code so two compile rounds asking
-    the same thing land on the same ticket (supersede, not duplicate), while
-    the kind is free to change as evidence changes."""
-    docs = sorted({row["doc"] for row in sources})
-    digest = hashlib.sha256(
-        (_normalize_claim_text(question) + "\n" + "\n".join(docs)).encode("utf-8")
-    ).hexdigest()[:12]
+def ticket_claim_id(question: str, sources: list[dict] | None = None) -> str:
+    """Stable identity of the CLAIM in dispute — the question alone. Computed
+    by code so two compile rounds asking the same thing land on the same ticket
+    (supersede, not duplicate) while the kind and the evidence are free to
+    change: a single-source model_gap that later finds the disagreeing second
+    document must flip in place, which is impossible if the document set is
+    part of the id (review repro: it filed a duplicate and left the stale
+    model_gap open). `sources` is accepted for call-site compatibility and
+    deliberately not hashed."""
+    digest = hashlib.sha256(_normalize_claim_text(question).encode("utf-8")).hexdigest()[:12]
     return f"{TICKET_CLAIM_ID_PREFIX}{digest}"
 
 

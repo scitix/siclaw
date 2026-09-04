@@ -113,8 +113,11 @@ shapes:
   manifest the control plane materializes). A missing id is inserted; an id
   that disagrees with the manifest is replaced, because only manifest ids pass
   `validateAuthoringEvidence` at publish. Unmanaged resources keep the author's id.
-- One marker per answerable section (ATX heading spans plus the preamble),
-  placed on the line directly above the heading. Sources = the tags inside the
+- One marker per answerable section (ATX or setext heading spans plus the
+  preamble), placed on the line directly above the heading; the answering
+  prompt states that convention (a marker above a heading belongs to the
+  section below it). Raw and masked lines are paired on `\n` only, so a lone
+  CR / FF / U+2028 inside a code fence cannot shift the pairing. Sources = the tags inside the
   section, in order of first appearance, capped at 8; a single-source page binds
   every section to that source; a multi-source section with no tag falls back to
   the page's sources and is reported as `fallback`.

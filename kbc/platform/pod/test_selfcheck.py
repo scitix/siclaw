@@ -1165,7 +1165,18 @@ def test_ticket_kind_gate_and_claim_identity():
     tid = selfcheck.ticket_claim_id("Which  K8s version is current?", two)
     assert tid.startswith("tk-") and len(tid) == 3 + 12
     assert selfcheck.ticket_claim_id("which k8s version is current?", list(reversed(two))) == tid
-    assert selfcheck.ticket_claim_id("Which K8s version is current?", one) != tid
+    # The claim is the question: finding the second document must land on the
+    # SAME ticket so the kind can flip in place instead of filing a duplicate.
+    assert selfcheck.ticket_claim_id("Which K8s version is current?", one) == tid
+    assert selfcheck.ticket_claim_id("Which etcd snapshot cadence applies?", one) != tid
+    # Spellings: a bare basename is the pathed row it matches; authoring/
+    # framing never counts as a raw document however it is spelled.
+    assert selfcheck.ticket_distinct_raw_docs(selfcheck.normalize_ticket_sources(
+        [{"doc": "manual.md", "quote": "a"}, {"doc": "docs/manual.md", "quote": "b"}])) == ["docs/manual.md"]
+    assert selfcheck.ticket_kind_allowed_by_evidence(selfcheck.normalize_ticket_sources(
+        [{"doc": "BRIEF.json", "quote": "tone"}, {"doc": "a.md", "quote": "x"}])) == selfcheck.TICKET_KIND_MODEL_GAP
+    assert selfcheck.ticket_distinct_raw_docs(selfcheck.normalize_ticket_sources(
+        [{"doc": "x/manual.md", "quote": "a"}, {"doc": "y/manual.md", "quote": "b"}])) == ["x/manual.md", "y/manual.md"]
     print("✓ ticket kind is gated by evidence; claim id is stable across wording/order")
 
 
@@ -2891,3 +2902,54 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_attribution_pairs_lines_by_newline_and_keeps_the_page_tail():
+    """A lone CR inside a fenced block splits str.splitlines but not the masked
+    prose; pairing by "\n" keeps every line and the tail (review repro)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", MANIFEST_TWO)
+        _mk(base, "raw/docs/验收单.md")
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [P](p.md) - p\n")
+        page = (
+            "---\ntype: t\ntitle: t\nsources:\n  - resource: raw/docs/验收单.md\n  - resource: raw/docs/手册.md\n---\n"
+            "## 命令\n\n```\nout\rput\n```\n\n- 事实 (source: raw/docs/验收单.md)\n\n## 尾段\n\nlast line (source: raw/docs/手册.md)\n"
+        )
+        _mk(base, "candidate/p.md", page)
+        selfcheck.attribute_evidence_sections(td)
+        text = (base / "candidate" / "p.md").read_bytes().decode("utf-8")  # read_text would fold the CR
+        assert "last line (source: raw/docs/手册.md)\n" in text and "out\rput" in text, text
+        assert text.count("okf:evidence") == 2 and f'"sources":["{_ID_B}"]}} -->\n## 尾段' in text, text
+        # Setext headings are sections too: the marker lands above the title line.
+        _mk(base, "candidate/s.md",
+            "---\ntype: t\ntitle: s\nsources:\n  - resource: raw/docs/手册.md\n---\n"
+            "Intro line.\n\n第一节\n=====\n\n- 事实一 (source: raw/docs/手册.md)\n\n第二节\n------\n\n- 事实二\n")
+        selfcheck.attribute_evidence_sections(td)
+        text = (base / "candidate" / "s.md").read_text()
+        assert text.count("okf:evidence") == 3, text
+        assert "-->\n第一节\n=====\n" in text and "-->\n第二节\n------\n" in text, text
+    print("OK  evidence attribution: newline pairing keeps the tail; setext headings are sections")
+
+
+def test_source_id_stamping_handles_bare_and_non_scalar_ids():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", MANIFEST_TWO)
+        _mk(base, "raw/docs/验收单.md")
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [P](p.md) - p\n- [Q](q.md) - q\n")
+        # A bare `id:` (null scalar) must gain a SPACE before the spliced value.
+        _mk(base, "candidate/p.md",
+            "---\ntype: t\ntitle: p\nsources:\n  - resource: raw/docs/验收单.md\n    id:\n---\n## 段\n\n事实 (source: raw/docs/验收单.md)\n")
+        # A non-scalar id is left alone AND no marker cites the manifest id for it.
+        _mk(base, "candidate/q.md",
+            "---\ntype: t\ntitle: q\nsources:\n  - resource: raw/docs/手册.md\n    id: [x]\n---\n## 段\n\n事实\n")
+        selfcheck.attribute_evidence_sections(td)
+        p = (base / "candidate" / "p.md").read_text()
+        fm, _, err = selfcheck.parse_okf_frontmatter(p)
+        assert err is None and fm["sources"][0]["id"] == _ID_A, p
+        q = (base / "candidate" / "q.md").read_text()
+        assert "id: [x]" in q and "okf:evidence" not in q, q
+    print("OK  source id stamping: bare id gets a space; non-scalar id is not cited")

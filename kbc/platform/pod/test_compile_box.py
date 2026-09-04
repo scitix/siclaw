@@ -7576,10 +7576,13 @@ async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
         assert rows[0]["filed_operation_id"] == "op-round-2" and rows[0]["filed_generation"] == 3
         assert rows[0]["filed_at"] == tk["filed_at"]  # first sighting kept; re-filing stamps superseded_at
         assert rows[0]["superseded_at"]
+        # Finding the second document flips the SAME claim to source_conflict
+        # in place — one row, not a duplicate beside a stale model_gap.
         r = await ft.handler({**base, "sources": two, "ticket_kind": "source_conflict"})
-        assert "已开" in r and "source_conflict" in r, r
+        assert "已更新" in r, r
         rows = json.loads(ledger.read_text("utf-8"))
-        assert [x["ticket_kind"] for x in rows] == ["model_gap", "source_conflict"]
+        assert [x["ticket_kind"] for x in rows] == ["source_conflict"] and rows[0]["id"] == tk["id"]
+        assert len(rows[0]["sources"]) == 2
 
         # the model hand-writes a row anyway → turn-end backstop marks it unclassified and tells the owner
         rows.append({"id": "hand-1", "title": "手写", "question": "?", "sources": two,
@@ -7593,7 +7596,8 @@ async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
         await tools["resolve_ticket"].handler({"ticket_id": tk["id"], "applied_value": "1.30.2",
                                                "pages_edited": ["cluster.md"], "note": ""})
         rows = {x["id"]: x for x in json.loads(ledger.read_text("utf-8"))}
-        assert rows[tk["id"]]["status"] == "applied" and rows[tk["id"]]["ticket_kind"] == "model_gap"
+        # the kind stayed what the LAST evidence supported (flipped in place above)
+        assert rows[tk["id"]]["status"] == "applied" and rows[tk["id"]]["ticket_kind"] == "source_conflict"
     # both prompt packs steer opening through the tool and forbid Write on the ledger
     for loc in ("en", "zh"):
         ts = compile_box._tool_strings(loc)
@@ -7641,6 +7645,15 @@ async def test_apply_proposal_command_renders_the_reviewed_brief():
                 raise AssertionError("apply_proposal must refuse a brief")
             compile_box._prepare_command(run, command)
             assert not (Path(td) / "authoring" / "BRIEF.json").exists()
+            # The approved scope is a byte-integrity guard, not prompt text.
+            (Path(td) / "candidate").mkdir(exist_ok=True)
+            (Path(td) / "candidate" / "other.md").write_text("untouchable", encoding="utf-8")
+            compile_box._arm_proposal_scope_guard(run, command["parameters"]["affected_pages"])
+            incr = run._incr_pending
+            assert incr and incr["changeset"]["affected_pages"] == ["cluster-baseline.md"]
+            assert incr["before_bytes"]["other.md"] == b"untouchable"
+            import incremental
+            assert incremental.authorized_pages(td, incr["changeset"]) == {"cluster-baseline.md", "index.md"}
         for broken in ({"proposal_id": "p", "title": "t"}, {"proposal_id": "p", "instruction": "b"}, {"proposal_id": "p", "title": "t", "instruction": "b", "affected_pages": "x"}):
             try:
                 compile_box._normalize_command({"command_id": "c", "command": {

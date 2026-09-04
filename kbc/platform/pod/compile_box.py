@@ -3882,6 +3882,23 @@ def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = No
     return _batch_plan_resumable(_load_batch_plan(run))
 
 
+def _arm_proposal_scope_guard(run: "CompileRun", pages: list[str]) -> None:
+    """An owner-approved brief names the pages it may touch; make that a
+    byte-integrity guard, not an honor-system line in the prompt. Same closing
+    gate as an incremental round: pages outside affected_pages ∪ ADDED_TARGETS
+    ∪ index are restored byte-exact from this snapshot (review finding: the
+    scope used to render prompt text only)."""
+    (Path(run.workdir) / incremental.ADDED_TARGETS_PATH).unlink(missing_ok=True)
+    run._incr_pending = {
+        "before": incremental.page_hashes(run.workdir),
+        "before_bytes": incremental.page_bytes(run.workdir),
+        "baseline_format_violations": selfcheck.format_violation_keys(
+            selfcheck.candidate_pages(run.workdir)),
+        "changeset": {"added": [], "modified": [], "deleted": [], "affected_pages": list(pages),
+                      "scope": "proposal"},
+    }
+
+
 async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = False) -> None:
     """Scoped incremental kickoff: materialize the model-facing CHANGESET from
     the consumer's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
@@ -7475,6 +7492,7 @@ async def _dispatch_authoring_turn(
     run: CompileRun,
     text: str,
     action: str | None = None,
+    scope_pages: list[str] | None = None,
     *,
     apply_dispatch_nonce: str = "",
 ) -> dict:
@@ -7553,6 +7571,8 @@ async def _dispatch_authoring_turn(
     run.apply_dispatch_nonce = (
         apply_dispatch_nonce if action == "compile.apply_rulings" else ""
     )
+    if action == "compile.apply_proposal" and scope_pages:
+        _arm_proposal_scope_guard(run, scope_pages)
     run._begin_turn(
         text,
         # A normal owner edit may touch one page without conscripting untouched
@@ -7654,6 +7674,11 @@ async def handle_command(request: web.Request):
                     command["parameters"]["dispatch_nonce"]
                     if command["action"] == "compile.apply_rulings"
                     else ""
+                ),
+                scope_pages=(
+                    command["parameters"].get("affected_pages")
+                    if command["action"] == "compile.apply_proposal"
+                    else None
                 ),
             )
         except BaseException:

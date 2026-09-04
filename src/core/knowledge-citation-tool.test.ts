@@ -89,6 +89,21 @@ describe("knowledge_cite", () => {
     expect(events).toHaveLength(1);
   });
 
+  it("keeps every claim when two entries resolve to the same page", async () => {
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({ knowledgeDir: dir, turnRef: { current: 1 }, sessionEventEmitter: (e) => events.push(e) });
+    readPage(support, page);
+    const output = await support.tool.execute("call", { pages: [
+      { path: page, claim: "The runbook documents the GPU reset procedure." },
+      { path: `.siclaw/knowledge/${path.basename(page)}`, claim: "The runbook lists the on-call rotation." },
+    ] } as never);
+    expect(output.details).toEqual({ cited: 1 });
+    const sources = (events[0] as { sources: Array<{ claim?: string }> }).sources;
+    expect(sources[0].claim).toContain("GPU reset procedure");
+    expect(sources[0].claim).toContain("on-call rotation");
+  });
+
   it("rejects pages items that are not bound to a concrete claim", async () => {
     const { dir, page } = fixture();
     const events: Record<string, unknown>[] = [];
