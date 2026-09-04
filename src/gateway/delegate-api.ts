@@ -809,12 +809,14 @@ export async function handleDelegate(
     const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig as never);
     const result = await runA2aDelegation({
       cfg,
+      // The control plane checks this against the authenticated Runtime and then
+      // decides the roster question itself, which is what moves delegation
+      // authorization out of this process.
+      coordinatorAgentId,
       peerAgentId,
       text,
       localSessionId: peerSessionId,
       parentSessionId: trustedParent ?? undefined,
-      // Omitted when the originating human is unknown — never substituted.
-      onBehalfOfUserId,
       ...(body.evidenceRefs?.length ? { evidenceRefs: body.evidenceRefs } : {}),
       delegationId,
       signal: peerAbort.signal,

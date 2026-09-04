@@ -46,37 +46,39 @@ const CONTEXT_MEDIA_TYPE = "application/vnd.siclaw.context+json";
  */
 export function a2aTransportConfig(env: NodeJS.ProcessEnv = process.env): A2aTransportConfig | undefined {
   if (env.SICLAW_DELEGATION_TRANSPORT !== "a2a") return undefined;
-  const baseUrl = env.SICLAW_INNER_A2A_URL?.replace(/\/$/, "");
-  const token = env.SICLAW_INNER_A2A_TOKEN;
+  // ⚠️ REUSES THE CREDENTIAL AND ENDPOINT THE RUNTIME ALREADY HAS.
+  //
+  // This used to require three variables of its own — SICLAW_INNER_A2A_URL,
+  // SICLAW_INNER_A2A_TOKEN and an https-or-else escape hatch — because the
+  // entrance authenticated a separate WORKLOAD bearer token. That identity is
+  // gone: the control plane now authenticates the Runtime's own adapter secret
+  // (the same X-Auth-Token the persistent WS upgrade presents) plus the caller
+  // agent id, checked against `siclaw_agents.runtime_id`.
+  //
+  // So there is nothing left to configure. The endpoint is the control-plane URL
+  // this Runtime is already connected to, and the credential is the one it is
+  // already holding — which means this transport cannot be pointed at the wrong
+  // place, cannot be given a stale token, and has no rotation story of its own
+  // (RotateSecret drops the WS session and invalidates this in the same instant).
+  //
+  // The https requirement went with the workload token. The adapter listener is
+  // plain HTTP on a ClusterIP-only port and the WS already runs over it, so
+  // demanding TLS here while ws:// rides the same channel would have been
+  // theatre — and its escape hatch was the part that would actually get set.
+  const baseUrl = env.SICLAW_SERVER_URL?.replace(/\/$/, "");
+  const token = env.SICLAW_PORTAL_SECRET;
   if (!baseUrl || !token) {
     throw new Error(
-      "SICLAW_DELEGATION_TRANSPORT=a2a requires both SICLAW_INNER_A2A_URL and SICLAW_INNER_A2A_TOKEN. " +
-      "Refusing to fall back to the legacy transport silently: set both, or unset " +
+      "SICLAW_DELEGATION_TRANSPORT=a2a requires the Runtime's own SICLAW_SERVER_URL and " +
+      "SICLAW_PORTAL_SECRET (the same pair the control-plane WS uses). Refusing to fall back " +
+      "to the legacy transport silently: fix the configuration, or unset " +
       "SICLAW_DELEGATION_TRANSPORT to use the legacy transport deliberately.",
     );
   }
-  let parsed: URL;
   try {
-    parsed = new URL(baseUrl);
+    new URL(baseUrl);
   } catch {
-    throw new Error(`SICLAW_INNER_A2A_URL is not a valid URL: ${baseUrl}`);
-  }
-  // A long-lived workload bearer token over plaintext HTTP is a credential
-  // anyone on the path can lift and replay. Refused by default; the escape hatch
-  // exists for a local/in-cluster loopback where TLS is genuinely absent, and it
-  // announces itself every time so it cannot become the accidental norm.
-  if (parsed.protocol !== "https:") {
-    if (env.SICLAW_INNER_A2A_ALLOW_PLAINTEXT !== "1") {
-      throw new Error(
-        `SICLAW_INNER_A2A_URL must use https: (got ${parsed.protocol}). A long-lived bearer token over ` +
-        "plaintext can be captured and replayed. Set SICLAW_INNER_A2A_ALLOW_PLAINTEXT=1 to accept that " +
-        "risk deliberately (e.g. a loopback address).",
-      );
-    }
-    console.warn(
-      `[delegate-a2a] SICLAW_INNER_A2A_URL is plaintext (${parsed.protocol}//${parsed.host}) and ` +
-      "SICLAW_INNER_A2A_ALLOW_PLAINTEXT=1 is set: the workload bearer token is sent unencrypted.",
-    );
+    throw new Error(`SICLAW_SERVER_URL is not a valid URL: ${baseUrl}`);
   }
   return { baseUrl, token };
 }
@@ -121,6 +123,15 @@ export function stableMessageId(parts: Array<string | undefined>): string {
 
 export interface A2aDelegationArgs {
   cfg: A2aTransportConfig;
+  /**
+   * The COORDINATOR agent this delegation is on behalf of. Sent as
+   * `X-Siclaw-Caller-Agent` and checked by the control plane against
+   * `siclaw_agents.runtime_id` before it decides the roster question — a
+   * Runtime connection authenticates a Runtime, not one of its agents, so
+   * without this every coordinator on this Runtime would inherit every other
+   * coordinator's roster.
+   */
+  coordinatorAgentId: string;
   peerAgentId: string;
   text: string;
   /** The local peer-session row id — the continuation key. */
@@ -128,18 +139,6 @@ export interface A2aDelegationArgs {
   parentSessionId?: string;
   parentTurnId?: string;
   delegationId: string;
-  /**
-   * The HUMAN this delegated work is being done for — the delegating turn's own
-   * userId. Sent as trusted metadata so the peer side can authorize, audit and
-   * apply no-self-approval against the ORIGINATING user instead of collapsing
-   * every delegated call onto the workload's service identity.
-   *
-   * NEVER fabricated: when the originating user is unknown the field is omitted
-   * entirely, because a plausible-looking placeholder would be worse than an
-   * absent value — it would attribute actions to someone who did not ask for
-   * them, and satisfy a check that was meant to fail.
-   */
-  onBehalfOfUserId?: string;
   /**
    * References to the evidence behind the delegated task (ids/URIs), carried as
    * a structured data part. References only — never inlined file bytes.
@@ -173,8 +172,16 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
   const redact = args.redact ?? ((t: string) => t);
   const thread = threads.get(args.localSessionId);
 
-  const headers = {
-    Authorization: `Bearer ${cfg.token}`,
+  // The Runtime's own adapter secret, in the SAME header the WS upgrade uses,
+  // plus the id of the agent this delegation is on behalf of. The caller agent
+  // is an ASSERTION — the control plane checks it against
+  // `siclaw_agents.runtime_id` and then decides the roster question
+  // `(callerAgent, peerAgent)` itself. That is the whole point of routing
+  // delegation through the control plane: authorization stops being something
+  // this Runtime does to itself.
+  const headers: Record<string, string> = {
+    "X-Auth-Token": cfg.token,
+    "X-Siclaw-Caller-Agent": args.coordinatorAgentId,
     "Content-Type": "application/json",
   };
   const agentBase = `${cfg.baseUrl}/inner/a2a/agents/${encodeURIComponent(peerAgentId)}`;
@@ -202,11 +209,21 @@ export async function runA2aDelegation(args: A2aDelegationArgs): Promise<A2aDele
 
   /** Metadata sent on BOTH the open and the resume, so neither loses lineage. */
   const messageMetadata = (): Record<string, string> => ({
+    // ⚠️ `siclaw.delegationId` is what makes the peer turn a DELEGATED turn.
+    //
+    // The control plane forwards it into the peer's `chat.send` as a delegation
+    // marker, and that marker is what `report_findings` and `request_input` gate
+    // their availability on. Without it the peer runs as an ordinary turn: no
+    // structured artifact, no way to ask the human a question, and nothing for
+    // the one-level recursion guard to key on. Those were exactly the three
+    // "Known deltas" this transport shipped with while the entrance still
+    // ignored the field.
+    "siclaw.delegationId": args.delegationId,
+    // Kept as the old spelling too: an older control plane reads
+    // investigationId and would otherwise lose the correlation entirely.
     "siclaw.investigationId": args.delegationId,
     ...(args.parentSessionId ? { "siclaw.parentSessionId": args.parentSessionId } : {}),
     ...(args.parentTurnId ? { "siclaw.parentTurnId": args.parentTurnId } : {}),
-    // Omitted rather than defaulted when unknown — see A2aDelegationArgs.
-    ...(args.onBehalfOfUserId ? { "siclaw.onBehalfOfUserId": args.onBehalfOfUserId } : {}),
   });
 
   // ── frame handling (declared before dispatch: a terminal task can arrive in
