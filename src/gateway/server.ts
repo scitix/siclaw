@@ -185,17 +185,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // default, and a Runtime that never delegates should not fail to boot over
   // delegation configuration it does not use.
   //
-  // ⚠️ The dispatch path still THROWS. That is what rules out the failure this
-  // check was originally written for — silently running on the legacy relay
-  // while the operator believes A2A is in use. A delegation with a broken
-  // config fails loudly at the point of use; it does not quietly downgrade.
+  // ⚠️ The dispatch path still THROWS, which is what keeps this warning from
+  // being the only signal: a delegation with a broken config fails loudly at
+  // the point of use. There is no second transport to fall back to, so the only
+  // way this can be unusable is a Runtime missing the server URL or the adapter
+  // secret it needs for everything else too.
   try {
     a2aTransportConfig();
   } catch (err) {
     console.warn(
       "[runtime] delegation transport is not usable:",
       err instanceof Error ? err.message : String(err),
-      "— delegations will fail until this is fixed. Set SICLAW_DELEGATION_TRANSPORT=legacy to use the legacy relay deliberately.",
+      "— delegations will fail until this is fixed.",
     );
   }
 

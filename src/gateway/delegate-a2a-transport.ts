@@ -1,24 +1,25 @@
 /**
- * Experimental A2A transport for delegation (default OFF).
+ * The A2A transport for delegation — the only one.
  *
- * When SICLAW_DELEGATION_TRANSPORT=a2a, delegate_to_agent stops using the
- * private start/event/control relay and instead submits the peer task to the
- * management plane's inner A2A profile — the same durable Task/Segment core
- * that serves external callers. The model-side tool experience is unchanged:
- * this module translates A2A frames back into the peer-event shapes the
- * coordinator side already consumes.
+ * `delegate_to_agent` submits the peer task to the management plane's internal
+ * A2A entrance — the same durable Task/Segment core that serves external
+ * callers — and this module translates the frames that come back into the
+ * peer-event shapes the coordinator side already consumes. The model-side tool
+ * experience is unchanged. The private start/event/control relay this replaced
+ * has been deleted; there is no second transport and nothing to select.
  *
- * What the caller keeps owning: the local peer-session row (ownership,
- * lineage, reuse policy). What moves to the control plane: task state,
- * waiting/resume, budgets, retries. During the dual-stack period the A2A
- * Task/Segment is the source of truth for EXECUTION state; the local row is a
- * read-model projection.
+ * What this process keeps owning: the local peer-session row (ownership,
+ * lineage, reuse policy). What belongs to the control plane: task state,
+ * waiting/resume, budgets, retries — and the roster decision, which used to be
+ * made here. The A2A Task is the source of truth for EXECUTION state; the local
+ * row is a read-model projection of it.
  *
- * Continuation mapping is process-local: localPeerSessionId → { contextId,
- * waitingTaskId }. A restart drops it, so before opening a brand-new task the
- * transport asks the control plane whether this context already has a PARKED
- * task to adopt (see recoverParkedTask) — the durable side is authoritative,
- * and the in-process map is only a cache of it.
+ * Continuation needs no storage. The remote conversation handle is DERIVED from
+ * the local peer session id (`contextIdFor`), so any process addresses the same
+ * remote thread; the waiting task id is a process-local hint whose miss costs
+ * one listing (see recoverParkedTask), not a duplicate task. It used to be the
+ * other way round — both lived only in an in-process map, and a restart, an
+ * eviction or a different gateway silently abandoned a peer parked mid-question.
  *
  * Idempotency: every message carries a STABLE messageId derived from the
  * logical answer it delivers, so a retried attempt is recognised as the same

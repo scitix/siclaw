@@ -1,80 +1,109 @@
-# A2A delegation transport (experimental, default off)
+# A2A delegation transport
 
-`delegate_to_agent` currently rides a private start/event/control relay between
-Runtimes. This change adds a third, opt-in transport that submits the peer task
-to the management plane's **inner A2A profile** — the same durable Task/Segment
-core that serves external A2A callers — and translates its frames back into the
-peer-event vocabulary the coordinator side already consumes.
+`delegate_to_agent` submits the peer task to the management plane's internal
+A2A entrance — the same durable Task/Segment core that serves external A2A
+callers — and translates its frames back into the peer-event vocabulary the
+coordinator side consumes.
+
+**This is the only delegation transport.** The private start/event/control
+relay between Runtimes that preceded it has been deleted.
 
 ## Why
 
-- **One task semantics instead of two.** The private relay and the external A2A
-  facade each carry their own lifecycle. Moving delegation onto the A2A core
-  gives every leg a durable task: waiting states, budgets, idempotent resume,
-  dispatch retries and expiry all come from the control plane instead of being
-  re-implemented in the relay.
-- **The model-side experience must not change.** The tool inputs, the SSE frame
+- **One task semantics instead of two.** The relay and the external A2A facade
+  each carried their own lifecycle. On the A2A core every leg has a durable
+  task: waiting states, budgets, idempotent resume, dispatch retries and expiry
+  come from the control plane instead of being re-implemented per transport.
+- **Authorization belongs to the control plane.** The relay checked the roster
+  in this process. The entrance checks `(caller agent, peer agent)` against
+  `siclaw_agent_delegates` itself, and derives where the peer runs from the peer
+  row — so this Runtime no longer decides either.
+- **The model-side experience did not change.** Tool inputs, the SSE frame
   protocol to the coordinator box (`delegate_session` / `peer_event` /
-  `delegate_result`), and the roster authorization all stay exactly as they
-  are. Only the leg between this Runtime and the peer changes.
+  `delegate_result`) and the card are untouched. Only the leg between this
+  Runtime and the peer changed.
 
-## Activation
+## Configuration
+
+None. It reuses what the Runtime already holds:
 
 ```
-SICLAW_DELEGATION_TRANSPORT=a2a
-SICLAW_INNER_A2A_URL=http://<internal-a2a-service>:<port>
-SICLAW_INNER_A2A_TOKEN=wk-…            # workload credential issued by the management plane
+SICLAW_SERVER_URL      # the control plane it is already connected to
+SICLAW_PORTAL_SECRET   # the adapter secret the persistent WS already presents
 ```
 
-All three must be set; otherwise the legacy transport runs (a partial
-configuration logs a warning and falls back). Default is legacy — this is a
-dual-stack migration, not a switch-over.
+Both are required for a Runtime to function at all, so this transport cannot be
+pointed at the wrong control plane, cannot be handed a stale token, and has no
+rotation story of its own — rotating the adapter secret drops the WS session and
+invalidates this in the same instant.
 
-## How it maps
+There is deliberately no https requirement and no plaintext escape hatch: the
+adapter listener is plain HTTP on a ClusterIP-only port and the control-plane WS
+already rides it. Demanding TLS here would have been theatre whose only real
+effect was an env var operators set to `1`.
 
-| Legacy concept | A2A transport |
+## Identity and authorization
+
+```
+X-Auth-Token            the Runtime's adapter secret
+X-Siclaw-Caller-Agent   the coordinator this delegation is on behalf of
+```
+
+The caller agent is an **assertion**, not a credential: a Runtime connection
+authenticates a Runtime, not one of its agents, so the control plane validates
+it against `siclaw_agents.runtime_id` before deciding the roster question.
+Without that check every coordinator on a Runtime would inherit every other
+coordinator's roster.
+
+The peer executes as **its own owner**, resolved control-plane side from the
+peer agent's `created_by`. The caller does not lend its identity, and there is
+no on-behalf-of: that concept existed for a workload identity that no longer
+exists, and its implementation allowed impersonating any member of an org.
+
+## Wire shape
+
+| Concept | On the wire |
 |---|---|
-| dispatch (`delegation.start` / local prompt) | `POST /inner/a2a/agents/{peer}/message:stream` (SSE until terminal) |
-| peer progress events | `statusUpdate` frames → fabricated `tool_execution_end` steps; artifact deltas accumulate |
-| `request_input` pause | `TASK_STATE_INPUT_REQUIRED` → `input_required` peer event; the WAITING task id is remembered per local peer-session |
-| answer delivery | next `delegate_to_agent` on the same peer session → `message:send` with `taskId` + fresh `messageId` (idempotent), then `tasks/{id}:subscribe` |
-| session reuse (context retention) | remembered `contextId` per local peer-session → same control-plane runtime session |
-| stop / disconnect | fetch abort + best-effort `tasks/{id}:cancel`; the control plane's wait expiry converges an orphaned wait |
-| peer terminal | `TASK_STATE_COMPLETED` → `message_end` with accumulated artifact text; FAILED/CANCELED/REJECTED → `stream_error` with the machine-readable detail |
+| open a leg | `POST /inner/a2a/agents/{peer}/message:stream` |
+| answer a parked question | `POST …/message:send` with `message.taskId`, then `…:subscribe` |
+| find a parked task | `GET …/tasks?contextId={ctx}&status=TASK_STATE_INPUT_REQUIRED` |
+| cancel | `POST …/tasks/{id}:cancel` |
+| delegation marker | `metadata["siclaw.delegationId"]`, on the open **and** every resume |
+| evidence references | a `data` part, media type `application/vnd.siclaw.context+json` |
+| tool records | `{"toolCall": …}` frames, merged by `toolCallId` |
 
-Redaction: every model-visible text crossing back (question, final text, error
-detail) passes `redactText` with the peer's model-config redaction set — this
-transport closes the delegation-payload redaction gap the legacy local path
-still has.
+`siclaw.delegationId` is what makes the peer turn a *delegated* turn: the
+marker gates `report_findings` and `request_input`, so without it the peer has
+no structured artifact, no way to ask a human anything, and nothing for the
+one-level recursion guard to key on. It rides the resume too — a marker that
+only rode the first turn would stop applying the moment a parked task continued.
 
-## Ownership during dual-stack
+## Continuation across a restart
 
-The **control-plane Task/Segment is the source of truth for execution state**.
-The local peer-session row remains the coordinator-side READ MODEL: ownership,
-lineage, recency-bounded reuse policy — unchanged. At terminal, the final
-answer is mirrored into that row (best-effort) so "open full session" still
-reads; the full execution transcript lives on the control-plane side, reachable
-via the task (`metadata.sessionId`).
+The remote conversation handle is **derived** from the local peer session id, so
+it needs no storage and any process addresses the same remote thread. The
+waiting task id is a process-local hint with a real fallback: every resume asks
+the control plane, so an empty hint after a restart costs one GET rather than a
+duplicate task.
 
-## Known deltas vs. legacy (accepted for the experimental flag)
-
-- The peer turn runs as an ordinary A2A turn, not a delegated turn: the
-  `report_findings` structured artifact is not available (the result carries
-  `finalText`, `artifact` stays null), and the one-level anti-recursion relies
-  on roster/agent-type policy rather than the delegation marker.
-- The local peer-session transcript is opening-question + final answer, not the
-  full turn-by-turn view.
-- The continuation map (local peer session → remote context / waiting task) is
-  process-local; a Runtime restart starts the next leg on a fresh remote
-  context — the same in-flight-state loss the legacy relay has.
-
-Closing these requires the management plane to accept a delegation context on
-the inner profile (planned follow-up), at which point the marker, structured
-artifact and full transcript relay can return.
+It used to be the other way round — both lived only in an in-process map, which
+gave a continuation three ways to vanish (a restart, a 500-entry cap's eviction,
+any gateway that had not opened the thread) and none of them failed loudly. The
+next leg opened a task on a fresh context, so a peer parked mid-question was
+abandoned and the human's answer went to a new turn.
 
 ## Tests
 
-`src/gateway/delegate-a2a-transport.test.ts` (mock control-plane HTTP server):
-completed-flow translation, INPUT_REQUIRED pause + same-task resume with an
-idempotency key, context reuse across legs, FAILED → `stream_error`, redaction
-of every model-visible text, and abort → remote `:cancel`.
+`src/gateway/delegate-a2a-transport.test.ts` — completed-flow translation,
+`toolCall` → rich start/end events, a failed call marked as an error, redaction
+of tool output, INPUT_REQUIRED pause plus same-task resume with a stable
+idempotency key, the derived context surviving a process that forgot
+everything, parked-task adoption from the listing, FAILED → `stream_error`,
+and abort → remote `:cancel`.
+
+⚠️ Those run against a hand-written HTTP server, which is why the control-plane
+side carries a **cross-repo contract test** driving these exact request shapes
+at the real handler. Four mismatches lived through both suites at once — a
+rejected `data` part, the wrong `status` spelling, discarded `siclaw.*`
+metadata, and an `errorCode` the transport's own fixture invented — because each
+side was validating the request it had imagined.

@@ -38,24 +38,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`sha256(delegationId:taskId:text)`), and the initial `message:stream` — which
   sent none at all — carries one too, so a retried open cannot create a
   duplicate task.
-- **A lost continuation abandoned a parked peer.** The
-  `localSessionId → waitingTaskId` map is process-local; on a miss the transport
-  now asks the control plane (`GET /tasks?contextId=…&status=working`) and
-  adopts a task in `TASK_STATE_INPUT_REQUIRED` before opening a new one.
+- **A lost continuation abandoned a parked peer.** The remote conversation
+  handle and the waiting task id both lived only in an in-process map, which
+  gave a continuation three silent ways to vanish (a restart, the 500-entry
+  cap's eviction, any gateway that had not opened the thread) — and the next leg
+  then opened a task on a fresh context, so the peer parked mid-question was
+  abandoned and the human's answer landed on a new turn. The context is now
+  **derived** from the local peer session id, so it needs no storage and any
+  process addresses the same remote thread; the task id is a hint whose miss
+  costs one `GET /tasks?contextId=…&status=TASK_STATE_INPUT_REQUIRED` rather
+  than a duplicate task.
 - **An unexpected SSE end errored out** although the code comment promised a
   `GET` fallback; the documented fallback is now implemented, keeping whatever
   had already streamed.
-- **Every delegated call ran as the workload's service identity**, collapsing
-  user-level authorization, audit attribution and no-self-approval onto one
-  account. Both the `message:send` and `message:stream` bodies now carry
-  `siclaw.onBehalfOfUserId` — taken only from a validated parent session's owner,
-  and OMITTED rather than substituted when the originating user is unknown.
-- **`SICLAW_DELEGATION_TRANSPORT=a2a` with a missing URL/token downgraded
-  silently** to the legacy transport, so an operator believed they were on the
-  durable path when they were not. It is now a loud startup/dispatch error. A
-  non-`https:` base URL is refused unless `SICLAW_INNER_A2A_ALLOW_PLAINTEXT=1`
-  is set (a long-lived bearer token over plaintext is capturable), and that
-  escape hatch logs a warning every time.
+- **Every delegated call ran as one service identity**, collapsing user-level
+  authorization, audit attribution and no-self-approval onto a single account.
+  The peer now executes as **its own owner**, resolved control-plane side from
+  the peer agent's row. The on-behalf-of field this used to carry is gone with
+  the identity it belonged to — as implemented it let a caller name any member
+  of the org.
+- **The transport asked for parked tasks by a spelling the control plane
+  refuses.** `?status=working` is a 400, and the transport's own
+  `if (!res.ok) return undefined` swallowed it, so recovery never once fired.
+  Corrected to `TASK_STATE_INPUT_REQUIRED`; the mismatch survived 22 green tests
+  on this side because the fixture registered the wrong spelling as a route.
 - `delegate_to_agent` accepts optional `evidence_refs`;
   the delegation transport carries them as a structured `data` part
   (`application/vnd.siclaw.context+json`) so an investigation's basis crosses the
@@ -108,15 +114,34 @@ Two paired, per-call opt-ins for management-plane callers (design:
   the original turn (`duplicate: true`) instead of starting a second turn or
   degrading into a steer.
 
-#### Experimental A2A delegation transport (`SICLAW_DELEGATION_TRANSPORT=a2a`)
+#### A2A is the only delegation transport
 
-Opt-in third transport for `delegate_to_agent`: the peer task is submitted to
-the management plane's inner A2A profile (durable task, waiting/resume,
-budgets, dispatch retries) and its frames are translated back into the existing
-peer-event vocabulary — tool inputs, coordinator SSE frames and roster
-authorization unchanged. Includes per-leg redaction of model-visible text and
-best-effort remote cancel on abort. Default off (legacy relay); design:
-`docs/design/2026-09-02-a2a-delegation-transport.md`.
+`delegate_to_agent` submits the peer task to the management plane's internal
+A2A entrance — durable task, waiting/resume, budgets, dispatch retries — and
+translates its frames back into the peer-event vocabulary the coordinator box
+already consumes. Tool inputs, the coordinator SSE frames and the delegation
+card are unchanged. Includes per-leg redaction of model-visible text, a
+structured `data` part for `evidence_refs`, remote `:cancel` on abort, and
+translation of the entrance's tool records into the rich
+`tool_execution_start` / `_end` events the box translator already parses.
+Design: `docs/design/2026-09-02-a2a-delegation-transport.md`.
+
+It needs **no configuration**: it reuses `SICLAW_SERVER_URL` and
+`SICLAW_PORTAL_SECRET`, both of which a Runtime already needs to function. So
+it cannot be pointed at the wrong control plane, cannot be handed a stale
+token, and has no rotation story of its own.
+
+Removed with it:
+
+- The private start/event/control relay between Runtimes, and the
+  `SICLAW_DELEGATION_TRANSPORT` switch that chose between them. There is no
+  dual stack and nothing to select.
+- The three control-plane RPCs the relay needed to route a leg itself
+  (`delegation.resolveRoute` / `.terminal` / `.control`) — the entrance derives
+  where the peer runs from the peer's own row, so the caller no longer decides.
+- `delegation.readOnly`: a caller-set dial that also replaced the peer's
+  persona. What a called agent may do is the called agent's configuration, not
+  a request parameter.
 
 #### Prometheus Observability Layer
 

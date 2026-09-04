@@ -168,14 +168,16 @@ function delegateResult(res: FakeRes) {
   return res.frames.find((f) => f?.type === "delegate_result")?.result;
 }
 
-// ⚠️ EVERY TEST IN THIS FILE EXERCISES THE LEGACY TRANSPORT, so it now has to
-// say so. A2A became the default, and these fixtures have no control plane to
-// talk to — a delegation would try to reach one and fail for a reason that has
-// nothing to do with what the test is about.
+// ⚠️ These fixtures have NO control plane to talk to, so `runA2aDelegation` is
+// mocked (`a2aOutcome` / `a2aCalls`) throughout. What this file covers is
+// everything the gateway still owns around the transport — identity binding on
+// `parentSessionId`, roster lookup, session reuse, ownership of the local peer
+// row, shutdown behaviour — and it asserts the transport was invoked with the
+// right arguments rather than what the transport then does with them.
 //
-// Declaring it here rather than deleting the file: the legacy path is still
-// present as the rollback (SICLAW_DELEGATION_TRANSPORT=legacy), so its
-// behaviour still needs to hold. When the code goes, this file goes with it.
+// The transport's own behaviour lives in delegate-a2a-transport.test.ts, and
+// the shapes it puts on the wire are pinned control-plane side by a contract
+// test. Mocking it here is the boundary between those three, not a gap.
 beforeEach(() => {
   a2aOutcome = { taskId: "t1" };
   a2aCalls.length = 0;
