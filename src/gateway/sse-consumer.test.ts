@@ -44,6 +44,24 @@ function mkClient(events: unknown[], onBeforeEvent?: (event: unknown) => void): 
   return c as unknown as AgentBoxClient;
 }
 
+/** A minimal, valid `llm_call` envelope as LlmCallRecorder would stamp it. */
+function mkEnvelope(overrides: Record<string, unknown> = {}) {
+  return {
+    v: 1,
+    round: 1,
+    attempt: 1,
+    kind: "agent",
+    model: { provider: "openai", id: "gpt-5" },
+    request_at: "2026-09-03T08:00:00.000Z",
+    response_end_at: "2026-09-03T08:00:01.000Z",
+    ms: { net_ttft: 300, thinking: 0, output: 700, total: 1000 },
+    blocks: [],
+    thinking_visible: false,
+    tool_call_ids: [],
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   appendCalls.length = 0;
   updateCalls.length = 0;
@@ -776,47 +794,47 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
   });
 
-  it("emits ttft_ms on only the first assistant row across two message_ends before commit", async () => {
+  it("persists each committed model call's llm_call envelope on its own row", async () => {
     const events = [
       { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }], stopReason: "stop" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }], stopReason: "stop", llmCall: mkEnvelope({ round: 1 }) } },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "second" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "second" }], stopReason: "stop" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "second" }], stopReason: "stop", llmCall: mkEnvelope({ round: 2 }) } },
       { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
     ];
-    // Anchor the turn start in the past so ttft is a positive, recorded value.
-    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true, turnStartTime: Date.now() - 5000 });
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
     const rows = appendCalls.filter((r) => r.role === "assistant" && (r.content === "first" || r.content === "second"));
     expect(rows).toHaveLength(2);
-    const withTtft = rows.filter((r) => r.metadata?.timing?.ttft_ms !== undefined);
-    expect(withTtft).toHaveLength(1);
-    expect(withTtft[0].content).toBe("first");
+    expect(rows[0].metadata.llm_call.round).toBe(1);
+    expect(rows[1].metadata.llm_call.round).toBe(2);
   });
 
-  it("keeps ttft_ms on the fallback reply when the primary streamed text then failed", async () => {
-    // Regression: the primary's enqueued assistant op flips firstAssistantPersisted;
-    // rollback discards that op, so without re-arming the flag the surviving
-    // fallback reply (the turn's real first assistant) loses its ttft anchor.
+  it("carries a rolled-back primary's model calls onto the switch notice as discarded_llm_calls", async () => {
     const events = [
       { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "primary text" } },
-      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429", llmCall: mkEnvelope({ round: 1, attempt: 1, stop_reason: "error" }) } },
       { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "model_route_switch", attempt: 2, fromCandidateKey: "openai/gpt-4", toCandidateKey: "anthropic/claude", fromProvider: "openai", fromModelId: "gpt-4", toProvider: "anthropic", toModelId: "claude", failureKind: "rate_limit" },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fallback answer" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop", llmCall: mkEnvelope({ round: 1, attempt: 2 }) } },
       { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
     ];
-    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true, turnStartTime: Date.now() - 5000 });
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const notice = appendCalls.find((r) => r.metadata?.kind === "model_route_notice");
+    expect(notice).toBeDefined();
+    expect(notice.metadata.discarded_llm_calls).toHaveLength(1);
+    expect(notice.metadata.discarded_llm_calls[0]).toMatchObject({ round: 1, attempt: 1, stop_reason: "error" });
     const fallbackRow = appendCalls.find((r) => r.role === "assistant" && r.content === "fallback answer");
-    expect(fallbackRow).toBeDefined();
-    expect(fallbackRow.metadata?.timing?.ttft_ms).toBeDefined();
-    // The rolled-back primary text never persists.
+    expect(fallbackRow.metadata.llm_call).toMatchObject({ round: 1, attempt: 2 });
+    // The rolled-back primary text never persists, and its envelope is not duplicated on an error row.
     expect(appendCalls.some((r) => r.content === "primary text")).toBe(false);
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
   });
 });
 
@@ -916,20 +934,19 @@ describe("consumeAgentSse — tool execution", () => {
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     const toolRow = updateCalls[0];
-    // blocked/error stripped; pre_thinking_ms is the lone surviving field
-    // (always persisted to support 💭 audit on every tool).
-    expect(toolRow.metadata).toEqual({ pre_thinking_ms: expect.any(Number) });
+    // blocked/error stripped; started_at is the lone surviving field.
+    expect(toolRow.metadata).toEqual({ started_at: expect.any(String) });
     expect(toolRow.metadata.error).toBeUndefined();
   });
 
-  it("metadata contains only pre_thinking_ms when details is absent", async () => {
+  it("metadata contains only started_at when details is absent and no model call preceded the tool", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "kubectl", args: {} },
       { type: "tool_execution_end", toolName: "kubectl", result: { content: [{ type: "text", text: "ok" }] } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     const toolRow = updateCalls[0];
-    expect(toolRow.metadata).toEqual({ pre_thinking_ms: expect.any(Number) });
+    expect(toolRow.metadata).toEqual({ started_at: expect.any(String) });
   });
 
   it("redacts secrets inside persisted metadata via JSON round-trip", async () => {
@@ -1079,98 +1096,170 @@ describe("consumeAgentSse — abort finalization", () => {
   });
 });
 
-// ── Timing (TTFT / 💭 / ⚙️ / turn total) ──────────────
+// ── LLM-call timeline (metadata.llm_call / thinking rows / llm_round) ──────────────
 
-describe("consumeAgentSse — timing", () => {
-  it("attributes pre-tool thinking only to the first tool of a one-thinking-many-tools batch", async () => {
-    // Simulate: model thinks, emits assistant message with text + 3 tool_use
-    // blocks. The runtime executes them serially. Only the FIRST tool should
-    // see meaningful pre_thinking_ms; the next two should be ~0 because the
-    // boundary advances on each tool_execution_end (no new model thinking
-    // happened between them).
+describe("consumeAgentSse — llm_call timeline", () => {
+  it("persists a model-call row even when the call produced only tool calls, and stamps its tools with llm_round + tool_call_id", async () => {
     const events = [
       { type: "message_start", message: { role: "assistant" } },
-      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "checking pods" } },
-      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods -A" } },
-      { type: "tool_execution_end", toolName: "bash",
-        result: { content: [{ type: "text", text: "pod1" }] } },
-      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods -n a" } },
-      { type: "tool_execution_end", toolName: "bash",
-        result: { content: [{ type: "text", text: "pod2" }] } },
-      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods -n b" } },
-      { type: "tool_execution_end", toolName: "bash",
-        result: { content: [{ type: "text", text: "pod3" }] } },
+      { type: "message_end", message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_a", name: "bash", arguments: {} }, { type: "toolCall", id: "call_b", name: "bash", arguments: {} }],
+        stopReason: "toolUse",
+        llmCall: mkEnvelope({ round: 3, tool_call_ids: ["call_a", "call_b"] }),
+      } },
+      { type: "tool_execution_start", toolName: "bash", toolCallId: "call_a", args: { command: "a" }, startedAt: 10_000 },
+      { type: "tool_execution_start", toolName: "bash", toolCallId: "call_b", args: { command: "b" }, startedAt: 10_005 },
+      { type: "tool_execution_end", toolName: "bash", toolCallId: "call_b", result: { content: [{ type: "text", text: "B" }] }, endedAt: 10_205 },
+      { type: "tool_execution_end", toolName: "bash", toolCallId: "call_a", result: { content: [{ type: "text", text: "A" }] }, endedAt: 12_000 },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    expect(updateCalls).toHaveLength(3);
-    // Every tool row carries pre_thinking_ms — the badge is auditable on all of them.
-    for (const row of updateCalls) {
-      expect(row.metadata.pre_thinking_ms).toEqual(expect.any(Number));
-      expect(row.metadata.pre_thinking_ms).toBeGreaterThanOrEqual(0);
-    }
-    // Crucially, no double-counting: tools 2 and 3 should be near-zero
-    // because the boundary advanced on the previous tool_execution_end.
-    expect(updateCalls[1].metadata.pre_thinking_ms).toBeLessThan(50);
-    expect(updateCalls[2].metadata.pre_thinking_ms).toBeLessThan(50);
+
+    const callRow = appendCalls.find((c) => c.role === "assistant");
+    expect(callRow).toBeDefined();
+    expect(callRow.content).toBe("");
+    expect(callRow.metadata.llm_call.round).toBe(3);
+    expect(callRow.metadata.timing).toBeUndefined();
+
+    const startRows = appendCalls.filter((c) => c.role === "tool");
+    expect(startRows).toHaveLength(2);
+    expect(startRows[0].metadata).toMatchObject({ status: "running", llm_round: 3, tool_call_id: "call_a", started_at: new Date(10_000).toISOString() });
+    expect(startRows[0].metadata.pre_thinking_ms).toBeUndefined();
+
+    // Durations come from the agentbox clock on the events, not the local one.
+    const endA = updateCalls.find((u) => u.toolInput === JSON.stringify({ command: "a" }));
+    const endB = updateCalls.find((u) => u.toolInput === JSON.stringify({ command: "b" }));
+    expect(endA.durationMs).toBe(2_000);
+    expect(endB.durationMs).toBe(200);
+    expect(endA.metadata).toEqual({ llm_round: 3, tool_call_id: "call_a", started_at: new Date(10_000).toISOString() });
   });
 
-  it("persists ttft_ms / output_ms / turn_total_ms on the first assistant message; thinking_ms suppressed because it equals ttft", async () => {
-    const events = [
-      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hello" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }] } },
+  it("never mixes the agentbox and gateway clocks when one of the stamps is missing", async () => {
+    // The agentbox stamps startedAt/endedAt; this process is a different pod.
+    // A duration built from one stamp and one local Date.now() is clock skew
+    // wearing a measurement's clothes — and Math.max(0, …) hides the negative
+    // case, so it never even looks wrong. The events below are the two ways a
+    // stamp goes missing: an older runtime that sends neither, and a mixed pair.
+    const stampedStartOnly = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "call_a", name: "bash", arguments: {} }], stopReason: "toolUse", llmCall: mkEnvelope({ round: 1, tool_call_ids: ["call_a"] }) } },
+      // startedAt is an agentbox timestamp from 2001; endedAt is absent.
+      { type: "tool_execution_start", toolName: "bash", toolCallId: "call_a", args: { command: "a" }, startedAt: 1_000_000_000_000 },
+      { type: "tool_execution_end", toolName: "bash", toolCallId: "call_a", result: { content: [{ type: "text", text: "A" }] } },
     ];
-    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const assistantRow = appendCalls.find((c) => c.role === "assistant");
-    expect(assistantRow).toBeDefined();
-    expect(assistantRow.metadata.timing.ttft_ms).toEqual(expect.any(Number));
-    // thinking_ms intentionally absent on first message: ttft already covers
-    // the same boundary→firstToken interval, so a naive sum would otherwise
-    // double-count it.
-    expect(assistantRow.metadata.timing.thinking_ms).toBeUndefined();
-    expect(assistantRow.metadata.timing.output_ms).toEqual(expect.any(Number));
-    expect(assistantRow.metadata.timing.turn_total_ms).toEqual(expect.any(Number));
+    await consumeAgentSse({ client: mkClient(stampedStartOnly), sessionId: "s", userId: "u", persistMessages: true });
+    const mixed = updateCalls.find((u) => u.toolInput === JSON.stringify({ command: "a" }));
+    // Local-clock start minus local-clock end: a few milliseconds, not the
+    // ~25 years that subtracting the 2001 stamp from Date.now() would give.
+    expect(mixed.durationMs).toBeLessThan(60_000);
+
+    appendCalls.length = 0;
+    updateCalls.length = 0;
+
+    const noStamps = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "call_b", name: "bash", arguments: {} }], stopReason: "toolUse", llmCall: mkEnvelope({ round: 1, tool_call_ids: ["call_b"] }) } },
+      { type: "tool_execution_start", toolName: "bash", toolCallId: "call_b", args: { command: "b" } },
+      { type: "tool_execution_end", toolName: "bash", toolCallId: "call_b", result: { content: [{ type: "text", text: "B" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(noStamps), sessionId: "s", userId: "u", persistMessages: true });
+    const legacy = updateCalls.find((u) => u.toolInput === JSON.stringify({ command: "b" }));
+    expect(legacy.durationMs).toBeGreaterThanOrEqual(0);
+    expect(legacy.durationMs).toBeLessThan(60_000);
   });
 
-  it("uses caller-supplied turnStartTime when provided (portal POST anchor)", async () => {
-    const earlyAnchor = Date.now() - 5000; // simulate portal stamp 5s ago
+  it("writes the thinking text as its own hidden row right before the model-call row and links them", async () => {
     const events = [
-      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer" } },
+      { type: "message_end", message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "deep thoughts sk-abc123", thinkingSignature: "sig" }, { type: "text", text: "answer" }],
+        stopReason: "stop",
+        llmCall: mkEnvelope({ round: 1, thinking_visible: true }),
+      } },
     ];
     await consumeAgentSse({
-      client: mkClient(events), sessionId: "s", userId: "u",
-      persistMessages: true, turnStartTime: earlyAnchor,
+      client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true,
+      redactionConfig: { patterns: [/sk-[a-z0-9]+/g] },
     });
-    const assistantRow = appendCalls.find((c) => c.role === "assistant");
-    // ttft must reflect the supplied anchor — at least the simulated 5s gap.
-    expect(assistantRow.metadata.timing.ttft_ms).toBeGreaterThanOrEqual(5000);
+    const rows = appendCalls.filter((c) => c.role === "assistant");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].metadata).toEqual({ kind: "thinking", llm_round: 1, redacted: false, signature_present: true });
+    expect(rows[0].content).toBe("deep thoughts [REDACTED]");
+    expect(rows[1].content).toBe("answer");
+    expect(rows[1].metadata.llm_call.thinking_row_id).toBe("msg-1");
   });
 
-  it("emits ttft_ms only on the first assistant message of a turn (avoids double-counting)", async () => {
+  it("does not write a thinking row when the provider streamed no thinking text", async () => {
     const events = [
-      // First assistant message
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } },
-      // Second assistant message in same turn — same turnStart anchor, but
-      // ttft would just repeat the same value, so it must be omitted.
-      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "more" } },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "more" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop", llmCall: mkEnvelope({ round: 1, thinking_visible: false }) } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const assistantRows = appendCalls.filter((c) => c.role === "assistant");
-    expect(assistantRows).toHaveLength(2);
-    expect(assistantRows[0].metadata.timing.ttft_ms).toEqual(expect.any(Number));
-    expect(assistantRows[1].metadata.timing.ttft_ms).toBeUndefined();
-    // Both messages still carry thinking_ms + output_ms (their per-message
-    // intervals are independent and additive).
-    expect(assistantRows[1].metadata.timing.thinking_ms).toEqual(expect.any(Number));
-    expect(assistantRows[1].metadata.timing.output_ms).toEqual(expect.any(Number));
+    const rows = appendCalls.filter((c) => c.role === "assistant");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata.llm_call.thinking_row_id).toBeUndefined();
   });
 
-  it("surfaces preThinkingMs and durationMs onto live events for frontend rendering", async () => {
+  it("writes the row once when message_end and turn_end deliver the same message", async () => {
+    const message = { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop", llmCall: mkEnvelope({ round: 1 }) };
     const events = [
-      { type: "tool_execution_start", toolName: "kubectl", args: {} },
-      { type: "tool_execution_end", toolName: "kubectl", result: { content: [{ type: "text", text: "ok" }] } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message },
+      { type: "turn_end", message, toolResults: [] },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(appendCalls.filter((c) => c.role === "assistant")).toHaveLength(1);
+  });
+
+  it("puts a failed call's envelope on the error row, not on a separate model-call row", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429", llmCall: mkEnvelope({ round: 2, stop_reason: "error" }) } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const rows = appendCalls.filter((c) => c.role === "assistant");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata.kind).toBe("error_response");
+    expect(rows[0].metadata.llm_call).toMatchObject({ round: 2, stop_reason: "error" });
+  });
+
+  it("keeps the failed call's envelope when turn_end repeats the same message", async () => {
+    // pi-agent delivers a terminal failure as message_end AND then turn_end, on
+    // the SAME message object. The error row is that call's ONLY carrier — a
+    // rollback would have used discarded_llm_calls instead — so if the second
+    // delivery overwrites the queued row with an envelope-less one, the failed
+    // call's time disappears entirely.
+    const message = {
+      role: "assistant", content: [], stopReason: "error", errorMessage: "429",
+      llmCall: mkEnvelope({ round: 2, stop_reason: "error" }),
+    };
+    const events = [
+      { type: "message_end", message },
+      { type: "turn_end", message, toolResults: [] },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const rows = appendCalls.filter((c) => c.role === "assistant");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata.kind).toBe("error_response");
+    expect(rows[0].metadata.llm_call).toMatchObject({ round: 2, stop_reason: "error" });
+  });
+
+  it("keeps the legacy text-only rule for messages without an envelope", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "x", name: "bash", arguments: {} }], stopReason: "toolUse" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const rows = appendCalls.filter((c) => c.role === "assistant");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe("hi");
+    expect(rows[0].metadata.llm_call).toBeUndefined();
+  });
+
+  it("surfaces llmCall, llmRound and durationMs onto live events for frontend rendering", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "toolUse", llmCall: mkEnvelope({ round: 4 }) } },
+      { type: "tool_execution_start", toolName: "kubectl", toolCallId: "c1", args: {} },
+      { type: "tool_execution_end", toolName: "kubectl", toolCallId: "c1", result: { content: [{ type: "text", text: "ok" }] } },
     ];
     const seen: any[] = [];
     await consumeAgentSse({
@@ -1178,10 +1267,13 @@ describe("consumeAgentSse — timing", () => {
       persistMessages: true,
       onEvent: (evt) => seen.push(evt),
     });
+    const endMsg = seen.find((e) => e.type === "message_end");
     const startEvt = seen.find((e) => e.type === "tool_execution_start");
     const endEvt = seen.find((e) => e.type === "tool_execution_end");
-    expect(typeof startEvt.preThinkingMs).toBe("number");
-    expect(typeof endEvt.preThinkingMs).toBe("number");
+    expect(endMsg.llmCall.round).toBe(4);
+    expect(endMsg.timing).toBeUndefined();
+    expect(startEvt.llmRound).toBe(4);
+    expect(startEvt.preThinkingMs).toBeUndefined();
     expect(typeof endEvt.durationMs).toBe("number");
   });
 });

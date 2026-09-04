@@ -774,11 +774,13 @@ describe("siclaw-api misc routes", () => {
   });
 
   describe("GET /api/v1/siclaw/metrics/timing", () => {
-    it("summarises ttft/thinking from assistant metadata + per-tool latency", async () => {
+    it("summarises the llm_call partition from model-call rows + per-tool latency", async () => {
       query
         .mockResolvedValueOnce([[ // assistant metadata rows
-          { metadata: JSON.stringify({ timing: { ttft_ms: 100, thinking_ms: 20 } }) },
-          { metadata: JSON.stringify({ timing: { ttft_ms: 300 } }) },
+          { metadata: JSON.stringify({ llm_call: { v: 1, ms: { net_ttft: 100, thinking: 20, output: 80, total: 200 } } }) },
+          { metadata: JSON.stringify({ llm_call: { v: 1, ms: { net_ttft: 300, thinking: 0, output: 100, total: 400 } } }) },
+          { metadata: JSON.stringify({ kind: "thinking", llm_round: 1 }) }, // thinking row: no ms
+          { metadata: JSON.stringify({ timing: { ttft_ms: 999 } }) }, // retired shape: ignored
         ], []])
         .mockResolvedValueOnce([[ // tool duration rows
           { toolName: "bash", durationMs: 500 },
@@ -792,7 +794,9 @@ describe("siclaw-api misc routes", () => {
       }));
       expect(status).toBe(200);
       expect(body.ttft).toMatchObject({ count: 2, min: 100, max: 300, avg: 200 });
-      expect(body.thinking).toMatchObject({ count: 1, avg: 20 });
+      expect(body.thinking).toMatchObject({ count: 2, min: 0, max: 20, avg: 10 });
+      expect(body.output).toMatchObject({ count: 2, min: 80, max: 100 });
+      expect(body.total).toMatchObject({ count: 2, min: 200, max: 400 });
       const bash = body.tools.find((t: any) => t.toolName === "bash");
       expect(bash).toMatchObject({ count: 2, min: 300, max: 500 });
       // tools sorted by count desc → bash (2) before read (1)

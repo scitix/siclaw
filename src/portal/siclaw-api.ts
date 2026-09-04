@@ -59,7 +59,7 @@ import {
 import { normalizeEntry, entrySessionPredicate, entryPromptPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 import { humanPromptPredicate } from "./human-prompt.js";
-import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
+import { summariseLatency, extractLlmCallMs } from "./metrics-timing.js";
 import {
   assembleExporterHeaders,
   maskExporterAuth,
@@ -4007,7 +4007,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const TIMING_ROW_LIMIT = 50_000;
     const db = getDb();
 
-    // ── TTFT / thinking from assistant metadata.timing.{ttft_ms,thinking_ms} ──
+    // ── Model-call partition from metadata.llm_call.ms.{net_ttft,thinking,output,total} ──
     const aParams: unknown[] = [from, to];
     let aSql = `SELECT m.metadata AS metadata FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
@@ -4020,11 +4020,18 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [aRows] = await db.query(aSql, aParams) as [Array<{ metadata: string | null }>, unknown];
     const ttftValues: number[] = [];
     const thinkingValues: number[] = [];
+    const outputValues: number[] = [];
+    const totalValues: number[] = [];
     for (const r of aRows.slice(0, TIMING_ROW_LIMIT)) {
-      const t = extractTimingMs(r.metadata, "ttft_ms");
+      const total = extractLlmCallMs(r.metadata, "total");
+      if (total === undefined) continue; // not a model-call row
+      totalValues.push(total);
+      const t = extractLlmCallMs(r.metadata, "net_ttft");
       if (t !== undefined) ttftValues.push(t);
-      const th = extractTimingMs(r.metadata, "thinking_ms");
+      const th = extractLlmCallMs(r.metadata, "thinking");
       if (th !== undefined) thinkingValues.push(th);
+      const out = extractLlmCallMs(r.metadata, "output");
+      if (out !== undefined) outputValues.push(out);
     }
 
     // ── Per-tool latency from tool rows' duration_ms ──
@@ -4051,6 +4058,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, {
       ttft: summariseLatency(ttftValues),
       thinking: summariseLatency(thinkingValues),
+      output: summariseLatency(outputValues),
+      total: summariseLatency(totalValues),
       tools,
       truncated: aRows.length > TIMING_ROW_LIMIT || tRows.length > TIMING_ROW_LIMIT,
     });

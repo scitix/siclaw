@@ -19,6 +19,7 @@ import type {
   PromptRequirements,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
+import type { LlmCallRecorder } from "../llm-call-recorder.js";
 import { rememberPromptFiles } from "../openai-file-payload.js";
 
 /** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
@@ -109,20 +110,37 @@ export class PiAgentBrain implements BrainSession {
   constructor(
     readonly session: AgentSession,
     private readonly toolsetsByName: ReadonlyMap<string, string> = new Map(),
+    readonly llmCalls?: LlmCallRecorder,
   ) {}
 
+  /**
+   * Tool events are the only timeline points not produced at the streamFn
+   * boundary, so they are stamped HERE — the single funnel every subscriber
+   * goes through — on the same process clock as `llmCall`. Memoised per event
+   * object: several subscribers must see one timestamp, not one each.
+   */
+  private static readonly toolEventStamps = new WeakMap<object, number>();
+
   private enrichToolEvent(event: any): any {
-    if (!event || typeof event !== "object" || event.toolset != null) return event;
-    if (
-      event.type !== "tool_execution_start" && event.type !== "tool_start" &&
-      event.type !== "tool_execution_end" && event.type !== "tool_end"
-    ) return event;
-    const toolName = typeof event.toolName === "string"
-      ? event.toolName
-      : typeof event.name === "string" ? event.name : undefined;
-    if (!toolName) return event;
+    if (!event || typeof event !== "object") return event;
+    const isStart = event.type === "tool_execution_start" || event.type === "tool_start";
+    const isEnd = event.type === "tool_execution_end" || event.type === "tool_end";
+    if (!isStart && !isEnd) return event;
+    let stamp = PiAgentBrain.toolEventStamps.get(event);
+    if (stamp === undefined) {
+      stamp = Date.now();
+      PiAgentBrain.toolEventStamps.set(event, stamp);
+    }
+    const stamped = isStart
+      ? (event.startedAt === undefined ? { ...event, startedAt: stamp } : event)
+      : (event.endedAt === undefined ? { ...event, endedAt: stamp } : event);
+    if (stamped.toolset != null) return stamped;
+    const toolName = typeof stamped.toolName === "string"
+      ? stamped.toolName
+      : typeof stamped.name === "string" ? stamped.name : undefined;
+    if (!toolName) return stamped;
     const toolset = this.toolsetsByName.get(toolName);
-    return toolset ? { ...event, toolset } : event;
+    return toolset ? { ...stamped, toolset } : stamped;
   }
 
   private static readonly MAX_EMPTY_RETRIES = 2;
@@ -167,6 +185,10 @@ export class PiAgentBrain implements BrainSession {
 
   async prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void> {
     this.aborted = false;
+    // Implicit prompt boundary for callers that bypass the agentbox HTTP layer
+    // (child sub-agents, synthetic notifies). A no-op when the HTTP layer already
+    // opened the prompt explicitly — routing calls prompt() once per attempt.
+    this.llmCalls?.beginPrompt(Date.now());
     let lastAssistantHadContent = false;
     let lastAssistantMessage: any = null;
     const successfulTools = new Set<string>();
@@ -281,6 +303,7 @@ export class PiAgentBrain implements BrainSession {
       }
     } finally {
       unsub();
+      this.llmCalls?.endPrompt();
     }
   }
 
