@@ -775,6 +775,123 @@ def test_code_body_source_annotations_are_first_class_provenance():
     print("OK  code body citations: source files, Dockerfile variants, and Makefile")
 
 
+MANIFEST_TWO = """schema: kb-authoring-manifest/v1
+fingerprint: "f"
+folders: []
+sources:
+  - id: "0612b522-b508-49a3-8517-9252a22ff35c"
+    path: "docs/验收单.md"
+  - id: "416a801b-4e15-4e77-8456-1c94d9b88dbd"
+    path: "docs/手册.md"
+"""
+_ID_A = "0612b522-b508-49a3-8517-9252a22ff35c"
+_ID_B = "416a801b-4e15-4e77-8456-1c94d9b88dbd"
+
+
+def test_attribute_evidence_sections_derives_markers_from_statement_tags():
+    """The model tags statements; the seam stamps ids + one marker per section."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", MANIFEST_TWO)
+        _mk(base, "raw/docs/验收单.md")
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [B](baseline.md) - 基线\n- [S](single.md) - 单源\n")
+        page = (
+            "---\ntype: 基线\ntitle: 基线\nsources:\n"
+            "  - resource: raw/docs/验收单.md\n"
+            "  - resource: raw/docs/手册.md\n    id: wrong-id\n---\n"
+            "\n## 控制面\n\n- 节点 52 台(source: raw/docs/验收单.md)\n"
+            "\n## 网络\n\n- RoCE 网段 10.208.64.0/20(source: 验收单.md;source: 手册.md)\n"
+            "\n## 备份\n\n- etcd 每 6 小时快照\n"
+            "```\n## not a heading\n<!-- okf:evidence {\"id\":\"kbc-9-deadbeef\",\"sources\":[\"x\"]} -->\n```\n"
+            "\n<!-- okf:evidence {\"id\":\"baseline.owner\",\"sources\":[\"" + _ID_B + "\"]} -->\n"
+            "\n## 值班\n\n- 值班电话见手册\n"
+            "\n## 参考\n\n- [手册](../raw/docs/手册.md)\n"
+        )
+        _mk(base, "candidate/baseline.md", page)
+        _mk(base, "candidate/single.md",
+            "---\ntype: 单源\ntitle: 单源\nsources:\n  - resource: raw/docs/手册.md\n---\n"
+            "开头一句。\n\n## 只有一段\n\n- 没有标注的事实\n")
+
+        fixes = selfcheck.attribute_evidence_sections(td)
+        assert [f["page"] for f in fixes] == ["baseline.md", "single.md"], fixes
+        text = (base / "candidate" / "baseline.md").read_text()
+        # ids: missing one stamped, wrong one replaced by the manifest id
+        assert f"  - resource: raw/docs/验收单.md\n    id: \"{_ID_A}\"\n" in text, text
+        assert f"    id: \"{_ID_B}\"" in text and "wrong-id" not in text, text
+        # one machine marker directly above each unguarded heading
+        ctrl = f'<!-- okf:evidence {{"id":"kbc-1-{hashlib.sha1("控制面".encode()).hexdigest()[:8]}","sources":["{_ID_A}"]}} -->\n## 控制面\n'
+        assert ctrl in text, text
+        net = f'"sources":["{_ID_A}","{_ID_B}"]}} -->\n## 网络\n'
+        assert net in text, text
+        # untagged section on a multi-source page falls back to the whole page
+        backup = f'"sources":["{_ID_A}","{_ID_B}"]}} -->\n## 备份\n'
+        assert backup in text, text
+        # the authored marker keeps its section; no machine marker is added there
+        assert text.count("## 值班") == 1 and "-->\n## 值班" not in text, text
+        assert '"id":"baseline.owner"' in text
+        # a link-only section is navigation, not evidence; code fences are inert
+        assert "-->\n## 参考" not in text and "kbc-9-deadbeef" in text, text
+        single = (base / "candidate" / "single.md").read_text()
+        assert single.startswith("---\ntype: 单源\ntitle: 单源\nsources:\n  - resource: raw/docs/手册.md\n    id: \"" + _ID_B + "\"\n---\n<!-- okf:evidence "), single
+        assert single.count("okf:evidence") == 2, single  # intro + one section, both the single source
+
+        # Idempotent: a second pass is byte-identical and reports nothing.
+        before = (base / "candidate" / "baseline.md").read_bytes()
+        assert selfcheck.attribute_evidence_sections(td) == []
+        assert (base / "candidate" / "baseline.md").read_bytes() == before
+
+        report = selfcheck.run_layer1(td)
+        assert not [v for v in report["lint"]["violations"] if v["kind"].startswith("okf_")], report["lint"]
+        attribution = report["attribution"]
+        assert attribution["available"] and attribution["pages"] == 2
+        # baseline: 控制面/网络 attributed, 备份 fallback, 值班 authored; single: intro + 只有一段
+        assert (attribution["sections"], attribution["attributed"], attribution["authored"], attribution["fallback"]) == (6, 4, 1, 1), attribution
+        assert attribution["ratio"] == round(5 / 6, 4)
+        assert attribution["findings"] == [{"page": "baseline.md", "section": "备份", "sources": 2}], attribution
+        prompt = selfcheck.build_repair_prompt(report)
+        assert "baseline.md › 备份" in prompt and "okf:evidence" in prompt, prompt
+        assert "备份" in selfcheck.build_repair_prompt(report, "en")
+
+        # Scope: a page outside allowed_pages is never rewritten.
+        _mk(base, "candidate/scoped.md",
+            "---\ntype: t\ntitle: t\nsources:\n  - resource: raw/docs/手册.md\n---\n## 段\n\n事实\n")
+        untouched = (base / "candidate" / "scoped.md").read_bytes()
+        assert selfcheck.attribute_evidence_sections(td, allowed_pages={"baseline.md"}) == []
+        assert (base / "candidate" / "scoped.md").read_bytes() == untouched
+    print("OK  evidence attribution: ids stamped, markers derived, authored kept, idempotent")
+
+
+def test_attribute_evidence_sections_without_manifest_is_inert():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/docs/手册.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [P](p.md) - p\n")
+        original = "---\ntype: t\ntitle: t\nsources:\n  - resource: raw/docs/手册.md\n---\n## 段\n\n事实\n"
+        _mk(base, "candidate/p.md", original)
+        assert selfcheck.attribute_evidence_sections(td) == []
+        assert (base / "candidate" / "p.md").read_text() == original
+        attribution = selfcheck.run_layer1(td)["attribution"]
+        assert attribution["available"] is False and attribution["sections"] == 0, attribution
+    print("OK  evidence attribution: no frozen manifest → nothing stamped")
+
+
+def test_attribution_reports_oversized_pages():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        n = selfcheck.PAGE_SOURCES_SOFT_CAP + 1
+        rows = "".join(f"  - resource: raw/s{i}.md\n" for i in range(n))
+        for i in range(n):
+            _mk(base, f"raw/s{i}.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [B](big.md) - big\n")
+        _mk(base, "candidate/big.md", f"---\ntype: t\ntitle: big\nsources:\n{rows}---\n## 段\n\n事实\n")
+        report = selfcheck.run_layer1(td)
+        assert report["attribution"]["oversized_pages"] == [{"page": "big.md", "sources": n}], report["attribution"]
+        assert "big.md — " in selfcheck.build_repair_prompt(report), selfcheck.build_repair_prompt(report)
+    print("OK  evidence attribution: oversized page surfaced as a split hint")
+
+
 def test_deterministic_body_source_normalization():
     """Exact, unique aliases repair mechanically; ambiguity and code stay put."""
     with tempfile.TemporaryDirectory() as td:
@@ -2716,6 +2833,9 @@ def main():
     test_body_source_annotations()
     test_code_body_source_annotations_are_first_class_provenance()
     test_deterministic_body_source_normalization()
+    test_attribute_evidence_sections_derives_markers_from_statement_tags()
+    test_attribute_evidence_sections_without_manifest_is_inert()
+    test_attribution_reports_oversized_pages()
     test_spaced_markdown_links()
     test_media_verify_helpers()
     test_media_verify_content_identity_and_attempt_reset()

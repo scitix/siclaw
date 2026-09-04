@@ -80,7 +80,7 @@ generated:
   by: process:siclaw-kbc
 status: stable
 ---
-<Body. Tag each statement with (source: filename). Adjudicated contradictions are written as conclusions with the involved sources retained; unadjudicated ones are tagged "⚠️ 存疑 (doubtful): …">
+<Body. Tag each statement with (source: filename) — the self-check derives one okf:evidence marker per section from these tags and stamps sources[].id from the frozen manifest; an untagged fact can only be cited page-wide. Adjudicated contradictions are written as conclusions with the involved sources retained; unadjudicated ones are tagged "⚠️ 存疑 (doubtful): …">
 ```
 Every concept frontmatter must be parseable YAML and `type` must be a non-empty string. Siclaw KBC pages carry 4–12 high-signal `labels`: use `entity` for named systems/products, `topic` for subject matter, `task` for the question or action the page supports, `component` for architecture parts, and `environment`/`version` only when the page is actually scoped that way. Put alternate names and abbreviations in `aliases`; do not tag every noun. `sources` is a list of mappings whose `resource` is the raw-relative path; preserve unknown OKF fields. The compile agent never writes `verified`: only a real reviewer or verification process may add it.
 

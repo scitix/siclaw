@@ -180,7 +180,7 @@ generated:
   by: process:siclaw-kbc
 status: stable
 ---
-<Body. Every statement cites (source: filename). Ruled contradictions become conclusions that keep their sources; unruled ones are marked "⚠️ 存疑: …">
+<Body. Every statement cites (source: filename) — the system derives per-section okf:evidence markers from these tags, so an untagged fact can only be cited page-wide. Ruled contradictions become conclusions that keep their sources; unruled ones are marked "⚠️ 存疑: …">
 ```
 
 These are OKF v0.2 concept documents: the YAML must parse and `type` must be a non-empty string. `sources` is a list of mappings and every row has a non-empty `resource`. Stamp agent-authored pages with `generated.by: process:siclaw-kbc` and `status: stable`. Never write `verified`; only a real reviewer or verification process may add it. Preserve unknown OKF fields when revising an existing page.

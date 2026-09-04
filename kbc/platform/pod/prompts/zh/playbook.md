@@ -117,7 +117,7 @@ generated:
   by: process:siclaw-kbc
 status: stable
 ---
-<正文。每条陈述都标(源:文件名)。已裁的矛盾写成保留其来源的结论;未裁的标"⚠️ 存疑:…">
+<正文。每条陈述都标 (source: 文件名)——系统按段从这些标注推导 okf:evidence 标记,没标注的事实只能被整页引用。已裁的矛盾写成保留其来源的结论;未裁的标"⚠️ 存疑:…">
 ```
 
 这些页面是 OKF v0.2 concept document:YAML 必须可解析,`type` 必须是非空字符串。`sources` 是 mapping 列表,每项都含非空 `resource`;agent 产出的页面写 `generated.by: process:siclaw-kbc` 和 `status: stable`。绝不代替真人或验证流程写 `verified`;修改已有页面时保留不认识的 OKF 字段。

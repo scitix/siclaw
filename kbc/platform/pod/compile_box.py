@@ -2954,6 +2954,11 @@ async def _post_turn_selfcheck(run) -> str | None:
             turn_format_guard.get("before") or {}, current))
     mechanical_fixes = selfcheck.normalize_body_source_annotations(
         workdir, allowed_pages=mechanical_allowed)
+    # Same seam, same scope: stamp sources[].id from the frozen manifest and
+    # derive one okf:evidence marker per section from the (source:) tags the
+    # model wrote, so knowledge_cite lands on a section's own originals.
+    mechanical_fixes = mechanical_fixes + selfcheck.attribute_evidence_sections(
+        workdir, allowed_pages=mechanical_allowed)
     if mechanical_fixes:
         mechanically_changed = {item["page"] for item in mechanical_fixes}
         mechanical_stamps, stamp_failures = (
