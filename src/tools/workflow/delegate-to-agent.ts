@@ -143,6 +143,15 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       }, onProgress, signal)
         .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, peerTraceId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
 
+      // ⚠️ `tool_calls` counts the SAME list the card renders.
+      //
+      // It used to read `resp.steps.length` — the gateway's own step list, built
+      // from a different translator with only {kind,toolName,durationMs} — while
+      // `steps` carried the box translator's six-field records. Two lists, two
+      // fidelities, and the card mixed them: a count that could disagree with
+      // the rows underneath it. Counting `kind === "tool"` also stops assistant
+      // reasoning lines from inflating a "tool calls" number.
+      //
       // Card-facing shape (portal-web AgentWorkCard reads target from args and
       // status/summary/tool_calls/steps from result details). Carry the accumulated
       // live steps into the FINAL result so the card keeps them after completion.
@@ -157,7 +166,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // fallback with no peerSessionId, and the failed/stopped legs are exactly
       // the ones a review needs to open.
       const childSessionId = resp.peerSessionId ?? liveChildSessionId;
-      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, duration_ms: Date.now() - startedAt, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
+      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: lastSteps.filter((st) => (st as { kind?: string }).kind === "tool").length, steps: lastSteps, duration_ms: Date.now() - startedAt, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
 
       // Stopped by the coordinator (turn aborted): the relay was torn down and
       // the peer turn cancelled. Report a clean stop, not a scary error.

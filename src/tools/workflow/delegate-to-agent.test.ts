@@ -56,7 +56,21 @@ describe("delegate_to_agent tool", () => {
   });
 
   it("resolves the target and calls the executor, shaping the AgentWorkCard result", async () => {
-    const exec = vi.fn(async () => okResp());
+    // ⚠️ The fake MUST drive onProgress. In production the box-side translator
+    // pushes the step records through it, and the card's `steps` AND its
+    // `tool_calls` count both come from that one list — a fake that skips it
+    // was letting the count be read from a second, thinner list instead.
+    const exec = vi.fn(async (_req: unknown, onProgress?: (p: unknown) => void) => {
+      onProgress?.({
+        toolCalls: 2,
+        steps: [
+          { kind: "tool", toolName: "kubectl", content: "ok", outcome: "success", durationMs: 12 },
+          { kind: "assistant", text: "checking coredns" },
+          { kind: "tool", toolName: "pod_logs", content: "OOMKilled", outcome: "success", durationMs: 30 },
+        ],
+      });
+      return okResp();
+    });
     const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
     const r = await tool.execute("c1", { agent_id: "agent-net", agent_name: "net-agent", task: "check sh-1 coredns" });
     expect(exec).toHaveBeenCalledWith({ peerAgentId: "agent-net", text: "check sh-1 coredns" }, expect.any(Function), undefined);
@@ -68,7 +82,10 @@ describe("delegate_to_agent tool", () => {
     expect(d.agent_id).toBe("agent-net");
     expect(d.agent_name).toBe("net-agent");
     expect(d.summary).toContain("CoreDNS OOMKilled x3");
+    // Two tool rows out of three steps: the assistant reasoning line is not a
+    // tool call, and it used to be counted as one.
     expect(d.tool_calls).toBe(2);
+    expect(d.steps).toHaveLength(3);
   });
 
   it("accepts a name in agent_id and still resolves", async () => {

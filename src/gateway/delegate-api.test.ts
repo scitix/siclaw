@@ -146,7 +146,16 @@ function delegateResult(res: FakeRes) {
   return res.frames.find((f) => f?.type === "delegate_result")?.result;
 }
 
+// ⚠️ EVERY TEST IN THIS FILE EXERCISES THE LEGACY TRANSPORT, so it now has to
+// say so. A2A became the default, and these fixtures have no control plane to
+// talk to — a delegation would try to reach one and fail for a reason that has
+// nothing to do with what the test is about.
+//
+// Declaring it here rather than deleting the file: the legacy path is still
+// present as the rollback (SICLAW_DELEGATION_TRANSPORT=legacy), so its
+// behaviour still needs to hold. When the code goes, this file goes with it.
 beforeEach(() => {
+  vi.stubEnv("SICLAW_DELEGATION_TRANSPORT", "legacy");
   vi.clearAllMocks();
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
