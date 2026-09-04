@@ -4,6 +4,7 @@ import {
   AGENT_TYPES,
   COMPLETE_CATALOG_KNOWLEDGE_QA_DEFAULT_PROMPT,
   LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT,
+  PRE_DISCOVERY_KNOWLEDGE_QA_DEFAULT_PROMPT,
   PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT,
   PRODUCT_SUPPORT_DEFAULT_PROMPT,
   normalizeAgentType,
@@ -63,6 +64,15 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.coordinator.defaultPrompt).not.toContain("search_memory");
   });
 
+  it("requires knowledge discovery before clarification without coupling the type to retrieval tools", () => {
+    const prompt = AGENT_TYPES.knowledge_qa.defaultPrompt;
+    expect(prompt).toContain("complete at least one bounded knowledge-discovery step");
+    expect(prompt).toContain("before asking the user a clarifying question");
+    expect(prompt).toContain("multiple evidence-backed interpretations");
+    expect(prompt).not.toContain("knowledge_search");
+    expect(prompt).not.toMatch(/full[- ]text|FTS|BM25/i);
+  });
+
   it("normalizeAgentType defaults unknown/absent to custom", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
     expect(normalizeAgentType("coordinator")).toBe("coordinator");
@@ -116,6 +126,8 @@ describe("agent-types", () => {
     expect(effectiveAgentPrompt("knowledge_qa", PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT))
       .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("knowledge_qa", COMPLETE_CATALOG_KNOWLEDGE_QA_DEFAULT_PROMPT))
+      .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
+    expect(effectiveAgentPrompt("knowledge_qa", PRE_DISCOVERY_KNOWLEDGE_QA_DEFAULT_PROMPT))
       .toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(resolveAgentPromptLayers("knowledge_qa", LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT)).toEqual({
       typeContract: AGENT_TYPES.knowledge_qa.defaultPrompt,
