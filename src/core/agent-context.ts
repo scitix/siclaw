@@ -118,7 +118,6 @@ export function resolveAgentHarness(
     ? [...resolvedTools, "task_report"]
     : resolvedTools;
   const allowedTools = resolution === "resolved" ? modeTools : [];
-  const delegatedReadOnly = input.delegation?.readOnly === true;
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
 
   const canOperate = hasAnyTool(allowedTools, [
@@ -135,27 +134,23 @@ export function resolveAgentHarness(
     // They are an explicit resource-binding axis, not names that can be placed
     // in a static built-in capability group. Siclaw currently receives no
     // trustworthy read/write or binding-source metadata with which to narrow
-    // this set further. Unresolved and delegated-read-only contexts fail closed.
-    mcpExposure: resolution === "resolved" && !delegatedReadOnly ? "configured" : "none",
+    // this set further. An unresolved context fails closed.
+    mcpExposure: resolution === "resolved" ? "configured" : "none",
     memoryEnabled:
       resolution === "resolved" &&
       input.memoryConfigured &&
-      !delegatedReadOnly &&
       hasAnyTool(allowedTools, ["memory_search", "memory_get"]),
     includeBundledSkills:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       canOperate,
     includePlatformSkills:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       hasAnyTool(allowedTools, ["write", "edit", "skill_preview"]),
     includePlanningGuidance:
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
     includeInfrastructureGuidance:
       resolution === "resolved" &&
@@ -163,7 +158,6 @@ export function resolveAgentHarness(
       hasAnyTool(allowedTools, ["cluster_list", "host_list"]),
     includeOperationalSafety:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       (agentType === "sre" || (agentType === "custom" && canOperate)),
     legacyUnrestrictedCustom,
   };
@@ -172,13 +166,7 @@ export function resolveAgentHarness(
 /** Compile the stable system prompt and enforceable policy for one session. */
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
-  const agentPrompt = input.delegation?.readOnly
-    ? {
-        addendum: typeof input.agentPrompt === "string" && input.agentPrompt.trim()
-          ? input.agentPrompt.trim()
-          : undefined,
-      }
-    : resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
+  const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
     templateOverride: input.systemPromptTemplate,

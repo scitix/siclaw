@@ -88,5 +88,4 @@ export const registration: ToolEntry = {
   // Present only on a delegated turn (and only when the extra-event bus exists to
   // carry the artifact). readOnlyDelegable so it survives the read-only filter.
   available: (refs) => Boolean(refs.delegation && refs.sessionEventEmitter),
-  readOnlyDelegable: true,
 };

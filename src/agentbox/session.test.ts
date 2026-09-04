@@ -386,21 +386,22 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     ).rejects.toThrow(/different user/);
   });
 
-  it("uses the delegated read-only persona exclusively", async () => {
+  // 被委托的 peer 保留它自己的 persona。这里曾经断言相反的事:委托会把 peer 的
+  // prompt 整个换成一段通用的只读替身。那段替身之所以存在,是因为"砍掉写工具但
+  // 留着'去修好它'的 prompt"根本不自洽 —— 而正确的解法是不砍,不是换掉它是谁。
+  it("keeps the peer's OWN persona on a delegated turn", async () => {
     const mgr = new AgentBoxSessionManager();
     mgr.agentTypeState = "sre";
     await mgr.getOrCreate(
-      "sess-readonly",
+      "sess-delegated",
       "web",
       "custom prompt that says to remediate",
       "normal",
-      { delegationId: "d1", readOnly: true },
+      { delegationId: "d1" },
     );
 
     const opts = lastCreateSiclawSession.calls.at(-1);
-    expect(opts.systemPromptAppend).toMatch(/read-only/i);
-    expect(opts.systemPromptAppend).not.toContain("custom prompt that says to remediate");
-    expect(opts.systemPromptAppend).not.toContain("Take the task end to end");
+    expect(opts.systemPromptAppend).toContain("custom prompt that says to remediate");
   });
 
   it("defaults mode to 'web' when none supplied", async () => {

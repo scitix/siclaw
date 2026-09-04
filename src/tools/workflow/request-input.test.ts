@@ -18,22 +18,21 @@ function makeRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
 const text = (r: any) => (r.content[0] as any).text as string;
 
 describe("request_input tool", () => {
-  it("is available on delegated turns or explicit top-level input requests, and is read-only-delegable", () => {
+  it("is available on delegated turns or explicit top-level input requests", () => {
     const emitter = vi.fn();
     expect(registration.available?.(makeRefs())).toBe(false);
-    expect(registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true } }))).toBe(false);
+    expect(registration.available?.(makeRefs({ delegation: { delegationId: "d1" } }))).toBe(false);
     expect(registration.available?.(makeRefs({ allowInputRequest: true }))).toBe(false);
     expect(
-      registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter })),
+      registration.available?.(makeRefs({ delegation: { delegationId: "d1" }, sessionEventEmitter: emitter })),
     ).toBe(true);
     expect(registration.available?.(makeRefs({ allowInputRequest: true, sessionEventEmitter: emitter }))).toBe(true);
-    expect(registration.readOnlyDelegable).toBe(true);
   });
 
   it("emits an input_required event stamped with the delegationId", async () => {
     const emitter = vi.fn();
     const tool = createRequestInputTool(
-      makeRefs({ delegation: { delegationId: "deleg-7", readOnly: true }, sessionEventEmitter: emitter }),
+      makeRefs({ delegation: { delegationId: "deleg-7" }, sessionEventEmitter: emitter }),
     );
     const r = await tool.execute("call-1", { question: "  Which cluster — sh-1 or sh-2?  " });
     expect(emitter).toHaveBeenCalledTimes(1);
@@ -72,7 +71,7 @@ describe("request_input tool", () => {
   it("rejects an empty question before emitting", async () => {
     const emitter = vi.fn();
     const tool = createRequestInputTool(
-      makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter }),
+      makeRefs({ delegation: { delegationId: "d1" }, sessionEventEmitter: emitter }),
     );
     const r = await tool.execute("call-empty", { question: "  " });
     expect(emitter).not.toHaveBeenCalled();

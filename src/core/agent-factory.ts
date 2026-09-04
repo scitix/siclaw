@@ -668,12 +668,6 @@ export async function createSiclawSession(
     isToolResultArtifactPath(candidate)
     || blockedFileDirs.some((blocked) => isPathInsideDir(candidate, blocked.dir));
 
-  // Read-only delegated turn: drop the write file tools (Edit/Write) so a
-  // delegated worker cannot mutate even its own scratch dir. Reads (Read/Grep/
-  // Find/Ls) stay. These tools live outside the registry, so the resolve()
-  // readOnlyDelegable filter doesn't reach them — gate them here instead.
-  const delegatedReadOnly = opts?.delegation?.readOnly === true;
-
   const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
@@ -689,7 +683,6 @@ export async function createSiclawSession(
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
-    ...(delegatedReadOnly ? [] : [
       createEditTool(cwd, {
         operations: {
           readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedFileDirs); return fsReadFile(p); },
@@ -703,7 +696,6 @@ export async function createSiclawSession(
           mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedFileDirs); await fsMkdir(d, { recursive: true }); },
         },
       }),
-    ]),
     createGrepTool(cwd, {
       operations: {
         isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.statSync(p).isDirectory(); },

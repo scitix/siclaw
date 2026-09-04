@@ -118,5 +118,4 @@ export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createMemoryGetTool(refs.memoryDir!),
   available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer && !!refs.memoryDir,
-  readOnlyDelegable: true,
 };

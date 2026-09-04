@@ -76,5 +76,4 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: createRequestInputTool,
   available: (refs) => Boolean(refs.sessionEventEmitter && (refs.delegation || refs.allowInputRequest === true)),
-  readOnlyDelegable: true,
 };

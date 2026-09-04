@@ -151,5 +151,4 @@ export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createKnowledgeSearchTool(refs.knowledgeIndexer!),
   available: (refs) => Boolean(refs.knowledgeIndexer),
-  readOnlyDelegable: true,
 };
