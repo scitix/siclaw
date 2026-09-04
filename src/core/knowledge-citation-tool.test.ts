@@ -63,6 +63,22 @@ describe("knowledge_cite", () => {
     expect(events).toHaveLength(1);
   });
 
+  it("tolerates a mount-prefixed relative path copied from the model's own read call", async () => {
+    const { dir, page } = fixture();
+    const events: Record<string, unknown>[] = [];
+    const support = createKnowledgeCitationSupport({ knowledgeDir: dir, turnRef: { current: 1 }, sessionEventEmitter: (e) => events.push(e) });
+    readPage(support, page);
+    // The model echoes the mount prefix it saw in its read tool call.
+    const prefixed = `.siclaw/knowledge/${path.basename(page)}`;
+    const output = await support.tool.execute("call", { pages: [{ path: prefixed, claim: "The runbook documents the GPU reset procedure." }] } as never);
+    expect(output.details).toEqual({ cited: 1 });
+    expect(events).toHaveLength(1);
+    // Stripping never invents a read: an unread page stays unread however it is spelled.
+    const unread = await support.tool.execute("call", { pages: [{ path: ".siclaw/knowledge/other.md", claim: "The runbook documents the GPU reset procedure." }] } as never);
+    expect(unread.details).toEqual({ cited: 0 });
+    expect(JSON.stringify(unread)).toContain("Cannot cite unread knowledge page");
+  });
+
   it("rejects pages items that are not bound to a concrete claim", async () => {
     const { dir, page } = fixture();
     const events: Record<string, unknown>[] = [];
