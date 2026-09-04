@@ -94,8 +94,14 @@ export interface ToolLatencyStats extends LatencyStats {
 }
 
 export interface TimingStats {
+  /** request sent → first token (network + queue + hidden reasoning) */
   ttft: LatencyStats
+  /** streamed reasoning blocks */
   thinking: LatencyStats
+  /** text + tool-call argument streaming */
+  output: LatencyStats
+  /** request sent → response end */
+  total: LatencyStats
   tools: ToolLatencyStats[]
   truncated?: boolean
 }

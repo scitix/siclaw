@@ -3836,6 +3836,20 @@ describe("collectChannelResponse — audit persistence", () => {
   function fakeClient(events: unknown[]) {
     return { streamEvents: async function* () { for (const e of events) yield e; } } as any;
   }
+  const envelope = (overrides: Record<string, unknown> = {}) => ({
+    v: 1,
+    round: 1,
+    attempt: 1,
+    kind: "agent",
+    model: { provider: "openai", id: "gpt-5" },
+    request_at: "2026-09-03T08:00:00.000Z",
+    response_end_at: "2026-09-03T08:00:01.000Z",
+    ms: { net_ttft: 300, thinking: 0, output: 700, total: 1000 },
+    blocks: [],
+    thinking_visible: false,
+    tool_call_ids: [],
+    ...overrides,
+  });
 
   it("persists every assistant turn + each tool call when persist is set", async () => {
     appendMessageMock
@@ -3931,6 +3945,109 @@ describe("collectChannelResponse — audit persistence", () => {
     const collected = await collectChannelResponse(fakeClient(events), "s-fail", "lark", { persist: { agentId: "a1" } });
     expect(collected.text).toBe("still replies");
     expect(collected.assistantMessageId).toBeNull();
+  });
+
+  it("deduplicates independently parsed message_end and turn_end envelopes", async () => {
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      stopReason: "stop",
+      llmCall: envelope(),
+    };
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message },
+      { type: "turn_end", message: JSON.parse(JSON.stringify(message)) },
+    ]), "s-dedup", "lark", { persist: { agentId: "a1" } });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("revokes recovered error rows while retaining every model call", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "transient",
+        llmCall: envelope({ round: 1, stop_reason: "error" }),
+      } },
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop",
+        llmCall: envelope({ round: 2, request_at: "2026-09-03T08:00:02.000Z", response_end_at: "2026-09-03T08:00:03.000Z" }),
+      } },
+    ]), "s-retry", "lark", { persist: { agentId: "a1" } });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    expect(rows.map((row) => row.metadata.llm_call.round)).toEqual([1, 2]);
+    expect(rows[0].content).toBe("");
+    expect(rows[1].content).toBe("recovered");
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
+  });
+
+  it("persists only the final retry error and redacts its envelope metadata", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "first",
+        llmCall: envelope({ round: 1, stop_reason: "error", error_message: "first" }),
+      } },
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "last sk-secret123",
+        llmCall: envelope({
+          round: 2,
+          request_at: "2026-09-03T08:00:02.000Z",
+          response_end_at: "2026-09-03T08:00:03.000Z",
+          stop_reason: "error",
+          error_message: "last sk-secret123",
+        }),
+      } },
+    ]), "s-errors", "lark", {
+      persist: { agentId: "a1", modelConfig: { apiKey: "sk-secret123" } },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ content: "", metadata: { llm_call: { round: 1 } } });
+    expect(rows[1].metadata.kind).toBe("error_response");
+    expect(rows[1].content).not.toContain("sk-secret123");
+    expect(rows[1].metadata.llm_call.error_message).not.toContain("sk-secret123");
+  });
+
+  it("moves a rolled-back attempt's calls onto the fallback notice", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "model_route_start", candidateCount: 2 },
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429 sk-secret123",
+        llmCall: envelope({ round: 1, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" }),
+      } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-5", failureKind: "rate_limit" },
+      {
+        type: "model_route_switch",
+        attempt: 2,
+        fromCandidateKey: "openai/gpt-5",
+        toCandidateKey: "anthropic/claude",
+        fromProvider: "openai",
+        fromModelId: "gpt-5",
+        toProvider: "anthropic",
+        toModelId: "claude",
+        failureKind: "rate_limit",
+      },
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop",
+        llmCall: envelope({ round: 1, attempt: 2 }),
+      } },
+      { type: "model_route_success" },
+    ]), "s-route", "lark", {
+      persist: { agentId: "a1", modelConfig: { apiKey: "sk-secret123" } },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    const notice = rows.find((row) => row.metadata?.kind === "model_route_notice");
+    expect(notice.metadata.discarded_llm_calls).toHaveLength(1);
+    expect(notice.metadata.discarded_llm_calls[0]).toMatchObject({ round: 1, attempt: 1 });
+    expect(notice.metadata.discarded_llm_calls[0].error_message).not.toContain("sk-secret123");
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
   });
 });
 

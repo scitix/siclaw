@@ -63,6 +63,16 @@ import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
 import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
+import type { LlmCallEnvelope } from "../../core/llm-call-recorder.js";
+import {
+  buildThinkingRow,
+  eventClock,
+  isModelCallRowEnvelope,
+  LlmCallTimeline,
+  redactLlmCallEnvelope,
+  toolDurationMs,
+} from "../llm-call-rows.js";
+import { modelRouteNoticeContent, modelRouteSwitchMetadata } from "../sse-consumer.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -3093,18 +3103,60 @@ export async function collectChannelResponse(
   // Invocation-id queues pair parallel start↔end events. Older runtimes without
   // toolCallId fall back to per-name FIFO for backward compatibility.
   const toolInputs = new Map<string, string[]>();
-  const toolStarts = new Map<string, number[]>();
+  const toolStarts = new Map<string, Array<{ startedAt?: number; localStartMs: number }>>();
   const toolsets = new Map<string, Array<string | undefined>>();
+  const toolRounds = new Map<string, Array<Record<string, unknown>>>();
   const pushQ = <T,>(m: Map<string, T[]>, k: string, v: T): void => { const a = m.get(k) ?? []; a.push(v); m.set(k, a); };
   const shiftQ = <T,>(m: Map<string, T[]>, k: string): T | undefined => m.get(k)?.shift();
   const toolKey = (ev: Record<string, any>, name: string): string =>
     ev.toolCallId != null ? `id:${String(ev.toolCallId)}` : `name:${name}`;
+  // Shared with sse-consumer: value-based envelope dedup, current round, and
+  // one-clock tool duration rules must stay identical across persistence paths.
+  const timeline = new LlmCallTimeline();
+  let attemptLlmCalls: LlmCallEnvelope[] = [];
+  let pendingFailedLlmCalls: LlmCallEnvelope[] = [];
+  let pendingError: { content: string; envelope?: LlmCallEnvelope } | null = null;
   const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<string | null> => {
     try { return await appendMessage({ ...msg, traceId: persist?.traceId ?? msg.traceId }); }
     catch (err) {
       console.warn(`[${logPrefix}] audit persist failed session=${sessionId}:`, err);
       return null;
     }
+  };
+  const persistCallOnlyRows = async (envelopes: LlmCallEnvelope[]) => {
+    for (const envelope of envelopes) {
+      await persistRow({
+        sessionId,
+        role: "assistant",
+        content: "",
+        metadata: { llm_call: redactLlmCallEnvelope(envelope, redact) },
+      });
+    }
+  };
+  const flushRecoveredLlmCalls = async () => {
+    const failedCalls = pendingFailedLlmCalls;
+    pendingFailedLlmCalls = [];
+    pendingError = null;
+    await persistCallOnlyRows(failedCalls);
+  };
+  const flushTerminalError = async () => {
+    if (!pendingError) return;
+    const failedCalls = pendingFailedLlmCalls;
+    pendingFailedLlmCalls = [];
+    const terminal = pendingError;
+    pendingError = null;
+    await persistCallOnlyRows(terminal.envelope ? failedCalls.slice(0, -1) : failedCalls);
+    await persistRow({
+      sessionId,
+      role: "assistant",
+      content: terminal.content,
+      metadata: {
+        kind: "error_response",
+        error_code: "MODEL_ERROR",
+        retriable: true,
+        ...(terminal.envelope ? { llm_call: redactLlmCallEnvelope(terminal.envelope, redact) } : {}),
+      },
+    });
   };
 
   try {
@@ -3114,7 +3166,30 @@ export async function collectChannelResponse(
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
         renderedKnowledgeSourceUrls.clear();
+        if (ev.type === "model_route_start") {
+          attemptLlmCalls = [];
+        } else {
+          pendingFailedLlmCalls = [];
+          pendingError = null;
+        }
       }
+      if (ev.type === "model_route_switch" && persist && redaction) {
+        const metadata = modelRouteSwitchMetadata(ev, redaction);
+        if (metadata) {
+          const discarded = attemptLlmCalls;
+          attemptLlmCalls = [];
+          if (discarded.length > 0) {
+            metadata.discarded_llm_calls = discarded.map((call) => redactLlmCallEnvelope(call, redact));
+          }
+          await persistRow({
+            sessionId,
+            role: "assistant",
+            content: modelRouteNoticeContent(metadata),
+            metadata,
+          });
+        }
+      }
+      if (ev.type === "model_route_success") attemptLlmCalls = [];
       if (ev.type === "knowledge_sources") {
         pendingKnowledgeSources = ev.sources;
       }
@@ -3156,8 +3231,9 @@ export async function collectChannelResponse(
         const name = (ev.toolName as string) || (ev.name as string) || "tool";
         const key = toolKey(ev, name);
         pushQ(toolInputs, key, ev.args ? JSON.stringify(ev.args) : "");
-        pushQ(toolStarts, key, Date.now());
+        pushQ(toolStarts, key, { startedAt: eventClock(ev, "startedAt"), localStartMs: Date.now() });
         pushQ(toolsets, key, typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
+        pushQ(toolRounds, key, timeline.toolMetadata(ev));
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
@@ -3172,9 +3248,14 @@ export async function collectChannelResponse(
           else if (ev.result?.details?.error) outcome = "error";
           const key = toolKey(ev, name);
           const input = shiftQ(toolInputs, key) || "";
-          const startedAt = shiftQ(toolStarts, key);
+          const start = shiftQ(toolStarts, key);
+          const endedAt = eventClock(ev, "endedAt");
+          const startedAt = start?.startedAt ?? start?.localStartMs;
           const toolset = shiftQ(toolsets, key) ??
             (typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
+          const roundMeta = shiftQ(toolRounds, key) ?? timeline.toolMetadata(ev);
+          const metadata: Record<string, unknown> = { ...roundMeta };
+          if (startedAt != null) metadata.started_at = new Date(startedAt).toISOString();
           await persistRow({
             sessionId,
             role: "tool",
@@ -3183,7 +3264,8 @@ export async function collectChannelResponse(
             toolset: toolset ?? null,
             toolInput: input ? redact(input) : null,
             outcome,
-            durationMs: startedAt != null ? Date.now() - startedAt : null,
+            durationMs: start ? toolDurationMs(start, endedAt) : null,
+            metadata: Object.keys(metadata).length > 0 ? metadata : null,
           });
         }
       }
@@ -3193,10 +3275,29 @@ export async function collectChannelResponse(
       }
       // pi-agent-brain emits the final assistant reply as message_end with
       // a content array of blocks; collect the text blocks only.
+      let envelope: LlmCallEnvelope | undefined;
+      if ((ev.type === "message_end" || ev.type === "turn_end") && ev.message?.role === "assistant") {
+        envelope = timeline.take(ev.message);
+        if (envelope?.kind === "agent") attemptLlmCalls.push(envelope);
+        if (ev.type === "message_end" && ev.message?.stopReason === "error") {
+          if (envelope) pendingFailedLlmCalls.push(envelope);
+          pendingError = {
+            content: redact(typeof ev.message.errorMessage === "string" ? ev.message.errorMessage : ""),
+            ...(envelope ? { envelope } : {}),
+          };
+        }
+      }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
+        const rowEnvelope = isModelCallRowEnvelope(envelope, ev.message?.stopReason)
+          ? redactLlmCallEnvelope(envelope, redact)
+          : undefined;
         let turnText = contentBlocksToMarkdown(blocks);
+        const producedOutput = ev.message?.stopReason !== "error" && ev.message?.stopReason !== "aborted" && (
+          turnText.trim().length > 0 || blocks.some((block: any) => block?.type === "toolCall")
+        );
+        if (pendingError && producedOutput) await flushRecoveredLlmCalls();
         if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error") {
           const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
             .filter((source) => !renderedKnowledgeSourceUrls.has(source.url));
@@ -3217,20 +3318,38 @@ export async function collectChannelResponse(
             if (m) options.onMilestone(m);
           }
           lastAssistantText = turnText;
-          // Persist every assistant turn (intermediate narration + final answer),
-          // mirroring sse-consumer. Awaited so its created_at precedes the next
-          // tool row in the transcript.
-          // Replace the id even when this write fails: retaining an earlier
-          // narration id would link the final card to the wrong assistant turn.
-          lastAssistantMessageId = persist
-            ? await persistRow({ sessionId, role: "assistant", content: redact(turnText) })
-            : null;
+        }
+        // Persist every model call (intermediate narration, tool-only call, final
+        // answer), mirroring sse-consumer. Awaited so its created_at precedes the
+        // next tool row in the transcript. Without an envelope (older runtime)
+        // only calls that produced text get a row.
+        if (persist && (turnText || rowEnvelope)) {
+          if (rowEnvelope) {
+            const thinkingRow = buildThinkingRow(ev.message, rowEnvelope, redact);
+            if (thinkingRow) {
+              const thinkingRowId = await persistRow({ sessionId, role: "assistant", ...thinkingRow });
+              if (thinkingRowId) rowEnvelope.thinking_row_id = thinkingRowId;
+            }
+          }
+          // Only a turn that produced TEXT is a card, so only that turn claims the
+          // id — and it claims it even when the write failed (rowId null), because
+          // retaining an earlier narration id would link the card to the wrong
+          // assistant turn. A tool-only model call writes a row here too, but it
+          // is not a card and must leave the id alone.
+          const rowId = await persistRow({
+            sessionId,
+            role: "assistant",
+            content: redact(turnText),
+            metadata: rowEnvelope ? { llm_call: rowEnvelope } : null,
+          });
+          if (turnText) lastAssistantMessageId = rowId;
         }
       }
     }
   } catch (err) {
     console.error(`[${logPrefix}] SSE collect error for session=${sessionId}:`, err);
   }
+  if (persist) await flushTerminalError();
   // Prefer the last full assistant turn; fall back to streamed deltas if the
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");
