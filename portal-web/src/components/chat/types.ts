@@ -7,26 +7,22 @@ export type ToolStatus = "running" | "success" | "error" | "aborted"
 /**
  * Per-message timing data shown as small badges in the chat bubble.
  *
- * Designed so a naive sum of all visible badges equals the turn's wall clock
- * (within event-dispatch noise) — no double-counting, no missing intervals.
- *
- * Assistant messages:
- *   - ⏳ ttftMs:     first message of a turn ONLY. Time to first token.
- *   - 💭 thinkingMs: boundary (turn-start or last tool_end) → first text token.
- *   - ✍️ outputMs:  first text token → message_end (text streaming time).
+ * Assistant messages carry ONE model call's partition, measured by the runtime at
+ * the provider boundary (`metadata.llm_call.ms`, live: `event.llmCall.ms`):
+ *   - netTtftMs:  request sent → first token (network + queue + hidden reasoning)
+ *   - thinkingMs: streamed reasoning blocks
+ *   - outputMs:   text + tool-call argument streaming
+ *   - totalMs:    request sent → response end (= the three above)
  *
  * Tool messages:
- *   - 💭 thinkingMs: model reasoning before this tool fired (boundary-based).
- *   - ⚙️ durationMs: tool wall-clock execution time.
- *
- * turnTotalMs is carried for cross-checking but not rendered as a badge.
+ *   - durationMs: tool wall-clock execution time (agentbox clock).
  */
 export interface MessageTiming {
-  ttftMs?: number
+  netTtftMs?: number
   thinkingMs?: number
   outputMs?: number
+  totalMs?: number
   durationMs?: number
-  turnTotalMs?: number
 }
 
 export interface ModelRouteMetadata {

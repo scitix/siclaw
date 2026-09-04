@@ -100,20 +100,15 @@ function formatTimingMs(ms: number): string {
 }
 
 /**
- * Inline "model time" shown next to the assistant's header. Combines the
- * three model-side phases (ttft + thinking + output) into one user-facing
- * figure so chat doesn't surface dashboard-level timing breakdowns.
- * Dashboard latency stats keep their per-phase split.
+ * Inline "model time" shown next to the assistant's header: the model call's
+ * total (request sent → response end). Chat shows one figure; the dashboard
+ * keeps the net_ttft / thinking / output split.
  */
 function combinedModelMs(timing: MessageTiming | undefined): number | undefined {
   if (!timing) return undefined
-  // ttftMs already covers user-message → first-token (and contains the
-  // thinking portion). Add outputMs (first-delta → message_end) to get
-  // total model wall-clock. thinkingMs is a subset of ttftMs and is
-  // intentionally not summed to avoid double-counting.
-  const ttft = typeof timing.ttftMs === "number" ? timing.ttftMs : 0
-  const out = typeof timing.outputMs === "number" ? timing.outputMs : 0
-  const total = ttft + out
+  const total = typeof timing.totalMs === "number"
+    ? timing.totalMs
+    : (timing.netTtftMs ?? 0) + (timing.thinkingMs ?? 0) + (timing.outputMs ?? 0)
   if (total <= 0) return undefined
   return total
 }
@@ -2794,16 +2789,13 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
           <div className="ml-auto flex items-center gap-1.5 shrink-0">
             {(() => {
               const t = message.timing
-              const showThink = typeof t?.thinkingMs === "number"
               const showDur = typeof t?.durationMs === "number"
               const durationLabel = message.toolStatus === "running" ? "running" : "ran"
               return (
                 <>
-                  {(showThink || showDur) && (
+                  {showDur && (
                     <span className="text-[11px] text-muted-foreground tabular-nums select-text">
-                      {showThink && <>thinking {formatTimingMs(t!.thinkingMs!)}</>}
-                      {showThink && showDur && ", "}
-                      {showDur && <>{durationLabel} {formatTimingMs(t!.durationMs!)}</>}
+                      {durationLabel} {formatTimingMs(t!.durationMs!)}
                     </span>
                   )}
                 </>
