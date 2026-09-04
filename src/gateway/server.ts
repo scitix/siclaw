@@ -94,7 +94,7 @@ import {
   handleDelegationEvents,
   handleMetricsFlush,
 } from "./internal-api.js";
-import { handleDelegate, handleDelegates, isDelegationSettled, salvageDelegationTraceBind } from "./delegate-api.js";
+import { handleDelegate, handleDelegates } from "./delegate-api.js";
 import { a2aTransportConfig } from "./delegate-a2a-transport.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
@@ -2540,33 +2540,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
-  // Reliable cross-Runtime delegation controls arrive as RPCs instead of the
-  // best-effort event lane. Acknowledge only after the matching source handler
-  // has consumed the envelope; the control plane retains and retries it otherwise.
-  rpcMethods.set("delegation.control", async (params) => {
-    if (frontendClient.dispatchReliableEvent("delegation.event", params)) return { ok: true };
-    // No live consumer is not automatically a delivery failure. A terminal whose
-    // acknowledgement was lost gets re-sent, and by then its consumer is gone
-    // *because it consumed the original*. Rejecting that would retry forever,
-    // which keeps the sender's relay alive; a relay that later expires aborts by
-    // (agent, session) and would kill a NEW turn reusing that peer session.
-    const delegationId = typeof params?.delegationId === "string" ? params.delegationId : "";
-    // A terminal that outlived its consumer (Stop, idle-timeout — or a source
-    // restart that emptied the settled set) still carries the leg's trace id —
-    // salvage the opening-row bind, or the interrupted legs a review drills into
-    // stay unlinked. Fire-and-forget on BOTH branches: the ack (or the retry-driving
-    // throw below) must not wait on a best-effort bind, and the salvage's own memo
-    // keeps redelivery retries from repeating the history walk.
-    if (delegationId) {
-      void salvageDelegationTraceBind(params as Record<string, unknown>).catch((err) => {
-        console.warn(`[runtime] settled-delegation trace salvage failed for ${delegationId}:`, err);
-      });
-    }
-    if (delegationId && isDelegationSettled(delegationId)) {
-      return { ok: true, alreadySettled: true };
-    }
-    throw new Error("No active delegation consumer accepted the control event");
-  });
+  // ⚠️ `delegation.control` 删了 —— 它没有发送方了。
+  //
+  // 它是跨 Runtime 委托中继的收尾:目标 Runtime 把控制帧(input_required、
+  // terminal)经控制面可靠投递回源 Runtime,源侧在这里 ack。委托改走 A2A 之后
+  // 这条中继不存在了:peer 的事件由控制面按 A2A 流下发给发起方,ack 语义由
+  // A2A Task 的状态机自己承担。
 
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
   // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to

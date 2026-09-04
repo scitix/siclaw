@@ -309,19 +309,11 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(abortSessionCalls).toEqual([]);
   });
 
-  it("acknowledges delegation controls only after a matching source consumer accepts them", async () => {
-    const frontendClient = fakeFrontendClient();
-    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
-    const control = server.rpcMethods.get("delegation.control")!;
-    const envelope = { delegationId: "d1", sessionId: "S", event: { type: "prompt_done" } };
-
-    frontendClient.dispatchReliableEvent.mockReturnValueOnce(false);
-    await expect(control(envelope, { sendEvent: vi.fn() })).rejects.toThrow(/No active delegation consumer/);
-
-    frontendClient.dispatchReliableEvent.mockReturnValueOnce(true);
-    await expect(control(envelope, { sendEvent: vi.fn() })).resolves.toMatchObject({ ok: true });
-    expect(frontendClient.dispatchReliableEvent).toHaveBeenLastCalledWith("delegation.event", envelope);
-  });
+  // ⚠️ 「delegation.control 的 ack 语义」那条删了 —— 那个 RPC 方法不存在了。
+  //
+  // 它是跨 Runtime 委托中继的收尾:目标 Runtime 把控制帧经控制面可靠投递回源
+  // Runtime,源侧 ack。委托改走 A2A 后这条中继没有了,peer 的事件由控制面按 A2A
+  // 流下发,ack 由 Task 状态机承担。
 
   it("starts consuming the reply without waiting for trace binding", async () => {
     bindMessageTraceIdMock.mockImplementationOnce(() => new Promise<void>(() => {}));

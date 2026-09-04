@@ -68,23 +68,6 @@ const REMOTE_RESULT_WINDOW_MAX = 20_000;
  */
 const MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
-/**
- * Maximum silence between matching remote relay events. The environment value
- * is in seconds so operators can extend deep diagnostic turns without allowing
- * a disconnected relay to wait forever.
- */
-export function getRemoteDelegationIdleTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-  const configured = parsePositiveIntEnv(
-    env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT,
-    DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS,
-    { unitMs: true },
-  );
-  if (configured <= MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS) return configured;
-  console.warn(
-    `[delegate-api] SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT=${configured}ms exceeds the control plane's relay lease; clamping to ${MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS}ms`,
-  );
-  return MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS;
-}
 
 interface DelegationRoute {
   local: boolean;
@@ -113,21 +96,7 @@ interface DelegationRelayEnvelope {
 const SETTLED_DELEGATION_MEMORY = 512;
 const settledDelegations = new Set<string>();
 
-function markDelegationSettled(delegationId: string): void {
-  if (!delegationId) return;
-  settledDelegations.delete(delegationId);
-  settledDelegations.add(delegationId);
-  while (settledDelegations.size > SETTLED_DELEGATION_MEMORY) {
-    const oldest = settledDelegations.values().next().value as string | undefined;
-    if (oldest === undefined) break;
-    settledDelegations.delete(oldest);
-  }
-}
 
-/** Whether a control frame for this delegation was already consumed to completion. */
-export function isDelegationSettled(delegationId: string): boolean {
-  return settledDelegations.has(delegationId);
-}
 
 interface DelegationExecutionOutcome {
   error?: string;
@@ -184,79 +153,7 @@ type DurableRemoteResult =
   | { status: "empty" }
   | { status: "failed"; error: string };
 
-/**
- * Read the authoritative remote answer after the terminal event. Live relay
- * frames are best-effort progress signals and may be dropped individually; the
- * current delegated user row is the durable boundary marker. The session lock
- * guarantees that later rows up to prompt_done belong to this turn even when a
- * peer session is reused.
- */
-/**
- * The widening-window walk both durable readers share: find the CURRENT turn's
- * opening user row (the durable boundary marker — delegationId is minted per
- * delegate call, so the reverse scan is unique). A fixed window would make the
- * search a function of how chatty the turn was: tool rows are messages too, so
- * one tool-heavy investigation can bury its own opening row.
- *
- * Returns the window and the boundary index, or undefined when the whole session
- * was read without finding the row. Throws what getMessages throws — each caller
- * reports that in its own vocabulary.
- */
-async function findTurnBoundary(
-  peerSessionId: string,
-  delegationId: string,
-): Promise<{ window: Awaited<ReturnType<typeof getMessages>>; boundary: number } | undefined> {
-  // The update clause doubles AND clamps in one expression (min(2l, MAX)):
-  // doubling blindly would overshoot the stated ceiling on the last step
-  // (12800 → 25600) and request more rows than the cap admits.
-  for (let limit = REMOTE_RESULT_WINDOW_START; ; limit = Math.min(limit * 2, REMOTE_RESULT_WINDOW_MAX)) {
-    const window = await getMessages(peerSessionId, { limit });
-    for (let i = window.length - 1; i >= 0; i -= 1) {
-      if (window[i].role === "user" && window[i].delegationId === delegationId) {
-        return { window, boundary: i };
-      }
-    }
-    // A window that came back short IS the whole session: widening cannot reveal
-    // a boundary row that is not there.
-    if (window.length < limit || limit >= REMOTE_RESULT_WINDOW_MAX) return undefined;
-  }
-}
 
-async function recoverRemoteResult(
-  peerSessionId: string,
-  delegationId: string,
-): Promise<DurableRemoteResult> {
-  let found: Awaited<ReturnType<typeof findTurnBoundary>>;
-  try {
-    found = await findTurnBoundary(peerSessionId, delegationId);
-  } catch (err) {
-    console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
-    return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
-  }
-  if (!found) {
-    return { status: "failed", error: "Remote delegation completed, but its durable turn boundary was not found" };
-  }
-  const turnMessages = found.window.slice(found.boundary + 1);
-
-  const persistedError = [...turnMessages].reverse().find((message) =>
-    message.role === "assistant" &&
-    message.metadata?.kind === "error_response" &&
-    message.content.trim().length > 0,
-  );
-  if (persistedError) return { status: "failed", error: persistedError.content.trim() };
-
-  const assistantText = turnMessages
-    .filter((message) =>
-      message.role === "assistant" &&
-      message.metadata?.kind !== "error_response" &&
-      message.content.trim().length > 0,
-    )
-    .map((message) => message.content.trim())
-    .join("\n\n");
-  if (assistantText) return { status: "found", finalText: assistantText };
-
-  return { status: "empty" };
-}
 
 /**
  * Salvage the trace link from a terminal that arrived AFTER its delegation's
@@ -276,33 +173,6 @@ async function recoverRemoteResult(
  */
 const salvagedDelegations = new Set<string>();
 const SALVAGED_DELEGATIONS_CAP = 512;
-export async function salvageDelegationTraceBind(params: Record<string, unknown>): Promise<void> {
-  const sessionId = typeof params?.sessionId === "string" ? params.sessionId : "";
-  const delegationId = typeof params?.delegationId === "string" ? params.delegationId : "";
-  const event = params?.event as Record<string, unknown> | undefined;
-  const traceId = validTraceId(event?.traceId);
-  if (!sessionId || !delegationId || !traceId) return;
-  if (salvagedDelegations.has(delegationId)) return;
-  salvagedDelegations.add(delegationId);
-  if (salvagedDelegations.size > SALVAGED_DELEGATIONS_CAP) {
-    // FIFO eviction, same shape as the settled-delegations bound: Set iteration
-    // order is insertion order.
-    const oldest = salvagedDelegations.values().next().value;
-    if (oldest !== undefined) salvagedDelegations.delete(oldest);
-  }
-  const found = await findTurnBoundary(sessionId, delegationId);
-  if (!found) {
-    // Loud, not silent: a salvage that found no opening row (the append failed at
-    // delegation time) is the one outcome an operator cannot distinguish from
-    // success without this line.
-    console.warn(`[delegate-api] settled-delegation trace salvage found no opening row for delegation=${delegationId} session=${sessionId}`);
-    return;
-  }
-  const row = found.window[found.boundary];
-  await bindMessageTraceId(row.id, sessionId, traceId).catch((err) => {
-    warnTraceBindFailure("settled delegation", sessionId, row.id, err);
-  });
-}
 
 /** GET /api/internal/delegates — the calling coordinator's roster. */
 export async function handleDelegates(

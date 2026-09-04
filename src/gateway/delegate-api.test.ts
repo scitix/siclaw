@@ -145,7 +145,6 @@ function makeDeps(resolveSessionResult: unknown) {
     }
     if (method === "chat.resolveSession") return resolveSessionResult;
     if (method === "chat.recentDelegationSessions") return { ids: [] };
-    if (method === "delegation.resolveRoute") return { local: true, sourceRuntimeId: "rt1", targetRuntimeId: "rt1" };
     return {};
   });
   return {
