@@ -71,6 +71,19 @@ export interface ConsumeAgentSseOptions {
    * output shares one trace_id in chat_messages. Absent → rows keep NULL.
    */
   traceId?: string;
+  /**
+   * The agent that RAN this turn, stamped onto every assistant/tool row.
+   *
+   * Only interesting once a session can change hands: a handed-over session's
+   * transcript is a single conversation answered by two different agents, and
+   * this column is the only thing that says which turn was whose. Without it an
+   * operator reading the transcript — or an analysis pass attributing a bad
+   * answer — sees one undifferentiated stream under the facade's name.
+   *
+   * Absent → rows keep NULL, which is what every pre-handoff caller wants: the
+   * session's own agent_id already answers the question when nothing moved.
+   */
+  agentId?: string;
 }
 
 export interface SseConsumptionResult {
@@ -349,7 +362,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // for the whole consume run (one prompt = one root trace), so one wrapper covers
   // all append sites; updateMessage is untouched (rows are stamped at append time).
   const appendRow = (input: Parameters<typeof appendMessage>[0]) =>
-    appendMessage({ ...input, traceId: opts.traceId ?? null });
+    appendMessage({
+      ...input,
+      traceId: opts.traceId ?? null,
+      // Who answered this turn. See ConsumeAgentSseOptions.agentId — the only
+      // record of that once a session can be handed to another agent.
+      fromAgentId: input.fromAgentId ?? opts.agentId ?? null,
+    });
 
   let assistantContent = "";
   let currentMsgText = "";

@@ -1298,3 +1298,35 @@ describe("consumeAgentSse — 交接之后", () => {
     expect(appendCalls.some((c) => c.toolName === "cluster_list")).toBe(true);
   });
 });
+
+// 交接之后,session 的 agent_id 永远还是 facade —— 一段对话两个作者,谁答的哪一轮
+// 只有这一列说得清。少了它,运维读 transcript、分析回溯一个坏答案,看到的是一条
+// 挂在 facade 名下、分不出层次的流水。
+describe("consumeAgentSse — 落库时打上执行方", () => {
+  it("assistant 与 tool 行都带 from_agent_id", async () => {
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get nodes" } },
+        { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "4 nodes" }] } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "4 个节点" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true, agentId: "agent-cn",
+    });
+    expect(appendCalls.length).toBeGreaterThan(0);
+    for (const c of appendCalls) expect(c.fromAgentId).toBe("agent-cn");
+  });
+
+  // 没传就是 NULL,不是空串:会话没换过手时,session 自己的 agent_id 已经回答了这个
+  // 问题,再存一遍只是把同一个事实写两处。
+  it("没传执行方就落 NULL", async () => {
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "bash", args: { command: "ls" } },
+        { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+    });
+    expect(appendCalls.length).toBeGreaterThan(0);
+    for (const c of appendCalls) expect(c.fromAgentId).toBeNull();
+  });
+});

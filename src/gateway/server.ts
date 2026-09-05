@@ -1207,6 +1207,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             sessionId: promptResult.sessionId,
             userId,
             traceId: ackTraceId,
+            // Stamp who answered. A handed-over session's transcript is one
+            // conversation with two authors, and this column is the only place
+            // that says which turn belonged to whom — the session's agent_id
+            // stays the facade forever.
+            agentId,
             persistMessages: true,
             // The box has started consuming a user message: give that row its place in
             // the conversation now, which is the only moment processing order is visible.
