@@ -1249,3 +1249,52 @@ describe("consumeAgentSse — onEvent callback", () => {
     expect(seen[1].dbMessageId).toBe(seen[0].dbMessageId);
   });
 });
+
+// 交接之后这一轮就结束了 —— 但只是"按约定"结束:transfer_to_agent 的结果文本让模型
+// 停下,模型不一定听。测试环境里观察到的就是不听:facade 把会话交出去之后又重试了
+// 刚失败的工具、再调一个、然后写了一段"转交链路可能有问题,会话又回到了我这里"。
+// 那段话抢在接手方的答案前面到达用户 —— 恰好是"看起来像一个 agent"要避免的 —— 而且
+// 它被**落库**了,以后每一轮回灌都会把它当历史读进去。
+describe("consumeAgentSse — 交接之后", () => {
+  const handoff = { type: "handoff_requested", targetAgentId: "agent-cn", brief: "查 roce-test 节点数" };
+
+  it("交接帧本身照常relay —— 控制面靠它决定下一跳去哪", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([handoff]), sessionId: "s", userId: "u",
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen).toEqual([handoff]);
+  });
+
+  it("交接之后的事件既不relay也不落库", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_start", message: { role: "assistant" } },
+        handoff,
+        { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get nodes" } },
+        { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "boom" }] } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "转交链路可能存在问题" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["message_start", "handoff_requested"]);
+    expect(appendCalls.map((c) => c.content)).not.toContain("转交链路可能存在问题");
+    expect(appendCalls.some((c) => c.toolName === "bash")).toBe(false);
+  });
+
+  // 交接之前的一切照常 —— 这个开关只往后切,不影响 facade 在决定交接前做的判断。
+  it("交接之前的事件不受影响", async () => {
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "cluster_list", args: {} },
+        { type: "tool_execution_end", toolName: "cluster_list", result: { content: [{ type: "text", text: "{}" }] } },
+        handoff,
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+    });
+    expect(appendCalls.some((c) => c.toolName === "cluster_list")).toBe(true);
+  });
+});

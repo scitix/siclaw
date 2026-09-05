@@ -503,6 +503,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // isn't written yet when agent_end arrives. We therefore stash the snapshot
   // here and let the deferred persistAssistant fold it into the row's metadata.
   let capturedContextUsage: Record<string, unknown> | undefined;
+  /** This turn handed the conversation away; see the cut inside the loop. */
+  let handoffRequested = false;
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
   // try/finally, not a bare fall-through: the terminal error is BUFFERED
@@ -519,6 +521,31 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // undefined would throw and kill the whole SSE stream (STREAM_INTERRUPTED).
       const eventType = (evt.type as string | undefined) ?? "";
       eventCount++;
+
+      // ── After a handoff, this agent's turn is over ────────────────────────
+      //
+      // `transfer_to_agent` is terminal BY CONTRACT, and its result text tells
+      // the model to stop. A model does not have to obey, and observed in the
+      // test environment it did not: after handing the conversation away the
+      // facade retried the tool that had just failed, ran another one, and wrote
+      // a paragraph concluding "the transfer seems broken, it came back to me".
+      // That paragraph then reached the user AHEAD of the answer the receiving
+      // agent was already producing — the exact opposite of the one-continuous-
+      // answer property the whole design exists for — and, worse, it was
+      // PERSISTED, so every later turn would read it as history.
+      //
+      // So the cut is made here rather than trusted to the prompt: once this
+      // turn has asked for a handoff, nothing more from it is relayed or
+      // written. `handoff_requested` itself still passes (the flag is set after
+      // this check) — the control plane reads it to decide where the next hop
+      // goes. `prompt_done` is unaffected: it is emitted by server.ts once this
+      // consumer returns, not through this loop, so the chain still gets its
+      // signal to dispatch.
+      //
+      // Not a fix for the wasted tokens: the box keeps running until its turn
+      // ends on its own. Stopping the brain itself is the follow-up.
+      if (handoffRequested) continue;
+      if (eventType === "handoff_requested") handoffRequested = true;
 
       if (eventType === "knowledge_sources") {
         pendingKnowledgeSources = (evt as Record<string, unknown>).sources;
