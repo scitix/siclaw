@@ -1267,6 +1267,24 @@ describe("consumeAgentSse — 交接之后", () => {
     expect(seen).toEqual([handoff]);
   });
 
+  // ⚠️ 第一版这一刀切掉了**全部**事件,把被弃权那一轮的 agent_end 也带走了 ——
+  // 前端剩下一个只见 agent_start、永远等不到 agent_end 的 turn,答案已经到了,
+  // "still working" 的转圈还挂在上面。turn 生命周期是客户端的状态机,不是输出。
+  it("生命周期事件照常放过,否则前端的转圈永远停不下来", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        handoff,
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "多余的话" }] } },
+        { type: "agent_end" },
+        { type: "turn_end" },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["handoff_requested", "agent_end", "turn_end"]);
+  });
+
   it("交接之后的事件既不relay也不落库", async () => {
     const seen: unknown[] = [];
     await consumeAgentSse({

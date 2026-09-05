@@ -33,6 +33,30 @@ export type OnEventCallback = (
   extras: SseEventExtras,
 ) => void;
 
+/**
+ * What a turn stops saying once it has handed the conversation away — see the
+ * cut in the event loop.
+ *
+ * Everything here is OUTPUT: it is rendered to the person watching, or written
+ * to the transcript, or both. Everything NOT here is turn lifecycle
+ * (`agent_start` / `agent_end` / `turn_end` / `agent_settled`, the routing
+ * events, compaction and retry) and must keep flowing: those are what the
+ * client balances its "still working" state on, and swallowing one leaves the
+ * spinner running under an answer that already arrived.
+ */
+const HANDOFF_MUTED_EVENT_TYPES = new Set([
+  "message_start",
+  "message_update",
+  "message_end",
+  "tool_start",
+  "tool_end",
+  "tool_execution_start",
+  "tool_execution_update",
+  "tool_execution_end",
+  "agent_message",
+  "knowledge_sources",
+]);
+
 export interface ConsumeAgentSseOptions {
   client: AgentBoxClient;
   sessionId: string;
@@ -563,7 +587,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       //
       // Not a fix for the wasted tokens: the box keeps running until its turn
       // ends on its own. Stopping the brain itself is the follow-up.
-      if (handoffRequested) continue;
+      //
+      // ⚠️ CONTENT only. The first version of this cut dropped EVERYTHING and
+      // took the abandoned turn's `agent_end` with it, leaving the frontend one
+      // `agent_start` it never saw closed — the answer arrived and the "still
+      // working" spinner stayed on it forever. The turn-lifecycle events are the
+      // client's state machine, not output: they have to stay balanced whether
+      // or not anybody is listening to what the agent says.
+      if (handoffRequested && HANDOFF_MUTED_EVENT_TYPES.has(eventType)) {
+        continue;
+      }
       if (eventType === "handoff_requested") handoffRequested = true;
 
       if (eventType === "knowledge_sources") {
