@@ -16,6 +16,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeRehydratedSession } from "./session-rehydrate-store.js";
 import { createSiclawSession } from "../core/agent-factory.js";
 import type {
   SpawnSubagentExecutor,
@@ -3036,6 +3037,42 @@ export class AgentBoxSessionManager {
       managed._releaseTimer = null;
     }
     await this.release(sessionId);
+  }
+
+  /**
+   * Make sure a continuation has context to continue FROM — the checkpointer read.
+   *
+   * Local JSONL is a cache; the control plane is the authority. When this box has
+   * nothing for `sessionId` (another agent ran the earlier turns, or a replica /
+   * restart moved the session here), pull the transcript and write it as a pi
+   * session BEFORE `getOrCreate` runs `continueRecent` — which then restores it
+   * through the exact path a pod restart already uses. Nothing downstream learns
+   * the history was ever remote.
+   *
+   * Returns whether context now exists, so the strict `requireExistingSession`
+   * check in http-server can read the truthful state instead of the pre-load one.
+   *
+   * ⚠️ A failure here is logged LOUDLY but does not fail the turn: a transient
+   * gateway error must not turn into a 412 for a session that may well be brand
+   * new. The cost is exactly the failure this exists to fix — a turn that starts
+   * fresh — so the log line is the signal to watch.
+   */
+  async ensureSessionContext(sessionId?: string): Promise<boolean> {
+    const id = sessionId?.trim();
+    if (!id) return false;
+    if (this.hasRestorableSessionContext(id)) return true;
+    const gc = this.gatewayClient;
+    if (!gc) return false;
+    try {
+      const { messages } = await gc.fetchSessionHistory(id);
+      if (!messages?.length) return false; // a genuinely new session — nothing to load
+      const { written } = writeRehydratedSession(process.cwd(), this.getSessionDir(id), messages);
+      console.log(`[agentbox-session] Rehydrated session ${id} from the control plane: ${messages.length} rows → ${written} messages`);
+      return written > 0;
+    } catch (err) {
+      console.error(`[agentbox-session] Could not rehydrate session ${id} from the control plane; the turn will start WITHOUT prior context:`, err);
+      return false;
+    }
   }
 
   /**

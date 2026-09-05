@@ -95,6 +95,8 @@ import {
   handleMetricsFlush,
 } from "./internal-api.js";
 import { handleDelegate, handleDelegates } from "./delegate-api.js";
+import { handleSessionHistory } from "./session-history-api.js";
+import { SESSION_HISTORY_PATH } from "../shared/session-history.js";
 import { a2aTransportConfig } from "./delegate-a2a-transport.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
@@ -2704,6 +2706,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/knowledge/bundle" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleKnowledgeBundle(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Session history — the checkpointer read. An agentbox that holds no
+          // local JSONL for a session (another agent's box, a replica, a restart)
+          // pulls the full transcript from the control plane before its turn.
+          if (url.startsWith(SESSION_HISTORY_PATH) && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            void handleSessionHistory(req, res, identity);
             return;
           }
 

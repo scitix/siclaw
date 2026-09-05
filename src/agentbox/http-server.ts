@@ -935,7 +935,11 @@ export function createHttpServer(
       sendJson(res, 200, { ok: true, sessionId: body.sessionId, turnId: body.turnId, duplicate: true });
       return;
     }
-    const resumed = sessionManager.hasRestorableSessionContext(body.sessionId);
+    // The checkpointer read runs BEFORE the strict check, or the check would judge
+    // a session this box has never seen — and refuse it — while the control plane
+    // holds its whole transcript. For a brand-new session the load is one cheap
+    // empty round-trip.
+    const resumed = await sessionManager.ensureSessionContext(body.sessionId);
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
         code: SESSION_CONTEXT_UNAVAILABLE_CODE,
