@@ -62,7 +62,15 @@ export async function loadFullHistory(
     before = oldest;
   }
   // 页是从新到旧取的,每页内部从旧到新;整体要从旧到新,把页序反过来再拍平。
-  return pages.reverse().flat().map(toRow);
+  //
+  // ⚠️ 丢掉**尚未被 box 消费**的行(seq_sequenced = false)。runtime 在调 box 的
+  // prompt **之前**就把本轮的 user 行落库了,回灌若把它当历史带进去,box 又拿同一段
+  // 文字当 prompt —— 模型看到最后一条 user 消息出现两次。首次 go/no-go 的日志
+  // "3 rows → 3 messages"(turn 1 只有 2 行)就是它。排队中的 steer 同理:它们会
+  // 作为 steer 送达,不是历史。`seq_sequenced` 的语义正是"发出但从未被消费"
+  // (控制面侧 docs/developer/siclaw-chat-seq-contract.md),用它而不是"比对末行
+  // 文本",因为文本相等是巧合,消费状态才是事实。
+  return pages.reverse().flat().filter((m) => m.seqSequenced).map(toRow);
 }
 
 export async function handleSessionHistory(
