@@ -1046,6 +1046,90 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
   });
 });
 
+/**
+ * 交接之后本 box 对这段会话的本地副本就作废了 —— 它停在交接那一刻,后面所有轮
+ * 都发生在别的 agent 那里。这组测试锁住"作废"的两种消费方式:被 release 删掉,
+ * 或者被下一次 ensureSessionContext 丢掉后重新回灌。
+ */
+describe("AgentBoxSessionManager — 交接后丢弃本地会话副本", () => {
+  it("默认不丢:本地有历史就直接用,不去问控制面", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message", message: { role: "user" } },
+      { type: "message", message: { role: "assistant" } },
+    ];
+    fs.mkdirSync(path.join(mgr.getBaseSessionDir(), "s-local"), { recursive: true });
+    const fetchSessionHistory = vi.fn();
+    mgr.gatewayClient = { fetchSessionHistory };
+
+    expect(await mgr.ensureSessionContext("s-local")).toBe(true);
+    expect(fetchSessionHistory).not.toHaveBeenCalled();
+  });
+
+  // ⚠️ 这条是关键:本地"有"历史,但那份历史是错的。不重新拉,接手回来的 agent 会
+  // 拿一段停在交接瞬间的对话去回答,中间几轮凭空消失。
+  it("交接过的 session 即使本地有历史也重新回灌", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message", message: { role: "user" } },
+      { type: "message", message: { role: "assistant" } },
+    ];
+    const dir = path.join(mgr.getBaseSessionDir(), "s-handed");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "stale.jsonl"), "{}\n");
+    const fetchSessionHistory = vi.fn(async () => ({ sessionId: "s-handed", messages: [] }));
+    mgr.gatewayClient = { fetchSessionHistory };
+
+    await mgr.evictSessionContext("s-handed");
+    await mgr.ensureSessionContext("s-handed");
+
+    expect(fetchSessionHistory).toHaveBeenCalledWith("s-handed");
+    expect(fs.existsSync(path.join(dir, "stale.jsonl"))).toBe(false);
+  });
+
+  it("release 把交接过的 session 目录删掉", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const dir = path.join(mgr.getBaseSessionDir(), "s-gone");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "stale.jsonl"), "{}\n");
+
+    await mgr.evictSessionContext("s-gone");
+    await mgr.release("s-gone");
+
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it("没交接过的 session,release 不碰它的目录", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const dir = path.join(mgr.getBaseSessionDir(), "s-kept");
+    fs.mkdirSync(dir, { recursive: true });
+
+    await mgr.release("s-kept");
+
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  // 标记被 ensureSessionContext 消费掉了,所以随后的 release 不能再去删 —— 那时
+  // 目录里装的已经是刚回灌回来的、正确的副本。
+  it("重新回灌之后 release 不再删这个目录", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__frameworkEntriesState.entries = [];
+    const dir = path.join(mgr.getBaseSessionDir(), "s-back");
+    fs.mkdirSync(dir, { recursive: true });
+    mgr.gatewayClient = { fetchSessionHistory: async () => ({ sessionId: "s-back", messages: [] }) };
+
+    await mgr.evictSessionContext("s-back");
+    await mgr.ensureSessionContext("s-back");
+    // 回灌之后的目录内容(这里手工摆一份,回灌本身走的是真实 SessionManager,
+    // 在这个文件里是假的)。
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "fresh.jsonl"), "{}\n");
+    await mgr.release("s-back");
+
+    expect(fs.existsSync(path.join(dir, "fresh.jsonl"))).toBe(true);
+  });
+});
+
 describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
   // A child fake brain whose behavior is driven by its prompt text, so the outcome is
   // deterministic regardless of the (concurrent) order children are created in.

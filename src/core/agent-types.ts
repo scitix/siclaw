@@ -271,7 +271,12 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     // `run_in_background`, whose tool descriptions tell it to call task_output /
     // job_stop — both of which live in this group. Without it an SRE agent can
     // start a background capture it can neither read nor stop.
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output"],
+    // transfer_conversation costs an ordinary SRE agent nothing — with no facade
+    // and no backends it has no destinations and the tool never appears. It is
+    // here because a REGIONAL SRE agent (one leg of a multi-region facade) is an
+    // sre, and without it that leg could be handed a conversation it can never
+    // hand back.
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
     defaultPrompt: SRE_DEFAULT_PROMPT,
     defaultNoSkills: false,
   },
@@ -280,7 +285,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
     // Coverage comes from list_delegates. cluster_list/host_list describe the
     // coordinator's own bindings and prime the wrong "bind a cluster" route.
-    capabilities: ["read_files", "delegate_agents"],
+    capabilities: ["read_files", "delegate_agents", "transfer_conversation"],
     defaultPrompt: COORDINATOR_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },

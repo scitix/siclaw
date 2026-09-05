@@ -40,6 +40,7 @@ import { registration as reportFindings } from "./workflow/report-findings.js";
 import { registration as requestInput } from "./workflow/request-input.js";
 import { registration as delegateToAgent } from "./workflow/delegate-to-agent.js";
 import { registration as listDelegates } from "./workflow/list-delegates.js";
+import { registration as transferToAgent } from "./workflow/transfer-to-agent.js";
 import {
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
 } from "./workflow/task-tools.js";
@@ -60,5 +61,5 @@ export const allToolEntries: ToolEntry[] = [
   channelUpdate, reportFindings, requestInput,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, jobStop, taskOutput,
-  delegateToAgent, listDelegates,
+  delegateToAgent, listDelegates, transferToAgent,
 ];

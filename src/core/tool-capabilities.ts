@@ -40,6 +40,12 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
   spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
   delegate_agents: ["delegate_to_agent", "list_delegates"],   // delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage; distinct from spawn
+  // Handing the conversation to another agent is NOT delegation and does not
+  // belong in that group: delegation calls a peer and keeps the turn, a transfer
+  // gives the session away for good. Granting one must not silently grant the
+  // other. Roster-gated the same way — an agent with no backends and no facade
+  // has no destinations, so this capability expands to nothing for it.
+  transfer_conversation: ["transfer_to_agent"],
   scheduling:      ["manage_schedule"],
   session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input", "propose_execution"],   // IM-channel-visible updates + delegation result artifact + clarification / write-approval requests
 };
