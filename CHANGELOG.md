@@ -46,6 +46,12 @@ is the transfer mechanism that makes both true at once.
   (that event itself still passes; `prompt_done` is emitted outside the loop, so
   the chain still gets its dispatch signal). The abandoned box keeps burning
   tokens until its turn ends on its own — stopping the brain is the follow-up.
+- **Every assistant/tool row now records WHICH agent produced it**
+  (`chat_messages.from_agent_id`, stamped by `consumeAgentSse`). A handed-over
+  session's `agent_id` stays the facade forever, so without this a transcript
+  answered by two agents reads as one undifferentiated stream — and an analysis
+  pass attributing a bad answer would attribute it to the wrong one. Absent
+  caller → NULL, which is right when nothing ever moved.
 - **A handed-away session loses its local transcript.** The local copy is a
   cache; the control plane is the authority. Marked at transfer time (the brain
   is still writing) and consumed either by `release`, which deletes the
