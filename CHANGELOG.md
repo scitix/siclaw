@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+#### Handoff: one agent per network region, one agent as far as the user is concerned
+
+A region's cluster APIs, host SSH, internal MCP servers and model endpoints are
+reachable only from a box sitting inside that region, so a multi-region
+deployment needs one Agent per region. The user should still see ONE agent. This
+is the transfer mechanism that makes both true at once.
+
+- **`transfer_to_agent`** — a terminal tool, shaped like `request_input`: it
+  emits a `handoff_requested` control frame, drops this box's local copy of the
+  session, and ends the turn. It does NOT flip any state itself; the control
+  plane validates the target against the facade's roster, moves the session, and
+  re-dispatches the brief on the same response stream, so the user sees one
+  continuous answer with no card and nothing restated. Its destination menu
+  lists each target's **bound clusters and hosts by name** — unlike
+  `delegate_to_agent`, which gives counts only — because "which region owns this
+  machine" IS the routing decision, and there are a handful of destinations
+  rather than hundreds of peers.
+- **`GET /api/internal/handoff-targets`** → `config.getHandoffTargets`. Scoped to
+  the caller's mTLS identity like `/api/internal/delegates`: a facade gets its
+  backends, a backend gets its facade (the hand-back) plus its siblings, an
+  ordinary agent gets nothing and grows no tool.
+- **`chat.send` honours `skipInitialPersistence` on a handoff hop**, not only on
+  a cross-Runtime delegation. The brief is already persisted as the transfer
+  tool's arguments, so re-persisting it would show the user their own question
+  twice. The arriving turn is also framed as a handover in its prompt (this turn
+  only, never persisted) — without it the receiving agent reads the brief as the
+  user repeating themselves and apologises for it.
+- **A handed-away session loses its local transcript.** The local copy is a
+  cache; the control plane is the authority. Marked at transfer time (the brain
+  is still writing) and consumed either by `release`, which deletes the
+  directory, or by a hand-back's `ensureSessionContext`, which drops it and
+  reloads everything the other agent did in between. ⚠️ The mark is in-memory, so
+  a box that crashes between the two keeps a stale transcript on its PV.
+- **New capability group `transfer_conversation`**, deliberately not folded into
+  `delegate_agents`: delegation calls a peer and keeps the turn, a transfer gives
+  the session away for good, and granting one must not silently grant the other.
+  Held by the `sre` and `coordinator` types — an agent with no facade and no
+  backends has no destinations, so it expands to nothing.
+
 ### Fixed
 
 #### Dispatch idempotency: released reservations and a cross-restart turn ledger

@@ -87,6 +87,11 @@ export interface CreateSiclawSessionOpts {
   delegationRoster?: import("./tool-registry.js").ToolRefs["delegationRoster"];
   /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
+  /** Facade / backend side: agents this one may HAND the conversation to
+   *  (manifest for the transfer_to_agent tool). Non-empty → the tool is exposed. */
+  handoffTargets?: import("./tool-registry.js").ToolRefs["handoffTargets"];
+  /** Drops this box's local copy of the session after handing it away. */
+  evictSessionContext?: () => Promise<void>;
   /** Agent tool allow-list: null is unrestricted only for explicit Custom; built-in types expand their locked groups. */
   allowedTools?: string[] | null;
   /** Agent kind used by the shared context compiler. Legacy standalone callers default to SRE. */
@@ -557,6 +562,8 @@ export async function createSiclawSession(
       delegation: opts?.delegation,
       delegationRoster: opts?.delegationRoster,
       delegateToAgentExecutor: opts?.delegateToAgentExecutor,
+      handoffTargets: opts?.handoffTargets,
+      evictSessionContext: opts?.evictSessionContext,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",

@@ -49,6 +49,7 @@ import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "
 import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
 import { normalizeAgentType } from "../core/agent-types.js";
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
+import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
@@ -3040,6 +3041,32 @@ export class AgentBoxSessionManager {
   }
 
   /**
+   * Sessions this box handed to another agent and must therefore forget.
+   *
+   * Marked rather than deleted on the spot: the transfer happens INSIDE a turn,
+   * and the brain is still appending to that transcript — the tool result and
+   * the closing assistant message are still to come. The mark is consumed either
+   * by `release` (delete the directory) or by `ensureSessionContext` (drop it and
+   * reload from the control plane), whichever comes first.
+   *
+   * ⚠️ In-memory, so a box that CRASHES between the transfer and the release
+   * keeps a stale transcript on its PV. A later hand-back would then resume from
+   * a conversation that stops mid-handoff. Bounded and self-correcting only in
+   * the sense that the control plane still has everything — the fix is a durable
+   * marker, not this set.
+   */
+  private readonly evictedSessions = new Set<string>();
+
+  /**
+   * Forget a session this box has handed away. See `evictedSessions`.
+   */
+  async evictSessionContext(sessionId: string): Promise<void> {
+    const id = sessionId?.trim();
+    if (!id) return;
+    this.evictedSessions.add(id);
+  }
+
+  /**
    * Make sure a continuation has context to continue FROM — the checkpointer read.
    *
    * Local JSONL is a cache; the control plane is the authority. When this box has
@@ -3060,7 +3087,21 @@ export class AgentBoxSessionManager {
   async ensureSessionContext(sessionId?: string): Promise<boolean> {
     const id = sessionId?.trim();
     if (!id) return false;
-    if (this.hasRestorableSessionContext(id)) return true;
+    // A session this box handed away and has been handed back before the delayed
+    // release fired: its local transcript stops at the moment of the transfer, so
+    // "there is context here" is true and useless — everything the other agent
+    // did is missing. Consume the mark, drop the stale copy, and fall through to
+    // a full reload. Consuming it is what keeps the eviction in `release` from
+    // then deleting the FRESH transcript this reload is about to write.
+    if (this.evictedSessions.delete(id)) {
+      try {
+        fs.rmSync(this.getSessionDir(id), { recursive: true, force: true });
+      } catch (err) {
+        console.warn(`[agentbox-session] Could not drop the stale transcript for ${id} before reloading it:`, err);
+      }
+    } else if (this.hasRestorableSessionContext(id)) {
+      return true;
+    }
     const gc = this.gatewayClient;
     if (!gc) return false;
     try {
@@ -3287,6 +3328,21 @@ export class AgentBoxSessionManager {
         }
       }
     }
+    // Handoff destinations: the agents this one may transfer the conversation
+    // to. Same delivery as the delegation roster (K8s boxes have no DB) and the
+    // same degradation — a fetch miss just means transfer_to_agent stays hidden
+    // and this agent answers the turn itself, which is a worse answer but not a
+    // broken one. Skipped on a delegated turn: a peer has no standing to dispose
+    // of the coordinator's session.
+    let handoffTargets: HandoffTarget[] | undefined;
+    if (gc && !delegation) {
+      try {
+        const r = await gc.fetchHandoffTargets();
+        handoffTargets = r.targets?.length ? r.targets : undefined;
+      } catch (err) {
+        console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
+      }
+    }
     const delegateToAgentExecutor: DelegateToAgentExecutor | undefined = (gc && delegationRoster)
       ? async (req, onProgress, signal) => {
           // Translate the peer's live event stream into coordinator-card steps
@@ -3378,6 +3434,9 @@ export class AgentBoxSessionManager {
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,
+      // Facade / backend side: expose transfer_to_agent + its destination menu.
+      handoffTargets,
+      evictSessionContext: async () => { await this.evictSessionContext(id); },
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).
       taskListId: id,
@@ -3801,7 +3860,13 @@ export class AgentBoxSessionManager {
 
   async release(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId);
-    if (!managed) return;
+    if (!managed) {
+      // Not resident — but a handed-away session still has to lose its on-disk
+      // copy, and "already released" is one of the ways it gets here (a rebuild
+      // released it before the mark could be consumed).
+      this.dropEvictedTranscript(sessionId);
+      return;
+    }
 
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
 
@@ -3857,6 +3922,24 @@ export class AgentBoxSessionManager {
       this.onSessionRelease?.();
     } else {
       console.log(`[agentbox-session] Session ${sessionId} was replaced during release, skipping delete`);
+    }
+
+    this.dropEvictedTranscript(sessionId);
+  }
+
+  /**
+   * Drop the on-disk transcript of a session this box handed away, if it is
+   * marked. Ordered after `release`'s memory auto-save on purpose: what this box
+   * LEARNED in its own turns is worth keeping; what it is dropping is only its
+   * stale view of a conversation someone else now owns.
+   */
+  private dropEvictedTranscript(sessionId: string): void {
+    if (!this.evictedSessions.delete(sessionId)) return;
+    try {
+      fs.rmSync(this.getSessionDir(sessionId), { recursive: true, force: true });
+      console.log(`[agentbox-session] Evicted the local transcript for handed-off session ${sessionId}`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Could not evict the local transcript for ${sessionId}:`, err);
     }
   }
 

@@ -13,6 +13,7 @@ import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
 import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
+import { HANDOFF_TARGETS_PATH, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
 import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
 
 export interface GatewayClientOptions {
@@ -282,6 +283,14 @@ export class GatewayClient {
   /** Fetch this coordinator's delegation roster (authorization + manifest). */
   async fetchDelegates(): Promise<DelegatesResponse> {
     return this.request("/api/internal/delegates", "GET");
+  }
+
+  /**
+   * Fetch the agents this one may TRANSFER the conversation to. Empty for an
+   * ordinary agent, which then grows no transfer tool at all.
+   */
+  async fetchHandoffTargets(): Promise<HandoffTargetsResponse> {
+    return this.request(HANDOFF_TARGETS_PATH, "GET");
   }
 
   /**

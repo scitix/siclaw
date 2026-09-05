@@ -19,14 +19,14 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "sre",
     label: "SRE Agent",
     description: "Hands-on specialist: inspects, diagnoses and remediates within its authorized clusters/hosts.",
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output"],
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
     defaultNoSkills: false,
   },
   {
     key: "coordinator",
     label: "Coordinator Agent",
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
-    capabilities: ["read_files", "delegate_agents"],
+    capabilities: ["read_files", "delegate_agents", "transfer_conversation"],
     defaultNoSkills: true,
   },
   {

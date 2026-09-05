@@ -97,6 +97,8 @@ import {
 import { handleDelegate, handleDelegates } from "./delegate-api.js";
 import { handleSessionHistory } from "./session-history-api.js";
 import { SESSION_HISTORY_PATH } from "../shared/session-history.js";
+import { handleHandoffTargets } from "./handoff-targets-api.js";
+import { HANDOFF_TARGETS_PATH } from "../shared/agent-handoff.js";
 import { a2aTransportConfig } from "./delegate-a2a-transport.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
@@ -770,7 +772,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // promptMessageId intentionally stays undefined on this path: the source
     // Runtime already persisted and sequenced the user row, so the target must
     // not bind or update a second local copy of it.
-    const skipInitialPersistence = params.skipInitialPersistence === true && Boolean(delegation?.delegationId);
+    // A HANDOFF arrival: the control plane ended the previous agent's turn on a
+    // `handoff_requested`, flipped the session's executing agent, and re-sent the
+    // brief here — same session, same response stream, new owner.
+    const handoffParam = params.handoff as { fromAgentId?: string; brief?: string } | undefined;
+    const handoff = handoffParam?.fromAgentId
+      ? { fromAgentId: String(handoffParam.fromAgentId), brief: String(handoffParam.brief ?? "") }
+      : undefined;
+    // ⚠️ The flag alone is not enough — it must come with a reason to believe the
+    // user row already exists. Two callers have one: a cross-Runtime delegation
+    // (the source Runtime persisted it) and a handoff hop (the brief is already
+    // in the transfer tool's arguments on the previous turn, so persisting it
+    // again would show the user their question twice under one prompt).
+    const skipInitialPersistence = params.skipInitialPersistence === true
+      && (Boolean(delegation?.delegationId) || Boolean(handoff));
     // Machine-facing strict callers cannot safely publish a reusable sessionId
     // until its session and first user message are durable. Interactive chat
     // keeps the legacy best-effort behavior; strict /run opts into this ACK.
@@ -869,12 +884,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       if (!delegation?.delegationId) return;
       delegatedTurns.delete(turnId);
     };
+    // 交接过来的这一轮,brief 是**上一个 agent 写的**,不是用户写的。不加这一句
+    // 框,模型看到的历史就是「用户问 → 助手说了半句 → 用户又问了一遍」—— 它会当成
+    // 用户在重复,于是道歉、或者从头再问一次。这段话只进本轮的模型上下文:
+    // skipInitialPersistence 让它不落库,所以用户看不到,历史里也不会有。
+    const promptText = handoff
+      ? `[这段对话刚交接到你手上。上文的历史是真的,你现在是这段对话的负责人 —— 直接回答用户,` +
+        `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
+      : text;
     const promptOpts: PromptOptions = {
       sessionId,
       turnId,
       requiredResultToolName,
       userId,
-      text,
+      text: promptText,
       agentId,
       modelProvider: params.modelProvider as string | undefined,
       modelId: params.modelId as string | undefined,
@@ -2715,6 +2738,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url.startsWith(SESSION_HISTORY_PATH) && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             void handleSessionHistory(req, res, identity);
+            return;
+          }
+
+          // Handoff targets — the agents this one may TRANSFER the conversation
+          // to (its backends if it is a facade; the facade + siblings if it is a
+          // backend). Distinct from the delegation roster above: a handoff moves
+          // ownership, it does not call out and come back.
+          if (url === HANDOFF_TARGETS_PATH && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            void handleHandoffTargets(req, res, identity, frontendClient);
             return;
           }
 

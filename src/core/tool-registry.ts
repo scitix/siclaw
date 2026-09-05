@@ -13,6 +13,7 @@ import type {
   SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
 } from "./types.js";
 import type { DelegateResponse, DelegateRosterMember, DelegateStep } from "../shared/agent-delegate.js";
+import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
@@ -513,6 +514,25 @@ export interface ToolRefs {
   delegationRoster?: DelegateRosterMember[];
   /** Runs a delegation to a peer agent. See DelegateToAgentExecutor. */
   delegateToAgentExecutor?: DelegateToAgentExecutor;
+  /**
+   * The agents this one may HAND THE CONVERSATION OVER to — its backends if it
+   * is a facade, its facade plus siblings if it is a backend. Non-empty exposes
+   * `transfer_to_agent` and fills its destination menu. Empty (an ordinary
+   * agent, or a fetch that failed) means the tool never appears, which is the
+   * right degradation: this agent then answers the turn itself.
+   *
+   * Distinct from `delegationRoster` on purpose — a handoff moves ownership of
+   * the session, a delegation calls out and comes back. See agent-handoff.ts.
+   */
+  handoffTargets?: HandoffTarget[];
+  /**
+   * Drops this box's LOCAL copy of the session after handing the conversation
+   * away. The copy is only ever a cache — the control plane holds the authority
+   * and any box can reload it — so dropping it is safe, and keeping it is not:
+   * a box handed the conversation back weeks later would resume from a stale
+   * context missing every turn the other agent ran.
+   */
+  evictSessionContext?: () => Promise<void>;
 }
 
 /** Declarative registration for a single tool. */
