@@ -35,6 +35,17 @@ is the transfer mechanism that makes both true at once.
   twice. The arriving turn is also framed as a handover in its prompt (this turn
   only, never persisted) — without it the receiving agent reads the brief as the
   user repeating themselves and apologises for it.
+- **After a handoff, the rest of that turn is cut at the event pump.** The
+  transfer tool is terminal by contract and its result text says so, but a model
+  does not have to obey — and in the test environment it did not: the facade
+  handed the conversation away, then retried the tool that had just failed, ran
+  another, and wrote "the transfer seems broken, it came back to me". That
+  paragraph reached the user AHEAD of the answer the receiving agent was already
+  producing, and it was persisted, so every later turn would read it as history.
+  `consumeAgentSse` now relays and writes nothing after `handoff_requested`
+  (that event itself still passes; `prompt_done` is emitted outside the loop, so
+  the chain still gets its dispatch signal). The abandoned box keeps burning
+  tokens until its turn ends on its own — stopping the brain is the follow-up.
 - **A handed-away session loses its local transcript.** The local copy is a
   cache; the control plane is the authority. Marked at transfer time (the brain
   is still writing) and consumed either by `release`, which deletes the
