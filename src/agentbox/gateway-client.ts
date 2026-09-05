@@ -12,6 +12,7 @@ import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
+import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
 import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
 
 export interface GatewayClientOptions {
@@ -281,6 +282,15 @@ export class GatewayClient {
   /** Fetch this coordinator's delegation roster (authorization + manifest). */
   async fetchDelegates(): Promise<DelegatesResponse> {
     return this.request("/api/internal/delegates", "GET");
+  }
+
+  /**
+   * Pull a session's full transcript from the control plane, oldest first.
+   * The checkpointer read: called when this box holds no local context for a
+   * session it has been asked to continue.
+   */
+  async fetchSessionHistory(sessionId: string): Promise<SessionHistoryResponse> {
+    return this.request(`${SESSION_HISTORY_PATH}?sessionId=${encodeURIComponent(sessionId)}`, "GET");
   }
 
   /**

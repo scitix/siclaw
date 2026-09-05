@@ -252,6 +252,10 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
     hasRestorableSessionContext: (id?: string) => Boolean(id && sessions.has(id)),
+    // The checkpointer read. This fake has no control plane to load from, so
+    // "context exists" is exactly "the session is resident" — same answer as
+    // the predicate above, which is what http-server used to call directly.
+    ensureSessionContext: async (id?: string) => Boolean(id && sessions.has(id)),
     stopSessionJobs: vi.fn(() => 0),
     markPendingAbort: vi.fn(),
     consumePendingAbort: vi.fn(() => false),
