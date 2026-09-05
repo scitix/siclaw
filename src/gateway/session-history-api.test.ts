@@ -83,6 +83,19 @@ describe("loadFullHistory", () => {
     expect(out.map((r) => r.content)).toEqual(["msg 1", "msg 2"]);
   });
 
+  // ⚠️ 这条钉的是紧接着的回归:`seq_sequenced` 只对 user 行有"消费"语义,
+  // assistant / tool 行永远是 0(没有人去翻它)。按它一刀切会把整段回复全删掉 ——
+  // 实测把一次 GO 退成了 NO_GO。非 user 行**无论** seq_sequenced 是什么都要保留。
+  it("keeps assistant and tool rows regardless of seq_sequenced — only user rows carry that meaning", async () => {
+    const user = msg(1, 30);
+    const assistant = msg(2, 20);
+    assistant.role = "assistant"; assistant.seqSequenced = false;
+    const tool = msg(3, 10);
+    tool.role = "tool"; tool.toolName = "bash"; tool.seqSequenced = false;
+    const out = await loadFullHistory("s1", pagedFetcher([user, assistant, tool]));
+    expect(out.map((r) => r.role)).toEqual(["user", "assistant", "tool"]);
+  });
+
   it("projects only the fields the rehydrator needs", async () => {
     const m = msg(1, 1);
     m.role = "tool"; m.toolName = "bash"; m.toolInput = "{}"; m.outcome = "success";

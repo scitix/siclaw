@@ -63,14 +63,19 @@ export async function loadFullHistory(
   }
   // 页是从新到旧取的,每页内部从旧到新;整体要从旧到新,把页序反过来再拍平。
   //
-  // ⚠️ 丢掉**尚未被 box 消费**的行(seq_sequenced = false)。runtime 在调 box 的
-  // prompt **之前**就把本轮的 user 行落库了,回灌若把它当历史带进去,box 又拿同一段
-  // 文字当 prompt —— 模型看到最后一条 user 消息出现两次。首次 go/no-go 的日志
-  // "3 rows → 3 messages"(turn 1 只有 2 行)就是它。排队中的 steer 同理:它们会
-  // 作为 steer 送达,不是历史。`seq_sequenced` 的语义正是"发出但从未被消费"
-  // (控制面侧 docs/developer/siclaw-chat-seq-contract.md),用它而不是"比对末行
-  // 文本",因为文本相等是巧合,消费状态才是事实。
-  return pages.reverse().flat().filter((m) => m.seqSequenced).map(toRow);
+  // ⚠️ 丢掉**尚未被 box 消费的 user 行**(role = user 且 seq_sequenced = false)。
+  // runtime 在调 box 的 prompt **之前**就把本轮的 user 行落库了,回灌若把它当历史
+  // 带进去,box 又拿同一段文字当 prompt —— 模型看到最后一条 user 消息出现两次。
+  // 首次 go/no-go 的日志 "3 rows → 3 messages"(turn 1 只有 2 行)就是它。排队中的
+  // steer 同理:它们会作为 steer 送达,不是历史。用消费状态而不是"比对末行文本":
+  // 文本相等是巧合,状态才是事实。
+  //
+  // ⚠️ **只看 user 行。** `seq_sequenced` 的"消费"语义仅属于 `deferSequence` 落的
+  // user 行 —— box 回 message_start 时被 chat.sequenceMessage 翻成 1。assistant /
+  // tool 行没有人去翻它,**永远是 0**。上一版对所有行一刀切,把 turn 1 的 assistant
+  // 回复也删了,go/no-go 从 GO 退成 NO_GO("1 rows → 1 messages")。数据库里能
+  // 直接看到:user 行 1、assistant 行 0。
+  return pages.reverse().flat().filter((m) => m.role !== "user" || m.seqSequenced).map(toRow);
 }
 
 export async function handleSessionHistory(
