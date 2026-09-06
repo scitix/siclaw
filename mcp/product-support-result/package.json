@@ -1,0 +1,30 @@
+{
+  "name": "mcp-product-support-result",
+  "version": "0.1.0",
+  "description": "Stateless MCP validator for product-support handoff results",
+  "type": "module",
+  "bin": {
+    "mcp-product-support-result": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "Apache-2.0"
+}
