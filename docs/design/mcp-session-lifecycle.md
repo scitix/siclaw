@@ -158,6 +158,14 @@ on Toggle-off / Delete, etc.
 
 ---
 
+## 6a. Connection outcomes are reported, not swallowed
+
+A server that fails to connect during the per-session `McpClientManager`
+initialization is recorded per server (`getServerConnections()`) and reported on
+`/api/sync-status` as `mcp.servers`, alongside the configured names. See
+[MCP Connection Observability](mcp-connection-observability.md) for the wire
+contract and the `mcp.probe` RPC.
+
 ## 7. When this contract must be revisited
 
 Reopen this doc if any of the following becomes true:

@@ -112,6 +112,141 @@ interface ManagedMcpClient {
 }
 
 // ---------------------------------------------------------------------------
+// Connection observations
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a configured MCP server could not be connected, as a closed vocabulary
+ * the control plane can render and aggregate without parsing free text.
+ *
+ *   invalid_config     the entry itself is unusable (unknown transport, bad URL)
+ *   dns                the host does not resolve
+ *   connection_refused TCP-level refusal
+ *   timeout            connect or handshake did not finish in time
+ *   tls                certificate / TLS negotiation failed
+ *   auth               HTTP 401/403 from the endpoint
+ *   not_found          HTTP 404 — usually a URL that points at something that
+ *                      is not an MCP endpoint (a web page, a wrong path)
+ *   not_mcp            the endpoint answered, but with something that is not an
+ *                      MCP response (an HTML page, a non-JSON body)
+ *   http               any other HTTP status the transport rejected
+ *   protocol           MCP-level failure after transport (initialize/listTools)
+ *   unknown            nothing above matched
+ */
+export type McpConnectErrorKind =
+  | "invalid_config"
+  | "dns"
+  | "connection_refused"
+  | "timeout"
+  | "tls"
+  | "auth"
+  | "not_found"
+  | "not_mcp"
+  | "http"
+  | "protocol"
+  | "unknown";
+
+export interface McpConnectError {
+  kind: McpConnectErrorKind;
+  /** HTTP status when the transport surfaced one. */
+  httpStatus?: number;
+  /** Hint about what the endpoint actually returned, e.g. "text/html". */
+  contentType?: string;
+  /** Short, HTML-stripped, length-capped message. Never a full response body. */
+  message: string;
+}
+
+/**
+ * One configured server's connection outcome, as observed by the process that
+ * actually dialled it. `toolCount` is 0 for a failed server by construction.
+ */
+export interface McpServerConnection {
+  name: string;
+  transport: string;
+  state: "connected" | "failed";
+  toolCount: number;
+  toolNames: string[];
+  durationMs: number;
+  observedAt: string;
+  error?: McpConnectError;
+}
+
+const MCP_CONNECT_ERROR_MESSAGE_MAX = 300;
+
+function looksLikeHtml(text: string): boolean {
+  return /^\s*<(?:!doctype\s+html|html[\s>])/i.test(text) || /<\/html>\s*$/i.test(text);
+}
+
+/** Collapse an error message to something safe to store and show. */
+function compactErrorMessage(raw: string): string {
+  let text = raw;
+  if (looksLikeHtml(text) || /<[a-z][^>]*>/i.test(text)) {
+    const title = /<title[^>]*>([^<]*)<\/title>/i.exec(text)?.[1]?.trim();
+    text = title ? `HTML page: ${title}` : "HTML page";
+  }
+  text = text.replace(/\s+/g, " ").trim();
+  return text.length > MCP_CONNECT_ERROR_MESSAGE_MAX
+    ? `${text.slice(0, MCP_CONNECT_ERROR_MESSAGE_MAX - 1)}…`
+    : text;
+}
+
+/**
+ * Classify a connection failure into {@link McpConnectError}.
+ *
+ * The SDK's `StreamableHTTPError` / `SseError` carry the HTTP status in `.code`
+ * and often the raw response body in the message. A body that is an HTML page
+ * is the signature of "this URL is not an MCP endpoint" — the exact mistake a
+ * platform MCP owner makes by pasting a page URL — so it gets its own kind even
+ * when the status is missing.
+ */
+export function classifyMcpConnectError(err: unknown): McpConnectError {
+  const anyErr = err as any;
+  const rawMessage: string = typeof anyErr?.message === "string" ? anyErr.message : String(err);
+  const message = compactErrorMessage(rawMessage);
+  const code = anyErr?.code;
+  let httpStatus: number | undefined;
+  if (typeof code === "number" && code >= 100 && code <= 599) {
+    httpStatus = code;
+  } else {
+    const m = /\b(?:HTTP\s+)?(?:status|code)\s*[:=]?\s*(\d{3})\b/i.exec(rawMessage)
+      ?? /\bHTTP\s+(\d{3})\b/.exec(rawMessage);
+    if (m) httpStatus = Number(m[1]);
+  }
+  const html = looksLikeHtml(rawMessage) || /<html[\s>]/i.test(rawMessage);
+  const base: Omit<McpConnectError, "kind"> = {
+    message,
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...(html ? { contentType: "text/html" } : {}),
+  };
+
+  const sysCode: string = typeof code === "string"
+    ? code
+    : typeof anyErr?.cause?.code === "string" ? anyErr.cause.code : "";
+  if (sysCode === "ENOTFOUND" || sysCode === "EAI_AGAIN" || /getaddrinfo/i.test(rawMessage)) {
+    return { kind: "dns", ...base };
+  }
+  if (sysCode === "ECONNREFUSED" || /ECONNREFUSED/.test(rawMessage)) {
+    return { kind: "connection_refused", ...base };
+  }
+  if (sysCode === "ETIMEDOUT" || anyErr?.name === "AbortError" || /timed? ?out/i.test(rawMessage)) {
+    return { kind: "timeout", ...base };
+  }
+  if (/^(?:ERR_TLS|CERT_|UNABLE_TO_VERIFY|SELF_SIGNED|DEPTH_ZERO)/.test(sysCode) || /certificate|\bTLS\b|\bSSL\b/i.test(rawMessage)) {
+    return { kind: "tls", ...base };
+  }
+  if (httpStatus === 401 || httpStatus === 403) return { kind: "auth", ...base };
+  if (httpStatus === 404) return { kind: "not_found", ...base };
+  if (html || /unexpected token|not valid JSON|invalid json/i.test(rawMessage)) {
+    return { kind: "not_mcp", ...base };
+  }
+  if (httpStatus !== undefined) return { kind: "http", ...base };
+  if (/^(?:McpError|ProtocolError)$/.test(anyErr?.name ?? "") || /MCP error|protocol/i.test(rawMessage)) {
+    return { kind: "protocol", ...base };
+  }
+  return { kind: "unknown", ...base };
+}
+
+// ---------------------------------------------------------------------------
 // MCP inputSchema handling
 // ---------------------------------------------------------------------------
 
@@ -251,6 +386,13 @@ export class McpClientManager {
   private clients: ManagedMcpClient[] = [];
   private tools: ToolDefinition[] = [];
   private config: McpServersConfig;
+  /**
+   * Per-server connection outcome from the last `initialize()`. Kept alongside
+   * the successful clients precisely because failures used to vanish into a
+   * console.error: the control plane then saw the configured names, could not
+   * tell a connected server from a dead one, and reported both as "installed".
+   */
+  private connections: McpServerConnection[] = [];
 
   constructor(config: McpServersConfig) {
     this.config = config;
@@ -261,6 +403,7 @@ export class McpClientManager {
    */
   async initialize(): Promise<void> {
     const entries = Object.entries(this.config.mcpServers);
+    this.connections = [];
     if (entries.length === 0) return;
 
     // Lazy-import the SDK (only when actually used)
@@ -270,16 +413,24 @@ export class McpClientManager {
     const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
 
     for (const [serverName, serverConfig] of entries) {
+      const startedAt = Date.now();
+      // Auto-detect transport when not explicitly set: url → streamable-http, command → stdio
+      const cfg = serverConfig as any;
+      const detectedTransport: string = cfg.transport
+        ?? (cfg.url ? "streamable-http" : cfg.command ? "stdio" : "");
+      const recordFailure = (error: McpConnectError) => {
+        this.connections.push({
+          name: serverName, transport: detectedTransport, state: "failed",
+          toolCount: 0, toolNames: [], durationMs: Date.now() - startedAt,
+          observedAt: new Date().toISOString(), error,
+        });
+      };
       try {
         const client = new Client(
           { name: `siclaw-mcp-${serverName}`, version: "1.0.0" },
         );
 
         let transport: any;
-        // Auto-detect transport when not explicitly set: url → streamable-http, command → stdio
-        const cfg = serverConfig as any;
-        const detectedTransport: string = cfg.transport
-          ?? (cfg.url ? "streamable-http" : cfg.command ? "stdio" : "");
         const stdioEnv = detectedTransport === "stdio"
           ? mergeMcpStdioEnv(cfg.env, process.env, isBundledCreateChartCommand(cfg.command, cfg.args))
           : undefined;
@@ -309,6 +460,10 @@ export class McpClientManager {
             break;
           default:
             console.warn(`[mcp-client] Unknown transport for "${serverName}": ${detectedTransport}`);
+            recordFailure({
+              kind: "invalid_config",
+              message: `unknown transport "${detectedTransport}"`,
+            });
             continue;
         }
 
@@ -334,12 +489,43 @@ export class McpClientManager {
         }
 
         this.clients.push({ serverName, client, transport });
+        this.connections.push({
+          name: serverName, transport: detectedTransport, state: "connected",
+          toolCount: mcpTools.length,
+          toolNames: mcpTools.map((t: any) => String(t.name)).sort(),
+          durationMs: Date.now() - startedAt,
+          observedAt: new Date().toISOString(),
+        });
       } catch (err) {
-        console.error(`[mcp-client] Failed to connect to "${serverName}":`, err);
+        const error = classifyMcpConnectError(err);
+        // The classified line is what an operator greps for; the raw error keeps
+        // the full detail (it can be a whole response body) on the next line.
+        console.error(
+          `[mcp-client] Failed to connect to "${serverName}" (${detectedTransport}): ${error.kind}` +
+          (error.httpStatus !== undefined ? ` http=${error.httpStatus}` : "") +
+          (error.contentType ? ` content-type=${error.contentType}` : "") +
+          ` — ${error.message}`,
+        );
+        console.error(`[mcp-client] Raw error for "${serverName}":`, err);
+        recordFailure(error);
       }
     }
 
     console.log(`[mcp-client] Initialized ${this.clients.length} servers, ${this.tools.length} tools total`);
+  }
+
+  /**
+   * Connection outcome of every configured server from the last `initialize()`,
+   * in configuration order. Failed servers are present with `state: "failed"`
+   * and a classified error; this is the list a box reports upstream so the
+   * control plane can show "configured but not connected" instead of "installed".
+   */
+  getServerConnections(): McpServerConnection[] {
+    return this.connections.map((item) => ({
+      ...item,
+      toolNames: [...item.toolNames],
+      ...(item.error ? { error: { ...item.error } } : {}),
+    }));
   }
 
   /**

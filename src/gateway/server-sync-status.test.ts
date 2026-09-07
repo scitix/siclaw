@@ -513,3 +513,74 @@ describe("agent.promptInspection RPC", () => {
     });
   });
 });
+
+describe("agent.syncStatus RPC — MCP connection outcomes", () => {
+  const connected = { name: "devops", transport: "streamable-http", state: "connected", toolCount: 2, toolNames: ["a", "b"], durationMs: 10, observedAt: "2026-09-07T09:44:58.000Z" };
+  const failed = { name: "siverse", transport: "streamable-http", state: "failed", toolCount: 0, toolNames: [], durationMs: 5, observedAt: "2026-09-07T09:45:00.000Z",
+    error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "HTML page: Simate" } };
+
+  it("surfaces per-server outcomes in the flat aggregate when every box agrees", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    for (const endpoint of ["https://b1", "https://b2"]) {
+      getJsonByEndpoint.set(endpoint, async () => ({
+        ...defaultSyncStatus,
+        schemaVersion: 4,
+        mcp: { names: ["devops", "siverse"], servers: [connected, failed] },
+      }));
+    }
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+    await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toMatchObject({
+      consistent: true,
+      mcp: { names: ["devops", "siverse"], servers: [connected, failed] },
+      observations: [
+        { boxId: "b1", status: { mcp: { servers: [connected, failed] } } },
+        { boxId: "b2", status: { mcp: { servers: [connected, failed] } } },
+      ],
+    });
+  });
+
+  it("treats the same config with a different connection outcome as inconsistent and withholds the flat servers", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    getJsonByEndpoint.set("https://b1", async () => ({
+      ...defaultSyncStatus, schemaVersion: 4,
+      mcp: { names: ["devops", "siverse"], servers: [connected, failed] },
+    }));
+    getJsonByEndpoint.set("https://b2", async () => ({
+      ...defaultSyncStatus, schemaVersion: 4,
+      mcp: { names: ["devops", "siverse"], servers: [connected, { ...failed, state: "connected", toolCount: 5, error: undefined }] },
+    }));
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+    const out: any = await syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(out.consistent).toBe(false);
+    expect(out.mcp).toEqual({ names: ["devops", "siverse"] });
+    expect(out.observations[0].status.mcp.servers[1].state).toBe("failed");
+    expect(out.observations[1].status.mcp.servers[1].state).toBe("connected");
+  });
+
+  it("ignores timing and message differences between replicas", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+    ];
+    getJsonByEndpoint.set("https://b1", async () => ({
+      ...defaultSyncStatus, schemaVersion: 4, mcp: { names: ["siverse"], servers: [failed] },
+    }));
+    getJsonByEndpoint.set("https://b2", async () => ({
+      ...defaultSyncStatus, schemaVersion: 4,
+      mcp: { names: ["siverse"], servers: [{ ...failed, durationMs: 900, observedAt: "2026-09-07T10:00:00.000Z", error: { ...failed.error, message: "HTML page" } }] },
+    }));
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+    const out: any = await syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+    expect(out.consistent).toBe(true);
+    expect(out.mcp.servers).toHaveLength(1);
+  });
+});
