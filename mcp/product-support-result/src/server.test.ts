@@ -9,7 +9,7 @@ async function withClient(
 ): Promise<void> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createProductSupportResultServer();
-  const client = new Client({ name: "product-support-result-test", version: "0.1.0" });
+  const client = new Client({ name: "product-support-result-test", version: "0.2.0" });
 
   await server.connect(serverTransport);
   await client.connect(clientTransport);
@@ -32,13 +32,31 @@ describe("product support result MCP", () => {
       const advertisedSchema = response.tools[0]?.inputSchema as {
         properties?: {
           info?: {
+            required?: string[];
             properties?: {
+              ticket_type?: { enum?: string[] };
               missing_fields?: { items?: { pattern?: string } };
+              llm?: {
+                properties?: {
+                  region?: { enum?: string[] };
+                  aspect?: { enum?: string[] };
+                };
+              };
             };
           };
         };
       };
       expect(advertisedSchema.properties?.info?.properties?.missing_fields?.items?.pattern).toBe("^[a-z][a-z0-9_]*$");
+      expect(advertisedSchema.properties?.info?.properties?.ticket_type?.enum).toEqual([
+        "consultation",
+        "incident",
+        "llm_incident",
+        "requirement",
+        "unknown",
+      ]);
+      expect(advertisedSchema.properties?.info?.required).toContain("llm");
+      expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.region?.enum).toEqual(["", "domestic", "overseas"]);
+      expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.aspect?.enum).toEqual(["", "platform_api", "network", "model"]);
       expect(response.tools[0]?.outputSchema).toEqual(response.tools[0]?.inputSchema);
     });
   });
@@ -57,6 +75,7 @@ describe("product support result MCP", () => {
               description: "  User cannot find the access setting.  ",
               evidence: [],
               missing_fields: [],
+              llm: { region: "", aspect: "", model: "" },
             },
           },
         },
@@ -73,6 +92,7 @@ describe("product support result MCP", () => {
           description: "User cannot find the access setting.",
           evidence: [],
           missing_fields: [],
+          llm: { region: "", aspect: "", model: "" },
         },
       });
       expect(Array.isArray(response.content)).toBe(true);
@@ -99,6 +119,7 @@ describe("product support result MCP", () => {
               description: "User requested support.",
               evidence: [],
               missing_fields: [],
+              llm: { region: "", aspect: "", model: "" },
             },
           },
         },

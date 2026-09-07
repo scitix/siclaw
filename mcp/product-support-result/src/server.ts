@@ -26,11 +26,14 @@ const inputSchema = {
         "description",
         "evidence",
         "missing_fields",
+        "llm",
       ],
       properties: {
         ticket_type: {
           type: "string",
-          enum: ["consultation", "incident", "requirement", "unknown"],
+          enum: ["consultation", "incident", "llm_incident", "requirement", "unknown"],
+          description:
+            "llm_incident covers failures while calling an LLM / model API or inference endpoint (gateway errors, auth, rate limits, quotas, a named model misbehaving). incident is every other fault.",
         },
         product: {
           type: "string",
@@ -53,6 +56,29 @@ const inputSchema = {
             pattern: "^[a-z][a-z0-9_]*$",
           },
         },
+        llm: {
+          type: "object",
+          additionalProperties: false,
+          required: ["region", "aspect", "model"],
+          description:
+            "Best-effort intake details for ticket_type=llm_incident, shown to first-line support as hints. Fill each field only from what the conversation establishes; leave it empty rather than guess. All three must be empty for any other ticket_type.",
+          properties: {
+            region: {
+              type: "string",
+              enum: ["", "domestic", "overseas"],
+              description: "Deployment region the user calls the LLM API from, per the operator's classification rules; empty when not established.",
+            },
+            aspect: {
+              type: "string",
+              enum: ["", "platform_api", "network", "model"],
+              description: "Failing part of the path: the API platform / gateway itself, network reachability, or a specific model; empty when not established.",
+            },
+            model: {
+              type: "string",
+              description: "Model name as the user stated it, when a specific model is involved; otherwise empty.",
+            },
+          },
+        },
       },
     },
   },
@@ -60,7 +86,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.1.0" },
+    { name: "mcp-product-support-result", version: "0.2.0" },
     { capabilities: { tools: {} } },
   );
 
