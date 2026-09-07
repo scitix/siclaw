@@ -62,6 +62,14 @@ is the transfer mechanism that makes both true at once.
   answered by two agents reads as one undifferentiated stream — and an analysis
   pass attributing a bad answer would attribute it to the wrong one. Absent
   caller → NULL, which is right when nothing ever moved.
+- **The transfer tool must not tell the model to say nothing.** It used to end
+  with "End your turn now — say nothing further". The model obeyed: it emitted an
+  assistant message with ZERO content blocks, which `pi-agent-brain` classifies
+  as a provider returning an empty response — two retries, then the whole turn
+  fails. Observed in the test environment as the facade transferring twice and
+  then the user getting no answer at all. The result now hands the model a short
+  line it may say and forbids a second call; the content is muted by the gateway
+  anyway, so its only job is to keep the turn non-empty.
 - **A handed-away session loses its local transcript.** The local copy is a
   cache; the control plane is the authority. Marked at transfer time (the brain
   is still writing) and consumed either by `release`, which deletes the

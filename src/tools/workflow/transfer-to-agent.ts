@@ -84,7 +84,8 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
       "answers the user directly. You will not be asked to summarise anything, and there is no result coming " +
       "back to you. So: call this INSTEAD of answering, not after answering. Do not tell the user you are " +
       "transferring them and do not say goodbye — they see one continuous conversation and a visible handover " +
-      "would only confuse them. Say nothing else in this turn; end it right after the call.\n\n" +
+      "would only confuse them. After the call, close your turn with one short internal line such as " +
+      "\"handed over\" and stop — do not call this tool again, and do not start new work.\n\n" +
       "`brief` is what the destination reads as its instruction. It has the full conversation history, so do " +
       "not retell it — state what needs doing and anything you already established (the exact cluster/host, " +
       "what you already ruled out).\n\n" +
@@ -131,8 +132,20 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
         console.warn("[transfer_to_agent] could not evict the local session context:", err);
       }
 
+      // ⚠️ 不要写"say nothing further"。
+      //
+      // 模型会照办 —— 它发一条**空的** assistant 消息,而 pi-agent-brain 把"零个
+      // content 块"当成 provider 返回空,重试两次,然后整轮判失败。测试环境实测:
+      // facade 交接完又交接了一次,然后发空消息,`Empty response persisted after
+      // 2 retries`,用户那边就是"没响应"。
+      //
+      // 所以要给它一句**能说的话**。说什么不重要 —— 交接之后这一轮的内容全都被
+      // 网关静音(见 consumeAgentSse 的 handoff 切断),用户和 transcript 都看不到;
+      // 这句话唯一的作用是让这一轮有内容、不被判成空响应。
       return result(
-        `Conversation handed to ${target.name}. End your turn now — say nothing further; they answer the user from here.`,
+        `Conversation handed to ${target.name}. They answer the user from here. ` +
+          `Close your turn now with a single short line like "handed over" — do not call this tool again ` +
+          `and do not start new work.`,
         true,
       );
     },

@@ -130,3 +130,31 @@ describe("transfer_to_agent 的执行", () => {
     expect((out as { details: { transferred: boolean } }).details.transferred).toBe(false);
   });
 });
+
+
+// ⚠️ 这条锁的是一次线上级故障,不是措辞偏好。
+//
+// 工具结果原来写着 "End your turn now — say nothing further"。模型照办了 —— 它发一条
+// **空的** assistant 消息,而 pi-agent-brain 把"零个 content 块"当成 provider 返回空、
+// 重试两次、然后整轮判失败(`Empty response persisted after 2 retries`)。用户那边看到
+// 的就是"没响应"。
+//
+// 交接之后这一轮的内容全都被网关静音,用户和 transcript 都看不到,所以这句话说什么
+// 不重要 —— 重要的是**必须让它有话可说**,这一轮才不会是空的。
+describe("transfer_to_agent 的结果文案", () => {
+  it("不叫模型闭嘴 —— 空 assistant 消息会被判成 provider 空响应,整轮失败", async () => {
+    const tool = createTransferToAgentTool(refs())
+    const out = await tool.execute!("call-1", { route_key: "cn", brief: "b" }, undefined as never)
+    const text = (out as { content: { text: string }[] }).content[0].text
+    expect(text).not.toMatch(/say nothing/i)
+    // 明确给一句可说的话,并且禁止再次调用(实测里它连着交接了两次)。
+    expect(text).toMatch(/short line/i)
+    expect(text).toMatch(/do not call this tool again/i)
+  })
+
+  it("工具描述里同样不能叫它闭嘴", () => {
+    const tool = createTransferToAgentTool(refs())
+    expect(tool.description).not.toMatch(/say nothing else/i)
+    expect(tool.description).toMatch(/do not call this tool again/i)
+  })
+})
