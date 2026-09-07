@@ -248,6 +248,7 @@ async function recoverRemoteResult(
     .filter((message) =>
       message.role === "assistant" &&
       message.metadata?.kind !== "error_response" &&
+      message.metadata?.kind !== "thinking" &&
       message.content.trim().length > 0,
     )
     .map((message) => message.content.trim())

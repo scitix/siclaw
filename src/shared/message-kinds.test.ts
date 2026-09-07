@@ -21,6 +21,7 @@ describe("CHAT_MESSAGE_KINDS", () => {
       "steer",
       "task_event",
       "task_notification",
+      "thinking",
     ]);
   });
 });

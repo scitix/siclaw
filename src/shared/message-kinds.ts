@@ -75,6 +75,10 @@ export const CHAT_MESSAGE_KINDS = [
   "task_event",
   // The <task_notification> text injected when a background job finishes.
   "task_notification",
+  // A model call's reasoning text, persisted as its own row right before the
+  // model-call row it belongs to (`metadata.llm_round` links them). role='assistant';
+  // hidden in transcripts, excluded from search and reply counts.
+  "thinking",
 ] as const;
 
 export type ChatMessageKind = (typeof CHAT_MESSAGE_KINDS)[number];

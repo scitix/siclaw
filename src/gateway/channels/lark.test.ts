@@ -3872,10 +3872,17 @@ describe("collectResponse — SSE event flattening", () => {
     updateMessageMock.mockReset();
     appendMessageMock.mockResolvedValueOnce("row-primary").mockResolvedValueOnce("row-fallback");
     updateMessageMock.mockResolvedValue(undefined);
+    const call = {
+      v: 1, kind: "agent", round: 1, attempt: 1,
+      model: { provider: "openai", id: "gpt-4" },
+      request_at: "2026-09-01T00:00:00.000Z", response_end_at: "2026-09-01T00:00:01.000Z",
+      ms: { net_ttft: 100, thinking: 0, output: 900, total: 1000 },
+      blocks: [], tool_call_ids: [], thinking_visible: false,
+    };
     const events = [
       { type: "model_route_start", candidateCount: 2 },
       { type: "knowledge_sources", sources: [{ title: "Primary Runbook", url: "https://example.com/primary", resource: "r.md", page: "p.md" }] },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial primary answer" }], stopReason: "stop" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial primary answer" }], stopReason: "stop", llmCall: call } },
       { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
       { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
@@ -3886,7 +3893,7 @@ describe("collectResponse — SSE event flattening", () => {
     // The primary row was written with citations, then marked discarded without them.
     expect(appendMessageMock.mock.calls[0][0].metadata).toHaveProperty("knowledge_citations");
     expect(updateMessageMock).toHaveBeenCalledWith(expect.objectContaining({
-      messageId: "row-primary", metadata: { discarded_route_attempt: true },
+      messageId: "row-primary", metadata: { discarded_route_attempt: true, llm_call: call },
     }));
     expect(updateMessageMock.mock.calls[0][0].metadata).not.toHaveProperty("knowledge_citations");
     // The fallback row carries no leftover citations from the discarded attempt.
@@ -4090,6 +4097,20 @@ describe("collectChannelResponse — audit persistence", () => {
   function fakeClient(events: unknown[]) {
     return { streamEvents: async function* () { for (const e of events) yield e; } } as any;
   }
+  const envelope = (overrides: Record<string, unknown> = {}) => ({
+    v: 1,
+    round: 1,
+    attempt: 1,
+    kind: "agent",
+    model: { provider: "openai", id: "gpt-5" },
+    request_at: "2026-09-03T08:00:00.000Z",
+    response_end_at: "2026-09-03T08:00:01.000Z",
+    ms: { net_ttft: 300, thinking: 0, output: 700, total: 1000 },
+    blocks: [],
+    thinking_visible: false,
+    tool_call_ids: [],
+    ...overrides,
+  });
 
   it("persists every assistant turn + each tool call when persist is set", async () => {
     appendMessageMock
@@ -4185,6 +4206,231 @@ describe("collectChannelResponse — audit persistence", () => {
     const collected = await collectChannelResponse(fakeClient(events), "s-fail", "lark", { persist: { agentId: "a1" } });
     expect(collected.text).toBe("still replies");
     expect(collected.assistantMessageId).toBeNull();
+  });
+
+  it("deduplicates independently parsed message_end and turn_end envelopes", async () => {
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      stopReason: "stop",
+      llmCall: envelope(),
+    };
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message },
+      { type: "turn_end", message: JSON.parse(JSON.stringify(message)) },
+    ]), "s-dedup", "lark", { persist: { agentId: "a1" } });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("revokes recovered error rows while retaining every model call", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "transient",
+        llmCall: envelope({ round: 1, stop_reason: "error" }),
+      } },
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop",
+        llmCall: envelope({ round: 2, request_at: "2026-09-03T08:00:02.000Z", response_end_at: "2026-09-03T08:00:03.000Z" }),
+      } },
+    ]), "s-retry", "lark", { persist: { agentId: "a1" } });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    expect(rows.map((row) => row.metadata.llm_call.round)).toEqual([1, 2]);
+    expect(rows[0].content).toBe("");
+    expect(rows[1].content).toBe("recovered");
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
+  });
+
+  it("persists only the final retry error and redacts its envelope metadata", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "first",
+        llmCall: envelope({ round: 1, stop_reason: "error", error_message: "first" }),
+      } },
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "last sk-secret123",
+        llmCall: envelope({
+          round: 2,
+          request_at: "2026-09-03T08:00:02.000Z",
+          response_end_at: "2026-09-03T08:00:03.000Z",
+          stop_reason: "error",
+          error_message: "last sk-secret123",
+        }),
+      } },
+    ]), "s-errors", "lark", {
+      persist: { agentId: "a1", modelConfig: { apiKey: "sk-secret123" } },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ content: "", metadata: { llm_call: { round: 1 } } });
+    expect(rows[1].metadata.kind).toBe("error_response");
+    expect(rows[1].content).not.toContain("sk-secret123");
+    expect(rows[1].metadata.llm_call.error_message).not.toContain("sk-secret123");
+  });
+
+  // [persist gate] Every write in the audit block is opt-in. The failure
+  // bookkeeping was not, so a non-audited binding still queued rows and the
+  // end-of-run flush wrote chat_messages for a session with no chat_sessions row
+  // — an FK violation swallowed as a console.warn, or orphan rows where the FK is
+  // not enforced. It also bypassed redaction outright: `redact` is the identity
+  // function when there is no model config to build a redactor from.
+  it("writes nothing at all when the binding is not audited", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "boom sk-secret123",
+        llmCall: envelope({ round: 1, stop_reason: "error", error_message: "boom sk-secret123" }),
+      } },
+    ]), "s-unaudited", "lark", {});
+
+    expect(appendMessageMock.mock.calls).toHaveLength(0);
+  });
+
+  // [error text required] pi emits synthetic error message_ends that carry no
+  // errorMessage. Coercing those to "" persisted a content-empty error_response:
+  // with no envelope it is not hidden as an empty carrier either, so it rendered
+  // as a blank assistant bubble on reload, and a reader scanning error content
+  // reported the turn empty rather than failed.
+  it("does not persist an error row for a failure that carries no message", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error" } },
+    ]), "s-no-msg", "lark", {
+      persist: { agentId: "a1", modelConfig: {} },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any);
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
+  });
+
+  // [shared output rule] The local re-derivation read only the content ARRAY, so
+  // a recovered turn whose final message carries STRING content looked like no
+  // output: the error stayed pending and the end-of-run flush wrote a terminal
+  // error_response over a perfectly good answer.
+  it("treats a string-content recovery as output and revokes the pending error", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "transient 500",
+        llmCall: envelope({ round: 1, stop_reason: "error" }),
+      } },
+      { type: "message_end", message: {
+        role: "assistant", content: "recovered answer", stopReason: "stop",
+        llmCall: envelope({ round: 2 }),
+      } },
+    ]), "s-string-recovery", "lark", {
+      persist: { agentId: "a1", modelConfig: {} },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any);
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
+    // The failed call is not lost — it becomes a call-only row.
+    expect(rows.filter((row) => row.metadata?.llm_call?.stop_reason === "error")).toHaveLength(1);
+  });
+
+  it.each([false, true])("keeps a failed call on the fallback notice (buffered=%s)", async (buffered) => {
+    await collectChannelResponse(fakeClient([
+      { type: "model_route_start", candidateCount: 2 },
+      ...(buffered ? [] : [{ type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429 sk-secret123",
+        llmCall: envelope({ round: 1, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" }),
+      } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-5", failureKind: "rate_limit" }]),
+      {
+        type: "model_route_switch",
+        ...(buffered ? { discardedLlmCalls: [envelope({ round: 1, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" })] } : {}),
+        attempt: 2,
+        fromCandidateKey: "openai/gpt-5",
+        toCandidateKey: "anthropic/claude",
+        fromProvider: "openai",
+        fromModelId: "gpt-5",
+        toProvider: "anthropic",
+        toModelId: "claude",
+        failureKind: "rate_limit",
+      },
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop",
+        llmCall: envelope({ round: 1, attempt: 2 }),
+      } },
+      { type: "model_route_success" },
+    ]), "s-route", "lark", {
+      persist: { agentId: "a1", modelConfig: { apiKey: "sk-secret123" } },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    const notice = rows.find((row) => row.metadata?.kind === "model_route_notice");
+    expect(notice.metadata.discarded_llm_calls).toHaveLength(1);
+    expect(notice.metadata.discarded_llm_calls[0]).toMatchObject({ round: 1, attempt: 1 });
+    expect(notice.metadata.discarded_llm_calls[0].error_message).not.toContain("sk-secret123");
+    expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);
+  });
+
+  // The discriminating case for the same notice. This path writes a successful
+  // call's row INLINE as it arrives, and a rollback cannot unwrite it — so an
+  // attempt that narrated before it failed has one call with a row and one
+  // without. Only the second belongs on the notice. Draining the whole attempt
+  // into it, as this used to, recorded the narration twice and made channel turns
+  // over-count model calls against identical web turns.
+  it("puts only the row-less call on the notice when a rolled-back attempt also narrated", async () => {
+    await collectChannelResponse(fakeClient([
+      { type: "model_route_start", candidateCount: 2 },
+      // Round 1 of attempt 1 succeeds and is persisted as its own row.
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "let me check that" }], stopReason: "stop",
+        llmCall: envelope({ round: 1, attempt: 1 }),
+      } },
+      // Round 2 of the same attempt fails, so it gets no row of its own.
+      { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429 sk-secret123",
+        llmCall: envelope({ round: 2, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" }),
+      } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-5", failureKind: "rate_limit" },
+      {
+        type: "model_route_switch",
+        attempt: 2,
+        fromCandidateKey: "openai/gpt-5",
+        toCandidateKey: "anthropic/claude",
+        fromProvider: "openai",
+        fromModelId: "gpt-5",
+        toProvider: "anthropic",
+        toModelId: "claude",
+        failureKind: "rate_limit",
+      },
+      { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop",
+        llmCall: envelope({ round: 1, attempt: 2 }),
+      } },
+      { type: "model_route_success" },
+    ]), "s-route-mixed", "lark", {
+      persist: { agentId: "a1", modelConfig: { apiKey: "sk-secret123" } },
+    });
+
+    const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
+      .filter((row) => row.role === "assistant");
+    const notice = rows.find((row) => row.metadata?.kind === "model_route_notice");
+
+    // Only the failed round is on the notice.
+    expect(notice.metadata.discarded_llm_calls).toHaveLength(1);
+    expect(notice.metadata.discarded_llm_calls[0]).toMatchObject({ round: 2, attempt: 1 });
+
+    // Every envelope appears under exactly ONE carrier — the invariant the double
+    // count broke. Counting rows and notice entries together must find each
+    // (round, attempt) once.
+    const carried: string[] = [];
+    for (const row of rows) {
+      if (row.metadata?.llm_call) {
+        carried.push(`${row.metadata.llm_call.round}/${row.metadata.llm_call.attempt}`);
+      }
+      for (const call of row.metadata?.discarded_llm_calls ?? []) {
+        carried.push(`${call.round}/${call.attempt}`);
+      }
+    }
+    expect([...carried].sort()).toEqual(["1/1", "1/2", "2/1"]);
+    expect(new Set(carried).size).toBe(carried.length);
   });
 });
 

@@ -59,7 +59,8 @@ import {
 import { normalizeEntry, entrySessionPredicate, entryPromptPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 import { humanPromptPredicate } from "./human-prompt.js";
-import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
+import { transcriptVisiblePredicate } from "./transcript-rows.js";
+import { summariseLatency, extractLlmCallMs } from "./metrics-timing.js";
 import {
   assembleExporterHeaders,
   maskExporterAuth,
@@ -2273,12 +2274,32 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       return;
     }
 
+    // Rows the transcript never renders are excluded IN THE QUERY, not filtered
+    // client-side, and the count uses the same predicate so pagination stays
+    // consistent with what comes back.
+    //
+    // Two shapes, and both scale with every model round rather than being sparse
+    // per-job markers like the older hidden kinds:
+    //   - a reasoning row, which carries a call's whole joined thinking text;
+    //   - an empty model-call carrier, the row a tool-only call writes to hold
+    //     its timing.
+    // Fetching them anyway meant page 1 of a reopened tool-heavy session could
+    // spend its whole page budget on rows nobody sees — sometimes rendering no
+    // assistant text at all — and every background poll re-downloaded tens of KB
+    // of reasoning that is then thrown away.
+    //
+    const visibleRows = transcriptVisiblePredicate(db);
+
     const [[countRows], [listRows]] = await Promise.all([
-      db.query("SELECT COUNT(*) AS count FROM chat_messages WHERE session_id = ?", [params.sid]),
+      db.query(
+        `SELECT COUNT(*) AS count FROM chat_messages WHERE session_id = ? AND ${visibleRows}`,
+        [params.sid],
+      ),
       db.query(
         // Fetch newest N messages (DESC + LIMIT), then reverse in app to get chronological order.
         // This ensures page=1 returns the most recent messages (for initial load at bottom of chat).
-        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
+        `SELECT * FROM chat_messages WHERE session_id = ? AND ${visibleRows}` +
+          " ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
         [params.sid, pageSize, offset],
       ),
     ]) as [any, any];
@@ -2672,7 +2693,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Fetch newest N+1 rows DESC, then reverse to chronological order.
     const [msgRows] = await db.query(
       `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, created_at
-       FROM chat_messages WHERE session_id = ?
+       FROM chat_messages WHERE session_id = ? AND ${transcriptVisiblePredicate(db)}
        ORDER BY created_at DESC, id DESC LIMIT ?`,
       [sessionId, MAX_TRACE_MESSAGES + 1],
     ) as any;
@@ -4007,7 +4028,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const TIMING_ROW_LIMIT = 50_000;
     const db = getDb();
 
-    // ── TTFT / thinking from assistant metadata.timing.{ttft_ms,thinking_ms} ──
+    // ── Model-call partition from metadata.llm_call.ms.{net_ttft,thinking,output,total} ──
     const aParams: unknown[] = [from, to];
     let aSql = `SELECT m.metadata AS metadata FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
@@ -4020,11 +4041,19 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [aRows] = await db.query(aSql, aParams) as [Array<{ metadata: string | null }>, unknown];
     const ttftValues: number[] = [];
     const thinkingValues: number[] = [];
+    const outputValues: number[] = [];
+    const totalValues: number[] = [];
     for (const r of aRows.slice(0, TIMING_ROW_LIMIT)) {
-      const t = extractTimingMs(r.metadata, "ttft_ms");
+      const metadata = safeParseJson(r.metadata, null);
+      const total = extractLlmCallMs(metadata, "total");
+      if (total === undefined) continue; // not a model-call row
+      totalValues.push(total);
+      const t = extractLlmCallMs(metadata, "net_ttft");
       if (t !== undefined) ttftValues.push(t);
-      const th = extractTimingMs(r.metadata, "thinking_ms");
+      const th = extractLlmCallMs(metadata, "thinking");
       if (th !== undefined) thinkingValues.push(th);
+      const out = extractLlmCallMs(metadata, "output");
+      if (out !== undefined) outputValues.push(out);
     }
 
     // ── Per-tool latency from tool rows' duration_ms ──
@@ -4051,6 +4080,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, {
       ttft: summariseLatency(ttftValues),
       thinking: summariseLatency(thinkingValues),
+      output: summariseLatency(outputValues),
+      total: summariseLatency(totalValues),
       tools,
       truncated: aRows.length > TIMING_ROW_LIMIT || tRows.length > TIMING_ROW_LIMIT,
     });

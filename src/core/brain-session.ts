@@ -12,6 +12,8 @@
  * - auto_compaction_start/end, auto_retry_start/end
  */
 
+import type { LlmCallPromptBoundary } from "./llm-call-recorder.js";
+
 export type BrainType = "pi-agent";
 
 /**
@@ -166,6 +168,14 @@ export interface BrainContextPreflightResult {
 
 export interface BrainSession {
   readonly brainType: BrainType;
+
+  /**
+   * Optional: prompt / routing-attempt boundaries for the LLM call recorder
+   * (`src/core/llm-call-recorder.ts`). The agentbox HTTP layer marks receipt and
+   * completion so round 1's `since_prev_ms` covers setup; the routing runner's
+   * attempt events rewind rounds on rollback.
+   */
+  readonly llmCalls?: LlmCallPromptBoundary;
 
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
   prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void>;

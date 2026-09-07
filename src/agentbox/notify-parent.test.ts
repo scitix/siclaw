@@ -1,3 +1,4 @@
+import { LlmCallRecorder } from "../core/llm-call-recorder.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AgentBoxSessionManager } from "./session.js";
 
@@ -301,13 +302,23 @@ describe("notifyParent", () => {
     let currentModel = models[0];
     const seenModels: string[] = [];
     const routeFlagDuringPrompt: boolean[] = [];
+    const recorder = new LlmCallRecorder();
+    const attempts: number[] = [];
+    const endPrompt = vi.spyOn(recorder, "endPrompt");
     const brain = {
+      llmCalls: recorder,
       followUp: vi.fn(async () => {}),
       subscribe: vi.fn((fn: (e: any) => void) => {
         listeners.add(fn);
         return () => listeners.delete(fn);
       }),
       prompt: vi.fn(async () => {
+        // PiAgentBrain opens/closes each candidate implicitly. The explicit
+        // synthetic boundary must prevent those from resetting attempt state.
+        recorder.beginPrompt();
+        attempts.push(recorder.snapshot().attempt);
+        recorder.endPrompt();
+        expect(recorder.snapshot().promptOpen).toBe(true);
         seenModels.push(`${currentModel.provider}/${currentModel.id}`);
         // The routed runner buffers brain events; the SSE route's live brain
         // subscription must be suppressed for the whole turn or a connected
@@ -362,6 +373,9 @@ describe("notifyParent", () => {
     await flushCoalesce();
 
     expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(attempts).toEqual([1, 2]);
+    expect(recorder.snapshot().promptOpen).toBe(false);
+    expect(endPrompt).toHaveBeenLastCalledWith({ explicit: true });
     expect(routeFlagDuringPrompt).toEqual([true, true]);
     expect(managed._routeBrainEventsThroughExtra).toBe(false);
     expect(managed.modelRouteState.activeCandidateKey).toBe("anthropic/claude");

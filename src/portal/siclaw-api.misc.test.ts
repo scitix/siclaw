@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 /**
  * Smoke tests for registerSiclawRoutes covering non-skills domains:
  * mcp, chat sessions, my-tasks, task runs, channel bindings, model providers,
@@ -88,6 +89,32 @@ describe("siclaw-api misc routes", () => {
     // driver is explicit: siclaw-api.ts builds dialect-aware SQL, and a mock
     // without it silently exercises the SQLite branch of every such helper.
     (getDb as any).mockReturnValue({ query, getConnection: vi.fn(), driver: "mysql" });
+  });
+
+  it("filters hidden rows in the actual chat and task trace SQL before applying limits", async () => {
+    const sqlite = new DatabaseSync(":memory:");
+    try {
+      sqlite.exec(`CREATE TABLE chat_messages (id TEXT, session_id TEXT, role TEXT, content TEXT,
+        metadata TEXT, seq INTEGER, tool_name TEXT, tool_input TEXT, outcome TEXT, duration_ms INTEGER, created_at TEXT)`);
+      const insert = sqlite.prepare("INSERT INTO chat_messages (id, session_id, role, content, metadata, seq, created_at) VALUES (?, 's1', ?, ?, ?, ?, '2026-09-01')");
+      insert.run("prompt", "user", "question", null, 1);
+      insert.run("answer", "assistant", "answer", null, 2);
+      for (let i = 0; i < 205; i++) insert.run(`thinking-${i}`, "assistant", "hidden", '{"kind":"thinking"}', i + 3);
+      query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("FROM chat_sessions")) return [[{ user_id: "u1", parent_session_id: null }], []];
+        if (sql.includes("FROM agent_task_runs")) return [[{ session_id: "s1" }], []];
+        return [sqlite.prepare(sql).all(...params), []];
+      });
+      (getDb as any).mockReturnValue({ query, driver: "sqlite" });
+      const chat = await runRoute(router, fakeReq({ url: "/api/v1/siclaw/agents/a1/chat/sessions/s1/messages", method: "GET" }));
+      expect(chat.status).toBe(200);
+      expect(chat.body.total).toBe(2);
+      expect(chat.body.data.map((m: any) => m.content)).toEqual(["question", "answer"]);
+      const trace = await runRoute(router, fakeReq({ url: "/api/v1/siclaw/agents/a1/tasks/t1/runs/r1/messages", method: "GET" }));
+      expect(trace.status).toBe(200);
+      expect(trace.body.truncated).toBe(false);
+      expect(trace.body.messages.map((m: any) => m.id).sort()).toEqual(["answer", "prompt"]);
+    } finally { sqlite.close(); }
   });
 
   // ── MCP endpoints ─────────────────────────────────────────
@@ -774,11 +801,13 @@ describe("siclaw-api misc routes", () => {
   });
 
   describe("GET /api/v1/siclaw/metrics/timing", () => {
-    it("summarises ttft/thinking from assistant metadata + per-tool latency", async () => {
+    it("summarises the llm_call partition from model-call rows + per-tool latency", async () => {
       query
         .mockResolvedValueOnce([[ // assistant metadata rows
-          { metadata: JSON.stringify({ timing: { ttft_ms: 100, thinking_ms: 20 } }) },
-          { metadata: JSON.stringify({ timing: { ttft_ms: 300 } }) },
+          { metadata: JSON.stringify({ llm_call: { v: 1, ms: { net_ttft: 100, thinking: 20, output: 80, total: 200 } } }) },
+          { metadata: JSON.stringify({ llm_call: { v: 1, ms: { net_ttft: 300, thinking: 0, output: 100, total: 400 } } }) },
+          { metadata: JSON.stringify({ kind: "thinking", llm_round: 1 }) }, // thinking row: no ms
+          { metadata: JSON.stringify({ timing: { ttft_ms: 999 } }) }, // retired shape: ignored
         ], []])
         .mockResolvedValueOnce([[ // tool duration rows
           { toolName: "bash", durationMs: 500 },
@@ -792,7 +821,9 @@ describe("siclaw-api misc routes", () => {
       }));
       expect(status).toBe(200);
       expect(body.ttft).toMatchObject({ count: 2, min: 100, max: 300, avg: 200 });
-      expect(body.thinking).toMatchObject({ count: 1, avg: 20 });
+      expect(body.thinking).toMatchObject({ count: 2, min: 0, max: 20, avg: 10 });
+      expect(body.output).toMatchObject({ count: 2, min: 80, max: 100 });
+      expect(body.total).toMatchObject({ count: 2, min: 200, max: 400 });
       const bash = body.tools.find((t: any) => t.toolName === "bash");
       expect(bash).toMatchObject({ count: 2, min: 300, max: 500 });
       // tools sorted by count desc → bash (2) before read (1)

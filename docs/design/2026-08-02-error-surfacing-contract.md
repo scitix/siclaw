@@ -82,6 +82,14 @@ with no answers and no explanation.
 Persisted error rows follow the same scoping, so a reload agrees with what was
 on screen while it was happening.
 
+ADR-018 retains failed-call telemetry separately from the visible error:
+recovered failures have empty model-call carrier rows; on terminal failure,
+earlier failed calls keep their carriers and the final envelope rides the single
+`error_response` row. A rolled-back routing attempt instead rides the route
+notice's `discarded_llm_calls`. Revocation removes the error bubble, not the
+measurement of time spent on failed calls. Transcript readers hide empty
+carriers and thinking rows; metrics/timeline readers may still consume them.
+
 ### Ordering guarantee
 
 Turn N's `stream_error` is emitted BEFORE turn N+1's events. The flush happens
@@ -116,7 +124,7 @@ recovers, but the failing `message_end` is already in the consumer's hands — s
 a consumer that buffers without also forgetting resurrects the withdrawn error
 at the fallback step, and paints it under the answer that succeeded. That is the
 original bug, reintroduced through the safety net meant to prevent it. Worse, it
-is invisible on reload: siclaw wrote no row for a turn that recovered, so the
+is invisible on reload: siclaw wrote no visible error row for a turn that recovered, so the
 live view and the reloaded view disagree.
 
 The condition is "produced output", not "stopReason is not error". An empty 200

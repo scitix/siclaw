@@ -756,7 +756,6 @@ async function submitA2aTask(params: {
     modelRouting: modelBinding.modelRouting,
     subagentTiers: modelBinding.subagentTiers,
     systemPrompt: modelBinding.systemPrompt ?? undefined,
-    turnStartMs: Date.now(),
   });
 
   if (!result.ok) {
