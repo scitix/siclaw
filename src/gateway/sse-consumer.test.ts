@@ -1462,7 +1462,7 @@ describe("consumeAgentSse — knowledge citation attribution", () => {
       { type: "knowledge_sources", sources: [
         { title: "A", url: a, page: "repos/kb-1/a.md", repoId: "repo-1", claim: "A says so." },
       ] },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }], llmCall: mkEnvelope() } },
       { type: "knowledge_sources", sources: [
         { title: "A", url: a, page: "repos/kb-1/a.md", repoId: "repo-1", claim: "A says so." },
         { title: "B", url: b, page: "repos/kb-2/b.md", repoId: "repo-2", evidence: "ev.b" },
@@ -1472,6 +1472,7 @@ describe("consumeAgentSse — knowledge citation attribution", () => {
     await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
     const rows = appendCalls.filter((r) => r.role === "assistant");
     expect(rows).toHaveLength(2);
+    expect(rows[0].metadata.llm_call).toMatchObject({ round: 1 });
     // First row carries A; second row carries only the delta (B). Attribution
     // mirrors the rendered text: each source lands on exactly one row.
     expect(rows[0].metadata.knowledge_citations).toEqual({

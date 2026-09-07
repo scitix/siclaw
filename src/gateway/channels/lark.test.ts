@@ -3872,10 +3872,17 @@ describe("collectResponse — SSE event flattening", () => {
     updateMessageMock.mockReset();
     appendMessageMock.mockResolvedValueOnce("row-primary").mockResolvedValueOnce("row-fallback");
     updateMessageMock.mockResolvedValue(undefined);
+    const call = {
+      v: 1, kind: "agent", round: 1, attempt: 1,
+      model: { provider: "openai", id: "gpt-4" },
+      request_at: "2026-09-01T00:00:00.000Z", response_end_at: "2026-09-01T00:00:01.000Z",
+      ms: { net_ttft: 100, thinking: 0, output: 900, total: 1000 },
+      blocks: [], tool_call_ids: [], thinking_visible: false,
+    };
     const events = [
       { type: "model_route_start", candidateCount: 2 },
       { type: "knowledge_sources", sources: [{ title: "Primary Runbook", url: "https://example.com/primary", resource: "r.md", page: "p.md" }] },
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial primary answer" }], stopReason: "stop" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial primary answer" }], stopReason: "stop", llmCall: call } },
       { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
       { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
@@ -3886,7 +3893,7 @@ describe("collectResponse — SSE event flattening", () => {
     // The primary row was written with citations, then marked discarded without them.
     expect(appendMessageMock.mock.calls[0][0].metadata).toHaveProperty("knowledge_citations");
     expect(updateMessageMock).toHaveBeenCalledWith(expect.objectContaining({
-      messageId: "row-primary", metadata: { discarded_route_attempt: true },
+      messageId: "row-primary", metadata: { discarded_route_attempt: true, llm_call: call },
     }));
     expect(updateMessageMock.mock.calls[0][0].metadata).not.toHaveProperty("knowledge_citations");
     // The fallback row carries no leftover citations from the discarded attempt.

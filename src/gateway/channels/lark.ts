@@ -3205,12 +3205,13 @@ export async function collectChannelResponse(
         const discardedId = lastAssistantMessageId;
         lastAssistantMessageId = null;
         lastAssistantText = "";
+        const { knowledge_citations: _citations, ...retainedMetadata } = lastRowMetadata;
         try {
           await updateMessage({
             messageId: discardedId,
             sessionId,
             content: redact(lastRowContent),
-            metadata: { ...lastRowMetadata, knowledge_citations: undefined, discarded_route_attempt: true },
+            metadata: { ...retainedMetadata, discarded_route_attempt: true },
           });
         } catch (err) {
           console.warn(`[${logPrefix}] discard rolled-back assistant row failed session=${sessionId}:`, err);
