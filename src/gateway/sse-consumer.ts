@@ -1078,8 +1078,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               }
             }
           }
+          // Some providers only deliver text on message_end. Persist the complete
+          // message rather than relying on earlier deltas being present.
+          assistantContent = extracted || assistantContent;
           resultText = extracted || currentMsgText || resultText;
 
+          // phase 不是 timing:它区分「工具间的旁白」和「最终答复」,前端据此分组。
+          const phase = message.stopReason === "toolUse" ? "commentary" : "final_answer";
+          (evt as Record<string, unknown>).phase = phase;
           if (currentModelRouteMetadata) {
             (evt as Record<string, unknown>).modelRoute = currentModelRouteMetadata;
           }
@@ -1101,6 +1107,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               ? buildThinkingRow(message, rowEnvelope, (text) => redactText(text, redactionConfig))
               : null;
             const assistantRowMetadata: Record<string, unknown> = {
+              phase,
               ...(rowEnvelope ? { llm_call: rowEnvelope } : {}),
               ...(!rowEnvelope && envelope && envelope.round > 0 ? { llm_round: envelope.round } : {}),
               ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),

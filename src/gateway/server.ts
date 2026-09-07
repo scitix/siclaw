@@ -766,7 +766,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // the worker gates its toolset read-only and stamps the result artifact.
     const delegation = params.delegation as PromptOptions["delegation"];
     const allowInputRequest = params.allowInputRequest === true;
-    const requireExistingSession = params.requireExistingSession === true;
+    const requireExistingSession = params.requireExistingSession === true || Boolean(params.handoff);
     // The envelope's BINDING CONTEXT must travel with it. The box compares the
     // envelope's targetAgentId / segmentId / taskId against these and refuses a
     // mismatch (fail closed), which is what stops an envelope observed on one

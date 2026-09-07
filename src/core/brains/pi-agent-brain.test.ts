@@ -920,3 +920,41 @@ describe("PiAgentBrain", () => {
     });
   });
 });
+
+
+describe("handoff execution boundary", () => {
+  it("does not retry a successful terminal transfer even without final assistant text", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async () => {
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } });
+      session.__emit({ type: "tool_execution_end", toolName: "transfer_to_agent", result: { terminate: true, details: { transferred: true } } });
+    });
+    await new PiAgentBrain(session).prompt("count nodes");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+  it("blocks every call in a batch mixing handoff and work before execution", async () => {
+    const session = makeFakeSession();
+    const previous = vi.fn();
+    session.agent.beforeToolCall = previous;
+    new PiAgentBrain(session);
+    const calls = [{ type: "toolCall", name: "bash" }, { type: "toolCall", name: "transfer_to_agent" }];
+    for (const toolCall of calls) {
+      expect(await session.agent.beforeToolCall({ assistantMessage: { content: calls }, toolCall })).toMatchObject({ block: true });
+    }
+    expect(previous).not.toHaveBeenCalled();
+    await session.agent.beforeToolCall({ assistantMessage: { content: [calls[0]] }, toolCall: calls[0] });
+    expect(previous).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("processes already queued input before transfer and rejects input during the reserved handoff", async () => {
+  const session = makeFakeSession({ pendingMessageCount: 1 });
+  const brain = new PiAgentBrain(session);
+  const call = { type: "toolCall", name: "transfer_to_agent" };
+  const ctx = { assistantMessage: { content: [call] }, toolCall: call };
+  expect(await session.agent.beforeToolCall(ctx)).toMatchObject({ block: true });
+  session.pendingMessageCount = 0;
+  expect(await session.agent.beforeToolCall(ctx)).toBeUndefined();
+  await expect(brain.steer("new instruction")).rejects.toThrow("HANDOFF_IN_PROGRESS");
+  expect(session.steer).not.toHaveBeenCalled();
+});

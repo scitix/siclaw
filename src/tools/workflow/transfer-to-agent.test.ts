@@ -99,16 +99,16 @@ describe("transfer_to_agent 的执行", () => {
     expect(evict).toHaveBeenCalledTimes(1);
   });
 
-  // 丢缓存失败不影响这次交接:下一轮回灌会覆盖。
-  it("丢缓存失败不让交接失败", async () => {
+  // 失效标记持久化失败时不能承诺交接成功。
+  it("缓存失效失败时不交接", async () => {
     const emit = vi.fn();
     const tool = createTransferToAgentTool(refs({
       sessionEventEmitter: emit,
       evictSessionContext: async () => { throw new Error("disk gone"); },
     }));
     const out = await tool.execute!("call-1", { route_key: "cn", brief: "b" }, undefined as never);
-    expect(emit).toHaveBeenCalledTimes(1);
-    expect((out as { details: { transferred: boolean } }).details.transferred).toBe(true);
+    expect(emit).not.toHaveBeenCalled();
+    expect((out as { details: { transferred: boolean } }).details.transferred).toBe(false);
   });
 
   // ⚠️ 名单外的 key 一帧都不能发:控制面随后照样会拒,但那时这一轮已经结束了,
@@ -141,20 +141,45 @@ describe("transfer_to_agent 的执行", () => {
 //
 // 交接之后这一轮的内容全都被网关静音,用户和 transcript 都看不到,所以这句话说什么
 // 不重要 —— 重要的是**必须让它有话可说**,这一轮才不会是空的。
-describe("transfer_to_agent 的结果文案", () => {
-  it("不叫模型闭嘴 —— 空 assistant 消息会被判成 provider 空响应,整轮失败", async () => {
-    const tool = createTransferToAgentTool(refs())
-    const out = await tool.execute!("call-1", { route_key: "cn", brief: "b" }, undefined as never)
-    const text = (out as { content: { text: string }[] }).content[0].text
-    expect(text).not.toMatch(/say nothing/i)
-    // 明确给一句可说的话,并且禁止再次调用(实测里它连着交接了两次)。
-    expect(text).toMatch(/short line/i)
-    expect(text).toMatch(/do not call this tool again/i)
-  })
+describe("terminal handoff", () => {
+  it("returns the engine termination flag instead of requiring a closing response", async () => {
+    const tool = createTransferToAgentTool(refs());
+    const out = await tool.execute!("call", { route_key: "cn", brief: "Count nodes" }, undefined, undefined, {} as never);
+    expect(out).toMatchObject({ terminate: true, details: { transferred: true } });
+    expect(tool.executionMode).toBe("sequential");
+    expect(tool.description).toContain("ALONE");
+  });
+  it("validation errors do not terminate execution", async () => {
+    const tool = createTransferToAgentTool(refs());
+    const out = await tool.execute!("call", { route_key: "unknown", brief: "Count nodes" }, undefined, undefined, {} as never);
+    expect(out).toMatchObject({ terminate: false, details: { transferred: false } });
+  });
+});
 
-  it("工具描述里同样不能叫它闭嘴", () => {
-    const tool = createTransferToAgentTool(refs())
-    expect(tool.description).not.toMatch(/say nothing else/i)
-    expect(tool.description).toMatch(/do not call this tool again/i)
-  })
-})
+it("the installed agent loop stops after the handoff result without another model call", async () => {
+  const { runAgentLoop } = await import("@earendil-works/pi-agent-core");
+  const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai");
+  const tool = createTransferToAgentTool(refs());
+  const model = { id: "test", name: "test", api: "openai-completions", provider: "test", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } as const;
+  const events: any[] = [];
+  const streamFn = vi.fn(() => {
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      stream.push({ type: "done", reason: "toolUse", message: {
+        role: "assistant", content: [{ type: "toolCall", id: "transfer-1", name: "transfer_to_agent", arguments: { route_key: "cn", brief: "count nodes" } }],
+        api: model.api, provider: model.provider, model: model.id, stopReason: "toolUse", timestamp: Date.now(),
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      } });
+      stream.end();
+    });
+    return stream;
+  });
+  await runAgentLoop([{ role: "user", content: "count nodes", timestamp: Date.now() }],
+    { systemPrompt: "test", messages: [], tools: [tool as never] },
+    { model: model as never, convertToLlm: (messages) => messages as never },
+    (event) => { events.push(event); }, undefined, streamFn);
+  expect(streamFn).toHaveBeenCalledTimes(1);
+  expect(events.filter(e => e.type === "tool_execution_end")).toHaveLength(1);
+  expect(events.at(-1).type).toBe("agent_end");
+  expect(events.some(e => e.type === "message_end" && e.message.role === "toolResult")).toBe(true);
+});

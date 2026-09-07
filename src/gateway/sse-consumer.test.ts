@@ -1685,3 +1685,19 @@ describe("consumeAgentSse — 落库时打上执行方", () => {
     for (const c of appendCalls) expect(c.fromAgentId).toBeNull();
   });
 });
+
+describe("conversation phases", () => {
+  it("keeps progress distinct from the final answer in live events and persisted history", async () => {
+    const seen: any[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "我先检查节点状态。" }, { type: "toolCall", id: "c1", name: "bash", arguments: {} }], stopReason: "toolUse" } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "共有 5 个节点。" }], stopReason: "stop" } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (event: any) => { seen.push(event); },
+    });
+    expect(seen.filter(e => e.type === "message_end").map(e => e.phase)).toEqual(["commentary", "final_answer"]);
+    expect(appendCalls.filter(e => e.role === "assistant").map(e => e.metadata?.phase)).toEqual(["commentary", "final_answer"]);
+  });
+});

@@ -3048,19 +3048,10 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Sessions this box handed to another agent and must therefore forget.
-   *
-   * Marked rather than deleted on the spot: the transfer happens INSIDE a turn,
-   * and the brain is still appending to that transcript — the tool result and
-   * the closing assistant message are still to come. The mark is consumed either
-   * by `release` (delete the directory) or by `ensureSessionContext` (drop it and
-   * reload from the control plane), whichever comes first.
-   *
-   * ⚠️ In-memory, so a box that CRASHES between the transfer and the release
-   * keeps a stale transcript on its PV. A later hand-back would then resume from
-   * a conversation that stops mid-handoff. Bounded and self-correcting only in
-   * the sense that the control plane still has everything — the fix is a durable
-   * marker, not this set.
+   * Sessions handed away have a durable sibling marker. The source finishes
+   * appending its terminal tool result before release deletes the stale cache.
+   * Only successful control-plane rehydration clears the marker, including
+   * after a process restart or a hand-back to a still-resident session.
    */
   private readonly evictedSessions = new Set<string>();
 
@@ -3070,6 +3061,9 @@ export class AgentBoxSessionManager {
   async evictSessionContext(sessionId: string): Promise<void> {
     const id = sessionId?.trim();
     if (!id) return;
+    const marker = `${this.getSessionDir(id)}.handoff`;
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, "reload from control plane\n", { mode: 0o600 });
     this.evictedSessions.add(id);
   }
 
@@ -3086,25 +3080,25 @@ export class AgentBoxSessionManager {
    * Returns whether context now exists, so the strict `requireExistingSession`
    * check in http-server can read the truthful state instead of the pre-load one.
    *
-   * ⚠️ A failure here is logged LOUDLY but does not fail the turn: a transient
-   * gateway error must not turn into a 412 for a session that may well be brand
-   * new. The cost is exactly the failure this exists to fix — a turn that starts
-   * fresh — so the log line is the signal to watch.
+   * A failure returns false. Handoff requests require existing history and the
+   * HTTP boundary rejects them rather than starting with missing context.
    */
   async ensureSessionContext(sessionId?: string): Promise<boolean> {
     const id = sessionId?.trim();
     if (!id) return false;
-    // A session this box handed away and has been handed back before the delayed
-    // release fired: its local transcript stops at the moment of the transfer, so
-    // "there is context here" is true and useless — everything the other agent
-    // did is missing. Consume the mark, drop the stale copy, and fall through to
-    // a full reload. Consuming it is what keeps the eviction in `release` from
-    // then deleting the FRESH transcript this reload is about to write.
-    if (this.evictedSessions.delete(id)) {
+    // Release a completed resident brain before rebuilding its stale transcript.
+    // Keep the durable marker until a nonempty history has been written.
+    const marker = `${this.getSessionDir(id)}.handoff`;
+    if (this.evictedSessions.has(id) || fs.existsSync(marker)) {
+      const resident = this.sessions.get(id);
+      if (resident && (!resident._promptDone || resident._promptInflight)) return false;
+      if (resident?._releaseTimer) { clearTimeout(resident._releaseTimer); resident._releaseTimer = null; }
+      await this.release(id);
       try {
         fs.rmSync(this.getSessionDir(id), { recursive: true, force: true });
       } catch (err) {
-        console.warn(`[agentbox-session] Could not drop the stale transcript for ${id} before reloading it:`, err);
+        console.error(`[agentbox-session] Cannot discard stale context for ${id}:`, err);
+        return false;
       }
     } else if (this.hasRestorableSessionContext(id)) {
       return true;
@@ -3116,9 +3110,13 @@ export class AgentBoxSessionManager {
       if (!messages?.length) return false; // a genuinely new session — nothing to load
       const { written } = writeRehydratedSession(process.cwd(), this.getSessionDir(id), messages);
       console.log(`[agentbox-session] Rehydrated session ${id} from the control plane: ${messages.length} rows → ${written} messages`);
+      if (written > 0) {
+        fs.rmSync(marker, { force: true });
+        this.evictedSessions.delete(id);
+      }
       return written > 0;
     } catch (err) {
-      console.error(`[agentbox-session] Could not rehydrate session ${id} from the control plane; the turn will start WITHOUT prior context:`, err);
+      console.error(`[agentbox-session] Could not rehydrate session ${id} from the control plane; strict continuations must not start:`, err);
       return false;
     }
   }
@@ -3941,7 +3939,7 @@ export class AgentBoxSessionManager {
    * stale view of a conversation someone else now owns.
    */
   private dropEvictedTranscript(sessionId: string): void {
-    if (!this.evictedSessions.delete(sessionId)) return;
+    if (!this.evictedSessions.delete(sessionId) && !fs.existsSync(`${this.getSessionDir(sessionId)}.handoff`)) return;
     try {
       fs.rmSync(this.getSessionDir(sessionId), { recursive: true, force: true });
       console.log(`[agentbox-session] Evicted the local transcript for handed-off session ${sessionId}`);

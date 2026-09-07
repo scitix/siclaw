@@ -24,6 +24,12 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
     static continueRecent(cwd: string, sessionDir: string) {
       return new FakeFrameworkSessionManager(cwd, sessionDir);
     }
+    static create(cwd: string, sessionDir: string) {
+      return new FakeFrameworkSessionManager(cwd, sessionDir);
+    }
+    appendMessage(message: any) {
+      (globalThis as any).__frameworkEntriesState.entries.push({ type: "message", message });
+    }
     getEntries(): any[] {
       return (globalThis as any).__frameworkEntriesState.entries;
     }
@@ -1087,6 +1093,21 @@ describe("AgentBoxSessionManager — 交接后丢弃本地会话副本", () => {
     expect(fs.existsSync(path.join(dir, "stale.jsonl"))).toBe(false);
   });
 
+  it("进程重启后仍拒绝使用失效历史，恢复失败保留标记", async () => {
+    const original = new AgentBoxSessionManager() as any;
+    const dir = path.join(original.getBaseSessionDir(), "s-restart");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "stale.jsonl"), "{}\n");
+    await original.evictSessionContext("s-restart");
+    const restarted = new AgentBoxSessionManager() as any;
+    const fetchSessionHistory = vi.fn(async () => { throw new Error("offline"); });
+    restarted.gatewayClient = { fetchSessionHistory };
+    expect(await restarted.ensureSessionContext("s-restart")).toBe(false);
+    expect(fetchSessionHistory).toHaveBeenCalledOnce();
+    expect(fs.existsSync(`${dir}.handoff`)).toBe(true);
+    expect(fs.existsSync(path.join(dir, "stale.jsonl"))).toBe(false);
+  });
+
   it("release 把交接过的 session 目录删掉", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     const dir = path.join(mgr.getBaseSessionDir(), "s-gone");
@@ -1116,10 +1137,11 @@ describe("AgentBoxSessionManager — 交接后丢弃本地会话副本", () => {
     (globalThis as any).__frameworkEntriesState.entries = [];
     const dir = path.join(mgr.getBaseSessionDir(), "s-back");
     fs.mkdirSync(dir, { recursive: true });
-    mgr.gatewayClient = { fetchSessionHistory: async () => ({ sessionId: "s-back", messages: [] }) };
+    mgr.gatewayClient = { fetchSessionHistory: async () => ({ sessionId: "s-back", messages: [{ id: "u1", role: "user", content: "继续检查节点", createdAt: new Date().toISOString() }] }) };
 
     await mgr.evictSessionContext("s-back");
-    await mgr.ensureSessionContext("s-back");
+    expect(await mgr.ensureSessionContext("s-back")).toBe(true);
+    expect(fs.existsSync(`${dir}.handoff`)).toBe(false);
     // 回灌之后的目录内容(这里手工摆一份,回灌本身走的是真实 SessionManager,
     // 在这个文件里是假的)。
     fs.mkdirSync(dir, { recursive: true });

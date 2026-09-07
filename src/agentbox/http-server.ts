@@ -1655,8 +1655,9 @@ export function createHttpServer(
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
       const message = err instanceof Error ? err.message : "Steer failed";
-      sendJson(res, 500, {
-        error: { code: "INTERNAL_ERROR", message, retriable: true },
+      const handingOff = message.includes("HANDOFF_IN_PROGRESS");
+      sendJson(res, handingOff ? 409 : 500, {
+        error: { code: handingOff ? "HANDOFF_IN_PROGRESS" : "INTERNAL_ERROR", message, retriable: true },
       });
     }
   });

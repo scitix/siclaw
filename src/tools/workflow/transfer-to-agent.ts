@@ -43,6 +43,7 @@ function result(text: string, transferred: boolean) {
   return {
     content: [{ type: "text" as const, text }],
     details: { transferred },
+    terminate: transferred,
   };
 }
 
@@ -74,6 +75,7 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
   return {
     name: "transfer_to_agent",
     label: "Transfer Conversation",
+    executionMode: "sequential",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("transfer_to_agent")), 0, 0),
     renderResult: renderTextResult,
     description:
@@ -82,10 +84,9 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
       "than by you — you cannot reach their networks, and a tool call against them will simply fail.\n\n" +
       "This is a TRANSFER, not a delegation: after you call this, the destination owns the conversation and " +
       "answers the user directly. You will not be asked to summarise anything, and there is no result coming " +
-      "back to you. So: call this INSTEAD of answering, not after answering. Do not tell the user you are " +
-      "transferring them and do not say goodbye — they see one continuous conversation and a visible handover " +
-      "would only confuse them. After the call, close your turn with one short internal line such as " +
-      "\"handed over\" and stop — do not call this tool again, and do not start new work.\n\n" +
+      "back to you. Call this tool ALONE, never in the same batch as another tool. A successful call ends " +
+      "your execution automatically; do not produce a closing message or repeat the call. Before calling, " +
+      "you may briefly tell the user what you are checking, without explaining internal routing.\n\n" +
       "`brief` is what the destination reads as its instruction. It has the full conversation history, so do " +
       "not retell it — state what needs doing and anything you already established (the exact cluster/host, " +
       "what you already ruled out).\n\n" +
@@ -121,33 +122,18 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
         );
       }
 
-      refs.sessionEventEmitter({ type: "handoff_requested", targetAgentId: target.id, brief });
-
       // 丢掉本地副本。交出去之后这个 box 对这段会话不再有发言权,留着只会在它某天
       // 又被交回来时,拿一份缺了中间几轮的陈旧上下文去接 —— 而控制面那边是全的。
-      // 尽力而为:丢不掉也不影响这次交接,下一轮回灌会覆盖。
+      // 先持久化失效标记；失败时不发出交接事件。
       try {
         await refs.evictSessionContext?.();
       } catch (err) {
         console.warn("[transfer_to_agent] could not evict the local session context:", err);
+        return result("Cannot safely invalidate local context. Handoff was not started.", false);
       }
+      refs.sessionEventEmitter({ type: "handoff_requested", targetAgentId: target.id, brief });
 
-      // ⚠️ 不要写"say nothing further"。
-      //
-      // 模型会照办 —— 它发一条**空的** assistant 消息,而 pi-agent-brain 把"零个
-      // content 块"当成 provider 返回空,重试两次,然后整轮判失败。测试环境实测:
-      // facade 交接完又交接了一次,然后发空消息,`Empty response persisted after
-      // 2 retries`,用户那边就是"没响应"。
-      //
-      // 所以要给它一句**能说的话**。说什么不重要 —— 交接之后这一轮的内容全都被
-      // 网关静音(见 consumeAgentSse 的 handoff 切断),用户和 transcript 都看不到;
-      // 这句话唯一的作用是让这一轮有内容、不被判成空响应。
-      return result(
-        `Conversation handed to ${target.name}. They answer the user from here. ` +
-          `Close your turn now with a single short line like "handed over" — do not call this tool again ` +
-          `and do not start new work.`,
-        true,
-      );
+      return result(`Conversation handed to ${target.name}. Execution yielded to the destination.`, true);
     },
   };
 }
