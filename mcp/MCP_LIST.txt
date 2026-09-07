@@ -27,3 +27,4 @@
 # and append <name> to this file.
 
 create-chart
+product-support-result
