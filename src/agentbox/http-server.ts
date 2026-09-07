@@ -32,6 +32,7 @@ import {
   readBoxSyncStatus,
   type KnowledgeSyncHandler,
 } from "./sync-handlers.js";
+import type { ObservedMcpServer } from "../shared/agentbox-sync-status.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
@@ -653,6 +654,14 @@ export function createHttpServer(
     candidatesRevision: string | null;
     observedAt: string;
   } | null = null;
+  /**
+   * Per-server MCP connection outcome from the most recent session that
+   * initialized MCP in this box. Recorded when the session is CREATED, not when
+   * a turn succeeds: a server that fails to connect is exactly the observation
+   * a developer needs, and it must not disappear because the turn that followed
+   * also failed (e.g. the model rejecting an oversized tool list).
+   */
+  let observedMcpServers: ObservedMcpServer[] | null = null;
   if (sessionManager.credentialBroker) {
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
@@ -808,11 +817,21 @@ export function createHttpServer(
    * intended to send.
    */
   addRoute("GET", "/api/sync-status", async (_req, res) => {
+    const inventory = readBoxSyncStatus({
+      knowledgeDir: sessionManager.knowledgeDir,
+      knowledgeHandler: perServerKnowledgeHandler,
+    });
+    // Prefer a live session's manager over the last recorded snapshot: an MCP
+    // reload invalidates sessions, so the newest session is the one built from
+    // the current config. Fall back to the snapshot when every session has been
+    // released, and to "no servers field" when this box never initialized MCP.
+    const liveManager = sessionManager.list()
+      .filter((session) => session.mcpManager)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]?.mcpManager;
+    const servers = liveManager ? liveManager.getServerConnections() : observedMcpServers;
     sendJson(res, 200, {
-      ...readBoxSyncStatus({
-        knowledgeDir: sessionManager.knowledgeDir,
-        knowledgeHandler: perServerKnowledgeHandler,
-      }),
+      ...inventory,
+      mcp: { ...inventory.mcp, ...(servers ? { servers } : {}) },
       model: observedModel,
       harness: observedHarness,
       tiers: observedTiers,
@@ -916,6 +935,9 @@ export function createHttpServer(
       delegation,
       body.userId,
     );
+    if (managed.mcpManager) {
+      observedMcpServers = managed.mcpManager.getServerConnections();
+    }
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped

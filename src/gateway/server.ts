@@ -79,6 +79,7 @@ import {
   type BoxSyncObservation,
   type BoxSyncStatus,
 } from "../shared/agentbox-sync-status.js";
+import { McpClientManager, type McpConnectErrorKind, type McpServerConnection } from "../core/mcp-client.js";
 import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
@@ -2236,6 +2237,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       knowledge: [...(status.knowledge?.repos ?? [])].sort((a, b) => a.id.localeCompare(b.id)),
       skills: [...(status.skills?.names ?? [])].sort(),
       mcp: [...(status.mcp?.names ?? [])].sort(),
+      // Connection outcome is part of what a replica IS: two boxes with the same
+      // config where one reached a server and the other did not are serving
+      // different toolsets. Timing, tool names and error text are evidence, not
+      // identity, so only name/state/toolCount/error kind participate.
+      mcpServers: status.mcp?.servers
+        ? [...status.mcp.servers]
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((s) => ({ name: s.name, state: s.state, toolCount: s.toolCount, errorKind: s.error?.kind ?? null }))
+        : null,
       harness: status.harness ? {
         agentType: status.harness.agentType,
         systemPromptTemplate: status.harness.systemPromptTemplate,
@@ -2290,7 +2300,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // the old verifier in sync_pending rather than producing a false success.
       knowledge: first.knowledge ?? { syncedAt: null, repos: [] },
       skills: first.skills ?? { names: [] },
-      mcp: first.mcp ?? { names: [] },
+      // `servers` follows the harness/model gate: per-box outcomes live in
+      // `observations`; the flat view only claims a connection state every
+      // running box agrees on.
+      mcp: {
+        names: first.mcp?.names ?? [],
+        ...(consistent && first.mcp?.servers ? { servers: first.mcp.servers } : {}),
+      },
       harness: consistent ? (first.harness ?? null) : null,
       model: consistent ? (first.model ?? null) : null,
       // Same gate as the two above: a tier observation is proof only when every
@@ -2298,6 +2314,61 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // walking `observations` would otherwise have no way to see tier state at all.
       tiers: consistent ? (first.tiers ?? null) : null,
     };
+  });
+
+  // mcp.probe — dial ONE MCP server config from this Runtime and report the
+  // outcome in the same shape a box reports after initializing MCP.
+  //
+  // This exists so a platform MCP owner can learn "your URL returns an HTML
+  // page" when they SAVE the config, instead of after an agent somewhere fails
+  // to connect and nobody surfaces it. It runs here rather than in the control
+  // plane on purpose: the Runtime is where the config will actually be used, it
+  // shares the network position of the boxes it spawns, and per-runtime address
+  // overrides only make sense when the runtime itself resolves them.
+  //
+  // stdio servers are refused: probing one would execute an arbitrary command in
+  // the Runtime process, and a box start already reports their outcome.
+  rpcMethods.set("mcp.probe", async (params) => {
+    const server = params.server as Record<string, unknown> | undefined;
+    if (!server || typeof server.name !== "string" || server.name.trim() === "") {
+      throw new Error("server.name required");
+    }
+    const name = server.name;
+    const transport = typeof server.transport === "string" && server.transport !== ""
+      ? server.transport
+      : typeof server.url === "string" ? "streamable-http" : typeof server.command === "string" ? "stdio" : "";
+    const startedAt = Date.now();
+    const failed = (kind: McpConnectErrorKind, message: string): McpServerConnection => ({
+      name, transport, state: "failed", toolCount: 0, toolNames: [],
+      durationMs: Date.now() - startedAt, observedAt: new Date().toISOString(),
+      error: { kind, message },
+    });
+    if (transport === "stdio") {
+      return { ok: true, probe: failed("invalid_config", "stdio servers run inside the AgentBox and are not probed from the Runtime") };
+    }
+    const requested = Number(params.timeoutMs);
+    const timeoutMs = Number.isFinite(requested) ? Math.min(Math.max(Math.trunc(requested), 1_000), 30_000) : 10_000;
+    const manager = new McpClientManager({ mcpServers: { [name]: { ...server, transport } as any } });
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
+    try {
+      const outcome = await Promise.race([manager.initialize().then(() => "done" as const), timedOut]);
+      if (outcome === "timeout") {
+        return { ok: true, probe: failed("timeout", `no MCP handshake within ${timeoutMs}ms`) };
+      }
+      const probe = manager.getServerConnections().find((item) => item.name === name)
+        ?? failed("unknown", "probe produced no observation");
+      console.log(`[rpc] mcp.probe: "${name}" (${transport}) → ${probe.state}${probe.error ? ` ${probe.error.kind}` : ` ${probe.toolCount} tools`}`);
+      return { ok: true, probe };
+    } finally {
+      if (timer) clearTimeout(timer);
+      // Awaited, not fire-and-forget: shutdown() marks the manager disposed so a
+      // connection that completes after the timeout is closed by initialize()
+      // itself instead of leaking into a list nobody will close again.
+      await manager.shutdown().catch((err) => {
+        console.warn(`[rpc] mcp.probe: shutdown of "${name}" failed:`, err);
+      });
+    }
   });
 
   // agent.promptInspection — explicit sensitive audit of one resident session.

@@ -104,3 +104,64 @@ describe("tiers observation", () => {
     }
   });
 });
+
+describe("mcp.servers observation", () => {
+  it("leaves `servers` absent when the box did not send it (v3 box or MCP never initialized)", () => {
+    const status = normalizeBoxSyncStatus(payload({ mcp: { names: ["devops"] } }));
+    expect(status.mcp).toEqual({ names: ["devops"] });
+    expect("servers" in status.mcp).toBe(false);
+  });
+
+  it("keeps an empty `servers` array distinct from an absent one", () => {
+    const status = normalizeBoxSyncStatus(payload({ mcp: { names: [], servers: [] } }));
+    expect(status.mcp.servers).toEqual([]);
+  });
+
+  it("preserves a connected and a failed server with the classified error", () => {
+    const status = normalizeBoxSyncStatus(payload({
+      mcp: {
+        names: ["devops", "siverse"],
+        servers: [
+          { name: "devops", transport: "streamable-http", state: "connected", toolCount: 2,
+            toolNames: ["get_change_detail", "list_change_records"], durationMs: 361, observedAt: "2026-09-07T09:44:58.643Z" },
+          { name: "siverse", transport: "streamable-http", state: "failed", toolCount: 0, toolNames: [], durationMs: 20,
+            observedAt: "2026-09-07T09:45:00.168Z",
+            error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "HTML page: Simate" } },
+        ],
+      },
+    }));
+    expect(status.mcp.servers).toEqual([
+      { name: "devops", transport: "streamable-http", state: "connected", toolCount: 2,
+        toolNames: ["get_change_detail", "list_change_records"], durationMs: 361, observedAt: "2026-09-07T09:44:58.643Z" },
+      { name: "siverse", transport: "streamable-http", state: "failed", toolCount: 0, toolNames: [], durationMs: 20,
+        observedAt: "2026-09-07T09:45:00.168Z",
+        error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "HTML page: Simate" } },
+    ]);
+  });
+
+  it("drops entries without a name or a recognised state and never invents a connection", () => {
+    const status = normalizeBoxSyncStatus(payload({
+      mcp: {
+        names: ["a", "b", "c"],
+        servers: [
+          { transport: "sse", state: "connected" },
+          { name: "b", state: "pending" },
+          { name: "c", state: "failed" },
+        ],
+      },
+    }));
+    expect(status.mcp.servers).toEqual([
+      // A failed server without an explanation still reports failed, with an
+      // `unknown` error rather than a fabricated success.
+      { name: "c", transport: "", state: "failed", toolCount: 0, toolNames: [], durationMs: 0, observedAt: "",
+        error: { kind: "unknown", message: "" } },
+    ]);
+  });
+
+  it("maps an unrecognised error kind to unknown instead of leaking free text into the vocabulary", () => {
+    const status = normalizeBoxSyncStatus(payload({
+      mcp: { names: ["x"], servers: [{ name: "x", state: "failed", error: { kind: "weird", message: "boom" } }] },
+    }));
+    expect(status.mcp.servers?.[0].error).toEqual({ kind: "unknown", message: "boom" });
+  });
+});
