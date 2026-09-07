@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createTransferToAgentTool, registration } from "./transfer-to-agent.js";
+import { resolveAgentHarness } from "../../core/agent-context.js";
+import { ToolRegistry } from "../../core/tool-registry.js";
 import type { ToolRefs } from "../../core/tool-registry.js";
 import type { HandoffTarget } from "../../shared/agent-handoff.js";
 
@@ -182,4 +184,80 @@ it("the installed agent loop stops after the handoff result without another mode
   expect(events.filter(e => e.type === "tool_execution_end")).toHaveLength(1);
   expect(events.at(-1).type).toBe("agent_end");
   expect(events.some(e => e.type === "message_end" && e.message.role === "toolResult")).toBe(true);
+});
+
+// Exercise the real compiler + registry together, not just a capability array.
+describe("conversation handoff across Agent types", () => {
+  const registry = new ToolRegistry();
+  registry.register(registration);
+  function toolsFor(agentType: string, overrides: Parameters<typeof resolveAgentHarness>[0] = { allowedTools: null, memoryConfigured: false }, toolRefs = refs()) {
+    const harness = resolveAgentHarness({
+      agentType, mode: "web", handoffAvailable: true, ...overrides,
+    });
+    return registry.resolve({ mode: "web", refs: toolRefs, allowedTools: harness.allowedTools });
+  }
+  it.each(["sre", "coordinator", "knowledge_qa", "product_support", "custom"])("offers transfer to a resolved %s conversation owner", (type) => {
+    expect(toolsFor(type).map(t => t.name)).toEqual(["transfer_to_agent"]);
+  });
+  it("adds only ownership transfer to a restricted Custom allowance", () => {
+    const allowedTools = ["read"];
+    const harness = resolveAgentHarness({ agentType: "custom", allowedTools, mode: "web", memoryConfigured: false, handoffAvailable: true });
+    expect(harness.allowedTools).toEqual(["read", "transfer_to_agent"]);
+    expect(allowedTools).toEqual(["read"]);
+    expect(harness.includeOperationalSafety).toBe(false);
+    expect(toolsFor("custom", { allowedTools, memoryConfigured: false })).toHaveLength(1);
+  });
+  it("does not grant operations to a read-only knowledge agent", () => {
+    const harness = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false, handoffAvailable: true });
+    expect(harness.allowedTools).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "transfer_to_agent"]);
+    expect(harness.includeSubagentGuidance).toBe(false);
+  });
+  it("keeps an unresolved harness closed even with a roster", () => {
+    expect(toolsFor("custom", { allowedTools: null, memoryConfigured: false, harnessResolved: false })).toEqual([]);
+  });
+  it.each([
+    { handoffTargets: [] }, { sessionEventEmitter: undefined },
+    { isSubagent: true }, { delegation: { delegationId: "d1" } },
+  ])("does not expose a transfer without ownership and transport: %j", (overrides) => {
+    expect(toolsFor("custom", undefined, refs(overrides))).toEqual([]);
+  });
+  it.each(["channel", "task", "cli"] as const)("does not expose handoff in %s mode", (mode) => {
+    expect(registry.resolve({ mode, refs: refs(), allowedTools: null })).toEqual([]);
+  });
+});
+
+describe("target capability summaries", () => {
+  it("describes type allowances and configured skills, knowledge and MCP names", () => {
+    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({
+      agentType: "knowledge_qa", toolCapabilities: null,
+      skills: ["GPU FAQ guide"], knowledgeBases: ["Product FAQ"], mcpServers: ["Ticket service"], resourcesResolved: true,
+    })] }));
+    expect(tool.description).toContain("Knowledge Q&A Agent");
+    expect(tool.description).toContain("knowledge_search");
+    expect(tool.description).not.toContain("node_exec");
+    expect(tool.description).toContain("bound skills: GPU FAQ guide");
+    expect(tool.description).toContain("bound knowledge bases: Product FAQ");
+    expect(tool.description).toContain("bound MCP servers: Ticket service");
+    expect(tool.description).toContain("not proof of live tool health");
+  });
+  it("uses restricted Custom capabilities instead of guessing from its name", () => {
+    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ agentType: "custom", toolCapabilities: ["read_files"] })] }));
+    expect(tool.description).toContain("knowledge_search");
+    expect(tool.description).not.toContain("node_exec");
+  });
+  it.each([undefined, "future_type", "custom"])("does not infer unrestricted capabilities from missing metadata: %s", (agentType) => {
+    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ agentType })] }));
+    expect(tool.description).toContain("built-in capabilities: unknown");
+    expect(tool.description).not.toContain("legacy Custom defaults");
+  });
+  it("marks failed resource lookup as unknown instead of no bound resources", () => {
+    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ resourcesResolved: false, clusters: [], hosts: [] })] }));
+    expect(tool.description).toContain("configured resources: unknown");
+    expect(tool.description).not.toContain("bound clusters/hosts: none");
+  });
+  it("bounds capability binding lists and reports omitted entries", () => {
+    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ skills: Array.from({ length: 60 }, (_, i) => `skill-${i}`) })] }));
+    expect(tool.description).toContain("(+36 more)");
+    expect(tool.description).not.toContain("skill-59");
+  });
 });

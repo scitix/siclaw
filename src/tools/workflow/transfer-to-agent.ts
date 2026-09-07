@@ -32,6 +32,8 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
+import { AGENT_TYPES, effectiveCapabilityKeys, requireAgentType } from "../../core/agent-types.js";
+import { resolveCapabilities } from "../../core/tool-capabilities.js";
 import type { HandoffTarget } from "../../shared/agent-handoff.js";
 
 interface TransferParams {
@@ -55,17 +57,34 @@ function result(text: string, transferred: boolean) {
  */
 const COVERAGE_LIMIT = 24;
 
-function coverageOf(t: HandoffTarget): string {
-  const names = [...t.clusters, ...t.hosts];
-  if (names.length === 0) return "no bound resources";
+function boundedNames(names: string[]): string {
   const shown = names.slice(0, COVERAGE_LIMIT).join(", ");
-  return names.length > COVERAGE_LIMIT ? `${shown} … (+${names.length - COVERAGE_LIMIT} more)` : shown;
+  return names.length > COVERAGE_LIMIT ? `${shown} … (+${names.length - COVERAGE_LIMIT} more)` : shown || "none";
+}
+
+function targetCapabilities(t: HandoffTarget): string {
+  try {
+    const type = requireAgentType(t.agentType);
+    if (type === "custom" && t.toolCapabilities === undefined) return "built-in capabilities: unknown";
+    const tools = resolveCapabilities(effectiveCapabilityKeys(type, t.toolCapabilities ?? null));
+    return `${AGENT_TYPES[type].label}: ${AGENT_TYPES[type].description}\n  built-in tool allowance: ${tools === null
+      ? "legacy Custom defaults (per-session availability still applies)"
+      : tools.filter((name) => name !== "transfer_to_agent").join(", ")}`;
+  } catch {
+    return "built-in capabilities: unknown (not supplied by control plane)";
+  }
 }
 
 function targetLine(t: HandoffTarget): string {
   const desc = t.description ? ` — ${t.description}` : "";
-  const back = t.isFacade ? " (hand the conversation BACK here when the work leaves your region)" : "";
-  return `- ${t.routeKey}: ${t.name}${desc}${back}\n  covers: ${coverageOf(t)}`;
+  const back = t.isFacade ? " (hand the conversation BACK here when it needs the entry agent)" : "";
+  const resources = t.resourcesResolved === false ? "  configured resources: unknown (lookup failed)" : [
+    `  bound clusters/hosts: ${boundedNames([...t.clusters, ...t.hosts])}`,
+    ...(t.skills ? [`  bound skills: ${boundedNames(t.skills)}`] : []),
+    ...(t.knowledgeBases ? [`  bound knowledge bases: ${boundedNames(t.knowledgeBases)}`] : []),
+    ...(t.mcpServers ? [`  bound MCP servers: ${boundedNames(t.mcpServers)}`] : []),
+  ].join("\n");
+  return `- ${t.routeKey}: ${t.name}${desc}${back}\n  ${targetCapabilities(t)}\n${resources}`;
 }
 
 export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
@@ -79,9 +98,14 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("transfer_to_agent")), 0, 0),
     renderResult: renderTextResult,
     description:
-      "Hand this conversation over to the agent that can actually reach the target resource. Use it when the " +
-      "cluster, host or service the user is asking about is covered by one of the destinations below rather " +
-      "than by you — you cannot reach their networks, and a tool call against them will simply fail.\n\n" +
+      "Hand this conversation over when an authorized destination is better suited to continue the user's " +
+      "request. Match the requested domain and action to its description, built-in capabilities and bound " +
+      "resources below. Agent names and list order alone are not evidence of capability. These are configured " +
+      "allowances and binding names, not proof of live tool health, published skill content or network reachability. " +
+      "If the target or capability is ambiguous, ask for the missing detail instead of guessing or trying agents " +
+      "one by one. Continue yourself when you can handle the request; do not transfer merely because another " +
+      "agent exists. Moving the main conversation uses this tool; delegate_to_agent is for an independent " +
+      "subtask whose result you need back.\n\n" +
       "This is a TRANSFER, not a delegation: after you call this, the destination owns the conversation and " +
       "answers the user directly. You will not be asked to summarise anything, and there is no result coming " +
       "back to you. Call this tool ALONE, never in the same batch as another tool. A successful call ends " +
@@ -145,6 +169,6 @@ export const registration: ToolEntry = {
   // 转发接住那条帧(见文件头)。
   modes: ["web"],
   available: (refs) =>
-    Boolean(refs.sessionEventEmitter && (refs.handoffTargets?.length ?? 0) > 0 && !refs.delegation),
+    Boolean(refs.sessionEventEmitter && (refs.handoffTargets?.length ?? 0) > 0 && !refs.delegation && !refs.isSubagent),
   requiresUserApproval: false,
 };

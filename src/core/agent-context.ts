@@ -43,6 +43,8 @@ export interface CompileAgentContextInput {
   mode: SessionMode;
   agentPrompt?: string;
   interactiveProgress?: boolean;
+  /** A conversation owner has a control emitter and an authorized handoff roster. */
+  handoffAvailable?: boolean;
   systemPromptTemplate?: string;
   delegation?: DelegationContext;
 }
@@ -118,7 +120,14 @@ export function resolveAgentHarness(
   const modeTools = input.mode === "task" && Array.isArray(resolvedTools) && !resolvedTools.includes("task_report")
     ? [...resolvedTools, "task_report"]
     : resolvedTools;
-  const allowedTools = resolution === "resolved" ? modeTools : [];
+  // Ownership transfer is a conversation transport capability for every type.
+  // The factory proves emitter/roster/owner availability; unresolved harnesses
+  // still fail closed. This grants no command, delegation, or resource access.
+  const conversationTools = input.mode === "web" && input.handoffAvailable && !input.delegation
+    && Array.isArray(modeTools) && !modeTools.includes("transfer_to_agent")
+    ? [...modeTools, "transfer_to_agent"]
+    : modeTools;
+  const allowedTools = resolution === "resolved" ? conversationTools : [];
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
 
   const canOperate = hasAnyTool(allowedTools, [
@@ -168,11 +177,21 @@ export function resolveAgentHarness(
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
   const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
+  const handoffContract = input.mode === "web" && input.handoffAvailable && !input.delegation
+    && harness.resolution === "resolved"
+    ? "Conversation ownership: transfer_to_agent is available for this main conversation. " +
+      "When another authorized destination is better suited to continue the user's request, use its " +
+      "configured capability and coverage summary to transfer ownership. General role guidance to route " +
+      "work to a specialist uses this ownership transfer for the main request; reserve delegation for " +
+      "independent subtasks whose results you need back. Handle requests within your own capabilities " +
+      "yourself. Do not guess an ambiguous destination, cycle between agents, or transfer merely to " +
+      "repeat an answer. This does not grant you additional execution or resource permissions."
+    : undefined;
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
     interactiveProgress: input.interactiveProgress ?? (input.mode === "web" && !input.delegation),
     templateOverride: input.systemPromptTemplate,
-    agentTypePrompt: agentPrompt.typeContract,
+    agentTypePrompt: [agentPrompt.typeContract, handoffContract].filter(Boolean).join("\n\n") || undefined,
     agentAddendum: agentPrompt.addendum,
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,

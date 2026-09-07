@@ -46,6 +46,16 @@ export interface HandoffTarget {
    */
   routeKey: string;
   description: string;
+  /** Optional for rolling upgrades. Missing type must not imply unrestricted Custom. */
+  agentType?: string;
+  /** Same semantics as config.getAgentInfo; null explicitly selects Custom defaults. */
+  toolCapabilities?: string[] | null;
+  /** Configured bindings, not a live tool-health or network reachability guarantee. */
+  skills?: string[];
+  knowledgeBases?: string[];
+  mcpServers?: string[];
+  /** False means coverage/binding lookup failed; empty lists must not imply no resources. */
+  resourcesResolved?: boolean;
   /** True for the facade itself — the hand-back, always `routeKey: "facade"`. */
   isFacade: boolean;
   /** Bound cluster names: WHICH resources this target can actually reach. */

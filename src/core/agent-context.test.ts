@@ -218,3 +218,19 @@ describe("createAgentContextManifest", () => {
     expect(JSON.stringify(manifest)).not.toContain("question answering agent");
   });
 });
+
+
+describe("handoff conversation contract", () => {
+  it.each(["sre", "coordinator", "knowledge_qa", "product_support", "custom"])("gives %s the same main-conversation transfer semantics", (agentType) => {
+    const context = compileAgentContext({ agentType, allowedTools: null, memoryConfigured: false, mode: "web", handoffAvailable: true });
+    expect(context.systemPrompt).toContain("Conversation ownership: transfer_to_agent is available");
+    expect(context.systemPrompt).toContain("reserve delegation for independent subtasks");
+  });
+  it.each([
+    { handoffAvailable: false }, { harnessResolved: false },
+    { mode: "channel" as const }, { delegation: { delegationId: "d1" } },
+  ])("does not instruct sessions without handoff authority to transfer: %j", (overrides) => {
+    const context = compileAgentContext({ agentType: "knowledge_qa", allowedTools: null, memoryConfigured: false, mode: "web", handoffAvailable: true, ...overrides });
+    expect(context.systemPrompt).not.toContain("Conversation ownership: transfer_to_agent is available");
+  });
+});

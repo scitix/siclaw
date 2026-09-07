@@ -432,6 +432,7 @@ export async function createSiclawSession(
     agentPrompt: opts?.systemPromptAppend,
     systemPromptTemplate: opts?.systemPromptTemplate,
     delegation: opts?.delegation,
+    handoffAvailable: Boolean(opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
     interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
   });
   const allowedTools = compiledContext.harness.allowedTools;
