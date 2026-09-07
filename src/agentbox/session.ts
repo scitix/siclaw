@@ -2181,7 +2181,13 @@ export class AgentBoxSessionManager {
         managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
         let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
         let currentModelRouteMetadata: Record<string, unknown> | null = null;
+        managed.brain.llmCalls?.beginPrompt(Date.now(), { explicit: true });
         const handleRouteEvent = (event: ModelRouteEvent): void => {
+          if (event.type === "model_route_attempt" && event.status === "started") {
+            managed.brain.llmCalls?.beginAttempt(event.attempt);
+          } else if ((event.type === "model_route_attempt" && event.status === "failed") || event.type === "model_route_rollback") {
+            managed.brain.llmCalls?.rollbackAttempt();
+          }
           if (!managed._promptDone) managed._eventBuffer.push({ ...event, sessionId: sid });
           if (event.type === "model_route_switch") {
             latestModelRouteSwitch = event;
@@ -2270,6 +2276,7 @@ export class AgentBoxSessionManager {
         } catch (err) {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
+          managed.brain.llmCalls?.endPrompt({ explicit: true });
           managed._promptDone = true;
           managed._routeBrainEventsThroughExtra = false;
           if (managed._bufferUnsub) { managed._bufferUnsub(); managed._bufferUnsub = null; }

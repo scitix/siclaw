@@ -59,6 +59,7 @@ import {
 import { normalizeEntry, entrySessionPredicate, entryPromptPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
 import { humanPromptPredicate } from "./human-prompt.js";
+import { transcriptVisiblePredicate } from "./transcript-rows.js";
 import { summariseLatency, extractLlmCallMs } from "./metrics-timing.js";
 import {
   assembleExporterHeaders,
@@ -2287,24 +2288,17 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // assistant text at all — and every background poll re-downloaded tens of KB
     // of reasoning that is then thrown away.
     //
-    // metadata is TEXT written with a compact JSON.stringify, so these LIKEs are
-    // exact for rows this runtime writes and behave the same on MySQL and SQLite.
-    // The carrier clause requires NO `kind`: an error_response or route notice can
-    // also be content-empty, and those must stay visible.
-    const HIDDEN_ROW_PREDICATE =
-      `(metadata LIKE '%"kind":"thinking"%'` +
-      ` OR (role = 'assistant' AND (content IS NULL OR content = '')` +
-      ` AND metadata LIKE '%"llm_call"%' AND metadata NOT LIKE '%"kind":%'))`;
+    const visibleRows = transcriptVisiblePredicate(db);
 
     const [[countRows], [listRows]] = await Promise.all([
       db.query(
-        `SELECT COUNT(*) AS count FROM chat_messages WHERE session_id = ? AND NOT ${HIDDEN_ROW_PREDICATE}`,
+        `SELECT COUNT(*) AS count FROM chat_messages WHERE session_id = ? AND ${visibleRows}`,
         [params.sid],
       ),
       db.query(
         // Fetch newest N messages (DESC + LIMIT), then reverse in app to get chronological order.
         // This ensures page=1 returns the most recent messages (for initial load at bottom of chat).
-        `SELECT * FROM chat_messages WHERE session_id = ? AND NOT ${HIDDEN_ROW_PREDICATE}` +
+        `SELECT * FROM chat_messages WHERE session_id = ? AND ${visibleRows}` +
           " ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
         [params.sid, pageSize, offset],
       ),
@@ -2699,7 +2693,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Fetch newest N+1 rows DESC, then reverse to chronological order.
     const [msgRows] = await db.query(
       `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, created_at
-       FROM chat_messages WHERE session_id = ?
+       FROM chat_messages WHERE session_id = ? AND ${transcriptVisiblePredicate(db)}
        ORDER BY created_at DESC, id DESC LIMIT ?`,
       [sessionId, MAX_TRACE_MESSAGES + 1],
     ) as any;
@@ -4050,14 +4044,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const outputValues: number[] = [];
     const totalValues: number[] = [];
     for (const r of aRows.slice(0, TIMING_ROW_LIMIT)) {
-      const total = extractLlmCallMs(r.metadata, "total");
+      const metadata = safeParseJson(r.metadata, null);
+      const total = extractLlmCallMs(metadata, "total");
       if (total === undefined) continue; // not a model-call row
       totalValues.push(total);
-      const t = extractLlmCallMs(r.metadata, "net_ttft");
+      const t = extractLlmCallMs(metadata, "net_ttft");
       if (t !== undefined) ttftValues.push(t);
-      const th = extractLlmCallMs(r.metadata, "thinking");
+      const th = extractLlmCallMs(metadata, "thinking");
       if (th !== undefined) thinkingValues.push(th);
-      const out = extractLlmCallMs(r.metadata, "output");
+      const out = extractLlmCallMs(metadata, "output");
       if (out !== undefined) outputValues.push(out);
     }
 

@@ -536,7 +536,8 @@ and `/metrics/timing` endpoints, the gateway `metrics.live` RPC, the aggregator'
 maps, and the whole `LocalCollector`. `MetricsAggregator` is now a federation-only pull
 loop. The agentbox `/api/internal/metrics-snapshot` pull and the SIGTERM
 `/api/internal/metrics-flush` push share one `MetricsFlushPayload { incarnation, prom }`.
-Per-message `ttft_ms` (still consumed by the chat timing badge) is kept.
+At the time of ADR-014, per-message `ttft_ms` was kept for the chat badge.
+ADR-018 supersedes that field: timing now comes only from `metadata.llm_call.ms`.
 
 **Scope — which boxes are pulled**:
 Only boxes running the default `agent` profile serve `/api/internal/metrics-snapshot`.
@@ -766,7 +767,10 @@ Persistence contract (web/api/a2a `sse-consumer.ts` and Lark
   and the final failure's envelope rides the single `error_response` row.
 - **Reasoning text is its own row** (`kind: "thinking"`, `metadata.llm_round`),
   written immediately before the model-call row and linked back via
-  `llm_call.thinking_row_id`. Redacted like any other content.
+  `llm_call.thinking_row_id`. Redacted like any other content, then clipped at
+  a UTF-8 boundary to MySQL TEXT's 65,535-byte limit, including the truncation
+  marker (`metadata.truncated: true`). A failed reasoning insert is logged and
+  does not prevent the answer row from being written.
 - **Tool rows carry `metadata.llm_round` and `metadata.tool_call_id`**; their
   `duration_ms` and `started_at` come from `startedAt`/`endedAt` stamped by
   `PiAgentBrain.enrichToolEvent` on the same clock. Two consecutive model calls
@@ -775,7 +779,13 @@ Persistence contract (web/api/a2a `sse-consumer.ts` and Lark
   are folded into the next agent call's `aux_calls`.
 - The prompt boundary is explicit (`brain.llmCalls.beginPrompt` at HTTP receipt,
   `endPrompt` in `actuallyFinish`) so round 1's `since_prev_ms` is the setup time;
-  paths that bypass the HTTP layer open it implicitly on the first call.
+  synthetic notification turns also explicitly bracket the entire routing run
+  and apply attempt/rollback events. Other paths open it implicitly on the first call.
+- Buffered failed attempts carry only their envelopes on the routing switch's
+  `discardedLlmCalls`; consumers attach those to the same notice as live-attempt
+  envelopes. Discarded answer/reasoning text is never replayed. The synthetic
+  notification path still uses its existing conditional report persistence,
+  rather than the full SSE timeline persistence described above.
 
 The old fields are **not written any more and readers must not fall back to
 them**. `turnStartMs` is accepted on the wire and ignored.
@@ -786,6 +796,12 @@ them**. `turnStartMs` is accepted on the wire and ignored.
 - ✅ Reasoning tokens (`usage.reasoning`) and reasoning text are retained; output tok/s is computable.
 - ✅ Tool-only calls, failed calls and rolled-back attempts all appear on the timeline.
 - ✅ No schema change: envelope in `metadata`, thinking in `content`, grouping keys in `metadata`.
+- Empty model-call carriers deliberately have no separate row kind: they are
+  identified by assistant role, empty content, `llm_call`, and no `kind`.
+  Error/route notice kinds take precedence, even when content is empty.
+  Portal chat list/count and task traces share `transcriptVisiblePredicate`,
+  using dialect-aware JSON extraction before pagination rather than serialized
+  substring matching. NULL-metadata legacy rows remain visible.
 - ⚠️ One extra row per model call, plus one per call with reasoning text. Thinking rows and empty model-call carriers are hidden in transcripts, but `chat_sessions.message_count` and the Portal's generic `message_count` metric remain physical-row counts by the existing persistence contract. Any reader of `chat_messages` must treat `kind: "thinking"` as a hidden assistant kind before this runtime ships, or a call's own reasoning counts as a reply.
 - ⚠️ Providers that hide reasoning (`reasoning_tokens` without `reasoning_content`) report `thinking_visible: false`; their reasoning time is inside `net_ttft` and is not guessed at.
 - ❌ Historical rows without `llm_call` have no time accounting — only the wall clock.

@@ -1583,3 +1583,28 @@ describe("modelOptionsSupportImageInput", () => {
 function isEventType(event: unknown, type: string): boolean {
   return typeof event === "object" && event !== null && (event as { type?: unknown }).type === type;
 }
+
+
+it("carries buffered failed-call envelopes on the switch without relaying discarded text", async () => {
+  const brain = makeBrain([]);
+  const call = { v: 1, kind: "agent", round: 1, attempt: 1, model: { provider: "openai", id: "gpt-4" },
+    request_at: "2026-09-03T08:00:00.000Z", response_end_at: "2026-09-03T08:00:01.000Z",
+    ms: { net_ttft: 1000, thinking: 0, output: 0, total: 1000 }, blocks: [], thinking_visible: false, tool_call_ids: [] };
+  let attempt = 0;
+  vi.mocked(brain.prompt).mockImplementation(async () => {
+    attempt++;
+    brain.emitter.emit("event", { type: "message_end", message: { role: "assistant",
+      content: [{ type: "text", text: attempt === 1 ? "discarded answer" : "survivor" }],
+      stopReason: attempt === 1 ? "error" : "stop", errorMessage: attempt === 1 ? "429 rate limit" : undefined,
+      ...(attempt === 1 ? { llmCall: call } : {}),
+    } });
+  });
+  const route: ModelRouteEvent[] = [];
+  const relayed: any[] = [];
+  await runPromptWithModelRouting(brain, "test", makePolicy(), createModelRouteState(), {
+    optimisticPrimaryStream: false, emitEvent: event => route.push(event), emitBrainEvent: event => relayed.push(event),
+  });
+  expect(route.find(e => e.type === "model_route_switch")).toMatchObject({ discardedLlmCalls: [call] });
+  expect(relayed).toHaveLength(1);
+  expect(relayed[0].message.content[0].text).toBe("survivor");
+});

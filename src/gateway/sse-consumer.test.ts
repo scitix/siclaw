@@ -1,3 +1,4 @@
+import { appendMessage } from "./chat-repo.js";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { AgentBoxClient } from "./agentbox/client.js";
@@ -1493,4 +1494,57 @@ describe("consumeAgentSse — knowledge citation attribution", () => {
     expect(plainRows).toHaveLength(1);
     expect(plainRows[0].metadata).not.toHaveProperty("knowledge_citations");
   });
+});
+
+describe("review regressions: thinking and abort", () => {
+  it("clips multi-byte reasoning within MySQL TEXT and still stores the answer", async () => {
+    await consumeAgentSse({ client: mkClient([{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer" } }, { type: "message_end", message: {
+      role: "assistant", stopReason: "stop", llmCall: mkEnvelope(),
+      content: [{ type: "thinking", thinking: "想🧠".repeat(20000) }, { type: "text", text: "answer" }],
+    } }]), sessionId: "s", userId: "u", persistMessages: true });
+    const thinking = appendCalls.find(r => r.metadata?.kind === "thinking");
+    expect(Buffer.byteLength(thinking.content)).toBeLessThanOrEqual(65535);
+    expect(thinking.content).not.toContain("\ufffd");
+    expect(thinking.metadata.truncated).toBe(true);
+    expect(appendCalls.at(-1).content).toBe("answer");
+  });
+
+  it("continues the answer and stream after a thinking insert fails", async () => {
+    vi.mocked(appendMessage).mockRejectedValueOnce(new Error("thinking insert failed"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await consumeAgentSse({ client: mkClient([
+        { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer" } },
+        { type: "message_end", message: { role: "assistant", stopReason: "stop", llmCall: mkEnvelope(),
+          content: [{ type: "thinking", thinking: "reason" }, { type: "text", text: "answer" }] } },
+        { type: "agent_end" },
+      ]), sessionId: "s", userId: "u", persistMessages: true });
+      expect(result.eventCount).toBe(3);
+      expect(appendCalls.at(-1).content).toBe("answer");
+      expect(appendCalls.at(-1).metadata.llm_call.thinking_row_id).toBeUndefined();
+      expect(warn).toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+
+  it("keeps all stopped parallel tools linked to their model round", async () => {
+    const controller = new AbortController();
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "toolUse", llmCall: mkEnvelope({ round: 3 }) } },
+      ...["a", "b", "c"].map(toolCallId => ({ type: "tool_execution_start", toolCallId, toolName: "read", args: {} })),
+    ];
+    const client = { async *streamEvents() { for (const event of events) yield event; controller.abort(); } } as unknown as AgentBoxClient;
+    await consumeAgentSse({ client, sessionId: "s", userId: "u", persistMessages: true, signal: controller.signal });
+    expect(updateCalls.filter(r => r.metadata?.status === "stopped").map(r => [r.metadata.llm_round, r.metadata.tool_call_id]))
+      .toEqual([[3, "a"], [3, "b"], [3, "c"]]);
+  });
+});
+
+it("persists and redacts buffered failure envelopes from route switches", async () => {
+  const call = mkEnvelope({ stop_reason: "error", error_message: "secret sk-abc123" });
+  await consumeAgentSse({ client: mkClient([
+    { type: "model_route_start" },
+    { type: "model_route_switch", attempt: 1, fromCandidateKey: "a", toCandidateKey: "b", fromProvider: "openai", fromModelId: "a", toProvider: "openai", toModelId: "b", failureKind: "rate_limit", discardedLlmCalls: [call] },
+  ]), sessionId: "s", userId: "u", persistMessages: true, redactionConfig: { patterns: [/sk-[a-z0-9]+/g] } });
+  expect(appendCalls.filter(r => r.metadata?.kind === "model_route_notice")).toHaveLength(1);
+  expect(appendCalls[0].metadata.discarded_llm_calls).toEqual([{ ...call, error_message: "secret [REDACTED]" }]);
 });

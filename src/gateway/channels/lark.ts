@@ -3225,7 +3225,7 @@ export async function collectChannelResponse(
           // recorded those calls TWICE and made channel turns over-count model
           // calls against identical web turns. The failed call is the one with no
           // row, and this notice is its carrier.
-          const discarded = pendingFailedLlmCalls;
+          const discarded = [...pendingFailedLlmCalls, ...((ev.discardedLlmCalls as LlmCallEnvelope[] | undefined) ?? [])];
           pendingFailedLlmCalls = [];
           if (discarded.length > 0) {
             metadata.discarded_llm_calls = discarded.map((call) => redactLlmCallEnvelope(call, redact));

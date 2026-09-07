@@ -1,3 +1,4 @@
+import { llmCallFromMessage, type LlmCallEnvelope } from "./llm-call-recorder.js";
 import { modelNeedsRebind } from "./brain-session.js";
 import type {
   BrainModelInfo,
@@ -92,6 +93,8 @@ export type ModelRouteEvent =
   | {
       type: "model_route_switch";
       attempt: number;
+      /** Calls whose buffered messages were discarded before reaching consumers. */
+      discardedLlmCalls?: LlmCallEnvelope[];
       fromCandidateKey: string;
       toCandidateKey: string;
       fromProvider: string;
@@ -989,6 +992,13 @@ export async function runPromptWithModelRouting(
     emitEvent({
       type: "model_route_switch",
       attempt: attempt.attempt,
+      // Buffered events never reached consumers. Carry only their envelopes;
+      // replaying message_end would resurrect discarded text and errors.
+      discardedLlmCalls: attemptResult.events.flatMap((event) => {
+        if (!isRecord(event) || event.type !== "message_end") return [];
+        const call = llmCallFromMessage(event.message);
+        return call ? [call] : [];
+      }),
       fromCandidateKey: key,
       toCandidateKey: candidateKey(nextCandidate),
       fromProvider: candidate.provider,

@@ -4324,16 +4324,17 @@ describe("collectChannelResponse — audit persistence", () => {
     expect(rows.filter((row) => row.metadata?.llm_call?.stop_reason === "error")).toHaveLength(1);
   });
 
-  it("moves a rolled-back attempt's failed call onto the fallback notice", async () => {
+  it.each([false, true])("keeps a failed call on the fallback notice (buffered=%s)", async (buffered) => {
     await collectChannelResponse(fakeClient([
       { type: "model_route_start", candidateCount: 2 },
-      { type: "message_end", message: {
+      ...(buffered ? [] : [{ type: "message_end", message: {
         role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429 sk-secret123",
         llmCall: envelope({ round: 1, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" }),
       } },
-      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-5", failureKind: "rate_limit" },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-5", failureKind: "rate_limit" }]),
       {
         type: "model_route_switch",
+        ...(buffered ? { discardedLlmCalls: [envelope({ round: 1, attempt: 1, stop_reason: "error", error_message: "primary 429 sk-secret123" })] } : {}),
         attempt: 2,
         fromCandidateKey: "openai/gpt-5",
         toCandidateKey: "anthropic/claude",

@@ -583,7 +583,7 @@ export function toPilotMessage(m: ChatMessage): PilotMessage {
   const isThinkingRow = metadata?.kind === "thinking"
   // A model call that produced only tool calls still gets a row (it carries the
   // call's timing/tokens in metadata.llm_call); there is nothing to render for it.
-  const isEmptyModelCallRow = m.role === "assistant" && !m.content?.trim() && metadata?.llm_call != null
+  const isEmptyModelCallRow = m.role === "assistant" && !m.content?.trim() && metadata?.llm_call != null && metadata?.kind == null
   const staleRunning = isStaleRunningTool(m)
   const toolIsDelegation = isDelegationTool(m.tool_name)
   const toolStatus = toolStatusFromMessage(m)

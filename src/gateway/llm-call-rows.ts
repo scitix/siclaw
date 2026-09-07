@@ -130,10 +130,19 @@ export function buildThinkingRow(
 ): ThinkingRowSpec | null {
   const blocks = thinkingBlocksFromMessage(message).filter((b) => b.text.length > 0 || b.redacted);
   if (blocks.length === 0) return null;
+  // chat_messages.content is MySQL TEXT (65,535 bytes), including on existing
+  // deployments. Clip after redaction, on a UTF-8 boundary, without a migration.
+  const text = redact(blocks.map((b) => b.text).join("\n\n"));
+  const bytes = Buffer.from(text, "utf8");
+  const suffix = "\n[thinking truncated]";
+  let end = 65_535 - Buffer.byteLength(suffix);
+  while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+  const truncated = bytes.length > 65_535;
   return {
-    content: redact(blocks.map((b) => b.text).join("\n\n")),
+    content: truncated ? bytes.subarray(0, end).toString("utf8") + suffix : text,
     metadata: {
       kind: "thinking",
+      ...(truncated ? { truncated: true } : {}),
       llm_round: envelope.round,
       redacted: blocks.some((b) => b.redacted),
       signature_present: blocks.some((b) => b.signature_present),

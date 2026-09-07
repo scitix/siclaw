@@ -605,8 +605,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // The failed attempt's model calls ride on the notice row: their rows
           // were (or will be) discarded, but the time they took is part of the
           // prompt's timeline and the survivor's since_prev_ms spans it.
-          const discarded = takeDiscardedLlmCalls();
-          if (discarded) {
+          const discarded = [...(takeDiscardedLlmCalls() ?? []), ...((evt.discardedLlmCalls as LlmCallEnvelope[] | undefined) ?? [])];
+          if (discarded.length > 0) {
             metadata.discarded_llm_calls = discarded.map((call) =>
               redactLlmCallEnvelope(call, (text) => redactText(text, redactionConfig))
             );
@@ -922,7 +922,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             }
           } else if (pendingStreamError && messageProducedOutput(message)) {
             // A later attempt produced a real assistant turn: the earlier failure
-            // was transient and must leave nothing behind — no bubble, no row, and
+            // was transient and must leave no visible error bubble or error row, and
             // nothing in the returned summary that a notification could quote.
             //
             // "Real" means it actually carried output. A non-error stopReason is
@@ -999,11 +999,15 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             pendingRowCitations = [];
             const persistAssistant = async () => {
               // Thinking first: it happened before the answer, and seq order is
-              // the timeline. Full text, redacted like any other content.
+              // the timeline. Bounded and redacted by buildThinkingRow.
               if (rowEnvelope && thinkingRow) {
-                const thinkingRowId = await appendRow({ sessionId, role: "assistant", ...thinkingRow });
-                await incrementMessageCount(sessionId);
-                rowEnvelope.thinking_row_id = thinkingRowId;
+                try {
+                  const thinkingRowId = await appendRow({ sessionId, role: "assistant", ...thinkingRow });
+                  rowEnvelope.thinking_row_id = thinkingRowId;
+                  await incrementMessageCount(sessionId);
+                } catch (err) {
+                  console.warn(`[sse-consumer] thinking row persistence failed for ${sessionId}:`, err);
+                }
               }
               // Fold in the context-usage snapshot if agent_end already arrived
               // (the routed/default order — agent_end precedes this commit). The
@@ -1079,6 +1083,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       for (const pendingCall of queue) {
         if (!pendingCall.messageId) continue;
         const stoppedMeta: Record<string, unknown> = {
+          ...pendingCall.roundMeta,
           status: "stopped",
           started_at: new Date(pendingCall.startMs).toISOString(),
         };
