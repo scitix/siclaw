@@ -566,6 +566,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // reopened/refreshed (it otherwise only has it from a live agent_end, which a
   // cold session never replays). Overwritten on each assistant message_end, so
   // by agent_end these point at the turn's final assistant message.
+  let assistantEndedInStep = false;
   let lastAssistantDbMessageId: string | undefined;
   let lastAssistantContent: string | undefined;
   let lastAssistantMetadata: Record<string, unknown> | undefined;
@@ -955,8 +956,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         }
       }
 
+      // Pi repeats the completed assistant on turn_end, after message_end and
+      // tool results. Only use turn_end as a fallback when this step had no
+      // message_end. Content equality cannot distinguish legitimate repeated answers.
+      if (eventType === "turn_start") assistantEndedInStep = false;
+      const duplicateTurnEnd = eventType === "turn_end" && assistantEndedInStep;
+      if (eventType === "message_end" && (evt.message as any)?.role === "assistant") assistantEndedInStep = true;
+      if (eventType === "turn_end") assistantEndedInStep = false;
+
       // ── message_end / turn_end: persist assistant message + extract result ──
-      if (eventType === "message_end" || eventType === "turn_end") {
+      if (eventType === "message_end" || (eventType === "turn_end" && !duplicateTurnEnd)) {
         const message = evt.message as Record<string, unknown> | undefined;
         if (message?.role === "assistant") {
           // ── LLM-call envelope: the timing source of truth ──

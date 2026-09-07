@@ -346,13 +346,14 @@ export class AgentBoxClient {
    * stopped rather than aborting whatever is running now. Omit it for the user's
    * Stop button, which does mean "stop the current turn".
    */
-  async abortSession(sessionId: string, turnId?: string): Promise<void> {
+  async abortSession(sessionId: string, turnId?: string): Promise<{ ok?: boolean; pending?: boolean }> {
     console.log(`[agentbox-client] abort sessionId=${sessionId}${turnId ? ` turnId=${turnId}` : ""}`);
-    await this.fetch(`/api/sessions/${sessionId}/abort`, {
+    const response = await this.fetch(`/api/sessions/${sessionId}/abort`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(turnId ? { turnId } : {}),
     });
+    return response.json();
   }
 
   /**

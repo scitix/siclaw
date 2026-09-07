@@ -1701,3 +1701,21 @@ describe("conversation phases", () => {
     expect(appendCalls.filter(e => e.role === "assistant").map(e => e.metadata?.phase)).toEqual(["commentary", "final_answer"]);
   });
 });
+
+
+describe("assistant lifecycle persistence", () => {
+  it("persists message_end plus its turn_end echo once, preserving later identical answers", async () => {
+    const message = { role: "assistant", content: [{ type: "text", text: "5 nodes" }], stopReason: "stop" };
+    await consumeAgentSse({ client: mkClient([
+      { type: "turn_start" }, { type: "message_end", message },
+      { type: "turn_end", message },
+      { type: "turn_start" }, { type: "message_end", message },
+      { type: "turn_end", message },
+    ]), sessionId: "s", userId: "u", persistMessages: true });
+    expect(appendCalls.filter(c => c.role === "assistant").map(c => c.content)).toEqual(["5 nodes", "5 nodes"]);
+  });
+  it("retains turn_end-only providers", async () => {
+    await consumeAgentSse({ client: mkClient([{ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "fallback" }] } }]), sessionId: "s", userId: "u", persistMessages: true });
+    expect(appendCalls.filter(c => c.role === "assistant").map(c => c.content)).toEqual(["fallback"]);
+  });
+});

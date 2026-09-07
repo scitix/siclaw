@@ -2064,14 +2064,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const stopOne = (id?: string) => client.abortSession(sessionId, id).catch((err) => {
       if (!isSessionNotFound(err)) throw err;
       console.log(`[runtime] abort: session=${sessionId} not on the box we asked; treating as already stopped`);
+      return { ok: true, pending: true }; // no turn-specific stop proof from a legacy 404
     });
-    if (targets.length === 0) {
-      // Nothing in flight here: the box may still hold a turn from before a restart.
-      await stopOne(undefined);
-    } else {
-      for (const id of targets) await stopOne(id);
+    let stopped = true;
+    for (const id of targets.length === 0 ? [undefined] : targets) {
+      const outcome = await stopOne(id);
+      // An HTTP 200 may only acknowledge a pending abort (cold start or drain
+      // timeout). Only a completed box abort proves the execution has stopped.
+      if (outcome?.ok !== true || outcome.pending === true) stopped = false;
     }
-    return { ok: true };
+    return { ok: true, ...(requestedTurnId ? { turnId: requestedTurnId, stopped } : {}) };
   });
 
   rpcMethods.set("chat.steer", async (params) => {

@@ -67,6 +67,7 @@ let promptResumed: boolean | undefined;
 let promptBlocker: Promise<void> | undefined;
 // Set to make the fake box refuse the abort.
 let abortSessionError: Error | undefined;
+let abortSessionPending = false;
 // Holds abortSession open, to model a box that has not answered yet.
 let abortSessionBlocker: Promise<void> | undefined;
 // Fails only the FIRST abort, to model a refusal that a later one recovers from.
@@ -94,6 +95,7 @@ vi.mock("./agentbox/client.js", () => ({
       if (attempt === 0 && abortSessionBlocker) await abortSessionBlocker;
       if (attempt === 0 && abortFirstAttempt) throw abortFirstAttempt;
       if (abortSessionError) throw abortSessionError;
+      return { ok: true, pending: abortSessionPending };
     });
     steerSession = steerSessionMock;
     streamEvents = async function* () {};
@@ -155,6 +157,7 @@ afterEach(async () => {
   abortSessionCalls.length = 0;
   abortSessionTurnIds.length = 0;
   abortSessionError = undefined;
+  abortSessionPending = false;
   abortSessionBlocker = undefined;
   abortFirstAttempt = undefined;
   vi.clearAllMocks();
@@ -556,8 +559,10 @@ describe("startRuntime — chat.abort wiring", () => {
     await waitFor(() => promptCalls.length === 1);
     expect(promptCalls[0]).toMatchObject({ turnId: "chosen-by-caller" });
 
-    await abort({ agentId: "a", sessionId: "supplied", turnId: "chosen-by-caller" });
+    expect(await abort({ agentId: "a", sessionId: "supplied", turnId: "chosen-by-caller" })).toEqual({ ok: true, stopped: true, turnId: "chosen-by-caller" });
     expect(abortSessionTurnIds).toEqual(["chosen-by-caller"]);
+    abortSessionPending = true;
+    expect(await abort({ agentId: "a", sessionId: "supplied", turnId: "chosen-by-caller" })).toMatchObject({ ok: true, stopped: false, turnId: "chosen-by-caller" });
   });
 
   it("does not touch the running turn's consumer when the abort names a queued turn", async () => {
