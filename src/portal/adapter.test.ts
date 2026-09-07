@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
 
 vi.mock("../gateway/db.js", () => ({
@@ -7,7 +8,7 @@ vi.mock("../gateway/db.js", () => ({
 
 import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
-import { registerAdapterRoutes } from "./adapter.js";
+import { registerAdapterRoutes, buildAdapterRpcHandlers } from "./adapter.js";
 
 const INTERNAL_SECRET = "test-internal-secret";
 
@@ -305,5 +306,47 @@ describe("registerAdapterRoutes — is_production filter", () => {
       expect(sql).not.toContain("agent_hosts");
       expect(sql).not.toContain("is_production");
     });
+  });
+});
+
+
+describe("adapter transcript visibility", () => {
+  it.each(["HTTP", "RPC"])("%s filters telemetry before limit and preserves legacy messages", async (transport) => {
+    const sqlite = new DatabaseSync(":memory:");
+    try {
+      sqlite.exec(`CREATE TABLE chat_messages (id TEXT, session_id TEXT, role TEXT, content TEXT,
+        tool_name TEXT, toolset TEXT, tool_input TEXT, metadata TEXT, outcome TEXT, duration_ms INTEGER,
+        from_agent_id TEXT, parent_session_id TEXT, delegation_id TEXT, target_agent_id TEXT,
+        created_at TEXT, seq INTEGER)`);
+      const insert = sqlite.prepare(`INSERT INTO chat_messages
+        (id, session_id, role, content, metadata, created_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      insert.run("user", "s1", "user", "question", null, "2026-09-01 00:00:00", 1);
+      insert.run("answer", "s1", "assistant", "answer", null, "2026-09-01 00:00:01", 2);
+      insert.run("error", "s1", "assistant", "", '{"kind":"error_response","llm_call":{}}', "2026-09-01 00:00:02", 3);
+      insert.run("other", "s2", "assistant", "other session", null, "2026-09-01 00:00:03", 1);
+      insert.run("future", "s1", "assistant", "after cursor", null, "2026-09-03 00:00:00", 100);
+      for (let i = 0; i < 60; i++) {
+        insert.run(`hidden-${i}`, "s1", "assistant", i % 2 ? "reasoning" : "",
+          i % 2 ? '{"kind":"thinking"}' : '{"llm_call":{}}', "2026-09-01 00:00:04", i + 4);
+      }
+      const query = vi.fn(async (sql: string, params: any[]) => [sqlite.prepare(sql).all(...params), []]);
+      (getDb as any).mockReturnValue({ driver: "sqlite", query });
+      const params = { session_id: "s1", before: "2026-09-02T00:00:00.000Z", limit: 3 };
+      let result: any;
+      if (transport === "RPC") {
+        result = await buildAdapterRpcHandlers().get("chat.getMessages")!(params, "a1");
+      } else {
+        const router = createRestRouter();
+        registerAdapterRoutes(router, INTERNAL_SECRET);
+        const response = await runRoute(router, fakeReq({
+          url: "/api/internal/siclaw/chat/messages", method: "POST", body: params,
+        }));
+        expect(response.status).toBe(200);
+        result = response.body;
+      }
+      expect(result.messages.map((m: any) => m.id)).toEqual(["error", "answer", "user"]);
+      expect(result.messages[0].metadata.kind).toBe("error_response");
+      expect(result.messages[2].metadata).toBeNull();
+    } finally { sqlite.close(); }
   });
 });

@@ -27,6 +27,7 @@ import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
 import { resolveAgentModelRouting, resolveAgentSubagentTiers } from "./model-routing-config.js";
 import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js";
+import { transcriptVisiblePredicate } from "./transcript-rows.js";
 import { humanPromptPredicate } from "./human-prompt.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
@@ -1891,7 +1892,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const db = getDb();
     const limit = body.limit ?? 50;
     const params: unknown[] = [body.session_id];
-    let where = "session_id = ?";
+    let where = `session_id = ? AND ${transcriptVisiblePredicate(db)}`;
     if (body.before) {
       where += " AND created_at < ?";
       params.push(toSqlTimestamp(body.before));
@@ -2958,7 +2959,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     const limit = params.limit ?? 50;
     const sqlParams: unknown[] = [params.session_id];
-    let where = "session_id = ?";
+    let where = `session_id = ? AND ${transcriptVisiblePredicate(db)}`;
     if (params.before) {
       where += " AND created_at < ?";
       sqlParams.push(toSqlTimestamp(params.before));
