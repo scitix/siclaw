@@ -3,7 +3,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { parseProductSupportResult } from "./result.js";
+import { LIMITS, MISSING_FIELD_PATTERN, parseProductSupportResult } from "./result.js";
 
 export const TOOL_NAME = "submit_product_support_result";
 
@@ -37,23 +37,27 @@ const inputSchema = {
         },
         product: {
           type: "string",
+          maxLength: LIMITS.productMaxChars,
           description:
             "Concrete, knowledge-grounded product for requirements. For incidents and consultations, use a concrete product only when established by the conversation or authoritative product knowledge; otherwise leave this empty and preserve the user-visible entry in description.",
         },
-        summary: { type: "string" },
-        description: { type: "string" },
+        summary: { type: "string", maxLength: LIMITS.summaryMaxChars },
+        description: { type: "string", maxLength: LIMITS.descriptionMaxChars },
         evidence: {
           type: "array",
-          items: { type: "string", minLength: 1 },
+          maxItems: LIMITS.evidenceMaxItems,
+          items: { type: "string", minLength: 1, maxLength: LIMITS.evidenceItemMaxChars },
         },
         missing_fields: {
           type: "array",
           description:
             "Blocking machine field identifiers only; never user-facing questions or diagnostic instructions.",
+          maxItems: LIMITS.missingFieldsMaxItems,
           items: {
             type: "string",
             minLength: 1,
-            pattern: "^[a-z][a-z0-9_]*$",
+            maxLength: LIMITS.missingFieldMaxChars,
+            pattern: MISSING_FIELD_PATTERN,
           },
         },
         llm: {
@@ -61,7 +65,7 @@ const inputSchema = {
           additionalProperties: false,
           required: ["region", "aspect", "model"],
           description:
-            "Best-effort intake details for ticket_type=llm_incident, shown to first-line support as hints. Fill each field only from what the conversation establishes; leave it empty rather than guess. All three must be empty for any other ticket_type.",
+            "Best-effort intake details for ticket_type=llm_incident, shown to first-line support as hints. Fill each field only from what the conversation establishes; leave it empty rather than guess. May already be filled while ticket_type is still unknown; must be empty once the type resolves to anything other than llm_incident.",
           properties: {
             region: {
               type: "string",
@@ -75,6 +79,7 @@ const inputSchema = {
             },
             model: {
               type: "string",
+              maxLength: LIMITS.modelMaxChars,
               description: "Model name as the user stated it, when a specific model is involved; otherwise empty.",
             },
           },
@@ -86,7 +91,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.2.0" },
+    { name: "mcp-product-support-result", version: "0.2.1" },
     { capabilities: { tools: {} } },
   );
 

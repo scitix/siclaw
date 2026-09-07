@@ -1,6 +1,6 @@
 {
   "name": "mcp-product-support-result",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Stateless MCP validator for product-support handoff results",
   "type": "module",
   "bin": {
@@ -20,7 +20,7 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.27.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

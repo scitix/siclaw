@@ -68,9 +68,28 @@ These fields are hints, not gates. Fill each one only from what the
 conversation establishes and leave it empty otherwise; a `label=true`
 `llm_incident` does not require any of them. While still gathering, the
 identifiers `llm_region`, `llm_aspect` and `llm_model` may appear in
-`missing_fields`. For every other `ticket_type` all three fields must be empty,
-so a stray region or model name is never read as an established fact. The
-block is always present.
+`missing_fields`. The block may already be filled while `ticket_type` is still
+`unknown`, so a region or model the user stated up front has somewhere to
+live; once the type resolves to `consultation`, `incident` or `requirement`
+all three fields must be empty, so a stray value is never read as an
+established fact. The block is always present.
+
+### Size limits
+
+The validated result is persisted downstream as one row's metadata, so every
+field is bounded and an oversized value is rejected here, where the model can
+shorten it. Limits are in characters, not bytes.
+
+| Field | Limit |
+| --- | --- |
+| `summary` | 200 |
+| `description` | 2000 |
+| `product`, `llm.model` | 128 |
+| `evidence` | 20 items, 300 characters each |
+| `missing_fields` | 20 items, 64 characters each |
+
+Enum fields (`ticket_type`, `llm.region`, `llm.aspect`) are trimmed and
+lower-cased on input and always returned in canonical lowercase.
 
 The server validates each call independently. It does not know Siclaw session
 or turn identity, so "exactly one successful result per turn" is not enforced

@@ -9,7 +9,7 @@ async function withClient(
 ): Promise<void> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createProductSupportResultServer();
-  const client = new Client({ name: "product-support-result-test", version: "0.2.0" });
+  const client = new Client({ name: "product-support-result-test", version: "0.2.1" });
 
   await server.connect(serverTransport);
   await client.connect(clientTransport);
@@ -35,7 +35,10 @@ describe("product support result MCP", () => {
             required?: string[];
             properties?: {
               ticket_type?: { enum?: string[] };
-              missing_fields?: { items?: { pattern?: string } };
+              summary?: { maxLength?: number };
+              description?: { maxLength?: number };
+              evidence?: { maxItems?: number };
+              missing_fields?: { maxItems?: number; items?: { pattern?: string } };
               llm?: {
                 properties?: {
                   region?: { enum?: string[] };
@@ -57,6 +60,10 @@ describe("product support result MCP", () => {
       expect(advertisedSchema.properties?.info?.required).toContain("llm");
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.region?.enum).toEqual(["", "domestic", "overseas"]);
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.aspect?.enum).toEqual(["", "platform_api", "network", "model"]);
+      expect(advertisedSchema.properties?.info?.properties?.summary?.maxLength).toBe(200);
+      expect(advertisedSchema.properties?.info?.properties?.description?.maxLength).toBe(2000);
+      expect(advertisedSchema.properties?.info?.properties?.evidence?.maxItems).toBe(20);
+      expect(advertisedSchema.properties?.info?.properties?.missing_fields?.maxItems).toBe(20);
       expect(response.tools[0]?.outputSchema).toEqual(response.tools[0]?.inputSchema);
     });
   });

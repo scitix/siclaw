@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseProductSupportResult } from "./result.js";
+import { LIMITS, parseProductSupportResult } from "./result.js";
 
 function emptyLlm(): Record<string, string> {
   return { region: "", aspect: "", model: "" };
@@ -231,8 +231,8 @@ describe("parseProductSupportResult", () => {
     }
   });
 
-  it("rejects llm intake details on any other ticket type", () => {
-    for (const ticketType of ["incident", "consultation", "requirement", "unknown"]) {
+  it("rejects llm intake details once the type has resolved to a non-LLM one", () => {
+    for (const ticketType of ["incident", "consultation", "requirement"]) {
       const input = validResult({ label: false });
       input.info = {
         ...(input.info as Record<string, unknown>),
@@ -241,6 +241,81 @@ describe("parseProductSupportResult", () => {
       };
       expect(() => parseProductSupportResult(input)).toThrow(/unless ticket_type is llm_incident/);
     }
+  });
+
+  it("lets an unresolved turn record llm details the user already stated", () => {
+    // During intake ticket_type is unknown by construction; a region heard in
+    // the first message must have somewhere to live before the type resolves.
+    const result = parseProductSupportResult({
+      label: false,
+      info: {
+        ticket_type: "unknown",
+        product: "",
+        summary: "",
+        description: "",
+        evidence: [],
+        missing_fields: ["actual_behavior"],
+        llm: { region: "domestic", aspect: "", model: "" },
+      },
+    });
+    expect(result.info.llm.region).toBe("domestic");
+  });
+
+  it("normalizes ticket_type case like the other enum fields", () => {
+    const result = parseProductSupportResult(
+      validResult({
+        info: {
+          ticket_type: " Incident ",
+          product: "",
+          summary: "Task failed",
+          description: "Task task-123 failed.",
+          evidence: [],
+          missing_fields: [],
+          llm: emptyLlm(),
+        },
+      }),
+    );
+    expect(result.info.ticket_type).toBe("incident");
+  });
+
+  it("reports missing_fields errors at the caller's index, not the deduplicated one", () => {
+    const input = validResult({ label: false });
+    input.info = {
+      ...(input.info as Record<string, unknown>),
+      missing_fields: ["a", "a", "Bad Field"],
+    };
+    expect(() => parseProductSupportResult(input)).toThrow(/missing_fields\[2\] must be a lowercase snake_case/);
+  });
+
+  it("rejects oversized fields so the model can shorten them instead of losing the row", () => {
+    const long = (n: number) => "x".repeat(n + 1);
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ summary: long(LIMITS.summaryMaxChars) }, /summary must be at most 200 characters/],
+      [{ description: long(LIMITS.descriptionMaxChars) }, /description must be at most 2000 characters/],
+      [{ product: long(LIMITS.productMaxChars) }, /product must be at most 128 characters/],
+      [{ evidence: Array.from({ length: LIMITS.evidenceMaxItems + 1 }, (_, i) => `e${i}`) }, /evidence must have at most 20 items/],
+      [{ evidence: [long(LIMITS.evidenceItemMaxChars)] }, /evidence\[0\] must be at most 300 characters/],
+      [{ missing_fields: Array.from({ length: LIMITS.missingFieldsMaxItems + 1 }, (_, i) => `f${i}`) }, /missing_fields must have at most 20 items/],
+    ];
+    for (const [patch, re] of cases) {
+      const input = validResult({ label: false });
+      input.info = { ...(input.info as Record<string, unknown>), ...patch };
+      expect(() => parseProductSupportResult(input)).toThrow(re);
+    }
+
+    const model = validResult({ label: false });
+    model.info = {
+      ...(model.info as Record<string, unknown>),
+      ticket_type: "llm_incident",
+      llm: { region: "", aspect: "", model: long(LIMITS.modelMaxChars) },
+    };
+    expect(() => parseProductSupportResult(model)).toThrow(/llm\.model must be at most 128 characters/);
+  });
+
+  it("counts limits in characters, not bytes, so CJK text is not penalized", () => {
+    const input = validResult();
+    input.info = { ...(input.info as Record<string, unknown>), summary: "故".repeat(LIMITS.summaryMaxChars) };
+    expect(parseProductSupportResult(input).info.summary.length).toBe(LIMITS.summaryMaxChars);
   });
 
   it("requires the llm block with exactly its three keys", () => {

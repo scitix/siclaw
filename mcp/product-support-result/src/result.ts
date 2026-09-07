@@ -23,6 +23,26 @@ export const LLM_ASPECTS = ["platform_api", "network", "model"] as const;
 export type LlmAspect = (typeof LLM_ASPECTS)[number];
 
 /**
+ * Size bounds, enforced here and advertised in the tool's JSON Schema.
+ *
+ * The validated result is persisted downstream as one row's metadata, whose
+ * column is a MySQL TEXT (65,535 bytes). The bounds are chosen so that even a
+ * result filled to every limit with 3-byte UTF-8 characters stays well under
+ * that, and so that an oversized field is rejected here — where the model can
+ * shorten it — instead of being forwarded and then dropped by the INSERT.
+ */
+export const LIMITS = {
+  summaryMaxChars: 200,
+  descriptionMaxChars: 2000,
+  productMaxChars: 128,
+  modelMaxChars: 128,
+  evidenceMaxItems: 20,
+  evidenceItemMaxChars: 300,
+  missingFieldsMaxItems: 20,
+  missingFieldMaxChars: 64,
+} as const;
+
+/**
  * Best-effort intake details for an `llm_incident`. Every field may stay empty:
  * the block exists so first-line support sees what the conversation did
  * establish, not so the agent is forced to guess. Only the enum shape is
@@ -63,7 +83,8 @@ const LLM_KEYS = new Set(["region", "aspect", "model"]);
 const TICKET_TYPE_SET = new Set<string>(TICKET_TYPES);
 const LLM_REGION_SET = new Set<string>(LLM_REGIONS);
 const LLM_ASPECT_SET = new Set<string>(LLM_ASPECTS);
-const MISSING_FIELD_PATTERN = /^[a-z][a-z0-9_]*$/;
+export const MISSING_FIELD_PATTERN = "^[a-z][a-z0-9_]*$";
+const MISSING_FIELD_RE = new RegExp(MISSING_FIELD_PATTERN);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -86,40 +107,62 @@ function assertExactKeys(
   }
 }
 
-function readString(value: unknown, path: string): string {
+function readString(value: unknown, path: string, maxChars: number): string {
   if (typeof value !== "string") {
     throw new Error(`${path} must be a string`);
   }
-  return value.trim();
+  const text = value.trim();
+  if ([...text].length > maxChars) {
+    throw new Error(`${path} must be at most ${maxChars} characters`);
+  }
+  return text;
 }
 
-function readOptionalEnum<T extends string>(
+function readEnum<T extends string>(
   value: unknown,
   allowed: ReadonlySet<string>,
   options: readonly T[],
   path: string,
+  optional: boolean,
 ): "" | T {
-  const text = readString(value, path).toLowerCase();
-  if (text.length === 0) {
+  // Enum fields are case-insensitive on input and canonical lowercase on
+  // output, uniformly: the model must not have to guess which field is strict.
+  const text = readString(value, path, 64).toLowerCase();
+  if (text.length === 0 && optional) {
     return "";
   }
   if (!allowed.has(text)) {
-    throw new Error(`${path} must be empty or one of: ${options.join(", ")}`);
+    const prefix = optional ? "must be empty or one of" : "must be one of";
+    throw new Error(`${path} ${prefix}: ${options.join(", ")}`);
   }
   return text as T;
 }
 
-function readStringArray(value: unknown, path: string): string[] {
+interface StringArrayRules {
+  maxItems: number;
+  itemMaxChars: number;
+  /** Validated against each item at its ORIGINAL index, before dedup. */
+  itemPattern?: { re: RegExp; message: string };
+}
+
+function readStringArray(value: unknown, path: string, rules: StringArrayRules): string[] {
   if (!Array.isArray(value)) {
     throw new Error(`${path} must be an array of strings`);
+  }
+  if (value.length > rules.maxItems) {
+    throw new Error(`${path} must have at most ${rules.maxItems} items`);
   }
 
   const canonical: string[] = [];
   const seen = new Set<string>();
   value.forEach((item, index) => {
-    const text = readString(item, `${path}[${index}]`);
+    const itemPath = `${path}[${index}]`;
+    const text = readString(item, itemPath, rules.itemMaxChars);
     if (text.length === 0) {
-      throw new Error(`${path}[${index}] must not be blank`);
+      throw new Error(`${itemPath} must not be blank`);
+    }
+    if (rules.itemPattern && !rules.itemPattern.re.test(text)) {
+      throw new Error(`${itemPath} ${rules.itemPattern.message}`);
     }
     if (!seen.has(text)) {
       seen.add(text);
@@ -135,9 +178,9 @@ function readLlmInfo(value: unknown, path: string): LlmIncidentInfo {
   }
   assertExactKeys(value, LLM_KEYS, path);
   return {
-    region: readOptionalEnum(value.region, LLM_REGION_SET, LLM_REGIONS, `${path}.region`),
-    aspect: readOptionalEnum(value.aspect, LLM_ASPECT_SET, LLM_ASPECTS, `${path}.aspect`),
-    model: readString(value.model, `${path}.model`),
+    region: readEnum(value.region, LLM_REGION_SET, LLM_REGIONS, `${path}.region`, true),
+    aspect: readEnum(value.aspect, LLM_ASPECT_SET, LLM_ASPECTS, `${path}.aspect`, true),
+    model: readString(value.model, `${path}.model`, LIMITS.modelMaxChars),
   };
 }
 
@@ -155,44 +198,51 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
   }
   assertExactKeys(input.info, INFO_KEYS, "input.info");
 
-  const ticketType = readString(input.info.ticket_type, "input.info.ticket_type");
-  if (!TICKET_TYPE_SET.has(ticketType)) {
-    throw new Error(
-      `input.info.ticket_type must be one of: ${TICKET_TYPES.join(", ")}`,
-    );
-  }
+  const ticketType = readEnum(
+    input.info.ticket_type,
+    TICKET_TYPE_SET,
+    TICKET_TYPES,
+    "input.info.ticket_type",
+    false,
+  ) as TicketType;
 
   const result: ProductSupportResult = {
     label: input.label,
     info: {
-      ticket_type: ticketType as TicketType,
-      product: readString(input.info.product, "input.info.product"),
-      summary: readString(input.info.summary, "input.info.summary"),
-      description: readString(input.info.description, "input.info.description"),
-      evidence: readStringArray(input.info.evidence, "input.info.evidence"),
-      missing_fields: readStringArray(
-        input.info.missing_fields,
-        "input.info.missing_fields",
+      ticket_type: ticketType,
+      product: readString(input.info.product, "input.info.product", LIMITS.productMaxChars),
+      summary: readString(input.info.summary, "input.info.summary", LIMITS.summaryMaxChars),
+      description: readString(
+        input.info.description,
+        "input.info.description",
+        LIMITS.descriptionMaxChars,
       ),
+      evidence: readStringArray(input.info.evidence, "input.info.evidence", {
+        maxItems: LIMITS.evidenceMaxItems,
+        itemMaxChars: LIMITS.evidenceItemMaxChars,
+      }),
+      missing_fields: readStringArray(input.info.missing_fields, "input.info.missing_fields", {
+        maxItems: LIMITS.missingFieldsMaxItems,
+        itemMaxChars: LIMITS.missingFieldMaxChars,
+        itemPattern: {
+          re: MISSING_FIELD_RE,
+          message: "must be a lowercase snake_case field identifier",
+        },
+      }),
       llm: readLlmInfo(input.info.llm, "input.info.llm"),
     },
   };
 
-  result.info.missing_fields.forEach((field, index) => {
-    if (!MISSING_FIELD_PATTERN.test(field)) {
-      throw new Error(
-        `input.info.missing_fields[${index}] must be a lowercase snake_case field identifier`,
-      );
-    }
-  });
-
-  // The llm block belongs to llm_incident only. A stray region or model on a
-  // consultation would be read by first-line support as an established fact.
-  if (result.info.ticket_type !== "llm_incident") {
+  // The llm block belongs to llm_incident. Once the type has resolved to a
+  // non-LLM one, a stray region or model would be read by first-line support as
+  // an established fact, so the block must be empty. While the type is still
+  // `unknown` the agent may already have heard the region or model name and
+  // needs somewhere to record it, so `unknown` is exempt.
+  if (result.info.ticket_type !== "llm_incident" && result.info.ticket_type !== "unknown") {
     const { region, aspect, model } = result.info.llm;
     if (region !== "" || aspect !== "" || model !== "") {
       throw new Error(
-        "input.info.llm fields must be empty unless ticket_type is llm_incident",
+        "input.info.llm fields must be empty unless ticket_type is llm_incident or unknown",
       );
     }
   }
