@@ -38,6 +38,7 @@
 /** 控制面一行会话记录里,回灌用得上的字段。 */
 export interface RehydrateRow {
   role: string;
+  metadata?: Record<string, unknown> | null;
   content: string;
   toolName?: string | null;
   toolInput?: string | null;
@@ -48,7 +49,7 @@ export interface RehydrateRow {
 /** 占位 model 标记:凡是带着它的 assistant 消息都是回灌出来的,不是真实调用。 */
 export const REHYDRATED_MODEL = "rehydrated-from-control-plane";
 
-type TextContent = { type: "text"; text: string };
+type TextContent = { type: "text"; text: string; textSignature?: string };
 type ToolCall = { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
 
 /**
@@ -162,10 +163,12 @@ export function toRehydratedMessages(
     // assistant,以及任何其它角色(error 等)都按 assistant 文本还原 —— 它们在
     // 对话里就是"模型说过的话",丢掉会让后面的追问失去指代。
     if (!row.content?.trim()) return;
+    const item = row.metadata?.assistant_item as Record<string, unknown> | undefined;
+    const source = (key: string, fallback: string) => typeof item?.[key] === "string" ? item[key] as string : fallback;
     out.push({
       role: "assistant",
-      content: [{ type: "text", text: row.content }],
-      api: "rehydrated", provider: "rehydrated", model: REHYDRATED_MODEL,
+      content: [{ type: "text", text: row.content, ...(typeof item?.textSignature === "string" ? { textSignature: item.textSignature } : {}) }],
+      api: source("api", "rehydrated"), provider: source("provider", "rehydrated"), model: source("model", REHYDRATED_MODEL),
       usage: { ...ZERO_USAGE, cost: { ...ZERO_USAGE.cost } },
       stopReason: "stop",
       timestamp,

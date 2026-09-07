@@ -111,7 +111,7 @@ describe("consumeAgentSse — assistant message flow", () => {
     });
     expect(result.resultText).toContain("### 参考原文");
     expect(result.resultText).toContain("https://docs.feishu.cn/wiki/a");
-    expect((seen[1].message.content[0].text as string)).toBe(result.resultText);
+    expect((seen.filter(e => e.type === "message_end")[0].message.content[0].text as string)).toBe(result.resultText);
   });
 
   it("renders each source exactly once across a turn's messages, never duplicating the union", async () => {
@@ -128,8 +128,8 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const seen: any[] = [];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const narration = seen[1].message.content[0].text as string;
-    const final = seen[3].message.content[0].text as string;
+    const narration = seen.filter(e => e.type === "message_end")[0].message.content[0].text as string;
+    const final = seen.filter(e => e.type === "message_end")[1].message.content[0].text as string;
     expect(narration).toContain(a);
     expect(narration).not.toContain(b);
     expect(final).toContain(b);
@@ -150,7 +150,7 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const seen: any[] = [];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const combined = `${seen[1].message.content[0].text}\n${seen[3].message.content[0].text}`;
+    const combined = `${seen.filter(e => e.type === "message_end")[0].message.content[0].text}\n${seen.filter(e => e.type === "message_end")[1].message.content[0].text}`;
     expect(combined.split(a).length - 1).toBe(1); // present exactly once, not lost, not doubled
   });
 
@@ -165,8 +165,8 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const seen: any[] = [];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const answerOne = seen[1].message.content[0].text as string;
-    const answerTwo = seen[4].message.content[0].text as string;
+    const answerOne = seen.filter(e => e.type === "message_end")[0].message.content[0].text as string;
+    const answerTwo = seen.filter(e => e.type === "message_end")[1].message.content[0].text as string;
     expect(answerOne).toContain(a);
     expect(answerTwo).toContain(a); // new turn — the rendered-set was cleared, so it renders again
   });
@@ -1691,13 +1691,13 @@ describe("conversation phases", () => {
     const seen: any[] = [];
     await consumeAgentSse({
       client: mkClient([
-        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "我先检查节点状态。" }, { type: "toolCall", id: "c1", name: "bash", arguments: {} }], stopReason: "toolUse" } },
-        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "共有 5 个节点。" }], stopReason: "stop" } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "我先检查节点状态。", textSignature: JSON.stringify({ v: 1, id: "msg_p", phase: "commentary" }) }, { type: "toolCall", id: "c1", name: "bash", arguments: {} }], stopReason: "toolUse" } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "共有 5 个节点。", textSignature: JSON.stringify({ v: 1, id: "msg_f", phase: "final_answer" }) }], stopReason: "stop" } },
       ]),
       sessionId: "s", userId: "u", persistMessages: true,
       onEvent: async (event: any) => { seen.push(event); },
     });
-    expect(seen.filter(e => e.type === "message_end").map(e => e.phase)).toEqual(["commentary", "final_answer"]);
+    expect(seen.filter(e => e.type === "item/completed" && !e.dbMessageId).map(e => e.item.phase)).toEqual(["commentary", "commentary", "final_answer", "final_answer"]);
     expect(appendCalls.filter(e => e.role === "assistant").map(e => e.metadata?.phase)).toEqual(["commentary", "final_answer"]);
   });
 });
@@ -1717,44 +1717,5 @@ describe("assistant lifecycle persistence", () => {
   it("retains turn_end-only providers", async () => {
     await consumeAgentSse({ client: mkClient([{ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "fallback" }] } }]), sessionId: "s", userId: "u", persistMessages: true });
     expect(appendCalls.filter(c => c.role === "assistant").map(c => c.content)).toEqual(["fallback"]);
-  });
-});
-
-
-describe("tool-intent progress fallback", () => {
-  const start = (id: string, text = "已确认位置，继续查询数量。") => ({ type: "tool_execution_start", toolCallId: id, toolName: "lookup", args: { name: "demo" }, publicProgress: text });
-  it("persists and relays one commentary before a parallel batch, retaining next-step progress", async () => {
-    const seen: any[] = [];
-    const first = start("c1");
-    const result = await consumeAgentSse({ client: mkClient([
-      { type: "turn_start" }, first, start("c2"),
-      { type: "turn_start" }, start("c3"),
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "共有 5 个。" }], stopReason: "stop" } },
-    ]), sessionId: "s", userId: "u", agentId: "target", persistMessages: true,
-    onEvent: (evt, _type, extras) => seen.push({ ...evt, ...extras }), });
-    expect(seen.slice(0, 4).map(e => e.type)).toEqual(["turn_start", "progress_update", "tool_execution_start", "tool_execution_start"]);
-    expect(seen.filter(e => e.type === "progress_update")).toHaveLength(2);
-    expect(seen[1]).toMatchObject({ dbMessageId: "msg-1", progressId: "tool-progress:c1", phase: "commentary" });
-    expect(appendCalls.map(m => m.role)).toEqual(["assistant", "tool", "tool", "assistant", "tool", "assistant"]);
-    expect(appendCalls[0]).toMatchObject({ fromAgentId: "target", metadata: { phase: "commentary", source: "tool_intent" } });
-    expect(appendCalls[1].toolInput).toBe('{"name":"demo"}');
-    expect(seen[2].args).toEqual({ name: "demo" });
-    expect(first.publicProgress).toBe("已确认位置，继续查询数量。");
-    expect(result.resultText).toBe("共有 5 个。");
-  });
-  it.each(["delta", "end-only"])("prefers native %s text without showing another tool-intent paragraph", async (kind) => {
-    const seen: any[] = [];
-    const native = kind === "delta"
-      ? { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "我先核对库存。" } }
-      : { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "我先核对库存。" }], stopReason: "toolUse" } };
-    await consumeAgentSse({ client: mkClient([native, start("c1")]), sessionId: "s", userId: "u", onEvent: evt => seen.push(evt) });
-    expect(seen.some(e => e.type === "progress_update")).toBe(false);
-    expect(seen.find(e => e.type === "tool_execution_start").args).toEqual({ name: "demo" });
-  });
-  it("does not create a final answer from an intent or emit content after handoff", async () => {
-    const seen: any[] = [];
-    const result = await consumeAgentSse({ client: mkClient([start("c1"), { type: "handoff_requested" }, { type: "turn_start" }, start("c2")]), sessionId: "s", userId: "u", onEvent: e => seen.push(e) });
-    expect(result.resultText).toBe("");
-    expect(seen.filter(e => e.type === "progress_update")).toHaveLength(1);
   });
 });

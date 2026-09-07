@@ -101,7 +101,7 @@ describe("loadFullHistory", () => {
     m.role = "tool"; m.toolName = "bash"; m.toolInput = "{}"; m.outcome = "success";
     const [row] = await loadFullHistory("s1", pagedFetcher([m]));
     expect(row).toEqual({
-      role: "tool", content: "msg 1", toolName: "bash", toolInput: "{}", outcome: "success",
+      role: "tool", content: "msg 1", toolName: "bash", toolInput: "{}", outcome: "success", metadata: null,
       createdAt: m.createdAt.toISOString(),
     });
   });

@@ -6,6 +6,17 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { writeRehydratedSession } from "./session-rehydrate-store.js";
 import type { RehydrateRow } from "../shared/session-rehydrate.js";
 
+it("retains public item signatures and source model through the real session store", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "native-phase-"));
+  try {
+    const signature = JSON.stringify({ v: 1, id: "msg_progress", phase: "commentary" });
+    writeRehydratedSession(process.cwd(), folder, [{ role: "assistant", content: "Checking nodes.",
+      metadata: { phase: "commentary", assistant_item: { id: "item-1", textSignature: signature, api: "openai-responses", provider: "openai", model: "test" } } }]);
+    const restored = SessionManager.continueRecent(process.cwd(), folder).buildSessionContext();
+    expect(restored.messages[0]).toMatchObject({ api: "openai-responses", provider: "openai", model: "test", content: [{ type: "text", textSignature: signature }] });
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
 /**
  * ⚠️ 这个文件**不 mock** SessionManager。session.test.ts 把它换成了假的,那对测
  * 会话管理器的状态机是对的,但对这里是错的:回灌的全部意义是"写出去的东西

@@ -960,16 +960,12 @@ it("processes already queued input before transfer and rejects input during the 
 });
 
 
-it("separates public intent only for registered progress tools without mutating engine events", () => {
+it("preserves tool arguments without interpreting them as narration", () => {
   const session = makeFakeSession();
-  const brain = new PiAgentBrain(session, new Map(), undefined, new Set(["lookup"]));
+  const brain = new PiAgentBrain(session, new Map([["lookup", "query"]]));
   const seen: any[] = []; brain.subscribe(event => seen.push(event));
-  const args = Object.freeze({ name: "demo", _siclaw_progress: "Check the inventory." });
-  const event = Object.freeze({ type: "tool_execution_start", toolName: "lookup", toolset: "query", args });
-  session.__emit(event);
-  session.__emit({ ...event, toolName: "third_party" });
-  expect(seen[0]).toMatchObject({ args: { name: "demo" }, toolset: "query", publicProgress: "Check the inventory." });
-  expect(seen[0].args).not.toHaveProperty("_siclaw_progress");
-  expect(seen[1].args).toBe(args);
-  expect(event.args._siclaw_progress).toBe("Check the inventory.");
+  const args = Object.freeze({ name: "demo", description: "domain value" });
+  session.__emit(Object.freeze({ type: "tool_execution_start", toolName: "lookup", args }));
+  expect(seen[0].args).toBe(args);
+  expect(seen[0]).not.toHaveProperty("publicProgress");
 });

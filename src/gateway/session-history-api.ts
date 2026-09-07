@@ -28,6 +28,7 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
 function toRow(m: StoredMessage): RehydrateRow {
   return {
     role: m.role,
+    metadata: m.metadata,
     content: m.content,
     toolName: m.toolName,
     toolInput: m.toolInput,

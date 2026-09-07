@@ -5,7 +5,6 @@
  * hacks (streamFn, dequeue, agent internals) that live in agent-factory.ts.
  */
 
-import { splitToolProgress } from "../../shared/tool-progress.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type {
   BrainSession,
@@ -114,7 +113,6 @@ export class PiAgentBrain implements BrainSession {
     readonly session: AgentSession,
     private readonly toolsetsByName: ReadonlyMap<string, string> = new Map(),
     readonly llmCalls?: LlmCallRecorder,
-    private readonly progressToolNames: ReadonlySet<string> = new Set(),
   ) {
     const previous = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, signal) => {
@@ -162,13 +160,9 @@ export class PiAgentBrain implements BrainSession {
       ? stamped.toolName
       : typeof stamped.name === "string" ? stamped.name : undefined;
     if (!toolName) return stamped;
-    const toolset = stamped.toolset ?? this.toolsetsByName.get(toolName);
-    if (isStart && this.progressToolNames.has(toolName) &&
-        stamped.args && typeof stamped.args === "object" && !Array.isArray(stamped.args)) {
-      const progress = splitToolProgress(stamped.args);
-      return { ...stamped, ...(toolset ? { toolset } : {}), args: progress.args, publicProgress: progress.text };
-    }
-    return toolset && stamped.toolset == null ? { ...stamped, toolset } : stamped;
+    if (stamped.toolset != null) return stamped;
+    const toolset = this.toolsetsByName.get(toolName);
+    return toolset ? { ...stamped, toolset } : stamped;
   }
 
   private static readonly MAX_EMPTY_RETRIES = 2;

@@ -1229,6 +1229,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             },
             redactionConfig,
             signal: abortCtrl.signal,
+            turnId,
             onEvent: (evt, _eventType, extras) => {
               context.sendEvent("chat.event", {
                 sessionId: promptResult.sessionId,
