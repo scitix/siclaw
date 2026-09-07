@@ -567,6 +567,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // cold session never replays). Overwritten on each assistant message_end, so
   // by agent_end these point at the turn's final assistant message.
   let assistantEndedInStep = false;
+  let stepHasProgress = false;
   let lastAssistantDbMessageId: string | undefined;
   let lastAssistantContent: string | undefined;
   let lastAssistantMetadata: Record<string, unknown> | undefined;
@@ -590,7 +591,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     for await (const event of client.streamEvents(sessionId)) {
       if (signal?.aborted) break;
 
-      const evt = event as SseEvent;
+      const evt = { ...event as SseEvent };
       // Always a string: tool-pushed extra events (e.g. task_event, which carries
       // `kind` not `type`) have no `type`. A bare `eventType.includes(...)` on
       // undefined would throw and kill the whole SSE stream (STREAM_INTERRUPTED).
@@ -655,6 +656,21 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       }
 
       let dbMessageId: string | undefined;
+      if (eventType === "turn_start" || (eventType === "message_start" &&
+          (evt.message as { role?: string } | undefined)?.role === "assistant")) stepHasProgress = false;
+      if (eventType === "message_update" &&
+          (evt.assistantMessageEvent as { type?: string; delta?: string } | undefined)?.type === "text_delta" &&
+          (evt.assistantMessageEvent as { delta?: string }).delta?.trim()) stepHasProgress = true;
+      if (eventType === "agent_message" && typeof evt.text === "string" && evt.text.trim()) stepHasProgress = true;
+      if (eventType === "message_end" || eventType === "turn_end") {
+        const msg = evt.message as { role?: string; content?: unknown } | undefined;
+        if (msg?.role === "assistant") {
+          const content = msg.content;
+          if (typeof content === "string" ? content.trim() : Array.isArray(content) &&
+              content.some(part => part?.type === "text" && typeof part.text === "string" && part.text.trim())) stepHasProgress = true;
+        }
+      }
+
 
       // ── Capture context-usage snapshot from agent_end ──────────────────────
       // The brain computes {tokens, contextWindow, percent, inputTokens, ...} and
@@ -911,6 +927,22 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         // clock the parallel view places bars on — and the local clock only as a
         // last resort. The DURATION never mixes the two; see toolDurationMs.
         const nowAtStart = stampedStart ?? localStartMs;
+        // Only the brain's explicitly wrapped tools carry this field. Never
+        // interpret a third-party tool's domain arguments as communication.
+        const publicProgress = typeof evt.publicProgress === "string" ? evt.publicProgress.trim() : "";
+        delete evt.publicProgress;
+        if (!stepHasProgress && publicProgress) {
+          stepHasProgress = true;
+          const text = redactText(publicProgress, redactionConfig);
+          const progressId = `tool-progress:${String(evt.toolCallId ?? eventCount)}`;
+          const metadata = { phase: "commentary", source: "tool_intent", progress_id: progressId };
+          let progressDbId: string | undefined;
+          if (persist) {
+            progressDbId = await appendRow({ sessionId, role: "assistant", content: text, metadata });
+            await incrementMessageCount(sessionId);
+          }
+          onEvent?.({ type: "progress_update", text, progressId, phase: "commentary" }, "progress_update", { dbMessageId: progressDbId });
+        }
         const startToolName = (evt.toolName as string) || (evt.name as string) || "tool";
         const args = evt.args as Record<string, unknown> | undefined;
         const rawToolInput = args ? JSON.stringify(args) : "";

@@ -11,6 +11,7 @@ const MODE_LABELS: Record<string, string> = {
 export interface BuildSystemPromptInput {
   mode?: "cli" | "web" | "channel" | "task";
   templateOverride?: string;
+  interactiveProgress?: boolean;
   /** Immutable built-in Agent Type contract. */
   agentTypePrompt?: string;
   /** Editable Agent-owned specialization. */
@@ -126,6 +127,10 @@ export function buildSystemPromptAssembly(input: BuildSystemPromptInput): Prompt
   if (agentAddendum?.trim()) {
     add("agent.addendum", "agent", "agents.system_prompt", true,
       `\n\n# Agent Addendum\n\n${renderSystemPromptFragment(agentAddendum, mode, memoryEnabled)}`);
+  }
+
+  if (mode === "web" && input.interactiveProgress !== false) {
+    add("mode.web_progress", "mode", "src/core/prompt.ts#WEB_PROGRESS_SECTION", false, WEB_PROGRESS_SECTION);
   }
 
   if (includeOperationalSafety) {
@@ -337,3 +342,17 @@ const DEFAULT_TEMPLATE = `Help the user accomplish their goal with the available
 # Runtime
 
 Siclaw {{mode}} session. Configuration is managed through {{settingsPath}}; do not edit \`.siclaw/config/settings.json\` manually.`;
+
+
+const WEB_PROGRESS_SECTION = `
+
+# Web Conversation Progress
+
+This is a live conversation. The user needs readable updates while you act, even for short tool-assisted queries. Concise output means short updates, not silent execution.
+- Before the first tool batch, write one plain sentence describing the check in the user's language, then call the tools in that same response. Do not stop after announcing intent.
+- Before subsequent batches, briefly connect an observed finding or blocker to the next check. For example: "The inventory identifies the target cluster; I will now count its nodes." Only mention evidence already returned by tools. Group related checks into one update; do not list commands or repeat status for each parallel tool.
+- Prefer ordinary assistant text alongside tool calls. When a tool schema includes _siclaw_progress, also fill it with a short public update for that batch. The interface uses it only when ordinary text is absent, and removes it before executing the tool. It is user-facing prose, not private reasoning or a command argument.
+- Before handing off, explain what needs the next agent and why. On receipt, continue from the evidence and describe the next check without restarting the introduction. Agent identity is displayed by the interface.
+- If a call is still running and no new evidence is available, do not invent findings or claim success. At the next model response, explain an actual delay, failure, or change of direction if relevant.
+- Finish with one self-contained answer based on observed results. Progress belongs before tools, not repeated in the final answer.
+`;

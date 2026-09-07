@@ -28,6 +28,7 @@ import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
+import { hasToolProgress, wantsToolProgress, withToolProgress } from "./tool-progress.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
 import {
@@ -432,6 +433,7 @@ export async function createSiclawSession(
     agentPrompt: opts?.systemPromptAppend,
     systemPromptTemplate: opts?.systemPromptTemplate,
     delegation: opts?.delegation,
+    interactiveProgress: wantsToolProgress({ ...opts, mode }),
   });
   const allowedTools = compiledContext.harness.allowedTools;
   const memoryEnabled = compiledContext.harness.memoryEnabled;
@@ -744,6 +746,10 @@ export async function createSiclawSession(
     customTools.push(citationSupport.tool);
   }
 
+  if (wantsToolProgress({ ...opts, mode })) {
+    customTools.splice(0, customTools.length, ...customTools.map(withToolProgress));
+  }
+
   // Final model-visible tool set (registry-resolved + MCP + file tools, after the
   // whitelist is applied at every chokepoint). Logged by NAME when restricted so a
   // capability-group change is verifiable straight from the box log — this is the
@@ -979,7 +985,12 @@ export async function createSiclawSession(
       return toolset ? [[tool.name, toolset] as const] : [];
     }),
   );
-  const brain: BrainSession = new PiAgentBrain(session, toolsetsByName, llmCallRecorder);
+  const brain: BrainSession = new PiAgentBrain(
+    session,
+    toolsetsByName,
+    llmCallRecorder,
+    new Set(customTools.filter(hasToolProgress).map(tool => tool.name)),
+  );
   const getSkillSnapshot = () => {
     const currentSkills = loader.getSkills().skills;
     const skillNames = currentSkills.map((skill) => skill.name).sort();

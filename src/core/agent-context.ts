@@ -42,6 +42,7 @@ export interface CompileAgentContextInput {
   memoryConfigured: boolean;
   mode: SessionMode;
   agentPrompt?: string;
+  interactiveProgress?: boolean;
   systemPromptTemplate?: string;
   delegation?: DelegationContext;
 }
@@ -169,6 +170,7 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
   const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
+    interactiveProgress: input.interactiveProgress ?? (input.mode === "web" && !input.delegation),
     templateOverride: input.systemPromptTemplate,
     agentTypePrompt: agentPrompt.typeContract,
     agentAddendum: agentPrompt.addendum,
