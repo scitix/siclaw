@@ -9,7 +9,7 @@ async function withClient(
 ): Promise<void> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createProductSupportResultServer();
-  const client = new Client({ name: "product-support-result-test", version: "0.2.1" });
+  const client = new Client({ name: "product-support-result-test", version: "0.2.2" });
 
   await server.connect(serverTransport);
   await client.connect(clientTransport);
@@ -57,7 +57,7 @@ describe("product support result MCP", () => {
         "requirement",
         "unknown",
       ]);
-      expect(advertisedSchema.properties?.info?.required).toContain("llm");
+      expect(advertisedSchema.properties?.info?.required).not.toContain("llm");
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.region?.enum).toEqual(["", "domestic", "overseas"]);
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.aspect?.enum).toEqual(["", "platform_api", "network", "model"]);
       expect(advertisedSchema.properties?.info?.properties?.summary?.maxLength).toBe(200);

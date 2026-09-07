@@ -77,8 +77,12 @@ const INFO_KEYS = new Set([
   "description",
   "evidence",
   "missing_fields",
-  "llm",
 ]);
+// Optional: absent means "all three empty". All-empty is the correct value for
+// four of the five ticket types, so requiring the block would only turn the
+// most common shape into a host-side schema rejection on the turn's one
+// mandatory tool call.
+const INFO_OPTIONAL_KEYS = new Set(["llm"]);
 const LLM_KEYS = new Set(["region", "aspect", "model"]);
 const TICKET_TYPE_SET = new Set<string>(TICKET_TYPES);
 const LLM_REGION_SET = new Set<string>(LLM_REGIONS);
@@ -94,9 +98,10 @@ function assertExactKeys(
   value: Record<string, unknown>,
   expected: ReadonlySet<string>,
   path: string,
+  optional: ReadonlySet<string> = new Set(),
 ): void {
   for (const key of Object.keys(value)) {
-    if (!expected.has(key)) {
+    if (!expected.has(key) && !optional.has(key)) {
       throw new Error(`${path}.${key} is not allowed`);
     }
   }
@@ -111,11 +116,13 @@ function readString(value: unknown, path: string, maxChars: number): string {
   if (typeof value !== "string") {
     throw new Error(`${path} must be a string`);
   }
-  const text = value.trim();
-  if ([...text].length > maxChars) {
+  // Length is checked on the raw value, exactly as the advertised `maxLength`
+  // is applied by a host that validates arguments before dispatch, so this
+  // parser is never more lenient than the schema the model was shown.
+  if ([...value].length > maxChars) {
     throw new Error(`${path} must be at most ${maxChars} characters`);
   }
-  return text;
+  return value.trim();
 }
 
 function readEnum<T extends string>(
@@ -125,9 +132,14 @@ function readEnum<T extends string>(
   path: string,
   optional: boolean,
 ): "" | T {
-  // Enum fields are case-insensitive on input and canonical lowercase on
-  // output, uniformly: the model must not have to guess which field is strict.
-  const text = readString(value, path, 64).toLowerCase();
+  // Exact match only. The advertised JSON Schema `enum` is validated by the
+  // host before dispatch on the primary path, so any tolerance added here
+  // would apply on one host path and not the other; the schema is the single
+  // answer and the parser mirrors it.
+  if (typeof value !== "string") {
+    throw new Error(`${path} must be a string`);
+  }
+  const text = value;
   if (text.length === 0 && optional) {
     return "";
   }
@@ -164,6 +176,9 @@ function readStringArray(value: unknown, path: string, rules: StringArrayRules):
     if (rules.itemPattern && !rules.itemPattern.re.test(text)) {
       throw new Error(`${itemPath} ${rules.itemPattern.message}`);
     }
+    // Post-trim duplicates are dropped; this canonicalization is documented in
+    // the README and the schema description because consumers that diff the
+    // persisted tool_input against structuredContent will see it.
     if (!seen.has(text)) {
       seen.add(text);
       canonical.push(text);
@@ -196,7 +211,7 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
   if (!isRecord(input.info)) {
     throw new Error("input.info must be an object");
   }
-  assertExactKeys(input.info, INFO_KEYS, "input.info");
+  assertExactKeys(input.info, INFO_KEYS, "input.info", INFO_OPTIONAL_KEYS);
 
   const ticketType = readEnum(
     input.info.ticket_type,
@@ -229,7 +244,10 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
           message: "must be a lowercase snake_case field identifier",
         },
       }),
-      llm: readLlmInfo(input.info.llm, "input.info.llm"),
+      llm:
+        input.info.llm === undefined
+          ? { region: "", aspect: "", model: "" }
+          : readLlmInfo(input.info.llm, "input.info.llm"),
     },
   };
 

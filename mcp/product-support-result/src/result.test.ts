@@ -170,7 +170,7 @@ describe("parseProductSupportResult", () => {
           description: "Calls to the model API return HTTP 429 since this morning.",
           evidence: ["HTTP 429", "model=example-model-v2"],
           missing_fields: [],
-          llm: { region: " Overseas ", aspect: "MODEL", model: "  example-model-v2 " },
+          llm: { region: "overseas", aspect: "model", model: "  example-model-v2 " },
         },
       }),
     );
@@ -261,21 +261,27 @@ describe("parseProductSupportResult", () => {
     expect(result.info.llm.region).toBe("domestic");
   });
 
-  it("normalizes ticket_type case like the other enum fields", () => {
-    const result = parseProductSupportResult(
-      validResult({
-        info: {
-          ticket_type: " Incident ",
-          product: "",
-          summary: "Task failed",
-          description: "Task task-123 failed.",
-          evidence: [],
-          missing_fields: [],
-          llm: emptyLlm(),
-        },
-      }),
-    );
-    expect(result.info.ticket_type).toBe("incident");
+  it("mirrors the advertised schema: enum values are exact and length applies to the raw string", () => {
+    // The host validates the advertised schema before dispatch on the primary
+    // path, so the parser must not be more lenient than that schema.
+    const enumInput = validResult({ label: false });
+    enumInput.info = { ...(enumInput.info as Record<string, unknown>), ticket_type: " Incident " };
+    expect(() => parseProductSupportResult(enumInput)).toThrow(/ticket_type must be one of/);
+
+    const regionInput = validResult({ label: false });
+    regionInput.info = {
+      ...(regionInput.info as Record<string, unknown>),
+      ticket_type: "llm_incident",
+      llm: { region: "Overseas", aspect: "", model: "" },
+    };
+    expect(() => parseProductSupportResult(regionInput)).toThrow(/region must be empty or one of/);
+
+    const lengthInput = validResult();
+    lengthInput.info = {
+      ...(lengthInput.info as Record<string, unknown>),
+      summary: "x".repeat(LIMITS.summaryMaxChars) + "\n",
+    };
+    expect(() => parseProductSupportResult(lengthInput)).toThrow(/summary must be at most 200 characters/);
   });
 
   it("reports missing_fields errors at the caller's index, not the deduplicated one", () => {
@@ -318,10 +324,10 @@ describe("parseProductSupportResult", () => {
     expect(parseProductSupportResult(input).info.summary.length).toBe(LIMITS.summaryMaxChars);
   });
 
-  it("requires the llm block with exactly its three keys", () => {
-    const missing = validResult();
-    delete (missing.info as Record<string, unknown>).llm;
-    expect(() => parseProductSupportResult(missing)).toThrow(/input\.info\.llm is required/);
+  it("treats an absent llm block as all-empty and requires all three keys when present", () => {
+    const absent = validResult();
+    delete (absent.info as Record<string, unknown>).llm;
+    expect(parseProductSupportResult(absent).info.llm).toEqual({ region: "", aspect: "", model: "" });
 
     const extra = validResult();
     extra.info = {

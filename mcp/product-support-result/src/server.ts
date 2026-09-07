@@ -26,7 +26,6 @@ const inputSchema = {
         "description",
         "evidence",
         "missing_fields",
-        "llm",
       ],
       properties: {
         ticket_type: {
@@ -46,12 +45,14 @@ const inputSchema = {
         evidence: {
           type: "array",
           maxItems: LIMITS.evidenceMaxItems,
+          description:
+            "Error messages, timestamps, object ids and verified observations. Items are trimmed and post-trim duplicates are removed.",
           items: { type: "string", minLength: 1, maxLength: LIMITS.evidenceItemMaxChars },
         },
         missing_fields: {
           type: "array",
           description:
-            "Blocking machine field identifiers only; never user-facing questions or diagnostic instructions.",
+            "Blocking machine field identifiers only; never user-facing questions or diagnostic instructions. Items are trimmed and post-trim duplicates are removed.",
           maxItems: LIMITS.missingFieldsMaxItems,
           items: {
             type: "string",
@@ -65,7 +66,7 @@ const inputSchema = {
           additionalProperties: false,
           required: ["region", "aspect", "model"],
           description:
-            "Best-effort intake details for ticket_type=llm_incident, shown to first-line support as hints. Fill each field only from what the conversation establishes; leave it empty rather than guess. May already be filled while ticket_type is still unknown; must be empty once the type resolves to anything other than llm_incident.",
+            "Optional; omit it or send all three fields empty for any ticket_type other than llm_incident (absent means all empty). Best-effort intake details for ticket_type=llm_incident, shown to first-line support as hints. Fill each field only from what the conversation establishes; leave it empty rather than guess. May already be filled while ticket_type is still unknown; must be empty once the type resolves to consultation, incident or requirement.",
           properties: {
             region: {
               type: "string",
@@ -91,7 +92,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.2.1" },
+    { name: "mcp-product-support-result", version: "0.2.2" },
     { capabilities: { tools: {} } },
   );
 

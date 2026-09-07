@@ -18,8 +18,7 @@ both MCP text content and `structuredContent`.
     "summary": "Training task cannot start",
     "description": "Task task-123 remains Pending after retry.",
     "evidence": ["task_id=task-123", "status=Pending"],
-    "missing_fields": [],
-    "llm": { "region": "", "aspect": "", "model": "" }
+    "missing_fields": []
   }
 }
 ```
@@ -72,7 +71,9 @@ identifiers `llm_region`, `llm_aspect` and `llm_model` may appear in
 `unknown`, so a region or model the user stated up front has somewhere to
 live; once the type resolves to `consultation`, `incident` or `requirement`
 all three fields must be empty, so a stray value is never read as an
-established fact. The block is always present.
+established fact. The block is optional on input: omitting it means all three
+fields are empty, which is the correct value for every type except
+`llm_incident`. It is always present in the returned result.
 
 ### Size limits
 
@@ -88,8 +89,17 @@ shorten it. Limits are in characters, not bytes.
 | `evidence` | 20 items, 300 characters each |
 | `missing_fields` | 20 items, 64 characters each |
 
-Enum fields (`ticket_type`, `llm.region`, `llm.aspect`) are trimmed and
-lower-cased on input and always returned in canonical lowercase.
+Limits apply to the raw value before trimming, exactly as a host that
+validates the advertised schema before dispatch applies `maxLength`, so the
+parser is never more lenient than the schema the model was shown.
+
+### Canonicalization
+
+The parser mirrors the advertised JSON Schema and adds nothing the schema does
+not say: enum values (`ticket_type`, `llm.region`, `llm.aspect`) must be the
+exact lowercase spelling. String fields are trimmed. `evidence` and
+`missing_fields` items are trimmed and post-trim duplicates are removed, so the
+returned arrays can be shorter than the caller's.
 
 The server validates each call independently. It does not know Siclaw session
 or turn identity, so "exactly one successful result per turn" is not enforced
