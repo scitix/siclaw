@@ -426,6 +426,10 @@ export class McpClientManager {
       const cfg = serverConfig as any;
       const detectedTransport: string = cfg.transport
         ?? (cfg.url ? "streamable-http" : cfg.command ? "stdio" : "");
+      // Set once the transport is up, so the catch below can close a client
+      // whose listTools() failed: the SSE stream is open by then, and a client
+      // that never reached this.clients is otherwise closed by nobody.
+      let connected: any = null;
       const recordFailure = (error: McpConnectError) => {
         this.connections.push({
           name: serverName, transport: detectedTransport, state: "failed",
@@ -476,6 +480,7 @@ export class McpClientManager {
         }
 
         await client.connect(transport);
+        connected = client;
         if (this.disposed) {
           await this.closeLate(serverName, client, startedAt, detectedTransport);
           continue;
@@ -524,6 +529,11 @@ export class McpClientManager {
         );
         console.error(`[mcp-client] Raw error for "${serverName}":`, err);
         recordFailure(error);
+        if (connected) {
+          try { await connected.close(); } catch (closeErr) {
+            console.warn(`[mcp-client] Failed to close "${serverName}" after a failed handshake:`, closeErr);
+          }
+        }
       }
     }
 

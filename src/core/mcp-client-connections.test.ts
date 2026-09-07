@@ -159,6 +159,39 @@ describe("McpClientManager.getServerConnections", () => {
   });
 });
 
+describe("McpClientManager closes clients that fail after the transport is up", () => {
+  it("closes the SSE stream when tools/list returns a protocol error", async () => {
+    let sseOpened = 0;
+    let sseClosed = 0;
+    const url = await listen((req, body, res) => {
+      if (req.method === "GET") { // the SDK opens the server→client SSE stream after initialize
+        sseOpened++;
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(":\n\n");
+        // res.close fires when the client tears the stream down; req.close would
+        // fire as soon as the (empty) request body is read.
+        res.on("close", () => { sseClosed++; });
+        return;
+      }
+      const msg = JSON.parse(body);
+      if (msg.method === "tools/list") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "tools/list exploded" } }));
+        return;
+      }
+      fakeMcpServer([])(req, body, res);
+    });
+    const manager = new McpClientManager({ mcpServers: { flaky: { transport: "streamable-http", url } } });
+    await manager.initialize();
+    expect(manager.getServerConnections()[0]).toMatchObject({ name: "flaky", state: "failed", error: { kind: "protocol" } });
+    expect(manager.getTools()).toEqual([]);
+    // Wait for the server to observe the client going away.
+    for (let i = 0; i < 50 && sseClosed < sseOpened; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(sseOpened).toBeGreaterThan(0);
+    expect(sseClosed).toBe(sseOpened);
+  });
+});
+
 describe("McpClientManager.shutdown during initialize", () => {
   it("closes a connection that completes after shutdown instead of leaking it", async () => {
     let handshakes = 0;
