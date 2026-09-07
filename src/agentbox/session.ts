@@ -3441,6 +3441,7 @@ export class AgentBoxSessionManager {
       delegateToAgentExecutor,
       // Facade / backend side: expose transfer_to_agent + its destination menu.
       handoffTargets,
+      getHandoffTraceContext: (callId) => tracingRecorder.captureHandoffTrace(id, callId),
       evictSessionContext: async () => { await this.evictSessionContext(id); },
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).

@@ -525,6 +525,8 @@ export interface ToolRefs {
    * the session, a delegation calls out and comes back. See agent-handoff.ts.
    */
   handoffTargets?: HandoffTarget[];
+  /** Captured before session eviction; tracing is independent of tool arguments. */
+  getHandoffTraceContext?: (callId: string) => import("../shared/handoff-trace.js").HandoffTraceContext | undefined;
   /**
    * Drops this box's LOCAL copy of the session after handing the conversation
    * away. The copy is only ever a cache — the control plane holds the authority

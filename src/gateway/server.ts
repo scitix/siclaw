@@ -18,6 +18,7 @@
  *   POST /api/internal/feedback            — AgentBox feedback
  */
 
+import { normalizeHandoffTrace } from "../shared/handoff-trace.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
@@ -786,7 +787,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A HANDOFF arrival: the control plane ended the previous agent's turn on a
     // `handoff_requested`, flipped the session's executing agent, and re-sent the
     // brief here — same session, same response stream, new owner.
-    const handoffParam = params.handoff as { fromAgentId?: string; brief?: string } | undefined;
+    const handoffParam = params.handoff as { fromAgentId?: string; brief?: string; traceContext?: unknown } | undefined;
     const handoff = handoffParam?.fromAgentId
       ? { fromAgentId: String(handoffParam.fromAgentId), brief: String(handoffParam.brief ?? "") }
       : undefined;
@@ -903,6 +904,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       requiredResultToolName,
       userId,
       text: promptText,
+      handoffTrace: handoff ? normalizeHandoffTrace(handoffParam?.traceContext) : undefined,
       agentId,
       modelProvider: params.modelProvider as string | undefined,
       modelId: params.modelId as string | undefined,

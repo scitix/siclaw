@@ -19,6 +19,8 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  /** Source AgentBox context for an authorized conversation handoff only. */
+  handoffTrace?: import("../../shared/handoff-trace.js").HandoffTraceContext;
   sessionId?: string;
   /**
    * Identity of THIS turn, so a later abort can name the turn it means rather than

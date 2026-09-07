@@ -146,6 +146,8 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
         );
       }
 
+      const traceContext = refs.getHandoffTraceContext?.(_toolCallId);
+
       // 丢掉本地副本。交出去之后这个 box 对这段会话不再有发言权,留着只会在它某天
       // 又被交回来时,拿一份缺了中间几轮的陈旧上下文去接 —— 而控制面那边是全的。
       // 先持久化失效标记；失败时不发出交接事件。
@@ -155,7 +157,7 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
         console.warn("[transfer_to_agent] could not evict the local session context:", err);
         return result("Cannot safely invalidate local context. Handoff was not started.", false);
       }
-      refs.sessionEventEmitter({ type: "handoff_requested", targetAgentId: target.id, brief });
+      refs.sessionEventEmitter({ type: "handoff_requested", targetAgentId: target.id, brief, ...(traceContext ? { traceContext } : {}) });
 
       return result(`Conversation handed to ${target.name}. Execution yielded to the destination.`, true);
     },

@@ -83,6 +83,7 @@ export interface HandoffTargetsResponse {
  */
 export interface HandoffRequestedEvent extends Record<string, unknown> {
   type: "handoff_requested";
+  traceContext?: import("./handoff-trace.js").HandoffTraceContext;
   targetAgentId: string;
   /** What the receiving agent is being asked to do, in the sender's words. */
   brief: string;

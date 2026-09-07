@@ -2282,3 +2282,20 @@ describe("http-server — turn ledger (cross-restart dispatch idempotency)", () 
     expect(readTurnLedger(path.join(ledgerSm.ledgerDir, "never-used"))).toEqual([]);
   });
 });
+
+describe("handoff prompt trace acknowledgement", () => {
+  it("inherits the source trace per request and starts a fresh trace for the next user question", async () => {
+    const traceId = "0123456789abcdef0123456789abcdef";
+    const first = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "handoff-trace-session", text: "continue checking",
+      handoffTrace: { traceId, parentSpanId: "1234567890abcdef", traceFlags: 1 },
+    });
+    expect(first.status).toBe(200);
+    expect(first.data.traceId).toBe(traceId);
+    await flushAsync();
+    const next = await getJson(port, "/api/prompt", "POST", { sessionId: "handoff-trace-session", text: "new question" });
+    expect(next.status).toBe(200);
+    expect(next.data.traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(next.data.traceId).not.toBe(traceId);
+  });
+});

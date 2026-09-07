@@ -4,6 +4,7 @@
  * Provides HTTP API for Gateway to call, with SSE streaming support.
  */
 
+import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
@@ -79,6 +80,8 @@ interface Route {
 }
 
 interface PromptRequestBody {
+  /** Trusted Runtime continuation context; per-request, never session-cached. */
+  handoffTrace?: unknown;
   sessionId?: string;
   /** User who initiated this prompt (per-request), forwarded to the trace
    *  recorder as the root span's user.id. */
@@ -1212,7 +1215,8 @@ export function createHttpServer(
     // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
     // after model setup so a setModel switch is not captured as prompt activity;
     // closed in actuallyFinish, which every terminal path funnels through.
-    tracingRecorder.startPrompt(managed.id, promptText, body.userId);
+    const handoffTrace = normalizeHandoffTrace(body.handoffTrace);
+    tracingRecorder.startPrompt(managed.id, promptText, body.userId, handoffTrace?.traceId, handoffParentSpan(handoffTrace));
 
     const actuallyFinish = () => {
       managed._promptDone = true;

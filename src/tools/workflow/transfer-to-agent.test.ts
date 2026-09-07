@@ -261,3 +261,18 @@ describe("target capability summaries", () => {
     expect(tool.description).not.toContain("skill-59");
   });
 });
+
+it("carries trace context on the control event, captured before eviction and absent from model parameters", async () => {
+  const context = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "1234567890abcdef", traceFlags: 1 };
+  const order: string[] = [];
+  const emit = vi.fn();
+  const tool = createTransferToAgentTool(refs({
+    sessionEventEmitter: emit,
+    getHandoffTraceContext: callId => { expect(callId).toBe("handoff-call"); order.push("capture"); return context; },
+    evictSessionContext: async () => { order.push("evict"); },
+  }));
+  await tool.execute!("handoff-call", { route_key: "cn", brief: "continue" }, undefined as never);
+  expect(order).toEqual(["capture", "evict"]);
+  expect(emit).toHaveBeenCalledWith({ type: "handoff_requested", targetAgentId: "agent-cn", brief: "continue", traceContext: context });
+  expect(JSON.stringify(tool.parameters)).not.toContain("traceId");
+});

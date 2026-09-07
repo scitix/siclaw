@@ -213,6 +213,36 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect(assistantRow.traceId).toBe("0123456789abcdef0123456789abcdef");
   });
 
+  it("keeps the handoff trace in relayed control events and both agents' persisted rows", async () => {
+    const traceContext = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "0123456789abcdef", traceFlags: 1 };
+    const handoff = { type: "handoff_requested", targetAgentId: "agent-b", brief: "Check nodes", traceContext };
+    const seen: any[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "I will transfer this check." }] } },
+        { type: "tool_execution_start", toolName: "transfer_to_agent", toolCallId: "transfer-a", args: {} },
+        handoff,
+        { type: "tool_execution_end", toolName: "transfer_to_agent", toolCallId: "transfer-a", result: { content: [{ type: "text", text: "Transferred" }] } },
+      ]), sessionId: "sid", userId: "u", agentId: "agent-a", persistMessages: true,
+      traceId: traceContext.traceId, onEvent: (event) => { seen.push(event); },
+    });
+    expect(seen.find(event => event.type === "handoff_requested")).toEqual(handoff);
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "bash", toolCallId: "nodes-b", args: {} },
+        { type: "tool_execution_end", toolName: "bash", toolCallId: "nodes-b", result: { content: [{ type: "text", text: "5" }] } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "There are 5 nodes." }] } },
+      ]), sessionId: "sid", userId: "u", agentId: "agent-b", persistMessages: true,
+      traceId: traceContext.traceId,
+    });
+    for (const agentId of ["agent-a", "agent-b"]) {
+      const rows = appendCalls.filter(row => row.fromAgentId === agentId);
+      expect(rows.some(row => row.role === "assistant")).toBe(true);
+      expect(rows.some(row => row.role === "tool")).toBe(true);
+      expect(rows.every(row => row.traceId === traceContext.traceId)).toBe(true);
+    }
+  });
+
   it("merges the agent_end context-usage snapshot onto the last assistant row's metadata", async () => {
     // Lets the frontend restore the context meter on session reopen/refresh.
     const cu = { tokens: 24144, contextWindow: 100000, percent: 24.1, inputTokens: 24118, outputTokens: 26 };

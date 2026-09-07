@@ -98,6 +98,7 @@ export interface CreateSiclawSessionOpts {
   /** Facade / backend side: agents this one may HAND the conversation to
    *  (manifest for the transfer_to_agent tool). Non-empty → the tool is exposed. */
   handoffTargets?: import("./tool-registry.js").ToolRefs["handoffTargets"];
+  getHandoffTraceContext?: import("./tool-registry.js").ToolRefs["getHandoffTraceContext"];
   /** Drops this box's local copy of the session after handing it away. */
   evictSessionContext?: () => Promise<void>;
   /** Agent tool allow-list: null is unrestricted only for explicit Custom; built-in types expand their locked groups. */
@@ -581,6 +582,7 @@ export async function createSiclawSession(
       delegationRoster: opts?.delegationRoster,
       delegateToAgentExecutor: opts?.delegateToAgentExecutor,
       handoffTargets: opts?.handoffTargets,
+      getHandoffTraceContext: opts?.getHandoffTraceContext,
       evictSessionContext: opts?.evictSessionContext,
     },
     allowedTools,
