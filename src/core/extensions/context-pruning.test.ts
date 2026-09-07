@@ -10,6 +10,24 @@ import {
   SOFT_TRIM_TAIL,
   HARD_CLEAR_PLACEHOLDER,
 } from "./context-pruning.js";
+import contextPruningExtension from "./context-pruning.js";
+
+describe("context pruning output retrieval", () => {
+  it.each([0.35, 0.8])("retains the reference at context ratio %s", (ratio) => {
+    const ref = '[siclaw-output 36000 chars; read selected lines with tool_output({"output_id":"saved"})]';
+    let handle: any;
+    contextPruningExtension({ on: (_name: string, handler: any) => { handle = handler; } } as any);
+    const messages = [
+      makeToolResult(`${"x".repeat(2000)}\n${ref}\n${"y".repeat(6000)}`),
+      makeUser("z".repeat(Math.floor(100000 * 4 * ratio))),
+      makeAssistant(), makeAssistant(), makeAssistant(),
+    ];
+    const result = handle({ messages }, { getContextUsage: () => ({ contextWindow: 100000 }) });
+    expect(result.messages[0].content[0].text).toContain(ref);
+    if (ratio > 0.5) expect(result.messages[0].content[0].text).toContain(HARD_CLEAR_PLACEHOLDER);
+    else expect(result.messages[0].content[0].text).toContain("old output trimmed");
+  });
+});
 
 // We can't easily test the extension registration (needs ExtensionAPI),
 // so we test the exported helpers and simulate the pruning logic inline.

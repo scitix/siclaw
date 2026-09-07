@@ -30,6 +30,7 @@ import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/in
 import { ToolRegistry, type AgentMode, type ResolvedToolDefinition } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
+import { ToolOutputStore } from "../tools/infra/tool-output-store.js";
 import {
   compileAgentContext,
   createAgentContextManifest,
@@ -76,6 +77,8 @@ import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
+  /** Durable directory owned by the logical task; idle release must not remove it. */
+  toolOutputDir?: string;
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
@@ -210,6 +213,7 @@ export interface SiclawSessionResult {
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
   sessionIdRef: { current: string };
+  toolOutputStore: ToolOutputStore;
   /** Bumped once per turn by the prompt owner; scopes per-attempt tool state (ToolRefs.turnRef). */
   turnRef: { current: number };
   /** Non-sensitive compiler output: hashes + model-visible resource names. */
@@ -531,11 +535,15 @@ export async function createSiclawSession(
 
   // Shared task-ledger id; sub-agents pass the parent's id to share its ledger.
   const taskListId = opts?.taskListId ?? randomUUID();
+  const toolOutputStore = new ToolOutputStore(opts?.toolOutputDir ?? path.join(
+    userDataDir, "agent", "tool-output",
+    createHash("sha256").update(JSON.stringify([userId, agentId, sessionManager.getSessionId()])).digest("hex"),
+  ));
 
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
+      kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef, toolOutputStore,
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
@@ -650,7 +658,7 @@ export async function createSiclawSession(
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
   const readAllowedDirs = [
     builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir,
-    os.tmpdir(),
+    os.tmpdir(), toolOutputStore.directory,
     ...(opts?.portalSkillsDir ? [opts.portalSkillsDir] : []),
   ];
   const writeAllowedDirs = [userDataDir];
@@ -1010,6 +1018,6 @@ export async function createSiclawSession(
     skillNames, skillDigests, getSkillSnapshot,
     kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
     sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,
-    getPromptInspection,
+    getPromptInspection, toolOutputStore,
   };
 }

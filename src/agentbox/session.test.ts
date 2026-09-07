@@ -400,6 +400,21 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
 });
 
 describe("AgentBoxSessionManager — release", () => {
+  it("retains saved output through idle release/rebuild and removes it on explicit close even after eviction", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("output-session");
+    const directory = lastCreateSiclawSession.calls.at(-1)!.toolOutputDir;
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "sample.log"), "full output");
+    await mgr.release("output-session");
+    expect(fs.readFileSync(path.join(directory, "sample.log"), "utf8")).toBe("full output");
+    await mgr.getOrCreate("output-session");
+    expect(lastCreateSiclawSession.calls.at(-1)!.toolOutputDir).toBe(directory);
+    await mgr.release("output-session");
+    await mgr.close("output-session");
+    expect(fs.existsSync(directory)).toBe(false);
+  });
+
   it("release removes the session from the map", async () => {
     const mgr = new AgentBoxSessionManager();
     await mgr.getOrCreate("sess-1");

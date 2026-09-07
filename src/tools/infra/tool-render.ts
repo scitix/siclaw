@@ -3,17 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { Text } from "@earendil-works/pi-tui";
+import { OUTPUT_CHAR_BUDGET, omittedOutputBlocks, outputLineAt, outputLineStarts, sampleOutputRanges } from "./output-sampling.js";
+import { currentToolOutputStore } from "./tool-output-store.js";
 
 const PREVIEW_LINES = 5;
-
-/**
- * Maximum characters of tool output sent to the LLM.
- * Keeps head + tail and drops the middle, so the model sees
- * both the beginning (headers, config) and end (results, errors).
- */
-const MAX_CHARS = 8000;
-const HEAD_CHARS = 3000;
-const TAIL_CHARS = 3000;
 
 // ANSI escape code pattern (same regex as strip-ansi package)
 // eslint-disable-next-line no-control-regex
@@ -37,15 +30,17 @@ export function sanitizeOutput(text: string): string {
 function saveTempFile(text: string): string {
   const id = randomBytes(4).toString("hex");
   const filePath = path.join(os.tmpdir(), `siclaw-output-${id}.log`);
-  fs.writeFileSync(filePath, text, "utf-8");
+  fs.writeFileSync(filePath, text, { encoding: "utf8", flag: "wx", mode: 0o600 });
   return filePath;
 }
 
 /**
  * Sanitize and truncate tool output for the LLM.
  * - Strips ANSI codes and control characters
- * - When truncated, saves full output to a temp file and tells the LLM the path
- * - Keeps the first HEAD_CHARS and last TAIL_CHARS characters, drops the middle
+ * - Saves the full sanitized output before sampling; runtime storage is task-scoped.
+ * - Distributes 8000 source characters across ceil(length / 8000) samples, then
+ *   expands head/tail to at least 2000 each without reducing interior samples.
+ *   The remaining omitted text forms equal gaps between the samples.
  */
 export function processToolOutput(text: string): string {
   const clean = sanitizeOutput(text);
@@ -54,13 +49,33 @@ export function processToolOutput(text: string): string {
   // as a stuck "Running" card and tempts the model to assume the output was hidden
   // elsewhere and invent a file path to read.
   if (clean.trim().length === 0) return "(no output)";
-  if (clean.length <= MAX_CHARS) return clean;
+  if (clean.length <= OUTPUT_CHAR_BUDGET) return clean;
 
-  const fullPath = saveTempFile(clean);
-  const head = clean.slice(0, HEAD_CHARS);
-  const tail = clean.slice(-TAIL_CHARS);
-  const totalLines = clean.split("\n").length;
-  return `${head}\n\n... [${totalLines} lines total, output truncated. Full output saved to: ${fullPath}]\n\n${tail}`;
+  const context = currentToolOutputStore();
+  const outputId = context?.store.save(clean);
+  const outputPath = context?.useToolReader ? undefined : context ? context.store.file(outputId!) : saveTempFile(clean);
+  const readHint = context?.useToolReader
+    ? `tool_output(${JSON.stringify({ output_id: outputId, offset: 1, limit: 100 })})`
+    : `read(${JSON.stringify({ path: outputPath, offset: 1, limit: 100 })})`;
+  const starts = outputLineStarts(clean);
+  const ranges = sampleOutputRanges(clean);
+  const blocks = omittedOutputBlocks(ranges, starts);
+  const sampledChars = ranges.reduce((sum, range) => sum + range.end - range.start, 0);
+  const parts = [`[siclaw-output ${clean.length} chars; ${starts.length} lines total; output truncated to ${sampledChars} sampled chars (8000 base budget plus head/tail minima); read selected lines with ${readHint}]`];
+  let previousEnd = 0;
+  let blockIndex = 0;
+  for (const range of ranges) {
+    if (range.start > previousEnd) {
+      const block = blocks[blockIndex++];
+      const expandHint = context?.useToolReader
+        ? `tool_output(${JSON.stringify({ output_id: outputId, block_id: block.id })})`
+        : `read(${JSON.stringify({ path: outputPath, offset: block.startLine, limit: block.endLine - block.startLine + 1 })})`;
+      parts.push(`... [omitted chars ${block.start + 1}-${block.end}; lines ${block.startLine}-${block.endLine}; block ${block.id}; expand with ${expandHint}] ...`);
+    }
+    parts.push(`[chars ${range.start + 1}-${range.end}; lines ${outputLineAt(starts, range.start)}-${outputLineAt(starts, range.end - 1)}; boundaries may split lines]\n${clean.slice(range.start, range.end)}`);
+    previousEnd = range.end;
+  }
+  return parts.join("\n\n");
 }
 
 /** @deprecated Use processToolOutput instead */

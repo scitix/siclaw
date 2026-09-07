@@ -10,6 +10,7 @@
  * no plugin hooks, no transcript events).
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { preserveOutputReferences } from "../tools/infra/output-sampling.js";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { extractToolCallsFromAssistant, extractToolResultId } from "./message-utils.js";
 import { sanitizeToolCallInputs } from "./tool-call-repair.js";
@@ -108,7 +109,7 @@ function capToolResultSize(msg: AgentMessage): AgentMessage {
     if (!block || typeof block !== "object" || block.type !== "text" || typeof block.text !== "string") return block;
     const blockShare = block.text.length / totalChars;
     const blockBudget = Math.max(MIN_KEEP_CHARS + TRUNCATION_SUFFIX.length, Math.floor(HARD_MAX_TOOL_RESULT_CHARS * blockShare));
-    return { ...block, text: truncateToolResultText(block.text, blockBudget) };
+    return { ...block, text: preserveOutputReferences(block.text, truncateToolResultText(block.text, blockBudget)) };
   });
   return { ...msg, content: newContent } as unknown as AgentMessage;
 }

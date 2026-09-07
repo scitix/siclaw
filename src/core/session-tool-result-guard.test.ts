@@ -210,6 +210,15 @@ describe("installSessionToolResultGuard", () => {
     expect(persistedText).toContain("[Content truncated");
   });
 
+  it("preserves a retrieval reference even when it is beyond the persistence cutoff", () => {
+    const sm = createMockSessionManager();
+    installSessionToolResultGuard(sm as any);
+    const ref = '[siclaw-output 500000 chars; read selected lines with tool_output({"output_id":"saved"})]';
+    sm.appendMessage({ role: "toolResult", toolCallId: "saved-call", content: [{ type: "text", text: `${"x".repeat(500000)}\n${ref}` }] });
+    expect(sm._appended[0].content[0].text).toContain(ref);
+    expect(sm._appended[0].content[0].text).toContain("[Content truncated");
+  });
+
   it("persists a recoverable artifact reference for oversized captured results", () => {
     const sm = createMockSessionManager();
     installSessionToolResultGuard(sm as any);

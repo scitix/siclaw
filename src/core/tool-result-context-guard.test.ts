@@ -284,6 +284,17 @@ describe("enforceToolResultContextBudgetInPlace", () => {
         : "";
     expect(firstText).toContain("[compacted:");
   });
+
+  it("retains output references through both single-result truncation and hard compaction", () => {
+    const ref = '[siclaw-output 36000 chars; 360 lines total; read selected lines with tool_output({"output_id":"saved"})]';
+    const messages = [{ role: "toolResult", toolCallId: "saved-call", content: [{ type: "text", text: `${"x".repeat(10000)}\n${ref}\ntail` }] }] as any[];
+    enforceToolResultContextBudgetInPlace({ messages, contextBudgetChars: 100_000, maxSingleToolResultChars: 500 });
+    expect(getToolResultText(messages[0])).toContain(ref);
+    expect(getToolResultText(messages[0])).toContain("[truncated:");
+    enforceToolResultContextBudgetInPlace({ messages, contextBudgetChars: 300, maxSingleToolResultChars: 10000 });
+    expect(getToolResultText(messages[0])).toContain(ref);
+    expect(getToolResultText(messages[0])).toContain("[compacted:");
+  });
 });
 
 describe("installToolResultContextGuard", () => {

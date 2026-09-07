@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { preserveOutputReferences } from "../../tools/infra/output-sampling.js";
 
 /** Rough character-to-token ratio for estimating context usage */
 const CHARS_PER_TOKEN = 4;
@@ -108,7 +109,7 @@ function softTrimMessage(msg: any): any {
     const totalLines = block.text.split("\n").length;
     return {
       ...block,
-      text: `${head}\n\n... [${totalLines} lines total, old output trimmed to save context.]\n\n${tail}`,
+      text: preserveOutputReferences(block.text, `${head}\n\n... [${totalLines} lines total, old output trimmed to save context.]\n\n${tail}`),
     };
   });
   return { ...msg, content: newContent };
@@ -120,7 +121,10 @@ function softTrimMessage(msg: any): any {
 function hardClearMessage(msg: any): any {
   return {
     ...msg,
-    content: [{ type: "text", text: HARD_CLEAR_PLACEHOLDER }],
+    content: [{ type: "text", text: preserveOutputReferences(
+      (msg.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n"),
+      HARD_CLEAR_PLACEHOLDER,
+    ) }],
   };
 }
 
@@ -171,7 +175,7 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
         const len = getToolResultLength(next[i]);
         if (len <= HARD_CLEAR_PLACEHOLDER.length) continue;
         next[i] = hardClearMessage(next[i]);
-        const saved = len - HARD_CLEAR_PLACEHOLDER.length;
+        const saved = len - getToolResultLength(next[i]);
         totalChars -= saved;
         ratio = totalChars / charWindow;
       }

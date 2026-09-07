@@ -2652,6 +2652,8 @@ export class AgentBoxSessionManager {
     const sharedMcpManager = this.sessions.get(request.parentSessionId)?.mcpManager;
 
     const child = await createSiclawSession({
+      // Child output belongs to the parent task; retain it until that task closes.
+      toolOutputDir: path.join(this.getSessionDir(request.parentSessionId), "tool-output", childSessionId),
       mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
       kubeconfigRef,
@@ -3289,6 +3291,7 @@ export class AgentBoxSessionManager {
       : undefined;
 
     const result = await createSiclawSession({
+      toolOutputDir: path.join(sessionDir, "tool-output"),
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
@@ -3848,6 +3851,9 @@ export class AgentBoxSessionManager {
    * are still NOT destroyed (they belong to the AgentBox).
    */
   async close(sessionId: string): Promise<void> {
+    // Explicit logical-task closure, even if the in-memory session was already evicted.
+    // release()/closeAll() intentionally retain these files for idle/pod restoration.
+    fs.rmSync(path.join(this.getBaseSessionDir(), sessionId, "tool-output"), { recursive: true, force: true });
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);

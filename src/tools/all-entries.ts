@@ -27,6 +27,7 @@ import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
 import { registration as knowledgeSearch } from "./query/knowledge-search.js";
 import { registration as knowledgeCite } from "./query/knowledge-cite.js";
+import { registration as toolOutput } from "./query/tool-output.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
 // end_investigation removed as part of the DP state-machine teardown
 // (see docs/design/2026-04-24-dp-mode-refactor-design.md §6.6).
@@ -54,7 +55,7 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
   clusterList, hostList, k8sInspect,
-  memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
+  memorySearch, memoryGet, knowledgeSearch, knowledgeCite, toolOutput,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, reportFindings, requestInput,

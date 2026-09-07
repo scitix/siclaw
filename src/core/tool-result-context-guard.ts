@@ -10,6 +10,7 @@
  * with inlined char estimation (no separate module).
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { preserveOutputReferences } from "../tools/infra/output-sampling.js";
 import type { ContextGuard } from "./guard-pipeline.js";
 import {
   formatToolResultArtifactReference,
@@ -200,6 +201,7 @@ export function truncateTextToBudget(text: string, maxChars: number): string {
 }
 
 function replaceToolResultText(msg: AgentMessage, text: string): AgentMessage {
+  text = preserveOutputReferences(getToolResultText(msg), text);
   const content = (msg as { content?: unknown }).content;
   const replacementContent =
     typeof content === "string" || content === undefined ? text : [{ type: "text", text }];

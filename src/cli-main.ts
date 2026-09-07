@@ -195,6 +195,14 @@ const credentialsDir = portalCredentialsDir ?? path.resolve(process.cwd(), confi
 // executors can be injected; sessionRef is filled in once the session exists (and on
 // every session swap via createRuntime).
 const tuiBackgroundHost = new TuiBackgroundHost();
+// A runtime swap (/new, /resume, /fork) is not task completion. Retain output
+// across swaps; CLI exit is the explicit lifetime boundary for this host.
+const toolOutputStores = new Set<import("./tools/infra/tool-output-store.js").ToolOutputStore>();
+process.on("exit", () => {
+  for (const store of toolOutputStores) {
+    try { store.clear(); } catch (error) { console.warn("[tool-output] cleanup failed:", error); }
+  }
+});
 // Background bash children are detached process-group leaders, so terminal SIGINT does
 // not reach them — sweep them on shutdown so they don't orphan in the host.
 {
@@ -231,14 +239,16 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   taskOutputReader: tuiBackgroundHost.createTaskOutputReader(),
 });
 
-const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, knowledgeIndexer, mcpManager } =
+const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, knowledgeIndexer, mcpManager, toolOutputStore } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
+toolOutputStores.add(toolOutputStore);
 tuiBackgroundHost.setSession(session);
 
 // pi 0.73 drives the TUI through an AgentSessionRuntime rather than a bare
 // AgentSession. The factory recreates a full siclaw session on session switch.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ sessionManager: sm }) => {
   const recreated = await createSiclawSession(buildSiclawOpts(sm));
+  toolOutputStores.add(recreated.toolOutputStore);
   tuiBackgroundHost.setSession(recreated.session);
   return {
     session: recreated.session,

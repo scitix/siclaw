@@ -16,6 +16,7 @@ import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./su
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
+import { withToolOutputStore, type ToolOutputStore } from "../tools/infra/tool-output-store.js";
 
 export type { SessionMode };
 
@@ -440,6 +441,8 @@ export interface ToolRefs {
   turnRef?: { current: number };
   /** Shared task-ledger id. A session and the sub-agents it spawns share one taskListId. */
   taskListId: string;
+  /** Saved sanitized output, scoped to the logical task rather than the runtime instance. */
+  toolOutputStore?: ToolOutputStore;
   /**
    * True when this session is a spawned sub-agent (child). The plan/task tools are
    * hidden from sub-agents — the plan is owned by the parent; a child that mutated the
@@ -629,6 +632,20 @@ export class ToolRegistry {
     const tools = applicable.map((e) => {
       const def = e.create(refs) as ResolvedToolDefinition;
       def.toolset = e.category;
+      // Legacy explicit whitelists keep the file/read fallback, but use the same
+      // task-owned storage and cleanup as the id-based reader.
+      if (refs.toolOutputStore) {
+        const execute = def.execute.bind(def);
+        const store = refs.toolOutputStore;
+        const useToolReader = !Array.isArray(allowedTools) || allowedTools.includes("tool_output");
+        def.execute = (...args) => withToolOutputStore(store, () => execute(...args), useToolReader);
+        if (e.category === "cmd-exec" || e.category === "script-exec" || def.name === "k8s_inspect") {
+          def.description += " Long output is sampled across its full length with an 8000-character base budget, " +
+            "expanded as needed to keep at least 2000 characters each at the head and tail, " +
+            "with omitted gaps and original line ranges. Follow the siclaw-output reference to read specific lines " +
+            "of the saved result without rerunning the command.";
+        }
+      }
       if (e.requiresUserApproval) {
         def.requiresUserApproval = true;
       }
