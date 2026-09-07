@@ -2362,8 +2362,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       return { ok: true, probe };
     } finally {
       if (timer) clearTimeout(timer);
-      // Best-effort: a hung transport must not keep the Runtime's probe pending.
-      void manager.shutdown().catch(() => {});
+      // Awaited, not fire-and-forget: shutdown() marks the manager disposed so a
+      // connection that completes after the timeout is closed by initialize()
+      // itself instead of leaking into a list nobody will close again.
+      await manager.shutdown().catch((err) => {
+        console.warn(`[rpc] mcp.probe: shutdown of "${name}" failed:`, err);
+      });
     }
   });
 

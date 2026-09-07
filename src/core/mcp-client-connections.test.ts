@@ -158,3 +158,27 @@ describe("McpClientManager.getServerConnections", () => {
     expect(manager.getServerConnections()[0]).toMatchObject({ state: "failed", toolNames: [] });
   });
 });
+
+describe("McpClientManager.shutdown during initialize", () => {
+  it("closes a connection that completes after shutdown instead of leaking it", async () => {
+    let handshakes = 0;
+    const url = await listen((req, body, res) => {
+      const msg = JSON.parse(body);
+      if (msg.method === "initialize") handshakes++;
+      // Answer slowly so shutdown() can land while the SDK is still dialling.
+      setTimeout(() => fakeMcpServer(["ping"])(req, body, res), 300);
+    });
+    const manager = new McpClientManager({ mcpServers: { slow: { transport: "streamable-http", url } } });
+    const init = manager.initialize();
+    await new Promise((r) => setTimeout(r, 50));
+    await manager.shutdown();
+    await init;
+    expect(handshakes).toBe(1);
+    expect(manager.getTools()).toEqual([]);
+    expect(manager.getServerConnections()).toEqual([
+      expect.objectContaining({ name: "slow", state: "failed", toolCount: 0, error: { kind: "timeout", message: "connection completed after the manager was shut down" } }),
+    ]);
+    // Nothing left to close: a second shutdown is a no-op rather than a second disconnect.
+    await manager.shutdown();
+  });
+});

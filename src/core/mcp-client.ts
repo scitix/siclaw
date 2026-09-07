@@ -393,6 +393,13 @@ export class McpClientManager {
    * tell a connected server from a dead one, and reported both as "installed".
    */
   private connections: McpServerConnection[] = [];
+  /**
+   * Set by shutdown(). initialize() checks it after every await so a connection
+   * that completes AFTER the manager was shut down — a probe that timed out, a
+   * session released while a slow server was still dialling — is closed on the
+   * spot instead of being registered into a list nobody will close again.
+   */
+  private disposed = false;
 
   constructor(config: McpServersConfig) {
     this.config = config;
@@ -404,6 +411,7 @@ export class McpClientManager {
   async initialize(): Promise<void> {
     const entries = Object.entries(this.config.mcpServers);
     this.connections = [];
+    this.disposed = false;
     if (entries.length === 0) return;
 
     // Lazy-import the SDK (only when actually used)
@@ -468,11 +476,19 @@ export class McpClientManager {
         }
 
         await client.connect(transport);
+        if (this.disposed) {
+          await this.closeLate(serverName, client, startedAt, detectedTransport);
+          continue;
+        }
         console.log(`[mcp-client] Connected to "${serverName}" (${detectedTransport})`);
         const serverImplementationName = client.getServerVersion()?.name;
 
         // Discover tools
         const { tools: mcpTools } = await client.listTools();
+        if (this.disposed) {
+          await this.closeLate(serverName, client, startedAt, detectedTransport);
+          continue;
+        }
         console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
 
         for (const mcpTool of mcpTools) {
@@ -514,6 +530,21 @@ export class McpClientManager {
     console.log(`[mcp-client] Initialized ${this.clients.length} servers, ${this.tools.length} tools total`);
   }
 
+  /** Close a connection that completed after shutdown() and record why it is not usable. */
+  private async closeLate(serverName: string, client: any, startedAt: number, transport: string): Promise<void> {
+    console.warn(`[mcp-client] "${serverName}" connected after the manager was shut down; closing it`);
+    try {
+      await client.close();
+    } catch (err) {
+      console.warn(`[mcp-client] Error closing late connection to "${serverName}":`, err);
+    }
+    this.connections.push({
+      name: serverName, transport, state: "failed", toolCount: 0, toolNames: [],
+      durationMs: Date.now() - startedAt, observedAt: new Date().toISOString(),
+      error: { kind: "timeout", message: "connection completed after the manager was shut down" },
+    });
+  }
+
   /**
    * Connection outcome of every configured server from the last `initialize()`,
    * in configuration order. Failed servers are present with `state: "failed"`
@@ -546,6 +577,7 @@ export class McpClientManager {
    * Shutdown all MCP client connections.
    */
   async shutdown(): Promise<void> {
+    this.disposed = true;
     for (const { serverName, client } of this.clients) {
       try {
         await client.close();
