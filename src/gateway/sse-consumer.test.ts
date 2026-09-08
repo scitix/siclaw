@@ -1567,6 +1567,61 @@ describe("consumeAgentSse — 交接之后", () => {
     expect(seen).toEqual([handoff]);
   });
 
+  // ⚠️ 第一版这一刀切掉了**全部**事件,把被弃权那一轮的 agent_end 也带走了 ——
+  // 前端剩下一个只见 agent_start、永远等不到 agent_end 的 turn,答案已经到了,
+  // "still working" 的转圈还挂在上面。turn 生命周期是客户端的状态机,不是输出。
+  it("生命周期事件照常放过,否则前端的转圈永远停不下来", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        handoff,
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "多余的话" }] } },
+        { type: "agent_end" },
+        { type: "turn_end" },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["handoff_requested", "agent_end", "turn_end"]);
+  });
+
+  // ⚠️ 这条是"转圈停不下来"的第二次:transfer_to_agent 从自己的 execute() 里发
+  // handoff_requested,所以它的 tool_execution_end 落在标志位之后。上一版按类型
+  // 静音把它也吞了,前端那行工具永远停在 running,而 running 的工具行就是"还在干活"
+  // 的判据 —— 答案都出来了,转圈还挂着。**关**的事件不能按类型静音。
+  it("交接前就开始的工具,它的结束事件照常放过", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "transfer_to_agent", toolCallId: "call-t", args: {} },
+        handoff,
+        { type: "tool_execution_end", toolName: "transfer_to_agent", toolCallId: "call-t", result: { content: [{ type: "text", text: "已交接" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual([
+      "tool_execution_start", "handoff_requested", "tool_execution_end",
+    ]);
+  });
+
+  // 反过来:交接之后才开始的工具,开和关都得藏 —— 只放"关"会让控制台把一个没有对应
+  // 行的结果贴到最后一个还在跑的工具上。
+  it("交接之后才开始的工具,开和关都藏", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        handoff,
+        { type: "tool_execution_start", toolName: "bash", toolCallId: "call-b", args: {} },
+        { type: "tool_execution_end", toolName: "bash", toolCallId: "call-b", result: { content: [{ type: "text", text: "多余的" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["handoff_requested"]);
+    expect(appendCalls.some((c) => c.toolName === "bash")).toBe(false);
+  });
+
   it("交接之后的事件既不relay也不落库", async () => {
     const seen: unknown[] = [];
     await consumeAgentSse({

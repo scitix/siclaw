@@ -44,8 +44,18 @@ is the transfer mechanism that makes both true at once.
   producing, and it was persisted, so every later turn would read it as history.
   `consumeAgentSse` now relays and writes nothing after `handoff_requested`
   (that event itself still passes; `prompt_done` is emitted outside the loop, so
-  the chain still gets its dispatch signal). The abandoned box keeps burning
-  tokens until its turn ends on its own — stopping the brain is the follow-up.
+  the chain still gets its dispatch signal). ⚠️ The cut is over CONTENT only —
+  the first version dropped everything and took the abandoned turn's `agent_end`
+  with it, leaving the frontend one `agent_start` it never saw closed and the
+  "still working" spinner running under an answer that had already arrived. Turn
+  lifecycle is the client's state machine, not output. ⚠️ And the cut is over
+  OPENERS only: `transfer_to_agent` emits `handoff_requested` from inside its own
+  execute(), so its `tool_execution_end` lands after the flag is set — muting
+  that left the transfer's own tool row `running` for good, which the console
+  reads as "a tool is still executing", i.e. the same stuck spinner one layer
+  down. A closer is now muted only when this cut also hid its opener. The abandoned box keeps
+  burning tokens until its turn ends on its own — stopping the brain is the
+  follow-up.
 - **Every assistant/tool row now records WHICH agent produced it**
   (`chat_messages.from_agent_id`, stamped by `consumeAgentSse`). A handed-over
   session's `agent_id` stays the facade forever, so without this a transcript

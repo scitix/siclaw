@@ -47,6 +47,49 @@ export type OnEventCallback = (
   extras: SseEventExtras,
 ) => void;
 
+/**
+ * What a turn stops saying once it has handed the conversation away — see the
+ * cut in the event loop.
+ *
+ * Everything here is OUTPUT: it is rendered to the person watching, or written
+ * to the transcript, or both. Everything NOT here is turn lifecycle
+ * (`agent_start` / `agent_end` / `turn_end` / `agent_settled`, the routing
+ * events, compaction and retry) and must keep flowing: those are what the
+ * client balances its "still working" state on, and swallowing one leaves the
+ * spinner running under an answer that already arrived.
+ */
+const HANDOFF_MUTED_EVENT_TYPES = new Set([
+  "message_start",
+  "message_update",
+  "message_end",
+  "tool_start",
+  "tool_execution_start",
+  "agent_message",
+  "knowledge_sources",
+]);
+
+/**
+ * ⚠️ CLOSERS ARE NOT MUTED BY TYPE. Muting an event that CLOSES something the
+ * client already drew leaves that thing open forever, and the client reads
+ * "something is still open" as "the agent is still working".
+ *
+ * That is exactly how the previous version of this cut broke:
+ * `transfer_to_agent` emits `handoff_requested` from inside its own execute(),
+ * so its `tool_execution_end` lands AFTER the flag is set — it was muted, the
+ * transfer's tool row stayed `running` for good, and the spinner ran forever
+ * underneath the finished answer.
+ *
+ * So a closer is muted only when THIS cut also hid its opener (see
+ * `mutedToolCalls`); a closer for a tool that started before the handoff goes
+ * out. Letting an unmatched one through would be worse than noise: the console
+ * attaches a result with no matching row to the last still-running tool.
+ */
+const HANDOFF_PAIRED_CLOSERS = new Set([
+  "tool_end",
+  "tool_execution_update",
+  "tool_execution_end",
+]);
+
 export interface ConsumeAgentSseOptions {
   client: AgentBoxClient;
   sessionId: string;
@@ -534,6 +577,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let capturedContextUsage: Record<string, unknown> | undefined;
   /** This turn handed the conversation away; see the cut inside the loop. */
   let handoffRequested = false;
+  /** Tool invocations whose START this cut hid, so their END is hidden too. */
+  const mutedToolCalls = new Set<string>();
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
   // try/finally, not a bare fall-through: the terminal error is BUFFERED
@@ -573,7 +618,26 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       //
       // Not a fix for the wasted tokens: the box keeps running until its turn
       // ends on its own. Stopping the brain itself is the follow-up.
-      if (handoffRequested) continue;
+      //
+      // ⚠️ CONTENT only. The first version of this cut dropped EVERYTHING and
+      // took the abandoned turn's `agent_end` with it, leaving the frontend one
+      // `agent_start` it never saw closed — the answer arrived and the "still
+      // working" spinner stayed on it forever. The turn-lifecycle events are the
+      // client's state machine, not output: they have to stay balanced whether
+      // or not anybody is listening to what the agent says.
+      if (handoffRequested) {
+        const evtRec = evt as Record<string, unknown>;
+        const pairKey = () => toolCallKey(evtRec, String(evtRec.toolName ?? ""));
+        if (HANDOFF_MUTED_EVENT_TYPES.has(eventType)) {
+          if (eventType === "tool_execution_start" || eventType === "tool_start") {
+            mutedToolCalls.add(pairKey());
+          }
+          continue;
+        }
+        if (HANDOFF_PAIRED_CLOSERS.has(eventType) && mutedToolCalls.has(pairKey())) {
+          continue;
+        }
+      }
       if (eventType === "handoff_requested") handoffRequested = true;
 
       if (eventType === "knowledge_sources") {
