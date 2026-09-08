@@ -8,8 +8,7 @@ import {
 const KNOWN_KEYS = CAPABILITY_GROUPS.map((g) => g.key)
 
 describe("CAPABILITY_GROUPS shape", () => {
-  it("declares exactly the 11 designed groups", () => {
-    expect(CAPABILITY_GROUPS).toHaveLength(11)
+  it("declares the designed capability groups, including conversation handoff", () => {
     expect([...KNOWN_KEYS].sort()).toEqual([
       "delegate_agents",
       "inspect_infra",
@@ -21,6 +20,7 @@ describe("CAPABILITY_GROUPS shape", () => {
       "search_memory",
       "session_output",
       "spawn_subagents",
+      "transfer_conversation",
       "write_sandbox",
     ])
   })
