@@ -580,8 +580,24 @@ describe("CapabilityRunManager", () => {
     clock = 7000; // past idleTtl
     expect(await mgr.reapStale()).toEqual([runId]);
     expect(stopped).toEqual([runId]); // box still stopped (resource hygiene)
-    // ...but the outcome is a normal session end, not a failure.
-    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
+    // ...but the outcome is a normal session end, not a failure — stamped with
+    // WHY the runtime (not the box) wrote it, so a consumer whose operation is
+    // still open can tell an undriven run from a finished one.
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId,
+      status: "done",
+      checkpoint: { close_reason: "idle_timeout" },
+    });
+  });
+
+  it("a done the box itself emits carries no close_reason", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    await mgr.endRun(runId, "done");
+    const last = be.persists().at(-1)?.params;
+    expect(last).toMatchObject({ run_id: runId, status: "done" });
+    expect(last?.checkpoint?.close_reason).toBeUndefined();
   });
 
   it("onAdopt fires once per NEWLY adopted run — never for runs already tracked", async () => {

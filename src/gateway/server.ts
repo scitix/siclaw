@@ -28,6 +28,7 @@ import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
+import { acquireCapabilityBox } from "./capability/box-acquire.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
@@ -1215,18 +1216,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         created: false,
       };
     }
-    // Compatibility for embedded managers/test doubles built before acquisition
-    // disposition existed. The concrete manager always reports it; an older
-    // implementation is conservatively treated as the creator so failed setup
-    // retains the historical cleanup behavior.
-    const manager = agentBoxManager as AgentBoxManager & {
-      getOrCreateWithDisposition?: AgentBoxManager["getOrCreateWithDisposition"];
-    };
-    const acquired = typeof manager.getOrCreateWithDisposition === "function"
-      ? await manager.getOrCreateWithDisposition(runId, { profile, orgId })
-      : { handle: await manager.getOrCreate(runId, { profile, orgId }), created: true };
+    // A live box for this run is reused as-is; only a missing box is spawned.
+    // Routing a live kbc box through acquisition rolls it on a stale image and
+    // abandons the run it is executing — see box-acquire.ts for the incident.
+    const acquired = await acquireCapabilityBox(agentBoxManager, runId, profile, orgId);
     return {
-      client: new AgentBoxClient(acquired.handle.endpoint, 30000, agentBoxTlsOptions),
+      client: new AgentBoxClient(acquired.endpoint, 30000, agentBoxTlsOptions),
       created: acquired.created,
     };
   };
