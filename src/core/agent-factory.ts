@@ -172,6 +172,8 @@ export interface CreateSiclawSessionOpts {
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
   /** Expose `request_input` to this top-level machine-driven session. */
   allowInputRequest?: boolean;
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
   /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
@@ -434,7 +436,8 @@ export async function createSiclawSession(
     agentPrompt: opts?.systemPromptAppend,
     systemPromptTemplate: opts?.systemPromptTemplate,
     delegation: opts?.delegation,
-    handoffAvailable: Boolean(opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
+    handoffPolicy: opts?.handoffPolicy,
+    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
     interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
   });
   const allowedTools = compiledContext.harness.allowedTools;
@@ -555,6 +558,8 @@ export async function createSiclawSession(
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       allowInputRequest: opts?.allowInputRequest === true,
+      handoffSupported: opts?.handoffSupported === true,
+      handoffPolicy: opts?.handoffPolicy,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       // Channels currently deliver one foreground response. Do not advertise

@@ -17,6 +17,12 @@ import {
 } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
 
+const supportsConversationsMock = vi.hoisted(() => vi.fn());
+vi.mock("../conversation-client.js", async (original) => ({
+  ...await original<typeof import("../conversation-client.js")>(),
+  supportsConversations: supportsConversationsMock,
+}));
+
 // ── Mocks ──────────────────────────────────────────────────────────
 
 // Stub AgentBoxClient so tests don't open real HTTPS sockets.
@@ -250,6 +256,7 @@ async function waitForExpect(assertion: () => void): Promise<void> {
 }
 
 beforeEach(() => {
+  supportsConversationsMock.mockReset().mockResolvedValue(false);
   promptMock.mockReset();
   streamEventsMock.mockReset();
   closeSessionMock.mockReset();
@@ -595,7 +602,8 @@ describe("handleLarkMessage — personal bot p2p", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("不需要 PAIR");
   });
 
-  it("p2p /new resets only the current personal session", async () => {
+  it.each([false, true])("p2p /new resets only the current personal session (managed=%s)", async (managed) => {
+    supportsConversationsMock.mockResolvedValue(managed);
     resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
       bindingId: "personal-bot-1",
       sessionId: "old-personal",
@@ -611,6 +619,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
     });
     const lark = makeLarkClient();
     const mgr = makeAgentBoxManager("a1");
+    const frontend = { request: vi.fn().mockResolvedValue({ ok: true }) };
 
     await handleLarkMessage(
       makeTextEvent("/new", { chat_type: "p2p" }),
@@ -618,14 +627,19 @@ describe("handleLarkMessage — personal bot p2p", () => {
       "personal-bot-1",
       mgr as any,
       undefined,
-      {} as any,
+      frontend as any,
       "zh-CN",
       makePersonalConfig("platform_authorized"),
     );
+    if (managed) {
+      expect(frontend.request).toHaveBeenCalledWith("conversation.abort", { agentId: "a1", sessionId: "old-personal", userId: "user-1" });
+      expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    }
 
     expect(resetPersonalSessionMock).toHaveBeenCalledWith("personal-bot-1", "platform_user:user-1", expect.anything());
     expect(resetBindingSessionMock).not.toHaveBeenCalled();
-    expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
+    if (managed) expect(closeSessionMock).not.toHaveBeenCalled();
+    else expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 
@@ -2540,6 +2554,40 @@ describe("buildChannelTurnPrompt", () => {
 // ── handleLarkMessage × streaming card integration ────────────────
 
 describe("handleLarkMessage — streaming card flow", () => {
+  it("keeps one card through remote handoff without launching a local AgentBox", async () => {
+    supportsConversationsMock.mockResolvedValue(true);
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    appendMessageMock.mockResolvedValue("original-user-row");
+    let receive: (data: unknown) => void = () => {};
+    const frontend = {
+      connected: true,
+      subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
+      request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.start") {
+          for (const event of [
+            { type: "text", text: "正在准备国内检查" },
+            { type: "agent_switch", toAgentId: "overseas", toAgentName: "海外 SRE" },
+            { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "海外检查完成：5 个节点" }] } },
+            { type: "prompt_done" },
+          ]) receive({ sessionId: input.sessionId, requestId: input.userMessageId, event });
+          return { sessionId: input.sessionId };
+        }
+        return {};
+      }),
+    };
+    const lark = makeCardAwareLarkClient();
+    const manager = makeAgentBoxManager();
+    await handleLarkMessage(makeTextEvent("检查海外"), lark, "lark", manager as any, undefined, frontend as any);
+    expect(manager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(frontend.request).toHaveBeenCalledWith("conversation.start", expect.objectContaining({ agentId: "a1", userMessageId: "original-user-row", origin: "channel" }));
+    const content = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content;
+    expect(content).toContain("海外检查完成：5 个节点");
+    expect(content).not.toContain("正在准备国内检查");
+    expect(lark.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
+    expect(appendMessageMock.mock.calls.filter(([row]) => row.role === "assistant")).toHaveLength(0);
+  });
+
   function makeCardAwareLarkClient() {
     return {
       im: {

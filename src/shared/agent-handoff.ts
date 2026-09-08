@@ -85,6 +85,40 @@ export interface HandoffRequestedEvent extends Record<string, unknown> {
   type: "handoff_requested";
   traceContext?: import("./handoff-trace.js").HandoffTraceContext;
   targetAgentId: string;
+  newEvidence?: string;
   /** What the receiving agent is being asked to do, in the sender's words. */
   brief: string;
+}
+
+/** Control-plane-owned, per-request policy; never supplied by a model or channel payload. */
+export interface HandoffPolicy {
+  remaining: number;
+  visitedAgentIds: string[];
+  history: { from: string; to: string; brief: string; newEvidence?: string }[];
+}
+
+export function parseHandoffPolicy(value: unknown): HandoffPolicy | undefined {
+  if (value === undefined) return undefined;
+  const p = value as HandoffPolicy;
+  if (!p || !Number.isInteger(p.remaining) || p.remaining < 0 || p.remaining > 2
+    || !Array.isArray(p.visitedAgentIds) || p.visitedAgentIds.length > 3 || !p.visitedAgentIds.every(v => typeof v === "string")
+    || !Array.isArray(p.history) || p.history.length > 2
+    || !p.history.every(s => s && typeof s.from === "string" && typeof s.to === "string" && typeof s.brief === "string" && (s.newEvidence === undefined || typeof s.newEvidence === "string"))) {
+    throw new Error("Invalid conversation handoff policy");
+  }
+  return { remaining: p.remaining, visitedAgentIds: [...p.visitedAgentIds], history: p.history.map(s => ({ ...s })) };
+}
+
+export function handoffRefusal(policy: HandoffPolicy | undefined, targetId: string, evidence: string): string | undefined {
+  if (!policy) return undefined;
+  const finish = "Continue the user's request yourself. Explain verified findings, unresolved limits and the specific information or access needed. Do not delegate the main request to bypass this restriction.";
+  if (policy.remaining === 0) return `No further transfers are available for this request. ${finish}`;
+  if (policy.visitedAgentIds.at(-1) === targetId) return `You already own this conversation. ${finish}`;
+  if (!policy.visitedAgentIds.includes(targetId)) return undefined;
+  const normalize = (s: string) => s.toLowerCase().trim().replace(/\s+/gu, " ");
+  const normalized = normalize(evidence);
+  if (!normalized || policy.history.some(s => normalized === normalize(s.newEvidence ?? "") || normalized === normalize(s.brief))) {
+    return `That agent already participated in this request. A return requires new verified evidence and why it enables that agent to proceed; repeating the request is not progress. If no such evidence exists, ${finish}`;
+  }
+  return undefined;
 }

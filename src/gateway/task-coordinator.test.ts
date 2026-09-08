@@ -80,6 +80,7 @@ vi.mock("./output-redactor.js", () => ({
 // ── Imports (after mocks) ────────────────────────────────────
 
 import { TaskCoordinator } from "./task-coordinator.js";
+import { consumeAgentSse } from "./sse-consumer.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import type { RuntimeConfig } from "./config.js";
@@ -277,6 +278,36 @@ describe("TaskCoordinator.fireNow", () => {
 // ── executeJob paths (via fireNow with skipStatusCheck=true) ──
 
 describe("TaskCoordinator execution", () => {
+  it("finalizes the original scheduled run only after the remote destination finishes", async () => {
+    const { coord, frontend, mgr } = makeCoord();
+    frontend.responses.set("conversation.capabilities", { handoff: true });
+    frontend.responses.set("task.fireNow", { outcome: "ok", task: {
+      id: "scheduled-original", agent_id: "domestic", name: "Regional check", schedule: "*/5 * * * *",
+      prompt: "check overseas", status: "active", created_by: "u1",
+    } });
+    let receive: (data: unknown) => void = () => {};
+    Object.assign(frontend, { connected: true, subscribe: vi.fn((_topic: string, listener: (data: unknown) => void) => { receive = listener; return vi.fn(); }) });
+    vi.mocked(consumeAgentSse).mockImplementationOnce(async ({ client, sessionId }: any) => {
+      let text = "";
+      for await (const event of client.streamEvents(sessionId)) if (event.type === "text") text = event.text;
+      return { resultText: text, taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 1 };
+    });
+    await coord.fireNow("scheduled-original");
+    await vi.waitFor(() => expect(frontend.calls.some(c => c.method === "conversation.start")).toBe(true));
+    expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    expect(frontend.calls.some(c => c.method === "task.runFinalize")).toBe(false);
+    const start = frontend.calls.find(c => c.method === "conversation.start")!.params;
+    expect(start).toMatchObject({ agentId: "domestic", origin: "task" });
+    const emit = (event: any) => receive({ sessionId: start.sessionId, requestId: start.userMessageId, event });
+    emit({ type: "agent_switch", toAgentId: "overseas" });
+    expect(frontend.calls.some(c => c.method === "task.runFinalize")).toBe(false);
+    emit({ type: "text", text: "overseas complete" });
+    emit({ type: "prompt_done" });
+    await vi.waitFor(() => expect(frontend.calls.find(c => c.method === "task.runFinalize")?.params).toMatchObject({ status: "success", result_text: "overseas complete" }));
+    expect(frontend.calls.filter(c => c.method === "task.runStart")).toHaveLength(1);
+    expect(frontend.calls.find(c => c.method === "task.runStart")?.params.task_id).toBe("scheduled-original");
+  });
+
   it("records failure when model binding is missing", async () => {
     const { coord, frontend } = makeCoord();
     bindingResponder.result = null;

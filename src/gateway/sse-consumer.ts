@@ -94,7 +94,7 @@ const HANDOFF_PAIRED_CLOSERS = new Set([
 ]);
 
 export interface ConsumeAgentSseOptions {
-  client: AgentBoxClient;
+  client: Pick<AgentBoxClient, "streamEvents">;
   sessionId: string;
   userId: string;
   /**
@@ -662,6 +662,15 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         }
       }
       if (eventType === "handoff_requested") handoffRequested = true;
+      if (eventType === "agent_switch") {
+        // A logical channel/task stream continues on an independent executor.
+        // Its final result must never fall back to the previous agent's progress.
+        handoffRequested = false;
+        assistantContent = currentMsgText = resultText = taskReportText = "";
+        assistantItems.begin();
+        pendingKnowledgeSources = null;
+        renderedKnowledgeSourceUrls.clear();
+      }
 
       if (eventType === "knowledge_sources") {
         pendingKnowledgeSources = (evt as Record<string, unknown>).sources;

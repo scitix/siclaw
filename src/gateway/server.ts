@@ -1,3 +1,4 @@
+import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
  *
@@ -787,7 +788,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A HANDOFF arrival: the control plane ended the previous agent's turn on a
     // `handoff_requested`, flipped the session's executing agent, and re-sent the
     // brief here — same session, same response stream, new owner.
-    const handoffParam = params.handoff as { fromAgentId?: string; brief?: string; traceContext?: unknown } | undefined;
+    const handoffParam = params.handoff as { fromAgentId?: string; brief?: string; traceContext?: unknown; recovery?: boolean } | undefined;
     const handoff = handoffParam?.fromAgentId
       ? { fromAgentId: String(handoffParam.fromAgentId), brief: String(handoffParam.brief ?? "") }
       : undefined;
@@ -797,7 +798,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // in the transfer tool's arguments on the previous turn, so persisting it
     // again would show the user their question twice under one prompt).
     const skipInitialPersistence = params.skipInitialPersistence === true
-      && (Boolean(delegation?.delegationId) || Boolean(handoff));
+      && (Boolean(delegation?.delegationId) || Boolean(handoff) || params.persistedInput === true);
     // Machine-facing strict callers cannot safely publish a reusable sessionId
     // until its session and first user message are durable. Interactive chat
     // keeps the legacy best-effort behavior; strict /run opts into this ACK.
@@ -894,7 +895,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // 框,模型看到的历史就是「用户问 → 助手说了半句 → 用户又问了一遍」—— 它会当成
     // 用户在重复,于是道歉、或者从头再问一次。这段话只进本轮的模型上下文:
     // skipInitialPersistence 让它不落库,所以用户看不到,历史里也不会有。
-    const promptText = handoff
+    const promptText = handoffParam?.recovery === true
+      ? `[This is a continuation of the same request, not a new user message or an ownership transfer. Use the existing history to finish.]\n${text}`
+      : handoff
       ? `[这段对话刚交接到你手上。上文的历史是真的,你现在是这段对话的负责人 —— 直接回答用户,` +
         `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
       : text;
@@ -915,6 +918,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       origin: origin as PromptOptions["origin"],
       delegation,
       allowInputRequest,
+      handoffSupported: params.handoffSupported === true,
+      handoffPolicy: parseHandoffPolicy(params.handoffPolicy),
       requireExistingSession,
       segmentId,
       taskId: boundTaskId,
@@ -963,7 +968,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     addLiveTurn(sessionId, turnId, turnAbort);
     if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
 
-    let promptMessageId: string | undefined;
+    let promptMessageId: string | undefined = params.persistedInput === true && typeof params.userMessageId === "string"
+      ? params.userMessageId : undefined;
     if (!skipInitialPersistence) {
       try {
         await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);

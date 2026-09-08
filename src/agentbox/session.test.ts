@@ -245,6 +245,26 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
 });
 
 describe("AgentBoxSessionManager — getOrCreate", () => {
+  it("handing off one session preserves another active session on the same Agent", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("handoff-a");
+    const other = await mgr.getOrCreate("running-b");
+    other._promptInflight = true;
+    const otherDir = path.join(mgr.getBaseSessionDir(), "running-b");
+    fs.mkdirSync(otherDir, { recursive: true });
+    fs.writeFileSync(path.join(otherDir, "history.jsonl"), "other session history\n");
+    await mgr.evictSessionContext("handoff-a");
+    await mgr.release("handoff-a");
+    expect(mgr.get("handoff-a")).toBeUndefined();
+    expect(mgr.get("running-b")).toBe(other);
+    expect(other._promptInflight).toBe(true);
+    expect(mgr.activeCount()).toBe(1);
+    expect(fs.existsSync(`${otherDir}.handoff`)).toBe(false);
+    expect(fs.readFileSync(path.join(otherDir, "history.jsonl"), "utf8")).toBe("other session history\n");
+    other._promptInflight = false;
+    await mgr.release("running-b");
+  });
+
   it("creates a new session on first call and caches it", async () => {
     const mgr = new AgentBoxSessionManager();
     const s1 = await mgr.getOrCreate("sess-1");
@@ -297,6 +317,26 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(rebuilt).not.toBe(first);
     expect(rebuilt.allowInputRequest).toBe(true);
     expect(lastCreateSiclawSession.calls[1].allowInputRequest).toBe(true);
+  });
+
+  it("rebuilds per-request handoff limits without changing a concurrent session", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const fresh = { remaining: 2, visitedAgentIds: ["a"], history: [] };
+    const final = { remaining: 0, visitedAgentIds: ["a", "b", "a"], history: [] };
+    const first = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    const peer = await mgr.getOrCreate("policy-b", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    peer._promptInflight = true;
+    const rebuilt = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, final);
+    expect(rebuilt).not.toBe(first);
+    expect(rebuilt.handoffPolicy?.remaining).toBe(0);
+    expect(lastCreateSiclawSession.calls.at(-1).handoffPolicy).toEqual(final);
+    expect(peer.handoffPolicy?.remaining).toBe(2);
+    expect(peer._promptInflight).toBe(true);
+    const next = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    expect(next).not.toBe(rebuilt);
+    expect(next.handoffPolicy?.remaining).toBe(2);
+    peer._promptInflight = false;
+    await mgr.close("policy-a"); await mgr.close("policy-b");
   });
 
   it("detects resumable context in memory or persisted JSONL", async () => {

@@ -20,6 +20,7 @@ function target(over: Partial<HandoffTarget> = {}): HandoffTarget {
 
 function refs(over: Partial<ToolRefs> = {}): ToolRefs {
   return {
+    handoffSupported: true,
     sessionEventEmitter: vi.fn(),
     handoffTargets: [target()],
     ...over,
@@ -42,8 +43,8 @@ describe("transfer_to_agent 的可用性", () => {
   });
 
   // channel 的 turn 在 runtime 本地跑、不经网关,没有人接住那条帧做链式转发。
-  it("只在 web 模式出现,channel 与 task 排除在外", () => {
-    expect(registration.modes).toEqual(["web"]);
+  it("supports every control-plane conversation mode", () => {
+    expect(registration.modes).toEqual(["web", "channel", "task"]);
   });
 });
 
@@ -221,8 +222,8 @@ describe("conversation handoff across Agent types", () => {
   ])("does not expose a transfer without ownership and transport: %j", (overrides) => {
     expect(toolsFor("custom", undefined, refs(overrides))).toEqual([]);
   });
-  it.each(["channel", "task", "cli"] as const)("does not expose handoff in %s mode", (mode) => {
-    expect(registry.resolve({ mode, refs: refs(), allowedTools: null })).toEqual([]);
+  it.each(["web", "channel", "task", "cli"] as const)("does not expose handoff without a capable transport in %s mode", (mode) => {
+    expect(registry.resolve({ mode, refs: refs({ handoffSupported: false }), allowedTools: null })).toEqual([]);
   });
 });
 
@@ -275,4 +276,40 @@ it("carries trace context on the control event, captured before eviction and abs
   expect(order).toEqual(["capture", "evict"]);
   expect(emit).toHaveBeenCalledWith({ type: "handoff_requested", targetAgentId: "agent-cn", brief: "continue", traceContext: context });
   expect(JSON.stringify(tool.parameters)).not.toContain("traceId");
+});
+
+describe("per-request loop prevention", () => {
+  const policy = { remaining: 1, visitedAgentIds: ["agent-cn", "agent-intl"], history: [{ from: "agent-cn", to: "agent-intl", brief: "Inspect overseas", newEvidence: "Location confirmed" }] };
+  it.each([undefined, " ", "LOCATION  confirmed", "inspect overseas"])("rejects a return without new evidence before eviction: %s", async (new_evidence) => {
+    const emit = vi.fn(); const evict = vi.fn();
+    const tool = createTransferToAgentTool(refs({ handoffPolicy: policy, sessionEventEmitter: emit, evictSessionContext: evict }));
+    const out = await tool.execute!("return", { route_key: "cn", brief: "Please try again", new_evidence }, undefined as never);
+    expect(out).toMatchObject({ terminate: false, details: { transferred: false } });
+    expect(emit).not.toHaveBeenCalled(); expect(evict).not.toHaveBeenCalled();
+    expect(JSON.stringify(out)).toContain("specific information or access needed");
+  });
+  it("allows an evidenced return and carries it to the control plane", async () => {
+    const emit = vi.fn();
+    const tool = createTransferToAgentTool(refs({ handoffPolicy: policy, sessionEventEmitter: emit }));
+    expect(tool.description).toContain("already participated in this request; returning requires new_evidence");
+    const new_evidence = "Overseas inventory resolves this host to the domestic cluster; domestic access can check it.";
+    const out = await tool.execute!("return", { route_key: "cn", brief: "Check the domestic cluster", new_evidence }, undefined as never);
+    expect(out).toMatchObject({ terminate: true });
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ targetAgentId: "agent-cn", newEvidence: new_evidence }));
+  });
+  it("hides the tool at zero budget and rejects stale invocations without ending the response", async () => {
+    const r = refs({ handoffPolicy: { ...policy, remaining: 0 } });
+    expect(registration.available?.(r)).toBe(false);
+    const out = await createTransferToAgentTool(r).execute!("stale", { route_key: "cn", brief: "again", new_evidence: "new" }, undefined as never);
+    expect(out).toMatchObject({ terminate: false, details: { transferred: false } });
+    expect(r.sessionEventEmitter).not.toHaveBeenCalled();
+  });
+  it("keeps another session's fresh policy independent", async () => {
+    const blocked = refs({ handoffPolicy: { ...policy, remaining: 0 } });
+    const fresh = refs({ handoffPolicy: { remaining: 2, visitedAgentIds: ["other"], history: [] } });
+    expect(registration.available?.(blocked)).toBe(false);
+    const out = await createTransferToAgentTool(fresh).execute!("new", { route_key: "cn", brief: "Inspect" }, undefined as never);
+    expect(out).toMatchObject({ terminate: true });
+    expect(blocked.sessionEventEmitter).not.toHaveBeenCalled();
+  });
 });

@@ -45,6 +45,9 @@ export interface PromptOptions {
   delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../../shared/agent-handoff.js").HandoffPolicy;
   /**
    * The control-plane segment / task this turn belongs to. They travel with the
    * dispatch so the turn can be correlated back to the ledger, and so a retried

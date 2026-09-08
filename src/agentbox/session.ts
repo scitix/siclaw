@@ -232,6 +232,8 @@ export interface ManagedSession {
   delegation?: DelegationContext;
   /** Whether this session was built with top-level `request_input` available. */
   allowInputRequest: boolean;
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -3176,6 +3178,8 @@ export class AgentBoxSessionManager {
     delegation?: DelegationContext,
     requestUserId?: string,
     allowInputRequest = false,
+    handoffSupported = false,
+    handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
@@ -3221,7 +3225,10 @@ export class AgentBoxSessionManager {
         // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
         // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
         const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
-        const sameInputCapability = existing.allowInputRequest === allowInputRequest;
+        const sameInputCapability = existing.allowInputRequest === allowInputRequest
+          && Boolean(existing.handoffSupported) === handoffSupported
+          && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
+          && existing.mode === (mode ?? "web");
         // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
         // change falls through to a rebuild below), but every delegation turn gets a NEW
         // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
@@ -3478,6 +3485,8 @@ export class AgentBoxSessionManager {
       taskListId: id,
       sessionEventEmitter: emitExtraEvent,
       allowInputRequest,
+      handoffSupported,
+      handoffPolicy,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
@@ -3536,6 +3545,8 @@ export class AgentBoxSessionManager {
       activeMode,
       delegation,
       allowInputRequest,
+      handoffSupported,
+      handoffPolicy,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,

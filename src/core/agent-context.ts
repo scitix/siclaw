@@ -45,6 +45,7 @@ export interface CompileAgentContextInput {
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   systemPromptTemplate?: string;
   delegation?: DelegationContext;
 }
@@ -123,7 +124,7 @@ export function resolveAgentHarness(
   // Ownership transfer is a conversation transport capability for every type.
   // The factory proves emitter/roster/owner availability; unresolved harnesses
   // still fail closed. This grants no command, delegation, or resource access.
-  const conversationTools = input.mode === "web" && input.handoffAvailable && !input.delegation
+  const conversationTools = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
     && Array.isArray(modeTools) && !modeTools.includes("transfer_to_agent")
     ? [...modeTools, "transfer_to_agent"]
     : modeTools;
@@ -177,7 +178,7 @@ export function resolveAgentHarness(
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
   const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
-  const handoffContract = input.mode === "web" && input.handoffAvailable && !input.delegation
+  const handoffContract = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
     && harness.resolution === "resolved"
     ? "Conversation ownership: transfer_to_agent is available for this main conversation. " +
       "When another authorized destination is better suited to continue the user's request, use its " +
@@ -185,13 +186,26 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
       "work to a specialist uses this ownership transfer for the main request; reserve delegation for " +
       "independent subtasks whose results you need back. Handle requests within your own capabilities " +
       "yourself. Do not guess an ambiguous destination, cycle between agents, or transfer merely to " +
-      "repeat an answer. This does not grant you additional execution or resource permissions."
+      "repeat an answer. Not knowing an answer is not a reason to transfer: identify a concrete " +
+      "capability or resource the destination has that can advance the request. If nobody suitable is " +
+      "available, explain what remains unresolved and ask for the specific missing information or access. " +
+      "Before returning to an agent that already participated, identify new verified evidence and why it " +
+      "enables that agent to proceed. This does not grant you additional execution or resource permissions."
+    : undefined;
+  const handoffClosure = input.handoffPolicy && (input.handoffPolicy.remaining === 0 || !input.handoffAvailable) && !input.delegation
+    ? (input.handoffPolicy.remaining === 0
+        ? "Further conversation transfers are disabled for this request. "
+        : "No eligible authorized transfer destination is available for this request. ") +
+      "Continue within your own capabilities. " +
+      "Use the available history and verified results to answer the user in their language. If unresolved, " +
+      "explain the concrete limitation and ask for specific missing information or access. Do not claim " +
+      "success, repeat failed checks without a new basis, or delegate the main request to bypass this limit."
     : undefined;
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
     interactiveProgress: input.interactiveProgress ?? (input.mode === "web" && !input.delegation),
     templateOverride: input.systemPromptTemplate,
-    agentTypePrompt: [agentPrompt.typeContract, handoffContract].filter(Boolean).join("\n\n") || undefined,
+    agentTypePrompt: [agentPrompt.typeContract, handoffContract, handoffClosure].filter(Boolean).join("\n\n") || undefined,
     agentAddendum: agentPrompt.addendum,
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,

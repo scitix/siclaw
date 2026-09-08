@@ -1741,6 +1741,17 @@ describe("conversation phases", () => {
 
 
 describe("assistant lifecycle persistence", () => {
+  it("does not reuse a previous executor's task report after handoff", async () => {
+    const result = await consumeAgentSse({ client: mkClient([
+      { type: "tool_execution_start", toolName: "task_report", args: { summary: "provisional" } },
+      { type: "tool_execution_end", toolName: "task_report", result: { content: [{ type: "text", text: "source provisional report" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "source progress" }] } },
+      { type: "agent_switch", toAgentId: "overseas" },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "destination conclusion" }] } },
+    ]), sessionId: "s", userId: "u", persistMessages: false });
+    expect(result.resultText).toBe("destination conclusion");
+    expect(result.taskReportText).toBe("");
+  });
   it("persists message_end plus its turn_end echo once, preserving later identical answers", async () => {
     const message = { role: "assistant", content: [{ type: "text", text: "5 nodes" }], stopReason: "stop" };
     await consumeAgentSse({ client: mkClient([

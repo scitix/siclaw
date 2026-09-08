@@ -454,6 +454,9 @@ export interface ToolRefs {
    * (currently A2A). Delegated peer turns use `delegation` instead.
    */
   allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** Per-session citation registrar sharing successful-read state with Read. */
   knowledgeCitationTool?: ToolDefinition;
   /**

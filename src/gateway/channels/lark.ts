@@ -1,3 +1,4 @@
+import { ConversationClient, supportsConversations } from "../conversation-client.js";
 /**
  * Lark (飞书) channel handler.
  *
@@ -1468,6 +1469,7 @@ export async function handleLarkMessage(
       sessionKey: personalSessionKey,
       channelId: personalChannelId,
       route: "personal",
+      resetUserId: binding.createdBy ?? undefined,
       larkClient,
       agentBoxManager,
       tlsOptions,
@@ -1711,6 +1713,7 @@ export async function handleLarkMessage(
     sessionKey: effectiveSessionKey,
     channelId: groupChannelId,
     route: "group",
+    resetUserId: binding.createdBy ?? undefined,
     contextMode,
     conversationKey,
     rootMessageId,
@@ -1731,6 +1734,7 @@ export async function handleLarkMessage(
 }
 
 interface QueuedLarkMessageContext {
+  resetUserId?: string;
   text: string;
   imageRefs: LarkImageRef[];
   messageId: string;
@@ -1806,6 +1810,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       frontendClient,
       locale,
       replyInThread,
+      ctx.resetUserId,
     );
     return;
   }
@@ -2000,63 +2005,65 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // rejection escaped every handler and the user got nothing at all.
   let releaseTurn: (() => void) | undefined;
   try {
-    releaseTurn = await sessionTurnLocks.acquire(sessionId);
-  // Get or create AgentBox for this agent (shared across all callers).
-  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-  sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
-  const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
-
-  const modelBinding = frontendClient
-    ? await resolveAgentModelBinding(agentId, frontendClient)
-    : null;
-  // Native Lark images are vision-gated too, mirroring the text-URL path: a
-  // non-vision model can't use them and would fail-closed at AgentBox media
-  // filtering, so skip the download entirely for non-vision models (the [image]
-  // placeholder in effectiveText still records that the user sent an image).
-  // Text image URLs are NOT handled here — they are resolved generically (and
-  // vision-gated) at the `AgentBoxClient.prompt()` boundary, shared with Portal
-  // Web chat / a2a / cron.
-  const visionCapable = modelOptionsSupportImageInput({
-    modelProvider: modelBinding?.modelProvider,
-    modelId: modelBinding?.modelId,
-    modelConfig: modelBinding?.modelConfig,
-    modelRouting: modelBinding?.modelRouting,
-  });
-  const images = visionCapable
-    ? await collectInboundImages({ imageRefs, larkClient, messageId })
-    : [];
-  // Non-vision model + the user sent native image(s): they were dropped (can't be
-  // used). Tell the model so it can inform the user — mirroring the text-URL path,
-  // where a non-vision model at least sees the URL and can say it can't open it.
-  const promptText = !visionCapable && imageRefs.length > 0
-    ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
-    : effectiveText;
-  // Shared group: drain the chatter buffered since the last reply and attribute
-  // the asker, so the agent answers @-turns with the whole group's context.
-  const drained = contextMode === "shared" && !conversationKey
-    ? drainDiscussion(channelId, chatId)
-    : undefined;
-  const sharedContext: SharedGroupContext | undefined = drained
-    ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
-    : undefined;
-  const promptOpts: PromptOptions = {
-    text: buildChannelTurnPrompt(promptText, sharedContext),
-    agentId,
-    mode: "channel",
-    sessionId,
-    modelProvider: modelBinding?.modelProvider,
-    modelId: modelBinding?.modelId,
-    releaseId: modelBinding?.releaseId,
-    modelFingerprint: modelBinding?.modelFingerprint,
-    modelConfig: modelBinding?.modelConfig,
-    modelRouting: modelBinding?.modelRouting,
-    subagentTiers: modelBinding?.subagentTiers,
-    systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
-    ...(images.length ? { images } : {}),
-  };
-  try {
+    const remoteConversation = frontendClient ? await supportsConversations(frontendClient) : false;
+    if (!remoteConversation) releaseTurn = await sessionTurnLocks.acquire(sessionId);
+    let client: Pick<AgentBoxClient, "prompt" | "streamEvents">;
+    if (remoteConversation && frontendClient) {
+      client = new ConversationClient(frontendClient, { agentId, userId: binding.createdBy, sessionId, userMessageId: promptMessageId, origin: "channel" });
+    } else {
+      const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+      sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
+      client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
+    }
+    const modelBinding = !remoteConversation && frontendClient
+      ? await resolveAgentModelBinding(agentId, frontendClient) : null;
+    // Native Lark images are vision-gated too, mirroring the text-URL path: a
+    // non-vision model can't use them and would fail-closed at AgentBox media
+    // filtering, so skip the download entirely for non-vision models (the [image]
+    // placeholder in effectiveText still records that the user sent an image).
+    // Text image URLs are NOT handled here — they are resolved generically (and
+    // vision-gated) at the `AgentBoxClient.prompt()` boundary, shared with Portal
+    // Web chat / a2a / cron.
+    const visionCapable = remoteConversation || modelOptionsSupportImageInput({
+      modelProvider: modelBinding?.modelProvider,
+      modelId: modelBinding?.modelId,
+      modelConfig: modelBinding?.modelConfig,
+      modelRouting: modelBinding?.modelRouting,
+    });
+    const images = visionCapable
+      ? await collectInboundImages({ imageRefs, larkClient, messageId })
+      : [];
+    // Non-vision model + the user sent native image(s): they were dropped (can't be
+    // used). Tell the model so it can inform the user — mirroring the text-URL path,
+    // where a non-vision model at least sees the URL and can say it can't open it.
+    const promptText = !visionCapable && imageRefs.length > 0
+      ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
+      : effectiveText;
+    // Shared group: drain the chatter buffered since the last reply and attribute
+    // the asker, so the agent answers @-turns with the whole group's context.
+    const drained = contextMode === "shared" && !conversationKey
+      ? drainDiscussion(channelId, chatId)
+      : undefined;
+    const sharedContext: SharedGroupContext | undefined = drained
+      ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
+      : undefined;
+    const promptOpts: PromptOptions = {
+      text: buildChannelTurnPrompt(promptText, sharedContext),
+      agentId,
+      mode: "channel",
+      sessionId,
+      modelProvider: modelBinding?.modelProvider,
+      modelId: modelBinding?.modelId,
+      releaseId: modelBinding?.releaseId,
+      modelFingerprint: modelBinding?.modelFingerprint,
+      modelConfig: modelBinding?.modelConfig,
+      modelRouting: modelBinding?.modelRouting,
+      subagentTiers: modelBinding?.subagentTiers,
+      systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
+      ...(images.length ? { images } : {}),
+    };
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
-    const promptResult = await promptWithBusyRetry(client, promptOpts);
+    const promptResult = remoteConversation ? await client.prompt(promptOpts) : await promptWithBusyRetry(client, promptOpts);
     void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
       warnTraceBindFailure("lark prompt", promptResult.sessionId, promptMessageId, bindErr);
     });
@@ -2072,7 +2079,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       // Audit: persist assistant + tool rows so the channel transcript matches
       // web/api/a2a (origin="channel" set on the session above). Tool output on
       // this stream is already sanitized at the agentbox boundary.
-      persist: { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
+      persist: remoteConversation ? undefined : { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
+      throwOnError: remoteConversation,
     });
     resultText = collected.text;
     replyImages = collected.images;
@@ -2086,7 +2094,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       agentError = err instanceof Error ? err : new Error(String(err));
       console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
     }
-  }
   } finally {
     releaseTurn?.();
   }
@@ -2488,6 +2495,7 @@ async function handleNewCommand(
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
   replyInThread: boolean = false,
+  resetUserId?: string,
 ): Promise<void> {
   const reset = route === "personal"
     ? await resetPersonalSession(channelId, sessionKey, frontendClient!)
@@ -2500,12 +2508,17 @@ async function handleNewCommand(
   if (reset.oldSessionId) {
     sessionRegistry.forget(reset.oldSessionId);
     try {
+      if (frontendClient && await supportsConversations(frontendClient)) {
+        if (!resetUserId) throw new Error("Cannot authorize cancellation of the old conversation");
+        await frontendClient.request("conversation.abort", { agentId: reset.agentId, sessionId: reset.oldSessionId, userId: resetUserId });
+      } else {
       // The OLD session id, not none: closeSession has to reach the box that actually
       // holds it. Without it a pooled agent closes on an arbitrary box, the real session
       // stays resident forever (pooled boxes never idle out), and that box never drains.
       const handle = await agentBoxManager.getOrCreate(reset.agentId, undefined, reset.oldSessionId);
       const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
       await client.closeSession(reset.oldSessionId);
+      }
     } catch (err) {
       console.error(`[lark] Failed to close old session=${reset.oldSessionId} on /new:`, err);
     }
@@ -2988,7 +3001,7 @@ function isSessionBusyError(err: unknown): boolean {
  * shows the friendly busy notice). Never surfaces the raw 409.
  */
 async function promptWithBusyRetry(
-  client: AgentBoxClient,
+  client: Pick<AgentBoxClient, "prompt">,
   opts: PromptOptions,
   maxWaitMs = 45_000,
 ): Promise<Awaited<ReturnType<AgentBoxClient["prompt"]>>> {
@@ -3094,10 +3107,10 @@ export interface ChannelPersistContext {
 }
 
 export async function collectChannelResponse(
-  client: AgentBoxClient,
+  client: Pick<AgentBoxClient, "streamEvents">,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale; throwOnError?: boolean } = {},
 ): Promise<CollectedChannelResponse> {
   // Reuse the public-text adapter used by web. Publish completed text blocks
   // before tools start; never wait for the following model call. Complete blocks
@@ -3222,6 +3235,19 @@ export async function collectChannelResponse(
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
+      if (ev.type === "agent_switch") {
+        flushPendingNarration();
+        const name = ev.toAgentName || ev.toAgentId;
+        if (name) options.onActivity?.(options.locale === "en-US" ? `${name} is continuing` : `${name} 继续处理`);
+        lastAssistantText = "";
+        lastAssistantMessageId = null;
+        parts.length = 0;
+        pendingKnowledgeSources = null;
+        renderedKnowledgeSourceUrls.clear();
+        assistantItems.begin();
+      }
+      if (!persist && ev.type === "item/completed" && ev.item?.type === "agentMessage" && ev.dbMessageId) lastAssistantMessageId = String(ev.dbMessageId);
+
       if (ev.type === "turn_start" || (ev.type === "message_start" && ev.message?.role === "assistant")) {
         flushPendingNarration();
         assistantItems.begin();
@@ -3486,6 +3512,7 @@ export async function collectChannelResponse(
     }
   } catch (err) {
     console.error(`[${logPrefix}] SSE collect error for session=${sessionId}:`, err);
+    if (options.throwOnError) throw err;
   }
   if (persist) await flushTerminalError();
   // Prefer the last full assistant turn; fall back to streamed deltas if the

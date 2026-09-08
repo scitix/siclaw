@@ -1,3 +1,4 @@
+import { ConversationClient, supportsConversations } from "../conversation-client.js";
 /**
  * DingTalk (钉钉) channel handler.
  *
@@ -314,65 +315,58 @@ export async function handleDingTalkMessage(
   // rejection escaped every handler and the user got nothing at all.
   let releaseTurn: (() => void) | undefined;
   try {
-    releaseTurn = await sessionTurnLocks.acquire(sessionId);
-  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-  sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
-  const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
-
-  // Apply the agent's custom system prompt (best-effort — undefined falls back
-  // to the built-in default template). Note: AgentBox only applies the template
-  // at session creation, so an existing 1:1 multi-turn session keeps the prompt
-  // it was created with until /new.
-  const systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
-  // Forward the agent's bound model so AgentBox uses it instead of its built-in
-  // default (mirrors web/api/a2a/lark — without this a model-bound agent fell
-  // back to AgentBox's default model, e.g. an invalid-key Kimi → 401 / empty
-  // reply). null-tolerant: a default-model agent leaves these undefined and
-  // keeps the default. System prompt stays sourced from resolveAgentSystemPrompt
-  // above, which (unlike the model binding) is populated for default-model
-  // agents too — so this does not regress custom prompts.
-  const modelBinding = frontendClient ? await resolveAgentModelBinding(agentId, frontendClient) : null;
-
-  // Audit: persist the session + inbound user message so DingTalk sessions are
-  // visible in the audit (they were previously invisible — no chat_messages at
-  // all). origin="channel" unifies IM channels alongside Web/API/A2A. user_id =
-  // the binding owner (a real user UUID), mirroring lark. Best-effort: a persist
-  // failure must NOT break the reply (DingTalk worked without persistence before).
-  const auditable = !!binding.createdBy;
-  // Channel audit actor (NOT runtime identity). The sender's raw DingTalk staff
-  // id is the "same person" key for channel audit; it is stamped on the SESSION
-  // (chat_sessions), never falls back to the binding owner. NULL when absent.
-  const senderExternalId = message.senderStaffId ?? null;
-  let promptMessageId: string | null = null;
-  if (auditable) {
-    try {
-      await ensureChatSession(sessionId, agentId, binding.createdBy!, text, text, "channel", undefined, { senderExternalId, channelId });
-      promptMessageId = await appendMessage({
-        sessionId,
-        role: "user",
-        content: text,
-        metadata: { source: "dingtalk", channelId, conversationId, route: routeType },
-      });
-    } catch (err) {
-      console.error(`[dingtalk] Failed to persist channel user message session=${sessionId}:`, err);
+    const remoteConversation = frontendClient ? await supportsConversations(frontendClient) : false;
+    const systemPromptTemplate = !remoteConversation ? await resolveAgentSystemPrompt(agentId, frontendClient) : undefined;
+    const modelBinding = !remoteConversation && frontendClient ? await resolveAgentModelBinding(agentId, frontendClient) : null;
+    // Audit: persist the session + inbound user message so DingTalk sessions are
+    // visible in the audit (they were previously invisible — no chat_messages at
+    // all). origin="channel" unifies IM channels alongside Web/API/A2A. user_id =
+    // the binding owner (a real user UUID), mirroring lark. Best-effort: a persist
+    // failure must NOT break the reply (DingTalk worked without persistence before).
+    const auditable = !!binding.createdBy;
+    // Channel audit actor (NOT runtime identity). The sender's raw DingTalk staff
+    // id is the "same person" key for channel audit; it is stamped on the SESSION
+    // (chat_sessions), never falls back to the binding owner. NULL when absent.
+    const senderExternalId = message.senderStaffId ?? null;
+    let promptMessageId: string | null = null;
+    if (auditable) {
+      try {
+        await ensureChatSession(sessionId, agentId, binding.createdBy!, text, text, "channel", undefined, { senderExternalId, channelId });
+        promptMessageId = await appendMessage({
+          sessionId,
+          role: "user",
+          content: text,
+          metadata: { source: "dingtalk", channelId, conversationId, route: routeType },
+        });
+      } catch (err) {
+        console.error(`[dingtalk] Failed to persist channel user message session=${sessionId}:`, err);
+      }
     }
-  }
 
-  const promptOpts: PromptOptions = {
-    text,
-    agentId,
-    mode: "channel",
-    sessionId,
-    modelProvider: modelBinding?.modelProvider,
-    modelId: modelBinding?.modelId,
-    releaseId: modelBinding?.releaseId,
-    modelFingerprint: modelBinding?.modelFingerprint,
-    modelConfig: modelBinding?.modelConfig,
-    modelRouting: modelBinding?.modelRouting,
-    subagentTiers: modelBinding?.subagentTiers,
-    systemPromptTemplate,
-  };
-  try {
+    let client: Pick<AgentBoxClient, "prompt" | "streamEvents">;
+    if (remoteConversation && frontendClient) {
+      if (!promptMessageId || !binding.createdBy) throw new Error("Conversation input could not be persisted");
+      client = new ConversationClient(frontendClient, { agentId, userId: binding.createdBy, sessionId, userMessageId: promptMessageId, origin: "channel" });
+    } else {
+      releaseTurn = await sessionTurnLocks.acquire(sessionId);
+      const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+      sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
+      client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
+    }
+    const promptOpts: PromptOptions = {
+      text,
+      agentId,
+      mode: "channel",
+      sessionId,
+      modelProvider: modelBinding?.modelProvider,
+      modelId: modelBinding?.modelId,
+      releaseId: modelBinding?.releaseId,
+      modelFingerprint: modelBinding?.modelFingerprint,
+      modelConfig: modelBinding?.modelConfig,
+      modelRouting: modelBinding?.modelRouting,
+      subagentTiers: modelBinding?.subagentTiers,
+      systemPromptTemplate,
+    };
     const promptResult = await client.prompt(promptOpts);
     if (promptMessageId) {
       void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
@@ -383,14 +377,14 @@ export async function handleDingTalkMessage(
     // session row exists) AND image artifacts for channel delivery.
     const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
       includeImages: true,
-      persist: auditable ? { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId } : undefined,
+      persist: !remoteConversation && auditable ? { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId } : undefined,
+      throwOnError: remoteConversation,
     });
     resultText = collected.text;
     replyImages = collected.images;
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
-  }
   } finally {
     releaseTurn?.();
   }
