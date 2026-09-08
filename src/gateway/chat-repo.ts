@@ -93,6 +93,14 @@ export interface StoredMessage {
   delegationId: string | null;
   targetAgentId: string | null;
   createdAt: Date;
+  /**
+   * Whether the box has started processing this row. A row appended with
+   * `deferSequence` (the prompt row the runtime writes BEFORE calling the box,
+   * or a queued steer) stays `false` until the box echoes `message_start`
+   * for it. So `false` means "sent but never consumed" — not history yet.
+   * Defaults to `true` for a control plane that predates the column.
+   */
+  seqSequenced: boolean;
 }
 
 export interface AppendDelegationEventInput {
@@ -430,6 +438,9 @@ export async function getMessages(
       delegationId: (r.delegation_id as string | null) ?? null,
       targetAgentId: (r.target_agent_id as string | null) ?? null,
       createdAt: new Date(r.created_at as string),
+      // tinyint(1) arrives as 0/1 through the Go map scan; tolerate a bool too.
+      // Absent (older control plane) reads as consumed, preserving prior behaviour.
+      seqSequenced: r.seq_sequenced == null ? true : !(r.seq_sequenced === 0 || r.seq_sequenced === false),
     };
   }).reverse();
 }

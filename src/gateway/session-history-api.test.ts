@@ -8,6 +8,7 @@ function msg(i: number, secondsAgo: number): StoredMessage {
     toolName: null, toolset: null, toolInput: null, metadata: null, outcome: null, durationMs: null,
     fromAgentId: null, parentSessionId: null, delegationId: null, targetAgentId: null,
     createdAt: new Date(Date.UTC(2026, 8, 5, 0, 0, 0) - secondsAgo * 1000),
+    seqSequenced: true,
   };
 }
 
@@ -66,6 +67,33 @@ describe("loadFullHistory", () => {
     const out = await loadFullHistory("s1", fetchPage);
     expect(fetchPage).toHaveBeenCalledTimes(2);
     expect(out).toHaveLength(HISTORY_PAGE_SIZE * 2);
+  });
+
+  // ⚠️ 这条钉的是首次 go/no-go 暴露的 wart:runtime 在调 box 之前就把本轮的 user 行
+  // 落了库,回灌把它当历史带进去,box 又拿同一段文字当 prompt → 最后一条 user 消息
+  // 出现两次。未消费(seq_sequenced=false)的行不是历史。
+  it("drops rows the box has not consumed yet — the pending prompt and queued steers", async () => {
+    const consumed1 = msg(1, 30);
+    const consumed2 = msg(2, 20);
+    const pendingPrompt = msg(3, 10);
+    pendingPrompt.seqSequenced = false;
+    const queuedSteer = msg(4, 5);
+    queuedSteer.seqSequenced = false;
+    const out = await loadFullHistory("s1", pagedFetcher([consumed1, consumed2, pendingPrompt, queuedSteer]));
+    expect(out.map((r) => r.content)).toEqual(["msg 1", "msg 2"]);
+  });
+
+  // ⚠️ 这条钉的是紧接着的回归:`seq_sequenced` 只对 user 行有"消费"语义,
+  // assistant / tool 行永远是 0(没有人去翻它)。按它一刀切会把整段回复全删掉 ——
+  // 实测把一次 GO 退成了 NO_GO。非 user 行**无论** seq_sequenced 是什么都要保留。
+  it("keeps assistant and tool rows regardless of seq_sequenced — only user rows carry that meaning", async () => {
+    const user = msg(1, 30);
+    const assistant = msg(2, 20);
+    assistant.role = "assistant"; assistant.seqSequenced = false;
+    const tool = msg(3, 10);
+    tool.role = "tool"; tool.toolName = "bash"; tool.seqSequenced = false;
+    const out = await loadFullHistory("s1", pagedFetcher([user, assistant, tool]));
+    expect(out.map((r) => r.role)).toEqual(["user", "assistant", "tool"]);
   });
 
   it("projects only the fields the rehydrator needs", async () => {
