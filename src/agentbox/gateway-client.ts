@@ -12,6 +12,8 @@ import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
+import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
+import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH, type HandoffSearchQuery, type HandoffSearchResponse, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
 import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
 
 export interface GatewayClientOptions {
@@ -88,7 +90,7 @@ export class GatewayClient {
   /**
    * Fetch settings (providers, models, embedding config) from Gateway
    */
-  async fetchSettings(): Promise<any> {
+    async fetchSettings(): Promise<any> {
     return this.request("/api/internal/settings", "GET");
   }
 
@@ -281,6 +283,27 @@ export class GatewayClient {
   /** Fetch this coordinator's delegation roster (authorization + manifest). */
   async fetchDelegates(): Promise<DelegatesResponse> {
     return this.request("/api/internal/delegates", "GET");
+  }
+
+  /**
+   * Fetch the agents this one may TRANSFER the conversation to. Empty for an
+   * ordinary agent, which then grows no transfer tool at all.
+   */
+  async searchHandoffTargets(query: HandoffSearchQuery): Promise<HandoffSearchResponse> {
+    return this.request(HANDOFF_SEARCH_PATH, "POST", query);
+  }
+
+  async fetchHandoffTargets(): Promise<HandoffTargetsResponse> {
+    return this.request(`${HANDOFF_TARGETS_PATH}?indexOnly=true`, "GET");
+  }
+
+  /**
+   * Pull a session's full transcript from the control plane, oldest first.
+   * The checkpointer read: called when this box holds no local context for a
+   * session it has been asked to continue.
+   */
+  async fetchSessionHistory(sessionId: string): Promise<SessionHistoryResponse> {
+    return this.request(`${SESSION_HISTORY_PATH}?sessionId=${encodeURIComponent(sessionId)}`, "GET");
   }
 
   /**

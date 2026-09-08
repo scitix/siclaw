@@ -66,6 +66,7 @@ export interface JobRecord {
   abort?: () => void;
   // ── subagent-only ───────────────────────────────────────────────
   childSessionId?: string;
+  reportArtifact?: import("./tool-result-artifact.js").ToolResultArtifactReference;
   /**
    * Set on a `spawn_subagent` batch (map→reduce) job. The job `type` stays "subagent" (reused
    * deliberately so the three `type === "subagent"` branches — notifyParent event routing,
@@ -126,7 +127,7 @@ export class JobRegistry {
   snapshot(jobId: string): TaskOutputSnapshot {
     const job = this.jobs.get(jobId);
     return job
-      ? { found: true, status: job.status, exitCode: job.exitCode, outputFile: job.outputFile }
+      ? { found: true, status: job.status, exitCode: job.exitCode, outputFile: job.outputFile, ...(job.reportArtifact ? { reportArtifact: job.reportArtifact } : {}) }
       : { found: false };
   }
 

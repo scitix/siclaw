@@ -177,3 +177,14 @@ describe("renderSystemPromptFragment", () => {
     expect(prompt.indexOf("agent mode=TUI")).toBeLessThan(prompt.indexOf("# Safety"));
   });
 });
+
+
+it("retains the web progress contract after custom and legacy prompts", () => {
+  const prompt = buildSreSystemPrompt("web", "Legacy instructions.", "Brief answers.");
+  expect(prompt).toContain("# Web Conversation Progress");
+  expect(prompt.indexOf("# Web Conversation Progress")).toBeGreaterThan(prompt.indexOf("Legacy instructions."));
+  expect(prompt).not.toContain("_siclaw_progress");
+  expect(prompt).toContain("ordinary assistant text");
+  expect(buildSreSystemPrompt("task")).not.toContain("# Web Conversation Progress");
+  expect(buildSreSystemPrompt("cli")).not.toContain("# Web Conversation Progress");
+});

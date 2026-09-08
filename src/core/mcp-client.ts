@@ -9,7 +9,7 @@
 
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { ResolvedToolDefinition } from "./tool-registry.js";
+import { type ResolvedToolDefinition } from "./tool-registry.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -606,7 +606,16 @@ export class McpClientManager {
   private createToolDefinition(
     serverName: string,
     serverDescription: string | undefined,
-    mcpTool: { name: string; description?: string; inputSchema?: any },
+    mcpTool: {
+      name: string;
+      description?: string;
+      inputSchema?: any;
+      /**
+       * MCP 规范的工具注解。这里只用 `readOnlyHint` —— authority guard 靠它决定
+       * 这个工具算不算"读"。见 tool-registry 的 MCP_TOOL_EFFECTS。
+       */
+      annotations?: { readOnlyHint?: boolean };
+    },
     client: any,
     requestTimeoutMs?: number,
   ): ResolvedToolDefinition {

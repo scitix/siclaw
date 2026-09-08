@@ -75,17 +75,21 @@ describe("resolveAgentHarness", () => {
     })).toThrow("Invalid or missing agent_type");
   });
 
-  it("removes MCP and memory from delegated read-only work", () => {
-    const harness = resolveAgentHarness({
-      agentType: "sre",
+  // 被委托的 turn 跟直接调用解析出同一套 harness。这条曾经断言相反:委托会摘掉
+  // peer 的 MCP、memory 和操作安全段。那是调用方在削被调 agent 的能力,而能力是
+  // 那个 agent 自己的事。
+  it("resolves a delegated turn exactly like a direct one", () => {
+    const input = {
+      agentType: "sre" as const,
       allowedTools: ["read", "memory_search", "cluster_list"],
       memoryConfigured: true,
-      delegation: { delegationId: "d1", readOnly: true },
-    });
+    };
+    const delegated = resolveAgentHarness({ ...input, delegation: { delegationId: "d1" } });
+    const direct = resolveAgentHarness(input);
 
-    expect(harness.mcpExposure).toBe("none");
-    expect(harness.memoryEnabled).toBe(false);
-    expect(harness.includeOperationalSafety).toBe(false);
+    expect(delegated.mcpExposure).toBe(direct.mcpExposure);
+    expect(delegated.memoryEnabled).toBe(direct.memoryEnabled);
+    expect(delegated.includeOperationalSafety).toBe(direct.includeOperationalSafety);
   });
 
   it("adds the automated-task report tool without broadening interactive capabilities", () => {
@@ -213,4 +217,35 @@ describe("createAgentContextManifest", () => {
     expect(manifest.prompt.layers.map((layer) => layer.id)).toContain("agent_type.contract");
     expect(JSON.stringify(manifest)).not.toContain("question answering agent");
   });
+});
+
+
+describe("handoff conversation contract", () => {
+  it.each(["sre", "coordinator", "knowledge_qa", "product_support", "custom"])("gives %s the same main-conversation transfer semantics", (agentType) => {
+    const context = compileAgentContext({ agentType, allowedTools: null, memoryConfigured: false, mode: "web", handoffAvailable: true });
+    expect(context.systemPrompt).toContain("Conversation ownership: transfer_to_agent is available");
+    expect(context.systemPrompt).toContain("reserve delegation for independent subtasks");
+  });
+  it.each([
+    { handoffAvailable: false }, { harnessResolved: false },
+    { mode: "cli" as const }, { delegation: { delegationId: "d1" } },
+  ])("does not instruct sessions without handoff authority to transfer: %j", (overrides) => {
+    const context = compileAgentContext({ agentType: "knowledge_qa", allowedTools: null, memoryConfigured: false, mode: "web", handoffAvailable: true, ...overrides });
+    expect(context.systemPrompt).not.toContain("Conversation ownership: transfer_to_agent is available");
+  });
+});
+
+it("gives the last conversation owner explicit honest closure guidance", () => {
+  const compiled = compileAgentContext({ agentType: "sre", mode: "web", allowedTools: null, memoryConfigured: false,
+    handoffAvailable: false, handoffPolicy: { remaining: 0, visitedAgentIds: ["a", "b", "c"], history: [] } });
+  expect(JSON.stringify(compiled)).toContain("Further conversation transfers are disabled");
+  expect(JSON.stringify(compiled)).toContain("specific missing information or access");
+  expect(JSON.stringify(compiled)).not.toContain("transfer_to_agent is available for this main conversation");
+});
+
+it("asks for concrete missing information when the managed owner has no eligible targets", () => {
+  const compiled = compileAgentContext({ agentType: "custom", mode: "channel", allowedTools: ["read"], memoryConfigured: false,
+    handoffAvailable: false, handoffPolicy: { remaining: 2, visitedAgentIds: ["a"], history: [] } });
+  expect(compiled.systemPrompt).toContain("No eligible authorized transfer destination");
+  expect(compiled.systemPrompt).toContain("specific missing information or access");
 });

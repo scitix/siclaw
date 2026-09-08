@@ -166,6 +166,11 @@ export interface BrainContextPreflightResult {
   errorMessage?: string;
 }
 
+export interface TaskCompletionAssessment {
+  status: "complete" | "incomplete" | "blocked";
+  reason: string;
+}
+
 export interface BrainSession {
   readonly brainType: BrainType;
 
@@ -179,6 +184,10 @@ export interface BrainSession {
 
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
   prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void>;
+
+  /** Evaluate the delegated result against its assignment using the full execution context.
+   * No tools execute during assessment. An unavailable/invalid assessment fails closed. */
+  assessTaskCompletion?(assignment: string): Promise<TaskCompletionAssessment>;
 
   /** Abort the current agent run. */
   abort(): Promise<void>;

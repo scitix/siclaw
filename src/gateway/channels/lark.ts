@@ -1,3 +1,4 @@
+import { ConversationClient, supportsConversations } from "../conversation-client.js";
 /**
  * Lark (飞书) channel handler.
  *
@@ -6,6 +7,8 @@
  * Supports PAIR command for binding chat groups to agents.
  */
 
+import { AssistantItemStream } from "../assistant-item-stream.js";
+import { assistantTextBlocks } from "../../shared/assistant-items.js";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
@@ -1466,6 +1469,7 @@ export async function handleLarkMessage(
       sessionKey: personalSessionKey,
       channelId: personalChannelId,
       route: "personal",
+      resetUserId: binding.createdBy ?? undefined,
       larkClient,
       agentBoxManager,
       tlsOptions,
@@ -1709,6 +1713,7 @@ export async function handleLarkMessage(
     sessionKey: effectiveSessionKey,
     channelId: groupChannelId,
     route: "group",
+    resetUserId: binding.createdBy ?? undefined,
     contextMode,
     conversationKey,
     rootMessageId,
@@ -1729,6 +1734,7 @@ export async function handleLarkMessage(
 }
 
 interface QueuedLarkMessageContext {
+  resetUserId?: string;
   text: string;
   imageRefs: LarkImageRef[];
   messageId: string;
@@ -1804,6 +1810,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       frontendClient,
       locale,
       replyInThread,
+      ctx.resetUserId,
     );
     return;
   }
@@ -1895,13 +1902,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   let deliveredTextChars = 0;
   // Live "current step" indicator. Two milestone sources feed it: explicit
   // channel_update tool calls (agent-curated) AND auto-derived first lines of
-  // intermediate assistant turns (collectChannelResponse.onMilestone). The card
+  // completed public text blocks (collectChannelResponse.onMilestone). The card
   // shows ONLY the single latest step (⏳), replaced in place as work proceeds —
   // no accumulating checklist — and on finalize the step is replaced entirely by
   // the conclusion. `milestones` is kept only to dedup against the last step;
   // renders use the latest entry. Re-renders are coalesced to respect Feishu's
   // update rate.
   const milestones: string[] = [];
+  let activity = "";
   let cardFlushInflight = false;
   let cardFlushDirty = false;
   let cardFinalizing = false;
@@ -1915,8 +1923,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
         do {
           cardFlushDirty = false;
           // Render only the single latest step — never an accumulating list.
-          const md = buildMilestoneCardMarkdown({ milestones: milestones.slice(-1) });
-          if (md.trim()) await updateCardContent(larkClient, cardSession, md);
+          const md = [
+            buildMilestoneCardMarkdown({ milestones: milestones.slice(-1) }),
+            activity ? `⏳ ${activity}` : "",
+          ].filter(Boolean).join("\n\n");
+          await updateCardContent(larkClient, cardSession, md || PLACEHOLDER_BY_LOCALE[locale]);
         } while (cardFlushDirty && !cardFinalizing);
       } catch (err) {
         console.warn(`[lark] milestone card flush failed for session=${sessionId}:`, err);
@@ -1994,74 +2005,82 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // rejection escaped every handler and the user got nothing at all.
   let releaseTurn: (() => void) | undefined;
   try {
-    releaseTurn = await sessionTurnLocks.acquire(sessionId);
-  // Get or create AgentBox for this agent (shared across all callers).
-  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-  sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
-  const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
-
-  const modelBinding = frontendClient
-    ? await resolveAgentModelBinding(agentId, frontendClient)
-    : null;
-  // Native Lark images are vision-gated too, mirroring the text-URL path: a
-  // non-vision model can't use them and would fail-closed at AgentBox media
-  // filtering, so skip the download entirely for non-vision models (the [image]
-  // placeholder in effectiveText still records that the user sent an image).
-  // Text image URLs are NOT handled here — they are resolved generically (and
-  // vision-gated) at the `AgentBoxClient.prompt()` boundary, shared with Portal
-  // Web chat / a2a / cron.
-  const visionCapable = modelOptionsSupportImageInput({
-    modelProvider: modelBinding?.modelProvider,
-    modelId: modelBinding?.modelId,
-    modelConfig: modelBinding?.modelConfig,
-    modelRouting: modelBinding?.modelRouting,
-  });
-  const images = visionCapable
-    ? await collectInboundImages({ imageRefs, larkClient, messageId })
-    : [];
-  // Non-vision model + the user sent native image(s): they were dropped (can't be
-  // used). Tell the model so it can inform the user — mirroring the text-URL path,
-  // where a non-vision model at least sees the URL and can say it can't open it.
-  const promptText = !visionCapable && imageRefs.length > 0
-    ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
-    : effectiveText;
-  // Shared group: drain the chatter buffered since the last reply and attribute
-  // the asker, so the agent answers @-turns with the whole group's context.
-  const drained = contextMode === "shared" && !conversationKey
-    ? drainDiscussion(channelId, chatId)
-    : undefined;
-  const sharedContext: SharedGroupContext | undefined = drained
-    ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
-    : undefined;
-  const promptOpts: PromptOptions = {
-    text: buildChannelTurnPrompt(promptText, sharedContext),
-    agentId,
-    mode: "channel",
-    sessionId,
-    modelProvider: modelBinding?.modelProvider,
-    modelId: modelBinding?.modelId,
-    releaseId: modelBinding?.releaseId,
-    modelFingerprint: modelBinding?.modelFingerprint,
-    modelConfig: modelBinding?.modelConfig,
-    modelRouting: modelBinding?.modelRouting,
-    subagentTiers: modelBinding?.subagentTiers,
-    systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
-    ...(images.length ? { images } : {}),
-  };
-  try {
+    const remoteConversation = frontendClient ? await supportsConversations(frontendClient) : false;
+    if (!remoteConversation) releaseTurn = await sessionTurnLocks.acquire(sessionId);
+    let client: Pick<AgentBoxClient, "prompt" | "streamEvents">;
+    if (remoteConversation && frontendClient) {
+      client = new ConversationClient(frontendClient, { agentId, userId: binding.createdBy, sessionId, userMessageId: promptMessageId, origin: "channel" });
+    } else {
+      const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+      sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
+      client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
+    }
+    const modelBinding = !remoteConversation && frontendClient
+      ? await resolveAgentModelBinding(agentId, frontendClient) : null;
+    // Native Lark images are vision-gated too, mirroring the text-URL path: a
+    // non-vision model can't use them and would fail-closed at AgentBox media
+    // filtering, so skip the download entirely for non-vision models (the [image]
+    // placeholder in effectiveText still records that the user sent an image).
+    // Text image URLs are NOT handled here — they are resolved generically (and
+    // vision-gated) at the `AgentBoxClient.prompt()` boundary, shared with Portal
+    // Web chat / a2a / cron.
+    const visionCapable = remoteConversation || modelOptionsSupportImageInput({
+      modelProvider: modelBinding?.modelProvider,
+      modelId: modelBinding?.modelId,
+      modelConfig: modelBinding?.modelConfig,
+      modelRouting: modelBinding?.modelRouting,
+    });
+    const images = visionCapable
+      ? await collectInboundImages({ imageRefs, larkClient, messageId })
+      : [];
+    // Non-vision model + the user sent native image(s): they were dropped (can't be
+    // used). Tell the model so it can inform the user — mirroring the text-URL path,
+    // where a non-vision model at least sees the URL and can say it can't open it.
+    const promptText = !visionCapable && imageRefs.length > 0
+      ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
+      : effectiveText;
+    // Shared group: drain the chatter buffered since the last reply and attribute
+    // the asker, so the agent answers @-turns with the whole group's context.
+    const drained = contextMode === "shared" && !conversationKey
+      ? drainDiscussion(channelId, chatId)
+      : undefined;
+    const sharedContext: SharedGroupContext | undefined = drained
+      ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
+      : undefined;
+    const promptOpts: PromptOptions = {
+      text: buildChannelTurnPrompt(promptText, sharedContext),
+      agentId,
+      mode: "channel",
+      sessionId,
+      modelProvider: modelBinding?.modelProvider,
+      modelId: modelBinding?.modelId,
+      releaseId: modelBinding?.releaseId,
+      modelFingerprint: modelBinding?.modelFingerprint,
+      modelConfig: modelBinding?.modelConfig,
+      modelRouting: modelBinding?.modelRouting,
+      subagentTiers: modelBinding?.subagentTiers,
+      systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
+      ...(images.length ? { images } : {}),
+    };
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
-    const promptResult = await promptWithBusyRetry(client, promptOpts);
+    const promptResult = remoteConversation ? await client.prompt(promptOpts) : await promptWithBusyRetry(client, promptOpts);
     void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
       warnTraceBindFailure("lark prompt", promptResult.sessionId, promptMessageId, bindErr);
     });
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
       includeImages: true,
       onMilestone: addMilestone,
+      onActivity: (text) => {
+        if (activity === text) return;
+        activity = text;
+        void flushMilestoneCard();
+      },
       locale,
       // Audit: persist assistant + tool rows so the channel transcript matches
       // web/api/a2a (origin="channel" set on the session above). Tool output on
       // this stream is already sanitized at the agentbox boundary.
-      persist: { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
+      persist: remoteConversation ? undefined : { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
+      throwOnError: remoteConversation,
     });
     resultText = collected.text;
     replyImages = collected.images;
@@ -2075,7 +2094,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       agentError = err instanceof Error ? err : new Error(String(err));
       console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
     }
-  }
   } finally {
     releaseTurn?.();
   }
@@ -2477,6 +2495,7 @@ async function handleNewCommand(
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
   replyInThread: boolean = false,
+  resetUserId?: string,
 ): Promise<void> {
   const reset = route === "personal"
     ? await resetPersonalSession(channelId, sessionKey, frontendClient!)
@@ -2489,12 +2508,17 @@ async function handleNewCommand(
   if (reset.oldSessionId) {
     sessionRegistry.forget(reset.oldSessionId);
     try {
+      if (frontendClient && await supportsConversations(frontendClient)) {
+        if (!resetUserId) throw new Error("Cannot authorize cancellation of the old conversation");
+        await frontendClient.request("conversation.abort", { agentId: reset.agentId, sessionId: reset.oldSessionId, userId: resetUserId });
+      } else {
       // The OLD session id, not none: closeSession has to reach the box that actually
       // holds it. Without it a pooled agent closes on an arbitrary box, the real session
       // stays resident forever (pooled boxes never idle out), and that box never drains.
       const handle = await agentBoxManager.getOrCreate(reset.agentId, undefined, reset.oldSessionId);
       const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
       await client.closeSession(reset.oldSessionId);
+      }
     } catch (err) {
       console.error(`[lark] Failed to close old session=${reset.oldSessionId} on /new:`, err);
     }
@@ -2977,7 +3001,7 @@ function isSessionBusyError(err: unknown): boolean {
  * shows the friendly busy notice). Never surfaces the raw 409.
  */
 async function promptWithBusyRetry(
-  client: AgentBoxClient,
+  client: Pick<AgentBoxClient, "prompt">,
   opts: PromptOptions,
   maxWaitMs = 45_000,
 ): Promise<Awaited<ReturnType<AgentBoxClient["prompt"]>>> {
@@ -3083,11 +3107,38 @@ export interface ChannelPersistContext {
 }
 
 export async function collectChannelResponse(
-  client: AgentBoxClient,
+  client: Pick<AgentBoxClient, "streamEvents">,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean; onMilestone?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale; throwOnError?: boolean } = {},
 ): Promise<CollectedChannelResponse> {
+  // Reuse the public-text adapter used by web. Publish completed text blocks
+  // before tools start; never wait for the following model call. Complete blocks
+  // keep partial Markdown/render-source and private reasoning off the IM card.
+  const assistantItems = new AssistantItemStream();
+  let lastMilestone = "";
+  let pendingNarration = "";
+  const publishNarration = (text: string, phase?: string) => {
+    if (phase === "final_answer") return;
+    const milestone = condenseMilestone(text);
+    if (!milestone || milestone === lastMilestone) return;
+    lastMilestone = milestone;
+    options.onMilestone?.(milestone);
+  };
+  const flushPendingNarration = () => {
+    if (pendingNarration) publishNarration(pendingNarration);
+    pendingNarration = "";
+  };
+  const progressToolNames = new Map<string, string>();
+  const groupActivities = new Map<string, { done: number; total: number }>();
+  const publishActivity = () => {
+    const counts = [...groupActivities.values()];
+    const done = counts.reduce((sum, count) => sum + count.done, 0);
+    const total = counts.reduce((sum, count) => sum + count.total, 0);
+    options.onActivity?.(total === 0 ? "" : options.locale === "en-US"
+      ? `Sub-tasks: ${done}/${total} finished`
+      : `子任务：${done}/${total} 已结束`);
+  };
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
   const seenImageKeys = new Set<string>();
@@ -3184,6 +3235,37 @@ export async function collectChannelResponse(
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
+      if (ev.type === "agent_switch") {
+        flushPendingNarration();
+        const name = ev.toAgentName || ev.toAgentId;
+        if (name) options.onActivity?.(options.locale === "en-US" ? `${name} is continuing` : `${name} 继续处理`);
+        lastAssistantText = "";
+        lastAssistantMessageId = null;
+        parts.length = 0;
+        pendingKnowledgeSources = null;
+        renderedKnowledgeSourceUrls.clear();
+        assistantItems.begin();
+      }
+      if (!persist && ev.type === "item/completed" && ev.item?.type === "agentMessage" && ev.dbMessageId) lastAssistantMessageId = String(ev.dbMessageId);
+
+      if (ev.type === "turn_start" || (ev.type === "message_start" && ev.message?.role === "assistant")) {
+        flushPendingNarration();
+        assistantItems.begin();
+      }
+      if (ev.type === "tool_execution_start" || ev.type === "tool_start" ||
+          (ev.type === "message_end" && (ev.message?.role === "toolResult" || ev.message?.role === "tool"))) {
+        flushPendingNarration();
+        if (ev.toolCallId && (ev.toolName || ev.name)) progressToolNames.set(ev.toolCallId, ev.toolName || ev.name);
+      }
+      if (ev.type === "message_update" && ev.assistantMessageEvent) {
+        const output = assistantItems.update(ev.assistantMessageEvent);
+        if (output?.completed) publishNarration(output.item.text, output.item.phase);
+      }
+      if (ev.type === "model_route_rollback") {
+        assistantItems.begin();
+        lastMilestone = "";
+        pendingNarration = "";
+      }
 
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
@@ -3248,7 +3330,9 @@ export async function collectChannelResponse(
       // sits frozen at the last line for the whole (multi-minute) batch. spawn_subagent streams
       // group progress via tool_execution_update; surface it as the current ⏳ step. (Background
       // groups instead report via group_progress, not this SSE.)
-      if (ev.type === "tool_execution_update" && options.onMilestone) {
+      const progressToolName = ev.toolName || ev.name || progressToolNames.get(ev.toolCallId);
+      if (ev.type === "tool_execution_update" && (options.onMilestone || options.onActivity)
+          && (!progressToolName || progressToolName === "spawn_subagent" || progressToolName === "delegate_to_agent")) {
         const items = Array.isArray(ev.partialResult?.details?.items) ? ev.partialResult.details.items : null;
         let milestone = "";
         if (items) {
@@ -3256,7 +3340,10 @@ export async function collectChannelResponse(
           // text is hard-coded English; localize here where we know the locale).
           const total = items.length;
           const done = items.filter((i: any) => i?.status !== "queued" && i?.status !== "running").length;
-          milestone = (options.locale === "en-US")
+          if (options.onActivity) {
+            groupActivities.set(toolKey(ev, ev.toolName || ev.name || "tool"), { done, total });
+            publishActivity();
+          } else milestone = (options.locale === "en-US")
             ? `Running sub-agents… ${done}/${total} done`
             : `子任务执行中… ${done}/${total} 完成`;
         } else {
@@ -3269,7 +3356,7 @@ export async function collectChannelResponse(
             .trim();
           milestone = channelActivityMilestone(activity, options.locale);
         }
-        if (milestone) options.onMilestone(milestone);
+        if (milestone) options.onMilestone?.(milestone);
       }
 
       if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
@@ -3286,6 +3373,8 @@ export async function collectChannelResponse(
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
+        if (groupActivities.delete(toolKey(ev, ev.toolName || ev.name || "tool"))) publishActivity();
+        if (ev.toolCallId) progressToolNames.delete(ev.toolCallId);
         if (options.includeImages) collectImageAttachments(ev.result?.content, images, seenImageKeys);
         if (persist) {
           const name = (ev.toolName as string) || (ev.name as string) || "tool";
@@ -3351,11 +3440,21 @@ export async function collectChannelResponse(
       }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
+        flushPendingNarration();
+        if (ev.message.stopReason !== "error") {
+          const hasTools = blocks.some((block: any) => block?.type === "toolCall" || block?.type === "tool_use");
+          for (const item of assistantItems.complete(ev.message)) {
+            if (item.phase === "commentary" || hasTools) publishNarration(item.text, item.phase);
+            // Legacy providers have no phase. The next tool/start event proves
+            // this is progress; don't show an unclassified final twice.
+            else if (!item.phase) pendingNarration = item.text;
+          }
+        }
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
         const rowEnvelope = isModelCallRowEnvelope(envelope, ev.message?.stopReason)
           ? redactLlmCallEnvelope(envelope, redact)
           : undefined;
-        let turnText = contentBlocksToMarkdown(blocks);
+        let turnText = assistantTextBlocks(ev.message).map(block => block.text).join("");
         // The SHARED rule, not a second copy of it. The local re-derivation read
         // only `blocks`, so a recovered turn whose final message carries STRING
         // content looked like no output — the error stayed pending and a terminal
@@ -3373,14 +3472,6 @@ export async function collectChannelResponse(
           // cited after this one; the rendered-set prevents any double-append.
         }
         if (turnText) {
-          // A NEW assistant turn means the PREVIOUS one was an intermediate
-          // step (the agent narrated, then called a tool) — surface its first
-          // line as a progress milestone. The final turn is never followed by
-          // another, so it stays the answer, not a milestone.
-          if (lastAssistantText && options.onMilestone) {
-            const m = condenseMilestone(lastAssistantText);
-            if (m) options.onMilestone(m);
-          }
           lastAssistantText = turnText;
         }
         // Persist every model call (intermediate narration, tool-only call, final
@@ -3421,6 +3512,7 @@ export async function collectChannelResponse(
     }
   } catch (err) {
     console.error(`[${logPrefix}] SSE collect error for session=${sessionId}:`, err);
+    if (options.throwOnError) throw err;
   }
   if (persist) await flushTerminalError();
   // Prefer the last full assistant turn; fall back to streamed deltas if the
@@ -3474,7 +3566,7 @@ function channelActivityMilestone(activity: string, locale?: LarkLocale): string
   const clean = activity.trim();
   if (!clean) return "";
   // `Ran <tool>` — a tool name, not a milestone.
-  if (/^Ran\s+\S+$/.test(clean)) return "";
+  if (/^Ran\s+\S+$/.test(clean) || /^Working[.…\s]*\d+ tool calls?$/i.test(clean)) return "";
   // Sub-agent slot wait: real information, but hard-coded English at the source.
   if (/^Waiting for a free slot/i.test(clean)) {
     return locale === "en-US" ? "Waiting for a free sub-agent slot…" : "排队等待子任务空位…";

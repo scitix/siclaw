@@ -1,9 +1,13 @@
+import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * AgentBox HTTP Server
  *
  * Provides HTTP API for Gateway to call, with SSE streaming support.
  */
 
+import { assistantTextBlocks } from "../shared/assistant-items.js";
+import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
+import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
@@ -63,6 +67,7 @@ import {
 } from "../core/subagent-models.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
+import { SESSION_CONTEXT_UNAVAILABLE_CODE, SESSION_CONTEXT_UNAVAILABLE_STATUS } from "../shared/session-context.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -78,6 +83,8 @@ interface Route {
 }
 
 interface PromptRequestBody {
+  /** Trusted Runtime continuation context; per-request, never session-cached. */
+  handoffTrace?: unknown;
   sessionId?: string;
   /** User who initiated this prompt (per-request), forwarded to the trace
    *  recorder as the root span's user.id. */
@@ -88,6 +95,19 @@ interface PromptRequestBody {
   origin?: OriginKind;
   /** Present when a coordinator agent delegated this turn over the mesh. */
   delegation?: DelegationContext;
+  /** Expose `request_input` to a top-level machine-driven turn. */
+  allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
+  /**
+   * Control-plane segment / task this turn belongs to. Carried so the turn can
+   * be correlated back to the control plane's ledger.
+   */
+  segmentId?: string;
+  taskId?: string;
+  /** Reject if `sessionId` has no in-memory or persisted conversation context. */
+  requireExistingSession?: boolean;
   modelProvider?: string;
   modelId?: string;
   releaseId?: string;
@@ -467,19 +487,25 @@ function resolveActiveMode(
  *
  * A delegated agent runs under ITS OWN configuration — the coordinator and the
  * worker manage their own permissions independently, so delegation does NOT
- * downgrade the worker's toolset or persona. `readOnly` is therefore EXPLICIT
- * opt-in only (default false); it is honored when a caller sets it true (a
- * future read-only delegation tier), but never forced on by origin or by
- * omission. The marker's real jobs are the result-artifact contract,
- * one-level anti-recursion, and audit — not permission degradation.
+ * downgrade the worker's toolset or persona, and there is no dial here that
+ * could. The marker's jobs are the result-artifact contract, one-level
+ * anti-recursion, and audit.
  */
 export function resolveDelegation(
   delegation: DelegationContext | undefined,
   _origin: OriginKind | undefined,
 ): DelegationContext | undefined {
   if (!delegation || !delegation.delegationId) return undefined;
-  const readOnly = delegation.readOnly === true;
-  return { ...delegation, readOnly };
+  // Built field by field, NOT spread: this marker arrives in the request body,
+  // so a spread would let a caller smuggle through any property the type gains
+  // later — including one meant to modulate the peer. There is no such property
+  // today and there should not be one; constructing explicitly is what keeps
+  // that true without anyone having to remember it.
+  return {
+    delegationId: delegation.delegationId,
+    ...(delegation.parentSessionId ? { parentSessionId: delegation.parentSessionId } : {}),
+    ...(delegation.parentAgentId ? { parentAgentId: delegation.parentAgentId } : {}),
+  };
 }
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -925,8 +951,34 @@ export function createHttpServer(
 
     const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
     // A delegated agent runs under its own configuration; delegation does not
-    // downgrade it. readOnly is honored only when explicitly set true.
+    // downgrade it.
     const delegation = resolveDelegation(body.delegation, body.origin);
+    // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
+    // dispatch in process memory only, so after a Runtime restart the same turn
+    // would execute twice. This box ran it and outlived that Runtime, so it is
+    // the authority: a turnId already in this session's ledger is answered
+    // WITHOUT starting anything. (See turn-ledger.ts.)
+    if (body.sessionId && body.turnId && sessionManager.hasAcceptedTurn(body.sessionId, body.turnId)) {
+      logPromptResponse(200, "duplicate", undefined, body.sessionId);
+      sendJson(res, 200, { ok: true, sessionId: body.sessionId, turnId: body.turnId, duplicate: true });
+      return;
+    }
+    // The checkpointer read runs BEFORE the strict check, or the check would judge
+    // a session this box has never seen — and refuse it — while the control plane
+    // holds its whole transcript. For a brand-new session the load is one cheap
+    // empty round-trip.
+    const resumed = await sessionManager.ensureSessionContext(body.sessionId);
+    if (body.requireExistingSession === true && !resumed) {
+      const detail = {
+        code: SESSION_CONTEXT_UNAVAILABLE_CODE,
+        message: "The requested session context is unavailable and cannot be resumed",
+        retriable: false,
+        status: SESSION_CONTEXT_UNAVAILABLE_STATUS,
+      };
+      logPromptResponse(SESSION_CONTEXT_UNAVAILABLE_STATUS, "context_unavailable", detail.message);
+      sendJson(res, SESSION_CONTEXT_UNAVAILABLE_STATUS, { error: detail });
+      return;
+    }
     const managed = await sessionManager.getOrCreate(
       body.sessionId,
       body.mode,
@@ -934,6 +986,9 @@ export function createHttpServer(
       activeMode,
       delegation,
       body.userId,
+      body.allowInputRequest === true,
+      body.handoffSupported === true,
+      parseHandoffPolicy(body.handoffPolicy),
     );
     if (managed.mcpManager) {
       observedMcpServers = managed.mcpManager.getServerConnections();
@@ -990,8 +1045,14 @@ export function createHttpServer(
     // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
     // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
     managed._currentTurnId = body.turnId;
+    // Accepted: the session is claimed and this turn is going to run. Recorded
+    // BEFORE the ack, because a record that landed after it would leave open
+    // exactly the window it exists to close. A 409/412 above returns earlier and
+    // deliberately records nothing — that turn did not run.
+    if (body.turnId) sessionManager.recordAcceptedTurn(managed.id, body.turnId);
     if (sessionManager.consumePendingAbort(managed.id, body.turnId)) {
       managed._aborted = true;
+      managed._backgroundWorkTurn?.cancel();
       console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
     }
     // Default to the extra channel; refined to false only for the no-current-model
@@ -1014,7 +1075,7 @@ export function createHttpServer(
     // Subscribe to buffer events so SSE can replay them even if it connects late
     const brainUnsub = managed.brain.subscribe((event) => {
       if (!managed._promptDone && !managed._routeBrainEventsThroughExtra) {
-        managed._eventBuffer.push(event);
+        managed._eventBuffer.push(decorateBackgroundWorkEvent(event, managed._backgroundWorkTurn));
       }
     });
 
@@ -1163,9 +1224,22 @@ export function createHttpServer(
     // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
     // after model setup so a setModel switch is not captured as prompt activity;
     // closed in actuallyFinish, which every terminal path funnels through.
-    tracingRecorder.startPrompt(managed.id, promptText, body.userId);
+    const handoffTrace = normalizeHandoffTrace(body.handoffTrace);
+    tracingRecorder.startPrompt(managed.id, promptText, body.userId, handoffTrace?.traceId, handoffParentSpan(handoffTrace));
+
+    const backgroundWorkTurn = new BackgroundWorkTurn();
+    managed._backgroundWorkTurn = backgroundWorkTurn;
+    let parentReportSeen = false;
+    const reportUnsubscribe = managed.brain.subscribe((event: any) => {
+      if ((event.type !== "message_end" && event.type !== "turn_end") || event.message?.role !== "assistant") return;
+      parentReportSeen = !backgroundWorkTurn.pending && event.message.stopReason !== "toolUse"
+        && event.message.stopReason !== "error" && event.message.stopReason !== "aborted"
+        && assistantTextBlocks(event.message).some(block => block.text.trim() && block.phase !== "commentary");
+    });
 
     const actuallyFinish = () => {
+      backgroundWorkTurn.cancel();
+      reportUnsubscribe();
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
       managed.brain.llmCalls?.endPrompt({ explicit: true });
@@ -1289,7 +1363,7 @@ export function createHttpServer(
       // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
       actuallyFinish();
       logPromptResponse(200, "aborted_before_start", undefined, managed.id);
-      sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, aborted: true });
+      sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, resumed, aborted: true });
       return;
     }
 
@@ -1307,9 +1381,9 @@ export function createHttpServer(
     // Only the no-current-model edge falls back to a bare brain.prompt (runner
     // guard) whose events flow through the live _eventBuffer subscription.
     managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
-    const promptPromise = runPromptWithModelRouting(
+    const runPrompt = (text: string, media?: typeof promptMedia) => runPromptWithModelRouting(
       managed.brain,
-      promptText,
+      text,
       effectivePolicy,
       managed.modelRouteState,
       {
@@ -1317,7 +1391,7 @@ export function createHttpServer(
         // The runner streams/replays brain events through this callback instead
         // of the live SSE subscription that enriches agent_end — re-apply the
         // same enrichment so token/cost stats survive on every turn.
-        emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
+        emitBrainEvent: (event) => emitSessionExtraEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), backgroundWorkTurn)),
         onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
         shouldAbort: () => managed._aborted,
         applyCandidateModelParams: (candidate) => {
@@ -1344,11 +1418,36 @@ export function createHttpServer(
           managed._routeBrainEventsThroughExtra = capturing;
         },
       },
-      promptMedia,
+      media,
       requiredResultToolName
         ? { requiredResultToolName }
         : undefined,
     );
+
+    // Keep the original stream, prompt mutex, trace and persistence consumer alive
+    // through required child completion and parent synthesis. No detached reply path.
+    const promptPromise = (async () => {
+      let result = await runPrompt(promptText, promptMedia);
+      while (!managed._aborted && result?.success !== false) {
+        const notifications = await backgroundWorkTurn.next();
+        if (managed._aborted) break;
+        const steer = backgroundWorkTurn.takeSteer();
+        if (steer) {
+          parentReportSeen = false;
+          result = await runPrompt(steer.text, steer.media);
+          continue;
+        }
+        if (notifications.length === 0) {
+          if (backgroundWorkTurn.jobIds.length && !backgroundWorkTurn.isCancelled && !parentReportSeen) {
+            throw new Error("Required background work finished without a parent report");
+          }
+          break;
+        }
+        parentReportSeen = false;
+        result = await runPrompt(backgroundWorkTurn.resultPrompt(notifications));
+      }
+      return result;
+    })();
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
@@ -1357,6 +1456,7 @@ export function createHttpServer(
       if (result && result.success === false) {
         console.warn(`[agentbox-http] Prompt finished without success for session ${managed.id} (${result.finalFailureKind ?? "unknown"}: ${result.finalErrorMessage ?? "no error message"})`);
         promptOutcome = "error";
+        if (!managed._aborted && backgroundWorkTurn.jobIds.length) sessionManager.stopSessionJobs(managed.id, backgroundWorkTurn.jobIds);
       } else {
         console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
         promptOutcome = "completed";
@@ -1407,11 +1507,13 @@ export function createHttpServer(
     }).catch((err) => {
       console.error(`[agentbox-http] Prompt error for session ${managed.id}:`, err);
       promptOutcome = "error";
+      if (backgroundWorkTurn.jobIds.length) sessionManager.stopSessionJobs(managed.id, backgroundWorkTurn.jobIds);
+      emitSessionExtraEvent({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: backgroundWorkTurn.jobIds.length ? "Parent task could not finish its background-work report" : "Agent execution failed", content: [] } });
       onPromptFinish();
     });
 
     logPromptResponse(200, "accepted", undefined, managed.id);
-    sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, traceId: tracingRecorder.getRootTraceId(managed.id) });
+    sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, resumed, traceId: tracingRecorder.getRootTraceId(managed.id) });
   });
 
   /**
@@ -1500,7 +1602,7 @@ export function createHttpServer(
     const unsubscribe = managed.brain.subscribe((event: any) => {
       if (managed._routeBrainEventsThroughExtra) return;
       // Enrich agent_end with context usage so frontend can display token stats
-      writeEvent(enrichAgentEndEvent(managed.brain, event));
+      writeEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), managed._backgroundWorkTurn));
     });
 
     // Heartbeat: send SSE comment every 30s to keep connection alive
@@ -1597,7 +1699,9 @@ export function createHttpServer(
     // addition to that active prompt, so it inherits this existing trace.
     const traceId = tracingRecorder.getRootTraceId(sessionId);
     try {
-      if (promptMedia) {
+      if (managed._backgroundWorkTurn?.queueSteer(steerText, promptMedia)) {
+        // The original request loop resumes this real input with normal persistence.
+      } else if (promptMedia) {
         await managed.brain.steer(steerText, promptMedia);
       } else {
         await managed.brain.steer(steerText);
@@ -1606,8 +1710,9 @@ export function createHttpServer(
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
       const message = err instanceof Error ? err.message : "Steer failed";
-      sendJson(res, 500, {
-        error: { code: "INTERNAL_ERROR", message, retriable: true },
+      const handingOff = message.includes("HANDOFF_IN_PROGRESS");
+      sendJson(res, handingOff ? 409 : 500, {
+        error: { code: handingOff ? "HANDOFF_IN_PROGRESS" : "INTERNAL_ERROR", message, retriable: true },
       });
     }
   });
@@ -1709,6 +1814,7 @@ export function createHttpServer(
 
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
     managed._aborted = true;
+    managed._backgroundWorkTurn?.cancel();
 
     // Stop is terminal: drop any queued steer/followUp so it does NOT replay on the next prompt.
     try {

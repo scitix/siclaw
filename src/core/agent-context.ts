@@ -42,6 +42,10 @@ export interface CompileAgentContextInput {
   memoryConfigured: boolean;
   mode: SessionMode;
   agentPrompt?: string;
+  interactiveProgress?: boolean;
+  /** A conversation owner has a control emitter and an authorized handoff roster. */
+  handoffAvailable?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   systemPromptTemplate?: string;
   delegation?: DelegationContext;
 }
@@ -117,8 +121,14 @@ export function resolveAgentHarness(
   const modeTools = input.mode === "task" && Array.isArray(resolvedTools) && !resolvedTools.includes("task_report")
     ? [...resolvedTools, "task_report"]
     : resolvedTools;
-  const allowedTools = resolution === "resolved" ? modeTools : [];
-  const delegatedReadOnly = input.delegation?.readOnly === true;
+  // Ownership transfer is a conversation transport capability for every type.
+  // The factory proves emitter/roster/owner availability; unresolved harnesses
+  // still fail closed. This grants no command, delegation, or resource access.
+  const conversationTools = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
+    && Array.isArray(modeTools)
+    ? [...new Set([...modeTools, "transfer_to_agent", "search_handoff_targets"])]
+    : modeTools;
+  const allowedTools = resolution === "resolved" ? conversationTools : [];
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
 
   const canOperate = hasAnyTool(allowedTools, [
@@ -135,27 +145,23 @@ export function resolveAgentHarness(
     // They are an explicit resource-binding axis, not names that can be placed
     // in a static built-in capability group. Siclaw currently receives no
     // trustworthy read/write or binding-source metadata with which to narrow
-    // this set further. Unresolved and delegated-read-only contexts fail closed.
-    mcpExposure: resolution === "resolved" && !delegatedReadOnly ? "configured" : "none",
+    // this set further. An unresolved context fails closed.
+    mcpExposure: resolution === "resolved" ? "configured" : "none",
     memoryEnabled:
       resolution === "resolved" &&
       input.memoryConfigured &&
-      !delegatedReadOnly &&
       hasAnyTool(allowedTools, ["memory_search", "memory_get"]),
     includeBundledSkills:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       canOperate,
     includePlatformSkills:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       hasAnyTool(allowedTools, ["write", "edit", "skill_preview"]),
     includePlanningGuidance:
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
     includeInfrastructureGuidance:
       resolution === "resolved" &&
@@ -163,7 +169,6 @@ export function resolveAgentHarness(
       hasAnyTool(allowedTools, ["cluster_list", "host_list"]),
     includeOperationalSafety:
       resolution === "resolved" &&
-      !delegatedReadOnly &&
       (agentType === "sre" || (agentType === "custom" && canOperate)),
     legacyUnrestrictedCustom,
   };
@@ -172,17 +177,35 @@ export function resolveAgentHarness(
 /** Compile the stable system prompt and enforceable policy for one session. */
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
-  const agentPrompt = input.delegation?.readOnly
-    ? {
-        addendum: typeof input.agentPrompt === "string" && input.agentPrompt.trim()
-          ? input.agentPrompt.trim()
-          : undefined,
-      }
-    : resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
+  const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
+  const handoffContract = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
+    && harness.resolution === "resolved"
+    ? "Conversation ownership: transfer_to_agent is available for this main conversation. " +
+      "When another authorized destination is better suited to continue the user's request, use its " +
+      "coverage evidence from search_handoff_targets to transfer ownership. Query the exact cluster name/ID or host name/ID/IP when known; otherwise search configured capabilities. Do not infer resource ownership from Agent names. General role guidance to route " +
+      "work to a specialist uses this ownership transfer for the main request; reserve delegation for " +
+      "independent subtasks whose results you need back. Handle requests within your own capabilities " +
+      "yourself. Do not guess an ambiguous destination, cycle between agents, or transfer merely to " +
+      "repeat an answer. Not knowing an answer is not a reason to transfer: identify a concrete " +
+      "capability or resource the destination has that can advance the request. If nobody suitable is " +
+      "available, explain what remains unresolved and ask for the specific missing information or access. " +
+      "Before returning to an agent that already participated, identify new verified evidence and why it " +
+      "enables that agent to proceed. This does not grant you additional execution or resource permissions."
+    : undefined;
+  const handoffClosure = input.handoffPolicy && (input.handoffPolicy.remaining === 0 || !input.handoffAvailable) && !input.delegation
+    ? (input.handoffPolicy.remaining === 0
+        ? "Further conversation transfers are disabled for this request. "
+        : "No eligible authorized transfer destination is available for this request. ") +
+      "Continue within your own capabilities. " +
+      "Use the available history and verified results to answer the user in their language. If unresolved, " +
+      "explain the concrete limitation and ask for specific missing information or access. Do not claim " +
+      "success, repeat failed checks without a new basis, or delegate the main request to bypass this limit."
+    : undefined;
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
+    interactiveProgress: input.interactiveProgress ?? (input.mode === "web" && !input.delegation),
     templateOverride: input.systemPromptTemplate,
-    agentTypePrompt: agentPrompt.typeContract,
+    agentTypePrompt: [agentPrompt.typeContract, handoffContract, handoffClosure].filter(Boolean).join("\n\n") || undefined,
     agentAddendum: agentPrompt.addendum,
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,

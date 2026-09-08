@@ -268,3 +268,43 @@ describe("startRuntime — chat.send custom system prompt", () => {
     warn.mockRestore();
   });
 });
+
+describe("authorized handoff trace propagation", () => {
+  it("forwards the source Runtime context to the receiving AgentBox", async () => {
+    server = await bootRuntime();
+    const traceContext = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "1234567890abcdef", traceFlags: 1 };
+    await server.rpcMethods.get("chat.send")!({
+      agentId: "receiver", userId: "u", sessionId: "handoff-trace", text: "continue", skipInitialPersistence: true,
+      handoff: { fromAgentId: "sender", brief: "continue", traceContext },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+    expect(promptCalls[0]).toMatchObject({ handoffTrace: traceContext });
+  });
+  it("does not accept a trace override on an ordinary new user turn", async () => {
+    server = await bootRuntime();
+    await server.rpcMethods.get("chat.send")!({
+      agentId: "a", userId: "u", sessionId: "plain-trace", text: "question",
+      handoffTrace: { traceId: "0123456789abcdef0123456789abcdef" },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+    expect(promptCalls[0]).not.toHaveProperty("handoffTrace", { traceId: "0123456789abcdef0123456789abcdef" });
+  });
+});
+
+
+describe("handoff continuation policy transport", () => {
+  it("resumes the same owner with policy and trace without persisting a fake user message", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const policy = { remaining: 0, visitedAgentIds: ["a", "b"], history: [{ from: "a", to: "b", brief: "inspect" }] };
+    const traceContext = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "1234567890abcdef", traceFlags: 1 };
+    await send({ agentId: "b", userId: "u", sessionId: "closure", text: "Explain what remains unresolved", skipInitialPersistence: true,
+      handoffSupported: false, handoffPolicy: policy, handoff: { fromAgentId: "b", brief: "closure", recovery: true, traceContext } }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+    expect(promptCalls[0]).toMatchObject({ handoffSupported: false, handoffPolicy: policy, handoffTrace: traceContext, requireExistingSession: true });
+    expect((promptCalls[0] as any).text).toContain("continuation of the same request");
+    expect((promptCalls[0] as any).text).toContain("Explain what remains unresolved");
+    expect(chatRepo.ensureChatSession).not.toHaveBeenCalled();
+    expect(chatRepo.appendMessage).not.toHaveBeenCalled();
+  });
+});

@@ -28,12 +28,14 @@
  * clean no-op.
  */
 
+import { normalizeHandoffTrace, type HandoffTraceContext } from "../handoff-trace.js";
 import {
   trace as otelTrace,
   ROOT_CONTEXT,
   SpanStatusCode,
   TraceFlags,
   isValidTraceId,
+  isSpanContextValid,
   type Span,
   type Context,
   type SpanContext,
@@ -472,8 +474,8 @@ function perCallTokenAttributes(usage: unknown): Attributes {
  * CALLER: runSpawnedSubagent (agentbox/session.ts) — a sub-agent passes its parent
  * prompt's root trace id (mainTraceId) here so the child's span tree lands under the
  * SAME trace T1 (block B, sibling root under T1). This is runtime-internal main→child
- * propagation, NOT the old Plan-A portal downlink (removed in 0d9b374a) — do not wire
- * external/gateway trace ids in. Keep this caller comment so it is not mistaken for
+ * propagation. Authorized conversation handoffs also reuse the source AgentBox
+ * trace context via the control plane; public request parameters do not choose it. Keep this caller comment so it is not mistaken for
  * dead code and dropped again.
  */
 function rootContextForTrace(traceId?: string): Context {
@@ -525,13 +527,15 @@ export const tracingRecorder = {
    * Also records a per-prompt root trace id in `promptTraceIds`, decoupled from
    * the tracing export switch: when tracing is on it is the real ROOT span's
    * trace id (so DB-side trace_id matches the exported trace); when off — or when
-   * no attachment exists — a freshly generated 32-hex id, so DB trace_id stamping
+   * no attachment exists — the inherited ID or a fresh 32-hex ID, so DB trace_id stamping
    * works regardless. Read via getRootTraceId; cleared in endPrompt/detach.
    */
   startPrompt(sessionId: string, promptText?: string, userId?: string, traceId?: string, parentSpanContext?: SpanContext): void {
+    const validParent = parentSpanContext && isSpanContextValid(parentSpanContext) ? parentSpanContext : undefined;
+    const inheritedId = validParent?.traceId ?? (traceId && isValidTraceId(traceId) ? traceId : undefined);
     if (!isTracingEnabled()) {
       try {
-        promptTraceIds.set(sessionId, randomBytes(16).toString("hex"));
+        promptTraceIds.set(sessionId, inheritedId ?? randomBytes(16).toString("hex"));
       } catch (err) {
         console.warn("[tracing] startPrompt (id-only) error:", err);
       }
@@ -541,7 +545,7 @@ export const tracingRecorder = {
       const attachment = attachments.get(sessionId);
       if (!attachment) {
         console.debug(`[tracing] startPrompt with no attachment for ${sessionId}; id-only`);
-        promptTraceIds.set(sessionId, randomBytes(16).toString("hex"));
+        promptTraceIds.set(sessionId, inheritedId ?? randomBytes(16).toString("hex"));
         return;
       }
       // A pre-existing trace means a prior endPrompt was missed — abort it cleanly.
@@ -562,9 +566,9 @@ export const tracingRecorder = {
       //     tree under T1.
       //   • else (main prompt) → rootContextForTrace returns ROOT_CONTEXT, a
       //     genuine root whose SDK-assigned trace id is read back.
-      const rootParent = parentSpanContext
-        ? otelTrace.setSpanContext(ROOT_CONTEXT, parentSpanContext)
-        : rootContextForTrace(traceId);
+      const rootParent = validParent
+        ? otelTrace.setSpanContext(ROOT_CONTEXT, validParent)
+        : rootContextForTrace(inheritedId);
       const root = getTracer().startSpan(
         ROOT_SPAN_NAME,
         {
@@ -600,6 +604,17 @@ export const tracingRecorder = {
       });
     } catch (err) {
       console.warn("[tracing] startPrompt error:", err);
+    }
+  },
+
+  /** Capture owned transport metadata before handing off and evicting the session. */
+  captureHandoffTrace(sessionId: string, callId: string): HandoffTraceContext | undefined {
+    try {
+      const parent = tracingRecorder.ensureToolSpan(sessionId, callId, "transfer_to_agent");
+      return normalizeHandoffTrace({ traceId: promptTraceIds.get(sessionId), parentSpanId: parent?.spanId, traceFlags: parent?.traceFlags });
+    } catch (err) {
+      console.warn("[tracing] capture handoff context failed:", err);
+      return undefined;
     }
   },
 

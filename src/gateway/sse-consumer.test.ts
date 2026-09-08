@@ -111,7 +111,7 @@ describe("consumeAgentSse — assistant message flow", () => {
     });
     expect(result.resultText).toContain("### 参考原文");
     expect(result.resultText).toContain("https://docs.feishu.cn/wiki/a");
-    expect((seen[1].message.content[0].text as string)).toBe(result.resultText);
+    expect((seen.filter(e => e.type === "message_end")[0].message.content[0].text as string)).toBe(result.resultText);
   });
 
   it("renders each source exactly once across a turn's messages, never duplicating the union", async () => {
@@ -128,8 +128,8 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const seen: any[] = [];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const narration = seen[1].message.content[0].text as string;
-    const final = seen[3].message.content[0].text as string;
+    const narration = seen.filter(e => e.type === "message_end")[0].message.content[0].text as string;
+    const final = seen.filter(e => e.type === "message_end")[1].message.content[0].text as string;
     expect(narration).toContain(a);
     expect(narration).not.toContain(b);
     expect(final).toContain(b);
@@ -150,7 +150,7 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const seen: any[] = [];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const combined = `${seen[1].message.content[0].text}\n${seen[3].message.content[0].text}`;
+    const combined = `${seen.filter(e => e.type === "message_end")[0].message.content[0].text}\n${seen.filter(e => e.type === "message_end")[1].message.content[0].text}`;
     expect(combined.split(a).length - 1).toBe(1); // present exactly once, not lost, not doubled
   });
 
@@ -165,8 +165,8 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const seen: any[] = [];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const answerOne = seen[1].message.content[0].text as string;
-    const answerTwo = seen[4].message.content[0].text as string;
+    const answerOne = seen.filter(e => e.type === "message_end")[0].message.content[0].text as string;
+    const answerTwo = seen.filter(e => e.type === "message_end")[1].message.content[0].text as string;
     expect(answerOne).toContain(a);
     expect(answerTwo).toContain(a); // new turn — the rendered-set was cleared, so it renders again
   });
@@ -211,6 +211,36 @@ describe("consumeAgentSse — assistant message flow", () => {
     });
     const assistantRow = appendCalls.find((r) => r.role === "assistant");
     expect(assistantRow.traceId).toBe("0123456789abcdef0123456789abcdef");
+  });
+
+  it("keeps the handoff trace in relayed control events and both agents' persisted rows", async () => {
+    const traceContext = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "0123456789abcdef", traceFlags: 1 };
+    const handoff = { type: "handoff_requested", targetAgentId: "agent-b", brief: "Check nodes", traceContext };
+    const seen: any[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "I will transfer this check." }] } },
+        { type: "tool_execution_start", toolName: "transfer_to_agent", toolCallId: "transfer-a", args: {} },
+        handoff,
+        { type: "tool_execution_end", toolName: "transfer_to_agent", toolCallId: "transfer-a", result: { content: [{ type: "text", text: "Transferred" }] } },
+      ]), sessionId: "sid", userId: "u", agentId: "agent-a", persistMessages: true,
+      traceId: traceContext.traceId, onEvent: (event) => { seen.push(event); },
+    });
+    expect(seen.find(event => event.type === "handoff_requested")).toEqual(handoff);
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "bash", toolCallId: "nodes-b", args: {} },
+        { type: "tool_execution_end", toolName: "bash", toolCallId: "nodes-b", result: { content: [{ type: "text", text: "5" }] } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "There are 5 nodes." }] } },
+      ]), sessionId: "sid", userId: "u", agentId: "agent-b", persistMessages: true,
+      traceId: traceContext.traceId,
+    });
+    for (const agentId of ["agent-a", "agent-b"]) {
+      const rows = appendCalls.filter(row => row.fromAgentId === agentId);
+      expect(rows.some(row => row.role === "assistant")).toBe(true);
+      expect(rows.some(row => row.role === "tool")).toBe(true);
+      expect(rows.every(row => row.traceId === traceContext.traceId)).toBe(true);
+    }
   });
 
   it("merges the agent_end context-usage snapshot onto the last assistant row's metadata", async () => {
@@ -1548,4 +1578,221 @@ it("persists and redacts buffered failure envelopes from route switches", async 
   ]), sessionId: "s", userId: "u", persistMessages: true, redactionConfig: { patterns: [/sk-[a-z0-9]+/g] } });
   expect(appendCalls.filter(r => r.metadata?.kind === "model_route_notice")).toHaveLength(1);
   expect(appendCalls[0].metadata.discarded_llm_calls).toEqual([{ ...call, error_message: "secret [REDACTED]" }]);
+});
+
+// 交接之后这一轮就结束了 —— 但只是"按约定"结束:transfer_to_agent 的结果文本让模型
+// 停下,模型不一定听。测试环境里观察到的就是不听:facade 把会话交出去之后又重试了
+// 刚失败的工具、再调一个、然后写了一段"转交链路可能有问题,会话又回到了我这里"。
+// 那段话抢在接手方的答案前面到达用户 —— 恰好是"看起来像一个 agent"要避免的 —— 而且
+// 它被**落库**了,以后每一轮回灌都会把它当历史读进去。
+describe("consumeAgentSse — 交接之后", () => {
+  const handoff = { type: "handoff_requested", targetAgentId: "agent-cn", brief: "查 roce-test 节点数" };
+
+  it("交接帧本身照常relay —— 控制面靠它决定下一跳去哪", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([handoff]), sessionId: "s", userId: "u",
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen).toEqual([handoff]);
+  });
+
+  // ⚠️ 第一版这一刀切掉了**全部**事件,把被弃权那一轮的 agent_end 也带走了 ——
+  // 前端剩下一个只见 agent_start、永远等不到 agent_end 的 turn,答案已经到了,
+  // "still working" 的转圈还挂在上面。turn 生命周期是客户端的状态机,不是输出。
+  it("生命周期事件照常放过,否则前端的转圈永远停不下来", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        handoff,
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "多余的话" }] } },
+        { type: "agent_end" },
+        { type: "turn_end" },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["handoff_requested", "agent_end", "turn_end"]);
+  });
+
+  // ⚠️ 这条是"转圈停不下来"的第二次:transfer_to_agent 从自己的 execute() 里发
+  // handoff_requested,所以它的 tool_execution_end 落在标志位之后。上一版按类型
+  // 静音把它也吞了,前端那行工具永远停在 running,而 running 的工具行就是"还在干活"
+  // 的判据 —— 答案都出来了,转圈还挂着。**关**的事件不能按类型静音。
+  it("交接前就开始的工具,它的结束事件照常放过", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "transfer_to_agent", toolCallId: "call-t", args: {} },
+        handoff,
+        { type: "tool_execution_end", toolName: "transfer_to_agent", toolCallId: "call-t", result: { content: [{ type: "text", text: "已交接" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual([
+      "tool_execution_start", "handoff_requested", "tool_execution_end",
+    ]);
+  });
+
+  // 反过来:交接之后才开始的工具,开和关都得藏 —— 只放"关"会让控制台把一个没有对应
+  // 行的结果贴到最后一个还在跑的工具上。
+  it("交接之后才开始的工具,开和关都藏", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        handoff,
+        { type: "tool_execution_start", toolName: "bash", toolCallId: "call-b", args: {} },
+        { type: "tool_execution_end", toolName: "bash", toolCallId: "call-b", result: { content: [{ type: "text", text: "多余的" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["handoff_requested"]);
+    expect(appendCalls.some((c) => c.toolName === "bash")).toBe(false);
+  });
+
+  it("交接之后的事件既不relay也不落库", async () => {
+    const seen: unknown[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_start", message: { role: "assistant" } },
+        handoff,
+        { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get nodes" } },
+        { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "boom" }] } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "转交链路可能存在问题" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (e: any) => { seen.push(e); },
+    });
+    expect(seen.map((e: any) => e.type)).toEqual(["message_start", "handoff_requested"]);
+    expect(appendCalls.map((c) => c.content)).not.toContain("转交链路可能存在问题");
+    expect(appendCalls.some((c) => c.toolName === "bash")).toBe(false);
+  });
+
+  // 交接之前的一切照常 —— 这个开关只往后切,不影响 facade 在决定交接前做的判断。
+  it("交接之前的事件不受影响", async () => {
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "cluster_list", args: {} },
+        { type: "tool_execution_end", toolName: "cluster_list", result: { content: [{ type: "text", text: "{}" }] } },
+        handoff,
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+    });
+    expect(appendCalls.some((c) => c.toolName === "cluster_list")).toBe(true);
+  });
+});
+
+// 交接之后,session 的 agent_id 永远还是 facade —— 一段对话两个作者,谁答的哪一轮
+// 只有这一列说得清。少了它,运维读 transcript、分析回溯一个坏答案,看到的是一条
+// 挂在 facade 名下、分不出层次的流水。
+describe("consumeAgentSse — 落库时打上执行方", () => {
+  it("assistant 与 tool 行都带 from_agent_id", async () => {
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get nodes" } },
+        { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "4 nodes" }] } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "4 个节点" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true, agentId: "agent-cn",
+    });
+    expect(appendCalls.length).toBeGreaterThan(0);
+    for (const c of appendCalls) expect(c.fromAgentId).toBe("agent-cn");
+  });
+
+  // 没传就是 NULL,不是空串:会话没换过手时,session 自己的 agent_id 已经回答了这个
+  // 问题,再存一遍只是把同一个事实写两处。
+  it("没传执行方就落 NULL", async () => {
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "tool_execution_start", toolName: "bash", args: { command: "ls" } },
+        { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+    });
+    expect(appendCalls.length).toBeGreaterThan(0);
+    for (const c of appendCalls) expect(c.fromAgentId).toBeNull();
+  });
+});
+
+describe("conversation phases", () => {
+  it("keeps progress distinct from the final answer in live events and persisted history", async () => {
+    const seen: any[] = [];
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "我先检查节点状态。", textSignature: JSON.stringify({ v: 1, id: "msg_p", phase: "commentary" }) }, { type: "toolCall", id: "c1", name: "bash", arguments: {} }], stopReason: "toolUse" } },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "共有 5 个节点。", textSignature: JSON.stringify({ v: 1, id: "msg_f", phase: "final_answer" }) }], stopReason: "stop" } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: async (event: any) => { seen.push(event); },
+    });
+    expect(seen.filter(e => e.type === "item/completed" && !e.dbMessageId).map(e => e.item.phase)).toEqual(["commentary", "commentary", "final_answer", "final_answer"]);
+    expect(appendCalls.filter(e => e.role === "assistant").map(e => e.metadata?.phase)).toEqual(["commentary", "final_answer"]);
+    for (const row of appendCalls.filter(e => e.role === "assistant")) {
+      const item = row.metadata.assistant_item;
+      expect(item.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      const deliveries = seen.filter(e => e.type === "item/completed" && e.item.id === item.id);
+      expect(deliveries.length).toBeGreaterThan(0);
+      expect(deliveries.every(e => e.assistantItem.completedAt === item.completedAt)).toBe(true);
+    }
+  });
+});
+
+
+describe("assistant lifecycle persistence", () => {
+  it("does not reuse a previous executor's task report after handoff", async () => {
+    const result = await consumeAgentSse({ client: mkClient([
+      { type: "tool_execution_start", toolName: "task_report", args: { summary: "provisional" } },
+      { type: "tool_execution_end", toolName: "task_report", result: { content: [{ type: "text", text: "source provisional report" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "source progress" }] } },
+      { type: "agent_switch", toAgentId: "overseas" },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "destination conclusion" }] } },
+    ]), sessionId: "s", userId: "u", persistMessages: false });
+    expect(result.resultText).toBe("destination conclusion");
+    expect(result.taskReportText).toBe("");
+  });
+  it("persists message_end plus its turn_end echo once, preserving later identical answers", async () => {
+    const message = { role: "assistant", content: [{ type: "text", text: "5 nodes" }], stopReason: "stop" };
+    await consumeAgentSse({ client: mkClient([
+      { type: "turn_start" }, { type: "message_end", message },
+      { type: "turn_end", message },
+      { type: "turn_start" }, { type: "message_end", message },
+      { type: "turn_end", message },
+    ]), sessionId: "s", userId: "u", persistMessages: true });
+    expect(appendCalls.filter(c => c.role === "assistant").map(c => c.content)).toEqual(["5 nodes", "5 nodes"]);
+  });
+  it("retains turn_end-only providers", async () => {
+    await consumeAgentSse({ client: mkClient([{ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "fallback" }] } }]), sessionId: "s", userId: "u", persistMessages: true });
+    expect(appendCalls.filter(c => c.role === "assistant").map(c => c.content)).toEqual(["fallback"]);
+  });
+});
+
+
+describe("required child work stays in the original assistant stream", () => {
+  it("does not forward an internal result echo as a user steer", async () => {
+    const onUserMessageStarted = vi.fn();
+    const onEvent = vi.fn();
+    await consumeAgentSse({ client: mkClient([
+      { type: "message_start", internalMessage: true, message: { role: "user", content: [{ type: "text", text: "internal child results" }] } },
+    ]), sessionId: "s", userId: "u", onUserMessageStarted, onEvent });
+    expect(onUserMessageStarted).not.toHaveBeenCalled();
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(["awaitingBackgroundJobs", "awaitingSubagents"])("persists %s as commentary, followed by one plain-text final report", async (waitingFlag) => {
+    const events = [
+      { type: "message_end", [waitingFlag]: true, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking nodes", textSignature: JSON.stringify({ v: 1, phase: "final_answer" }) }] } },
+      { type: "turn_end", [waitingFlag]: true, message: { role: "assistant", content: [{ type: "text", text: "Checking nodes" }] } },
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "All five nodes are ready" }] } },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(result.resultText).toBe("All five nodes are ready");
+    const rows = appendCalls.filter(r => r.role === "assistant");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].metadata.phase).toBe("commentary");
+    expect(rows[0].metadata.assistant_item.phase).toBe("commentary");
+    expect(rows[1].content).toBe("All five nodes are ready");
+  });
 });

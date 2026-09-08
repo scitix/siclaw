@@ -17,6 +17,12 @@ import {
 } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
 
+const supportsConversationsMock = vi.hoisted(() => vi.fn());
+vi.mock("../conversation-client.js", async (original) => ({
+  ...await original<typeof import("../conversation-client.js")>(),
+  supportsConversations: supportsConversationsMock,
+}));
+
 // ── Mocks ──────────────────────────────────────────────────────────
 
 // Stub AgentBoxClient so tests don't open real HTTPS sockets.
@@ -250,6 +256,7 @@ async function waitForExpect(assertion: () => void): Promise<void> {
 }
 
 beforeEach(() => {
+  supportsConversationsMock.mockReset().mockResolvedValue(false);
   promptMock.mockReset();
   streamEventsMock.mockReset();
   closeSessionMock.mockReset();
@@ -595,7 +602,8 @@ describe("handleLarkMessage — personal bot p2p", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("不需要 PAIR");
   });
 
-  it("p2p /new resets only the current personal session", async () => {
+  it.each([false, true])("p2p /new resets only the current personal session (managed=%s)", async (managed) => {
+    supportsConversationsMock.mockResolvedValue(managed);
     resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
       bindingId: "personal-bot-1",
       sessionId: "old-personal",
@@ -611,6 +619,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
     });
     const lark = makeLarkClient();
     const mgr = makeAgentBoxManager("a1");
+    const frontend = { request: vi.fn().mockResolvedValue({ ok: true }) };
 
     await handleLarkMessage(
       makeTextEvent("/new", { chat_type: "p2p" }),
@@ -618,14 +627,19 @@ describe("handleLarkMessage — personal bot p2p", () => {
       "personal-bot-1",
       mgr as any,
       undefined,
-      {} as any,
+      frontend as any,
       "zh-CN",
       makePersonalConfig("platform_authorized"),
     );
+    if (managed) {
+      expect(frontend.request).toHaveBeenCalledWith("conversation.abort", { agentId: "a1", sessionId: "old-personal", userId: "user-1" });
+      expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    }
 
     expect(resetPersonalSessionMock).toHaveBeenCalledWith("personal-bot-1", "platform_user:user-1", expect.anything());
     expect(resetBindingSessionMock).not.toHaveBeenCalled();
-    expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
+    if (managed) expect(closeSessionMock).not.toHaveBeenCalled();
+    else expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 
@@ -2540,6 +2554,40 @@ describe("buildChannelTurnPrompt", () => {
 // ── handleLarkMessage × streaming card integration ────────────────
 
 describe("handleLarkMessage — streaming card flow", () => {
+  it("keeps one card through remote handoff without launching a local AgentBox", async () => {
+    supportsConversationsMock.mockResolvedValue(true);
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    appendMessageMock.mockResolvedValue("original-user-row");
+    let receive: (data: unknown) => void = () => {};
+    const frontend = {
+      connected: true,
+      subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
+      request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.start") {
+          for (const event of [
+            { type: "text", text: "正在准备国内检查" },
+            { type: "agent_switch", toAgentId: "overseas", toAgentName: "海外 SRE" },
+            { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "海外检查完成：5 个节点" }] } },
+            { type: "prompt_done" },
+          ]) receive({ sessionId: input.sessionId, requestId: input.userMessageId, event });
+          return { sessionId: input.sessionId };
+        }
+        return {};
+      }),
+    };
+    const lark = makeCardAwareLarkClient();
+    const manager = makeAgentBoxManager();
+    await handleLarkMessage(makeTextEvent("检查海外"), lark, "lark", manager as any, undefined, frontend as any);
+    expect(manager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(frontend.request).toHaveBeenCalledWith("conversation.start", expect.objectContaining({ agentId: "a1", userMessageId: "original-user-row", origin: "channel" }));
+    const content = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content;
+    expect(content).toContain("海外检查完成：5 个节点");
+    expect(content).not.toContain("正在准备国内检查");
+    expect(lark.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
+    expect(appendMessageMock.mock.calls.filter(([row]) => row.role === "assistant")).toHaveLength(0);
+  });
+
   function makeCardAwareLarkClient() {
     return {
       im: {
@@ -2813,6 +2861,11 @@ describe("handleLarkMessage — streaming card flow", () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-fg-progress" });
     streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{
+        type: "text", text: "正在分别核对网络和存储。",
+        textSignature: JSON.stringify({ v: 1, phase: "commentary" }),
+      }] } };
+
       // Group progress carries structured details.items; the card localizes it (tool text is
       // hard-coded English, so we render N/M from items in the channel locale).
       yield {
@@ -2834,10 +2887,13 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls.map((c: any) => c[0].data.content as string);
     // Localized (zh-CN default) progress step, computed from items (2 done / 3 total).
-    expect(contentCalls.some((c) => c.includes("子任务执行中") && c.includes("2/3") && c.includes("⏳"))).toBe(true);
+    expect(contentCalls.some((c) => c.includes("子任务：") && c.includes("2/3") && c.includes("⏳"))).toBe(true);
     // Not the raw English activity text.
     expect(contentCalls.some((c) => c.includes("Running sub-agents"))).toBe(false);
+    expect(contentCalls.some((c) => c.includes("正在分别核对网络和存储。") && c.includes("2/3"))).toBe(true);
     expect(contentCalls.at(-1)).toContain("统一结论");
+    expect(contentCalls.at(-1)).not.toContain("2/3");
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1); // one card, no child cards
   });
 
   it("never shows a bare tool name as a step, but keeps the agent's own narration", async () => {
@@ -3946,6 +4002,69 @@ describe("collectResponse — SSE event flattening", () => {
     expect(milestones).toEqual(["先看 node 状态", "node 正常,继续查 `sichek`"]);
     // The final turn is the answer, not a milestone.
     expect(collected.text).toBe("结论:GPU#3 fatal,建议换卡。");
+  });
+
+  it("publishes a native commentary block before a long tool starts and ignores reasoning", async () => {
+    const milestones: string[] = [];
+    const text = "先检查节点状态。";
+    const signature = JSON.stringify({ v: 1, phase: "commentary" });
+    const client = { streamEvents: async function* () {
+      yield { type: "message_start", message: { role: "assistant" } };
+      yield { type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "private reasoning" } };
+      yield { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "先检查" } };
+      expect(milestones).toEqual([]); // no token-by-token card churn
+      yield { type: "message_update", assistantMessageEvent: {
+        type: "text_end", content: text,
+        partial: { content: [{ type: "text", text, textSignature: signature }] },
+      } };
+      expect(milestones).toEqual([text]); // observed BEFORE any tool response
+      yield { type: "message_end", message: { role: "assistant", content: [
+        { type: "text", text, textSignature: signature }, { type: "toolCall", name: "bash" },
+      ] } };
+      yield { type: "tool_execution_start", toolCallId: "cmd", toolName: "bash", args: { command: "kubectl get nodes" } };
+      expect(milestones).toEqual([text]); // completion and tool events don't repeat it
+      yield { type: "message_end", message: { role: "assistant", content: [{
+        type: "text", text: "共 5 个节点。", textSignature: JSON.stringify({ v: 1, phase: "final_answer" }),
+      }] } };
+    } };
+    const collected = await collectChannelResponse(client as any, "native-progress", "lark", {
+      onMilestone: text => milestones.push(text),
+    });
+    expect(milestones).toEqual([text]);
+    expect(collected.text).toBe("共 5 个节点。");
+  });
+
+  it("publishes end-only legacy narration at tool start without waiting for another model reply", async () => {
+    const milestones: string[] = [];
+    const client = { streamEvents: async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: "先查询集群。" } };
+      yield { type: "tool_execution_start", toolCallId: "cmd", toolName: "bash" };
+      expect(milestones).toEqual(["先查询集群。"]);
+      yield { type: "message_end", message: { role: "assistant", content: "共 5 个节点。" } };
+    } };
+    const collected = await collectChannelResponse(client as any, "legacy-progress", "lark", {
+      onMilestone: text => milestones.push(text),
+    });
+    expect(milestones).toEqual(["先查询集群。"]);
+    expect(collected.text).toBe("共 5 个节点。");
+  });
+
+  it("keeps parallel sub-task activity separate from narration and clears settled batches", async () => {
+    const milestones: string[] = [];
+    const activity: string[] = [];
+    await collectChannelResponse(fakeClient([
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "分别检查两个集群。", textSignature: JSON.stringify({ v: 1, phase: "commentary" }) }] } },
+      { type: "tool_execution_update", toolName: "spawn_subagent", toolCallId: "g1", partialResult: { details: { items: [{ status: "done" }, { status: "running" }] } } },
+      { type: "tool_execution_update", toolName: "spawn_subagent", toolCallId: "g2", partialResult: { details: { items: [{ status: "failed" }, { status: "queued" }] } } },
+      { type: "tool_execution_start", toolName: "bash", toolCallId: "cmd" },
+      { type: "tool_execution_update", toolCallId: "cmd", partialResult: { content: [{ type: "text", text: "raw command output" }] } },
+      { type: "tool_execution_end", toolName: "spawn_subagent", toolCallId: "g1" },
+      { type: "tool_execution_end", toolName: "spawn_subagent", toolCallId: "g2" },
+    ]), "parallel-progress", "lark", {
+      onMilestone: text => milestones.push(text), onActivity: text => activity.push(text), locale: "en-US",
+    });
+    expect(milestones).toEqual(["分别检查两个集群。"]);
+    expect(activity).toEqual(["Sub-tasks: 1/2 finished", "Sub-tasks: 2/4 finished", "Sub-tasks: 1/2 finished", ""]);
   });
 
   it("never exposes renderer source in intermediate channel milestones", async () => {

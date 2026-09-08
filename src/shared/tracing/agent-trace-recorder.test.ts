@@ -1008,3 +1008,41 @@ describe("root span trace id (decoupled per-prompt id)", () => {
     expect(tid).not.toBe("not-a-valid-trace-id");
   });
 });
+
+describe("conversation handoff trace continuity", () => {
+  it("keeps A → B → A in one trace with separate agent and transfer spans; a new question gets a new trace", () => {
+    tracingRecorder.attach("a", makeBrain(), { agentId: "agent-a" });
+    tracingRecorder.startPrompt("a", "question", "u");
+    const first = tracingRecorder.captureHandoffTrace("a", "transfer-1")!;
+    expect(first.parentSpanId).toMatch(/^[0-9a-f]{16}$/);
+    tracingRecorder.endPrompt("a", "completed");
+    tracingRecorder.attach("b", makeBrain(), { agentId: "agent-b" });
+    tracingRecorder.startPrompt("b", "continue", "u", first.traceId, { traceId: first.traceId, spanId: first.parentSpanId!, traceFlags: first.traceFlags!, isRemote: true });
+    const second = tracingRecorder.captureHandoffTrace("b", "transfer-2")!;
+    expect(second.traceId).toBe(first.traceId);
+    expect(second.parentSpanId).not.toBe(first.parentSpanId);
+    tracingRecorder.endPrompt("b", "completed");
+    tracingRecorder.startPrompt("a", "continue again", "u", second.traceId, { traceId: second.traceId, spanId: second.parentSpanId!, traceFlags: second.traceFlags!, isRemote: true });
+    tracingRecorder.endPrompt("a", "completed");
+    const agents = byKind(SpanKind.AGENT);
+    expect(agents).toHaveLength(3);
+    expect(new Set(spans().map(s => s.spanContext().traceId))).toEqual(new Set([first.traceId]));
+    expect(parentIdOf(agents[1])).toBe(first.parentSpanId);
+    expect(parentIdOf(agents[2])).toBe(second.parentSpanId);
+    expect(new Set(agents.map(s => s.spanContext().spanId)).size).toBe(3);
+    tracingRecorder.startPrompt("a", "new user question", "u");
+    expect(tracingRecorder.getRootTraceId("a")).not.toBe(first.traceId);
+    tracingRecorder.endPrompt("a", "completed");
+  });
+  it.each([false, true])("inherits the audit trace with no attachment, export enabled=%s", enabled => {
+    if (!enabled) __installTracerProviderForTest(null);
+    const traceId = "0123456789abcdef0123456789abcdef";
+    tracingRecorder.startPrompt("handoff-no-attachment", "continue", "u", traceId);
+    expect(tracingRecorder.getRootTraceId("handoff-no-attachment")).toBe(traceId);
+    expect(tracingRecorder.captureHandoffTrace("handoff-no-attachment", "transfer-x")).toEqual({ traceId });
+    tracingRecorder.endPrompt("handoff-no-attachment", "completed");
+    tracingRecorder.startPrompt("handoff-no-attachment", "new question", "u");
+    expect(tracingRecorder.getRootTraceId("handoff-no-attachment")).not.toBe(traceId);
+    tracingRecorder.endPrompt("handoff-no-attachment", "completed");
+  });
+});

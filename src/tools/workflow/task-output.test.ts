@@ -94,3 +94,18 @@ describe("task_output tool", () => {
     expect(JSON.parse((r.content[0] as { text: string }).text).error).toBe(true);
   });
 });
+
+
+it("provides complete byte pagination beyond the default tail window", async () => {
+  const body = "BEGIN\n" + "中文🚀证据\n".repeat(100) + "END";
+  await seedOutput("job-pages", body);
+  let offset: number | null = 0, full = "";
+  while (offset !== null) {
+    const page = await run(snap({ status: "completed" }), { task_id: "job-pages", offset, limit: 31 });
+    full += page.output;
+    offset = page.next_offset;
+    expect(Buffer.byteLength(page.output)).toBeLessThanOrEqual(31);
+    expect(page.complete).toBe(offset === null);
+  }
+  expect(full).toBe(body);
+});

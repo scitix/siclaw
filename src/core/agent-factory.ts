@@ -1,3 +1,4 @@
+import { scheduleToolOutputCleanup } from "./tool-output-cleanup.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -73,6 +74,7 @@ import {
 import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 
+import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
@@ -95,6 +97,13 @@ export interface CreateSiclawSessionOpts {
   delegationRoster?: import("./tool-registry.js").ToolRefs["delegationRoster"];
   /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
+  /** Facade / backend side: agents this one may HAND the conversation to
+   *  (internal index only). Non-empty plus a search executor exposes discovery and transfer. */
+  handoffTargets?: import("./tool-registry.js").ToolRefs["handoffTargets"];
+  searchHandoffTargets?: import("./tool-registry.js").ToolRefs["searchHandoffTargets"];
+  getHandoffTraceContext?: import("./tool-registry.js").ToolRefs["getHandoffTraceContext"];
+  /** Drops this box's local copy of the session after handing it away. */
+  evictSessionContext?: () => Promise<void>;
   /** Agent tool allow-list: null is unrestricted only for explicit Custom; built-in types expand their locked groups. */
   allowedTools?: string[] | null;
   /** Agent kind used by the shared context compiler. Legacy standalone callers default to SRE. */
@@ -163,6 +172,10 @@ export interface CreateSiclawSessionOpts {
    * frontend can render them in a nested block).
    */
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
+  /** Expose `request_input` to this top-level machine-driven session. */
+  allowInputRequest?: boolean;
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
   /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
@@ -185,6 +198,7 @@ export interface CreateSiclawSessionOpts {
 
 export interface SiclawSessionResult {
   brain: BrainSession;
+  toolResultArtifactStore: ToolResultArtifactStore;
   session: AgentSession;  // backward compat — only set for pi-agent brain
   /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the TUI */
   services: AgentSessionServices;
@@ -425,6 +439,9 @@ export async function createSiclawSession(
     agentPrompt: opts?.systemPromptAppend,
     systemPromptTemplate: opts?.systemPromptTemplate,
     delegation: opts?.delegation,
+    handoffPolicy: opts?.handoffPolicy,
+    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
+    interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
   });
   const allowedTools = compiledContext.harness.allowedTools;
   const memoryEnabled = compiledContext.harness.memoryEnabled;
@@ -452,6 +469,7 @@ export async function createSiclawSession(
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
   const toolResultArtifactsDir = toolResultArtifactRoot(sessionManager.getSessionDir());
+  scheduleToolOutputCleanup(path.dirname(sessionManager.getSessionDir()));
   const knowledgeDir = opts?.knowledgeDir
     ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
       ? opts.portalKnowledgeDir
@@ -543,33 +561,32 @@ export async function createSiclawSession(
       skillScriptResolver,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
+      allowInputRequest: opts?.allowInputRequest === true,
+      handoffSupported: opts?.handoffSupported === true,
+      handoffPolicy: opts?.handoffPolicy,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
-      // Force sub-agents foreground when a detached batch's conclusion would be
-      // stranded because the caller blocks on the turn's own result and has no
-      // persistent client to receive a later notification:
-      //   • Channel (Feishu/DingTalk): exposes spawn_subagent, no persistent client.
-      //   • Delegated peer (any delegation turn): the gateway prompts it with no
-      //     mode → it runs as "web" (so it has FULL capabilities incl. spawn), but
-      //     the coordinator delegates SYNCHRONOUSLY (drains one turn's stream). A
-      //     backgrounded batch would return an intermediate "started…" and the
-      //     coordinator would poll by re-delegating. Foreground makes the one turn
-      //     carry the complete result.
-      // Direct api/a2a/task calls need no handling here: spawn_subagent's `modes`
-      // are web/channel/cli only, so those entries never expose it. web/cli keep
-      // background (persistent clients). run_in_background exec is untouched.
+      // Channels currently deliver one foreground response. Do not advertise
+      // background launches until they support an owned, resumable delivery lifecycle.
+      // Delegated peers retain foreground subagents for their synchronous result contract.
       foregroundSubagentOnly: mode === "channel" || opts?.delegation != null,
       // The tier menu this session will advertise. Passed in rather than read from
       // box state because the tool schema is built HERE, once: the menu the lead is
       // shown has to be the one its choice is later resolved against.
       subagentTierMenu: opts?.subagentTierMenu ?? null,
       jobStopExecutor: opts?.jobStopExecutor,
-      backgroundExecExecutor: opts?.backgroundExecExecutor,
+      backgroundExecExecutor: allowsBackgroundExec(mode, allowedTools) && opts?.taskOutputReader && opts?.jobStopExecutor
+        ? opts.backgroundExecExecutor : undefined,
       taskOutputReader: opts?.taskOutputReader,
       channelMessageExecutor: opts?.channelMessageExecutor,
       delegation: opts?.delegation,
       delegationRoster: opts?.delegationRoster,
       delegateToAgentExecutor: opts?.delegateToAgentExecutor,
+      handoffTargets: opts?.handoffTargets,
+      searchHandoffTargets: opts?.searchHandoffTargets,
+      handoffSearchMatches: new Map(),
+      getHandoffTraceContext: opts?.getHandoffTraceContext,
+      evictSessionContext: opts?.evictSessionContext,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",
@@ -665,12 +682,6 @@ export async function createSiclawSession(
     isToolResultArtifactPath(candidate)
     || blockedFileDirs.some((blocked) => isPathInsideDir(candidate, blocked.dir));
 
-  // Read-only delegated turn: drop the write file tools (Edit/Write) so a
-  // delegated worker cannot mutate even its own scratch dir. Reads (Read/Grep/
-  // Find/Ls) stay. These tools live outside the registry, so the resolve()
-  // readOnlyDelegable filter doesn't reach them — gate them here instead.
-  const delegatedReadOnly = opts?.delegation?.readOnly === true;
-
   const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
@@ -686,7 +697,6 @@ export async function createSiclawSession(
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
-    ...(delegatedReadOnly ? [] : [
       createEditTool(cwd, {
         operations: {
           readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedFileDirs); return fsReadFile(p); },
@@ -700,7 +710,6 @@ export async function createSiclawSession(
           mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedFileDirs); await fsMkdir(d, { recursive: true }); },
         },
       }),
-    ]),
     createGrepTool(cwd, {
       operations: {
         isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.statSync(p).isDirectory(); },
@@ -733,6 +742,16 @@ export async function createSiclawSession(
   // Subject to allowedTools (same chokepoint as MCP append above): file tools are
   // created outside the registry, so the shared name-based whitelist is applied here.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
+
+  for (let i = 0; i < customTools.length; i++) {
+    const tool = customTools[i];
+    if (!tool.name.startsWith("tool_result_") && !mcpTools.includes(tool)) {
+      customTools[i] = withToolResultArtifactCapture(tool, toolResultArtifactStore,
+        tool.name === "spawn_subagent" ? 0 : 4096);
+    }
+  }
+
+
   // Citation registration is an intrinsic, side-effect-free companion to Read,
   // but it must have a delivery sink — otherwise the tool would promise that
   // links are appended while CLI/child sessions silently drop the event.
@@ -1006,7 +1025,7 @@ export async function createSiclawSession(
     });
   };
   return {
-    brain, session, services, extensionsResult, modelFallbackMessage, customTools,
+    brain, session, services, extensionsResult, modelFallbackMessage, customTools, toolResultArtifactStore,
     skillNames, skillDigests, getSkillSnapshot,
     kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
     sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,

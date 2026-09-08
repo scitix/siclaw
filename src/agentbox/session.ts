@@ -11,11 +11,13 @@
  * and restored from JSONL on the next prompt.
  */
 
+import type { BackgroundWorkTurn } from "./background-work-turn.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeRehydratedSession } from "./session-rehydrate-store.js";
 import { createSiclawSession } from "../core/agent-factory.js";
 import type {
   SpawnSubagentExecutor,
@@ -36,8 +38,9 @@ import type {
   AgentMode,
 } from "../core/tool-registry.js";
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentPodConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getGroupPodShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
-import { buildReduceInput, GroupCircuitBreaker, truncateReduceSummary, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
+import { GroupCircuitBreaker, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
+import { hasAcceptedTurn, recordAcceptedTurn } from "./turn-ledger.js";
 import { buildNotificationBatch, buildGroupNotificationSummary, summarizeItemStatuses, type TaskNotification } from "../core/task-notification.js";
 import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
@@ -47,6 +50,7 @@ import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "
 import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
 import { normalizeAgentType } from "../core/agent-types.js";
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
+import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
@@ -70,6 +74,12 @@ import type {
   DelegationToolUpdatePayload,
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
+import { assistantTextBlocks } from "../shared/assistant-items.js";
+import { scheduleToolOutputCleanup } from "../core/tool-output-cleanup.js";
+import { ToolResultArtifactStore, toolResultArtifactRoot, formatToolResultArtifactReference, getToolResultArtifactDetails } from "../core/tool-result-artifact.js";
+import { prepareReduceEvidence } from "./subagent-evidence.js";
+import { runSubagentToAcceptance } from "./subagent-completion.js";
+import { restoreTaskLedgerFromHistory } from "./task-ledger-recovery.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
 import { getOrCreateLedger, peekLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
 import { createCoalescedWriter, createSerialQueue } from "./keyed-writes.js";
@@ -136,6 +146,8 @@ export interface ManagedSession {
   isRetrying: boolean;
   /** Whether the current prompt has finished (for race condition prevention) */
   _promptDone: boolean;
+  /** Required background work owned by the current user prompt. */
+  _backgroundWorkTurn?: BackgroundWorkTurn;
   /** Events buffered during prompt execution (replayed when SSE connects) */
   _eventBuffer: unknown[];
   /** Unsubscribe function for the event buffer subscription */
@@ -224,6 +236,10 @@ export interface ManagedSession {
   /** Delegation context this agent was built for (undefined = non-delegated). Drives
    *  rebuild when the delegation tier changes on a reused session id. */
   delegation?: DelegationContext;
+  /** Whether this session was built with top-level `request_input` available. */
+  allowInputRequest: boolean;
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -347,34 +363,15 @@ const LEDGER_AUTOCLEAR_MS = 5_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
 
-/**
- * System-prompt addendum for a read-only DELEGATED worker turn (a peer agent
- * dispatched by a coordinator over the mesh). Mirrors the general-purpose
- * sub-agent persona (core/subagent-registry.ts) but tailored: read-only tier +
- * the structured `report_findings` hand-off contract. The coordinator relays the
- * worker's stream to the user as one assistant identity, so the worker writes a
- * concise human-readable narrative AND calls report_findings once at the end.
- */
-const DELEGATED_READONLY_PERSONA =
-  "You are handling ONE bounded diagnostic task delegated to you by a coordinator agent. " +
-  "This is a READ-ONLY investigation: inspect and gather evidence only. You have read-only " +
-  "tools — kubectl read commands (get/describe/logs/top/events) and shell text tools via bash, " +
-  "cluster/host lookups, and memory search — but NO write or remediation tools; do not attempt " +
-  "to change any infrastructure. Do exactly the task described, then END by calling the " +
-  "`report_findings` tool once with a compact structured result (findings / actions_taken / " +
-  "residual_state). Keep your visible narrative concise — the user sees it directly. Do not ask " +
-  "for confirmation; if blocked, report what you found and what's missing in report_findings.";
-
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Rebuild key for the delegation tier: "none" (non-delegated) | "ro" | "rw".
- *  Only the tier (not the ids) affects the resolved toolset, so a re-delegation
- *  of the same session at the same tier reuses the built agent. */
-function delegationSignature(d: DelegationContext | undefined): "none" | "ro" | "rw" {
-  if (!d) return "none";
-  return d.readOnly ? "ro" : "rw";
+ *  The ids do not affect the resolved toolset, so a re-delegation of the same
+ *  session reuses the built agent. */
+function delegationSignature(d: DelegationContext | undefined): "none" | "delegated" {
+  return d ? "delegated" : "none";
 }
 
 async function abortBrainBestEffort(
@@ -398,6 +395,18 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
+  // Retain the launching request owner until notification, even if Stop/handoff
+  // replaces the session's current request before a late child/process exit.
+  private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
+
+  private registerBackgroundWork(sessionId: string, jobId: string): BackgroundWorkTurn | undefined {
+    const owner = this.sessions.get(sessionId)?._backgroundWorkTurn;
+    if (owner) {
+      owner.register(jobId);
+      this.backgroundWorkOwners.set(jobId, owner);
+    }
+    return owner;
+  }
   /** Per-session write chain so route-state persists land in call order. */
   private _modelRouteStatePersists = new Map<string, Promise<void>>();
   private defaultSessionId = "default";
@@ -755,11 +764,28 @@ export class AgentBoxSessionManager {
    */
   private getSessionDir(sessionId: string): string {
     const base = this.getBaseSessionDir();
+    scheduleToolOutputCleanup(base);
     const dir = path.join(base, sessionId);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
     return dir;
+  }
+
+  /**
+   * Has this session already accepted `turnId`? The AgentBox is the dispatch
+   * de-duplication authority across a Runtime restart, because it is what runs
+   * the turn and it outlives the Runtime. See turn-ledger.ts.
+   */
+  hasAcceptedTurn(sessionId: string, turnId: string): boolean {
+    if (!sessionId || !turnId) return false;
+    return hasAcceptedTurn(this.getSessionDir(sessionId), turnId);
+  }
+
+  /** Records `turnId` as accepted by this session (durable, best-effort). */
+  recordAcceptedTurn(sessionId: string, turnId: string): void {
+    if (!sessionId || !turnId) return;
+    recordAcceptedTurn(this.getSessionDir(sessionId), turnId);
   }
 
   /**
@@ -970,6 +996,7 @@ export class AgentBoxSessionManager {
     // session with the same id. Never let stale work drain or schedule release
     // on that replacement.
     if (this.sessions.get(sessionId) !== managed) return;
+    managed._backgroundWorkTurn?.cancel();
     this.clearPendingNotificationState(managed);
     // scheduleRelease() may have declined to arm while the notification buffer
     // owned the session. Once Stop abandons that work, restore the ordinary
@@ -1180,6 +1207,7 @@ export class AgentBoxSessionManager {
     type ItemState = {
       status: "queued" | "running" | GroupItemStatus;
       summary: string;
+      fullSummary?: string;
       childSessionId: string;
       activity?: string;
       /** Which model this item ran on and why — absent for items that never started. */
@@ -1298,6 +1326,7 @@ export class AgentBoxSessionManager {
         // (which counts `done` only), so a cancellation stub can never fabricate a reduce over nothing.
         state.status = res.status;
         state.summary = res.summary;
+        state.fullSummary = res.fullSummary ?? res.summary;
         state.childSessionId = res.childSessionId;
         state.tierOutcome = res.tierOutcome;
       }
@@ -1339,13 +1368,9 @@ export class AgentBoxSessionManager {
     let reduceError: string | undefined;    // reduce ran but did not complete → drives status + groupSummary (kept off the report as its own key)
     let reduceSkippedForCancel = false;      // reduce requested but skipped because the user cancelled
 
-    // Reduce gate: run when a reduce_prompt was given AND at least one item COMPLETED on its own
-    // (`doneCount > 0`), the user didn't cancel, and the breaker didn't trip. Every map-child
-    // `partial` is a cancellation stub (runSpawnedSubagent reports `partial` only when stopped —
-    // by mapAbort or the parent's `_aborted` setup-window check — never for real partial output),
-    // so gating on `done` (not `done+partial`) stops a fully-timed-out batch from running a reduce
-    // over N "was cancelled" notices. The reduce INPUT still includes every item's summary, so
-    // genuine content from a completed-enough batch is never dropped from the synthesis.
+    // Require at least one accepted result before synthesis. Partial results may now contain
+    // useful evidence without satisfying their assignment; preserve them in the reducer input
+    // and the parent report, but never turn an entirely unverified batch into a green completion.
     if (request.reducePrompt) {
       if (userAbort.signal.aborted) {
         reduceSkippedForCancel = true;
@@ -1353,11 +1378,12 @@ export class AgentBoxSessionManager {
         const outcomes: GroupItemOutcome[] = states.map((s, i) => ({
           item: tasks[i].item,
           status: s.status as GroupItemStatus,
-          summary: s.summary,
+          summary: s.fullSummary ?? s.summary,
         }));
         const reduceReq: SpawnSubagentRequest = {
           description: `${request.description} — summary`,
-          prompt: buildReduceInput(request.reducePrompt, outcomes),
+          prompt: request.reducePrompt,
+          inputReports: outcomes,
           subagentType: request.subagentType,
           runInBackground: false,
           parentSessionId: request.parentSessionId,
@@ -1388,12 +1414,10 @@ export class AgentBoxSessionManager {
             );
           })));
           if (reduceRes.status === "done") {
-            // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
-            // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
-            // to 6000 was a no-op and the larger group budget never took effect.
-            const trunc = truncateReduceSummary(reduceRes.fullSummary ?? reduceRes.summary);
-            reduceSummary = trunc.text;
-            reduceTruncated = trunc.truncated;
+            // Keep the complete synthesis. Model context is bounded by recoverable artifacts,
+            // not by dropping the report tail before it reaches the caller.
+            reduceSummary = reduceRes.fullSummary ?? reduceRes.summary;
+            reduceTruncated = false;
             reduceChildSessionId = reduceRes.childSessionId;
           } else {
             // Reduce child failed / timed out / cancelled: do NOT set reduceSummary — that would
@@ -1432,6 +1456,7 @@ export class AgentBoxSessionManager {
       item: tasks[i].item,
       status: s.status as GroupItemStatus,
       summary: s.summary,
+      fullSummary: s.fullSummary,
       childSessionId: s.childSessionId,
       tierOutcome: s.tierOutcome,
     }));
@@ -1530,6 +1555,7 @@ export class AgentBoxSessionManager {
    * parent on completion. Background work blocks session release until it finishes.
    */
   private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest, traceCtx?: SubagentTraceContext): SubagentGroupResult {
+    this.registerBackgroundWork(request.parentSessionId, request.spawnId);
     const jobId = request.spawnId;
     const controller = new AbortController();
 
@@ -1601,7 +1627,8 @@ export class AgentBoxSessionManager {
     const onProgress = this.makeGroupProgressEmitter(request.parentSessionId, jobId);
 
     void this.runSubagentGroup(request, onProgress.emit, controller.signal, traceCtx)
-      .then((report) => {
+      .then(async (report) => {
+        await this.persistSubagentJobOutput(jobId, JSON.stringify(report));
         onProgress.settle();
         const job = this.jobs.get(jobId);
         const stopped = job?.status === "stopped";
@@ -1612,7 +1639,8 @@ export class AgentBoxSessionManager {
           status,
           summary: stopped
             ? `Sub-agent group "${request.description}" was stopped`
-            : buildGroupNotificationSummary(request.description, report),
+            : buildGroupNotificationSummary(request.description, report) +
+              `\nComplete reports: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`,
         });
       })
       .catch((err) => {
@@ -1707,9 +1735,22 @@ export class AgentBoxSessionManager {
     return async (jobId) => this.jobs.stopJob(jobId);
   }
 
-  private createTaskOutputReader(): TaskOutputReader {
+  private async persistSubagentJobOutput(jobId: string, report: string): Promise<void> {
+    const job = this.jobs.get(jobId);
+    if (!job) throw new Error("Background report has no owning job");
+    const store = new ToolResultArtifactStore({
+      rootDir: toolResultArtifactRoot(this.getSessionDir(job.parentSessionId)),
+      getScope: () => ({ agentId: this.agentId ?? `user:${this.userId}`, sessionId: job.parentSessionId }),
+    });
+    const saved = await store.capture({ text: report, toolCallId: jobId, toolName: "subagent_report" });
+    if (!("reference" in saved)) throw new Error(`Background report storage failed: ${saved.failure.reason}`);
+    job.reportArtifact = saved.reference;
+  }
+
+  private createTaskOutputReader(parentSessionId: string): TaskOutputReader {
     // Snapshot the job's live status so task_output can report running/terminal (same as TUI).
-    return (jobId) => this.jobs.snapshot(jobId);
+    return (jobId) => this.jobs.get(jobId)?.parentSessionId === parentSessionId
+      ? this.jobs.snapshot(jobId) : { found: false };
   }
 
   private createChannelMessageExecutor(): ChannelMessageExecutor {
@@ -1749,9 +1790,10 @@ export class AgentBoxSessionManager {
    * signal), but also the detached background jobs, which are otherwise decoupled from the turn.
    * Returns how many were stopped.
    */
-  stopSessionJobs(sessionId: string): number {
+  stopSessionJobs(sessionId: string, jobIds?: readonly string[]): number {
     let stopped = 0;
     for (const job of this.jobs.list(sessionId)) {
+      if (jobIds && !jobIds.includes(job.jobId)) continue;
       // suppressNotifyTurn: the user's Stop is terminal. The completion still folds each job's card
       // to "stopped", but we must NOT wake the model with a synthetic turn reacting to the
       // cancellation — that "comes back to life after Stop" is exactly what the button must avoid.
@@ -1819,6 +1861,10 @@ export class AgentBoxSessionManager {
         }
       }
 
+      // Register BEFORE spawning: even a synchronously completed job belongs to
+      // this request. Roll back if launch throws and the tool falls back foreground.
+      const owner = this.registerBackgroundWork(req.parentSessionId, req.jobId);
+
       // Pair the increment with the decrement: if spawnBackgroundBash throws
       // synchronously (e.g. SanitizingLineBuffer fail-closed, spawn EACCES) the job's
       // close/error handlers never wire onSettled, so undo the increment here — otherwise
@@ -1831,6 +1877,8 @@ export class AgentBoxSessionManager {
           () => this.releaseBackgroundWork(req.parentSessionId),
         );
       } catch (err) {
+        owner?.unregister(req.jobId);
+        this.backgroundWorkOwners.delete(req.jobId);
         this.releaseBackgroundWork(req.parentSessionId);
         throw err;
       }
@@ -1853,6 +1901,7 @@ export class AgentBoxSessionManager {
    * parent model. Background work blocks session release until it finishes.
    */
   private startBackgroundSubagent(request: SpawnSubagentRequest, traceCtx?: SubagentTraceContext): SpawnSubagentResult {
+    this.registerBackgroundWork(request.parentSessionId, request.spawnId);
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
     // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
@@ -1947,7 +1996,8 @@ export class AgentBoxSessionManager {
     const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
     void sessionLim.run(() => this.podSubagentLimiter.run(() =>
       this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })))
-      .then((res) => {
+      .then(async (res) => {
+        if (res.status !== "launched") await this.persistSubagentJobOutput(jobId, res.fullSummary ?? res.summary);
         const job = this.jobs.get(jobId);
         const status: JobStatus =
           job?.status === "stopped"
@@ -1961,7 +2011,8 @@ export class AgentBoxSessionManager {
             ? `Sub-agent "${request.description}" was stopped`
             : res.status === "launched"
               ? `Sub-agent "${request.description}" finished`
-              : `Sub-agent "${request.description}" ${res.status}: ${res.summary}`;
+              : `Sub-agent "${request.description}" ${res.status}: ${res.summary}\n` +
+                `Complete report: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`;
         void this.notifyParent(request.parentSessionId, jobId, {
           taskId: jobId,
           status,
@@ -2012,6 +2063,9 @@ export class AgentBoxSessionManager {
     // flips running → done/failed live and on reload. Exec jobs only (sub-agents have their
     // own Jobs-bar fold). Independent of the model turn below.
     const job = this.jobs.get(jobId);
+    if (job?.reportArtifact) {
+      n = { ...n, summary: `${n.summary}\n${formatToolResultArtifactReference(job.reportArtifact, "Complete background report", 1000)}` };
+    }
     if (job && job.type !== "subagent") {
       void this.persistExecJobEvent(sessionId, jobId, n.status, job.exitCode);
     } else if (job) {
@@ -2039,12 +2093,15 @@ export class AgentBoxSessionManager {
     // User Stop is terminal: the card already folded to "stopped" above, but do NOT wake the model
     // with a synthetic turn reacting to its own cancellation (the "won't stop" behavior). Card
     // folds, model stays silent.
+    const owner = this.backgroundWorkOwners.get(jobId) ?? managed._backgroundWorkTurn;
+    this.backgroundWorkOwners.delete(jobId);
+    if (owner?.complete(n)) return;
     if (job?.suppressNotifyTurn) return;
 
     // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
     // via the synthetic-turn path (never followUp): the completion itself already shows in the
-    // tool box (exec_job_done above), and a followUp's acknowledgement rides the running turn
-    // where it can't be suppressed. The synthetic path drops pure acks (no tool call).
+    // tool box (exec_job_done above). Requests without an owner use the legacy
+    // queued delivery path; attached work has already returned above.
     managed._pendingNotifications.push(n);
     if (!managed._coalesceTimer) {
       managed._coalesceTimer = setTimeout(() => {
@@ -2087,17 +2144,10 @@ export class AgentBoxSessionManager {
     }
     const batch = managed._pendingNotifications.splice(0);
     if (batch.length === 0) return;
-    // A notification with NO output_file carries its result INLINE in the summary (sub-agents —
-    // see task-notification.ts). For those the model's report is pure text (no read tool call),
-    // so the turnHadTool persist guard below would wrongly drop it — allow a text-only reaction.
-    // Require EVERY notification in the batch to be inline-result (`.every`, not `.some`): a
-    // mixed batch (sub-agent + a shell/exec job whose data lives in output_file) must keep the
-    // STRICT guard, else the shell job's pure-ack ("nothing new") text gets persisted as a noise
-    // bubble — the exact thing turnHadTool suppresses. In that rare mixed case the sub-agent's
-    // result is still visible via its own card fold (annotateSubagentCompletions), so only the
-    // model's optional prose is dropped, never the result itself.
-    const allInlineResult = batch.every((n) => !n.outputFile);
-    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch), allInlineResult);
+    // Public model output must not be filtered by tool usage or the types of
+    // jobs coalesced into this batch. Required subagents bypass this legacy
+    // detached-job path and are consumed by their original HTTP prompt.
+    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch));
   }
 
   /**
@@ -2107,7 +2157,7 @@ export class AgentBoxSessionManager {
    * already started (re-check degrades us to followUp) or hits the 409 guard. This closes
    * the TOCTOU documented at the _promptInflight declaration.
    */
-  private runSyntheticPrompt(managed: ManagedSession, text: string, allowTextOnlyPersist = false): Promise<void> {
+  private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
@@ -2276,6 +2326,33 @@ export class AgentBoxSessionManager {
         } catch (err) {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
+          // Preserve non-empty public output, including pure-text reports.
+          const turnHadText = turnMessages.some((m) => {
+            if (m.role !== "assistant") return false;
+            const c = Array.isArray(m.content)
+              ? m.content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("")
+              : typeof m.content === "string" ? m.content : "";
+            return c.trim().length > 0;
+          });
+          if (canPersist && !managed._aborted && (turnHadTool || turnHadText)) {
+            try {
+              // Preserve message order; emit done only after every write succeeds.
+              for (const message of turnMessages) {
+                await this.persistSyntheticMessage(sid, message, currentModelRouteMetadata);
+              }
+              await this.persistDelegationEvent({
+                type: "delegation.emit_chat_event",
+                sessionId: sid,
+                event: { type: "background_turn_done", sessionId: sid },
+              });
+            } catch (err) {
+              console.error(`[agentbox-session] background report delivery failed for ${sid}:`, err);
+              await this.persistDelegationEvent({
+                type: "delegation.emit_chat_event", sessionId: sid,
+                event: { type: "stream_error", sessionId: sid, error: "Background report could not be saved" },
+              }).catch(error => console.error(`[agentbox-session] background error delivery failed for ${sid}:`, error));
+            }
+          }
           managed.brain.llmCalls?.endPrompt({ explicit: true });
           managed._promptDone = true;
           managed._routeBrainEventsThroughExtra = false;
@@ -2285,38 +2362,12 @@ export class AgentBoxSessionManager {
           managed._promptInflight = null;
           release();
           if (managed._backgroundWorkCount === 0) this.scheduleRelease(managed.id);
-          // Decide whether to keep the model's reaction. Normally we keep it ONLY if it made a
-          // tool call: for a bash/exec completion the data lives in output_file, so a data-bearing
-          // report necessarily reads that file first (a tool call), and a text-only reaction is a
-          // pure ack ("nothing new") we drop to avoid a noise bubble (the completion already shows
-          // in the launching tool's own box).
-          // EXCEPTION (allowTextOnlyPersist): a sub-agent's result is delivered INLINE in the
-          // notification summary — the model reports it as pure text with NO tool call. There the
-          // text IS the answer the user is waiting for, so keep a non-empty text-only reaction too.
-          const turnHadText = turnMessages.some((m) => {
-            if (m.role !== "assistant") return false;
-            const c = Array.isArray(m.content)
-              ? m.content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("")
-              : typeof m.content === "string" ? m.content : "";
-            return c.trim().length > 0;
-          });
-          // When kept, persist the whole turn then fire a refetch so the frontend shows it.
-          if (canPersist && (turnHadTool || (allowTextOnlyPersist && turnHadText))) {
-            void Promise.allSettled(
-              turnMessages.map((m) => this.persistSyntheticMessage(sid, m, currentModelRouteMetadata).catch(() => {})),
-            ).then(() =>
-              this.persistDelegationEvent({
-                type: "delegation.emit_chat_event",
-                sessionId: sid,
-                event: { type: "background_turn_done", sessionId: sid },
-              }).catch(() => {}),
-            );
-          }
         }
       });
-    managed._syntheticPromptQueue = run.finally(() => {
-      if (managed._syntheticPromptQueue === run) managed._syntheticPromptQueue = null;
+    const queued = run.finally(() => {
+      if (managed._syntheticPromptQueue === queued) managed._syntheticPromptQueue = null;
     });
+    managed._syntheticPromptQueue = queued;
     return run;
   }
 
@@ -2431,6 +2482,7 @@ export class AgentBoxSessionManager {
       message = { ...message, content: stripLanguageDirective(message.content) };
     }
     const result = await this.persistDelegationEvent({ type: "delegation.append_message", message });
+    if (!result.ok) throw new Error("Message persistence was rejected");
     return result.id ?? "";
   }
 
@@ -2805,6 +2857,11 @@ export class AgentBoxSessionManager {
         : "";
 
     let finalText = "";
+    let lastStopReason: string | undefined;
+    const responseFragments: string[] = [];
+    let reviewing = false;
+    let deadlineReached = false;
+    let childTimer: ReturnType<typeof setTimeout> | undefined;
     let toolCalls = 0;
     let status: SpawnSubagentStatus = "done";
     const pendingTools = new Map<string, { startMs: number; toolName: string; toolset?: string; toolInput?: string }>();
@@ -2818,6 +2875,7 @@ export class AgentBoxSessionManager {
       // Feed the recorder FIRST, unconditionally (gated on tracing state), so the child's
       // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
       if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
+      if (reviewing) return;
       if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
         toolCalls++;
         const toolName = (event.toolName as string) || (event.name as string) || "tool";
@@ -2837,7 +2895,7 @@ export class AgentBoxSessionManager {
         const toolName = (event.toolName as string) || (event.name as string) || pending?.toolName || "tool";
         const durationMs = pending ? Date.now() - pending.startMs : null;
         const outcome: "success" | "error" = event.isError ? "error" : "success";
-        const resultText = redactText(extractEventText(event.result?.content), redactionConfig).slice(0, 4000);
+        const resultText = redactText(extractEventText(event.result?.content), redactionConfig);
         liveSteps.push({ kind: "tool", toolName, toolInput: pending?.toolInput, content: resultText.slice(0, 1000), outcome, durationMs });
         emitProgress(`Finished ${toolName}`);
         enqueuePersist(async () => {
@@ -2848,6 +2906,7 @@ export class AgentBoxSessionManager {
             toolName,
             toolset: pending?.toolset ?? (typeof event.toolset === "string" ? event.toolset : null),
             toolInput: pending?.toolInput,
+            metadata: getToolResultArtifactDetails(event.result?.details) ?? undefined,
             outcome,
             durationMs,
             fromAgentId: agentId,
@@ -2859,9 +2918,11 @@ export class AgentBoxSessionManager {
         });
       }
       if (event?.type === "message_end" && event.message?.role === "assistant") {
+        lastStopReason = event.message.stopReason;
         const text = extractEventText(event.message.content).trim();
         if (text) {
-          finalText = text;
+          finalText = [...responseFragments, text].join("\n");
+          if (lastStopReason === "length") responseFragments.push(text);
           liveSteps.push({ kind: "assistant", text: redactText(text, redactionConfig) });
           emitProgress();
           enqueuePersist(async () => {
@@ -2869,6 +2930,15 @@ export class AgentBoxSessionManager {
               sessionId: childSessionId,
               role: "assistant",
               content: redactText(text, redactionConfig),
+              metadata: {
+                phase: assistantTextBlocks(event.message).find((b) => b.phase)?.phase,
+                stop_reason: event.message.stopReason,
+                ...(event.message.errorMessage ? { error_message: redactText(event.message.errorMessage, redactionConfig) } : {}),
+                assistant_item: {
+                  api: event.message.api, provider: event.message.provider, model: event.message.model,
+                  textSignature: event.message.content?.find((b: any) => b.type === "text")?.textSignature,
+                },
+              },
               fromAgentId: agentId,
               parentSessionId: request.parentSessionId,
               delegationId,
@@ -2904,10 +2974,33 @@ export class AgentBoxSessionManager {
           `sub-agent could not be placed on a model${tierOutcome.detail ? `: ${tierOutcome.detail}` : ""}`,
         );
       }
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
-      );
-      await Promise.race([child.brain.prompt(this.buildSpawnedSubagentPrompt(request)), timeoutPromise]);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        childTimer = setTimeout(() => {
+          deadlineReached = true;
+          reject(new Error("spawn_subagent_timeout"));
+        }, DELEGATED_AGENT_MAX_RUNTIME_MS);
+        childTimer.unref?.();
+      });
+      const execution = async () => {
+        const promptRequest = request.inputReports ? {
+          ...request,
+          prompt: await prepareReduceEvidence(request.prompt, request.inputReports, child.toolResultArtifactStore),
+        } : request;
+        if (stopRequested || deadlineReached) throw new Error("stopped before sub-agent prompt started");
+        return runSubagentToAcceptance({
+        brain: child.brain,
+        prompt: this.buildSpawnedSubagentPrompt(promptRequest),
+        assignment: request.prompt,
+        stopped: () => stopRequested || deadlineReached,
+        stopReason: () => lastStopReason,
+        reviewing: (active) => { reviewing = active; },
+        });
+      };
+      const acceptance = await Promise.race([execution(), timeoutPromise]);
+      if (!acceptance.accepted && !stopRequested) {
+        status = lastStopReason === "error" ? "failed" : "partial";
+        finalText = `${finalText}\n\n[Task completion not verified: ${redactText(acceptance.reason ?? "incomplete", redactionConfig)}]`;
+      }
     } catch (err) {
       interruptedTool = [...pendingTools.values()][0]?.toolName;
       if (stopRequested) {
@@ -2937,6 +3030,7 @@ export class AgentBoxSessionManager {
         finalText = finalText || `Sub-agent failed: ${failureText}`;
       }
     } finally {
+      if (childTimer) clearTimeout(childTimer);
       unsubscribe();
       // Shut down only connections this child opened. A manager shared with the
       // parent outlives every child and is torn down with the parent session.
@@ -2966,7 +3060,7 @@ export class AgentBoxSessionManager {
     // terminal persist, mirroring the main-prompt ordering.
     tracingRecorder.endPrompt(childSessionId, status === "done" ? "completed" : "error");
     try {
-      const bundle = buildDelegateSummaryBundle(finalText);
+      const bundle = buildDelegateSummaryBundle(redactText(finalText, redactionConfig));
       const durationMs = Date.now() - startedAt;
 
       // Drain prior (best-effort) trace writes, then emit the terminal event.
@@ -3045,6 +3139,116 @@ export class AgentBoxSessionManager {
     await this.release(sessionId);
   }
 
+  /**
+   * Sessions handed away have a durable sibling marker. The source finishes
+   * appending its terminal tool result before release deletes the stale cache.
+   * Only successful control-plane rehydration clears the marker, including
+   * after a process restart or a hand-back to a still-resident session.
+   */
+  private readonly evictedSessions = new Set<string>();
+
+  private removeCachedSessionTranscript(sessionId: string): void {
+    const directory = this.getSessionDir(sessionId);
+    // Handoff invalidates the conversational cache, not scoped evidence still referenced by
+    // history. Artifacts retain their own TTL and authorization; they are never shared implicitly.
+    for (const name of fs.readdirSync(directory)) {
+      if (name !== ".tool-results") fs.rmSync(path.join(directory, name), { recursive: true, force: true });
+    }
+    if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
+  }
+
+
+  /**
+   * Forget a session this box has handed away. See `evictedSessions`.
+   */
+  async evictSessionContext(sessionId: string): Promise<void> {
+    const id = sessionId?.trim();
+    if (!id) return;
+    const marker = `${this.getSessionDir(id)}.handoff`;
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, "reload from control plane\n", { mode: 0o600 });
+    this.evictedSessions.add(id);
+  }
+
+  /**
+   * Make sure a continuation has context to continue FROM — the checkpointer read.
+   *
+   * Local JSONL is a cache; the control plane is the authority. When this box has
+   * nothing for `sessionId` (another agent ran the earlier turns, or a replica /
+   * restart moved the session here), pull the transcript and write it as a pi
+   * session BEFORE `getOrCreate` runs `continueRecent` — which then restores it
+   * through the exact path a pod restart already uses. Nothing downstream learns
+   * the history was ever remote.
+   *
+   * Returns whether context now exists, so the strict `requireExistingSession`
+   * check in http-server can read the truthful state instead of the pre-load one.
+   *
+   * A failure returns false. Handoff requests require existing history and the
+   * HTTP boundary rejects them rather than starting with missing context.
+   */
+  async ensureSessionContext(sessionId?: string): Promise<boolean> {
+    const id = sessionId?.trim();
+    if (!id) return false;
+    // Release a completed resident brain before rebuilding its stale transcript.
+    // Keep the durable marker until a nonempty history has been written.
+    const marker = `${this.getSessionDir(id)}.handoff`;
+    if (this.evictedSessions.has(id) || fs.existsSync(marker)) {
+      const resident = this.sessions.get(id);
+      if (resident && (!resident._promptDone || resident._promptInflight)) return false;
+      if (resident?._releaseTimer) { clearTimeout(resident._releaseTimer); resident._releaseTimer = null; }
+      await this.release(id);
+      try {
+        this.removeCachedSessionTranscript(id);
+      } catch (err) {
+        console.error(`[agentbox-session] Cannot discard stale context for ${id}:`, err);
+        return false;
+      }
+    } else if (this.hasRestorableSessionContext(id)) {
+      return true;
+    }
+    const gc = this.gatewayClient;
+    if (!gc) return false;
+    try {
+      const { messages } = await gc.fetchSessionHistory(id);
+      if (!messages?.length) return false; // a genuinely new session — nothing to load
+      const { written } = writeRehydratedSession(process.cwd(), this.getSessionDir(id), messages);
+      if (restoreTaskLedgerFromHistory(id, messages)) await this.persistLedgerSnapshot(id);
+      console.log(`[agentbox-session] Rehydrated session ${id} from the control plane: ${messages.length} rows → ${written} messages`);
+      if (written > 0) {
+        fs.rmSync(marker, { force: true });
+        this.evictedSessions.delete(id);
+      }
+      return written > 0;
+    } catch (err) {
+      console.error(`[agentbox-session] Could not rehydrate session ${id} from the control plane; strict continuations must not start:`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Whether a requested continuation can recover real conversation context.
+   * A resident session is resumable in memory; otherwise the pi-agent JSONL
+   * must contain more than its header. Fail closed when the history is absent
+   * or unreadable so a continuation never starts from an isolated answer.
+   */
+  hasRestorableSessionContext(sessionId?: string): boolean {
+    const id = sessionId?.trim();
+    if (!id) return false;
+    if (this.sessions.has(id)) return true;
+
+    const sessionDir = path.join(this.getBaseSessionDir(), id);
+    if (!fs.existsSync(sessionDir)) return false;
+    try {
+      return SessionManager.continueRecent(process.cwd(), sessionDir).getEntries().some(
+        (entry: { type?: string; message?: { role?: string } }) =>
+          entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant"),
+      );
+    } catch (err) {
+      console.warn(`[agentbox-session] Session context for ${id} is unreadable:`, err);
+      return false;
+    }
+  }
+
   async getOrCreate(
     sessionId?: string,
     mode?: SessionMode,
@@ -3052,6 +3256,9 @@ export class AgentBoxSessionManager {
     activeMode: AgentMode = "normal",
     delegation?: DelegationContext,
     requestUserId?: string,
+    allowInputRequest = false,
+    handoffSupported = false,
+    handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
@@ -3091,11 +3298,16 @@ export class AgentBoxSessionManager {
           existing._releaseTimer = null;
           console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
         }
-        // Reuse unless the operating mode OR the delegation tier changed mid-session
+        // Reuse unless the operating mode, delegation tier, or explicit input
+        // capability changed mid-session
         // (e.g. user toggled Deep Investigation, or a reused session id flips between a
         // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
         // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
         const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
+        const sameInputCapability = existing.allowInputRequest === allowInputRequest
+          && Boolean(existing.handoffSupported) === handoffSupported
+          && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
+          && existing.mode === (mode ?? "web");
         // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
         // change falls through to a rebuild below), but every delegation turn gets a NEW
         // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
@@ -3116,14 +3328,14 @@ export class AgentBoxSessionManager {
           existing.delegation.parentAgentId = delegation.parentAgentId;
         }
         if (
-          (existing.activeMode === activeMode && sameDelegation && !needsUserIdentityRebuild) ||
+          (existing.activeMode === activeMode && sameDelegation && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
           existing._promptInflight
         ) {
           return existing;
         }
         console.log(
-          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/${effectiveUserId ?? "anonymous"}`,
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
         );
         await this.releaseForRebuild(id, existing);
       }
@@ -3175,6 +3387,13 @@ export class AgentBoxSessionManager {
     const EXTRA_EVENT_BUFFER_CAP = 1000;
     let extraEventBufferOverflowed = false;
     const emitExtraEvent = (event: Record<string, unknown>) => {
+      if (event.type === "handoff_requested") {
+        const owner = this.sessions.get(id)?._backgroundWorkTurn;
+        if (owner) {
+          owner.cancel();
+          this.stopSessionJobs(id, owner.jobIds);
+        }
+      }
       // Task ledger events are persisted (refresh recovery, design §14 Approach A)
       // in addition to being streamed live below.
       if (isTaskEvent(event)) {
@@ -3230,6 +3449,21 @@ export class AgentBoxSessionManager {
         }
       }
     }
+    // Handoff destinations: the agents this one may transfer the conversation
+    // to. Same delivery as the delegation roster (K8s boxes have no DB) and the
+    // same degradation — a fetch miss just means transfer_to_agent stays hidden
+    // and this agent answers the turn itself, which is a worse answer but not a
+    // broken one. Skipped on a delegated turn: a peer has no standing to dispose
+    // of the coordinator's session.
+    let handoffTargets: HandoffTarget[] | undefined;
+    if (gc && !delegation) {
+      try {
+        const r = await gc.fetchHandoffTargets();
+        handoffTargets = r.targets?.length ? r.targets : undefined;
+      } catch (err) {
+        console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
+      }
+    }
     const delegateToAgentExecutor: DelegateToAgentExecutor | undefined = (gc && delegationRoster)
       ? async (req, onProgress, signal) => {
           // Translate the peer's live event stream into coordinator-card steps
@@ -3242,7 +3476,7 @@ export class AgentBoxSessionManager {
           const pending = new Map<string, { toolName?: string; args?: unknown }>();
           let childSessionId: string | undefined;
           return gc.delegateStream(
-            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId },
+            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId, evidenceRefs: req.evidenceRefs },
             (evt) => {
               const e = evt as any;
               const t = String(e?.type ?? "");
@@ -3315,19 +3549,24 @@ export class AgentBoxSessionManager {
       // the model knows to end with report_findings.
       delegation,
       // Built-in types compile their immutable contract plus this persisted
-      // Agent addendum. Delegated read-only is an exclusive runtime constraint:
-      // composing it with an SRE or Coordinator contract would instruct the
-      // model to use tools that the read-only gate deliberately removed.
-      systemPromptAppend: delegation?.readOnly
-        ? DELEGATED_READONLY_PERSONA
-        : systemPromptTemplate,
+      // Agent addendum. A delegated peer keeps its OWN contract — being called
+      // by a coordinator does not change who it is.
+      systemPromptAppend: systemPromptTemplate,
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,
+      // Keep an internal target index; discover matching coverage on demand.
+      handoffTargets,
+      searchHandoffTargets: gc ? query => gc.searchHandoffTargets(query) : undefined,
+      getHandoffTraceContext: (callId) => tracingRecorder.captureHandoffTrace(id, callId),
+      evictSessionContext: async () => { await this.evictSessionContext(id); },
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).
       taskListId: id,
       sessionEventEmitter: emitExtraEvent,
+      allowInputRequest,
+      handoffSupported,
+      handoffPolicy,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
@@ -3336,7 +3575,7 @@ export class AgentBoxSessionManager {
       subagentTierMenu: this.subagentTierMenuState,
       jobStopExecutor: this.createJobStopExecutor(),
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
-      taskOutputReader: this.createTaskOutputReader(),
+      taskOutputReader: this.createTaskOutputReader(id),
       channelMessageExecutor: this.createChannelMessageExecutor(),
     });
 
@@ -3385,6 +3624,9 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       delegation,
+      allowInputRequest,
+      handoffSupported,
+      handoffPolicy,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
@@ -3745,7 +3987,13 @@ export class AgentBoxSessionManager {
 
   async release(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId);
-    if (!managed) return;
+    if (!managed) {
+      // Not resident — but a handed-away session still has to lose its on-disk
+      // copy, and "already released" is one of the ways it gets here (a rebuild
+      // released it before the mark could be consumed).
+      this.dropEvictedTranscript(sessionId);
+      return;
+    }
 
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
 
@@ -3801,6 +4049,24 @@ export class AgentBoxSessionManager {
       this.onSessionRelease?.();
     } else {
       console.log(`[agentbox-session] Session ${sessionId} was replaced during release, skipping delete`);
+    }
+
+    this.dropEvictedTranscript(sessionId);
+  }
+
+  /**
+   * Drop the on-disk transcript of a session this box handed away, if it is
+   * marked. Ordered after `release`'s memory auto-save on purpose: what this box
+   * LEARNED in its own turns is worth keeping; what it is dropping is only its
+   * stale view of a conversation someone else now owns.
+   */
+  private dropEvictedTranscript(sessionId: string): void {
+    if (!this.evictedSessions.delete(sessionId) && !fs.existsSync(`${this.getSessionDir(sessionId)}.handoff`)) return;
+    try {
+      this.removeCachedSessionTranscript(sessionId);
+      console.log(`[agentbox-session] Evicted the local transcript for handed-off session ${sessionId}`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Could not evict the local transcript for ${sessionId}:`, err);
     }
   }
 

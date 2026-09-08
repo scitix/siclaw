@@ -1,3 +1,4 @@
+import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
@@ -112,15 +113,7 @@ Examples:
         ? {
             run_in_background: Type.Optional(
               Type.Boolean({
-                description:
-                  "Run the command inside the pod in the background instead of waiting. Returns immediately " +
-                  "with a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, " +
-                  "sleep, or read its output until the completion notification — then call task_output(task_id), " +
-                  "not the raw output_file). EXCEPTION: when this is the " +
-                  "server/listener side of a paired test, do NOT wait — IMMEDIATELY run the counterpart, then call " +
-                  "task_output(task_id) when the test finishes (waiting for the server's completion first deadlocks: it " +
-                  "blocks until the client connects, then times out). Note: if stopped early, the in-pod process may " +
-                  "keep running until the pod ends. Output needing structural (JSON) redaction cannot run in background.",
+                description: BACKGROUND_EXEC_DESCRIPTION + "If stopped early, the in-pod process may keep running until the pod ends. Output needing structural (JSON) redaction cannot run in background.",
               })
             ),
           }

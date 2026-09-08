@@ -1,7 +1,4 @@
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { randomBytes } from "node:crypto";
+import { retainSanitizedToolOutput } from "../../core/tool-output-context.js";
 import { Text } from "@earendil-works/pi-tui";
 
 const PREVIEW_LINES = 5;
@@ -32,19 +29,9 @@ export function sanitizeOutput(text: string): string {
 }
 
 /**
- * Save text to a temporary file, return the file path.
- */
-function saveTempFile(text: string): string {
-  const id = randomBytes(4).toString("hex");
-  const filePath = path.join(os.tmpdir(), `siclaw-output-${id}.log`);
-  fs.writeFileSync(filePath, text, "utf-8");
-  return filePath;
-}
-
-/**
  * Sanitize and truncate tool output for the LLM.
  * - Strips ANSI codes and control characters
- * - When truncated, saves full output to a temp file and tells the LLM the path
+ * - Keeps the sanitized full result in the authenticated invocation for artifact storage
  * - Keeps the first HEAD_CHARS and last TAIL_CHARS characters, drops the middle
  */
 export function processToolOutput(text: string): string {
@@ -56,11 +43,13 @@ export function processToolOutput(text: string): string {
   if (clean.trim().length === 0) return "(no output)";
   if (clean.length <= MAX_CHARS) return clean;
 
-  const fullPath = saveTempFile(clean);
   const head = clean.slice(0, HEAD_CHARS);
   const tail = clean.slice(-TAIL_CHARS);
   const totalLines = clean.split("\n").length;
-  return `${head}\n\n... [${totalLines} lines total, output truncated. Full output saved to: ${fullPath}]\n\n${tail}`;
+  const preview = `${head}\n\n... [${totalLines} lines total, output truncated]\n\n${tail}`;
+  if (retainSanitizedToolOutput(preview, clean)) return preview;
+  // No authenticated invocation scope: never write a shared /tmp file or claim recoverability.
+  return `${head}\n\n... [${totalLines} lines total, output truncated; full output unavailable without a session scope. Rerun with narrower filters.]\n\n${tail}`;
 }
 
 /** @deprecated Use processToolOutput instead */

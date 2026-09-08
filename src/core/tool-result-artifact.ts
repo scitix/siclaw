@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { withToolOutputContext, type ToolOutputContext } from "./tool-output-context.js";
 import path from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -7,6 +9,16 @@ import type { ResolvedToolDefinition } from "./tool-registry.js";
 
 export const TOOL_RESULT_ARTIFACT_DETAIL_KEY = "toolResultArtifact";
 export const TOOL_RESULT_ARTIFACT_FAILURE_DETAIL_KEY = "toolResultArtifactFailure";
+
+const rootWrites = new Map<string, Promise<unknown>>();
+export function serializeToolOutputWrites<T>(root: string, operation: () => Promise<T>): Promise<T> {
+  const key = path.resolve(root);
+  const previous = rootWrites.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => {}).then(operation);
+  rootWrites.set(key, next);
+  void next.finally(() => { if (rootWrites.get(key) === next) rootWrites.delete(key); }).catch(() => {});
+  return next;
+}
 
 const ARTIFACT_ID_PATTERN = /^tra_[0-9a-f]{32}$/;
 const DEFAULT_CAPTURE_MIN_BYTES = 32 * 1024;
@@ -232,7 +244,6 @@ export class ToolResultArtifactStore {
   private readonly maxScopeBytes: number;
   private readonly maxScopeArtifacts: number;
   private readonly now: () => number;
-  private writeChain: Promise<void> = Promise.resolve();
   private rootReady: Promise<void> | null = null;
 
   constructor(options: ToolResultArtifactStoreOptions) {
@@ -249,6 +260,17 @@ export class ToolResultArtifactStore {
     await this.ensureRoot();
   }
 
+  async scopedDirectory(scope = this.getScope()): Promise<string> {
+    await this.ensureRoot();
+    if (!scope?.agentId || !scope.sessionId) throw new Error("tool result artifact scope is unavailable");
+    const directory = path.join(this.rootDir, this.scopeHash(scope));
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const stat = await fs.lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("artifact scope must be a real directory");
+    await fs.chmod(directory, 0o700);
+    return directory;
+  }
+
   async capture(input: { text: string; toolCallId: string; toolName: string }): Promise<ToolResultArtifactCapture> {
     const sizeBytes = Buffer.byteLength(input.text, "utf8");
     const failureBase = { version: 1 as const, sizeChars: input.text.length, sizeBytes };
@@ -260,12 +282,10 @@ export class ToolResultArtifactStore {
       return { failure: { ...failureBase, reason: "too_large" } };
     }
 
-    const run = this.writeChain.then(async () => {
+    const run = serializeToolOutputWrites(this.rootDir, async () => {
       await this.ensureRoot();
       const scopeHash = this.scopeHash(scope);
-      const scopeDir = path.join(this.rootDir, scopeHash);
-      await fs.mkdir(scopeDir, { recursive: true, mode: 0o700 });
-      await fs.chmod(scopeDir, 0o700);
+      const scopeDir = await this.scopedDirectory(scope);
       await this.cleanAndReserve(scopeDir, sizeBytes);
 
       const id = `tra_${randomUUID().replaceAll("-", "")}`;
@@ -291,7 +311,6 @@ export class ToolResultArtifactStore {
       }
       return publicReference(metadata);
     });
-    this.writeChain = run.then(() => undefined, () => undefined);
     try {
       return { reference: await run };
     } catch {
@@ -374,10 +393,10 @@ export class ToolResultArtifactStore {
 
   private async load(id: string): Promise<{ metadata: ToolResultArtifactMetadata; text: string }> {
     if (!ARTIFACT_ID_PATTERN.test(id)) throw new Error("invalid tool result artifact id");
-    const scopeDir = this.currentScopeDir();
+    const scopeDir = await this.scopedDirectory();
     let metadata: ToolResultArtifactMetadata;
     try {
-      metadata = JSON.parse(await fs.readFile(artifactMetadataPath(scopeDir, id), "utf8")) as ToolResultArtifactMetadata;
+      metadata = JSON.parse(await readPrivateArtifactFile(artifactMetadataPath(scopeDir, id))) as ToolResultArtifactMetadata;
     } catch {
       throw new Error("tool result artifact not found in this session");
     }
@@ -390,7 +409,7 @@ export class ToolResultArtifactStore {
     }
     let text: string;
     try {
-      text = await fs.readFile(artifactTextPath(scopeDir, id), "utf8");
+      text = await readPrivateArtifactFile(artifactTextPath(scopeDir, id));
     } catch {
       throw new Error("tool result artifact content is unavailable");
     }
@@ -422,18 +441,8 @@ export class ToolResultArtifactStore {
         }
       }
     }
-    live.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
-    let usedBytes = live.reduce((sum, metadata) => sum + metadata.sizeBytes, 0);
-    let liveCount = live.length;
-    for (const metadata of live) {
-      if (
-        usedBytes + incomingBytes <= this.maxScopeBytes
-        && liveCount + 1 <= this.maxScopeArtifacts
-      ) break;
-      await this.removeArtifact(scopeDir, metadata.id);
-      usedBytes -= metadata.sizeBytes;
-      liveCount -= 1;
-    }
+    const usedBytes = live.reduce((sum, metadata) => sum + metadata.sizeBytes, 0);
+    const liveCount = live.length;
     if (usedBytes + incomingBytes > this.maxScopeBytes || liveCount + 1 > this.maxScopeArtifacts) {
       throw new Error("tool result artifact scope quota exceeded");
     }
@@ -473,15 +482,19 @@ function toolResultText(result: unknown): string {
 export function withToolResultArtifactCapture(
   tool: ToolDefinition,
   store: ToolResultArtifactStore,
+  minBytes = DEFAULT_CAPTURE_MIN_BYTES,
 ): ToolDefinition {
   const originalExecute = tool.execute.bind(tool) as ToolDefinition["execute"];
   return {
     ...tool,
     execute: async (...executeArgs: Parameters<ToolDefinition["execute"]>) => {
       const [toolCallId] = executeArgs;
-      const result = await originalExecute(...executeArgs);
-      const text = toolResultText(result);
-      if (!text || Buffer.byteLength(text, "utf8") < DEFAULT_CAPTURE_MIN_BYTES) return result;
+      const scope: ToolOutputContext = { directory: await store.scopedDirectory(), outputs: [] };
+      const result = await withToolOutputContext(scope, () => originalExecute(...executeArgs));
+      const preview = toolResultText(result);
+      let text = preview;
+      for (const output of scope.outputs) text = text.replace(output.preview, output.full);
+      if (!text || Buffer.byteLength(text, "utf8") < minBytes) return result;
       const capture = await store.capture({ text, toolCallId, toolName: tool.name });
       const resultRecord = result as unknown as Record<string, unknown>;
       const details = resultRecord.details && typeof resultRecord.details === "object"
@@ -489,6 +502,9 @@ export function withToolResultArtifactCapture(
         : {};
       return {
         ...resultRecord,
+        ...(text !== preview || text.length > 8000 ? { content: [{ type: "text", text: "reference" in capture
+          ? formatToolResultArtifactReference(capture.reference, preview, 8000)
+          : formatUnrecoverableToolResult(capture.failure, preview, 8000) }] } : {}),
         details: "reference" in capture
           ? { ...details, [TOOL_RESULT_ARTIFACT_DETAIL_KEY]: capture.reference }
           : { ...details, [TOOL_RESULT_ARTIFACT_FAILURE_DETAIL_KEY]: capture.failure },
@@ -554,4 +570,9 @@ export function createToolResultArtifactTools(store: ToolResultArtifactStore): R
   };
 
   return [readTool, searchTool];
+}
+
+async function readPrivateArtifactFile(file: string): Promise<string> {
+  const handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try { return await handle.readFile("utf8"); } finally { await handle.close(); }
 }

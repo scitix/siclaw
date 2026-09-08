@@ -45,6 +45,9 @@ Hard rule: **start small, add only when we actually emit one in code**. No specu
 ### Chat-specific
 - `AGENT_NOT_FOUND` — agentId doesn't exist or user can't access it.
 - `AGENTBOX_FAILED` — runtime couldn't spawn or lost the agentbox process.
+- `SESSION_CONTEXT_UNAVAILABLE` — a caller required continuation of an existing
+  session, but AgentBox could restore neither resident state nor persisted JSONL.
+  This is non-retriable for that task and is returned with HTTP status 412.
 
 ### Model / tool (best-effort tagging when we recognize)
 - `MODEL_RATE_LIMIT` (with `retryAfterMs`) — upstream 429.
@@ -52,7 +55,7 @@ Hard rule: **start small, add only when we actually emit one in code**. No specu
 - `MODEL_ERROR` — generic model API failure.
 - `TOOL_ERROR` — tool execution failed (kept generic; per-tool details go in `details`).
 
-That's 11 codes total. Anything else is `INTERNAL_ERROR`. We add codes as we hit specific UX needs — not before.
+Anything else is `INTERNAL_ERROR`. We add codes as we hit specific UX needs — not before.
 
 ---
 

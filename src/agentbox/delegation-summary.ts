@@ -53,10 +53,6 @@ function extractCapsuleSection(text: string): string | null {
   return extractSection(text, new Set(["evidence capsule", "parent capsule", "capsule"]));
 }
 
-function extractFullReportSection(text: string): string | null {
-  return extractSection(text, new Set(["full report", "details", "audit report"]));
-}
-
 /**
  * Truncate `text` to `maxChars`, clipping at the nearest newline/sentence boundary (never
  * mid-word) and appending `suffix`. Shared by the delegate capsule and — via a custom suffix —
@@ -79,7 +75,7 @@ export function truncateAtBoundary(text: string, maxChars: number, suffix = TRUN
 export function buildDelegateSummaryBundle(rawSummary: string, fallback = "Completed. No concise summary was returned."): DelegateSummaryBundle {
   const normalized = normalizeReportText(rawSummary) || fallback;
   const requestedCapsule = extractCapsuleSection(normalized);
-  const fullSummary = extractFullReportSection(normalized) ?? normalized;
+  const fullSummary = normalized; // Preserve every section, including evidence outside a "Full report" heading.
   const candidate = requestedCapsule ?? normalized;
   const capsule = truncateAtBoundary(candidate, MAX_DELEGATE_CAPSULE_CHARS);
   return {

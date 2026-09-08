@@ -1,3 +1,4 @@
+import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -181,16 +182,7 @@ Examples (pass the id from host_list; names shown here for readability):
         ? {
             run_in_background: Type.Optional(
               Type.Boolean({
-                description:
-                  "Run the command on the host in the background instead of waiting. Returns immediately " +
-                  "with a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, " +
-                  "sleep, or read its output until the completion notification — then call task_output(task_id), " +
-                  "not the raw output_file). EXCEPTION: when this is the " +
-                  "server/listener side of a paired test, do NOT wait — IMMEDIATELY run the client on the peer " +
-                  "host, then call task_output(task_id) when the test finishes (waiting for the server's completion " +
-                  "first deadlocks: it blocks until the client connects, then times out). Use for long-running " +
-                  "host commands over SSH. The command is wrapped in `timeout` and capped (~3600s). Output needing " +
-                  "structural (JSON) redaction cannot run in background.",
+                description: BACKGROUND_EXEC_DESCRIPTION + "Use for long-running host commands over SSH. The command is wrapped in `timeout` and capped (~3600s). Output needing structural (JSON) redaction cannot run in background.",
               })
             ),
           }

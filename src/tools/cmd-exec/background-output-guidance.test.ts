@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 
 // Regression guard for the model-visible text of every background-capable tool.
 //
@@ -38,7 +39,9 @@ describe("background tools steer the model to task_output, not the raw output_fi
 
     it(`${rel}: references task_output`, () => {
       const src = fs.readFileSync(path.join(srcRoot, rel), "utf8");
-      expect(src).toMatch(/task_output/);
+      const guidance = src.includes("BACKGROUND_EXEC_DESCRIPTION") && src.includes("backgroundLaunchedResult(")
+        ? BACKGROUND_EXEC_DESCRIPTION : src;
+      expect(guidance).toMatch(/task_output/);
     });
   }
 });

@@ -6,6 +6,15 @@
  * the user" instruction) from drifting between tools.
  */
 
+/** Shared model contract for command and script background execution. */
+export const BACKGROUND_EXEC_DESCRIPTION =
+  "Start background work and return task_id/output_file immediately. The current request remains active: " +
+  "continue independent work now; results are delivered automatically for you to inspect and summarize. " +
+  "Do NOT poll, sleep, or spawn a waiter. For a server/listener, immediately run the counterpart client " +
+  "instead of waiting for server completion (which would deadlock). Use task_output(task_id) for output " +
+  "or a necessary readiness check, and job_stop to stop helpers after dependent work finishes. " +
+  "Use progress commentary while work remains; provide the final answer after processing its results. ";
+
 type BackgroundToolResult = {
   content: { type: "text"; text: string }[];
   details: Record<string, unknown>;
@@ -49,7 +58,7 @@ export function backgroundJsonPathError(): BackgroundToolResult {
 
 /**
  * The "launched" success result. `runningWhere` is the short human lead-in (e.g.
- * "Running on the node in the background."); everything after it — the END-YOUR-TURN
+ * "Running on the node in the background."); everything after it — the request-continuation
  * guidance and the "these are internal handles, don't show the user" instruction — is
  * shared so the three exec tools stay in lockstep.
  */
@@ -65,17 +74,9 @@ export function backgroundLaunchedResult(
       task_id: jobId,
       output_file: outputFile,
       message:
-        `${runningWhere} It runs detached and you are notified automatically when it COMPLETES. ` +
-        "Default: END YOUR TURN NOW — do NOT read anything, poll, sleep, or spawn a sub-agent to wait on it. " +
-        "EXCEPTION — paired/orchestrated tests: if this is ONE SIDE of a protocol that only makes progress once " +
-        "its counterpart runs (a server/listener blocking until its client connects; a packet capture needing " +
-        "traffic generated), do NOT wait for completion — immediately run the counterpart (e.g. the client on the peer " +
-        "node), then call task_output(task_id) once the test finishes. Waiting for such a server's completion FIRST " +
-        "deadlocks: it blocks until a client connects, then times out. " +
-        "Otherwise call task_output(task_id) ONLY after the completion notification — it reports " +
-        "running/completed/failed/stopped, so use it instead of reading output_file directly. Stop it early with job_stop. " +
-        "NOTE: task_id and output_file are internal handles for YOUR use only — do NOT show them to the user; just " +
-        "tell the user in plain language what is running and that you'll report back when it finishes.",
+        `${runningWhere} ` + BACKGROUND_EXEC_DESCRIPTION +
+        "NOTE: task_id and output_file are internal handles for YOUR use only — do NOT show them to the user; " +
+        "describe progress and findings in plain language.",
     }, null, 2) }],
     // extraDetails (e.g. a resolved host_label) is persisted to the tool row metadata so the
     // card can render a friendly label even when the model passed an opaque id.

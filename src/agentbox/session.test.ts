@@ -14,6 +14,8 @@ import { getOrCreateLedger, resetLedgers } from "../core/task-ledger.js";
  * cancellation, JSONL message counting, and the dp-state snapshot reader.
  */
 
+vi.mock("../core/tool-output-cleanup.js", () => ({ scheduleToolOutputCleanup: () => {} }));
+
 // ── Fakes/mocks (hoisted) ─────────────────────────────────────────────
 
 vi.mock("@earendil-works/pi-coding-agent", () => {
@@ -23,6 +25,12 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
     constructor(public cwd: string, public sessionDir: string) {}
     static continueRecent(cwd: string, sessionDir: string) {
       return new FakeFrameworkSessionManager(cwd, sessionDir);
+    }
+    static create(cwd: string, sessionDir: string) {
+      return new FakeFrameworkSessionManager(cwd, sessionDir);
+    }
+    appendMessage(message: any) {
+      (globalThis as any).__frameworkEntriesState.entries.push({ type: "message", message });
     }
     getEntries(): any[] {
       return (globalThis as any).__frameworkEntriesState.entries;
@@ -59,6 +67,7 @@ vi.mock("../core/agent-factory.js", async () => {
       subscribe,
       reload: async () => {},
       prompt: behavior.prompt ?? (async () => {}),
+      assessTaskCompletion: behavior.assessTaskCompletion ?? (async () => ({ status: "complete", reason: "fixture accepted" })),
       abort: behavior.abort ?? (async () => {}),
       steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
@@ -239,6 +248,26 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
 });
 
 describe("AgentBoxSessionManager — getOrCreate", () => {
+  it("handing off one session preserves another active session on the same Agent", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("handoff-a");
+    const other = await mgr.getOrCreate("running-b");
+    other._promptInflight = true;
+    const otherDir = path.join(mgr.getBaseSessionDir(), "running-b");
+    fs.mkdirSync(otherDir, { recursive: true });
+    fs.writeFileSync(path.join(otherDir, "history.jsonl"), "other session history\n");
+    await mgr.evictSessionContext("handoff-a");
+    await mgr.release("handoff-a");
+    expect(mgr.get("handoff-a")).toBeUndefined();
+    expect(mgr.get("running-b")).toBe(other);
+    expect(other._promptInflight).toBe(true);
+    expect(mgr.activeCount()).toBe(1);
+    expect(fs.existsSync(`${otherDir}.handoff`)).toBe(false);
+    expect(fs.readFileSync(path.join(otherDir, "history.jsonl"), "utf8")).toBe("other session history\n");
+    other._promptInflight = false;
+    await mgr.release("running-b");
+  });
+
   it("creates a new session on first call and caches it", async () => {
     const mgr = new AgentBoxSessionManager();
     const s1 = await mgr.getOrCreate("sess-1");
@@ -279,6 +308,59 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(s3.activeMode).toBe("dp");
     expect(lastCreateSiclawSession.calls).toHaveLength(2);
     expect(lastCreateSiclawSession.calls[1].activeMode).toBe("dp");
+  });
+
+  it("rebuilds when top-level request_input availability changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const first = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, undefined, false);
+    expect(first.allowInputRequest).toBe(false);
+    expect(lastCreateSiclawSession.calls[0].allowInputRequest).toBe(false);
+
+    const rebuilt = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, undefined, true);
+    expect(rebuilt).not.toBe(first);
+    expect(rebuilt.allowInputRequest).toBe(true);
+    expect(lastCreateSiclawSession.calls[1].allowInputRequest).toBe(true);
+  });
+
+  it("rebuilds per-request handoff limits without changing a concurrent session", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const fresh = { remaining: 2, visitedAgentIds: ["a"], history: [] };
+    const final = { remaining: 0, visitedAgentIds: ["a", "b", "a"], history: [] };
+    const first = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    const peer = await mgr.getOrCreate("policy-b", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    peer._promptInflight = true;
+    const rebuilt = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, final);
+    expect(rebuilt).not.toBe(first);
+    expect(rebuilt.handoffPolicy?.remaining).toBe(0);
+    expect(lastCreateSiclawSession.calls.at(-1).handoffPolicy).toEqual(final);
+    expect(peer.handoffPolicy?.remaining).toBe(2);
+    expect(peer._promptInflight).toBe(true);
+    const next = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    expect(next).not.toBe(rebuilt);
+    expect(next.handoffPolicy?.remaining).toBe(2);
+    peer._promptInflight = false;
+    await mgr.close("policy-a"); await mgr.close("policy-b");
+  });
+
+  it("detects resumable context in memory or persisted JSONL", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const missingDir = path.join(_cfgUserDataDir, "agent", "sessions", "missing");
+    expect(mgr.hasRestorableSessionContext("missing")).toBe(false);
+    expect(fs.existsSync(missingDir)).toBe(false);
+
+    await mgr.getOrCreate("resident");
+    expect(mgr.hasRestorableSessionContext("resident")).toBe(true);
+
+    const persistedDir = path.join(_cfgUserDataDir, "agent", "sessions", "persisted");
+    fs.mkdirSync(persistedDir, { recursive: true });
+    (globalThis as any).__frameworkEntriesState.entries = [{ type: "session" }];
+    expect(mgr.hasRestorableSessionContext("persisted")).toBe(false);
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "session" },
+      { type: "message", message: { role: "user", content: "first turn" } },
+    ];
+    expect(mgr.hasRestorableSessionContext("persisted")).toBe(true);
   });
 
   it("refreshes the delegation correlation id on reuse of an IDLE peer session", async () => {
@@ -353,21 +435,22 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     ).rejects.toThrow(/different user/);
   });
 
-  it("uses the delegated read-only persona exclusively", async () => {
+  // 被委托的 peer 保留它自己的 persona。这里曾经断言相反的事:委托会把 peer 的
+  // prompt 整个换成一段通用的只读替身。那段替身之所以存在,是因为"砍掉写工具但
+  // 留着'去修好它'的 prompt"根本不自洽 —— 而正确的解法是不砍,不是换掉它是谁。
+  it("keeps the peer's OWN persona on a delegated turn", async () => {
     const mgr = new AgentBoxSessionManager();
     mgr.agentTypeState = "sre";
     await mgr.getOrCreate(
-      "sess-readonly",
+      "sess-delegated",
       "web",
       "custom prompt that says to remediate",
       "normal",
-      { delegationId: "d1", readOnly: true },
+      { delegationId: "d1" },
     );
 
     const opts = lastCreateSiclawSession.calls.at(-1);
-    expect(opts.systemPromptAppend).toMatch(/read-only/i);
-    expect(opts.systemPromptAppend).not.toContain("custom prompt that says to remediate");
-    expect(opts.systemPromptAppend).not.toContain("Take the task end to end");
+    expect(opts.systemPromptAppend).toContain("custom prompt that says to remediate");
   });
 
   it("defaults mode to 'web' when none supplied", async () => {
@@ -1012,6 +1095,119 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
   });
 });
 
+/**
+ * 交接之后本 box 对这段会话的本地副本就作废了 —— 它停在交接那一刻,后面所有轮
+ * 都发生在别的 agent 那里。这组测试锁住"作废"的两种消费方式:被 release 删掉,
+ * 或者被下一次 ensureSessionContext 丢掉后重新回灌。
+ */
+describe("AgentBoxSessionManager — 交接后丢弃本地会话副本", () => {
+  it("默认不丢:本地有历史就直接用,不去问控制面", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message", message: { role: "user" } },
+      { type: "message", message: { role: "assistant" } },
+    ];
+    fs.mkdirSync(path.join(mgr.getBaseSessionDir(), "s-local"), { recursive: true });
+    const fetchSessionHistory = vi.fn();
+    mgr.gatewayClient = { fetchSessionHistory };
+
+    expect(await mgr.ensureSessionContext("s-local")).toBe(true);
+    expect(fetchSessionHistory).not.toHaveBeenCalled();
+  });
+
+  // ⚠️ 这条是关键:本地"有"历史,但那份历史是错的。不重新拉,接手回来的 agent 会
+  // 拿一段停在交接瞬间的对话去回答,中间几轮凭空消失。
+  it("交接过的 session 即使本地有历史也重新回灌", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message", message: { role: "user" } },
+      { type: "message", message: { role: "assistant" } },
+    ];
+    const dir = path.join(mgr.getBaseSessionDir(), "s-handed");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "stale.jsonl"), "{}\n");
+    const fetchSessionHistory = vi.fn(async () => ({ sessionId: "s-handed", messages: [] }));
+    mgr.gatewayClient = { fetchSessionHistory };
+
+    await mgr.evictSessionContext("s-handed");
+    await mgr.ensureSessionContext("s-handed");
+
+    expect(fetchSessionHistory).toHaveBeenCalledWith("s-handed");
+    expect(fs.existsSync(path.join(dir, "stale.jsonl"))).toBe(false);
+  });
+
+  it("进程重启后仍拒绝使用失效历史，恢复失败保留标记", async () => {
+    const original = new AgentBoxSessionManager() as any;
+    const dir = path.join(original.getBaseSessionDir(), "s-restart");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "stale.jsonl"), "{}\n");
+    await original.evictSessionContext("s-restart");
+    const restarted = new AgentBoxSessionManager() as any;
+    const fetchSessionHistory = vi.fn(async () => { throw new Error("offline"); });
+    restarted.gatewayClient = { fetchSessionHistory };
+    expect(await restarted.ensureSessionContext("s-restart")).toBe(false);
+    expect(fetchSessionHistory).toHaveBeenCalledOnce();
+    expect(fs.existsSync(`${dir}.handoff`)).toBe(true);
+    expect(fs.existsSync(path.join(dir, "stale.jsonl"))).toBe(false);
+  });
+
+  it("release 把交接过的 session 目录删掉", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const dir = path.join(mgr.getBaseSessionDir(), "s-gone");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "stale.jsonl"), "{}\n");
+
+    await mgr.evictSessionContext("s-gone");
+    await mgr.release("s-gone");
+
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it("handoff drops stale transcript data but retains scoped evidence for its own TTL", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const dir = path.join(mgr.getBaseSessionDir(), "handoff-evidence");
+    const evidence = path.join(dir, ".tool-results", "scope", "report.txt");
+    fs.mkdirSync(path.dirname(evidence), { recursive: true });
+    fs.writeFileSync(evidence, "complete evidence");
+    fs.writeFileSync(path.join(dir, "old.jsonl"), "old transcript");
+    await mgr.evictSessionContext("handoff-evidence");
+    await mgr.release("handoff-evidence");
+    expect(fs.existsSync(path.join(dir, "old.jsonl"))).toBe(false);
+    expect(fs.readFileSync(evidence, "utf8")).toBe("complete evidence");
+  });
+
+  it("没交接过的 session,release 不碰它的目录", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const dir = path.join(mgr.getBaseSessionDir(), "s-kept");
+    fs.mkdirSync(dir, { recursive: true });
+
+    await mgr.release("s-kept");
+
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  // 标记被 ensureSessionContext 消费掉了,所以随后的 release 不能再去删 —— 那时
+  // 目录里装的已经是刚回灌回来的、正确的副本。
+  it("重新回灌之后 release 不再删这个目录", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__frameworkEntriesState.entries = [];
+    const dir = path.join(mgr.getBaseSessionDir(), "s-back");
+    fs.mkdirSync(dir, { recursive: true });
+    mgr.gatewayClient = { fetchSessionHistory: async () => ({ sessionId: "s-back", messages: [{ id: "u1", role: "user", content: "继续检查节点", createdAt: new Date().toISOString() }] }) };
+
+    await mgr.evictSessionContext("s-back");
+    expect(await mgr.ensureSessionContext("s-back")).toBe(true);
+    expect(fs.existsSync(`${dir}.handoff`)).toBe(false);
+    // 回灌之后的目录内容(这里手工摆一份,回灌本身走的是真实 SessionManager,
+    // 在这个文件里是假的)。
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "fresh.jsonl"), "{}\n");
+    await mgr.release("s-back");
+
+    expect(fs.existsSync(path.join(dir, "fresh.jsonl"))).toBe(true);
+  });
+});
+
 describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
   // A child fake brain whose behavior is driven by its prompt text, so the outcome is
   // deterministic regardless of the (concurrent) order children are created in.
@@ -1598,6 +1794,48 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     expect(terminal.event.delegationId).not.toContain("#");
   });
 
+
+  it("does not mark an intent-only child complete after bounded continuation", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let prompts = 0;
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => { prompts++; emitter.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "I will check all interfaces.", textSignature: JSON.stringify({ v: 1, phase: "final_answer" }) }] } }); },
+      assessTaskCompletion: async () => ({ status: "incomplete", reason: "No interface findings were delivered" }),
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "node", prompt: "Check all interfaces" }] }));
+    expect(report.status).toBe("partial");
+    expect(report.fullSummary).toContain("No interface findings were delivered");
+    expect(prompts).toBe(3);
+  });
+
+  it("preserves a length-limited report fragment when the child continues", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let prompts = 0;
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => { prompts++; emitter.emit("event", { type: "message_end", message: { role: "assistant", stopReason: prompts === 1 ? "length" : "stop", content: [{ type: "text", text: prompts === 1 ? "FIRST_EVIDENCE" : "LAST_EVIDENCE" }] } }); },
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "node", prompt: "Check interfaces" }] }));
+    expect(report.status).toBe("done");
+    expect(report.fullSummary).toContain("FIRST_EVIDENCE");
+    expect(report.fullSummary).toContain("LAST_EVIDENCE");
+  });
+
+  it("passes the full map report tail to the reducer", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let reduction = "";
+    const reportText = "API evidence\n".repeat(400) + "RDMA netns: exclusive";
+    for (let i = 0; i < 2; i++) (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async (prompt: string) => {
+        const reduce = prompt.includes("── item"); if (reduce) reduction = prompt;
+        emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: reduce ? "Mode verified" : reportText }] } });
+      },
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "node", prompt: "Check interfaces" }], reducePrompt: "Summarize" }));
+    expect(report.status).toBe("done");
+    expect(reduction).toContain(reportText);
+    expect(report.itemResults[0].fullSummary).toBe(reportText);
+  });
+
   // ── v3 decision #21: the reduce summary must come from the FULL reduce report, not the capsule ──
   it("reduce summary uses the full reduce report (fullSummary), not the 1800-char capsule", async () => {
     const mgr = new AgentBoxSessionManager() as any;
@@ -1978,5 +2216,47 @@ describe("sub-agent tier isolation and redaction", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe("request-owned background command execution", () => {
+  it.each([0, 3])("delivers actual subprocess output before resuming the parent (exit %s)", async (exitCode) => {
+    const { BackgroundWorkTurn } = await import("./background-work-turn.js");
+    const mgr = new AgentBoxSessionManager() as any;
+    const turn = new BackgroundWorkTurn();
+    const managed = { id: "cmd-parent", _promptDone: false, _backgroundWorkCount: 0, _releaseTimer: null,
+      _backgroundWorkTurn: turn, _pendingNotifications: [], _extraEventSubs: new Set(), _extraEventBuffer: [] };
+    mgr.sessions.set(managed.id, managed);
+    const cleanup = vi.fn();
+    const exec = mgr.createBackgroundExecExecutor();
+    const launched = exec({ jobId: "cmd-result", parentSessionId: managed.id, description: "local verification",
+      file: "/bin/sh", args: ["-c", `printf 'collected output\\n'; exit ${exitCode}`],
+      action: null, hasSensitiveKubectl: false, env: process.env, isProd: false, onComplete: cleanup });
+    expect(turn.pending).toBe(true);
+    const [result] = await turn.next();
+    expect(result.status).toBe(exitCode === 0 ? "completed" : "failed");
+    expect(result.outputFile).toBe(launched.outputFile);
+    expect(fs.readFileSync(result.outputFile!, "utf8")).toContain("collected output");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(managed._backgroundWorkCount).toBe(0);
+    expect(managed._pendingNotifications).toEqual([]);
+    expect(turn.pending).toBe(false);
+  });
+
+  it("undoes request ownership and work count when launch throws before foreground fallback", async () => {
+    const { BackgroundWorkTurn } = await import("./background-work-turn.js");
+    const mgr = new AgentBoxSessionManager() as any;
+    const turn = new BackgroundWorkTurn();
+    const managed = { id: "cmd-parent", _promptDone: false, _backgroundWorkCount: 0,
+      _releaseTimer: null, _backgroundWorkTurn: turn };
+    mgr.sessions.set(managed.id, managed);
+    expect(() => mgr.createBackgroundExecExecutor()({ jobId: "bad-launch", parentSessionId: managed.id,
+      description: "bad launch", command: "true", action: { type: "sanitize", sanitize: (s: string) => s, lineSafe: false },
+      hasSensitiveKubectl: false, env: process.env, isProd: false })).toThrow();
+    expect(turn.jobIds).toEqual([]);
+    expect(managed._backgroundWorkCount).toBe(0);
+    expect(mgr.backgroundWorkOwners.size).toBe(0);
+    // Allow the launcher's eager output-file creation to settle before temp-dir cleanup.
+    await new Promise(resolve => setTimeout(resolve, 20));
   });
 });

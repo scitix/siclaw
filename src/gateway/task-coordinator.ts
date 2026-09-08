@@ -1,3 +1,4 @@
+import { ConversationClient, supportsConversations } from "./conversation-client.js";
 /**
  * Task Coordinator — scheduler + executor for agent_tasks in Runtime.
  *
@@ -267,66 +268,87 @@ export class TaskCoordinator {
     try {
       console.log(`[task-coordinator] Executing task ${job.id} (${job.name}) agent=${agentId} user=${userId}`);
 
-      const binding = await resolveAgentModelBinding(agentId, this.frontendClient);
-      if (!binding) throw new Error(`Agent ${agentId} has no valid model binding`);
+      if (await supportsConversations(this.frontendClient)) {
+        await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
+        const userMessageId = await appendMessage({ sessionId, role: "user", content: prompt });
+        await incrementMessageCount(sessionId);
+        const client = new ConversationClient(this.frontendClient, { agentId, userId, sessionId, userMessageId, origin: "task" });
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          void client.abort().catch(() => client.close());
+        }, this.executionTimeoutMs);
+        timer.unref();
+        try {
+          await client.prompt({ sessionId, agentId, userId, text: prompt, mode: "task", subagentTiers: undefined });
+          const consumed = await consumeAgentSse({ client, sessionId, userId, persistMessages: false });
+          if (timedOut) throw new Error("Scheduled conversation timed out; cancellation requested");
+          if (consumed.errorMessage) throw new Error(consumed.errorMessage);
+          resultText = consumed.resultText;
+        } finally { clearTimeout(timer); client.close(); }
+      } else {
+        const binding = await resolveAgentModelBinding(agentId, this.frontendClient);
+        if (!binding) throw new Error(`Agent ${agentId} has no valid model binding`);
 
-      // One pod per agent — shared across users who call the agent.
-      // Caller/task-owner attribution flows to Upstream via the session registry.
-      sessionRegistry.remember(sessionId, userId, agentId);
-      // One turn at a time for this task's session — see session-turn-lock.ts.
-      releaseTurn = await sessionTurnLocks.acquire(sessionId);
-      const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence }, sessionId);
-      sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
-      const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
+        // One pod per agent — shared across users who call the agent.
+        // Caller/task-owner attribution flows to Upstream via the session registry.
+        sessionRegistry.remember(sessionId, userId, agentId);
+        // One turn at a time for this task's session — see session-turn-lock.ts.
+        releaseTurn = await sessionTurnLocks.acquire(sessionId);
+        const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence }, sessionId);
+        sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
+        const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
-      const promptOpts: PromptOptions = {
-        sessionId,
-        userId,
-        text: prompt,
-        mode: "task",
-        agentId,
-        modelProvider: binding.modelProvider,
-        modelId: binding.modelId,
-        releaseId: binding.releaseId,
-        modelFingerprint: binding.modelFingerprint,
-        modelConfig: binding.modelConfig,
-        modelRouting: binding.modelRouting,
-        subagentTiers: binding.subagentTiers,
-        systemPromptTemplate: binding.systemPrompt ?? undefined,
-      };
-      const promptResult = await client.prompt(promptOpts);
-      // Cross-process trace ids are gated at ingestion (see chat-repo.validTraceId):
-      // stamping rows with an id the bind/link boundaries would reject strands them
-      // under an id no reader references.
-      const ackTraceId = validTraceId(promptResult.traceId);
-
-      // Seed chat_sessions + user message via RPC. `origin: "task"` is the
-      // one signal that lets upstream's Metrics dashboard split scheduled cron
-      // activity from interactive chat — without it every cron-triggered
-      // session collapses into the default Interactive world.
-      await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
-      await appendMessage({ sessionId, role: "user", content: prompt, traceId: ackTraceId });
-      await incrementMessageCount(sessionId);
-
-      const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig);
-
-      const abortCtrl = new AbortController();
-      const timer = setTimeout(() => abortCtrl.abort(), this.executionTimeoutMs);
-      timer.unref();
-      try {
-        const consumed = await consumeAgentSse({
-          client,
+        const promptOpts: PromptOptions = {
           sessionId,
           userId,
-          traceId: ackTraceId,
-          persistMessages: true,
-          redactionConfig,
-          signal: abortCtrl.signal,
-        });
-        resultText = consumed.resultText;
-        if (consumed.errorMessage) throw new Error(consumed.errorMessage);
-      } finally {
-        clearTimeout(timer);
+          text: prompt,
+          mode: "task",
+          agentId,
+          modelProvider: binding.modelProvider,
+          modelId: binding.modelId,
+          releaseId: binding.releaseId,
+          modelFingerprint: binding.modelFingerprint,
+          modelConfig: binding.modelConfig,
+          modelRouting: binding.modelRouting,
+          subagentTiers: binding.subagentTiers,
+          systemPromptTemplate: binding.systemPrompt ?? undefined,
+        };
+        const promptResult = await client.prompt(promptOpts);
+        // Cross-process trace ids are gated at ingestion (see chat-repo.validTraceId):
+        // stamping rows with an id the bind/link boundaries would reject strands them
+        // under an id no reader references.
+        const ackTraceId = validTraceId(promptResult.traceId);
+
+        // Seed chat_sessions + user message via RPC. `origin: "task"` is the
+        // one signal that lets upstream's Metrics dashboard split scheduled cron
+        // activity from interactive chat — without it every cron-triggered
+        // session collapses into the default Interactive world.
+        await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
+        await appendMessage({ sessionId, role: "user", content: prompt, traceId: ackTraceId });
+        await incrementMessageCount(sessionId);
+
+        const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig);
+
+        const abortCtrl = new AbortController();
+        const timer = setTimeout(() => abortCtrl.abort(), this.executionTimeoutMs);
+        timer.unref();
+        try {
+          const consumed = await consumeAgentSse({
+            client,
+            sessionId,
+            userId,
+            traceId: ackTraceId,
+            persistMessages: true,
+            redactionConfig,
+            signal: abortCtrl.signal,
+          });
+          resultText = consumed.resultText;
+          if (consumed.errorMessage) throw new Error(consumed.errorMessage);
+        } finally {
+          clearTimeout(timer);
+        }
+
       }
 
       console.log(`[task-coordinator] Task ${job.id} completed (${Date.now() - startTime}ms)`);

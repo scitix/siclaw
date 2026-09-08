@@ -19,6 +19,8 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  /** Source AgentBox context for an authorized conversation handoff only. */
+  handoffTrace?: import("../../shared/handoff-trace.js").HandoffTraceContext;
   sessionId?: string;
   /**
    * Identity of THIS turn, so a later abort can name the turn it means rather than
@@ -41,6 +43,20 @@ export interface PromptOptions {
   origin?: OriginKind;
   /** Present when a coordinator agent delegated this turn over the mesh. */
   delegation?: DelegationContext;
+  /** Expose `request_input` to a top-level machine-driven turn. */
+  allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../../shared/agent-handoff.js").HandoffPolicy;
+  /**
+   * The control-plane segment / task this turn belongs to. They travel with the
+   * dispatch so the turn can be correlated back to the ledger, and so a retried
+   * dispatch is recognizable as the same turn rather than a new one.
+   */
+  segmentId?: string;
+  taskId?: string;
+  /** Fail instead of creating a fresh conversation when `sessionId` cannot be restored. */
+  requireExistingSession?: boolean;
   /** Model provider to use for this prompt */
   modelProvider?: string;
   /** Model ID to use for this prompt */
@@ -104,6 +120,8 @@ export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
 export interface PromptResponse {
   ok: boolean;
   sessionId: string;
+  /** True when this prompt continued an in-memory or persisted conversation. */
+  resumed?: boolean;
   /** per-prompt root trace id (OTel 32-hex) echoed from the /api/prompt ack, for
    *  stamping chat_messages.trace_id on this turn's persisted rows. */
   traceId?: string;
@@ -150,11 +168,13 @@ export interface ContextUsageResponse {
 
 function agentBoxResponseError(status: number, body: string): RpcResponseError {
   const metadata: Record<string, unknown> = { status };
+  let structuredMessage: string | undefined;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
     const nested = parsed?.error && typeof parsed.error === "object"
       ? parsed.error as Record<string, unknown>
       : parsed;
+    if (typeof nested.message === "string" && nested.message.trim()) structuredMessage = nested.message;
     if (typeof nested.code === "string") metadata.code = nested.code;
     if (typeof nested.retriable === "boolean") metadata.retriable = nested.retriable;
     if (typeof nested.retryAfterMs === "number") metadata.retryAfterMs = nested.retryAfterMs;
@@ -162,7 +182,7 @@ function agentBoxResponseError(status: number, body: string): RpcResponseError {
   } catch {
     // Non-JSON error bodies still retain their HTTP-derived classification.
   }
-  const message = `AgentBox request failed: ${status}${body ? ` ${body}` : ""}`;
+  const message = structuredMessage ?? `AgentBox request failed: ${status}${body ? ` ${body}` : ""}`;
   return new RpcResponseError(wrapRpcError(Object.assign(new Error(message), metadata)));
 }
 
@@ -331,13 +351,14 @@ export class AgentBoxClient {
    * stopped rather than aborting whatever is running now. Omit it for the user's
    * Stop button, which does mean "stop the current turn".
    */
-  async abortSession(sessionId: string, turnId?: string): Promise<void> {
+  async abortSession(sessionId: string, turnId?: string): Promise<{ ok?: boolean; pending?: boolean }> {
     console.log(`[agentbox-client] abort sessionId=${sessionId}${turnId ? ` turnId=${turnId}` : ""}`);
-    await this.fetch(`/api/sessions/${sessionId}/abort`, {
+    const response = await this.fetch(`/api/sessions/${sessionId}/abort`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(turnId ? { turnId } : {}),
     });
+    return response.json();
   }
 
   /**

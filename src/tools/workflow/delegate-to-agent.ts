@@ -31,6 +31,7 @@ interface DelegateParams {
   agent_name?: string;
   task?: string;
   session_id?: string;
+  evidence_refs?: string[];
 }
 
 function rosterLine(m: DelegateRosterMember): string {
@@ -63,13 +64,20 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       "First use list_delegates(query=<target cluster/host/node>) to confirm WHICH agent covers the target " +
       "(the coverage is not listed here — only counts). To continue an earlier line of work with the SAME " +
       "specialist, pass the `session_id` that a prior delegation returned (the peer keeps its context); omit " +
-      "it to start a fresh session for an unrelated task.\n\n" +
+      "it to start a fresh session for an unrelated task. " +
+      "The peer's report is shown to the user on its own card, so do not repeat it back — add your judgement, " +
+      "the next step, or a synthesis across peers.\n\n" +
       "Agents you may delegate to:\n" + (rosterMd || "(none)"),
     parameters: Type.Object({
       agent_id: Type.String({ description: "The id of the agent to delegate to — the [id: …] value from the list above." }),
       agent_name: Type.Optional(Type.String({ description: "That agent's name (for display; from the list above)." })),
       task: Type.String({ minLength: 1, description: "The bounded task / question for that agent. Be specific about the target resource." }),
       session_id: Type.Optional(Type.String({ description: "Continue a prior peer session (the session_id a previous delegation to this agent returned) so the peer retains context. Omit to start fresh." })),
+      evidence_refs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+        description:
+          "References to the evidence behind this task — trace ids, metric queries, document URIs — so the peer " +
+          "can check your basis instead of re-deriving it. References only; do not paste file contents here.",
+      })),
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as DelegateParams;
@@ -95,6 +103,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // render details.steps live) — same path spawn_subagent uses.
       let lastSteps: unknown[] = [];
       let liveChildSessionId: string | undefined;
+      const startedAt = Date.now();
       const onProgress = (p: { toolCalls: number; steps: unknown[]; activity?: string; childSessionId?: string }) => {
         lastSteps = p.steps;
         if (p.childSessionId) liveChildSessionId = p.childSessionId;
@@ -105,14 +114,46 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
             content: p.activity ? [{ type: "text", text: p.activity }] : [],
             // child_session_id surfaced live (known at start) → the card's
             // "open full session" affordance appears while the peer is still running.
-            details: { status: "running", agent_id: member.id, agent_name: member.name, toolCalls: p.toolCalls, steps: p.steps, ...(liveChildSessionId ? { child_session_id: liveChildSessionId } : {}) },
+            //
+            // `activity` and `duration_ms` are ALSO in details, not only in content.
+            // The card reads what the peer is doing right now from details (the same
+            // field spawn_subagent uses), and content is a plain string the frontend
+            // has to guess the shape of — a delegation whose activity happened to
+            // look like JSON would be parsed as a result object. Emitting elapsed on
+            // every tick is what lets the card show a running clock without holding a
+            // timer of its own.
+            details: {
+              status: "running",
+              agent_id: member.id,
+              agent_name: member.name,
+              toolCalls: p.toolCalls,
+              steps: p.steps,
+              duration_ms: Date.now() - startedAt,
+              ...(p.activity ? { activity: p.activity } : {}),
+              ...(liveChildSessionId ? { child_session_id: liveChildSessionId } : {}),
+            },
           },
         });
       };
       const continueSessionId = params.session_id?.trim() || undefined;
-      const resp = await refs.delegateToAgentExecutor({ peerAgentId: member.id, text: task, peerSessionId: continueSessionId }, onProgress, signal)
+      const evidenceRefs = (params.evidence_refs ?? []).filter((r) => typeof r === "string" && r.trim());
+      const resp = await refs.delegateToAgentExecutor({
+        peerAgentId: member.id,
+        text: task,
+        peerSessionId: continueSessionId,
+        ...(evidenceRefs.length ? { evidenceRefs } : {}),
+      }, onProgress, signal)
         .catch((err) => ({ ok: false, peerAgentId: member.id, peerName: member.name, status: "failed" as const, steps: [], peerSessionId: undefined as string | undefined, peerTraceId: undefined as string | undefined, error: err instanceof Error ? err.message : String(err) }));
 
+      // ⚠️ `tool_calls` counts the SAME list the card renders.
+      //
+      // It used to read `resp.steps.length` — the gateway's own step list, built
+      // from a different translator with only {kind,toolName,durationMs} — while
+      // `steps` carried the box translator's six-field records. Two lists, two
+      // fidelities, and the card mixed them: a count that could disagree with
+      // the rows underneath it. Counting `kind === "tool"` also stops assistant
+      // reasoning lines from inflating a "tool calls" number.
+      //
       // Card-facing shape (portal-web AgentWorkCard reads target from args and
       // status/summary/tool_calls/steps from result details). Carry the accumulated
       // live steps into the FINAL result so the card keeps them after completion.
@@ -127,7 +168,7 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // fallback with no peerSessionId, and the failed/stopped legs are exactly
       // the ones a review needs to open.
       const childSessionId = resp.peerSessionId ?? liveChildSessionId;
-      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: resp.steps?.length ?? 0, steps: lastSteps, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
+      const cardBase = { agent_id: member.id, agent_name: member.name, tool_calls: lastSteps.filter((st) => (st as { kind?: string }).kind === "tool").length, steps: lastSteps, duration_ms: Date.now() - startedAt, ...(childSessionId ? { child_session_id: childSessionId } : {}), ...(resp.peerTraceId ? { child_trace_id: resp.peerTraceId } : {}) };
 
       // Stopped by the coordinator (turn aborted): the relay was torn down and
       // the peer turn cancelled. Report a clean stop, not a scary error.
@@ -160,8 +201,26 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       // Surface the peer session id in the TEXT (not just details) so the model can
       // pass it back as session_id to continue this peer thread on a follow-up.
       const cont = resp.peerSessionId ? `\n\n(To continue with ${member.name}, delegate again with session_id="${resp.peerSessionId}".)` : "";
+      // ⚠️ The user ALREADY SEES this report. It is rendered on the delegation
+      // card — the conclusion on the collapsed card, the peer's own full message
+      // and every tool it ran when expanded. Without this line the model does
+      // what it does with any tool result: paraphrase it. Observed in the test
+      // environment, the paraphrase silently dropped the peer's table and its
+      // whole "how this was counted" caveat, so the version the user read by
+      // default was the LOSSY one while the complete answer sat one click away.
+      //
+      // Deliberately not "say nothing": a turn still has to end with an
+      // assistant message, and a model told to be silent produces either an
+      // empty turn or a bare "done". It is given something short and legitimate
+      // to say instead. And the instruction is CONDITIONAL — synthesising across
+      // several peers, or adding its own judgement, is the coordinator's actual
+      // job and must not be suppressed.
+      const dontRestate =
+        `\n\n[The user can already read this report on the delegation card. Do NOT repeat or re-summarise ` +
+        `${member.name}'s findings — a paraphrase only loses detail. Reply with your own contribution instead: ` +
+        `the next step, a judgement call, or a synthesis if you delegated to several peers. One or two lines is enough.]`;
       return {
-        content: [{ type: "text" as const, text: `Result from ${member.name}:\n${full}${cont}` }],
+        content: [{ type: "text" as const, text: `Result from ${member.name}:\n${full}${cont}${dontRestate}` }],
         details: { ...cardBase, status: "done", summary, full_summary: full },
       };
     },

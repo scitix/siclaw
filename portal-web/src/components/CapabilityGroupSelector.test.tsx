@@ -44,7 +44,7 @@ describe("CapabilityGroupSelector — render contract", () => {
     expect(html).toContain("Unrestricted")
     expect(html).not.toContain("Restricted")
     expect(html).toContain("agent can use ALL tools")
-    expect(html).toContain("Capability groups (0 / 11)")
+    expect(html).toContain(`Capability groups (0 / ${CAPABILITY_GROUPS.length})`)
     expect(countChecked(html)).toBe(0)
   })
 
@@ -54,7 +54,7 @@ describe("CapabilityGroupSelector — render contract", () => {
     expect(html).not.toContain("Unrestricted")
     // "1 group" must be singular.
     expect(html).toContain(`1 group · ${toolCount("read_files")} tools`)
-    expect(html).toContain("Capability groups (1 / 11)")
+    expect(html).toContain(`Capability groups (1 / ${CAPABILITY_GROUPS.length})`)
     expect(countChecked(html)).toBe(1)
   })
 
@@ -62,7 +62,7 @@ describe("CapabilityGroupSelector — render contract", () => {
     const html = render(new Set(["read_files", "run_commands"]))
     // Plural "groups", and the count covers both selections.
     expect(html).toContain(`2 groups · ${toolCount("read_files", "run_commands")} tools`)
-    expect(html).toContain("Capability groups (2 / 11)")
+    expect(html).toContain(`Capability groups (2 / ${CAPABILITY_GROUPS.length})`)
     expect(countChecked(html)).toBe(2)
   })
 

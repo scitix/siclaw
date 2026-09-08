@@ -56,7 +56,21 @@ describe("delegate_to_agent tool", () => {
   });
 
   it("resolves the target and calls the executor, shaping the AgentWorkCard result", async () => {
-    const exec = vi.fn(async () => okResp());
+    // ⚠️ The fake MUST drive onProgress. In production the box-side translator
+    // pushes the step records through it, and the card's `steps` AND its
+    // `tool_calls` count both come from that one list — a fake that skips it
+    // was letting the count be read from a second, thinner list instead.
+    const exec = vi.fn(async (_req: unknown, onProgress?: (p: unknown) => void) => {
+      onProgress?.({
+        toolCalls: 2,
+        steps: [
+          { kind: "tool", toolName: "kubectl", content: "ok", outcome: "success", durationMs: 12 },
+          { kind: "assistant", text: "checking coredns" },
+          { kind: "tool", toolName: "pod_logs", content: "OOMKilled", outcome: "success", durationMs: 30 },
+        ],
+      });
+      return okResp();
+    });
     const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
     const r = await tool.execute("c1", { agent_id: "agent-net", agent_name: "net-agent", task: "check sh-1 coredns" });
     expect(exec).toHaveBeenCalledWith({ peerAgentId: "agent-net", text: "check sh-1 coredns" }, expect.any(Function), undefined);
@@ -68,7 +82,39 @@ describe("delegate_to_agent tool", () => {
     expect(d.agent_id).toBe("agent-net");
     expect(d.agent_name).toBe("net-agent");
     expect(d.summary).toContain("CoreDNS OOMKilled x3");
+    // Two tool rows out of three steps: the assistant reasoning line is not a
+    // tool call, and it used to be counted as one.
     expect(d.tool_calls).toBe(2);
+    expect(d.steps).toHaveLength(3);
+  });
+
+  // ⚠️ 没有这条指示的时候,coordinator 会像对待任何工具结果一样把 peer 的报告
+  // 转述一遍 —— 测试环境实测:转述把 peer 原文的表格和整段口径说明丢了,而用户
+  // 默认读到的正是这个有损版本,完整版反而在卡片里要点一下。
+  //
+  // 钉三件事:指示在;它明说"用户已经看到了";它是**有条件**的 —— 多个 peer 需要
+  // 综合、或者要给出自己的判断时,coordinator 本来就该说话,不能一并压掉。
+  it("tells the coordinator not to restate the peer's report", async () => {
+    const exec = vi.fn(async () => okResp());
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const r = await tool.execute("c1", { agent_id: "agent-net", agent_name: "net-agent", task: "check sh-1" });
+    const out = text(r);
+    expect(out).toMatch(/Do NOT repeat or re-summarise/);
+    expect(out).toContain("already read this report on the delegation card");
+    expect(out).toMatch(/synthesis if you delegated to several peers/);
+    // 报告本身仍然在结果里 —— 指示是"不要复述给用户",不是"不给模型看"。
+    expect(out).toContain("CoreDNS OOMKilled x3");
+  });
+
+  // 失败 / 停止 / 等待输入这三条路不该带这句:没有报告可复述,而
+  // input_required 恰恰**要求** coordinator 把问题转达给用户。
+  it("does not suppress relaying on the non-done outcomes", async () => {
+    const exec = vi.fn(async () => ({ ...okResp(), status: "input_required", inputQuestion: "which cluster?" }));
+    const tool = createDelegateToAgentTool(makeRefs({ delegationRoster: ROSTER, delegateToAgentExecutor: exec as any }));
+    const r = await tool.execute("c1", { agent_id: "agent-net", agent_name: "net-agent", task: "check sh-1" });
+    const out = text(r);
+    expect(out).not.toMatch(/Do NOT repeat/);
+    expect(out).toMatch(/Relay this question to the user/);
   });
 
   it("accepts a name in agent_id and still resolves", async () => {

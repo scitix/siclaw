@@ -21,18 +21,16 @@ describe("report_findings tool", () => {
   it("is available ONLY on a delegated turn with an event bus", () => {
     const emitter = vi.fn();
     expect(registration.available?.(makeRefs())).toBe(false); // no delegation
-    expect(registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true } }))).toBe(false); // no emitter
+    expect(registration.available?.(makeRefs({ delegation: { delegationId: "d1" } }))).toBe(false); // no emitter
     expect(
-      registration.available?.(makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter })),
+      registration.available?.(makeRefs({ delegation: { delegationId: "d1" }, sessionEventEmitter: emitter })),
     ).toBe(true);
-    // tagged readOnlyDelegable so it survives the read-only filter
-    expect(registration.readOnlyDelegable).toBe(true);
   });
 
   it("emits a delegation_artifact event stamped with the delegationId", async () => {
     const emitter = vi.fn();
     const tool = createReportFindingsTool(
-      makeRefs({ delegation: { delegationId: "deleg-42", readOnly: true }, sessionEventEmitter: emitter }),
+      makeRefs({ delegation: { delegationId: "deleg-42" }, sessionEventEmitter: emitter }),
     );
 
     const r = await tool.execute("call-1", {
@@ -57,7 +55,7 @@ describe("report_findings tool", () => {
   it("rejects empty findings before emitting", async () => {
     const emitter = vi.fn();
     const tool = createReportFindingsTool(
-      makeRefs({ delegation: { delegationId: "d1", readOnly: true }, sessionEventEmitter: emitter }),
+      makeRefs({ delegation: { delegationId: "d1" }, sessionEventEmitter: emitter }),
     );
     const r = await tool.execute("call-empty", { findings: "   " });
     expect(emitter).not.toHaveBeenCalled();

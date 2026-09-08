@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
+import { hasAcceptedTurn, readTurnLedger, recordAcceptedTurn, TURN_LEDGER_MAX } from "./turn-ledger.js";
+import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -227,14 +229,21 @@ function makeFakeSession(id: string) {
   };
 }
 
-function makeFakeSessionManager() {
+function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-ledger-"))) {
   const sessions = new Map<string, ReturnType<typeof makeFakeSession>>();
   const getOrCreateCalls: any[] = [];
   return {
     sessions,
     getOrCreateCalls,
+    ledgerDir,
     userId: "u",
     agentId: "a",
+    // The REAL file-backed ledger, so these tests exercise the durability that
+    // the cross-restart de-duplication depends on rather than a stub of it.
+    hasAcceptedTurn: (sessionId: string, turnId: string) =>
+      hasAcceptedTurn(path.join(ledgerDir, sessionId), turnId),
+    recordAcceptedTurn: (sessionId: string, turnId: string) =>
+      recordAcceptedTurn(path.join(ledgerDir, sessionId), turnId),
     agentTypeState: "sre",
     activeCount: () => sessions.size,
     // Resident is not the same as busy — box-status reports both.
@@ -242,6 +251,11 @@ function makeFakeSessionManager() {
     subagentStats: () => ({ active: 0, pending: 0, limit: 50 }),
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
+    hasRestorableSessionContext: (id?: string) => Boolean(id && sessions.has(id)),
+    // The checkpointer read. This fake has no control plane to load from, so
+    // "context exists" is exactly "the session is resident" — same answer as
+    // the predicate above, which is what http-server used to call directly.
+    ensureSessionContext: async (id?: string) => Boolean(id && sessions.has(id)),
     stopSessionJobs: vi.fn(() => 0),
     markPendingAbort: vi.fn(),
     consumePendingAbort: vi.fn(() => false),
@@ -253,8 +267,9 @@ function makeFakeSessionManager() {
       activeMode?: unknown,
       _delegation?: unknown,
       userId?: string,
+      allowInputRequest?: boolean,
     ) => {
-      getOrCreateCalls.push({ id, activeMode, userId });
+      getOrCreateCalls.push({ id, activeMode, userId, allowInputRequest });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
@@ -613,6 +628,130 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
+  it.each(["message_end", "turn_end"])("keeps the original prompt open for a plain-text parent report via %s", async (finalEvent) => {
+    const session = await sm.getOrCreate("joined");
+    const finish = vi.fn();
+    let releaseReport!: () => void;
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("group");
+      session.brain.emitter.emit("event", { type: "message_end", message: {
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking nodes" }],
+      } });
+    }).mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { releaseReport = resolve; });
+      session.brain.emitter.emit("event", { type: finalEvent, message: {
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "All five nodes are ready" }],
+      } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "check nodes", sessionId: "joined" });
+    session._promptDoneCallbacks.add(finish);
+    await flushAsync();
+    expect(session._promptDone).toBe(false);
+    expect(finish).not.toHaveBeenCalled();
+    expect((await getJson(port, "/api/prompt", "POST", { text: "duplicate", sessionId: "joined" })).status).toBe(409);
+    (session as any)._backgroundWorkTurn.complete({ taskId: "group", status: "done", summary: "All five nodes are ready" });
+    await flushAsync();
+    expect(session.brain.prompt).toHaveBeenCalledTimes(2);
+    expect(session.brain.prompt.mock.calls[1][0]).toContain("All five nodes are ready");
+    expect(session._promptDone).toBe(false);
+    releaseReport();
+    await flushAsync();
+    expect(session._promptDone).toBe(true);
+    expect(finish).toHaveBeenCalledTimes(1);
+    const ends = session._extraEventBuffer.filter((e: any) => e.type === "message_end" || e.type === "turn_end") as any[];
+    expect(ends[0].awaitingSubagents).toBe(true);
+    expect(ends[1].awaitingSubagents).toBeUndefined();
+  });
+
+  it("consumes mixed command/child results incrementally and summarizes only after helper cleanup", async () => {
+    const session = await sm.getOrCreate("mixed-work");
+    const text = (value: string) => session.brain.emitter.emit("event", { type: "message_end", message: {
+      role: "assistant", stopReason: "stop", content: [{ type: "text", text: value }],
+    } });
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("listener");
+      (session as any)._backgroundWorkTurn.register("child");
+      text("Collecting results");
+    }).mockImplementationOnce(async () => {
+      text("Client finished; stopping the listener");
+      (session as any)._backgroundWorkTurn.complete({ taskId: "listener", status: "stopped", outputFile: "/tmp/listener", summary: "listener stopped" });
+    }).mockImplementationOnce(async () => { text("Verified the client and listener outputs"); });
+    await getJson(port, "/api/prompt", "POST", { text: "paired check", sessionId: "mixed-work" });
+    await flushAsync();
+    expect(session._promptDone).toBe(false);
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "client succeeded" });
+    await flushAsync();
+    expect(session.brain.prompt).toHaveBeenCalledTimes(3);
+    expect(session.brain.prompt.mock.calls[1][0]).toContain('"pendingJobIds":["listener"]');
+    expect(session.brain.prompt.mock.calls[2][0]).toContain("task_output(task_id)");
+    const ends = session._extraEventBuffer.filter((e: any) => e.type === "message_end") as any[];
+    expect(ends.map(e => e.awaitingBackgroundJobs === true)).toEqual([true, true, false]);
+    expect(session._promptDone).toBe(true);
+  });
+
+  it("resumes a real steer during background wait on the original request", async () => {
+    const session = await sm.getOrCreate("steer-work");
+    const progress = () => session.brain.emitter.emit("event", { type: "message_end", message: {
+      role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Capture is active" }],
+    } });
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("listener");
+      progress();
+    }).mockImplementationOnce(async () => {
+      progress();
+      (session as any)._backgroundWorkTurn.complete({ taskId: "listener", status: "stopped", summary: "stopped" });
+    }).mockImplementationOnce(async () => {
+      session.brain.emitter.emit("event", { type: "message_end", message: {
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Stopped and summarized" }],
+      } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "observe", sessionId: "steer-work" });
+    await flushAsync();
+    expect((await getJson(port, "/api/sessions/steer-work/steer", "POST", { text: "finish the capture now" })).status).toBe(200);
+    await flushAsync();
+    expect(session.brain.steer).not.toHaveBeenCalled();
+    expect(session.brain.prompt.mock.calls[1][0]).toBe("finish the capture now");
+    expect(session._promptDone).toBe(true);
+  });
+
+  it("reports failure instead of silently completing when synthesis emits only commentary", async () => {
+    const session = await sm.getOrCreate("no-report");
+    const emitText = (text: string, phase: string) => session.brain.emitter.emit("event", {
+      type: "message_end", message: { role: "assistant", stopReason: "stop", content: [
+        { type: "text", text, textSignature: JSON.stringify({ v: 1, phase }) },
+      ] },
+    });
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("child");
+      emitText("Checking", "commentary");
+    }).mockImplementationOnce(async () => { emitText("I will report later", "commentary"); });
+    await getJson(port, "/api/prompt", "POST", { text: "check", sessionId: "no-report" });
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "five ready nodes" });
+    await flushAsync();
+    expect(session._promptDone).toBe(true);
+    expect(session._extraEventBuffer.some((e: any) => e.message?.stopReason === "error")).toBe(true);
+    expect(sm.stopSessionJobs).toHaveBeenCalledWith("no-report", ["child"]);
+  });
+
+  it("Stop during the child wait closes the parent and never starts the report", async () => {
+    const session = await sm.getOrCreate("stop-join");
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("child");
+      session.brain.emitter.emit("event", { type: "message_end", message: {
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking" }],
+      } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "check", sessionId: "stop-join" });
+    await flushAsync();
+    expect(session._promptDone).toBe(false);
+    await getJson(port, "/api/sessions/stop-join/abort", "POST", {});
+    await flushAsync();
+    expect(session._promptDone).toBe(true);
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "late" });
+    await flushAsync();
+    expect(session.brain.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("POST /api/prompt creates a session and returns ok", async () => {
     const r = await getJson(port, "/api/prompt", "POST", { text: "hi" });
     expect(r.status).toBe(200);
@@ -1146,6 +1285,51 @@ describe("http-server — prompt + session lifecycle", () => {
 
     expect(r.status).toBe(200);
     expect(sm.getOrCreateCalls.at(-1)?.userId).toBe("user-42");
+  });
+
+  it("passes allowInputRequest into session creation", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "inspect the cluster",
+      sessionId: "a2a-new",
+      allowInputRequest: true,
+    });
+
+    expect(r.status).toBe(200);
+    expect(r.data.resumed).toBe(false);
+    expect(sm.getOrCreateCalls.at(-1)?.allowInputRequest).toBe(true);
+  });
+
+  it("fails closed when a required session context is unavailable", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "the cluster is sh-1",
+      sessionId: "missing-session",
+      requireExistingSession: true,
+    });
+
+    expect(r.status).toBe(412);
+    expect(r.data.error).toEqual({
+      code: "SESSION_CONTEXT_UNAVAILABLE",
+      message: "The requested session context is unavailable and cannot be resumed",
+      retriable: false,
+      status: 412,
+    });
+    expect(sm.getOrCreateCalls).toHaveLength(0);
+  });
+
+  it("marks an accepted continuation as resumed", async () => {
+    await sm.getOrCreate("existing-session");
+    sm.getOrCreateCalls.length = 0;
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "the cluster is sh-1",
+      sessionId: "existing-session",
+      allowInputRequest: true,
+      requireExistingSession: true,
+    });
+
+    expect(r.status).toBe(200);
+    expect(r.data.resumed).toBe(true);
+    expect(sm.getOrCreateCalls.at(-1)?.allowInputRequest).toBe(true);
   });
 
   it("POST /api/prompt rejects a second prompt while the session is still running", async () => {
@@ -2109,29 +2293,26 @@ describe("http-server — idle self-destruct", () => {
   });
 });
 
-describe("resolveDelegation (worker autonomy — readOnly is explicit opt-in)", () => {
+describe("resolveDelegation (worker autonomy)", () => {
   it("returns undefined for a non-delegated turn", () => {
     expect(resolveDelegation(undefined, "web")).toBeUndefined();
     // A malformed marker without a delegationId is treated as non-delegated.
-    expect(resolveDelegation({ delegationId: "", readOnly: false }, "web")).toBeUndefined();
+    expect(resolveDelegation({ delegationId: "" }, "web")).toBeUndefined();
   });
 
-  it("does NOT downgrade the worker: readOnly=false survives from ANY origin", () => {
-    expect(resolveDelegation({ delegationId: "d1", readOnly: false }, "web")).toEqual({ delegationId: "d1", readOnly: false });
-    // Non-interactive origins no longer force read-only — the worker runs under its own config.
-    for (const origin of ["task", "a2a", "api", "channel"] as const) {
-      expect(resolveDelegation({ delegationId: "d1", readOnly: false }, origin)?.readOnly).toBe(false);
+  // 委托不降级被委托方 —— 它带回来的就是它自己,没有可供调用方拨动的档位。
+  // 这条曾经是 `readOnly` 开关:调用方一句话就能砍掉 peer 的工具表**并换掉它的
+  // persona**,于是"委托给 agent Y"拿到的根本不是 Y。只读是 agent 自己的角色配置
+  // (能力组),不是每次调用的参数。
+  it("carries the marker through unchanged from ANY origin", () => {
+    for (const origin of ["web", "task", "a2a", "api", "channel"] as const) {
+      expect(resolveDelegation({ delegationId: "d1" }, origin)).toEqual({ delegationId: "d1" });
     }
   });
 
-  it("defaults to NOT read-only when the flag is omitted (worker autonomous)", () => {
-    expect(resolveDelegation({ delegationId: "d1" } as any, "web")?.readOnly).toBe(false);
-    expect(resolveDelegation({ delegationId: "d1" } as any, "api")?.readOnly).toBe(false);
-  });
-
-  it("honors an EXPLICIT read-only=true opt-in (future read-only tier)", () => {
-    expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "web")?.readOnly).toBe(true);
-    expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "api")?.readOnly).toBe(true);
+  it("has no permission dial a caller could set", () => {
+    const resolved = resolveDelegation({ delegationId: "d1", readOnly: true } as any, "web");
+    expect(resolved).toEqual({ delegationId: "d1" });
   });
 });
 
@@ -2140,5 +2321,105 @@ describe("http-server — Skill handler wiring", () => {
     const src = fs.readFileSync(path.resolve(__dirname, "http-server.ts"), "utf8");
     expect(src).toContain("createSkillsHandler");
     expect(src).not.toContain("preserveExistingOnEmpty");
+  });
+});
+
+// ── Authority envelope binding + the turn ledger ──────────────────────────────
+
+describe("http-server — turn ledger (cross-restart dispatch idempotency)", () => {
+  let ledgerServer: http.Server | https.Server;
+  let ledgerPort: number;
+  let ledgerSm: ReturnType<typeof makeFakeSessionManager>;
+
+  beforeEach(async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.SICLAW_CERT_PATH = "/tmp/nonexistent-cert-path-for-siclaw-tests";
+    ledgerSm = makeFakeSessionManager();
+    ledgerServer = createHttpServer(ledgerSm as any);
+    ledgerPort = await startServer(ledgerServer);
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((r) => (ledgerServer as http.Server).close(() => r()));
+    vi.restoreAllMocks();
+  });
+
+  it("records an accepted turnId and answers a repeat with duplicate:true, without prompting", async () => {
+    const first = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L1", turnId: "turn-1" });
+    expect(first.status).toBe(200);
+    expect(first.data.duplicate).toBeUndefined();
+    const session = ledgerSm.sessions.get("L1")!;
+    const promptsAfterFirst = session.brain.prompt.mock.calls.length;
+
+    const repeat = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L1", turnId: "turn-1" });
+    expect(repeat.status).toBe(200);
+    expect(repeat.data).toMatchObject({ ok: true, sessionId: "L1", turnId: "turn-1", duplicate: true });
+    // The whole point: no second turn was started.
+    expect(session.brain.prompt.mock.calls.length).toBe(promptsAfterFirst);
+  });
+
+  it("treats a DIFFERENT turnId on the same session as a new turn", async () => {
+    await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L2", turnId: "turn-1" });
+    const other = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L2", turnId: "turn-2" });
+    expect(other.data.duplicate).toBeUndefined();
+  });
+
+  it("survives a fresh session-manager instance — this is the cross-restart case", async () => {
+    await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L3", turnId: "turn-restart" });
+
+    // Everything in memory is gone; only the volume remains. A new manager and a
+    // new server over the SAME session directory must still recognise the turn,
+    // which is exactly what a Runtime restart looks like from the box's side.
+    await new Promise<void>((r) => (ledgerServer as http.Server).close(() => r()));
+    const revivedSm = makeFakeSessionManager(ledgerSm.ledgerDir);
+    ledgerServer = createHttpServer(revivedSm as any);
+    ledgerPort = await startServer(ledgerServer);
+
+    const repeat = await getJson(ledgerPort, "/api/prompt", "POST", { text: "hi", sessionId: "L3", turnId: "turn-restart" });
+    expect(repeat.data).toMatchObject({ duplicate: true, turnId: "turn-restart" });
+    // No session was even created on the revived instance.
+    expect(revivedSm.sessions.has("L3")).toBe(false);
+  });
+
+  it("keeps only the most recent TURN_LEDGER_MAX entries", async () => {
+    const dir = path.join(ledgerSm.ledgerDir, "bounded");
+    for (let i = 0; i < TURN_LEDGER_MAX + 25; i += 1) recordAcceptedTurn(dir, `t-${i}`);
+    const kept = readTurnLedger(dir);
+    expect(kept).toHaveLength(TURN_LEDGER_MAX);
+    expect(kept.at(-1)).toBe(`t-${TURN_LEDGER_MAX + 24}`);
+    // The oldest fell off; the newest are all still recognised.
+    expect(hasAcceptedTurn(dir, "t-0")).toBe(false);
+    expect(hasAcceptedTurn(dir, `t-${TURN_LEDGER_MAX + 24}`)).toBe(true);
+  });
+
+  it("treats a corrupt or missing ledger as empty rather than failing the turn", async () => {
+    const dir = path.join(ledgerSm.ledgerDir, "corrupt");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, ".turn-ledger.json"), "{not json", "utf8");
+    expect(readTurnLedger(dir)).toEqual([]);
+    expect(hasAcceptedTurn(dir, "anything")).toBe(false);
+    // And it recovers: a later record rewrites a valid file.
+    recordAcceptedTurn(dir, "t-after-corruption");
+    expect(hasAcceptedTurn(dir, "t-after-corruption")).toBe(true);
+    // A directory that does not exist at all is simply empty.
+    expect(readTurnLedger(path.join(ledgerSm.ledgerDir, "never-used"))).toEqual([]);
+  });
+});
+
+describe("handoff prompt trace acknowledgement", () => {
+  it("inherits the source trace per request and starts a fresh trace for the next user question", async () => {
+    const traceId = "0123456789abcdef0123456789abcdef";
+    const first = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "handoff-trace-session", text: "continue checking",
+      handoffTrace: { traceId, parentSpanId: "1234567890abcdef", traceFlags: 1 },
+    });
+    expect(first.status).toBe(200);
+    expect(first.data.traceId).toBe(traceId);
+    await flushAsync();
+    const next = await getJson(port, "/api/prompt", "POST", { sessionId: "handoff-trace-session", text: "new question" });
+    expect(next.status).toBe(200);
+    expect(next.data.traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(next.data.traceId).not.toBe(traceId);
   });
 });

@@ -11,6 +11,7 @@ const MODE_LABELS: Record<string, string> = {
 export interface BuildSystemPromptInput {
   mode?: "cli" | "web" | "channel" | "task";
   templateOverride?: string;
+  interactiveProgress?: boolean;
   /** Immutable built-in Agent Type contract. */
   agentTypePrompt?: string;
   /** Editable Agent-owned specialization. */
@@ -126,6 +127,10 @@ export function buildSystemPromptAssembly(input: BuildSystemPromptInput): Prompt
   if (agentAddendum?.trim()) {
     add("agent.addendum", "agent", "agents.system_prompt", true,
       `\n\n# Agent Addendum\n\n${renderSystemPromptFragment(agentAddendum, mode, memoryEnabled)}`);
+  }
+
+  if (mode === "web" && input.interactiveProgress !== false) {
+    add("mode.web_progress", "mode", "src/core/prompt.ts#WEB_PROGRESS_SECTION", false, WEB_PROGRESS_SECTION);
   }
 
   if (includeOperationalSafety) {
@@ -321,7 +326,10 @@ const DEFAULT_TEMPLATE = `Help the user accomplish their goal with the available
 
 # Communication
 
-- Lead with the answer or outcome. Keep progress updates brief and reserve them for meaningful milestones, changed direction, or a load-bearing finding.
+- Before the first tool call in an interactive task, give one short sentence explaining what you will check or do in the user's language. A simple lookup needs only that sentence, not a plan.
+- During multi-step work, keep the user informed of meaningful findings, the next check and concrete blockers. If work lasts about a minute without an update, provide a brief factual progress update at the next opportunity. Do not narrate every command, invent progress, or expose private reasoning.
+- A handoff continues the same task: preserve the original goal, constraints and confirmed evidence; do not repeat an introduction or treat the handoff brief as a new user request.
+- Lead the final response with the answer or outcome. Keep progress updates brief and reserve them for meaningful milestones, changed direction, or a load-bearing finding.
 - The final response must stand on its own. Summarize relevant evidence instead of dumping raw tool output; keep exact identifiers, commands, and errors when they matter.
 - Use plain prose by default and tables only for facts that are genuinely easier to compare as rows and columns. Match the user's language and level of detail.
 
@@ -334,3 +342,17 @@ const DEFAULT_TEMPLATE = `Help the user accomplish their goal with the available
 # Runtime
 
 Siclaw {{mode}} session. Configuration is managed through {{settingsPath}}; do not edit \`.siclaw/config/settings.json\` manually.`;
+
+
+const WEB_PROGRESS_SECTION = `
+
+# Web Conversation Progress
+
+This is a live conversation. The user needs readable updates while you act, even for short tool-assisted queries. Concise output means short updates, not silent execution.
+- Before the first tool batch, write one plain sentence describing the check in the user's language, then call the tools in that same response. Do not stop after announcing intent.
+- Before subsequent batches, briefly connect an observed finding or blocker to the next check. For example: "The inventory identifies the target cluster; I will now count its nodes." Only mention evidence already returned by tools. Group related checks into one update; do not list commands or repeat status for each parallel tool.
+- Write progress as ordinary assistant text alongside tool calls. Explain the purpose of a group of checks and meaningful findings in prose; keep tool arguments solely for execution. Do not expose private reasoning.
+- Before handing off, explain what needs the next agent and why. On receipt, continue from the evidence and describe the next check without restarting the introduction. Agent identity is displayed by the interface.
+- If a call is still running and no new evidence is available, do not invent findings or claim success. At the next model response, explain an actual delay, failure, or change of direction if relevant.
+- Finish with one self-contained answer based on observed results. Progress belongs before tools, not repeated in the final answer.
+`;

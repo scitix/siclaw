@@ -11,6 +11,9 @@
  * chat_sessions row before invoking.
  */
 
+import { randomUUID } from "node:crypto";
+import { AssistantItemStream } from "./assistant-item-stream.js";
+import type { AssistantItem } from "../shared/assistant-items.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
@@ -47,8 +50,51 @@ export type OnEventCallback = (
   extras: SseEventExtras,
 ) => void;
 
+/**
+ * What a turn stops saying once it has handed the conversation away — see the
+ * cut in the event loop.
+ *
+ * Everything here is OUTPUT: it is rendered to the person watching, or written
+ * to the transcript, or both. Everything NOT here is turn lifecycle
+ * (`agent_start` / `agent_end` / `turn_end` / `agent_settled`, the routing
+ * events, compaction and retry) and must keep flowing: those are what the
+ * client balances its "still working" state on, and swallowing one leaves the
+ * spinner running under an answer that already arrived.
+ */
+const HANDOFF_MUTED_EVENT_TYPES = new Set([
+  "message_start",
+  "message_update",
+  "message_end",
+  "tool_start",
+  "tool_execution_start",
+  "agent_message",
+  "knowledge_sources",
+]);
+
+/**
+ * ⚠️ CLOSERS ARE NOT MUTED BY TYPE. Muting an event that CLOSES something the
+ * client already drew leaves that thing open forever, and the client reads
+ * "something is still open" as "the agent is still working".
+ *
+ * That is exactly how the previous version of this cut broke:
+ * `transfer_to_agent` emits `handoff_requested` from inside its own execute(),
+ * so its `tool_execution_end` lands AFTER the flag is set — it was muted, the
+ * transfer's tool row stayed `running` for good, and the spinner ran forever
+ * underneath the finished answer.
+ *
+ * So a closer is muted only when THIS cut also hid its opener (see
+ * `mutedToolCalls`); a closer for a tool that started before the handoff goes
+ * out. Letting an unmatched one through would be worse than noise: the console
+ * attaches a result with no matching row to the last still-running tool.
+ */
+const HANDOFF_PAIRED_CLOSERS = new Set([
+  "tool_end",
+  "tool_execution_update",
+  "tool_execution_end",
+]);
+
 export interface ConsumeAgentSseOptions {
-  client: AgentBoxClient;
+  client: Pick<AgentBoxClient, "streamEvents">;
   sessionId: string;
   userId: string;
   /**
@@ -77,6 +123,21 @@ export interface ConsumeAgentSseOptions {
    * output shares one trace_id in chat_messages. Absent → rows keep NULL.
    */
   traceId?: string;
+  /** Control-plane logical turn identity, shared by all items in this execution. */
+  turnId?: string;
+  /**
+   * The agent that RAN this turn, stamped onto every assistant/tool row.
+   *
+   * Only interesting once a session can change hands: a handed-over session's
+   * transcript is a single conversation answered by two different agents, and
+   * this column is the only thing that says which turn was whose. Without it an
+   * operator reading the transcript — or an analysis pass attributing a bad
+   * answer — sees one undifferentiated stream under the facade's name.
+   *
+   * Absent → rows keep NULL, which is what every pre-handoff caller wants: the
+   * session's own agent_id already answers the question when nothing moved.
+   */
+  agentId?: string;
 }
 
 export interface SseConsumptionResult {
@@ -338,7 +399,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // for the whole consume run (one prompt = one root trace), so one wrapper covers
   // all append sites; updateMessage is untouched (rows are stamped at append time).
   const appendRow = (input: Parameters<typeof appendMessage>[0]) =>
-    appendMessage({ ...input, traceId: opts.traceId ?? null });
+    appendMessage({
+      ...input,
+      traceId: opts.traceId ?? null,
+      // Who answered this turn. See ConsumeAgentSseOptions.agentId — the only
+      // record of that once a session can be handed to another agent.
+      fromAgentId: input.fromAgentId ?? opts.agentId ?? null,
+    });
 
   let assistantContent = "";
   let currentMsgText = "";
@@ -504,6 +571,24 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // reopened/refreshed (it otherwise only has it from a live agent_end, which a
   // cold session never replays). Overwritten on each assistant message_end, so
   // by agent_end these point at the turn's final assistant message.
+  let assistantEndedInStep = false;
+  const assistantItems = new AssistantItemStream();
+  const itemTurnId = opts.turnId ?? opts.traceId ?? randomUUID();
+  const startedItems = new Set<string>();
+  const emitItem = (item: AssistantItem, completed: boolean, dbId?: string, delta?: string, metadata?: Record<string, unknown>) => {
+    const type = delta !== undefined ? "item/agentMessage/delta" : completed ? "item/completed" : "item/started";
+    const scope = { threadId: sessionId, turnId: itemTurnId, itemId: item.id };
+    if (!startedItems.has(item.id) && type !== "item/started") {
+      onEvent?.({ type: "item/started", ...scope, sequence: 0,
+        item: { type: "agentMessage", id: item.id, text: "", phase: item.phase } }, "item/started", {});
+    }
+    startedItems.add(item.id);
+    onEvent?.({ type, ...scope, sequence: item.sequence, ...metadata,
+      ...(delta !== undefined ? { delta: redactText(delta, redactionConfig) } : {}),
+      ...(delta === undefined ? { item: { type: "agentMessage", id: item.id, text: redactText(item.text, redactionConfig), phase: item.phase } } : {}),
+      assistantItem: { ...item, text: undefined },
+    }, type, { dbMessageId: dbId });
+  };
   let lastAssistantDbMessageId: string | undefined;
   let lastAssistantContent: string | undefined;
   let lastAssistantMetadata: Record<string, unknown> | undefined;
@@ -513,6 +598,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // isn't written yet when agent_end arrives. We therefore stash the snapshot
   // here and let the deferred persistAssistant fold it into the row's metadata.
   let capturedContextUsage: Record<string, unknown> | undefined;
+  /** This turn handed the conversation away; see the cut inside the loop. */
+  let handoffRequested = false;
+  /** Tool invocations whose START this cut hid, so their END is hidden too. */
+  const mutedToolCalls = new Set<string>();
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
   // try/finally, not a bare fall-through: the terminal error is BUFFERED
@@ -523,12 +612,65 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     for await (const event of client.streamEvents(sessionId)) {
       if (signal?.aborted) break;
 
-      const evt = event as SseEvent;
+      const evt = { ...event as SseEvent };
       // Always a string: tool-pushed extra events (e.g. task_event, which carries
       // `kind` not `type`) have no `type`. A bare `eventType.includes(...)` on
       // undefined would throw and kill the whole SSE stream (STREAM_INTERRUPTED).
       const eventType = (evt.type as string | undefined) ?? "";
       eventCount++;
+
+      // ── After a handoff, this agent's turn is over ────────────────────────
+      //
+      // `transfer_to_agent` is terminal BY CONTRACT, and its result text tells
+      // the model to stop. A model does not have to obey, and observed in the
+      // test environment it did not: after handing the conversation away the
+      // facade retried the tool that had just failed, ran another one, and wrote
+      // a paragraph concluding "the transfer seems broken, it came back to me".
+      // That paragraph then reached the user AHEAD of the answer the receiving
+      // agent was already producing — the exact opposite of the one-continuous-
+      // answer property the whole design exists for — and, worse, it was
+      // PERSISTED, so every later turn would read it as history.
+      //
+      // So the cut is made here rather than trusted to the prompt: once this
+      // turn has asked for a handoff, nothing more from it is relayed or
+      // written. `handoff_requested` itself still passes (the flag is set after
+      // this check) — the control plane reads it to decide where the next hop
+      // goes. `prompt_done` is unaffected: it is emitted by server.ts once this
+      // consumer returns, not through this loop, so the chain still gets its
+      // signal to dispatch.
+      //
+      // Not a fix for the wasted tokens: the box keeps running until its turn
+      // ends on its own. Stopping the brain itself is the follow-up.
+      //
+      // ⚠️ CONTENT only. The first version of this cut dropped EVERYTHING and
+      // took the abandoned turn's `agent_end` with it, leaving the frontend one
+      // `agent_start` it never saw closed — the answer arrived and the "still
+      // working" spinner stayed on it forever. The turn-lifecycle events are the
+      // client's state machine, not output: they have to stay balanced whether
+      // or not anybody is listening to what the agent says.
+      if (handoffRequested) {
+        const evtRec = evt as Record<string, unknown>;
+        const pairKey = () => toolCallKey(evtRec, String(evtRec.toolName ?? ""));
+        if (HANDOFF_MUTED_EVENT_TYPES.has(eventType)) {
+          if (eventType === "tool_execution_start" || eventType === "tool_start") {
+            mutedToolCalls.add(pairKey());
+          }
+          continue;
+        }
+        if (HANDOFF_PAIRED_CLOSERS.has(eventType) && mutedToolCalls.has(pairKey())) {
+          continue;
+        }
+      }
+      if (eventType === "handoff_requested") handoffRequested = true;
+      if (eventType === "agent_switch") {
+        // A logical channel/task stream continues on an independent executor.
+        // Its final result must never fall back to the previous agent's progress.
+        handoffRequested = false;
+        assistantContent = currentMsgText = resultText = taskReportText = "";
+        assistantItems.begin();
+        pendingKnowledgeSources = null;
+        renderedKnowledgeSourceUrls.clear();
+      }
 
       if (eventType === "knowledge_sources") {
         pendingKnowledgeSources = (evt as Record<string, unknown>).sources;
@@ -543,7 +685,24 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         console.log(`[sse-consumer] ${userId}: ${eventType}`, JSON.stringify(event).slice(0, 300));
       }
 
+      // Internal child-result prompts continue the same request. They are not
+      // user steers, do not reset citation state, and must never become bubbles.
+      if (evt.internalMessage === true && (evt.message as { role?: string } | undefined)?.role === "user") continue;
+
       let dbMessageId: string | undefined;
+      if (eventType === "turn_start" || (eventType === "message_start" &&
+          (evt.message as { role?: string } | undefined)?.role === "assistant")) assistantItems.begin();
+      if (eventType === "message_update") {
+        const update = evt.assistantMessageEvent as Record<string, unknown> | undefined;
+        if (update) {
+          const output = assistantItems.update(update);
+          if (output) {
+            evt.nativeItems = true;
+            if ((evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true)) output.item.phase = "commentary";
+            emitItem(output.item, Boolean(output.completed), undefined, output.delta);
+          }
+        }
+      }
 
       // ── Capture context-usage snapshot from agent_end ──────────────────────
       // The brain computes {tokens, contextWindow, percent, inputTokens, ...} and
@@ -845,8 +1004,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         }
       }
 
+      // Pi repeats the completed assistant on turn_end, after message_end and
+      // tool results. Only use turn_end as a fallback when this step had no
+      // message_end. Content equality cannot distinguish legitimate repeated answers.
+      if (eventType === "turn_start") assistantEndedInStep = false;
+      const duplicateTurnEnd = eventType === "turn_end" && assistantEndedInStep;
+      if (eventType === "message_end" && (evt.message as any)?.role === "assistant") assistantEndedInStep = true;
+      if (eventType === "turn_end") assistantEndedInStep = false;
+
       // ── message_end / turn_end: persist assistant message + extract result ──
-      if (eventType === "message_end" || eventType === "turn_end") {
+      if (eventType === "message_end" || (eventType === "turn_end" && !duplicateTurnEnd)) {
         const message = evt.message as Record<string, unknown> | undefined;
         if (message?.role === "assistant") {
           // ── LLM-call envelope: the timing source of truth ──
@@ -961,42 +1128,74 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                 if (cited !== base) {
                   extracted = cited;
                   assistantContent = cited;
-                  message.content = [{ type: "text", text: cited }];
+                  if (Array.isArray(message.content)) {
+                    const parts = message.content.map(part => ({ ...part }));
+                    const lastText = [...parts].reverse().find(part => part.type === "text");
+                    if (lastText) lastText.text += cited.slice(base.length);
+                    message.content = parts;
+                  } else message.content = cited;
                   for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
                   pendingRowCitations = freshSources;
                 }
               }
             }
           }
-          resultText = extracted || currentMsgText || resultText;
+          // Some providers only deliver text on message_end. Persist the complete
+          // message rather than relying on earlier deltas being present.
+          assistantContent = extracted || assistantContent;
+          const completedItems = assistantItems.complete(message);
+          if ((evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true)) {
+            for (const item of completedItems) item.phase = "commentary";
+          }
+          evt.nativeItems = true;
+          const answerItems = completedItems.filter(item => item.phase !== "commentary");
+          if (answerItems.length) resultText = answerItems.map(item => item.text).join("\n\n");
 
+          // phase 不是 timing:它区分「工具间的旁白」和「最终答复」,前端据此分组。
+          const phase = (evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true) || message.stopReason === "toolUse" ||
+            (completedItems.length > 0 && completedItems.every(item => item.phase === "commentary")) ? "commentary" : "final_answer";
+          (evt as Record<string, unknown>).phase = phase;
+          // Provider phase is item-level. Unknown is not a guessed final answer.
+          for (const item of completedItems) emitItem(item, true, undefined, undefined,
+            currentModelRouteMetadata ? { modelRoute: currentModelRouteMetadata } : {});
           if (currentModelRouteMetadata) {
             (evt as Record<string, unknown>).modelRoute = currentModelRouteMetadata;
           }
 
-          // ── Persist: one model-call row per envelope, plus its thinking row ──
-          // A call that produced only tool calls still gets a row (content ""):
-          // it is the carrier of that round's timing, tokens and thinking. A
-          // failed call's envelope already rides the error row above, so here
-          // only its partial text (if any) is written, without the envelope.
-          // Rows without an envelope (runtime predating the recorder, or a
-          // duplicate turn_end delivery) keep the old rule: text or nothing.
-          const cleaned = assistantContent ? stripEmptyResponseMarkers(assistantContent) : "";
+          // ── 落库:按 assistant item 分行,这一轮调用的账挂在第一行 ──
+          // 上游按「一次模型调用一行 + 一条 thinking 行」落库,本分支按「一个
+          // assistant item 一行」落库 —— 同一批文本的两种切法。合并规则:行按 item
+          // 切,envelope / citations / model_route 只挂第一行(一轮调用只结算一次账),
+          // 没产出任何文本的纯工具轮仍然留一条空行来承载 envelope。
           const rowEnvelope = isModelCallRowEnvelope(envelope, message.stopReason)
             ? redactLlmCallEnvelope(envelope, (text) => redactText(text, redactionConfig))
             : undefined;
-          if (persist && (cleaned.length > 0 || rowEnvelope)) {
-            const assistantRowContent = cleaned.length > 0 ? redactText(cleaned, redactionConfig) : "";
+          const itemRows = completedItems
+            .map((item) => ({ item, cleaned: stripEmptyResponseMarkers(item.text) }))
+            .filter((row) => row.cleaned.length > 0);
+          if (persist && (itemRows.length > 0 || rowEnvelope)) {
             const thinkingRow = rowEnvelope
               ? buildThinkingRow(message, rowEnvelope, (text) => redactText(text, redactionConfig))
               : null;
-            const assistantRowMetadata: Record<string, unknown> = {
+            const headMetadata: Record<string, unknown> = {
               ...(rowEnvelope ? { llm_call: rowEnvelope } : {}),
               ...(!rowEnvelope && envelope && envelope.round > 0 ? { llm_round: envelope.round } : {}),
               ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
               ...(pendingRowCitations.length > 0 ? { knowledge_citations: knowledgeCitationsMetadata(pendingRowCitations) } : {}),
             };
             pendingRowCitations = [];
+            const rows: { content: string; item?: AssistantItem; metadata: Record<string, unknown> }[] =
+              itemRows.length > 0
+                ? itemRows.map(({ item, cleaned }, index) => ({
+                    content: redactText(cleaned, redactionConfig),
+                    item,
+                    metadata: {
+                      ...(index === 0 ? headMetadata : {}),
+                      phase: item.phase ?? phase,
+                      assistant_item: { ...item, text: undefined, status: "completed" },
+                    } as Record<string, unknown>,
+                  }))
+                : [{ content: "", metadata: { ...headMetadata, phase } }];
             const persistAssistant = async () => {
               // Thinking first: it happened before the answer, and seq order is
               // the timeline. Bounded and redacted by buildThinkingRow.
@@ -1009,30 +1208,30 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                   console.warn(`[sse-consumer] thinking row persistence failed for ${sessionId}:`, err);
                 }
               }
-              // Fold in the context-usage snapshot if agent_end already arrived
-              // (the routed/default order — agent_end precedes this commit). The
-              // closure reads capturedContextUsage at RUN time, not definition time.
-              const rowMetadata = capturedContextUsage
-                ? { ...assistantRowMetadata, context_usage: capturedContextUsage }
-                : assistantRowMetadata;
-              const id = await appendRow({
-                sessionId,
-                role: "assistant",
-                content: assistantRowContent,
-                metadata: rowMetadata,
-              });
-              // Remember the turn's latest assistant row so a later agent_end (the
-              // immediate/non-routed order) can patch the snapshot onto its metadata.
-              lastAssistantDbMessageId = id;
-              lastAssistantContent = assistantRowContent;
-              lastAssistantMetadata = rowMetadata;
-              // Carry the row id out on the relayed message_end so a consumer can match
-              // its live bubble to the persisted row by identity. Only meaningful when
-              // the write happened inline (the deferred path runs after the event has
-              // already been relayed), which is every turn that has no fallback to
-              // switch to.
-              dbMessageId = id;
-              await incrementMessageCount(sessionId);
+              for (const row of rows) {
+                // Fold in the context-usage snapshot if agent_end already arrived
+                // (the routed/default order — agent_end precedes this commit). The
+                // closure reads capturedContextUsage at RUN time, not definition time.
+                const rowMetadata = capturedContextUsage
+                  ? { ...row.metadata, context_usage: capturedContextUsage }
+                  : row.metadata;
+                const id = await appendRow({
+                  sessionId,
+                  role: "assistant",
+                  content: row.content,
+                  metadata: rowMetadata,
+                });
+                // Remember the turn's latest assistant row so a later agent_end (the
+                // immediate/non-routed order) can patch the snapshot onto its metadata.
+                lastAssistantDbMessageId = id;
+                lastAssistantContent = row.content;
+                lastAssistantMetadata = rowMetadata;
+                // Carry the row id out on the relayed message_end so a consumer can
+                // match its live bubble to the persisted row by identity.
+                dbMessageId = id;
+                if (row.item) emitItem(row.item, true, id);
+                await incrementMessageCount(sessionId);
+              }
             };
             // On a routed turn the primary streams live before we know it won;
             // defer the durable write to the commit point so a failed primary's
@@ -1106,18 +1305,17 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       }
     }
     if (assistantContent) {
-      const cleaned = stripEmptyResponseMarkers(assistantContent);
-      if (cleaned.length > 0) {
+      for (const item of assistantItems.snapshot()) {
+        const text = stripEmptyResponseMarkers(item.text);
+        if (!text.trim()) continue;
         try {
-          await appendRow({
-            sessionId,
-            role: "assistant",
-            content: redactText(cleaned, redactionConfig),
-            metadata: { incomplete: true, llm_round: timeline.nextRound() },
-          });
+          await appendRow({ sessionId, role: "assistant", content: redactText(text, redactionConfig),
+            metadata: { incomplete: true, llm_round: timeline.nextRound(),
+              ...(item.phase ? { phase: item.phase } : {}),
+              assistant_item: { ...item, text: undefined, status: "interrupted" } } });
           await incrementMessageCount(sessionId);
         } catch (err) {
-          console.warn(`[sse-consumer] ${userId}: failed to persist partial assistant message on abort:`, err);
+          console.warn(`[sse-consumer] ${userId}: failed to persist partial assistant item on abort:`, err);
         }
       }
       assistantContent = "";

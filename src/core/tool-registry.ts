@@ -8,10 +8,12 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { MCP_TOOL_PREFIX } from "./mcp-client.js";
 import type {
   SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
 } from "./types.js";
-import type { DelegateResponse, DelegateRosterMember } from "../shared/agent-delegate.js";
+import type { DelegateResponse, DelegateRosterMember, DelegateStep } from "../shared/agent-delegate.js";
+import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
@@ -50,6 +52,8 @@ export interface SpawnSubagentRequest {
   description: string;
   /** The bounded task briefing — the child's only context besides its system prompt. */
   prompt: string;
+  /** Internal reduce input: full reports, scoped into the receiving child before inference. */
+  inputReports?: Array<{ item: string | Record<string, string>; status: GroupItemStatus; summary: string }>;
   /** Resolved sub-agent type id (see subagent-registry). */
   subagentType: string;
   /** When true, run detached and notify the parent on completion (do not block). */
@@ -87,7 +91,7 @@ export interface SpawnSubagentReport {
   status: Exclude<SpawnSubagentStatus, "launched">;
   /** Budgeted capsule returned to the parent as model-visible tool content. */
   summary: string;
-  /** Full child report for UI/debug persistence; not model-visible. */
+  /** Full report used by the caller and reducer; capsules are display previews only. */
   fullSummary?: string;
   /** The child's own persisted session id, for UI drill-in. */
   childSessionId: string;
@@ -206,6 +210,7 @@ export interface SubagentGroupProgress {
 
 /** One item's terminal record in the group report. */
 export interface SubagentGroupItemResult {
+  fullSummary?: string;
   item: string | Record<string, string>;
   status: GroupItemStatus;
   /** Capsule (model-visible only when there is no reduce stage) or a short error/skip note. */
@@ -271,6 +276,7 @@ export interface TaskOutputSnapshot {
   status?: import("./job-registry.js").JobStatus;
   exitCode?: number;
   outputFile?: string;
+  reportArtifact?: import("./tool-result-artifact.js").ToolResultArtifactReference;
 }
 
 /**
@@ -385,20 +391,11 @@ export interface BackgroundExecWiring {
  */
 export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
-/** A single live step of a delegated peer's turn — same shape the spawn_subagent
- *  card renders (assistant reasoning line, or a tool call with its result). */
-export interface DelegateStep {
-  kind: "assistant" | "tool";
-  text?: string;
-  toolName?: string;
-  toolInput?: string;
-  content?: string;
-  outcome?: "success" | "error";
-  durationMs?: number | null;
-}
-
 /** Live progress of a delegated turn, emitted as the peer streams. Mirrors the
  *  spawn_subagent progress shape so the coordinator card updates identically. */
+export type { DelegateStep };
+
+/** Live progress of a delegated turn. */
 export interface DelegateProgress {
   toolCalls: number;
   steps: DelegateStep[];
@@ -416,7 +413,7 @@ export interface DelegateProgress {
  * Absent → the `delegate_to_agent` tool stays out of the resolved tool list.
  */
 export type DelegateToAgentExecutor = (
-  req: { peerAgentId: string; text: string; peerSessionId?: string },
+  req: { peerAgentId: string; text: string; peerSessionId?: string; evidenceRefs?: string[] },
   onProgress?: (p: DelegateProgress) => void,
   /** Aborts the delegation when the coordinator's turn is stopped: closes the
    *  relay stream and cancels the peer's turn. */
@@ -456,6 +453,14 @@ export interface ToolRefs {
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
+  /**
+   * Explicitly exposes `request_input` for a top-level machine-driven turn
+   * (currently A2A). Delegated peer turns use `delegation` instead.
+   */
+  allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** Per-session citation registrar sharing successful-read state with Read. */
   knowledgeCitationTool?: ToolDefinition;
   /**
@@ -516,6 +521,30 @@ export interface ToolRefs {
   delegationRoster?: DelegateRosterMember[];
   /** Runs a delegation to a peer agent. See DelegateToAgentExecutor. */
   delegateToAgentExecutor?: DelegateToAgentExecutor;
+  /**
+   * The agents this one may HAND THE CONVERSATION OVER to — its backends if it
+   * is a facade, its facade plus siblings if it is a backend. Non-empty exposes
+   * `search_handoff_targets` and `transfer_to_agent`; the index stays outside model context. Empty (an ordinary
+   * agent, or a fetch that failed) means the tool never appears, which is the
+   * right degradation: this agent then answers the turn itself.
+   *
+   * Distinct from `delegationRoster` on purpose — a handoff moves ownership of
+   * the session, a delegation calls out and comes back. See agent-handoff.ts.
+   */
+  handoffTargets?: HandoffTarget[];
+  searchHandoffTargets?: (query: import("../shared/agent-handoff.js").HandoffSearchQuery) => Promise<import("../shared/agent-handoff.js").HandoffSearchResponse>;
+  /** Session-local, discovered targets only. Never serialized into tool definitions. */
+  handoffSearchMatches?: Map<string, import("../shared/agent-handoff.js").HandoffSearchMatch>;
+  /** Captured before session eviction; tracing is independent of tool arguments. */
+  getHandoffTraceContext?: (callId: string) => import("../shared/handoff-trace.js").HandoffTraceContext | undefined;
+  /**
+   * Drops this box's LOCAL copy of the session after handing the conversation
+   * away. The copy is only ever a cache — the control plane holds the authority
+   * and any box can reload it — so dropping it is safe, and keeping it is not:
+   * a box handed the conversation back weeks later would resume from a stale
+   * context missing every turn the other agent ran.
+   */
+  evictSessionContext?: () => Promise<void>;
 }
 
 /** Declarative registration for a single tool. */
@@ -547,6 +576,7 @@ export interface ToolEntry {
    */
   requiresUserApproval?: boolean;
 
+
   /**
    * Runtime availability check. Return false to skip this tool (create is not called).
    * Use for tools that depend on resources that may not be available
@@ -555,15 +585,6 @@ export interface ToolEntry {
    */
   available?: (refs: ToolRefs) => boolean;
 
-  /**
-   * True on tools safe to expose in a READ-ONLY DELEGATED turn (queries, reads,
-   * the result-artifact reporter). When `refs.delegation?.readOnly` is set,
-   * `resolve()` keeps ONLY tools with this flag — every exec/script/mutation tool
-   * drops out, so a delegated worker physically cannot write. Omit = not exposed
-   * under read-only delegation. Orthogonal to `allowedTools` (per-agent capability
-   * whitelist) — both filters apply. See docs/design/agent-delegation.md §8.
-   */
-  readOnlyDelegable?: boolean;
 
   /**
    * Operating modes that expose this tool. Omit = available in every mode (the
@@ -609,19 +630,11 @@ export class ToolRegistry {
   }): ResolvedToolDefinition[] {
     const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // Read-only delegated turn: the worker was delegated a bounded task by a
-    // coordinator over the mesh, at the read-only tier (design §8). Keep ONLY
-    // tools tagged readOnlyDelegable — this drops every exec/script/mutation
-    // tool, so the worker physically cannot write. Non-delegated turns and
-    // write-tier delegation (P1) are unaffected.
-    const delegatedReadOnly = refs.delegation?.readOnly === true;
-
     // 1. session-mode + operating-mode + delegation + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&
         (!e.availableModes || e.availableModes.includes(activeMode)) &&
-        (!delegatedReadOnly || e.readOnlyDelegable === true) &&
         (!e.available || e.available(refs)),
     );
 

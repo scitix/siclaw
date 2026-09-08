@@ -7,19 +7,19 @@ describe("backgroundLaunchedResult message", () => {
     return JSON.parse(r.content[0].text).message as string;
   };
 
-  it("keeps the default: end the turn, don't poll/sleep/spawn-a-waiter", () => {
+  it("keeps the current request active while avoiding polling waiters", () => {
     const m = msg();
-    expect(m).toMatch(/END YOUR TURN/);
-    expect(m).toMatch(/do NOT read anything, poll, sleep, or spawn a sub-agent/i);
+    expect(m).toMatch(/current request remains active/);
+    expect(m).not.toMatch(/END YOUR TURN/);
+    expect(m).toMatch(/do NOT poll, sleep, or spawn a waiter/i);
   });
 
   it("directs the model to task_output(task_id) rather than reading the raw output_file", () => {
     expect(msg()).toMatch(/task_output\(task_id\)/);
   });
 
-  it("carries the paired server/client EXCEPTION (so a perftest server isn't waited on → no deadlock)", () => {
+  it("carries the paired server/client guidance (so a perftest server isn't waited on → no deadlock)", () => {
     const m = msg();
-    expect(m).toMatch(/EXCEPTION/);
     expect(m).toMatch(/immediately run the counterpart/i);
     expect(m).toMatch(/deadlock/i);
     expect(m.toLowerCase()).toContain("client"); // the counterpart to run now

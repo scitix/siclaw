@@ -1,3 +1,4 @@
+import { BACKGROUND_EXEC_DESCRIPTION } from "../cmd-exec/background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -106,15 +107,7 @@ Examples:
         ? {
             run_in_background: Type.Optional(
               Type.Boolean({
-                description:
-                  "Run the script in the pod in the background instead of waiting. Returns immediately with " +
-                  "a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, sleep, or " +
-                  "read its output until the completion notification — then call task_output(task_id), not the raw " +
-                  "output_file). EXCEPTION: when this is the server/listener " +
-                  "side of a paired test, do NOT wait — IMMEDIATELY run the counterpart, then call task_output(task_id) when " +
-                  "the test finishes (waiting for the server's completion first deadlocks: it blocks until the client " +
-                  "connects, then times out). The script is wrapped in `timeout` (requires coreutils/busybox " +
-                  "`timeout` in the pod). Use for long-running in-pod scripts (soak, load).",
+                description: BACKGROUND_EXEC_DESCRIPTION + "The script is wrapped in `timeout` (requires coreutils/busybox `timeout` in the pod). Use for long-running in-pod scripts (soak, load).",
               }),
             ),
           }

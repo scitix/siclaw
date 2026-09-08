@@ -920,3 +920,72 @@ describe("PiAgentBrain", () => {
     });
   });
 });
+
+
+describe("handoff execution boundary", () => {
+  it("does not retry a successful terminal transfer even without final assistant text", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async () => {
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } });
+      session.__emit({ type: "tool_execution_end", toolName: "transfer_to_agent", result: { terminate: true, details: { transferred: true } } });
+    });
+    await new PiAgentBrain(session).prompt("count nodes");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+  it("blocks every call in a batch mixing handoff and work before execution", async () => {
+    const session = makeFakeSession();
+    const previous = vi.fn();
+    session.agent.beforeToolCall = previous;
+    new PiAgentBrain(session);
+    const calls = [{ type: "toolCall", name: "bash" }, { type: "toolCall", name: "transfer_to_agent" }];
+    for (const toolCall of calls) {
+      expect(await session.agent.beforeToolCall({ assistantMessage: { content: calls }, toolCall })).toMatchObject({ block: true });
+    }
+    expect(previous).not.toHaveBeenCalled();
+    await session.agent.beforeToolCall({ assistantMessage: { content: [calls[0]] }, toolCall: calls[0] });
+    expect(previous).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("processes already queued input before transfer and rejects input during the reserved handoff", async () => {
+  const session = makeFakeSession({ pendingMessageCount: 1 });
+  const brain = new PiAgentBrain(session);
+  const call = { type: "toolCall", name: "transfer_to_agent" };
+  const ctx = { assistantMessage: { content: [call] }, toolCall: call };
+  expect(await session.agent.beforeToolCall(ctx)).toMatchObject({ block: true });
+  session.pendingMessageCount = 0;
+  expect(await session.agent.beforeToolCall(ctx)).toBeUndefined();
+  await expect(brain.steer("new instruction")).rejects.toThrow("HANDOFF_IN_PROGRESS");
+  expect(session.steer).not.toHaveBeenCalled();
+});
+
+
+it("preserves tool arguments without interpreting them as narration", () => {
+  const session = makeFakeSession();
+  const brain = new PiAgentBrain(session, new Map([["lookup", "query"]]));
+  const seen: any[] = []; brain.subscribe(event => seen.push(event));
+  const args = Object.freeze({ name: "demo", description: "domain value" });
+  session.__emit(Object.freeze({ type: "tool_execution_start", toolName: "lookup", args }));
+  expect(seen[0].args).toBe(args);
+  expect(seen[0]).not.toHaveProperty("publicProgress");
+});
+
+
+describe("task completion assessment", () => {
+  it("checks the existing context without tools and restores the tool set", async () => {
+    const session = makeFakeSession();
+    session.prompt.mockImplementation(async () => {
+      expect(session.getActiveToolNames()).toEqual([]);
+      session.__emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ status: "incomplete", reason: "Only a promise, no findings" }) }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    expect(await brain.assessTaskCompletion("Check node")).toEqual({ status: "incomplete", reason: "Only a promise, no findings" });
+    expect(session.getActiveToolNames()).toEqual(["read", "mcp__result__submit"]);
+  });
+  it("restores tools after malformed review output", async () => {
+    const session = makeFakeSession();
+    session.prompt.mockImplementation(async () => session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Looks good" }] } }));
+    await expect(new PiAgentBrain(session).assessTaskCompletion("Check node")).rejects.toThrow();
+    expect(session.getActiveToolNames()).toEqual(["read", "mcp__result__submit"]);
+  });
+});

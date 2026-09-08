@@ -8,6 +8,12 @@ import {
 import { sessionRegistry } from "../session-registry.js";
 import { buildMarkdownMessage, DINGTALK_TITLE, sanitizeMarkdownForDingTalk } from "./dingtalk-card.js";
 
+const supportsConversationsMock = vi.hoisted(() => vi.fn());
+vi.mock("../conversation-client.js", async (original) => ({
+  ...await original<typeof import("../conversation-client.js")>(),
+  supportsConversations: supportsConversationsMock,
+}));
+
 // ── Mocks ──────────────────────────────────────────────────────────
 
 // Stub AgentBoxClient so tests don't open real HTTPS sockets.
@@ -79,6 +85,7 @@ function makeDownstream(text: string, overrides: Record<string, unknown> = {}) {
 let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
+  supportsConversationsMock.mockReset().mockResolvedValue(false);
   promptMock.mockReset();
   streamEventsMock.mockReset();
   closeSessionMock.mockReset();
