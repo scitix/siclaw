@@ -1,3 +1,4 @@
+import { BackgroundWorkTurn } from "./background-work-turn.js";
 import { LlmCallRecorder } from "../core/llm-call-recorder.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AgentBoxSessionManager } from "./session.js";
@@ -59,6 +60,59 @@ function setup(promptDone: boolean) {
 }
 
 describe("notifyParent", () => {
+  it("keeps a late cancelled job attached to its old request after a new request starts", async () => {
+    const { mgr, managed, brain } = setup(false);
+    const oldTurn = new BackgroundWorkTurn();
+    (managed as any)._backgroundWorkTurn = oldTurn;
+    mgr.registerBackgroundWork("s1", "j1");
+    oldTurn.cancel();
+    const newTurn = new BackgroundWorkTurn();
+    (managed as any)._backgroundWorkTurn = newTurn;
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "stopped", summary: "late exit" });
+    await flushCoalesce();
+    expect(managed._pendingNotifications).toEqual([]);
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(brain.followUp).not.toHaveBeenCalled();
+    expect(newTurn.jobIds).toEqual([]);
+    expect(mgr.backgroundWorkOwners.size).toBe(0);
+  });
+
+  it("delivers an attached child's result to the original prompt, never to the synthetic path", async () => {
+    const { mgr, managed, brain } = setup(false);
+    const turn = new BackgroundWorkTurn();
+    (managed as any)._backgroundWorkTurn = turn;
+    turn.register("child");
+    mgr.jobs.register({ jobId: "child", type: "subagent", parentSessionId: "s1", description: "check", status: "done", startedAt: 0, notified: false });
+    const waiting = turn.next();
+    await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "five ready nodes" });
+    expect((await waiting)[0].summary).toBe("five ready nodes");
+    await flushCoalesce();
+    expect(managed._pendingNotifications).toEqual([]);
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(brain.followUp).not.toHaveBeenCalled();
+    await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "duplicate" });
+    expect(await turn.next()).toEqual([]);
+  });
+
+  it("does not announce report completion when a message write is rejected", async () => {
+    const { mgr, brain } = setup(true);
+    let listener: ((event: any) => void) | undefined;
+    brain.subscribe.mockImplementation((cb: any) => { listener = cb; return () => {}; });
+    brain.prompt.mockImplementation(async () => {
+      listener?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final report" }] } });
+    });
+    const events: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (event: any) => {
+      events.push(event);
+      return { ok: event.type !== "delegation.append_message", id: "row" };
+    } };
+    mgr.agentId = "agent-1";
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "result" });
+    await flushCoalesce();
+    expect(events.some(e => e.event?.type === "background_turn_done")).toBe(false);
+    expect(events.some(e => e.event?.type === "stream_error")).toBe(true);
+  });
+
   it("in-flight parent: buffered and delivered as a synthetic turn once idle (never followUp)", async () => {
     const { mgr, brain, managed } = setup(false); // turn in-flight
     await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" });
@@ -392,7 +446,7 @@ describe("notifyParent", () => {
     });
   });
 
-  it("a text-only synthetic turn for a BASH job (output_file present) is still dropped (pure ack)", async () => {
+  it("preserves a text-only report for a BASH job", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let cb: ((e: any) => void) | undefined;
     const brain = {
@@ -412,12 +466,12 @@ describe("notifyParent", () => {
     await flushCoalesce();
     const events = send.mock.calls.map((c) => c[0]);
     const ack = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("no new info"));
-    expect(ack).toBeFalsy(); // the pure-ack text is NOT persisted
+    expect(ack).toBeTruthy(); // public text is preserved without a tool-use heuristic
     const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
-    expect(btd).toHaveLength(0);
+    expect(btd).toHaveLength(1);
   });
 
-  it("a MIXED batch (sub-agent + shell job) keeps the strict guard — text-only ack is dropped", async () => {
+  it("preserves a text-only report for a mixed subagent and shell batch", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let cb: ((e: any) => void) | undefined;
     const brain = {
@@ -439,12 +493,11 @@ describe("notifyParent", () => {
     await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" });
     await flushCoalesce();
     const events = send.mock.calls.map((c) => c[0]);
-    // The shell job present in the batch flips off allowTextOnlyPersist, so a text-only reaction
-    // is NOT persisted as a bubble (the sub-agent result still shows via its own card fold).
+    // A mixed batch must preserve public prose just like a subagent-only batch.
     const ack = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("nothing new"));
-    expect(ack).toBeFalsy();
+    expect(ack).toBeTruthy();
     const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
-    expect(btd).toHaveLength(0);
+    expect(btd).toHaveLength(1);
   });
 
   it("emits a live subagent_done fold event when a background sub-agent completes", async () => {

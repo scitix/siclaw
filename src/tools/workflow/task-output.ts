@@ -34,7 +34,7 @@ export function createTaskOutputTool(
       "Read the output of a background job (started with run_in_background) by its task_id. " +
       "Reports the job's status (running / completed / failed / stopped) plus its output — use " +
       "this instead of reading the raw output_file path. If status is \"running\", the output is " +
-      "partial: END YOUR TURN and call task_output again only after the completion notification. " +
+      "partial: continue independent work, or wait for its completion notification without polling. Read partial output only when needed for a readiness decision. " +
       "By default returns the last ~400 lines; pass tail_lines to change (0 = as much as fits, up to the last ~8MB).",
     parameters: Type.Object({
       task_id: Type.String({ description: "The task_id returned by a background launch (run_in_background)." }),
@@ -101,7 +101,6 @@ export function createTaskOutputTool(
 export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskOutputTool(refs),
-  modes: ["web", "channel", "cli"],
   // Available once a background mode is on AND the runtime injected the reader (so a task_id
   // can exist and be looked up). Hidden otherwise.
   available: (refs) =>

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AssistantItemStream } from "./assistant-item-stream.js";
 import { toRehydratedMessages } from "../shared/session-rehydrate.js";
 
@@ -29,4 +29,24 @@ describe("native assistant items", () => {
     const next = stream.complete({ role: "assistant", content: [{ type: "text", text: "partial corrected" }] });
     expect(next[0].id).not.toBe(done[0].id);
   });
+});
+
+
+it("stamps completion once for both the event snapshot and persisted item", () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(new Date("2026-09-08T00:00:00Z"));
+    const stream = new AssistantItemStream();
+    stream.update({ type: "text_delta", delta: "Checking" });
+    expect(stream.snapshot()[0].completedAt).toBeUndefined();
+    vi.advanceTimersByTime(51000);
+    const completed = stream.complete({ content: [{ type: "text", text: "5 nodes" }] });
+    expect(completed[0].completedAt).toBe("2026-09-08T00:00:51.000Z");
+    vi.advanceTimersByTime(30000);
+    expect(stream.snapshot()[0].completedAt).toBe(completed[0].completedAt);
+    const serialized = JSON.parse(JSON.stringify({ assistant_item: { ...completed[0], text: undefined } }));
+    expect(serialized.assistant_item.completedAt).toBe(completed[0].completedAt);
+    stream.begin();
+    expect(stream.snapshot()).toEqual([]);
+  } finally { vi.useRealTimers(); }
 });

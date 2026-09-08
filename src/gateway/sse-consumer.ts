@@ -676,6 +676,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         console.log(`[sse-consumer] ${userId}: ${eventType}`, JSON.stringify(event).slice(0, 300));
       }
 
+      // Internal child-result prompts continue the same request. They are not
+      // user steers, do not reset citation state, and must never become bubbles.
+      if (evt.internalMessage === true && (evt.message as { role?: string } | undefined)?.role === "user") continue;
+
       let dbMessageId: string | undefined;
       if (eventType === "turn_start" || (eventType === "message_start" &&
           (evt.message as { role?: string } | undefined)?.role === "assistant")) assistantItems.begin();
@@ -685,6 +689,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           const output = assistantItems.update(update);
           if (output) {
             evt.nativeItems = true;
+            if ((evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true)) output.item.phase = "commentary";
             emitItem(output.item, Boolean(output.completed), undefined, output.delta);
           }
         }
@@ -1130,12 +1135,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // message rather than relying on earlier deltas being present.
           assistantContent = extracted || assistantContent;
           const completedItems = assistantItems.complete(message);
+          if ((evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true)) {
+            for (const item of completedItems) item.phase = "commentary";
+          }
           evt.nativeItems = true;
           const answerItems = completedItems.filter(item => item.phase !== "commentary");
           if (answerItems.length) resultText = answerItems.map(item => item.text).join("\n\n");
 
           // phase 不是 timing:它区分「工具间的旁白」和「最终答复」,前端据此分组。
-          const phase = message.stopReason === "toolUse" ? "commentary" : "final_answer";
+          const phase = (evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true) || message.stopReason === "toolUse" ||
+            (completedItems.length > 0 && completedItems.every(item => item.phase === "commentary")) ? "commentary" : "final_answer";
           (evt as Record<string, unknown>).phase = phase;
           // Provider phase is item-level. Unknown is not a guessed final answer.
           for (const item of completedItems) emitItem(item, true, undefined, undefined,

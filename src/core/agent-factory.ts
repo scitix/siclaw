@@ -73,6 +73,7 @@ import {
 import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 
+import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
@@ -556,26 +557,17 @@ export async function createSiclawSession(
       allowInputRequest: opts?.allowInputRequest === true,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
-      // Force sub-agents foreground when a detached batch's conclusion would be
-      // stranded because the caller blocks on the turn's own result and has no
-      // persistent client to receive a later notification:
-      //   • Channel (Feishu/DingTalk): exposes spawn_subagent, no persistent client.
-      //   • Delegated peer (any delegation turn): the gateway prompts it with no
-      //     mode → it runs as "web" (so it has FULL capabilities incl. spawn), but
-      //     the coordinator delegates SYNCHRONOUSLY (drains one turn's stream). A
-      //     backgrounded batch would return an intermediate "started…" and the
-      //     coordinator would poll by re-delegating. Foreground makes the one turn
-      //     carry the complete result.
-      // Direct api/a2a/task calls need no handling here: spawn_subagent's `modes`
-      // are web/channel/cli only, so those entries never expose it. web/cli keep
-      // background (persistent clients). run_in_background exec is untouched.
+      // Channels currently deliver one foreground response. Do not advertise
+      // background launches until they support an owned, resumable delivery lifecycle.
+      // Delegated peers retain foreground subagents for their synchronous result contract.
       foregroundSubagentOnly: mode === "channel" || opts?.delegation != null,
       // The tier menu this session will advertise. Passed in rather than read from
       // box state because the tool schema is built HERE, once: the menu the lead is
       // shown has to be the one its choice is later resolved against.
       subagentTierMenu: opts?.subagentTierMenu ?? null,
       jobStopExecutor: opts?.jobStopExecutor,
-      backgroundExecExecutor: opts?.backgroundExecExecutor,
+      backgroundExecExecutor: allowsBackgroundExec(mode, allowedTools) && opts?.taskOutputReader && opts?.jobStopExecutor
+        ? opts.backgroundExecExecutor : undefined,
       taskOutputReader: opts?.taskOutputReader,
       channelMessageExecutor: opts?.channelMessageExecutor,
       delegation: opts?.delegation,

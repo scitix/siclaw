@@ -11,6 +11,8 @@ export interface AssistantItem {
   provider?: string;
   model?: string;
   sequence: number;
+  /** Runtime completion instant, preserved in live events and persisted items. */
+  completedAt?: string;
 }
 
 export function textPhase(signature: unknown): AssistantPhase | undefined {

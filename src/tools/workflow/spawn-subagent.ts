@@ -131,14 +131,11 @@ function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean): st
     "homogeneous — all strings or all objects. Never delegate understanding — give concrete targets, paths, " +
     "and what to check, not 'based on your findings, decide X'.\n\n" +
     (backgroundAllowed
-      ? "Foreground vs background: a SINGLE item runs FOREGROUND by default (blocks and returns the result " +
-        "inline so you can keep reasoning); a MULTI-item batch runs in the BACKGROUND by default (it can take " +
-        "10+ minutes, so it launches detached and a completion notification carrying the result arrives on its " +
-        "own). Override with run_in_background: set true to detach a single task, or false to block on a small " +
-        "batch whose result you need inline right now. After a BACKGROUND launch, just END YOUR TURN (or do " +
-        "other independent work) — never poll it, never spawn another sub-agent to 'wait for' it, and never " +
-        "fabricate its result; report to the user only when the notification arrives. Returns a job_id you " +
-        "can pass to job_stop to cancel."
+      ? "A SINGLE item runs FOREGROUND by default and returns its result inline. A MULTI-item batch " +
+        "runs concurrently in the background by default. You may do other independent work while it runs. " +
+        "The user request remains active until required subagents and their reduce finish and you report " +
+        "the findings. Completion results are delivered to you automatically; do not poll or spawn a " +
+        "waiting agent. Use run_in_background:false to receive results inline. Returns a job_id for job_stop."
       : "Every launch runs FOREGROUND: the call BLOCKS until all items (and the reduce, if any) finish, then " +
         "returns the results inline. This surface has no detached delivery, so you MUST fold the findings into " +
         "your reply THIS turn — never tell the user you'll 'report back later'. A large batch can take minutes; " +
@@ -359,11 +356,10 @@ export function createSpawnSubagentTool(
 }
 
 const LAUNCHED_MESSAGE =
-  "Sub-agent(s) launched in the background. END YOUR TURN NOW unless you have OTHER independent work to do " +
-  "right now — do NOT poll it, do NOT sleep/wait, and do NOT spawn another sub-agent or call any tool whose " +
-  "purpose is to 'wait for', 'check on', or 'get the result of' this job. There is nothing to wait for: a " +
-  "completion notification carrying the result will arrive on its own, and you report to the user THEN. " +
-  "Tell the user in plain language what is running; do NOT show them this job_id (use it only with job_stop to cancel).";
+  "Subagents are running concurrently for the current request. Continue any independent work. " +
+  "Their completion results will be delivered to you; use them to finish the request and report the findings. " +
+  "Until then, describe progress as commentary, not a completed answer. Do NOT poll or launch another " +
+  "agent just to wait. Use job_stop to cancel if needed.";
 
 /**
  * Normalise both executor result shapes into the UNIFORM model-visible envelope

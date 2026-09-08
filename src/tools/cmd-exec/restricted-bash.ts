@@ -1,3 +1,4 @@
+import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -221,17 +222,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         ? {
             run_in_background: Type.Optional(
               Type.Boolean({
-                description:
-                  "Run the command in the background instead of waiting. Returns immediately with a " +
-                  "task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT call " +
-                  "read (or any other tool) to check on it, and do NOT sleep or wait. You will be " +
-                  "automatically notified when it completes; ONLY THEN call task_output(task_id). Polling " +
-                  "the file before the notification just wastes turns (it will not be there yet). Use " +
-                  "for long-running work (perftest, follow logs, big collections). ALSO use it when one " +
-                  "expensive collection has to answer SEVERAL questions (e.g. counting status codes AND " +
-                  "duration buckets in the same log): launch it once, then run your greps against the " +
-                  "output file, instead of re-running the collection per question. Output that needs " +
-                  "structural (JSON) redaction cannot run in the background — use -o wide/name or run foreground.",
+                description: BACKGROUND_EXEC_DESCRIPTION + "Output that needs structural (JSON) redaction cannot run in the background — use -o wide/name or run foreground.",
               })
             ),
           }

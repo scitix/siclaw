@@ -52,6 +52,8 @@ export class AssistantItemStream {
       });
     }
     this.closed = true;
+    const completedAt = new Date().toISOString();
+    for (const item of this.items.values()) item.completedAt = completedAt;
     return this.snapshot().filter(item => item.text.trim()).map(item => ({ ...item, sequence: item.sequence + 1 }));
   }
 

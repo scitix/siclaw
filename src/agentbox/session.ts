@@ -11,6 +11,7 @@
  * and restored from JSONL on the next prompt.
  */
 
+import type { BackgroundWorkTurn } from "./background-work-turn.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -139,6 +140,8 @@ export interface ManagedSession {
   isRetrying: boolean;
   /** Whether the current prompt has finished (for race condition prevention) */
   _promptDone: boolean;
+  /** Required background work owned by the current user prompt. */
+  _backgroundWorkTurn?: BackgroundWorkTurn;
   /** Events buffered during prompt execution (replayed when SSE connects) */
   _eventBuffer: unknown[];
   /** Unsubscribe function for the event buffer subscription */
@@ -384,6 +387,18 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
+  // Retain the launching request owner until notification, even if Stop/handoff
+  // replaces the session's current request before a late child/process exit.
+  private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
+
+  private registerBackgroundWork(sessionId: string, jobId: string): BackgroundWorkTurn | undefined {
+    const owner = this.sessions.get(sessionId)?._backgroundWorkTurn;
+    if (owner) {
+      owner.register(jobId);
+      this.backgroundWorkOwners.set(jobId, owner);
+    }
+    return owner;
+  }
   /** Per-session write chain so route-state persists land in call order. */
   private _modelRouteStatePersists = new Map<string, Promise<void>>();
   private defaultSessionId = "default";
@@ -972,6 +987,7 @@ export class AgentBoxSessionManager {
     // session with the same id. Never let stale work drain or schedule release
     // on that replacement.
     if (this.sessions.get(sessionId) !== managed) return;
+    managed._backgroundWorkTurn?.cancel();
     this.clearPendingNotificationState(managed);
     // scheduleRelease() may have declined to arm while the notification buffer
     // owned the session. Once Stop abandons that work, restore the ordinary
@@ -1532,6 +1548,7 @@ export class AgentBoxSessionManager {
    * parent on completion. Background work blocks session release until it finishes.
    */
   private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest, traceCtx?: SubagentTraceContext): SubagentGroupResult {
+    this.registerBackgroundWork(request.parentSessionId, request.spawnId);
     const jobId = request.spawnId;
     const controller = new AbortController();
 
@@ -1751,9 +1768,10 @@ export class AgentBoxSessionManager {
    * signal), but also the detached background jobs, which are otherwise decoupled from the turn.
    * Returns how many were stopped.
    */
-  stopSessionJobs(sessionId: string): number {
+  stopSessionJobs(sessionId: string, jobIds?: readonly string[]): number {
     let stopped = 0;
     for (const job of this.jobs.list(sessionId)) {
+      if (jobIds && !jobIds.includes(job.jobId)) continue;
       // suppressNotifyTurn: the user's Stop is terminal. The completion still folds each job's card
       // to "stopped", but we must NOT wake the model with a synthetic turn reacting to the
       // cancellation — that "comes back to life after Stop" is exactly what the button must avoid.
@@ -1821,6 +1839,10 @@ export class AgentBoxSessionManager {
         }
       }
 
+      // Register BEFORE spawning: even a synchronously completed job belongs to
+      // this request. Roll back if launch throws and the tool falls back foreground.
+      const owner = this.registerBackgroundWork(req.parentSessionId, req.jobId);
+
       // Pair the increment with the decrement: if spawnBackgroundBash throws
       // synchronously (e.g. SanitizingLineBuffer fail-closed, spawn EACCES) the job's
       // close/error handlers never wire onSettled, so undo the increment here — otherwise
@@ -1833,6 +1855,8 @@ export class AgentBoxSessionManager {
           () => this.releaseBackgroundWork(req.parentSessionId),
         );
       } catch (err) {
+        owner?.unregister(req.jobId);
+        this.backgroundWorkOwners.delete(req.jobId);
         this.releaseBackgroundWork(req.parentSessionId);
         throw err;
       }
@@ -1855,6 +1879,7 @@ export class AgentBoxSessionManager {
    * parent model. Background work blocks session release until it finishes.
    */
   private startBackgroundSubagent(request: SpawnSubagentRequest, traceCtx?: SubagentTraceContext): SpawnSubagentResult {
+    this.registerBackgroundWork(request.parentSessionId, request.spawnId);
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
     // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
@@ -2041,12 +2066,15 @@ export class AgentBoxSessionManager {
     // User Stop is terminal: the card already folded to "stopped" above, but do NOT wake the model
     // with a synthetic turn reacting to its own cancellation (the "won't stop" behavior). Card
     // folds, model stays silent.
+    const owner = this.backgroundWorkOwners.get(jobId) ?? managed._backgroundWorkTurn;
+    this.backgroundWorkOwners.delete(jobId);
+    if (owner?.complete(n)) return;
     if (job?.suppressNotifyTurn) return;
 
     // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
     // via the synthetic-turn path (never followUp): the completion itself already shows in the
-    // tool box (exec_job_done above), and a followUp's acknowledgement rides the running turn
-    // where it can't be suppressed. The synthetic path drops pure acks (no tool call).
+    // tool box (exec_job_done above). Requests without an owner use the legacy
+    // queued delivery path; attached work has already returned above.
     managed._pendingNotifications.push(n);
     if (!managed._coalesceTimer) {
       managed._coalesceTimer = setTimeout(() => {
@@ -2089,17 +2117,10 @@ export class AgentBoxSessionManager {
     }
     const batch = managed._pendingNotifications.splice(0);
     if (batch.length === 0) return;
-    // A notification with NO output_file carries its result INLINE in the summary (sub-agents —
-    // see task-notification.ts). For those the model's report is pure text (no read tool call),
-    // so the turnHadTool persist guard below would wrongly drop it — allow a text-only reaction.
-    // Require EVERY notification in the batch to be inline-result (`.every`, not `.some`): a
-    // mixed batch (sub-agent + a shell/exec job whose data lives in output_file) must keep the
-    // STRICT guard, else the shell job's pure-ack ("nothing new") text gets persisted as a noise
-    // bubble — the exact thing turnHadTool suppresses. In that rare mixed case the sub-agent's
-    // result is still visible via its own card fold (annotateSubagentCompletions), so only the
-    // model's optional prose is dropped, never the result itself.
-    const allInlineResult = batch.every((n) => !n.outputFile);
-    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch), allInlineResult);
+    // Public model output must not be filtered by tool usage or the types of
+    // jobs coalesced into this batch. Required subagents bypass this legacy
+    // detached-job path and are consumed by their original HTTP prompt.
+    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch));
   }
 
   /**
@@ -2109,7 +2130,7 @@ export class AgentBoxSessionManager {
    * already started (re-check degrades us to followUp) or hits the 409 guard. This closes
    * the TOCTOU documented at the _promptInflight declaration.
    */
-  private runSyntheticPrompt(managed: ManagedSession, text: string, allowTextOnlyPersist = false): Promise<void> {
+  private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
@@ -2278,6 +2299,33 @@ export class AgentBoxSessionManager {
         } catch (err) {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
+          // Preserve non-empty public output, including pure-text reports.
+          const turnHadText = turnMessages.some((m) => {
+            if (m.role !== "assistant") return false;
+            const c = Array.isArray(m.content)
+              ? m.content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("")
+              : typeof m.content === "string" ? m.content : "";
+            return c.trim().length > 0;
+          });
+          if (canPersist && !managed._aborted && (turnHadTool || turnHadText)) {
+            try {
+              // Preserve message order; emit done only after every write succeeds.
+              for (const message of turnMessages) {
+                await this.persistSyntheticMessage(sid, message, currentModelRouteMetadata);
+              }
+              await this.persistDelegationEvent({
+                type: "delegation.emit_chat_event",
+                sessionId: sid,
+                event: { type: "background_turn_done", sessionId: sid },
+              });
+            } catch (err) {
+              console.error(`[agentbox-session] background report delivery failed for ${sid}:`, err);
+              await this.persistDelegationEvent({
+                type: "delegation.emit_chat_event", sessionId: sid,
+                event: { type: "stream_error", sessionId: sid, error: "Background report could not be saved" },
+              }).catch(error => console.error(`[agentbox-session] background error delivery failed for ${sid}:`, error));
+            }
+          }
           managed.brain.llmCalls?.endPrompt({ explicit: true });
           managed._promptDone = true;
           managed._routeBrainEventsThroughExtra = false;
@@ -2287,38 +2335,12 @@ export class AgentBoxSessionManager {
           managed._promptInflight = null;
           release();
           if (managed._backgroundWorkCount === 0) this.scheduleRelease(managed.id);
-          // Decide whether to keep the model's reaction. Normally we keep it ONLY if it made a
-          // tool call: for a bash/exec completion the data lives in output_file, so a data-bearing
-          // report necessarily reads that file first (a tool call), and a text-only reaction is a
-          // pure ack ("nothing new") we drop to avoid a noise bubble (the completion already shows
-          // in the launching tool's own box).
-          // EXCEPTION (allowTextOnlyPersist): a sub-agent's result is delivered INLINE in the
-          // notification summary — the model reports it as pure text with NO tool call. There the
-          // text IS the answer the user is waiting for, so keep a non-empty text-only reaction too.
-          const turnHadText = turnMessages.some((m) => {
-            if (m.role !== "assistant") return false;
-            const c = Array.isArray(m.content)
-              ? m.content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("")
-              : typeof m.content === "string" ? m.content : "";
-            return c.trim().length > 0;
-          });
-          // When kept, persist the whole turn then fire a refetch so the frontend shows it.
-          if (canPersist && (turnHadTool || (allowTextOnlyPersist && turnHadText))) {
-            void Promise.allSettled(
-              turnMessages.map((m) => this.persistSyntheticMessage(sid, m, currentModelRouteMetadata).catch(() => {})),
-            ).then(() =>
-              this.persistDelegationEvent({
-                type: "delegation.emit_chat_event",
-                sessionId: sid,
-                event: { type: "background_turn_done", sessionId: sid },
-              }).catch(() => {}),
-            );
-          }
         }
       });
-    managed._syntheticPromptQueue = run.finally(() => {
-      if (managed._syntheticPromptQueue === run) managed._syntheticPromptQueue = null;
+    const queued = run.finally(() => {
+      if (managed._syntheticPromptQueue === queued) managed._syntheticPromptQueue = null;
     });
+    managed._syntheticPromptQueue = queued;
     return run;
   }
 
@@ -2433,6 +2455,7 @@ export class AgentBoxSessionManager {
       message = { ...message, content: stripLanguageDirective(message.content) };
     }
     const result = await this.persistDelegationEvent({ type: "delegation.append_message", message });
+    if (!result.ok) throw new Error("Message persistence was rejected");
     return result.id ?? "";
   }
 
@@ -3278,6 +3301,13 @@ export class AgentBoxSessionManager {
     const EXTRA_EVENT_BUFFER_CAP = 1000;
     let extraEventBufferOverflowed = false;
     const emitExtraEvent = (event: Record<string, unknown>) => {
+      if (event.type === "handoff_requested") {
+        const owner = this.sessions.get(id)?._backgroundWorkTurn;
+        if (owner) {
+          owner.cancel();
+          this.stopSessionJobs(id, owner.jobIds);
+        }
+      }
       // Task ledger events are persisted (refresh recovery, design §14 Approach A)
       // in addition to being streamed live below.
       if (isTaskEvent(event)) {

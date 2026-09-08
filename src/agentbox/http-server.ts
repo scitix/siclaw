@@ -4,6 +4,8 @@
  * Provides HTTP API for Gateway to call, with SSE streaming support.
  */
 
+import { assistantTextBlocks } from "../shared/assistant-items.js";
+import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
 import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -1044,6 +1046,7 @@ export function createHttpServer(
     if (body.turnId) sessionManager.recordAcceptedTurn(managed.id, body.turnId);
     if (sessionManager.consumePendingAbort(managed.id, body.turnId)) {
       managed._aborted = true;
+      managed._backgroundWorkTurn?.cancel();
       console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
     }
     // Default to the extra channel; refined to false only for the no-current-model
@@ -1066,7 +1069,7 @@ export function createHttpServer(
     // Subscribe to buffer events so SSE can replay them even if it connects late
     const brainUnsub = managed.brain.subscribe((event) => {
       if (!managed._promptDone && !managed._routeBrainEventsThroughExtra) {
-        managed._eventBuffer.push(event);
+        managed._eventBuffer.push(decorateBackgroundWorkEvent(event, managed._backgroundWorkTurn));
       }
     });
 
@@ -1218,7 +1221,19 @@ export function createHttpServer(
     const handoffTrace = normalizeHandoffTrace(body.handoffTrace);
     tracingRecorder.startPrompt(managed.id, promptText, body.userId, handoffTrace?.traceId, handoffParentSpan(handoffTrace));
 
+    const backgroundWorkTurn = new BackgroundWorkTurn();
+    managed._backgroundWorkTurn = backgroundWorkTurn;
+    let parentReportSeen = false;
+    const reportUnsubscribe = managed.brain.subscribe((event: any) => {
+      if ((event.type !== "message_end" && event.type !== "turn_end") || event.message?.role !== "assistant") return;
+      parentReportSeen = !backgroundWorkTurn.pending && event.message.stopReason !== "toolUse"
+        && event.message.stopReason !== "error" && event.message.stopReason !== "aborted"
+        && assistantTextBlocks(event.message).some(block => block.text.trim() && block.phase !== "commentary");
+    });
+
     const actuallyFinish = () => {
+      backgroundWorkTurn.cancel();
+      reportUnsubscribe();
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
       managed.brain.llmCalls?.endPrompt({ explicit: true });
@@ -1360,9 +1375,9 @@ export function createHttpServer(
     // Only the no-current-model edge falls back to a bare brain.prompt (runner
     // guard) whose events flow through the live _eventBuffer subscription.
     managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
-    const promptPromise = runPromptWithModelRouting(
+    const runPrompt = (text: string, media?: typeof promptMedia) => runPromptWithModelRouting(
       managed.brain,
-      promptText,
+      text,
       effectivePolicy,
       managed.modelRouteState,
       {
@@ -1370,7 +1385,7 @@ export function createHttpServer(
         // The runner streams/replays brain events through this callback instead
         // of the live SSE subscription that enriches agent_end — re-apply the
         // same enrichment so token/cost stats survive on every turn.
-        emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
+        emitBrainEvent: (event) => emitSessionExtraEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), backgroundWorkTurn)),
         onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
         shouldAbort: () => managed._aborted,
         applyCandidateModelParams: (candidate) => {
@@ -1397,11 +1412,36 @@ export function createHttpServer(
           managed._routeBrainEventsThroughExtra = capturing;
         },
       },
-      promptMedia,
+      media,
       requiredResultToolName
         ? { requiredResultToolName }
         : undefined,
     );
+
+    // Keep the original stream, prompt mutex, trace and persistence consumer alive
+    // through required child completion and parent synthesis. No detached reply path.
+    const promptPromise = (async () => {
+      let result = await runPrompt(promptText, promptMedia);
+      while (!managed._aborted && result?.success !== false) {
+        const notifications = await backgroundWorkTurn.next();
+        if (managed._aborted) break;
+        const steer = backgroundWorkTurn.takeSteer();
+        if (steer) {
+          parentReportSeen = false;
+          result = await runPrompt(steer.text, steer.media);
+          continue;
+        }
+        if (notifications.length === 0) {
+          if (backgroundWorkTurn.jobIds.length && !backgroundWorkTurn.isCancelled && !parentReportSeen) {
+            throw new Error("Required background work finished without a parent report");
+          }
+          break;
+        }
+        parentReportSeen = false;
+        result = await runPrompt(backgroundWorkTurn.resultPrompt(notifications));
+      }
+      return result;
+    })();
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
@@ -1410,6 +1450,7 @@ export function createHttpServer(
       if (result && result.success === false) {
         console.warn(`[agentbox-http] Prompt finished without success for session ${managed.id} (${result.finalFailureKind ?? "unknown"}: ${result.finalErrorMessage ?? "no error message"})`);
         promptOutcome = "error";
+        if (!managed._aborted && backgroundWorkTurn.jobIds.length) sessionManager.stopSessionJobs(managed.id, backgroundWorkTurn.jobIds);
       } else {
         console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
         promptOutcome = "completed";
@@ -1460,6 +1501,8 @@ export function createHttpServer(
     }).catch((err) => {
       console.error(`[agentbox-http] Prompt error for session ${managed.id}:`, err);
       promptOutcome = "error";
+      if (backgroundWorkTurn.jobIds.length) sessionManager.stopSessionJobs(managed.id, backgroundWorkTurn.jobIds);
+      emitSessionExtraEvent({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: backgroundWorkTurn.jobIds.length ? "Parent task could not finish its background-work report" : "Agent execution failed", content: [] } });
       onPromptFinish();
     });
 
@@ -1553,7 +1596,7 @@ export function createHttpServer(
     const unsubscribe = managed.brain.subscribe((event: any) => {
       if (managed._routeBrainEventsThroughExtra) return;
       // Enrich agent_end with context usage so frontend can display token stats
-      writeEvent(enrichAgentEndEvent(managed.brain, event));
+      writeEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), managed._backgroundWorkTurn));
     });
 
     // Heartbeat: send SSE comment every 30s to keep connection alive
@@ -1650,7 +1693,9 @@ export function createHttpServer(
     // addition to that active prompt, so it inherits this existing trace.
     const traceId = tracingRecorder.getRootTraceId(sessionId);
     try {
-      if (promptMedia) {
+      if (managed._backgroundWorkTurn?.queueSteer(steerText, promptMedia)) {
+        // The original request loop resumes this real input with normal persistence.
+      } else if (promptMedia) {
         await managed.brain.steer(steerText, promptMedia);
       } else {
         await managed.brain.steer(steerText);
@@ -1763,6 +1808,7 @@ export function createHttpServer(
 
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
     managed._aborted = true;
+    managed._backgroundWorkTurn?.cancel();
 
     // Stop is terminal: drop any queued steer/followUp so it does NOT replay on the next prompt.
     try {

@@ -1729,6 +1729,13 @@ describe("conversation phases", () => {
     });
     expect(seen.filter(e => e.type === "item/completed" && !e.dbMessageId).map(e => e.item.phase)).toEqual(["commentary", "commentary", "final_answer", "final_answer"]);
     expect(appendCalls.filter(e => e.role === "assistant").map(e => e.metadata?.phase)).toEqual(["commentary", "final_answer"]);
+    for (const row of appendCalls.filter(e => e.role === "assistant")) {
+      const item = row.metadata.assistant_item;
+      expect(item.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      const deliveries = seen.filter(e => e.type === "item/completed" && e.item.id === item.id);
+      expect(deliveries.length).toBeGreaterThan(0);
+      expect(deliveries.every(e => e.assistantItem.completedAt === item.completedAt)).toBe(true);
+    }
   });
 });
 
@@ -1747,5 +1754,34 @@ describe("assistant lifecycle persistence", () => {
   it("retains turn_end-only providers", async () => {
     await consumeAgentSse({ client: mkClient([{ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "fallback" }] } }]), sessionId: "s", userId: "u", persistMessages: true });
     expect(appendCalls.filter(c => c.role === "assistant").map(c => c.content)).toEqual(["fallback"]);
+  });
+});
+
+
+describe("required child work stays in the original assistant stream", () => {
+  it("does not forward an internal result echo as a user steer", async () => {
+    const onUserMessageStarted = vi.fn();
+    const onEvent = vi.fn();
+    await consumeAgentSse({ client: mkClient([
+      { type: "message_start", internalMessage: true, message: { role: "user", content: [{ type: "text", text: "internal child results" }] } },
+    ]), sessionId: "s", userId: "u", onUserMessageStarted, onEvent });
+    expect(onUserMessageStarted).not.toHaveBeenCalled();
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(["awaitingBackgroundJobs", "awaitingSubagents"])("persists %s as commentary, followed by one plain-text final report", async (waitingFlag) => {
+    const events = [
+      { type: "message_end", [waitingFlag]: true, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking nodes", textSignature: JSON.stringify({ v: 1, phase: "final_answer" }) }] } },
+      { type: "turn_end", [waitingFlag]: true, message: { role: "assistant", content: [{ type: "text", text: "Checking nodes" }] } },
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "All five nodes are ready" }] } },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(result.resultText).toBe("All five nodes are ready");
+    const rows = appendCalls.filter(r => r.role === "assistant");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].metadata.phase).toBe("commentary");
+    expect(rows[0].metadata.assistant_item.phase).toBe("commentary");
+    expect(rows[1].content).toBe("All five nodes are ready");
   });
 });

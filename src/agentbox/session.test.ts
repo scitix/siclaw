@@ -2120,3 +2120,45 @@ describe("sub-agent tier isolation and redaction", () => {
     }
   });
 });
+
+describe("request-owned background command execution", () => {
+  it.each([0, 3])("delivers actual subprocess output before resuming the parent (exit %s)", async (exitCode) => {
+    const { BackgroundWorkTurn } = await import("./background-work-turn.js");
+    const mgr = new AgentBoxSessionManager() as any;
+    const turn = new BackgroundWorkTurn();
+    const managed = { id: "cmd-parent", _promptDone: false, _backgroundWorkCount: 0, _releaseTimer: null,
+      _backgroundWorkTurn: turn, _pendingNotifications: [], _extraEventSubs: new Set(), _extraEventBuffer: [] };
+    mgr.sessions.set(managed.id, managed);
+    const cleanup = vi.fn();
+    const exec = mgr.createBackgroundExecExecutor();
+    const launched = exec({ jobId: "cmd-result", parentSessionId: managed.id, description: "local verification",
+      file: "/bin/sh", args: ["-c", `printf 'collected output\\n'; exit ${exitCode}`],
+      action: null, hasSensitiveKubectl: false, env: process.env, isProd: false, onComplete: cleanup });
+    expect(turn.pending).toBe(true);
+    const [result] = await turn.next();
+    expect(result.status).toBe(exitCode === 0 ? "completed" : "failed");
+    expect(result.outputFile).toBe(launched.outputFile);
+    expect(fs.readFileSync(result.outputFile!, "utf8")).toContain("collected output");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(managed._backgroundWorkCount).toBe(0);
+    expect(managed._pendingNotifications).toEqual([]);
+    expect(turn.pending).toBe(false);
+  });
+
+  it("undoes request ownership and work count when launch throws before foreground fallback", async () => {
+    const { BackgroundWorkTurn } = await import("./background-work-turn.js");
+    const mgr = new AgentBoxSessionManager() as any;
+    const turn = new BackgroundWorkTurn();
+    const managed = { id: "cmd-parent", _promptDone: false, _backgroundWorkCount: 0,
+      _releaseTimer: null, _backgroundWorkTurn: turn };
+    mgr.sessions.set(managed.id, managed);
+    expect(() => mgr.createBackgroundExecExecutor()({ jobId: "bad-launch", parentSessionId: managed.id,
+      description: "bad launch", command: "true", action: { type: "sanitize", sanitize: (s: string) => s, lineSafe: false },
+      hasSensitiveKubectl: false, env: process.env, isProd: false })).toThrow();
+    expect(turn.jobIds).toEqual([]);
+    expect(managed._backgroundWorkCount).toBe(0);
+    expect(mgr.backgroundWorkOwners.size).toBe(0);
+    // Allow the launcher's eager output-file creation to settle before temp-dir cleanup.
+    await new Promise(resolve => setTimeout(resolve, 20));
+  });
+});
