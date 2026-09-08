@@ -6,6 +6,8 @@
  * Supports PAIR command for binding chat groups to agents.
  */
 
+import { AssistantItemStream } from "../assistant-item-stream.js";
+import { assistantTextBlocks } from "../../shared/assistant-items.js";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
@@ -1895,13 +1897,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   let deliveredTextChars = 0;
   // Live "current step" indicator. Two milestone sources feed it: explicit
   // channel_update tool calls (agent-curated) AND auto-derived first lines of
-  // intermediate assistant turns (collectChannelResponse.onMilestone). The card
+  // completed public text blocks (collectChannelResponse.onMilestone). The card
   // shows ONLY the single latest step (⏳), replaced in place as work proceeds —
   // no accumulating checklist — and on finalize the step is replaced entirely by
   // the conclusion. `milestones` is kept only to dedup against the last step;
   // renders use the latest entry. Re-renders are coalesced to respect Feishu's
   // update rate.
   const milestones: string[] = [];
+  let activity = "";
   let cardFlushInflight = false;
   let cardFlushDirty = false;
   let cardFinalizing = false;
@@ -1915,8 +1918,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
         do {
           cardFlushDirty = false;
           // Render only the single latest step — never an accumulating list.
-          const md = buildMilestoneCardMarkdown({ milestones: milestones.slice(-1) });
-          if (md.trim()) await updateCardContent(larkClient, cardSession, md);
+          const md = [
+            buildMilestoneCardMarkdown({ milestones: milestones.slice(-1) }),
+            activity ? `⏳ ${activity}` : "",
+          ].filter(Boolean).join("\n\n");
+          await updateCardContent(larkClient, cardSession, md || PLACEHOLDER_BY_LOCALE[locale]);
         } while (cardFlushDirty && !cardFinalizing);
       } catch (err) {
         console.warn(`[lark] milestone card flush failed for session=${sessionId}:`, err);
@@ -2057,6 +2063,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
       includeImages: true,
       onMilestone: addMilestone,
+      onActivity: (text) => {
+        if (activity === text) return;
+        activity = text;
+        void flushMilestoneCard();
+      },
       locale,
       // Audit: persist assistant + tool rows so the channel transcript matches
       // web/api/a2a (origin="channel" set on the session above). Tool output on
@@ -3086,8 +3097,35 @@ export async function collectChannelResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean; onMilestone?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale } = {},
 ): Promise<CollectedChannelResponse> {
+  // Reuse the public-text adapter used by web. Publish completed text blocks
+  // before tools start; never wait for the following model call. Complete blocks
+  // keep partial Markdown/render-source and private reasoning off the IM card.
+  const assistantItems = new AssistantItemStream();
+  let lastMilestone = "";
+  let pendingNarration = "";
+  const publishNarration = (text: string, phase?: string) => {
+    if (phase === "final_answer") return;
+    const milestone = condenseMilestone(text);
+    if (!milestone || milestone === lastMilestone) return;
+    lastMilestone = milestone;
+    options.onMilestone?.(milestone);
+  };
+  const flushPendingNarration = () => {
+    if (pendingNarration) publishNarration(pendingNarration);
+    pendingNarration = "";
+  };
+  const progressToolNames = new Map<string, string>();
+  const groupActivities = new Map<string, { done: number; total: number }>();
+  const publishActivity = () => {
+    const counts = [...groupActivities.values()];
+    const done = counts.reduce((sum, count) => sum + count.done, 0);
+    const total = counts.reduce((sum, count) => sum + count.total, 0);
+    options.onActivity?.(total === 0 ? "" : options.locale === "en-US"
+      ? `Sub-tasks: ${done}/${total} finished`
+      : `子任务：${done}/${total} 已结束`);
+  };
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
   const seenImageKeys = new Set<string>();
@@ -3184,6 +3222,24 @@ export async function collectChannelResponse(
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
+      if (ev.type === "turn_start" || (ev.type === "message_start" && ev.message?.role === "assistant")) {
+        flushPendingNarration();
+        assistantItems.begin();
+      }
+      if (ev.type === "tool_execution_start" || ev.type === "tool_start" ||
+          (ev.type === "message_end" && (ev.message?.role === "toolResult" || ev.message?.role === "tool"))) {
+        flushPendingNarration();
+        if (ev.toolCallId && (ev.toolName || ev.name)) progressToolNames.set(ev.toolCallId, ev.toolName || ev.name);
+      }
+      if (ev.type === "message_update" && ev.assistantMessageEvent) {
+        const output = assistantItems.update(ev.assistantMessageEvent);
+        if (output?.completed) publishNarration(output.item.text, output.item.phase);
+      }
+      if (ev.type === "model_route_rollback") {
+        assistantItems.begin();
+        lastMilestone = "";
+        pendingNarration = "";
+      }
 
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
@@ -3248,7 +3304,9 @@ export async function collectChannelResponse(
       // sits frozen at the last line for the whole (multi-minute) batch. spawn_subagent streams
       // group progress via tool_execution_update; surface it as the current ⏳ step. (Background
       // groups instead report via group_progress, not this SSE.)
-      if (ev.type === "tool_execution_update" && options.onMilestone) {
+      const progressToolName = ev.toolName || ev.name || progressToolNames.get(ev.toolCallId);
+      if (ev.type === "tool_execution_update" && (options.onMilestone || options.onActivity)
+          && (!progressToolName || progressToolName === "spawn_subagent" || progressToolName === "delegate_to_agent")) {
         const items = Array.isArray(ev.partialResult?.details?.items) ? ev.partialResult.details.items : null;
         let milestone = "";
         if (items) {
@@ -3256,7 +3314,10 @@ export async function collectChannelResponse(
           // text is hard-coded English; localize here where we know the locale).
           const total = items.length;
           const done = items.filter((i: any) => i?.status !== "queued" && i?.status !== "running").length;
-          milestone = (options.locale === "en-US")
+          if (options.onActivity) {
+            groupActivities.set(toolKey(ev, ev.toolName || ev.name || "tool"), { done, total });
+            publishActivity();
+          } else milestone = (options.locale === "en-US")
             ? `Running sub-agents… ${done}/${total} done`
             : `子任务执行中… ${done}/${total} 完成`;
         } else {
@@ -3269,7 +3330,7 @@ export async function collectChannelResponse(
             .trim();
           milestone = channelActivityMilestone(activity, options.locale);
         }
-        if (milestone) options.onMilestone(milestone);
+        if (milestone) options.onMilestone?.(milestone);
       }
 
       if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
@@ -3286,6 +3347,8 @@ export async function collectChannelResponse(
       }
 
       if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
+        if (groupActivities.delete(toolKey(ev, ev.toolName || ev.name || "tool"))) publishActivity();
+        if (ev.toolCallId) progressToolNames.delete(ev.toolCallId);
         if (options.includeImages) collectImageAttachments(ev.result?.content, images, seenImageKeys);
         if (persist) {
           const name = (ev.toolName as string) || (ev.name as string) || "tool";
@@ -3351,11 +3414,21 @@ export async function collectChannelResponse(
       }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
+        flushPendingNarration();
+        if (ev.message.stopReason !== "error") {
+          const hasTools = blocks.some((block: any) => block?.type === "toolCall" || block?.type === "tool_use");
+          for (const item of assistantItems.complete(ev.message)) {
+            if (item.phase === "commentary" || hasTools) publishNarration(item.text, item.phase);
+            // Legacy providers have no phase. The next tool/start event proves
+            // this is progress; don't show an unclassified final twice.
+            else if (!item.phase) pendingNarration = item.text;
+          }
+        }
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
         const rowEnvelope = isModelCallRowEnvelope(envelope, ev.message?.stopReason)
           ? redactLlmCallEnvelope(envelope, redact)
           : undefined;
-        let turnText = contentBlocksToMarkdown(blocks);
+        let turnText = assistantTextBlocks(ev.message).map(block => block.text).join("");
         // The SHARED rule, not a second copy of it. The local re-derivation read
         // only `blocks`, so a recovered turn whose final message carries STRING
         // content looked like no output — the error stayed pending and a terminal
@@ -3373,14 +3446,6 @@ export async function collectChannelResponse(
           // cited after this one; the rendered-set prevents any double-append.
         }
         if (turnText) {
-          // A NEW assistant turn means the PREVIOUS one was an intermediate
-          // step (the agent narrated, then called a tool) — surface its first
-          // line as a progress milestone. The final turn is never followed by
-          // another, so it stays the answer, not a milestone.
-          if (lastAssistantText && options.onMilestone) {
-            const m = condenseMilestone(lastAssistantText);
-            if (m) options.onMilestone(m);
-          }
           lastAssistantText = turnText;
         }
         // Persist every model call (intermediate narration, tool-only call, final
@@ -3474,7 +3539,7 @@ function channelActivityMilestone(activity: string, locale?: LarkLocale): string
   const clean = activity.trim();
   if (!clean) return "";
   // `Ran <tool>` — a tool name, not a milestone.
-  if (/^Ran\s+\S+$/.test(clean)) return "";
+  if (/^Ran\s+\S+$/.test(clean) || /^Working[.…\s]*\d+ tool calls?$/i.test(clean)) return "";
   // Sub-agent slot wait: real information, but hard-coded English at the source.
   if (/^Waiting for a free slot/i.test(clean)) {
     return locale === "en-US" ? "Waiting for a free sub-agent slot…" : "排队等待子任务空位…";
