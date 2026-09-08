@@ -94,13 +94,13 @@ describe("spawn_subagent batch notification text", () => {
     expect(summary).toContain("Causes: 2 network, 1 storage.");
   });
 
-  it("buildGroupNotificationSummary omits the reduce block when there is no reduce", () => {
+  it("delivers item answers when there is no reduce instead of only reporting completion", () => {
     const report: SubagentGroupReport = {
       status: "done",
       durationMs: 5,
-      itemResults: [{ item: "a", status: "done", summary: "cap", childSessionId: "c1" }],
+      itemResults: [{ item: "a", status: "done", summary: "cause:\nUpstream service error", childSessionId: "c1" }],
     };
     const summary = buildGroupNotificationSummary("g", report);
-    expect(summary).toBe('Sub-agent group "g" done — 1 item(s): 1 done.');
+    expect(summary).toBe('Sub-agent group "g" done — 1 item(s): 1 done.\n\na — done\ncause:\nUpstream service error');
   });
 });

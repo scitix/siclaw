@@ -41,8 +41,10 @@ import {
 } from "../../core/subagent-registry.js";
 import { renderTierMenuForDescription, type ChildModelOutcome } from "../../core/subagent-models.js";
 import { validateAndRenderGroupPlan } from "../../agentbox/subagent-group.js";
+import { validateResponseForm, type SubagentResponseField } from "../../core/subagent-response-form.js";
 
 interface SpawnSubagentParams {
+  response_form: SubagentResponseField[];
   description: string;
   task_template?: string;
   items: Array<string | Record<string, string>>;
@@ -166,10 +168,38 @@ export function createSpawnSubagentTool(
     label: "Spawn Sub-agent",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("spawn_subagent")), 0, 0),
     renderResult: renderTextResult,
-    description:
-      buildDescription(isSubagentGroupEnabled(), backgroundAllowed) +
-      renderTierMenuForDescription(tierMenu),
+    description: buildDescription(isSubagentGroupEnabled(), backgroundAllowed) +
+      "\n\nDelegate work to be completed with explicit questions, not open-ended requests such as 'whatever this involves'. " +
+      "Sub-agents are smart but not all-knowing: they have no user-query context unless you provide it. " +
+      "Ask only questions whose failure can be explained concretely, so you know what proved infeasible. " +
+      "When a sub-agent returns, treat the delegated attempt as complete whether the answer contains faults " +
+      "or meets expectations. A completed attempt does not mean its conclusion is correct or the investigation succeeded. " +
+      "If the answer falls short, inspect where it went wrong from the returned failure details. Do NOT repeat " +
+      "its trajectory for ANY confirmation purpose, repeat its mistakes, or dispatch another sub-agent to " +
+      "compensate for an incompletely expressed first request. Report the result or concrete failure to the user. " +
+      "\n\nREQUIRED response_form: define the questions every child must answer. Use free-text fields for " +
+      "answers and concrete failure details, and options for a single-choice decision (include a failure or unknown option when needed). " +
+      "Carry all target identifiers and known facts in the task briefing; the form defines the deliverable. " +
+      "Children fill name + colon + newline + answer as plain text. Option keys are expanded to their " +
+      "meaning in the returned summaries. Example: [{name:'cause', question:'What caused the failure?', " +
+      "options:{A:'Upstream service error',B:'Insufficient evidence'}}, {name:'failure_details',question:'On failure, quote actual commands, observed errors, and mistakes not to repeat. On success: Not applicable.'}]. " +
+      "Omit reduce_prompt when the filled item forms already answer your task; synthesis costs another sub-agent run. " +
+      "Every question needs an answer; a failure counts. Include a free-text field for actual failed commands, " +
+      "observed failures, and core errors not to repeat; use 'Not applicable' for that field on success. " +
+      "If supplied, synthesis fills the same form for the group." +
+      renderTierMenuForDescription(tierMenu) +
+      "\n\nYou are supposed to lead to a conclusion using ONE dispatch of subagents, if not, you shall give a serious " +
+      "reason of why subagent utterly failed your expectation, or things you must do yourself before going to " +
+      "the next phase that you are looking at/answering user query, which is the design purpose. Trust your " +
+      "subagents, don't repeat faults.",
     parameters: Type.Object({
+      response_form: Type.Array(Type.Object({
+        name: Type.String({ description: "Unique field heading, without colons or newlines." }),
+        question: Type.String({ description: "Question to answer, including required facts and completion criteria." }),
+        options: Type.Optional(Type.Record(Type.String(), Type.String(), {
+          description: "Single-choice key-to-text mapping, e.g. A: Upstream service error. Omit for a fill-in answer.",
+        })),
+      }), { minItems: 1, description: "Required answer form for each item and optional synthesis. All answers return as plain text." }),
       description: Type.String({ description: "Short (3-5 word) label for the task or batch." }),
       task_template: Type.Optional(
         Type.String({
@@ -278,6 +308,9 @@ export function createSpawnSubagentTool(
       });
       if (!plan.ok) return errorResult(plan.error);
 
+      const formError = validateResponseForm(p.response_form);
+      if (formError) return errorResult(formError);
+
       // Conditional default (design §"Tool layer (single entry)"): a single item runs foreground (grab the result and
       // keep reasoning), a multi-item batch runs background (asymmetric harm — each side fits its own
       // failure mode). An explicit run_in_background always wins; the flag is force-false while gated.
@@ -336,6 +369,7 @@ export function createSpawnSubagentTool(
       const result = await executor(
         {
           description,
+          responseForm: p.response_form,
           renderedTasks: plan.tasks,
           reducePrompt,
           subagentType: type.agentType,

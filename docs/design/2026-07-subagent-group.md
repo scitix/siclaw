@@ -68,6 +68,53 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 
 ## Contracts (what must hold)
 
+### Plain-text response forms (2026-09)
+
+Every new `spawn_subagent` tool call requires `response_form`, an array of
+`{ name, question, options? }`. Names are unique headings without colons or newlines.
+Omitting `options` creates a fill-in question; providing a key-to-text object creates
+a single-choice question. Include an unknown/insufficient-evidence choice where applicable.
+The parent must still pass the target identity, time window and known facts in the briefing.
+
+Example tool argument:
+
+```json
+[
+  {"name":"cause","question":"What caused the target request to fail?","options":{"A":"Upstream service error","B":"Insufficient evidence"}},
+  {"name":"evidence","question":"Exact UTC time, service/provider, error excerpt and log coverage?"}
+]
+```
+
+The child fills the text artifact using a colon followed by an actual newline (`:\n`):
+
+```text
+cause:
+A
+
+evidence:
+12:00:00Z, target service, HTTP 429 server overload. Coverage is partial.
+```
+
+The runtime expands `A` to `Upstream service error` before returning the filled form
+as the existing `summary` text. No visual-card/JSON artifact is required from the child;
+the internal system instruction overrides presentation skills. CRLF is normalized to LF.
+Only declared headings delimit fields, so timestamps, URLs and multiline evidence survive.
+Missing, duplicate or invalid answers produce a failed report with explicit field errors
+and any valid answers preserved. There is no automatic repair prompt or second child run.
+Execution failures/timeouts keep their existing error reports and statuses.
+
+Forms propagate through single, map and reduce children, including background execution.
+The questions and option labels are retained in child audit briefings. Filled forms bypass
+the legacy 1800/6000-character summary clipping and reduce-input clipping; parents should
+ask for compact facts, not raw logs. Normal model context limits still apply.
+Full raw child responses remain available for audit.
+When reduce is requested it fills the same form for the group; omit it when per-item forms
+already answer the task to avoid an extra child execution. The existing envelope still
+returns the reduce answer instead of per-item answers when synthesis succeeds. Background
+batches without reduce now deliver the per-item answers, not just a completion count.
+
+The legacy capsule rules below continue to describe internal requests without a form.
+
 ### Tool layer (single entry)
 
 - **Uniform model-visible envelope.** Every call — collapse or batch — returns

@@ -23,6 +23,8 @@ function makeRefs(executor: ToolRefs["spawnSubagentExecutor"]): ToolRefs {
   };
 }
 
+const response_form = [{ name: "findings", question: "What did you find?" }];
+
 const text = (r: any) => (r.content[0] as any).text as string;
 
 describe("spawn_subagent tool — availability & registration", () => {
@@ -47,7 +49,7 @@ describe("spawn_subagent tool — single-task collapse path", () => {
       return { status: "done", summary: "node-01 disk 92% full", childSessionId: "child-1", toolCalls: 3, durationMs: 1200 };
     });
     const tool = createSpawnSubagentTool(makeRefs(executor));
-    const r = await tool.execute("call-1", { description: "check node-01", items: ["Check disk usage on node-01"] });
+    const r = await tool.execute("call-1", { description: "check node-01", response_form, items: ["Check disk usage on node-01"] });
 
     // The tool hands the executor a batch plan (one rendered task) — never a lone `prompt`.
     expect(captured).toMatchObject({
@@ -64,6 +66,7 @@ describe("spawn_subagent tool — single-task collapse path", () => {
       { item: "Check disk usage on node-01", prompt: "Check disk usage on node-01" },
     ]);
     expect(captured?.reducePrompt).toBeUndefined();
+    expect(captured?.responseForm).toEqual(response_form);
 
     // Uniform model-visible envelope: always item_results[] (design decision #18).
     const mv = JSON.parse(text(r));
@@ -91,7 +94,7 @@ describe("spawn_subagent tool — single-task collapse path", () => {
         : { status: "done", summary: "probed", childSessionId: "child-9", toolCalls: 1, durationMs: 5 };
     });
     const tool = createSpawnSubagentTool(makeRefs(executor));
-    const r = await tool.execute("call-bg", { description: "probe net", items: ["probe all nodes"], run_in_background: true });
+    const r = await tool.execute("call-bg", { description: "probe net", response_form, items: ["probe all nodes"], run_in_background: true });
 
     if (RUN_IN_BACKGROUND_ENABLED) {
       expect(captured?.runInBackground).toBe(true);
@@ -137,7 +140,7 @@ describe("spawn_subagent tool — foregroundSubagentOnly (channel)", () => {
 
     await tool.execute("call-fg", {
       description: "triage 3 nodes",
-      items: ["check node-a", "check node-b", "check node-c"],
+      response_form, items: ["check node-a", "check node-b", "check node-c"],
     });
     expect(captured?.runInBackground).toBe(false);
   });
@@ -153,17 +156,27 @@ describe("spawn_subagent tool — foregroundSubagentOnly (channel)", () => {
     const tool = createSpawnSubagentTool(makeRefs(executor)); // foregroundSubagentOnly unset
     await tool.execute("call-web", {
       description: "triage 3 nodes",
-      items: ["check node-a", "check node-b", "check node-c"],
+      response_form, items: ["check node-a", "check node-b", "check node-c"],
     });
     expect(captured?.runInBackground).toBe(RUN_IN_BACKGROUND_ENABLED);
   });
 });
 
 describe("spawn_subagent tool — validation fail-fast (zero executor calls)", () => {
+  it("requires the parent to define a valid answer form before starting any child", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    for (const form of [undefined, [], [{ name: "cause", question: "?", options: { A: "" } }]]) {
+      const result = await tool.execute("bad-form", { description: "check", items: ["Check pod-a"], response_form: form } as any);
+      expect(text(result)).toContain("response_form");
+    }
+    expect(executor).not.toHaveBeenCalled();
+    expect((tool.parameters as any).required).toContain("response_form");
+  });
   it("rejects an empty items list before calling the executor", async () => {
     const executor = vi.fn();
     const tool = createSpawnSubagentTool(makeRefs(executor as any));
-    const r = await tool.execute("v0", { description: "x", items: [] });
+    const r = await tool.execute("v0", { description: "x", response_form, items: [] });
     expect(executor).not.toHaveBeenCalled();
     expect((r.details as any).error).toBe(true);
   });
@@ -174,7 +187,7 @@ describe("spawn_subagent tool — validation fail-fast (zero executor calls)", (
     const r = await tool.execute("v1", {
       description: "diagnose pods",
       task_template: "Investigate {{pod}} in {{ns}}",
-      items: [{ pod: "web-1" }], // missing ns
+      response_form, items: [{ pod: "web-1" }], // missing ns
     });
     expect(executor).not.toHaveBeenCalled();
     expect(text(r)).toMatch(/missing key/i);
@@ -183,7 +196,7 @@ describe("spawn_subagent tool — validation fail-fast (zero executor calls)", (
   it("rejects mixed items before calling the executor", async () => {
     const executor = vi.fn();
     const tool = createSpawnSubagentTool(makeRefs(executor as any));
-    const r = await tool.execute("v2", { description: "x", task_template: "{{item}}", items: ["a", { k: "v" }] as any });
+    const r = await tool.execute("v2", { description: "x", task_template: "{{item}}", response_form, items: ["a", { k: "v" }] as any });
     expect(executor).not.toHaveBeenCalled();
     expect(text(r)).toMatch(/homogeneous/i);
   });
@@ -191,14 +204,14 @@ describe("spawn_subagent tool — validation fail-fast (zero executor calls)", (
   it("rejects an unknown subagent_type without calling the executor", async () => {
     const executor = vi.fn();
     const tool = createSpawnSubagentTool(makeRefs(executor as any));
-    const r = await tool.execute("v3", { description: "x", items: ["a"], subagent_type: "nope" });
+    const r = await tool.execute("v3", { description: "x", response_form, items: ["a"], subagent_type: "nope" });
     expect(executor).not.toHaveBeenCalled();
     expect(text(r)).toMatch(/unknown subagent_type/i);
   });
 
   it("errors clearly when no executor is available", async () => {
     const tool = createSpawnSubagentTool(makeRefs(undefined));
-    const r = await tool.execute("v4", { description: "x", items: ["a"] });
+    const r = await tool.execute("v4", { description: "x", response_form, items: ["a"] });
     expect(text(r)).toMatch(/not available/i);
     expect((r.details as any).error).toBe(true);
   });
@@ -215,7 +228,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     const r = await tool.execute("g5", {
       description: "diagnose crashing pods",
       task_template: "Find the root cause of {{item}} crashing.",
-      items: ["pod-a", "pod-b"],
+      response_form, items: ["pod-a", "pod-b"],
       reduce_prompt: "Group the causes into network/storage/other.",
     });
 
@@ -258,7 +271,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     const tool = createSpawnSubagentTool(makeRefs(executor));
     const r = await tool.execute("g6", {
       description: "x",
-      items: ["pod-a", "pod-b"],
+      response_form, items: ["pod-a", "pod-b"],
       reduce_prompt: "summarize",
       run_in_background: false,
     });
@@ -313,7 +326,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
 
     await tool.execute(
       "g-live",
-      { description: "x", items: ["pod-a", "pod-b"], reduce_prompt: "summarize", run_in_background: false },
+      { description: "x", response_form, items: ["pod-a", "pod-b"], reduce_prompt: "summarize", run_in_background: false },
       undefined,
       (update) => updates.push(update),
     );
@@ -345,7 +358,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
       ],
     }));
     const tool = createSpawnSubagentTool(makeRefs(executor));
-    const r = await tool.execute("g7", { description: "x", items: ["pod-a", "pod-b"] });
+    const r = await tool.execute("g7", { description: "x", response_form, items: ["pod-a", "pod-b"] });
     const mv = JSON.parse(text(r));
     expect(mv.reduce_summary).toBeUndefined();
     expect(mv.item_results).toEqual([
@@ -366,7 +379,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
       ],
     }));
     const tool = createSpawnSubagentTool(makeRefs(executor));
-    const r = await tool.execute("g8", { description: "x", items: ["a", "b"] });
+    const r = await tool.execute("g8", { description: "x", response_form, items: ["a", "b"] });
     const mv = JSON.parse(text(r));
     expect(mv.circuit_broken).toBe(true);
     expect(mv.status).toBe("failed");
@@ -382,7 +395,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
   it("runs batch mode when enabled (default)", async () => {
     const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "j" }));
     const tool = createSpawnSubagentTool(makeRefs(executor));
-    await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
+    await tool.execute("gg", { description: "x", task_template: "{{item}}", response_form, items: ["a", "b"] });
     expect(executor).toHaveBeenCalled();
   });
 
@@ -392,7 +405,7 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     try {
       const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "j" }));
       const tool = createSpawnSubagentTool(makeRefs(executor));
-      const r = await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
+      const r = await tool.execute("gg", { description: "x", task_template: "{{item}}", response_form, items: ["a", "b"] });
       expect(executor).not.toHaveBeenCalled();
       expect(text(r)).toMatch(/batch mode is disabled/i);
       expect(text(r)).toMatch(/one spawn_subagent call per target/i);

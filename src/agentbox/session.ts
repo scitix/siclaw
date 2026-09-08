@@ -11,6 +11,7 @@
  * and restored from JSONL on the next prompt.
  */
 
+import { buildResponseFormPrompt, parseResponseForm, SUBAGENT_RESPONSE_INSTRUCTIONS } from "../core/subagent-response-form.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -1034,6 +1035,7 @@ export class AgentBoxSessionManager {
         const childReq: SpawnSubagentRequest = {
           description: request.description,
           prompt: task.prompt,
+          responseForm: request.responseForm,
           subagentType: request.subagentType,
           runInBackground: request.runInBackground,
           parentSessionId: request.parentSessionId,
@@ -1221,6 +1223,7 @@ export class AgentBoxSessionManager {
       const childReq: SpawnSubagentRequest = {
         description: `${request.description} [${i + 1}/${total}]`,
         prompt: tasks[i].prompt,
+        responseForm: request.responseForm,
         subagentType: request.subagentType,
         runInBackground: false,
         parentSessionId: request.parentSessionId,
@@ -1357,7 +1360,8 @@ export class AgentBoxSessionManager {
         }));
         const reduceReq: SpawnSubagentRequest = {
           description: `${request.description} — summary`,
-          prompt: buildReduceInput(request.reducePrompt, outcomes),
+          prompt: buildReduceInput(request.reducePrompt, outcomes, request.responseForm ? Number.POSITIVE_INFINITY : undefined),
+          responseForm: request.responseForm,
           subagentType: request.subagentType,
           runInBackground: false,
           parentSessionId: request.parentSessionId,
@@ -1391,7 +1395,9 @@ export class AgentBoxSessionManager {
             // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
             // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
             // to 6000 was a no-op and the larger group budget never took effect.
-            const trunc = truncateReduceSummary(reduceRes.fullSummary ?? reduceRes.summary);
+            const trunc = request.responseForm
+              ? { text: reduceRes.summary, truncated: false }
+              : truncateReduceSummary(reduceRes.fullSummary ?? reduceRes.summary);
             reduceSummary = trunc.text;
             reduceTruncated = trunc.truncated;
             reduceChildSessionId = reduceRes.childSessionId;
@@ -2617,6 +2623,8 @@ export class AgentBoxSessionManager {
     signal?: AbortSignal,
   ): Promise<SpawnSubagentResult> {
     const startedAt = Date.now();
+    const childPrompt = this.buildSpawnedSubagentPrompt(request);
+    const auditPrompt = request.responseForm ? childPrompt : request.prompt;
     const childSessionId = opts?.childSessionId ?? randomUUID();
     // Trace context captured at dispatch by createSpawnSubagentExecutor (see there):
     //  - mainTraceId: the parent interaction's root trace id → stamps chat_messages.trace_id
@@ -2675,7 +2683,9 @@ export class AgentBoxSessionManager {
       // intentionally NOT shared with the child (nothing there would consume it).
       isSubagent: true,
       // The agent-type's prompt flavour for this child.
-      systemPromptAppend: type.systemPromptAddendum,
+      systemPromptAppend: type.systemPromptAddendum + (request.responseForm
+        ? `\n\n${SUBAGENT_RESPONSE_INSTRUCTIONS}`
+        : ""),
       // Deliberately omit spawnSubagentExecutor + delegate executors → the child
       // never sees spawn_subagent (no recursion).
     });
@@ -2723,7 +2733,7 @@ export class AgentBoxSessionManager {
     // Placed AFTER model setup so the ROOT captures llm.model_name; attach must precede
     // startPrompt (else startPrompt takes the id-only branch). Both self-gate on tracing state.
     tracingRecorder.attach(childSessionId, child.brain, { userId: request.userId, agentId });
-    tracingRecorder.startPrompt(childSessionId, request.prompt, request.userId, mainTraceId, spawnSpanContext);
+    tracingRecorder.startPrompt(childSessionId, auditPrompt, request.userId, mainTraceId, spawnSpanContext);
 
     // Cancellation: stopRequested is set by either the parent's abort signal
     // (main "stop" button → the spawn_subagent tool's signal) or job_stop.
@@ -2779,14 +2789,14 @@ export class AgentBoxSessionManager {
           agentId,
           request.userId,
           `Sub-agent: ${request.description}`,
-          redactText(request.prompt, redactionConfig).slice(0, 500),
+          redactText(auditPrompt, redactionConfig).slice(0, 500),
           "subagent",
           lineage,
         );
         await this.persistAppendMessage({
           sessionId: childSessionId,
           role: "user",
-          content: redactText(request.prompt, redactionConfig),
+          content: redactText(auditPrompt, redactionConfig),
           fromAgentId: agentId,
           parentSessionId: request.parentSessionId,
           delegationId,
@@ -2907,7 +2917,7 @@ export class AgentBoxSessionManager {
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );
-      await Promise.race([child.brain.prompt(this.buildSpawnedSubagentPrompt(request)), timeoutPromise]);
+      await Promise.race([child.brain.prompt(childPrompt), timeoutPromise]);
     } catch (err) {
       interruptedTool = [...pendingTools.values()][0]?.toolName;
       if (stopRequested) {
@@ -2960,13 +2970,21 @@ export class AgentBoxSessionManager {
       finalText = "(sub-agent produced no output)";
     }
 
+    const formResult = request.responseForm && status === "done"
+      ? parseResponseForm(request.responseForm, finalText)
+      : undefined;
+    if (formResult && !formResult.valid && status === "done") status = "failed";
+
     // Status is FINAL here → close the child's trace ROOT (span export). detach in the
     // finally below is the structural safety net: it ALWAYS runs even if a persist throws,
     // so no child trace is left open. endPrompt stays outside the try so it runs before the
     // terminal persist, mirroring the main-prompt ordering.
     tracingRecorder.endPrompt(childSessionId, status === "done" ? "completed" : "error");
     try {
-      const bundle = buildDelegateSummaryBundle(finalText);
+      // Filled answers are the deliverable: never clip fields into a UI-only report.
+      const bundle = formResult
+        ? { capsule: formResult.text, fullSummary: finalText, truncated: false }
+        : buildDelegateSummaryBundle(finalText);
       const durationMs = Date.now() - startedAt;
 
       // Drain prior (best-effort) trace writes, then emit the terminal event.
@@ -2988,7 +3006,7 @@ export class AgentBoxSessionManager {
             capsule: bundle.capsule,
             fullSummary: bundle.fullSummary,
             summaryTruncated: bundle.truncated,
-            scope: request.prompt,
+            scope: auditPrompt,
             toolCalls,
             durationMs,
             interruptedTool,
@@ -3025,8 +3043,9 @@ export class AgentBoxSessionManager {
     const lang = detectLanguage(`${request.description}\n${request.prompt}`);
     const langDirective = lang !== "English" ? `[System: respond in ${lang}]\n` : "";
     return `${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
-      `Complete this task now and end with a concise findings report — the caller only sees your ` +
-      `final report, not your intermediate steps. Do not ask for confirmation.`;
+      `Complete this task now. Answer every question, including failures, following the completion ` +
+      `instructions. The caller only sees your final answer. Do not ask for confirmation.` +
+      (request.responseForm ? `\n\n${buildResponseFormPrompt(request.responseForm)}` : "");
   }
 
   /**

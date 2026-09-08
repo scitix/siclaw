@@ -1599,6 +1599,98 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
   });
 
   // ── v3 decision #21: the reduce summary must come from the FULL reduce report, not the capsule ──
+  it.each(["single", "batch", "reduce", "background-single", "background-batch"])("delivers expanded, untruncated filled answers through the %s tool path", async (mode) => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const persisted: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (event: any) => {
+      persisted.push(event);
+      return { ok: true };
+    } };
+    const background = mode.startsWith("background-");
+    const single = mode === "single" || mode === "background-single";
+    const notifications: any[] = [];
+    if (background) vi.spyOn(mgr, "notifyParent").mockImplementation(async (_session: unknown, _job: unknown, notification: unknown) => {
+      notifications.push(notification);
+    });
+    const prompts: string[] = [];
+    const evidence = "x".repeat(6500) + "\nLAST COVERAGE FACT";
+    const response_form = [
+      { name: "cause", question: "Cause?", options: { A: "Upstream service error", B: "Unknown" } },
+      { name: "evidence", question: "Evidence and coverage?" },
+    ];
+    const count = single ? 1 : mode === "reduce" ? 3 : 2;
+    for (let i = 0; i < count; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async (prompt: string) => {
+          prompts.push(prompt);
+          emitter.emit("event", { type: "message_end", message: {
+            role: "assistant", content: [{ type: "text", text: `cause:\nA\n\nevidence:\n${evidence}` }],
+          } });
+        },
+      }));
+    }
+    const { createSpawnSubagentTool } = await import("../tools/workflow/spawn-subagent.js");
+    const tool = createSpawnSubagentTool({
+      spawnSubagentExecutor: mgr.createSpawnSubagentExecutor(), sessionIdRef: { current: "p1" },
+      agentId: "agent-1", userId: "u1", taskListId: "tl1",
+    } as any);
+    const result = await tool.execute("filled-form", {
+      description: "Check upstream", items: single ? ["Check pod-a"] : ["Check pod-a", "Check pod-b"],
+      response_form, run_in_background: background, ...(mode === "reduce" ? { reduce_prompt: "Combine the evidence" } : {}),
+    });
+    const visible = JSON.parse((result.content[0] as any).text);
+    if (background) {
+      expect(visible.status).toBe("launched");
+      await vi.waitFor(() => expect(notifications).toHaveLength(1));
+      expect(notifications[0].status).toBe("done");
+      expect(notifications[0].summary).toContain(`cause:\nUpstream service error\n\nevidence:\n${evidence}`);
+      if (!single) {
+        expect(notifications[0].summary).toContain("Check pod-a");
+        expect(notifications[0].summary).toContain("Check pod-b");
+      }
+    } else {
+      expect(visible.status).toBe("done");
+      const answers = mode === "reduce" ? [visible.reduce_summary] : visible.item_results.map((item: any) => item.summary);
+      for (const answer of answers) {
+        expect(answer).toBe(`cause:\nUpstream service error\n\nevidence:\n${evidence}`);
+      }
+    }
+    expect(prompts).toHaveLength(count);
+    const terminalEvents = persisted.filter((event) =>
+      event.type === "delegation.append_event" && !event.event.itemStatuses);
+    expect(terminalEvents).toHaveLength(count);
+    expect(terminalEvents[0].event.scope).toContain("A: Upstream service error");
+    expect(terminalEvents[0].event.capsule).toContain("cause:\nUpstream service error");
+    expect(terminalEvents[0].event.fullSummary).toContain("cause:\nA");
+    expect(prompts.every((prompt) => prompt.includes("cause:\n<answer>"))).toBe(true);
+    expect((globalThis as any).__createSessionCalls.every((opts: any) =>
+      opts.systemPromptAppend.includes("overrides presentation/report-card skills"))).toBe(true);
+    if (mode === "reduce") {
+      expect(prompts[2]).toContain("cause:\nUpstream service error");
+      expect(prompts[2]).toContain("LAST COVERAGE FACT");
+    }
+  });
+
+  it("returns valid fields plus a missing-field error without starting a repair child", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => emitter.emit("event", { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "cause:\nA" }],
+      } }),
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({
+      renderedTasks: [{ item: "pod-a", prompt: "Check pod-a" }],
+      responseForm: [
+        { name: "cause", question: "Cause?", options: { A: "Upstream service error" } },
+        { name: "evidence", question: "Evidence?" },
+      ],
+    }));
+    expect(report.status).toBe("failed");
+    expect(report.summary).toContain("cause:\nUpstream service error");
+    expect(report.summary).toContain("evidence: missing answer");
+    expect((globalThis as any).__createSessionCalls).toHaveLength(1);
+  });
+
   it("reduce summary uses the full reduce report (fullSummary), not the 1800-char capsule", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     const LONG = "X".repeat(2500); // > MAX_DELEGATE_CAPSULE_CHARS (1800), < GROUP_REDUCE_SUMMARY_MAX_CHARS (6000)

@@ -156,16 +156,24 @@ export function getSubagentMaxRuntimeMs(env: NodeJS.ProcessEnv = process.env): n
 
 export const DEFAULT_SUBAGENT_TYPE = "general-purpose";
 
+export const SUBAGENT_COMPLETION_INSTRUCTIONS =
+  "Answer every delegated question; failures count as answers too. Aggregate results only for the " +
+  "requested target. If the delegated question is answered, return the result directly without " +
+  "repeating methods or success justifications. If a required part remains unresolved, preserve " +
+  "the available result and quote the actual executed command and observed failure (the child's " +
+  "command when synthesising). Explain the concrete failure, not a generic limitations section. " +
+  "List the core errors the parent must not repeat. Never invent commands or failures; if no " +
+  "command was executed, say so. Do not present a failed investigation as a negative finding.";
+
 const GENERAL_PURPOSE: SubagentType = {
   agentType: "general-purpose",
   whenToUse:
     "General-purpose SRE sub-agent for a bounded diagnostic or research task: investigate one " +
-    "hypothesis, check one target, or gather specific evidence, then report concise findings.",
+    "hypothesis, check one target, or gather specific evidence. Answer every question; failures count as answers.",
   systemPromptAddendum:
     "You are a sub-agent handling ONE bounded task delegated by the main agent. " +
-    "Do exactly the task described, gather the requested evidence, and end with a concise findings " +
-    "report — the caller only sees your final report, not your steps. Do not ask for confirmation; " +
-    "if blocked, report what you found and what's missing.",
+    SUBAGENT_COMPLETION_INSTRUCTIONS +
+    " The caller only sees your final answer, not your intermediate steps. Do not ask for confirmation.",
   // No defaultModelTier: a general-purpose child inherits the parent's model, and
   // absent IS inherit. Setting a tier here would pick a model for every caller
   // that did not ask for one.

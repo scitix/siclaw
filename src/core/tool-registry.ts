@@ -16,6 +16,7 @@ import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./su
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
+import type { SubagentResponseField } from "./subagent-response-form.js";
 
 export type { SessionMode };
 
@@ -46,6 +47,7 @@ export type ResolvedToolDefinition = ToolDefinition & {
 export type SpawnSubagentStatus = "done" | "partial" | "failed" | "timed_out" | "launched";
 
 export interface SpawnSubagentRequest {
+  responseForm?: SubagentResponseField[];
   /** Short UI label for the spawned task. */
   description: string;
   /** The bounded task briefing — the child's only context besides its system prompt. */
@@ -85,7 +87,7 @@ export type SpawnSubagentResult =
 
 export interface SpawnSubagentReport {
   status: Exclude<SpawnSubagentStatus, "launched">;
-  /** Budgeted capsule returned to the parent as model-visible tool content. */
+  /** Filled form (or legacy budgeted capsule) returned as model-visible tool content. */
   summary: string;
   /** Full child report for UI/debug persistence; not model-visible. */
   fullSummary?: string;
@@ -155,6 +157,8 @@ export type GroupItemStatus = "done" | "partial" | "failed" | "timed_out" | "ski
  * consumes; this is the tool→executor boundary.
  */
 export interface SpawnSubagentGroupRequest {
+  /** Parent-owned form shared by map and optional synthesis children. */
+  responseForm?: SubagentResponseField[];
   /** Short UI label for the whole call (single task or batch). */
   description: string;
   /** One rendered task per item (item original kept for the report/UI + reduce headers). */
@@ -238,7 +242,7 @@ export type SubagentGroupResult =
 export interface SubagentGroupReport {
   status: "done" | "partial" | "failed" | "timed_out";
   itemResults: SubagentGroupItemResult[];
-  /** Reduce output, ≤ GROUP_REDUCE_SUMMARY_MAX_CHARS (truncation is annotated). Absent when no reduce ran. */
+  /** Filled reduce form, or legacy capped summary. Absent when no reduce ran. */
   reduceSummary?: string;
   reduceChildSessionId?: string;
   /** True when the circuit breaker tripped; the reason is folded into the summary. */

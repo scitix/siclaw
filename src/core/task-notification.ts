@@ -113,9 +113,12 @@ export function summarizeItemStatuses(items: Array<{ status: GroupItemStatus }>)
  */
 export function buildGroupNotificationSummary(description: string, report: SubagentGroupReport): string {
   const head = `Sub-agent group "${description}" ${report.status} — ${summarizeItemStatuses(report.itemResults)}.`;
-  // Prefer the reduce synthesis; else fall back to the group-level explanation (circuit-break
-  // reason / reduce failure / cancel note) so the notification says WHY a batch stopped even when
-  // no reduce ran (#7).
-  const body = report.reduceSummary ?? report.groupSummary;
+  // Without synthesis, deliver the actual item answers along with any group failure reason.
+  // A completion count alone forces the parent to rediscover results it should already have.
+  const body = report.reduceSummary ?? [
+    report.groupSummary,
+    ...report.itemResults.map((item) =>
+      `${typeof item.item === "string" ? item.item : JSON.stringify(item.item)} — ${item.status}\n${item.summary}`),
+  ].filter(Boolean).join("\n\n");
   return body ? `${head}\n\n${body}` : head;
 }
