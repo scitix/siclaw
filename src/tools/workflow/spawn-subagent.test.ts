@@ -268,8 +268,8 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     // preserve the reduce's context savings), all under the uniform `item_results` key.
     expect(mv.reduce_summary).toBe("All pods hit OOM.");
     expect(mv.item_results).toEqual([
-      { item: "pod-a", status: "done" },
-      { item: "pod-b", status: "failed" },
+      { item: "pod-a", status: "done", summary: "OOM" },
+      { item: "pod-b", status: "failed", summary: "unreachable" },
     ]);
     expect(mv.status).toBe("partial");
     // details carries the full per-item drill-in data.

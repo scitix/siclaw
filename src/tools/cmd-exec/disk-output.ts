@@ -19,6 +19,8 @@
  *    upstream in restricted-bash).
  */
 
+import { currentToolOutputContext } from "../../core/tool-output-context.js";
+import { StringDecoder } from "node:string_decoder";
 import { constants as fsConstants } from "node:fs";
 import { type FileHandle, mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import * as path from "node:path";
@@ -41,6 +43,8 @@ const MAX_TASK_OUTPUT_BYTES_DISPLAY = "5GB";
 
 /** <cwd>/<userDataDir>/agent/tasks — created lazily. */
 export function getTaskOutputDir(): string {
+  const scope = currentToolOutputContext();
+  if (scope) return path.join(scope.directory, "tasks");
   const userDataDir = path.resolve(process.cwd(), loadConfig().paths.userDataDir);
   return path.join(userDataDir, "agent", "tasks");
 }
@@ -103,7 +107,7 @@ export class DiskTaskOutput {
   constructor(jobId: string) {
     this.#path = getTaskOutputPath(jobId);
     this.#base = path.basename(this.#path);
-    liveTaskOutputs.add(this.#base); // protected from the stale-output sweep until markFinal()
+    liveTaskOutputs.add(this.#path); // protected from the stale-output sweep until markFinal()
   }
 
   /**
@@ -112,7 +116,7 @@ export class DiskTaskOutput {
    * past the cutoff. Idempotent; the file itself is left in place for the read window.
    */
   markFinal(): void {
-    liveTaskOutputs.delete(this.#base);
+    liveTaskOutputs.delete(this.#path);
   }
 
   /**
@@ -276,6 +280,32 @@ export async function readTaskOutput(
   }
 }
 
+/** Bounded byte pagination over the entire sanitized file, including content outside the tail window. */
+export async function readTaskOutputPage(jobId: string, offset = 0, limit = 32_768) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 4 || limit > 65_536) {
+    throw new Error("offset must be a nonnegative byte offset; limit must be 4..65536 bytes");
+  }
+  let fh: FileHandle;
+  try {
+    fh = await open(getTaskOutputPath(jobId), process.platform === "win32" ? "r" : fsConstants.O_RDONLY | O_NOFOLLOW);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return { output: "", bytes: 0, truncated: false, exists: false, offset, next_offset: null, complete: false };
+  }
+  try {
+    const bytes = (await fh.stat()).size;
+    if (offset > bytes) throw new Error("offset exceeds output size");
+    const buf = Buffer.alloc(Math.min(limit, bytes - offset));
+    const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+    if (bytesRead && (buf[0] & 0xc0) === 0x80) throw new Error("offset splits a UTF-8 character; use next_offset from the previous page");
+    const decoder = new StringDecoder("utf8");
+    const output = decoder.write(buf.subarray(0, bytesRead)) + (offset + bytesRead >= bytes ? decoder.end() : "");
+    const next = offset + Buffer.byteLength(output, "utf8");
+    return { output, bytes, truncated: offset > 0 || next < bytes, exists: true, offset,
+      next_offset: next < bytes ? next : null, complete: next >= bytes };
+  } finally { await fh.close(); }
+}
+
 /** Default age past which a finished job's output file is swept (24h). */
 const STALE_TASK_OUTPUT_MS = 24 * 60 * 60 * 1000;
 
@@ -293,8 +323,8 @@ const STALE_TASK_OUTPUT_MS = 24 * 60 * 60 * 1000;
 export async function sweepStaleTaskOutputs(
   maxAgeMs = STALE_TASK_OUTPUT_MS,
   protect?: Set<string>,
+  dir = getTaskOutputDir(),
 ): Promise<void> {
-  const dir = getTaskOutputDir();
   let entries: string[];
   try {
     entries = await readdir(dir);
@@ -307,8 +337,8 @@ export async function sweepStaleTaskOutputs(
       if (!name.endsWith(".output")) return;
       // Never delete a still-running job's file: it may be silent (old mtime) yet alive — its
       // writer would otherwise reopen an empty file on the next chunk and lose prior output.
-      if (liveTaskOutputs.has(name) || protect?.has(name)) return;
       const full = path.join(dir, name);
+      if (liveTaskOutputs.has(full) || protect?.has(name)) return;
       try {
         if ((await stat(full)).mtimeMs < cutoff) await unlink(full);
       } catch {

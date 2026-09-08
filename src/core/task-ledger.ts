@@ -118,9 +118,9 @@ export class TaskLedger {
 
   /** Replace all tasks from a persisted snapshot and restore the id sequence so
    *  new task_create ids continue past the highest restored id. */
-  hydrate(tasks: LedgerTask[]): void {
+  hydrate(tasks: LedgerTask[], highWater = 0): void {
     this.tasks.clear();
-    let maxSeq = 0;
+    let maxSeq = highWater;
     for (const t of tasks) {
       this.tasks.set(t.id, { ...t, blockedBy: [...(t.blockedBy ?? [])] });
       const n = Number(t.id);

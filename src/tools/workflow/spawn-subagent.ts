@@ -389,14 +389,11 @@ function toToolOutput(
     const hasReduce = typeof result.reduceSummary === "string";
     const modelVisible: Record<string, unknown> = {
       status: result.status,
-      // Uniform key `item_results` in every shape (design decision #18). When a reduce stage ran the
-      // per-item capsules are omitted (the reduce summary is the model's synthesis; keeping N capsules
-      // would defeat the reduce's context savings) — only item + status remain.
-      item_results: result.itemResults.map((r) =>
-        hasReduce
-          ? { item: itemToText(r.item), status: r.status }
-          : { item: itemToText(r.item), status: r.status, summary: r.summary },
-      ),
+      // Preserve source evidence alongside synthesis. The artifact wrapper bounds model context
+      // while keeping all reports recoverable, including evidence a reducer failed to mention.
+      item_results: result.itemResults.map((r) => (
+        { item: itemToText(r.item), status: r.status, summary: r.fullSummary ?? r.summary }
+      )),
     };
     if (hasReduce) modelVisible.reduce_summary = result.reduceSummary;
     // No reduce summary, but a group-level explanation exists (circuit-break reason / reduce-stage
@@ -424,7 +421,7 @@ function toToolOutput(
   }
 
   // ── Collapsed single-task report (legacy per-child result wrapped into the uniform envelope) ──
-  const single = { item: itemToText(items[0]), status: result.status, summary: result.summary };
+  const single = { item: itemToText(items[0]), status: result.status, summary: result.fullSummary ?? result.summary };
   const modelVisible = { status: result.status, item_results: [single] };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(modelVisible) }],

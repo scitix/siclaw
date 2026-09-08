@@ -1,3 +1,4 @@
+import { scheduleToolOutputCleanup } from "./tool-output-cleanup.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -197,6 +198,7 @@ export interface CreateSiclawSessionOpts {
 
 export interface SiclawSessionResult {
   brain: BrainSession;
+  toolResultArtifactStore: ToolResultArtifactStore;
   session: AgentSession;  // backward compat — only set for pi-agent brain
   /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the TUI */
   services: AgentSessionServices;
@@ -467,6 +469,7 @@ export async function createSiclawSession(
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
   const toolResultArtifactsDir = toolResultArtifactRoot(sessionManager.getSessionDir());
+  scheduleToolOutputCleanup(path.dirname(sessionManager.getSessionDir()));
   const knowledgeDir = opts?.knowledgeDir
     ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
       ? opts.portalKnowledgeDir
@@ -739,6 +742,16 @@ export async function createSiclawSession(
   // Subject to allowedTools (same chokepoint as MCP append above): file tools are
   // created outside the registry, so the shared name-based whitelist is applied here.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
+
+  for (let i = 0; i < customTools.length; i++) {
+    const tool = customTools[i];
+    if (!tool.name.startsWith("tool_result_") && !mcpTools.includes(tool)) {
+      customTools[i] = withToolResultArtifactCapture(tool, toolResultArtifactStore,
+        tool.name === "spawn_subagent" ? 0 : 4096);
+    }
+  }
+
+
   // Citation registration is an intrinsic, side-effect-free companion to Read,
   // but it must have a delivery sink — otherwise the tool would promise that
   // links are appended while CLI/child sessions silently drop the event.
@@ -1012,7 +1025,7 @@ export async function createSiclawSession(
     });
   };
   return {
-    brain, session, services, extensionsResult, modelFallbackMessage, customTools,
+    brain, session, services, extensionsResult, modelFallbackMessage, customTools, toolResultArtifactStore,
     skillNames, skillDigests, getSkillSnapshot,
     kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
     sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,

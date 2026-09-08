@@ -123,16 +123,14 @@ describe("ToolResultArtifactStore", () => {
     });
   });
 
-  it("evicts oldest artifacts to keep the session quota bounded", async () => {
+  it("refuses new artifacts at capacity without evicting valid evidence", async () => {
     const artifacts = store({ maxScopeBytes: 10 });
     const first = await artifacts.capture({ text: "123456", toolCallId: "call-6", toolName: "mcp__x__y" });
     if (!("reference" in first)) throw new Error("capture failed");
     now += 1;
     const second = await artifacts.capture({ text: "abcdef", toolCallId: "call-7", toolName: "mcp__x__y" });
-    if (!("reference" in second)) throw new Error("capture failed");
-
-    await expect(artifacts.read(first.reference.id)).rejects.toThrow("not found");
-    await expect(artifacts.read(second.reference.id)).resolves.toMatchObject({ text: "abcdef" });
+    expect(second).toHaveProperty("failure");
+    await expect(artifacts.read(first.reference.id)).resolves.toMatchObject({ text: "123456" });
   });
 
   it("caps the number of artifacts retained in one session scope", async () => {
@@ -141,15 +139,13 @@ describe("ToolResultArtifactStore", () => {
     if (!("reference" in first)) throw new Error("capture failed");
     now += 1;
     const second = await artifacts.capture({ text: "second", toolCallId: "call-9", toolName: "mcp__x__y" });
-    if (!("reference" in second)) throw new Error("capture failed");
-
-    await expect(artifacts.read(first.reference.id)).rejects.toThrow("not found");
-    await expect(artifacts.read(second.reference.id)).resolves.toMatchObject({ text: "second" });
+    expect(second).toHaveProperty("failure");
+    await expect(artifacts.read(first.reference.id)).resolves.toMatchObject({ text: "first" });
   });
 });
 
 describe("tool-result artifact tools", () => {
-  it("capture wrapper preserves live content and adds a recoverable reference", async () => {
+  it("capture wrapper bounds live content and preserves the complete recoverable result", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-wrapper-"));
     try {
       const store = new ToolResultArtifactStore({
@@ -168,14 +164,15 @@ describe("tool-result artifact tools", () => {
       }, store);
 
       const result = await wrapped.execute("call-1", {}, undefined, undefined, undefined);
-      expect((result.content[0] as any).text).toMatch(/^complete live result x+$/);
+      expect((result.content[0] as any).text.length).toBeLessThanOrEqual(8000);
+      expect((result.content[0] as any).text).toContain("artifact_id:");
       expect((result.details as any).upstream).toBe(true);
       const reference = getToolResultArtifactReference(result.details);
       expect(reference).not.toBeNull();
       const stored = await store.read(reference!.id);
-      expect(stored.text).toBe((result.content[0] as any).text.slice(0, 16_000));
+      expect(stored.text).toBe(`complete live result ${"x".repeat(40_000)}`.slice(0, 16_000));
       expect(stored.complete).toBe(false);
-      expect(reference!.sizeChars).toBe((result.content[0] as any).text.length);
+      expect(reference!.sizeChars).toBe(`complete live result ${"x".repeat(40_000)}`.length);
     } finally {
       await fs.rm(rootDir, { recursive: true, force: true });
     }

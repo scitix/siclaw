@@ -14,6 +14,8 @@ import { getOrCreateLedger, resetLedgers } from "../core/task-ledger.js";
  * cancellation, JSONL message counting, and the dp-state snapshot reader.
  */
 
+vi.mock("../core/tool-output-cleanup.js", () => ({ scheduleToolOutputCleanup: () => {} }));
+
 // ── Fakes/mocks (hoisted) ─────────────────────────────────────────────
 
 vi.mock("@earendil-works/pi-coding-agent", () => {
@@ -65,6 +67,7 @@ vi.mock("../core/agent-factory.js", async () => {
       subscribe,
       reload: async () => {},
       prompt: behavior.prompt ?? (async () => {}),
+      assessTaskCompletion: behavior.assessTaskCompletion ?? (async () => ({ status: "complete", reason: "fixture accepted" })),
       abort: behavior.abort ?? (async () => {}),
       steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
@@ -1160,6 +1163,19 @@ describe("AgentBoxSessionManager — 交接后丢弃本地会话副本", () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
+  it("handoff drops stale transcript data but retains scoped evidence for its own TTL", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const dir = path.join(mgr.getBaseSessionDir(), "handoff-evidence");
+    const evidence = path.join(dir, ".tool-results", "scope", "report.txt");
+    fs.mkdirSync(path.dirname(evidence), { recursive: true });
+    fs.writeFileSync(evidence, "complete evidence");
+    fs.writeFileSync(path.join(dir, "old.jsonl"), "old transcript");
+    await mgr.evictSessionContext("handoff-evidence");
+    await mgr.release("handoff-evidence");
+    expect(fs.existsSync(path.join(dir, "old.jsonl"))).toBe(false);
+    expect(fs.readFileSync(evidence, "utf8")).toBe("complete evidence");
+  });
+
   it("没交接过的 session,release 不碰它的目录", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     const dir = path.join(mgr.getBaseSessionDir(), "s-kept");
@@ -1776,6 +1792,48 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     const terminal = sent.find((e) => e.type === "delegation.append_event");
     expect(terminal?.event.delegationId).toBe("collapse1");
     expect(terminal.event.delegationId).not.toContain("#");
+  });
+
+
+  it("does not mark an intent-only child complete after bounded continuation", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let prompts = 0;
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => { prompts++; emitter.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "I will check all interfaces.", textSignature: JSON.stringify({ v: 1, phase: "final_answer" }) }] } }); },
+      assessTaskCompletion: async () => ({ status: "incomplete", reason: "No interface findings were delivered" }),
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "node", prompt: "Check all interfaces" }] }));
+    expect(report.status).toBe("partial");
+    expect(report.fullSummary).toContain("No interface findings were delivered");
+    expect(prompts).toBe(3);
+  });
+
+  it("preserves a length-limited report fragment when the child continues", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let prompts = 0;
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => { prompts++; emitter.emit("event", { type: "message_end", message: { role: "assistant", stopReason: prompts === 1 ? "length" : "stop", content: [{ type: "text", text: prompts === 1 ? "FIRST_EVIDENCE" : "LAST_EVIDENCE" }] } }); },
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "node", prompt: "Check interfaces" }] }));
+    expect(report.status).toBe("done");
+    expect(report.fullSummary).toContain("FIRST_EVIDENCE");
+    expect(report.fullSummary).toContain("LAST_EVIDENCE");
+  });
+
+  it("passes the full map report tail to the reducer", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let reduction = "";
+    const reportText = "API evidence\n".repeat(400) + "RDMA netns: exclusive";
+    for (let i = 0; i < 2; i++) (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async (prompt: string) => {
+        const reduce = prompt.includes("── item"); if (reduce) reduction = prompt;
+        emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: reduce ? "Mode verified" : reportText }] } });
+      },
+    }));
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "node", prompt: "Check interfaces" }], reducePrompt: "Summarize" }));
+    expect(report.status).toBe("done");
+    expect(reduction).toContain(reportText);
+    expect(report.itemResults[0].fullSummary).toBe(reportText);
   });
 
   // ── v3 decision #21: the reduce summary must come from the FULL reduce report, not the capsule ──

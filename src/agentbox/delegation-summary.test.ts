@@ -15,7 +15,8 @@ Longer audit notes that should remain available in UI only.
 
     expect(bundle.capsule).toContain("Verdict: likely");
     expect(bundle.capsule).not.toContain("Longer audit notes");
-    expect(bundle.fullSummary).toBe("Longer audit notes that should remain available in UI only.");
+    expect(bundle.fullSummary).toContain("Longer audit notes");
+    expect(bundle.fullSummary).toContain("Key evidence: scheduler rejected the pod");
     expect(bundle.truncated).toBe(false);
   });
 
@@ -26,7 +27,7 @@ Longer audit notes that should remain available in UI only.
     expect(bundle.capsule.length).toBeLessThanOrEqual(1800);
     expect(bundle.capsule).toContain("Full sub-agent report is available");
     expect(bundle.truncated).toBe(true);
-    expect(bundle.fullSummary).toBe("full");
+    expect(bundle.fullSummary).toBe(long);
   });
 
   it("keeps nested headings inside the full report body", () => {

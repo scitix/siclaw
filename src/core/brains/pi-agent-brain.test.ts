@@ -969,3 +969,23 @@ it("preserves tool arguments without interpreting them as narration", () => {
   expect(seen[0].args).toBe(args);
   expect(seen[0]).not.toHaveProperty("publicProgress");
 });
+
+
+describe("task completion assessment", () => {
+  it("checks the existing context without tools and restores the tool set", async () => {
+    const session = makeFakeSession();
+    session.prompt.mockImplementation(async () => {
+      expect(session.getActiveToolNames()).toEqual([]);
+      session.__emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ status: "incomplete", reason: "Only a promise, no findings" }) }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    expect(await brain.assessTaskCompletion("Check node")).toEqual({ status: "incomplete", reason: "Only a promise, no findings" });
+    expect(session.getActiveToolNames()).toEqual(["read", "mcp__result__submit"]);
+  });
+  it("restores tools after malformed review output", async () => {
+    const session = makeFakeSession();
+    session.prompt.mockImplementation(async () => session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Looks good" }] } }));
+    await expect(new PiAgentBrain(session).assessTaskCompletion("Check node")).rejects.toThrow();
+    expect(session.getActiveToolNames()).toEqual(["read", "mcp__result__submit"]);
+  });
+});

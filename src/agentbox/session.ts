@@ -38,7 +38,7 @@ import type {
   AgentMode,
 } from "../core/tool-registry.js";
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentPodConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getGroupPodShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
-import { buildReduceInput, GroupCircuitBreaker, truncateReduceSummary, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
+import { GroupCircuitBreaker, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
 import { hasAcceptedTurn, recordAcceptedTurn } from "./turn-ledger.js";
 import { buildNotificationBatch, buildGroupNotificationSummary, summarizeItemStatuses, type TaskNotification } from "../core/task-notification.js";
@@ -74,6 +74,12 @@ import type {
   DelegationToolUpdatePayload,
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
+import { assistantTextBlocks } from "../shared/assistant-items.js";
+import { scheduleToolOutputCleanup } from "../core/tool-output-cleanup.js";
+import { ToolResultArtifactStore, toolResultArtifactRoot, formatToolResultArtifactReference, getToolResultArtifactDetails } from "../core/tool-result-artifact.js";
+import { prepareReduceEvidence } from "./subagent-evidence.js";
+import { runSubagentToAcceptance } from "./subagent-completion.js";
+import { restoreTaskLedgerFromHistory } from "./task-ledger-recovery.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
 import { getOrCreateLedger, peekLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
 import { createCoalescedWriter, createSerialQueue } from "./keyed-writes.js";
@@ -758,6 +764,7 @@ export class AgentBoxSessionManager {
    */
   private getSessionDir(sessionId: string): string {
     const base = this.getBaseSessionDir();
+    scheduleToolOutputCleanup(base);
     const dir = path.join(base, sessionId);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -1200,6 +1207,7 @@ export class AgentBoxSessionManager {
     type ItemState = {
       status: "queued" | "running" | GroupItemStatus;
       summary: string;
+      fullSummary?: string;
       childSessionId: string;
       activity?: string;
       /** Which model this item ran on and why — absent for items that never started. */
@@ -1318,6 +1326,7 @@ export class AgentBoxSessionManager {
         // (which counts `done` only), so a cancellation stub can never fabricate a reduce over nothing.
         state.status = res.status;
         state.summary = res.summary;
+        state.fullSummary = res.fullSummary ?? res.summary;
         state.childSessionId = res.childSessionId;
         state.tierOutcome = res.tierOutcome;
       }
@@ -1359,13 +1368,9 @@ export class AgentBoxSessionManager {
     let reduceError: string | undefined;    // reduce ran but did not complete → drives status + groupSummary (kept off the report as its own key)
     let reduceSkippedForCancel = false;      // reduce requested but skipped because the user cancelled
 
-    // Reduce gate: run when a reduce_prompt was given AND at least one item COMPLETED on its own
-    // (`doneCount > 0`), the user didn't cancel, and the breaker didn't trip. Every map-child
-    // `partial` is a cancellation stub (runSpawnedSubagent reports `partial` only when stopped —
-    // by mapAbort or the parent's `_aborted` setup-window check — never for real partial output),
-    // so gating on `done` (not `done+partial`) stops a fully-timed-out batch from running a reduce
-    // over N "was cancelled" notices. The reduce INPUT still includes every item's summary, so
-    // genuine content from a completed-enough batch is never dropped from the synthesis.
+    // Require at least one accepted result before synthesis. Partial results may now contain
+    // useful evidence without satisfying their assignment; preserve them in the reducer input
+    // and the parent report, but never turn an entirely unverified batch into a green completion.
     if (request.reducePrompt) {
       if (userAbort.signal.aborted) {
         reduceSkippedForCancel = true;
@@ -1373,11 +1378,12 @@ export class AgentBoxSessionManager {
         const outcomes: GroupItemOutcome[] = states.map((s, i) => ({
           item: tasks[i].item,
           status: s.status as GroupItemStatus,
-          summary: s.summary,
+          summary: s.fullSummary ?? s.summary,
         }));
         const reduceReq: SpawnSubagentRequest = {
           description: `${request.description} — summary`,
-          prompt: buildReduceInput(request.reducePrompt, outcomes),
+          prompt: request.reducePrompt,
+          inputReports: outcomes,
           subagentType: request.subagentType,
           runInBackground: false,
           parentSessionId: request.parentSessionId,
@@ -1408,12 +1414,10 @@ export class AgentBoxSessionManager {
             );
           })));
           if (reduceRes.status === "done") {
-            // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
-            // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
-            // to 6000 was a no-op and the larger group budget never took effect.
-            const trunc = truncateReduceSummary(reduceRes.fullSummary ?? reduceRes.summary);
-            reduceSummary = trunc.text;
-            reduceTruncated = trunc.truncated;
+            // Keep the complete synthesis. Model context is bounded by recoverable artifacts,
+            // not by dropping the report tail before it reaches the caller.
+            reduceSummary = reduceRes.fullSummary ?? reduceRes.summary;
+            reduceTruncated = false;
             reduceChildSessionId = reduceRes.childSessionId;
           } else {
             // Reduce child failed / timed out / cancelled: do NOT set reduceSummary — that would
@@ -1452,6 +1456,7 @@ export class AgentBoxSessionManager {
       item: tasks[i].item,
       status: s.status as GroupItemStatus,
       summary: s.summary,
+      fullSummary: s.fullSummary,
       childSessionId: s.childSessionId,
       tierOutcome: s.tierOutcome,
     }));
@@ -1622,7 +1627,8 @@ export class AgentBoxSessionManager {
     const onProgress = this.makeGroupProgressEmitter(request.parentSessionId, jobId);
 
     void this.runSubagentGroup(request, onProgress.emit, controller.signal, traceCtx)
-      .then((report) => {
+      .then(async (report) => {
+        await this.persistSubagentJobOutput(jobId, JSON.stringify(report));
         onProgress.settle();
         const job = this.jobs.get(jobId);
         const stopped = job?.status === "stopped";
@@ -1633,7 +1639,8 @@ export class AgentBoxSessionManager {
           status,
           summary: stopped
             ? `Sub-agent group "${request.description}" was stopped`
-            : buildGroupNotificationSummary(request.description, report),
+            : buildGroupNotificationSummary(request.description, report) +
+              `\nComplete reports: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`,
         });
       })
       .catch((err) => {
@@ -1728,9 +1735,22 @@ export class AgentBoxSessionManager {
     return async (jobId) => this.jobs.stopJob(jobId);
   }
 
-  private createTaskOutputReader(): TaskOutputReader {
+  private async persistSubagentJobOutput(jobId: string, report: string): Promise<void> {
+    const job = this.jobs.get(jobId);
+    if (!job) throw new Error("Background report has no owning job");
+    const store = new ToolResultArtifactStore({
+      rootDir: toolResultArtifactRoot(this.getSessionDir(job.parentSessionId)),
+      getScope: () => ({ agentId: this.agentId ?? `user:${this.userId}`, sessionId: job.parentSessionId }),
+    });
+    const saved = await store.capture({ text: report, toolCallId: jobId, toolName: "subagent_report" });
+    if (!("reference" in saved)) throw new Error(`Background report storage failed: ${saved.failure.reason}`);
+    job.reportArtifact = saved.reference;
+  }
+
+  private createTaskOutputReader(parentSessionId: string): TaskOutputReader {
     // Snapshot the job's live status so task_output can report running/terminal (same as TUI).
-    return (jobId) => this.jobs.snapshot(jobId);
+    return (jobId) => this.jobs.get(jobId)?.parentSessionId === parentSessionId
+      ? this.jobs.snapshot(jobId) : { found: false };
   }
 
   private createChannelMessageExecutor(): ChannelMessageExecutor {
@@ -1976,7 +1996,8 @@ export class AgentBoxSessionManager {
     const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
     void sessionLim.run(() => this.podSubagentLimiter.run(() =>
       this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })))
-      .then((res) => {
+      .then(async (res) => {
+        if (res.status !== "launched") await this.persistSubagentJobOutput(jobId, res.fullSummary ?? res.summary);
         const job = this.jobs.get(jobId);
         const status: JobStatus =
           job?.status === "stopped"
@@ -1990,7 +2011,8 @@ export class AgentBoxSessionManager {
             ? `Sub-agent "${request.description}" was stopped`
             : res.status === "launched"
               ? `Sub-agent "${request.description}" finished`
-              : `Sub-agent "${request.description}" ${res.status}: ${res.summary}`;
+              : `Sub-agent "${request.description}" ${res.status}: ${res.summary}\n` +
+                `Complete report: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`;
         void this.notifyParent(request.parentSessionId, jobId, {
           taskId: jobId,
           status,
@@ -2041,6 +2063,9 @@ export class AgentBoxSessionManager {
     // flips running → done/failed live and on reload. Exec jobs only (sub-agents have their
     // own Jobs-bar fold). Independent of the model turn below.
     const job = this.jobs.get(jobId);
+    if (job?.reportArtifact) {
+      n = { ...n, summary: `${n.summary}\n${formatToolResultArtifactReference(job.reportArtifact, "Complete background report", 1000)}` };
+    }
     if (job && job.type !== "subagent") {
       void this.persistExecJobEvent(sessionId, jobId, n.status, job.exitCode);
     } else if (job) {
@@ -2832,6 +2857,11 @@ export class AgentBoxSessionManager {
         : "";
 
     let finalText = "";
+    let lastStopReason: string | undefined;
+    const responseFragments: string[] = [];
+    let reviewing = false;
+    let deadlineReached = false;
+    let childTimer: ReturnType<typeof setTimeout> | undefined;
     let toolCalls = 0;
     let status: SpawnSubagentStatus = "done";
     const pendingTools = new Map<string, { startMs: number; toolName: string; toolset?: string; toolInput?: string }>();
@@ -2845,6 +2875,7 @@ export class AgentBoxSessionManager {
       // Feed the recorder FIRST, unconditionally (gated on tracing state), so the child's
       // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
       if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
+      if (reviewing) return;
       if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
         toolCalls++;
         const toolName = (event.toolName as string) || (event.name as string) || "tool";
@@ -2864,7 +2895,7 @@ export class AgentBoxSessionManager {
         const toolName = (event.toolName as string) || (event.name as string) || pending?.toolName || "tool";
         const durationMs = pending ? Date.now() - pending.startMs : null;
         const outcome: "success" | "error" = event.isError ? "error" : "success";
-        const resultText = redactText(extractEventText(event.result?.content), redactionConfig).slice(0, 4000);
+        const resultText = redactText(extractEventText(event.result?.content), redactionConfig);
         liveSteps.push({ kind: "tool", toolName, toolInput: pending?.toolInput, content: resultText.slice(0, 1000), outcome, durationMs });
         emitProgress(`Finished ${toolName}`);
         enqueuePersist(async () => {
@@ -2875,6 +2906,7 @@ export class AgentBoxSessionManager {
             toolName,
             toolset: pending?.toolset ?? (typeof event.toolset === "string" ? event.toolset : null),
             toolInput: pending?.toolInput,
+            metadata: getToolResultArtifactDetails(event.result?.details) ?? undefined,
             outcome,
             durationMs,
             fromAgentId: agentId,
@@ -2886,9 +2918,11 @@ export class AgentBoxSessionManager {
         });
       }
       if (event?.type === "message_end" && event.message?.role === "assistant") {
+        lastStopReason = event.message.stopReason;
         const text = extractEventText(event.message.content).trim();
         if (text) {
-          finalText = text;
+          finalText = [...responseFragments, text].join("\n");
+          if (lastStopReason === "length") responseFragments.push(text);
           liveSteps.push({ kind: "assistant", text: redactText(text, redactionConfig) });
           emitProgress();
           enqueuePersist(async () => {
@@ -2896,6 +2930,15 @@ export class AgentBoxSessionManager {
               sessionId: childSessionId,
               role: "assistant",
               content: redactText(text, redactionConfig),
+              metadata: {
+                phase: assistantTextBlocks(event.message).find((b) => b.phase)?.phase,
+                stop_reason: event.message.stopReason,
+                ...(event.message.errorMessage ? { error_message: redactText(event.message.errorMessage, redactionConfig) } : {}),
+                assistant_item: {
+                  api: event.message.api, provider: event.message.provider, model: event.message.model,
+                  textSignature: event.message.content?.find((b: any) => b.type === "text")?.textSignature,
+                },
+              },
               fromAgentId: agentId,
               parentSessionId: request.parentSessionId,
               delegationId,
@@ -2931,10 +2974,33 @@ export class AgentBoxSessionManager {
           `sub-agent could not be placed on a model${tierOutcome.detail ? `: ${tierOutcome.detail}` : ""}`,
         );
       }
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
-      );
-      await Promise.race([child.brain.prompt(this.buildSpawnedSubagentPrompt(request)), timeoutPromise]);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        childTimer = setTimeout(() => {
+          deadlineReached = true;
+          reject(new Error("spawn_subagent_timeout"));
+        }, DELEGATED_AGENT_MAX_RUNTIME_MS);
+        childTimer.unref?.();
+      });
+      const execution = async () => {
+        const promptRequest = request.inputReports ? {
+          ...request,
+          prompt: await prepareReduceEvidence(request.prompt, request.inputReports, child.toolResultArtifactStore),
+        } : request;
+        if (stopRequested || deadlineReached) throw new Error("stopped before sub-agent prompt started");
+        return runSubagentToAcceptance({
+        brain: child.brain,
+        prompt: this.buildSpawnedSubagentPrompt(promptRequest),
+        assignment: request.prompt,
+        stopped: () => stopRequested || deadlineReached,
+        stopReason: () => lastStopReason,
+        reviewing: (active) => { reviewing = active; },
+        });
+      };
+      const acceptance = await Promise.race([execution(), timeoutPromise]);
+      if (!acceptance.accepted && !stopRequested) {
+        status = lastStopReason === "error" ? "failed" : "partial";
+        finalText = `${finalText}\n\n[Task completion not verified: ${redactText(acceptance.reason ?? "incomplete", redactionConfig)}]`;
+      }
     } catch (err) {
       interruptedTool = [...pendingTools.values()][0]?.toolName;
       if (stopRequested) {
@@ -2964,6 +3030,7 @@ export class AgentBoxSessionManager {
         finalText = finalText || `Sub-agent failed: ${failureText}`;
       }
     } finally {
+      if (childTimer) clearTimeout(childTimer);
       unsubscribe();
       // Shut down only connections this child opened. A manager shared with the
       // parent outlives every child and is torn down with the parent session.
@@ -2993,7 +3060,7 @@ export class AgentBoxSessionManager {
     // terminal persist, mirroring the main-prompt ordering.
     tracingRecorder.endPrompt(childSessionId, status === "done" ? "completed" : "error");
     try {
-      const bundle = buildDelegateSummaryBundle(finalText);
+      const bundle = buildDelegateSummaryBundle(redactText(finalText, redactionConfig));
       const durationMs = Date.now() - startedAt;
 
       // Drain prior (best-effort) trace writes, then emit the terminal event.
@@ -3080,6 +3147,17 @@ export class AgentBoxSessionManager {
    */
   private readonly evictedSessions = new Set<string>();
 
+  private removeCachedSessionTranscript(sessionId: string): void {
+    const directory = this.getSessionDir(sessionId);
+    // Handoff invalidates the conversational cache, not scoped evidence still referenced by
+    // history. Artifacts retain their own TTL and authorization; they are never shared implicitly.
+    for (const name of fs.readdirSync(directory)) {
+      if (name !== ".tool-results") fs.rmSync(path.join(directory, name), { recursive: true, force: true });
+    }
+    if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
+  }
+
+
   /**
    * Forget a session this box has handed away. See `evictedSessions`.
    */
@@ -3120,7 +3198,7 @@ export class AgentBoxSessionManager {
       if (resident?._releaseTimer) { clearTimeout(resident._releaseTimer); resident._releaseTimer = null; }
       await this.release(id);
       try {
-        fs.rmSync(this.getSessionDir(id), { recursive: true, force: true });
+        this.removeCachedSessionTranscript(id);
       } catch (err) {
         console.error(`[agentbox-session] Cannot discard stale context for ${id}:`, err);
         return false;
@@ -3134,6 +3212,7 @@ export class AgentBoxSessionManager {
       const { messages } = await gc.fetchSessionHistory(id);
       if (!messages?.length) return false; // a genuinely new session — nothing to load
       const { written } = writeRehydratedSession(process.cwd(), this.getSessionDir(id), messages);
+      if (restoreTaskLedgerFromHistory(id, messages)) await this.persistLedgerSnapshot(id);
       console.log(`[agentbox-session] Rehydrated session ${id} from the control plane: ${messages.length} rows → ${written} messages`);
       if (written > 0) {
         fs.rmSync(marker, { force: true });
@@ -3496,7 +3575,7 @@ export class AgentBoxSessionManager {
       subagentTierMenu: this.subagentTierMenuState,
       jobStopExecutor: this.createJobStopExecutor(),
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
-      taskOutputReader: this.createTaskOutputReader(),
+      taskOutputReader: this.createTaskOutputReader(id),
       channelMessageExecutor: this.createChannelMessageExecutor(),
     });
 
@@ -3984,7 +4063,7 @@ export class AgentBoxSessionManager {
   private dropEvictedTranscript(sessionId: string): void {
     if (!this.evictedSessions.delete(sessionId) && !fs.existsSync(`${this.getSessionDir(sessionId)}.handoff`)) return;
     try {
-      fs.rmSync(this.getSessionDir(sessionId), { recursive: true, force: true });
+      this.removeCachedSessionTranscript(sessionId);
       console.log(`[agentbox-session] Evicted the local transcript for handed-off session ${sessionId}`);
     } catch (err) {
       console.warn(`[agentbox-session] Could not evict the local transcript for ${sessionId}:`, err);

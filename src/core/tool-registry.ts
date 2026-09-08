@@ -52,6 +52,8 @@ export interface SpawnSubagentRequest {
   description: string;
   /** The bounded task briefing — the child's only context besides its system prompt. */
   prompt: string;
+  /** Internal reduce input: full reports, scoped into the receiving child before inference. */
+  inputReports?: Array<{ item: string | Record<string, string>; status: GroupItemStatus; summary: string }>;
   /** Resolved sub-agent type id (see subagent-registry). */
   subagentType: string;
   /** When true, run detached and notify the parent on completion (do not block). */
@@ -89,7 +91,7 @@ export interface SpawnSubagentReport {
   status: Exclude<SpawnSubagentStatus, "launched">;
   /** Budgeted capsule returned to the parent as model-visible tool content. */
   summary: string;
-  /** Full child report for UI/debug persistence; not model-visible. */
+  /** Full report used by the caller and reducer; capsules are display previews only. */
   fullSummary?: string;
   /** The child's own persisted session id, for UI drill-in. */
   childSessionId: string;
@@ -208,6 +210,7 @@ export interface SubagentGroupProgress {
 
 /** One item's terminal record in the group report. */
 export interface SubagentGroupItemResult {
+  fullSummary?: string;
   item: string | Record<string, string>;
   status: GroupItemStatus;
   /** Capsule (model-visible only when there is no reduce stage) or a short error/skip note. */
@@ -273,6 +276,7 @@ export interface TaskOutputSnapshot {
   status?: import("./job-registry.js").JobStatus;
   exitCode?: number;
   outputFile?: string;
+  reportArtifact?: import("./tool-result-artifact.js").ToolResultArtifactReference;
 }
 
 /**
