@@ -52,6 +52,13 @@ export interface CapabilityRunRecord {
   commandReceipts: CapabilityCommandReceipt[];
   /** Sanitized machine-readable terminal failure; never user/tool content. */
   failure?: CapabilityRunFailure;
+  /**
+   * Why a "done" was written by the RUNTIME rather than the box (e.g.
+   * `idle_timeout`: the watchdog closed a resting run). Absent for a done the
+   * box itself emitted. A consumer whose operation is still open when such a
+   * done arrives can tell "the box finished" from "nobody was driving the run".
+   */
+  closeReason?: string;
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -576,6 +583,12 @@ export class CapabilityRunManager {
           message: "runtime_stale:watchdog",
         });
       } else {
+        // An idle run closed by the watchdog is a normal session end for a
+        // conversation at rest — but for a compile whose operation never
+        // committed, it means the run was left undriven (its box was rolled or
+        // the relay never came back). Stamp the reason so the consumer can say
+        // which, instead of a bare "ended without committing".
+        rec.closeReason = "idle_timeout";
         await this.endRun(runId, outcome);
       }
       reaped.push(runId);
@@ -642,6 +655,7 @@ export class CapabilityRunManager {
       ...(rec.messageIds.length > 0 ? { message_ids: rec.messageIds } : {}),
       ...(rec.commandReceipts.length > 0 ? { command_receipts: rec.commandReceipts } : {}),
       ...(rec.failure ? { failure: rec.failure } : {}),
+      ...(rec.closeReason ? { close_reason: rec.closeReason } : {}),
     };
     const state: CapabilityRunState = {
       run_id: rec.runId,
