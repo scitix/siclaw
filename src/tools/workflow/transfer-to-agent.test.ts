@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createTransferToAgentTool, registration } from "./transfer-to-agent.js";
+import { createSearchHandoffTargetsTool, registration as searchRegistration } from "./search-handoff-targets.js";
 import { resolveAgentHarness } from "../../core/agent-context.js";
 import { ToolRegistry } from "../../core/tool-registry.js";
 import type { ToolRefs } from "../../core/tool-registry.js";
@@ -23,6 +24,8 @@ function refs(over: Partial<ToolRefs> = {}): ToolRefs {
     handoffSupported: true,
     sessionEventEmitter: vi.fn(),
     handoffTargets: [target()],
+    searchHandoffTargets: vi.fn(),
+    handoffSearchMatches: new Map([["cn", { id: "agent-cn", routeKey: "cn", name: "Siclaw (国内)", agentType: "sre", description: "", matches: [], matchCount: 1 }]]),
     ...over,
   } as unknown as ToolRefs;
 }
@@ -48,36 +51,19 @@ describe("transfer_to_agent 的可用性", () => {
   });
 });
 
-describe("transfer_to_agent 的描述", () => {
-  it("列出每个目标覆盖的集群与主机 —— 交接的判断依据就是这个", () => {
-    const tool = createTransferToAgentTool(refs());
-    expect(tool.description).toContain("cn: Siclaw (国内)");
-    expect(tool.description).toContain("roce-test");
-    expect(tool.description).toContain("10.0.0.1");
-  });
-
-  it("交回 facade 的那一项标出来", () => {
-    const tool = createTransferToAgentTool(refs({
-      handoffTargets: [target({ id: "f", name: "Siclaw", routeKey: "facade", isFacade: true })],
-    }));
-    expect(tool.description).toContain("BACK");
-  });
-
-  // 覆盖面可能是几百台主机,而这段文字是每一轮的常驻上下文。
-  it("覆盖列表超过上限就截断并说明还有多少", () => {
-    const hosts = Array.from({ length: 60 }, (_, i) => `host-${i}`);
-    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ clusters: [], hosts })] }));
-    expect(tool.description).toContain("(+36 more)");
-    expect(tool.description).not.toContain("host-59");
-  });
-
-  // 参数是字面量联合,不是自由字符串:模型只能挑名单里的那几个。
-  it("route_key 是目标 key 的枚举", () => {
-    const tool = createTransferToAgentTool(refs({
-      handoffTargets: [target(), target({ id: "agent-intl", routeKey: "intl" })],
-    }));
-    const schema = tool.parameters as unknown as { properties: { route_key: { anyOf?: { const: string }[] } } };
-    expect(schema.properties.route_key.anyOf?.map((v) => v.const)).toEqual(["cn", "intl"]);
+describe("constant-sized handoff tool definitions", () => {
+  it("does not serialize assets, target descriptions or a destination enum", () => {
+    const small = createTransferToAgentTool(refs());
+    const huge = createTransferToAgentTool(refs({ handoffTargets: Array.from({length: 100}, (_,i) => target({
+      id: `agent-${i}`, routeKey: `route-${i}`, description: "PRIVATE-LONG-DESCRIPTION".repeat(1000),
+      hosts: Array.from({length: 1000}, (_,j) => `host-${j}`), clusters: Array.from({length: 60}, (_,j) => `cluster-${j}`),
+    })) }));
+    expect(huge.description).toEqual(small.description);
+    expect(huge.parameters).toEqual(small.parameters);
+    expect(small.description).toContain("search_handoff_targets");
+    expect(small.description).not.toContain("roce-test");
+    expect(small.description).not.toContain("10.0.0.1");
+    expect(JSON.stringify(huge.parameters)).not.toContain("route-99");
   });
 });
 
@@ -122,7 +108,7 @@ describe("transfer_to_agent 的执行", () => {
     const out = await tool.execute!("call-1", { route_key: "moon", brief: "b" }, undefined as never);
     expect(emit).not.toHaveBeenCalled();
     expect((out as { details: { transferred: boolean } }).details.transferred).toBe(false);
-    expect((out as { content: { text: string }[] }).content[0].text).toContain("cn");
+    expect((out as { content: { text: string }[] }).content[0].text).toContain("search_handoff_targets");
   });
 
   it("brief 为空不发帧", async () => {
@@ -190,7 +176,7 @@ it("the installed agent loop stops after the handoff result without another mode
 // Exercise the real compiler + registry together, not just a capability array.
 describe("conversation handoff across Agent types", () => {
   const registry = new ToolRegistry();
-  registry.register(registration);
+  registry.register(registration, searchRegistration);
   function toolsFor(agentType: string, overrides: Parameters<typeof resolveAgentHarness>[0] = { allowedTools: null, memoryConfigured: false }, toolRefs = refs()) {
     const harness = resolveAgentHarness({
       agentType, mode: "web", handoffAvailable: true, ...overrides,
@@ -198,68 +184,32 @@ describe("conversation handoff across Agent types", () => {
     return registry.resolve({ mode: "web", refs: toolRefs, allowedTools: harness.allowedTools });
   }
   it.each(["sre", "coordinator", "knowledge_qa", "product_support", "custom"])("offers transfer to a resolved %s conversation owner", (type) => {
-    expect(toolsFor(type).map(t => t.name)).toEqual(["transfer_to_agent"]);
+    expect(toolsFor(type).map(t => t.name)).toEqual(["transfer_to_agent", "search_handoff_targets"]);
   });
   it("adds only ownership transfer to a restricted Custom allowance", () => {
     const allowedTools = ["read"];
     const harness = resolveAgentHarness({ agentType: "custom", allowedTools, mode: "web", memoryConfigured: false, handoffAvailable: true });
-    expect(harness.allowedTools).toEqual(["read", "transfer_to_agent"]);
+    expect(harness.allowedTools).toEqual(["read", "transfer_to_agent", "search_handoff_targets"]);
     expect(allowedTools).toEqual(["read"]);
     expect(harness.includeOperationalSafety).toBe(false);
-    expect(toolsFor("custom", { allowedTools, memoryConfigured: false })).toHaveLength(1);
+    expect(toolsFor("custom", { allowedTools, memoryConfigured: false })).toHaveLength(2);
   });
   it("does not grant operations to a read-only knowledge agent", () => {
     const harness = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false, handoffAvailable: true });
-    expect(harness.allowedTools).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "transfer_to_agent"]);
+    expect(harness.allowedTools).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "transfer_to_agent", "search_handoff_targets"]);
     expect(harness.includeSubagentGuidance).toBe(false);
   });
   it("keeps an unresolved harness closed even with a roster", () => {
     expect(toolsFor("custom", { allowedTools: null, memoryConfigured: false, harnessResolved: false })).toEqual([]);
   });
   it.each([
-    { handoffTargets: [] }, { sessionEventEmitter: undefined },
+    { handoffTargets: [] }, { sessionEventEmitter: undefined }, { searchHandoffTargets: undefined },
     { isSubagent: true }, { delegation: { delegationId: "d1" } },
   ])("does not expose a transfer without ownership and transport: %j", (overrides) => {
     expect(toolsFor("custom", undefined, refs(overrides))).toEqual([]);
   });
   it.each(["web", "channel", "task", "cli"] as const)("does not expose handoff without a capable transport in %s mode", (mode) => {
     expect(registry.resolve({ mode, refs: refs({ handoffSupported: false }), allowedTools: null })).toEqual([]);
-  });
-});
-
-describe("target capability summaries", () => {
-  it("describes type allowances and configured skills, knowledge and MCP names", () => {
-    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({
-      agentType: "knowledge_qa", toolCapabilities: null,
-      skills: ["GPU FAQ guide"], knowledgeBases: ["Product FAQ"], mcpServers: ["Ticket service"], resourcesResolved: true,
-    })] }));
-    expect(tool.description).toContain("Knowledge Q&A Agent");
-    expect(tool.description).toContain("knowledge_search");
-    expect(tool.description).not.toContain("node_exec");
-    expect(tool.description).toContain("bound skills: GPU FAQ guide");
-    expect(tool.description).toContain("bound knowledge bases: Product FAQ");
-    expect(tool.description).toContain("bound MCP servers: Ticket service");
-    expect(tool.description).toContain("not proof of live tool health");
-  });
-  it("uses restricted Custom capabilities instead of guessing from its name", () => {
-    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ agentType: "custom", toolCapabilities: ["read_files"] })] }));
-    expect(tool.description).toContain("knowledge_search");
-    expect(tool.description).not.toContain("node_exec");
-  });
-  it.each([undefined, "future_type", "custom"])("does not infer unrestricted capabilities from missing metadata: %s", (agentType) => {
-    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ agentType })] }));
-    expect(tool.description).toContain("built-in capabilities: unknown");
-    expect(tool.description).not.toContain("legacy Custom defaults");
-  });
-  it("marks failed resource lookup as unknown instead of no bound resources", () => {
-    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ resourcesResolved: false, clusters: [], hosts: [] })] }));
-    expect(tool.description).toContain("configured resources: unknown");
-    expect(tool.description).not.toContain("bound clusters/hosts: none");
-  });
-  it("bounds capability binding lists and reports omitted entries", () => {
-    const tool = createTransferToAgentTool(refs({ handoffTargets: [target({ skills: Array.from({ length: 60 }, (_, i) => `skill-${i}`) })] }));
-    expect(tool.description).toContain("(+36 more)");
-    expect(tool.description).not.toContain("skill-59");
   });
 });
 
@@ -311,5 +261,38 @@ describe("per-request loop prevention", () => {
     const out = await createTransferToAgentTool(fresh).execute!("new", { route_key: "cn", brief: "Inspect" }, undefined as never);
     expect(out).toMatchObject({ terminate: true });
     expect(blocked.sessionEventEmitter).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("on-demand destination lookup", () => {
+  const candidate = { id: "agent-cn", routeKey: "cn", name: "SRE", agentType: "sre", description: "Domestic diagnostics", matches: [{kind: "host", name: "host-999", ip: "10.1.2.3"}], matchCount: 1 };
+  it("requires discovery before transfer, and isolates another session's discovered targets", async () => {
+    const r = refs({ handoffSearchMatches: new Map(), searchHandoffTargets: vi.fn(async () => ({targets: [candidate], total: 1})) });
+    const transfer = createTransferToAgentTool(r);
+    expect(await transfer.execute!("before", {route_key:"cn", brief:"check"}, undefined as never)).toMatchObject({terminate:false});
+    const query = {kind:"host", query:"10.1.2.3"};
+    const found = await createSearchHandoffTargetsTool(r).execute!("query", query, undefined as never);
+    expect(r.searchHandoffTargets).toHaveBeenCalledWith(query);
+    expect(found.details).toMatchObject({targets:[{matches:candidate.matches}], total:1});
+    expect(await transfer.execute!("after", {route_key:"cn", brief:"check"}, undefined as never)).toMatchObject({terminate:true});
+    const other = refs({handoffSearchMatches:new Map()});
+    expect(await createTransferToAgentTool(other).execute!("other", {route_key:"cn",brief:"check"}, undefined as never)).toMatchObject({terminate:false});
+    expect(other.sessionEventEmitter).not.toHaveBeenCalled();
+  });
+  it("preserves pagination and ambiguity rather than selecting the first match", async () => {
+    const r = refs({handoffSearchMatches:new Map(), searchHandoffTargets:vi.fn(async()=>({targets:[candidate], total:9,nextOffset:1}))});
+    const out = await createSearchHandoffTargetsTool(r).execute!("query", {kind:"capability",query:"diagnostics",limit:1}, undefined as never);
+    expect(out.details).toMatchObject({total:9,nextOffset:1});
+    expect(r.sessionEventEmitter).not.toHaveBeenCalled();
+  });
+  it("does not treat lookup failure as no coverage, and rejects targets outside its index", async () => {
+    for (const search of [async()=>{throw Error("unavailable")}, async()=>({targets:[{...candidate,id:"foreign"}],total:1})]) {
+      const r=refs({handoffSearchMatches:new Map(),searchHandoffTargets:search});
+      const out=await createSearchHandoffTargetsTool(r).execute!("query",{kind:"host",query:"host-999"},undefined as never);
+      expect(out).toMatchObject({isError:true});
+      expect(r.handoffSearchMatches?.size).toBe(0);
+      expect(r.sessionEventEmitter).not.toHaveBeenCalled();
+    }
   });
 });

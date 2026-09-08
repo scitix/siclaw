@@ -3476,8 +3476,9 @@ export class AgentBoxSessionManager {
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,
-      // Facade / backend side: expose transfer_to_agent + its destination menu.
+      // Keep an internal target index; discover matching coverage on demand.
       handoffTargets,
+      searchHandoffTargets: gc ? query => gc.searchHandoffTargets(query) : undefined,
       getHandoffTraceContext: (callId) => tracingRecorder.captureHandoffTrace(id, callId),
       evictSessionContext: async () => { await this.evictSessionContext(id); },
       // Stable per-session ledger key so the plan survives release/rebuild

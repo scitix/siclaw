@@ -45,7 +45,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // gives the session away. This key remains for stored selections. Resolved
   // web conversation owners with a roster also receive transfer_to_agent from
   // the harness compiler, across all Agent types. No roster means no tool.
-  transfer_conversation: ["transfer_to_agent"],
+  transfer_conversation: ["transfer_to_agent", "search_handoff_targets"],
   scheduling:      ["manage_schedule"],
   session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input", "propose_execution"],   // IM-channel-visible updates + delegation result artifact + clarification / write-approval requests
 };

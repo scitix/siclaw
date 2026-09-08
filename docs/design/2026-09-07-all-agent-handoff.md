@@ -15,6 +15,9 @@ Delegated peers and spawned children cannot transfer the parent's conversation.
 An unresolved harness remains closed. Runtime terminates the successful sender;
 SiCore remains the sole owner of authorization and active-agent updates.
 
+> The static destination menu described below is superseded by
+> [on-demand handoff discovery](2026-09-08-handoff-discovery.md).
+
 ## Discovery and selection
 
 `config.getHandoffTargets` builds the permitted roster. An entry Agent sees its

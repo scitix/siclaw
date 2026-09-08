@@ -101,8 +101,8 @@ import {
 import { handleDelegate, handleDelegates } from "./delegate-api.js";
 import { handleSessionHistory } from "./session-history-api.js";
 import { SESSION_HISTORY_PATH } from "../shared/session-history.js";
-import { handleHandoffTargets } from "./handoff-targets-api.js";
-import { HANDOFF_TARGETS_PATH } from "../shared/agent-handoff.js";
+import { handleHandoffTargets, handleHandoffSearch } from "./handoff-targets-api.js";
+import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH } from "../shared/agent-handoff.js";
 import { a2aTransportConfig } from "./delegate-a2a-transport.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
@@ -2829,7 +2829,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // to (its backends if it is a facade; the facade + siblings if it is a
           // backend). Distinct from the delegation roster above: a handoff moves
           // ownership, it does not call out and come back.
-          if (url === HANDOFF_TARGETS_PATH && method === "GET") {
+          if (url === HANDOFF_SEARCH_PATH && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            void handleHandoffSearch(req, res, identity, frontendClient);
+            return;
+          }
+          if ((url === HANDOFF_TARGETS_PATH || url.startsWith(`${HANDOFF_TARGETS_PATH}?`)) && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             void handleHandoffTargets(req, res, identity, frontendClient);
             return;

@@ -13,7 +13,7 @@ import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
 import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
-import { HANDOFF_TARGETS_PATH, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
+import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH, type HandoffSearchQuery, type HandoffSearchResponse, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
 import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
 
 export interface GatewayClientOptions {
@@ -289,8 +289,12 @@ export class GatewayClient {
    * Fetch the agents this one may TRANSFER the conversation to. Empty for an
    * ordinary agent, which then grows no transfer tool at all.
    */
+  async searchHandoffTargets(query: HandoffSearchQuery): Promise<HandoffSearchResponse> {
+    return this.request(HANDOFF_SEARCH_PATH, "POST", query);
+  }
+
   async fetchHandoffTargets(): Promise<HandoffTargetsResponse> {
-    return this.request(HANDOFF_TARGETS_PATH, "GET");
+    return this.request(`${HANDOFF_TARGETS_PATH}?indexOnly=true`, "GET");
   }
 
   /**

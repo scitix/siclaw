@@ -97,8 +97,9 @@ export interface CreateSiclawSessionOpts {
   /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /** Facade / backend side: agents this one may HAND the conversation to
-   *  (manifest for the transfer_to_agent tool). Non-empty → the tool is exposed. */
+   *  (internal index only). Non-empty plus a search executor exposes discovery and transfer. */
   handoffTargets?: import("./tool-registry.js").ToolRefs["handoffTargets"];
+  searchHandoffTargets?: import("./tool-registry.js").ToolRefs["searchHandoffTargets"];
   getHandoffTraceContext?: import("./tool-registry.js").ToolRefs["getHandoffTraceContext"];
   /** Drops this box's local copy of the session after handing it away. */
   evictSessionContext?: () => Promise<void>;
@@ -437,7 +438,7 @@ export async function createSiclawSession(
     systemPromptTemplate: opts?.systemPromptTemplate,
     delegation: opts?.delegation,
     handoffPolicy: opts?.handoffPolicy,
-    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
+    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
     interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
   });
   const allowedTools = compiledContext.harness.allowedTools;
@@ -579,6 +580,8 @@ export async function createSiclawSession(
       delegationRoster: opts?.delegationRoster,
       delegateToAgentExecutor: opts?.delegateToAgentExecutor,
       handoffTargets: opts?.handoffTargets,
+      searchHandoffTargets: opts?.searchHandoffTargets,
+      handoffSearchMatches: new Map(),
       getHandoffTraceContext: opts?.getHandoffTraceContext,
       evictSessionContext: opts?.evictSessionContext,
     },

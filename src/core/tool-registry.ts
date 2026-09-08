@@ -520,7 +520,7 @@ export interface ToolRefs {
   /**
    * The agents this one may HAND THE CONVERSATION OVER to — its backends if it
    * is a facade, its facade plus siblings if it is a backend. Non-empty exposes
-   * `transfer_to_agent` and fills its destination menu. Empty (an ordinary
+   * `search_handoff_targets` and `transfer_to_agent`; the index stays outside model context. Empty (an ordinary
    * agent, or a fetch that failed) means the tool never appears, which is the
    * right degradation: this agent then answers the turn itself.
    *
@@ -528,6 +528,9 @@ export interface ToolRefs {
    * the session, a delegation calls out and comes back. See agent-handoff.ts.
    */
   handoffTargets?: HandoffTarget[];
+  searchHandoffTargets?: (query: import("../shared/agent-handoff.js").HandoffSearchQuery) => Promise<import("../shared/agent-handoff.js").HandoffSearchResponse>;
+  /** Session-local, discovered targets only. Never serialized into tool definitions. */
+  handoffSearchMatches?: Map<string, import("../shared/agent-handoff.js").HandoffSearchMatch>;
   /** Captured before session eviction; tracing is independent of tool arguments. */
   getHandoffTraceContext?: (callId: string) => import("../shared/handoff-trace.js").HandoffTraceContext | undefined;
   /**

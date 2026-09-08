@@ -125,8 +125,8 @@ export function resolveAgentHarness(
   // The factory proves emitter/roster/owner availability; unresolved harnesses
   // still fail closed. This grants no command, delegation, or resource access.
   const conversationTools = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
-    && Array.isArray(modeTools) && !modeTools.includes("transfer_to_agent")
-    ? [...modeTools, "transfer_to_agent"]
+    && Array.isArray(modeTools)
+    ? [...new Set([...modeTools, "transfer_to_agent", "search_handoff_targets"])]
     : modeTools;
   const allowedTools = resolution === "resolved" ? conversationTools : [];
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
@@ -182,7 +182,7 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
     && harness.resolution === "resolved"
     ? "Conversation ownership: transfer_to_agent is available for this main conversation. " +
       "When another authorized destination is better suited to continue the user's request, use its " +
-      "configured capability and coverage summary to transfer ownership. General role guidance to route " +
+      "coverage evidence from search_handoff_targets to transfer ownership. Query the exact cluster name/ID or host name/ID/IP when known; otherwise search configured capabilities. Do not infer resource ownership from Agent names. General role guidance to route " +
       "work to a specialist uses this ownership transfer for the main request; reserve delegation for " +
       "independent subtasks whose results you need back. Handle requests within your own capabilities " +
       "yourself. Do not guess an ambiguous destination, cycle between agents, or transfer merely to " +

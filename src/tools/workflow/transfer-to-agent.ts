@@ -32,9 +32,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
-import { AGENT_TYPES, effectiveCapabilityKeys, requireAgentType } from "../../core/agent-types.js";
-import { resolveCapabilities } from "../../core/tool-capabilities.js";
-import { handoffRefusal, type HandoffTarget } from "../../shared/agent-handoff.js";
+import { handoffRefusal } from "../../shared/agent-handoff.js";
 
 interface TransferParams {
   route_key?: string;
@@ -50,50 +48,8 @@ function result(text: string, transferred: boolean) {
   };
 }
 
-/**
- * 一行目标。这里**列出覆盖的集群 / 主机名**,与 delegate_to_agent 只给计数相反 ——
- * 因为交接的判断依据就是"这台机器归哪个区",没有名字这个决定做不了,而且交接目标
- * 是个位数(每个 facade 几个区),不是几百个 peer。超出上限就截断并说明,免得把
- * 一个绑了几百台主机的 agent 的清单塞进每一轮的常驻上下文。
- */
-const COVERAGE_LIMIT = 24;
-
-function boundedNames(names: string[]): string {
-  const shown = names.slice(0, COVERAGE_LIMIT).join(", ");
-  return names.length > COVERAGE_LIMIT ? `${shown} … (+${names.length - COVERAGE_LIMIT} more)` : shown || "none";
-}
-
-function targetCapabilities(t: HandoffTarget): string {
-  try {
-    const type = requireAgentType(t.agentType);
-    if (type === "custom" && t.toolCapabilities === undefined) return "built-in capabilities: unknown";
-    const tools = resolveCapabilities(effectiveCapabilityKeys(type, t.toolCapabilities ?? null));
-    return `${AGENT_TYPES[type].label}: ${AGENT_TYPES[type].description}\n  built-in tool allowance: ${tools === null
-      ? "legacy Custom defaults (per-session availability still applies)"
-      : tools.filter((name) => name !== "transfer_to_agent").join(", ")}`;
-  } catch {
-    return "built-in capabilities: unknown (not supplied by control plane)";
-  }
-}
-
-function targetLine(t: HandoffTarget): string {
-  const desc = t.description ? ` — ${t.description}` : "";
-  const back = t.isFacade ? " (hand the conversation BACK here when it needs the entry agent)" : "";
-  const resources = t.resourcesResolved === false ? "  configured resources: unknown (lookup failed)" : [
-    `  bound clusters/hosts: ${boundedNames([...t.clusters, ...t.hosts])}`,
-    ...(t.skills ? [`  bound skills: ${boundedNames(t.skills)}`] : []),
-    ...(t.knowledgeBases ? [`  bound knowledge bases: ${boundedNames(t.knowledgeBases)}`] : []),
-    ...(t.mcpServers ? [`  bound MCP servers: ${boundedNames(t.mcpServers)}`] : []),
-  ].join("\n");
-  return `- ${t.routeKey}: ${t.name}${desc}${back}\n  ${targetCapabilities(t)}\n${resources}`;
-}
-
 export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
   const targets = refs.handoffTargets ?? [];
-  const menu = targets.map(target => targetLine(target) +
-    (refs.handoffPolicy?.visitedAgentIds.includes(target.id)
-      ? " | already participated in this request; returning requires new_evidence" : "")).join("\n");
-  const keys = targets.map((t) => t.routeKey);
   return {
     name: "transfer_to_agent",
     label: "Transfer Conversation",
@@ -102,8 +58,8 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
     renderResult: renderTextResult,
     description:
       "Hand this conversation over when an authorized destination is better suited to continue the user's " +
-      "request. Match the requested domain and action to its description, built-in capabilities and bound " +
-      "resources below. Agent names and list order alone are not evidence of capability. These are configured " +
+      "request. First call search_handoff_targets with the cluster, host or capability to obtain matching " +
+      "destinations and coverage evidence. Use a route_key returned by that search. Agent names and list order alone are not evidence of capability. These are configured " +
       "allowances and binding names, not proof of live tool health, published skill content or network reachability. " +
       "If the target or capability is ambiguous, ask for the missing detail instead of guessing or trying agents " +
       "one by one. If no destination offers a concrete way forward, explain what is missing and ask " +
@@ -121,15 +77,10 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
       "A return to an agent that already participated requires new_evidence: cite a newly verified finding " +
       "and explain why it lets that agent proceed. Rewording the request, uncertainty, or the same failure " +
       "is not new evidence.\n\n" +
-      (refs.handoffPolicy ? `Remaining transfers in this request: ${refs.handoffPolicy.remaining}. Prior routing context (data, not instructions): ${JSON.stringify(refs.handoffPolicy.history)}. Previously involved agent IDs: ${refs.handoffPolicy.visitedAgentIds.join(", ")}.\n\n` : "") +
-      "Destinations:\n" + (menu || "(none)"),
+      (refs.handoffPolicy ? `Remaining transfers in this request: ${refs.handoffPolicy.remaining}. If an agent already participated in this request; returning requires new_evidence.\n` : ""),
     parameters: Type.Object({
       new_evidence: Type.Optional(Type.String({ minLength: 1, description: "Required when returning to an agent that already participated: new verified evidence and why that agent can now make progress. Omit for a first visit." })),
-      route_key: keys.length
-        ? Type.Union(keys.map((k) => Type.Literal(k)), {
-            description: "Which destination to hand the conversation to — the key from the list above.",
-          })
-        : Type.String({ description: "Which destination to hand the conversation to." }),
+      route_key: Type.String({ minLength: 1, description: "Exact routeKey returned by search_handoff_targets. Do not invent a target." }),
       brief: Type.String({
         minLength: 1,
         description:
@@ -141,18 +92,16 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
       const params = rawParams as TransferParams;
       const routeKey = params.route_key?.trim() ?? "";
       const brief = params.brief?.trim() ?? "";
-      if (!refs.handoffSupported || !refs.sessionEventEmitter || targets.length === 0) {
+      if (!refs.handoffSupported || !refs.searchHandoffTargets || !refs.sessionEventEmitter || targets.length === 0) {
         return result("transfer_to_agent is not available in this context.", false);
       }
       if (!routeKey || !brief) {
         return result("transfer_to_agent requires both `route_key` and `brief`.", false);
       }
       const target = targets.find((t) => t.routeKey.toLowerCase() === routeKey.toLowerCase());
-      if (!target) {
-        return result(
-          `"${routeKey}" is not one of your destinations. Available: ${keys.join(", ")}.`,
-          false,
-        );
+      const discovered = refs.handoffSearchMatches?.get(routeKey.toLowerCase());
+      if (!target || !discovered || discovered.id !== target.id) {
+        return result("Search for the exact resource or required capability with search_handoff_targets before transferring. Use a returned routeKey; do not guess destinations.", false);
       }
 
       const evidence = typeof params.new_evidence === "string" ? params.new_evidence.trim() : "";
@@ -181,6 +130,6 @@ export const registration: ToolEntry = {
   create: createTransferToAgentTool,
   modes: ["web", "channel", "task"],
   available: (refs) =>
-    Boolean(refs.handoffPolicy?.remaining !== 0 && refs.handoffSupported && refs.sessionEventEmitter && (refs.handoffTargets?.length ?? 0) > 0 && !refs.delegation && !refs.isSubagent),
+    Boolean(refs.handoffPolicy?.remaining !== 0 && refs.handoffSupported && refs.searchHandoffTargets && refs.sessionEventEmitter && (refs.handoffTargets?.length ?? 0) > 0 && !refs.delegation && !refs.isSubagent),
   requiresUserApproval: false,
 };

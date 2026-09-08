@@ -58,10 +58,10 @@ export interface HandoffTarget {
   resourcesResolved?: boolean;
   /** True for the facade itself — the hand-back, always `routeKey: "facade"`. */
   isFacade: boolean;
-  /** Bound cluster names: WHICH resources this target can actually reach. */
-  clusters: string[];
+  /** Legacy full manifest only; absent in the internal index. Configured, not live reachability. */
+  clusters?: string[];
   /** Bound host names, same purpose. */
-  hosts: string[];
+  hosts?: string[];
 }
 
 /** gateway → box: who this agent may hand off to. */
@@ -121,4 +121,23 @@ export function handoffRefusal(policy: HandoffPolicy | undefined, targetId: stri
     return `That agent already participated in this request. A return requires new verified evidence and why it enables that agent to proceed; repeating the request is not progress. If no such evidence exists, ${finish}`;
   }
   return undefined;
+}
+
+/** Bounded on-demand discovery; no credentials or full inventory in the result. */
+export const HANDOFF_SEARCH_PATH = "/api/internal/handoff-targets/search";
+export interface HandoffSearchQuery {
+  kind: "cluster" | "host" | "capability" | "agent";
+  query: string;
+  offset?: number;
+  limit?: number;
+}
+export interface HandoffSearchMatch {
+  id: string; name: string; routeKey: string; agentType: string; description: string;
+  matches: { kind: string; id?: string; name: string; ip?: string }[];
+  matchCount: number;
+}
+export interface HandoffSearchResponse {
+  targets: HandoffSearchMatch[];
+  total: number;
+  nextOffset?: number;
 }
