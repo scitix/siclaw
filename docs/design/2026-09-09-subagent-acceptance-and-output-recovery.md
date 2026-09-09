@@ -43,6 +43,11 @@ wrapper establishes an AsyncLocalStorage invocation context, including detached 
 Command stdout is sanitized/projected and stderr redacted by the existing pipeline *before*
 full-output retention. The wrapper captures that sanitized text before the 8,000-character
 preview cut. MCP and other tool results use the same scoped artifact mechanism.
+The native pi-coding-agent `read` tool is exempt from artifact wrapping: its bounded,
+consecutive pages and continuation notices are returned unchanged. Existing injected
+path checks still apply. Archiving a read page and replacing its middle with a preview
+would invalidate native continuation semantics; reading an artifact to completion also
+would not establish that the original file had been read to completion.
 
 Files live under the session's `.tool-results/<hash(agentId,sessionId)>` directory. Direct
 read/write/grep/bash access remains blocked; recovery tools accept opaque IDs, never paths.

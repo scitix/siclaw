@@ -74,3 +74,13 @@ Skills can be used in several ways:
 - from webhook-triggered workflows
 
 This makes them a good fit for turning repeated incident response habits into reusable, reviewable runbooks.
+
+
+## Reading Skill Instructions
+
+Skill files and their references use pi-coding-agent's native `read` behavior.
+Each text read returns up to 2,000 lines or 50 KiB, with a line offset for continuing
+when more content remains. Siclaw preserves these pages and continuation notices;
+it does not replace them with an 8,000-character head/tail preview. Existing file
+access restrictions still apply. A successful first page does not imply that the
+entire file or its references have been read.

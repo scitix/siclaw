@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Type } from "@sinclair/typebox";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ToolResultArtifactStore,
@@ -302,5 +303,83 @@ describe("formatUnrecoverableToolResult", () => {
     expect(rendered).toContain("cannot be recovered");
     expect(rendered).toContain("HEAD-");
     expect(rendered).toContain("-TAIL_ERROR");
+  });
+});
+
+
+describe("native read through artifact capture", () => {
+  let cwd: string;
+  let artifacts: ToolResultArtifactStore;
+
+  beforeEach(async () => {
+    cwd = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-native-read-"));
+    artifacts = new ToolResultArtifactStore({
+      rootDir: path.join(cwd, "artifacts"),
+      getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      // Reading an authorized file must not depend on artifact storage capacity.
+      maxArtifactBytes: 1,
+    });
+  });
+
+  afterEach(async () => {
+    await fs.rm(cwd, { recursive: true, force: true });
+  });
+
+  function read() {
+    return withToolResultArtifactCapture(createReadTool(cwd), artifacts, 4096);
+  }
+
+  it("returns a Skill over 8000 characters intact, including its middle", async () => {
+    const content = `${"step: inspect evidence\n".repeat(230)}MANDATORY MIDDLE GUIDANCE\n${"步骤：验证证据\n".repeat(650)}`;
+    expect(content.length).toBeGreaterThan(8000);
+    await fs.writeFile(path.join(cwd, "SKILL.md"), content);
+    const result = await read().execute("skill", { path: "SKILL.md" }, undefined, undefined, undefined);
+    expect(result.content).toEqual([{ type: "text", text: content }]);
+    expect(getToolResultArtifactReference(result.details)).toBeNull();
+  });
+
+  it.each([
+    { title: "line limit", count: 2300, width: 10 },
+    { title: "byte limit", count: 900, width: 100 },
+  ])("preserves consecutive pages and native continuation at the $title", async ({ count, width }) => {
+    const lines = Array.from({ length: count }, (_, index) => `${index + 1}: ${"x".repeat(width)}`);
+    await fs.writeFile(path.join(cwd, "source.ts"), lines.join("\n"));
+    const tool = read();
+    let offset = 1;
+    const collected: string[] = [];
+    for (let page = 0; page < 10; page++) {
+      const result = await tool.execute(`page-${page}`, { path: "source.ts", offset }, undefined, undefined, undefined);
+      const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+      expect(text).not.toContain("artifact_id:");
+      expect(text).not.toContain("preview middle omitted");
+      const notice = /\n\n\[Showing lines \d+-\d+ of \d+.*Use offset=(\d+) to continue\.\]$/;
+      const match = text.match(notice);
+      collected.push(...text.replace(notice, "").split("\n"));
+      if (!match) break;
+      const nextOffset = Number(match[1]);
+      expect(nextOffset).toBeGreaterThan(offset);
+      expect(collected).toEqual(lines.slice(0, nextOffset - 1));
+      offset = nextOffset;
+    }
+    expect(offset).toBeGreaterThan(1);
+    expect(collected).toEqual(lines);
+  });
+
+  it("retains explicit line ranges and continuation notices", async () => {
+    await fs.writeFile(path.join(cwd, "source.ts"), "one\ntwo\nthree\nfour");
+    const result = await read().execute("range", { path: "source.ts", offset: 2, limit: 2 }, undefined, undefined, undefined);
+    expect(result.content).toEqual([{ type: "text", text: "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]" }]);
+  });
+
+  it("keeps the injected file access restriction in effect", async () => {
+    const tool = createReadTool(cwd, {
+      operations: {
+        access: async () => { throw new Error("read denied by path policy"); },
+        readFile: async () => { throw new Error("must not read a denied file"); },
+      },
+    });
+    const wrapped = withToolResultArtifactCapture(tool, artifacts, 4096);
+    await expect(wrapped.execute("denied", { path: "private.txt" }, undefined, undefined, undefined))
+      .rejects.toThrow("read denied by path policy");
   });
 });
