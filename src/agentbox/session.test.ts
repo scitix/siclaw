@@ -71,7 +71,8 @@ vi.mock("../core/agent-factory.js", async () => {
       abort: behavior.abort ?? (async () => {}),
       steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
-      getModel: () => null,
+      getModel: behavior.getModel ?? (() => null),
+      checkContextFitForModelPrompt: behavior.checkContextFitForModelPrompt,
       // Overridable, unchanged defaults. Model SETUP is where a provider exception
       // is raised, and a factory that could only vary prompt/abort/steer could not
       // express that at all: every failure arrived as `findModel → null`, whose
@@ -89,7 +90,9 @@ vi.mock("../core/agent-factory.js", async () => {
       g.__createSessionCalls.push(opts);
       return {
         brain: createFakeBrain(),
-        session: { sessionId: "fake-session" },
+        session: { sessionId: "fake-session", messages: [], sendCustomMessage: async (message: any, options: any) => {
+          (g.__inheritedContextMessages ??= []).push({ message, options });
+        } },
         sessionIdRef: { current: "" },
         kubeconfigRef: opts.kubeconfigRef,
         skillsDirs: ["skills/core"],
@@ -2250,4 +2253,145 @@ describe("request-owned background command execution", () => {
     // Allow the launcher's eager output-file creation to settle before temp-dir cleanup.
     await new Promise(resolve => setTimeout(resolve, 20));
   });
+});
+
+describe("AgentBoxSessionManager — resumable child sessions", () => {
+  const request = (overrides: Record<string, unknown> = {}) => ({
+    description: "Inspect node", renderedTasks: [{ item: "node", prompt: "Inspect node" }],
+    subagentType: "general-purpose", runInBackground: false, parentSessionId: "parent",
+    parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "spawn-first", ...overrides,
+  });
+  function success() {
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({ prompt: async () => {
+      emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Verified node evidence" }] } });
+    } }));
+  }
+  it("seeds inherited context before the child runs and excludes later parent changes", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "user");
+    parent.session.messages = [{ role: "user", content: "first question" }, { role: "user", content: "latest question" }];
+    (globalThis as any).__inheritedContextMessages = [];
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({ prompt: async () => {
+      const inherited = (globalThis as any).__inheritedContextMessages;
+      expect(inherited).toHaveLength(1);
+      expect(JSON.stringify(inherited[0])).toContain("latest question");
+      expect(JSON.stringify(inherited[0])).not.toMatch(/first question|later change/);
+      expect(inherited[0].options.triggerTurn).toBe(false);
+      emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Verified inherited evidence" }] } });
+    } }));
+    const running = mgr.createSpawnSubagentExecutor()(request({ forkTurns: 1 }));
+    parent.session.messages[1].content = "later change";
+    const result = await running;
+    expect(result.status).toBe("done");
+  });
+
+  it("rejects inheritance from an unavailable parent or another user", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    await expect(mgr.createSpawnSubagentExecutor()(request({ forkTurns: "all" }))).rejects.toThrow(/unavailable/);
+    await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "someone-else");
+    await expect(mgr.createSpawnSubagentExecutor()(request({ forkTurns: "all" }))).rejects.toThrow(/unavailable/);
+  });
+  it("shares one captured context across map children and synthesis", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "user");
+    parent.session.messages = [{ role: "user", content: "inventory at dispatch" }];
+    const snapshots: unknown[] = [];
+    mgr.runSpawnedSubagent = async (req: any, options: any) => {
+      snapshots.push(req.parentContext);
+      parent.session.messages[0].content = "later inventory";
+      return { status: "done", summary: "Verified evidence", fullSummary: "Verified evidence", childSessionId: options?.childSessionId ?? "reduce", toolCalls: 0, durationMs: 1 };
+    };
+    await mgr.createSpawnSubagentExecutor()(request({ forkTurns: "all", reducePrompt: "Summarize", renderedTasks: [
+      { item: "a", prompt: "Inspect a" }, { item: "b", prompt: "Inspect b" },
+    ] }));
+    expect(snapshots).toHaveLength(3);
+    expect(snapshots[0]).toBe(snapshots[1]);
+    expect(snapshots[1]).toBe(snapshots[2]);
+    expect(JSON.stringify(snapshots)).toContain("inventory at dispatch");
+    expect(JSON.stringify(snapshots)).not.toContain("later inventory");
+  });
+  it("fails before inference when inherited context does not fit the child model", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "user");
+    parent.session.messages = [{ role: "user", content: "large context" }];
+    let prompted = false;
+    (globalThis as any).__fakeBrainFactories.push(() => ({
+      getModel: () => ({ id: "small", provider: "fixture", contextWindow: 64 }),
+      checkContextFitForModelPrompt: () => ({ ok: false, compacted: false }),
+      prompt: async () => { prompted = true; },
+    }));
+    const result = await mgr.createSpawnSubagentExecutor()(request({ forkTurns: "all" }));
+    expect(result.status).toBe("failed");
+    expect(result.summary).toContain("Inherited context exceeds");
+    expect(prompted).toBe(false);
+  });
+  it("retains the parent's business prompt independently of the child role", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const parent = await mgr.getOrCreate("parent", "web", "Only inspect region X", "normal", undefined, "user");
+    expect(parent.agentPrompt).toBe("Only inspect region X");
+    success();
+    await mgr.createSpawnSubagentExecutor()(request());
+    const child = (globalThis as any).__createSessionCalls.at(-1);
+    expect(child.systemPromptAppend).toBe("Only inspect region X");
+    expect(child.subagentPrompt).toContain("Execution role:");
+    expect(child.isSubagent).toBe(true);
+    expect(child.spawnSubagentExecutor).toBeUndefined();
+  });
+  it("reopens the same child transcript after the manager is rebuilt, with a new delegation ID", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    success();
+    const first = await mgr.createSpawnSubagentExecutor()(request());
+    expect(first.resumeHandle).toMatch(/^tra_/);
+    // The fake pi session manager does not write JSONL; simulate its persisted transcript.
+    fs.writeFileSync(path.join(mgr.getSessionDir(first.childSessionId), "transcript.jsonl"), "{}\n");
+    const restored = new AgentBoxSessionManager() as any;
+    const events: any[] = [];
+    restored.gatewayClient = { sendDelegationPersistenceEvent: async (event: any) => { events.push(event); return { ok: true, id: "persisted" }; } };
+    success();
+    const next = await restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, spawnId: "spawn-followup", renderedTasks: [{ item: "follow-up", prompt: "Explain the second interface" }] }));
+    expect(next.childSessionId).toBe(first.childSessionId);
+    expect(next.resumeHandle).toBe(first.resumeHandle);
+    expect((globalThis as any).__createSessionCalls.at(-1).sessionManager.sessionDir).toBe(mgr.getSessionDir(first.childSessionId));
+    expect(JSON.stringify(events)).toContain("spawn-followup");
+    expect(restored.subagentRuns.size).toBe(0);
+  });
+  it("queues a running child's guidance without starting another child or background job", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let finish!: () => void;
+    const blocked = new Promise<void>(resolve => { finish = resolve; });
+    const steer = vi.fn(async () => {});
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({ steer, prompt: async () => {
+      await blocked;
+      emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Verified" }] } });
+    } }));
+    const launch = await mgr.createSpawnSubagentExecutor()(request({ runInBackground: true }));
+    await vi.waitFor(() => expect((globalThis as any).__createSessionCalls.at(-1)?.isSubagent).toBe(true));
+    const count = (globalThis as any).__createSessionCalls.length;
+    const reply = await mgr.createSpawnSubagentExecutor()(request({ resumeHandle: launch.resumeHandle, spawnId: "guidance", renderedTasks: [{ item: "guidance", prompt: "Check eth1 too" }] }));
+    expect(reply).toMatchObject({ steered: true, childSessionId: launch.childSessionId, jobId: "spawn-first" });
+    expect((globalThis as any).__createSessionCalls.length).toBe(count);
+    expect(mgr.jobs.get("guidance")).toBeUndefined();
+    expect(steer).toHaveBeenCalledWith("Check eth1 too");
+    finish();
+    await vi.waitFor(() => expect(mgr.subagentRuns.size).toBe(0));
+  });
+  it("rejects another parent and missing transcripts instead of silently creating fresh children", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    success();
+    const first = await mgr.createSpawnSubagentExecutor()(request());
+    const count = (globalThis as any).__createSessionCalls.length;
+    await expect(mgr.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, parentSessionId: "other" }))).rejects.toThrow();
+    await expect(mgr.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle }))).rejects.toThrow(/transcript/);
+    expect((globalThis as any).__createSessionCalls.length).toBe(count);
+  });
+});
+
+it("does not let an older group's cleanup remove a newer continuation mailbox", () => {
+  const mgr = new AgentBoxSessionManager() as any;
+  const current = { jobId: "new-run", mailbox: {} };
+  mgr.subagentRuns.set("child", current);
+  mgr.releaseSubagentRun("child", "old-group");
+  expect(mgr.subagentRuns.get("child")).toBe(current);
+  mgr.releaseSubagentRun("child", "new-run");
+  expect(mgr.subagentRuns.has("child")).toBe(false);
 });

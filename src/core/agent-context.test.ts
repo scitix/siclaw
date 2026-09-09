@@ -216,3 +216,19 @@ it("asks for concrete missing information when the managed owner has no eligible
   expect(compiled.systemPrompt).toContain("No eligible authorized transfer destination");
   expect(compiled.systemPrompt).toContain("specific missing information or access");
 });
+
+describe("subagent prompt layers", () => {
+  it("retains business policy and safety but omits parent-only planning and spawning guidance", () => {
+    const input = { agentType: "sre", allowedTools: ["read", "cluster_list", "task_create", "task_update", "spawn_subagent"], memoryConfigured: false, agentPrompt: "Only operate in the assigned region" };
+    const parent = compileAgentContext(input);
+    const child = compileAgentContext({ ...input, isSubagent: true, subagentPrompt: "Investigate independently; report gaps to the caller" });
+    expect(child.systemPrompt).toContain(input.agentPrompt);
+    expect(child.systemPrompt).toContain("Investigate independently; report gaps to the caller");
+    expect(child.harness.includePlanningGuidance).toBe(false);
+    expect(child.harness.includeSubagentGuidance).toBe(false);
+    expect(parent.harness.includeSubagentGuidance).toBe(true);
+    expect(child.harness.includeOperationalSafety).toBe(parent.harness.includeOperationalSafety);
+    expect(child.harness.allowedTools).toEqual(parent.harness.allowedTools);
+    expect(parent.systemPrompt).not.toContain("Investigate independently; report gaps to the caller");
+  });
+});

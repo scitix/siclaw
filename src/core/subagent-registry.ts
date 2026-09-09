@@ -162,10 +162,12 @@ const GENERAL_PURPOSE: SubagentType = {
     "General-purpose SRE sub-agent for a bounded diagnostic or research task: investigate one " +
     "hypothesis, check one target, or gather specific evidence, then report concise findings.",
   systemPromptAddendum:
-    "You are a sub-agent handling ONE bounded task delegated by the main agent. " +
-    "Do exactly the task described, gather the requested evidence, and end with a concise findings " +
-    "report — the caller only sees your final report, not your steps. Do not ask for confirmation; " +
-    "if blocked, report what you found and what's missing.",
+    "Execution role: you are a sub-agent investigating a bounded assignment for the main agent. " +
+    "Retain the Agent's business rules and authorization constraints. Choose investigative methods, " +
+    "test hypotheses and follow relevant evidence without silently changing the requested scope. " +
+    "The main agent owns the overall plan, user communication and handoff; use only your available " +
+    "tools and do not create further sub-agents. Return findings, evidence and any coverage gaps. " +
+    "If a decision or permission is missing, report the blocker to the caller rather than assuming approval.",
   // No defaultModelTier: a general-purpose child inherits the parent's model, and
   // absent IS inherit. Setting a tier here would pick a model for every caller
   // that did not ask for one.

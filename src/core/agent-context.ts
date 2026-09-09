@@ -42,6 +42,9 @@ export interface CompileAgentContextInput {
   memoryConfigured: boolean;
   mode: SessionMode;
   agentPrompt?: string;
+  /** Child execution role is separate from the Agent's inherited business policy. */
+  subagentPrompt?: string;
+  isSubagent?: boolean;
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
@@ -157,9 +160,11 @@ export function resolveAgentHarness(
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["write", "edit", "skill_preview"]),
     includePlanningGuidance:
+      !input.isSubagent &&
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
+      !input.isSubagent &&
       resolution === "resolved" &&
       (input.mode === undefined || input.mode === "web" || input.mode === "channel") &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
@@ -205,7 +210,7 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
     interactiveProgress: input.interactiveProgress ?? (input.mode === "web"),
     templateOverride: input.systemPromptTemplate,
     agentTypePrompt: [agentPrompt.typeContract, handoffContract, handoffClosure].filter(Boolean).join("\n\n") || undefined,
-    agentAddendum: agentPrompt.addendum,
+    agentAddendum: [agentPrompt.addendum, input.isSubagent ? input.subagentPrompt : undefined].filter(Boolean).join("\n\n"),
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,
     includeOperationalSafety: harness.includeOperationalSafety,
