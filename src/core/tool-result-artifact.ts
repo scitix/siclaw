@@ -484,6 +484,11 @@ export function withToolResultArtifactCapture(
   store: ToolResultArtifactStore,
   minBytes = DEFAULT_CAPTURE_MIN_BYTES,
 ): ToolDefinition {
+  // Native read already bounds each page and supplies line-based continuation.
+  // Replacing a page with a head/tail preview loses its middle while retaining
+  // the next-page offset. Preserve the tool, including injected path checks.
+  if (tool.name === "read") return tool;
+
   const originalExecute = tool.execute.bind(tool) as ToolDefinition["execute"];
   return {
     ...tool,
