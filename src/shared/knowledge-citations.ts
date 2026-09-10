@@ -101,9 +101,13 @@ export function appendKnowledgeSourceCitations(text: string, value: unknown): st
     const destination = source.url.replaceAll("(", "%28").replaceAll(")", "%29");
     return `- [${source.title.replace(/[\[\]]/g, "")}](${destination})`;
   });
-  const footer = `\n\n### ${heading}\n\n${lines.join("\n")}`;
+  const sourceList = lines.join("\n");
+  const trimmedText = text.trimEnd();
   // A relayed or pre-rendered answer can already carry this exact footer.
-  // Match the complete generated block, not arbitrary URLs in answer prose.
-  if (text.trimEnd().endsWith(footer)) return text;
-  return `${text.trimEnd()}${footer}`;
+  // Source titles can change language detection after the first append, so
+  // recognize either supported heading while matching the complete source list.
+  if (["参考原文", "Original sources"].some((existingHeading) =>
+    trimmedText.endsWith(`\n\n### ${existingHeading}\n\n${sourceList}`),
+  )) return text;
+  return `${trimmedText}\n\n### ${heading}\n\n${sourceList}`;
 }
