@@ -16,7 +16,13 @@ export function restoreTaskLedgerFromHistory(sessionId: string, messages: Array<
     else if (e.action === "upsert" && e.task && typeof e.task.id === "string" &&
       typeof e.task.subject === "string" && typeof e.task.description === "string" &&
       ["pending", "in_progress", "completed"].includes(e.task.status) && Array.isArray(e.task.blockedBy)) {
-      tasks.set(e.task.id, e.task);
+      // Older status snapshots may have overwritten a valid title with "".
+      // Recover only within this task's lifetime; reset/delete clear the map.
+      const previous = tasks.get(e.task.id);
+      tasks.set(e.task.id, {
+        ...e.task,
+        subject: e.task.subject.trim() ? e.task.subject : previous?.subject ?? "",
+      });
       highWater = Math.max(highWater, Number(e.task.id) || 0);
       found = true;
     }

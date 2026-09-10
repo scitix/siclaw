@@ -377,6 +377,19 @@ that the Portal/Gateway DB owns sessions and chat history; AgentBox state is dis
   is persisted too. On refresh, the Jobs bar reloads running + recently-finished jobs and **reattaches to
   live progress** via SSE; `job_output` streams resume from the persisted offset.
 
+### Task titles during status updates
+
+A task title is non-empty at creation and cannot be cleared by `task_update`.
+Models may fill unused optional strings with empty placeholders, including in
+batch updates. An omitted, empty or whitespace-only subject keeps the current
+title; a nonblank subject renames it. Other optional fields retain their existing
+clearing semantics.
+
+When replaying legacy events, a blank title reuses the last nonblank title for
+that task within the current plan. Delete and reset events end that recovery
+scope. Replay does not rewrite stored events. If no title is available in the
+loaded history, the plan panel displays `Task #ID` instead of an empty row.
+
 ### In-flight work across refresh
 - A running sub-agent/job keeps executing in the AgentBox during a refresh (the client disconnecting does
   not abort it; background work uses an independent abort controller — §7). A session with live background

@@ -69,7 +69,10 @@ export function foldPlan(messages: PilotMessage[]): PlanTaskView[] {
       const t = ev.task
       map.set(String(t.id), {
         id: String(t.id),
-        subject: t.subject,
+        // Old status updates sometimes persisted a blank title. Retain the
+        // last real name until delete/reset, while accepting explicit renames.
+        subject: typeof t.subject === "string" && t.subject.trim()
+          ? t.subject : map.get(String(t.id))?.subject ?? "",
         description: t.description,
         status: t.status,
         owner: t.owner,

@@ -237,3 +237,24 @@ describe("task tools — batch form", () => {
     expect((r as any).details?.error).toBeUndefined();
   });
 });
+
+it("preserves titles in emitted snapshots for padded batch and single status updates", async () => {
+  resetLedgers();
+  const events: any[] = [];
+  const emit = (event: any) => events.push(JSON.parse(JSON.stringify(event)));
+  await createTaskCreateTool(TLID, emit).execute("create", { tasks: [
+    { subject: "Inspect request timing", description: "Read the trace" },
+    { subject: "Compare control request", description: "Match the input" },
+  ] });
+  const update = createTaskUpdateTool(TLID, emit);
+  await update.execute("batch", { updates: [
+    { id: "1", status: "completed", subject: "", description: "", activeForm: "", owner: "", addBlockedBy: [] },
+    { id: "2", status: "in_progress", subject: "", description: "", activeForm: "", owner: "", addBlockedBy: [] },
+  ], id: "", status: "pending", subject: "" });
+  expect(events.slice(2).map(event => [event.task.subject, event.task.status])).toEqual([
+    ["Inspect request timing", "completed"], ["Compare control request", "in_progress"],
+  ]);
+  await update.execute("single", { id: "2", status: "completed", subject: " \t" });
+  expect(events.at(-1).task.subject).toBe("Compare control request");
+  expect(text(await createTaskGetTool(TLID).execute("get", { id: "2" }))).toContain("Compare control request");
+});

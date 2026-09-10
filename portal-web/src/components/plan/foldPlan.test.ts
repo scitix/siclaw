@@ -81,3 +81,17 @@ describe("foldPlan", () => {
     expect(plan[0].owner).toBe("sub-agent-1")
   })
 })
+
+it("recovers titles from older events when status snapshots have blank names", () => {
+  const created = ev("upsert", { task: { id: "7", subject: "Inspect request timing", status: "pending" } });
+  const started = ev("upsert", { task: { id: "7", subject: "", status: "in_progress", activeForm: "" } });
+  const renamed = ev("upsert", { task: { id: "7", subject: "Verify timing evidence", status: "in_progress" } });
+  const completed = ev("upsert", { task: { id: "7", subject: " \t", status: "completed" } });
+  expect(foldPlan([created, started])[0]).toMatchObject({ subject: "Inspect request timing", group: "in_progress" });
+  const history = JSON.parse(JSON.stringify([created, started, renamed, completed]));
+  expect(foldPlan(history)[0]).toMatchObject({ subject: "Verify timing evidence", group: "completed" });
+  expect(history[3].metadata.task.subject).toBe(" \t");
+  for (const boundary of [ev("reset"), ev("delete", { taskId: "7" })]) {
+    expect(foldPlan([created, boundary, completed])[0].subject).toBe("");
+  }
+});
