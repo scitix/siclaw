@@ -272,18 +272,20 @@ request `chat.getVisualLink` from the host. Hosted conversations use the tool
 event's `dbMessageId`, relayed after destination Runtime persistence, without
 writing the transcript again. Raw AgentBox events use the locally persisted row
 ID. Replayed message/visual pairs do not issue duplicate link requests. The RPC accepts session_id,
-message_id and visual_id and returns `{url:string|null}`. SiCore verifies the
+message_id and visual_id and returns `{url:string|null}`. The host verifies the
 persisted attachment and Runtime/session relationship and returns its normal
 login-protected chat URL. No access token is created. Standalone Portal returns
 null because it has no comparable user permission model. Old hosts and export
 failures retain text output. Background notification PNG forwarding is not
 implemented; its tool attachment remains available in conversation history.
 
-Keep frontend copies synchronized without a new package dependency:
+Keep frontend copies synchronized without a new package dependency. The optional
+`--host-dir` points directly to an existing host chat-component directory; omit it
+to sync only the Portal contract:
 
 ```sh
-node scripts/sync-waterfall-contract.mjs --sicore /absolute/path/to/sicore
-node scripts/sync-waterfall-contract.mjs --check --sicore /absolute/path/to/sicore
+node scripts/sync-waterfall-contract.mjs --host-dir /absolute/path/to/host/chat-components
+node scripts/sync-waterfall-contract.mjs --check --host-dir /absolute/path/to/host/chat-components
 ```
 
 Source interaction code is Portal's `TraceTimeline.tsx`; wrappers use each
@@ -308,7 +310,7 @@ when PNG export fails. Portal exports charts and Mermaid.
 
 ## Timeline language and responsive layout
 
-The chart provides Auto / 中文 / English. Auto follows the SiCore platform locale,
+The chart provides Auto / 中文 / English. Auto follows the host platform locale,
 or browser language in standalone Portal; `TraceHostContext.locale` can supply a
 host override. The explicit preference is stored under `siclaw.traceLanguage.v1`
 and updates every chart without resetting selection or zoom. Controls, statuses,
