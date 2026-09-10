@@ -6931,6 +6931,7 @@ async def main():
     await test_incremental_integrity_guard()
     await test_incremental_guard_rearms_on_ledger_repair()
     await test_incremental_violation_auto_restored()
+    await test_incremental_rebinds_untouched_source_ids_without_widening_body_scope()
     await test_unconverged_files_residual_ticket()
     await test_exact_source_alias_is_repaired_before_l1_budget()
     await test_incremental_grandfathers_untouched_format_debt()
@@ -7799,6 +7800,66 @@ async def test_the_runtime_owns_the_dispatch_round_not_the_model():
         await client.close()
         td.cleanup()
     print("✓ dispatch round is stamped by the runtime; a wrong or missing echo cannot mislead it")
+
+
+async def test_incremental_rebinds_untouched_source_ids_without_widening_body_scope():
+    """Recreated Raw identity is metadata repair, including across repair turns."""
+    import incremental
+    import selfcheck
+
+    for needs_repair in (False, True):
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            for folder in ("raw", "candidate", "authoring"):
+                (wd / folder).mkdir()
+            (wd / "raw/changed.md").write_text("Changed source.")
+            (wd / "raw/stable.md").write_text("Unchanged source bytes.")
+            (wd / "authoring/manifest.yaml").write_text(
+                "sources:\n  - id: changed-source\n    path: changed.md\n"
+                "  - id: current-source\n    path: stable.md\n")
+            (wd / "candidate/index.md").write_text(
+                '---\nokf_version: "0.2"\n---\n# Index\n- [A](a.md)\n- [C](c.md)\n')
+            a = ('---\ntype: Guide\ntitle: Changed\nlabels:\n'
+                 '  - facet: topic\n    value: changed\nsources:\n'
+                 '  - resource: raw/changed.md\n    id: changed-source\n---\nA fact.\n')
+            # Inherited format debt must remain grandfathered: rekeying may
+            # not enlist this untouched page into a labels/format migration.
+            c = ('---\ntype: Guide\ntitle: Stable\nsources:\n'
+                 '  - resource: raw/stable.md\n    id: old-source\n---\n'
+                 '<!-- okf:evidence {"id":"stable.section","sources":["old-source"]} -->\n'
+                 '## Stable\nKeep this prose and its attribution exactly.\n')
+            expected = c.replace('id: old-source', 'id: "current-source"').replace(
+                '"sources":["old-source"]', '"sources":["current-source"]')
+            (wd / "candidate/a.md").write_text(a)
+            (wd / "candidate/c.md").write_text(c)
+            (wd / "authoring/RAW_CHANGES.json").write_text(json.dumps({
+                "modified": ["changed.md"], "added": [], "deleted": []}))
+            run = compile_box.CompileRun("source-rekey", td, 1)
+            run.client = _FakeSDKClient()
+            await compile_box._start_incremental(run, "Update changed source", strict=True)
+            assert run._incr_pending["changeset"]["affected_pages"] == ["a.md"]
+            if needs_repair:
+                (wd / "raw/orphan.md").write_text("Unaccounted input.")
+            # Even a simultaneous unauthorized body edit must be restored;
+            # the identity repair is never a blanket exemption for this page.
+            (wd / "candidate/c.md").write_text(c + "Unauthorized body edit.\n")
+            repair = await compile_box._post_turn_selfcheck(run)
+            assert (wd / "candidate/c.md").read_text() == expected
+            report = selfcheck.read_selfcheck(td)
+            assert not any(v["kind"] == "evidence_source_mapping" for v in report["lint"]["violations"])
+            assert report["incremental"]["restored_pages"] == ["c.md"]
+            if needs_repair:
+                assert repair and "orphan.md" in repair
+                assert "c.md" not in run._incr_pending["repair_pages"]
+                assert run._incr_pending["before_bytes"]["c.md"] == expected.encode()
+                (wd / "authoring/EXCLUSIONS.json").write_text(json.dumps([
+                    {"pattern": "orphan.md", "reason": "Live operational data"}]))
+                (wd / "candidate/c.md").write_text(expected + "Another unauthorized edit.\n")
+                repair = await compile_box._post_turn_selfcheck(run)
+                assert (wd / "candidate/c.md").read_text() == expected
+            assert repair is None
+            assert selfcheck.read_selfcheck(td)["state"] == "passed"
+            assert run._l1_repairs_used == 0
 
 
 if __name__ == "__main__":

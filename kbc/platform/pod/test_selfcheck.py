@@ -2851,6 +2851,14 @@ def main():
     test_deterministic_body_source_normalization()
     test_attribute_evidence_sections_derives_markers_from_statement_tags()
     test_attribute_evidence_sections_without_manifest_is_inert()
+    test_authored_evidence_ids_follow_frozen_source_identity()
+    test_trusted_evidence_check_rejects_self_consistent_unknown_id()
+    test_evidence_identity_repair_preserves_ambiguous_and_unstamped_ids()
+    test_frozen_identity_change_invalidates_selfcheck_key()
+    test_flow_source_rows_and_authored_markers_repair_together()
+    test_frozen_identity_check_preserves_unmanaged_resources()
+    test_flow_source_id_insertion_preserves_comments_and_yaml()
+    test_source_identity_rewrite_rejects_invalid_yaml_atomically()
     test_attribution_reports_oversized_pages()
     test_spaced_markdown_links()
     test_media_verify_helpers()
@@ -2898,10 +2906,6 @@ def main():
     test_ticket_kind_gate_and_claim_identity()
     test_file_ticket_record_supersedes_by_claim_and_normalizer_never_guesses()
     print("ALL OK  test_selfcheck")
-
-
-if __name__ == "__main__":
-    main()
 
 
 def test_attribution_pairs_lines_by_newline_and_keeps_the_page_tail():
@@ -2953,3 +2957,155 @@ def test_source_id_stamping_handles_bare_and_non_scalar_ids():
         q = (base / "candidate" / "q.md").read_text()
         assert "id: [x]" in q and "okf:evidence" not in q, q
     print("OK  source id stamping: bare id gets a space; non-scalar id is not cited")
+
+
+def test_authored_evidence_ids_follow_frozen_source_identity():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", 'sources:\n  - id: current-source\n    path: guide.md\n')
+        _mk(base, "raw/guide.md", "A source.")
+        page = ('---\ntype: guide\ntitle: Guide\nsources:\n'
+                '  - resource: raw/guide.md\n    id: old-source\n---\n'
+                '<!-- okf:evidence {"id":"owner.section","sources":["old-source"]} -->\n'
+                '## Guide\nA fact.\n'
+                '```html\n<!-- okf:evidence {"id":"example","sources":["old-source"]} -->\n```\n')
+        _mk(base, "candidate/guide.md", page)
+        selfcheck.attribute_evidence_sections(td)
+        result = (base / "candidate/guide.md").read_text()
+        fm, body, _ = selfcheck.parse_okf_frontmatter(result)
+        assert selfcheck._okf_evidence_violations("guide.md", fm, body) == []
+        assert '"sources":["current-source"]' in result
+        assert '"id":"example","sources":["old-source"]' in result
+        assert selfcheck.attribute_evidence_sections(td) == []
+
+
+def test_trusted_evidence_check_rejects_self_consistent_unknown_id():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", 'sources:\n  - id: current-source\n    path: guide.md\n')
+        page = ('---\ntype: guide\ntitle: Guide\nsources: [{resource: raw/guide.md, id: invented-source}]\n---\n'
+                '<!-- okf:evidence {"id":"section","sources":["invented-source"]} -->\nA fact.\n')
+        pages = {"guide.md": {"text": page}}
+        fm, body, _ = selfcheck.parse_okf_frontmatter(page)
+        assert selfcheck._okf_evidence_violations("guide.md", fm, body) == []
+        problems = selfcheck.trusted_evidence_violations(td, pages)
+        assert len(problems) == 1
+        assert problems[0]["kind"] == "evidence_source_mapping"
+        assert "invented-source" in problems[0]["detail"]
+
+
+def test_evidence_identity_repair_preserves_ambiguous_and_unstamped_ids():
+    page = ('---\nsources:\n'
+            '  - resource: raw/a.md\n    id: old\n'
+            '  - resource: raw/b.md\n    id: old\n---\n'
+            '<!-- okf:evidence {"id":"section","sources":["old"]} -->\nFact.\n')
+    assert selfcheck._remap_evidence_source_ids(page, page, {"a.md": "a", "b.md": "b"}) == page
+    flow = ('---\nsources: [{resource: raw/a.md, id: old}]\n---\n'
+            '<!-- okf:evidence {"id":"section","sources":["old"]} -->\nFact.\n')
+    assert selfcheck._remap_evidence_source_ids(flow, flow, {"a.md": "a"}) == flow
+
+
+def test_frozen_identity_change_invalidates_selfcheck_key():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/page.md", "A page.")
+        _mk(base, "authoring/manifest.yaml", 'sources: [{id: first, path: a.md}]\n')
+        before = selfcheck.state_key(td)
+        _mk(base, "authoring/manifest.yaml", 'sources: [{id: second, path: a.md}]\n')
+        assert selfcheck.state_key(td) != before
+
+
+def test_flow_source_rows_and_authored_markers_repair_together():
+    for row in ('{resource: raw/guide.md, id: old-source}', '{resource: raw/guide.md}', '{resource: raw/guide.md,}'):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            _mk(base, "authoring/manifest.yaml", 'sources: [{id: current-source, path: guide.md}]\n')
+            _mk(base, "raw/guide.md", "A source.")
+            marker = '<!-- okf:evidence {"id":"section","sources":["old-source"]} -->\n' if 'id:' in row else ''
+            _mk(base, "candidate/guide.md", f'---\ntype: guide\nsources: [{row}]\n---\n{marker}## Guide\nA fact.\n')
+            selfcheck.attribute_evidence_sections(td)
+            result = (base / "candidate/guide.md").read_text()
+            fm, body, error = selfcheck.parse_okf_frontmatter(result)
+            assert not error and fm["sources"][0]["id"] == "current-source", result
+            assert selfcheck._okf_evidence_violations("guide.md", fm, body) == []
+            assert selfcheck.trusted_evidence_violations(td, {"guide.md": {"text": result}}) == []
+            assert selfcheck.attribute_evidence_sections(td) == []
+
+
+def test_frozen_identity_check_preserves_unmanaged_resources():
+    resources = (
+        "https://example.com/manual", "s3://bucket/manual", "urn:manual:v1",
+        "references/manual.md", "package/manual.md", "Service API scope",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        # Even a colliding Raw-relative path must not capture an external URI
+        # or an explicitly package-owned references/ resource.
+        collisions = ("https:/example.com/manual", "references/manual.md")
+        rows = [{"path": path, "id": f"raw-{i}"} for i, path in enumerate(collisions)]
+        rows.append({"path": "managed.md", "id": "managed"})
+        _mk(base, "authoring/manifest.yaml", json.dumps({"sources": rows}))
+        for row in rows:
+            _mk(base, "raw/" + row["path"], "Managed source.")
+        for resource in resources:
+            page = ('---\ntype: Guide\nsources: [{resource: ' + json.dumps(resource)
+                    + ', id: external}]\n---\n'
+                    '<!-- okf:evidence {"id":"section","sources":["external"]} -->\nFact.\n')
+            _mk(base, "candidate/page.md", page)
+            assert selfcheck.trusted_evidence_violations(td, {"page.md": {"text": page}}) == [], resource
+            assert selfcheck.parse_okf_sources(page, set(collisions))[0] == [], resource
+            assert selfcheck.normalize_evidence_source_ids(td) == [], resource
+            assert (base / "candidate/page.md").read_text() == page
+        # A mixed page still keeps external evidence in its section fallback;
+        # namespace checking changes identity ownership, not attribution.
+        mixed = ('---\ntype: Guide\nsources: [{resource: raw/managed.md, id: managed}, '
+                 '{resource: https://example.com/manual, id: external}]\n---\n## Guide\nA fact.\n')
+        _mk(base, "candidate/page.md", mixed)
+        selfcheck.attribute_evidence_sections(td)
+        result = (base / "candidate/page.md").read_text()
+        assert '"sources":["managed","external"]' in result, result
+        for resource in ("raw/managed.md", "drop/managed.md", "managed.md", "raw/missing.md"):
+            page = ('---\nsources: [{resource: ' + resource + ', id: wrong}]\n---\n'
+                    '<!-- okf:evidence {"id":"section","sources":["wrong"]} -->\nFact.\n')
+            assert selfcheck.trusted_evidence_violations(td, {"page.md": {"text": page}}), resource
+
+
+def test_flow_source_id_insertion_preserves_comments_and_yaml():
+    rows = (
+        '{resource: raw/a.md, # Original document\n}',
+        '{resource: raw/a.md # Original document\n}',
+        '{resource: raw/a.md, note: "comma, # literal", # Original document\n}',
+    )
+    for row in rows:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            _mk(base, "authoring/manifest.yaml", 'sources: [{id: current, path: a.md}]\n')
+            page = f'---\ntype: Guide\nsources: [{row}]\n---\n## Guide\nKeep this body.\n'
+            fm_before, body_before, error = selfcheck.parse_okf_frontmatter(page)
+            assert error is None
+            _mk(base, "candidate/page.md", page)
+            selfcheck.normalize_evidence_source_ids(td)
+            result = (base / "candidate/page.md").read_text()
+            fm_after, body_after, error = selfcheck.parse_okf_frontmatter(result)
+            assert error is None, result
+            fm_before["sources"][0]["id"] = "current"
+            assert fm_after == fm_before
+            assert body_after == body_before and "# Original document" in result
+            assert selfcheck.normalize_evidence_source_ids(td) == []
+
+
+def test_source_identity_rewrite_rejects_invalid_yaml_atomically():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/manifest.yaml", 'sources: [{id: current, path: a.md}]\n')
+        # Replacing this scalar would also remove an anchor used elsewhere.
+        page = ('---\nsources: [{resource: raw/a.md, id: &shared old}]\n'
+                'other: *shared\n---\nKeep this body.\n')
+        assert selfcheck.parse_okf_frontmatter(page)[2] is None
+        _mk(base, "candidate/page.md", page)
+        assert selfcheck.normalize_evidence_source_ids(td) == []
+        assert (base / "candidate/page.md").read_text() == page
+
+
+if __name__ == "__main__":
+    main()
