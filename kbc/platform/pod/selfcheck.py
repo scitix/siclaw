@@ -2033,8 +2033,8 @@ def _stamp_source_ids_text(
 ) -> tuple[str, dict[str, str]] | None:
     """Return ``(text with sources[].id stamped, resource → id)``.
 
-    ``None`` means the frontmatter cannot be rewritten losslessly (flow-style
-    rows, invalid YAML, no block ``sources`` sequence); such a page is left for
+    ``None`` means the frontmatter cannot be rewritten losslessly (invalid
+    YAML or no ``sources`` sequence); such a page is left for
     the normal OKF lint and keeps page-wide citations. An existing id that
     agrees with the manifest is kept; one that disagrees is replaced — the
     frozen manifest, not the model, owns source ids, and a stray id would fail
@@ -2053,17 +2053,17 @@ def _stamp_source_ids_text(
         root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
     except yaml.YAMLError:
         return None
-    if not isinstance(root, yaml.MappingNode) or root.flow_style:
+    if not isinstance(root, yaml.MappingNode):
         return None
     sources_node = next((value for key, value in root.value
                          if isinstance(key, yaml.ScalarNode) and key.value == "sources"), None)
-    if not isinstance(sources_node, yaml.SequenceNode) or sources_node.flow_style:
+    if not isinstance(sources_node, yaml.SequenceNode):
         return None
     newline = "\r\n" if "\r\n" in text else "\n"
     ids: dict[str, str] = {}
     edits: list[tuple[int, int, str]] = []
     for item in sources_node.value:
-        if not isinstance(item, yaml.MappingNode) or item.flow_style:
+        if not isinstance(item, yaml.MappingNode):
             return None
         resource_pair = id_pair = None
         for key, value in item.value:
@@ -2092,7 +2092,11 @@ def _stamp_source_ids_text(
             # row tells the model what to fix). Leave the row out of the map.
             continue
         ids[entry] = wanted
-        if id_pair is None:
+        if id_pair is None and item.flow_style:
+            insert_at = item.end_mark.index - 1
+            prefix = " " if frontmatter[:insert_at].rstrip().endswith(",") else ", "
+            edits.append((insert_at, insert_at, f"{prefix}id: {json.dumps(wanted)}"))
+        elif id_pair is None:
             key_node, value_node = resource_pair
             finish = max(_yaml_terminal_end(key_node), _yaml_terminal_end(value_node))
             line_end = frontmatter.find("\n", finish)
@@ -2112,6 +2116,74 @@ def _stamp_source_ids_text(
     if edits:
         text = lines[0] + frontmatter + "".join(lines[end:])
     return text, ids
+
+
+def _remap_evidence_source_ids(text: str, original: str, manifest_ids: dict[str, str]) -> str:
+    """Repair only ids whose original page declaration identifies one Raw path."""
+    fm, _, error = parse_okf_frontmatter(original)
+    if error or not fm:
+        return text
+    destinations: dict[str, set[str | None]] = {}
+    for source in fm.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        old, resource = source.get("id"), source.get("resource")
+        if isinstance(old, str) and isinstance(resource, str):
+            destinations.setdefault(old.strip(), set()).add(manifest_ids.get(_norm_source_entry(resource)))
+    stamped_fm, _, _ = parse_okf_frontmatter(text)
+    stamped_ids = {source.get("id") for source in (stamped_fm or {}).get("sources", [])
+                   if isinstance(source, dict) and isinstance(source.get("id"), str)}
+    remap = {old: next(iter(values)) for old, values in destinations.items()
+             if len(values) == 1 and None not in values and next(iter(values)) in stamped_ids}
+    edits = []
+    for match in _EVIDENCE_MARKER_RE.finditer(_markdown_prose(text)):
+        try:
+            marker = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue  # Structural lint reports the original malformed marker.
+        if not isinstance(marker, dict) or not isinstance(marker.get("sources"), list):
+            continue
+        sources = marker["sources"]
+        if not all(isinstance(value, str) for value in sources):
+            continue
+        updated = [remap.get(value.strip(), value) for value in sources]
+        if updated != sources and len(set(updated)) == len(updated):
+            marker["sources"] = updated
+            edits.append((match.start(1), match.end(1), json.dumps(marker, separators=(",", ":"))))
+    for start, end, value in reversed(edits):
+        text = text[:start] + value + text[end:]
+    return text
+
+
+def trusted_evidence_violations(workdir: str, pages: dict[str, dict]) -> list[dict]:
+    """Check Raw evidence against frozen identity, not only page-local ids."""
+    manifest_ids = load_manifest_source_ids(workdir)
+    violations = []
+    for rel, page in sorted(pages.items()):
+        fm, body, error = parse_okf_frontmatter(page.get("text", ""))
+        if error or not fm:
+            continue
+        used = set()
+        for match in _EVIDENCE_MARKER_RE.finditer(_markdown_prose(body)):
+            try:
+                marker = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(marker, dict) and isinstance(marker.get("sources"), list):
+                used.update(value.strip() for value in marker["sources"] if isinstance(value, str))
+        for source in fm.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            source_id, resource = source.get("id"), source.get("resource")
+            if not isinstance(source_id, str) or not isinstance(resource, str) or source_id.strip() not in used:
+                continue
+            entry = _norm_source_entry(resource)
+            if _explicit_external_source(resource):
+                continue  # External citation declarations are inspected by the package boundary.
+            if manifest_ids.get(entry) != source_id.strip():
+                violations.append({"page": rel, "kind": "evidence_source_mapping",
+                                   "detail": f"Source {source_id!r} for {resource!r} does not match the frozen source manifest; restore the exact Raw resource and its id in both page sources and evidence markers."})
+    return violations
 
 
 def _marker_id(marker_json: str) -> str | None:
@@ -2323,7 +2395,8 @@ def attribute_evidence_sections(
         stamped = _stamp_source_ids_text(text, manifest_ids)
         if stamped is None or not stamped[1]:
             continue
-        updated, stats, _ = _attribute_page_text(stamped[0], stamped[1])
+        rebound = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
+        updated, stats, _ = _attribute_page_text(rebound, stamped[1])
         if updated == text:
             continue
         _write_text_atomic(path, updated)
@@ -2818,20 +2891,22 @@ def candidate_tree_hash(workdir: str) -> str | None:
 
 
 def state_key(workdir: str) -> str | None:
-    """Idempotency key for the self-check trigger: candidate tree + exclusions
-    file. Covers EXCLUSIONS.json explicitly because a repair that only adds
+    """Idempotency key for the self-check trigger: candidate tree, exclusions,
+    and frozen source manifest. Covers EXCLUSIONS.json explicitly because a repair that only adds
     exclusions (no candidate edits) must still trigger a re-check — otherwise
     the report would stay 'repairing' forever. None = nothing to check yet."""
     tree = candidate_tree_hash(workdir)
     if tree is None:
         return None
     h = hashlib.sha256(tree.encode())
-    excl = Path(workdir) / EXCLUSIONS_PATH
-    if excl.is_file():
-        try:
-            h.update(excl.read_bytes())
-        except OSError:
-            pass
+    for relative in (EXCLUSIONS_PATH, AUTHORING_MANIFEST_PATH):
+        path = Path(workdir) / relative
+        h.update(relative.encode())
+        if path.is_file():
+            try:
+                h.update(path.read_bytes())
+            except OSError:
+                pass
     return h.hexdigest()
 
 
@@ -2854,6 +2929,8 @@ def run_layer1(workdir: str) -> dict:
     exclusions, exclusion_errors = load_exclusions(workdir)
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
+    lint["violations"].extend(trusted_evidence_violations(workdir, pages))
+    lint["ok"] = not lint["violations"]
     over_broad = detect_over_broad_exclusions(workdir, exclusions)
     previous = read_selfcheck(workdir) or {}
     media_verify = previous.get("media_verify")
