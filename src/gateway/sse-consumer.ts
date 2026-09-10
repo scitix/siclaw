@@ -13,7 +13,7 @@
 
 import { randomUUID } from "node:crypto";
 import { AssistantItemStream } from "./assistant-item-stream.js";
-import type { AssistantItem } from "../shared/assistant-items.js";
+import { assistantTextBlocks, type AssistantItem } from "../shared/assistant-items.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
@@ -436,18 +436,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let isRoutingTurn = false;
   let routingCommitted = false;
   let pendingKnowledgeSources: unknown = null;
-  // Citations rendered into the assistant row being committed — persisted on
-  // that row's metadata as `knowledge_citations`, so feedback on the row can be
-  // attributed to the cited repos/pages. Exactly the delta appended to the text.
-  let pendingRowCitations: KnowledgeSourceCitation[] = [];
-  // URLs already rendered into an assistant message THIS TURN. Consumers ASSIGN
-  // (not merge) the knowledge_sources event, and a source must appear exactly
-  // once per turn. Nulling pending after the first ended message lost the
-  // references when the model narrated or re-cited before its final answer
-  // (zero-fresh re-cite emits nothing), and duplicated them across bubbles when
-  // it cited twice. Instead keep pending and append only the not-yet-rendered
-  // delta to each message; reset at the user-message turn boundary.
-  const renderedKnowledgeSourceUrls = new Set<string>();
+  // Keep the registered union until the user turn ends. Each independently
+  // delivered answer needs its sources even if an earlier message cited them.
   const pendingAssistantOps: Array<() => Promise<void>> = [];
   const pendingErrorOps: Array<() => Promise<void>> = [];
   const flushOps = async (ops: Array<() => Promise<void>>) => {
@@ -507,8 +497,6 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     pendingErrorOps.length = 0;
     pendingFailedLlmCalls = [];
     pendingKnowledgeSources = null;
-    renderedKnowledgeSourceUrls.clear();
-    pendingRowCitations = [];
     pendingStreamError = null;
     errorMessage = "";
   };
@@ -669,7 +657,6 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         assistantContent = currentMsgText = resultText = taskReportText = "";
         assistantItems.begin();
         pendingKnowledgeSources = null;
-        renderedKnowledgeSourceUrls.clear();
       }
 
       // A ConversationClient observes output already rendered by the owning
@@ -926,12 +913,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // once per LLM round-trip: a turn that calls tools emits several, and
           // flushing on those would defeat the in-turn suppression entirely.
           await flushTerminalError();
-          // Same boundary retires the previous turn's citation state, so a
-          // source rendered last turn never suppresses this turn's identical
-          // citation and stale pending never leaks onto the new answer.
+          // Retire the previous turn's source union so stale references never
+          // leak onto an answer to the new user input.
           pendingKnowledgeSources = null;
-          renderedKnowledgeSourceUrls.clear();
-          pendingRowCitations = [];
         }
         if (message?.role === "user" && onUserMessageStarted) {
           // The echoed text, so the caller can check the echo against the row it expects —
@@ -1118,30 +1102,24 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               .map((c) => c.text ?? "")
               .join("");
           }
-          if (pendingKnowledgeSources && message.stopReason !== "error") {
-            const base = extracted || currentMsgText || assistantContent;
+          let rowCitations: KnowledgeSourceCitation[] = [];
+          let citationContentIndex: number | undefined;
+          const textBlocks = assistantTextBlocks(message);
+          const answerBlock = [...textBlocks].reverse().find(block => block.phase !== "commentary" && block.text.trim());
+          const isProgress = message.stopReason === "toolUse" || evt.awaitingBackgroundJobs === true || evt.awaitingSubagents === true;
+          if (pendingKnowledgeSources && message.stopReason !== "error" && !isProgress &&
+              (answerBlock || textBlocks.length === 0)) {
+            const base = answerBlock?.text || extracted || currentMsgText || assistantContent;
             if (base.trim()) {
-              // Append only sources not already rendered this turn, and do NOT
-              // null pending: a later message may carry sources cited after this
-              // one, while the rendered-set stops any source appearing twice.
-              const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
-                .filter((source) => !renderedKnowledgeSourceUrls.has(source.url));
-              if (freshSources.length > 0) {
-                const cited = appendKnowledgeSourceCitations(base, freshSources);
-                if (cited !== base) {
-                  extracted = cited;
-                  assistantContent = cited;
-                  if (Array.isArray(message.content)) {
-                    const parts = message.content.map(part => ({ ...part }));
-                    const lastText = [...parts].reverse().find(part => part.type === "text");
-                    if (lastText) lastText.text += cited.slice(base.length);
-                    message.content = parts;
-                  } else message.content = cited;
-                }
-                // An identical footer may already exist; attribution still
-                // belongs to this row even when rendering is a no-op.
-                for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
-                pendingRowCitations = freshSources;
+              rowCitations = normalizeKnowledgeSourceCitations(pendingKnowledgeSources);
+              if (rowCitations.length > 0) {
+                const cited = appendKnowledgeSourceCitations(base, rowCitations);
+                citationContentIndex = answerBlock?.index ?? 0;
+                if (Array.isArray(message.content) && answerBlock) {
+                  message.content = message.content.map((part, index) =>
+                    index === answerBlock.index ? { ...part, text: cited } : part);
+                } else message.content = cited;
+                extracted = assistantTextBlocks(message).map(block => block.text).join("");
               }
             }
           }
@@ -1170,7 +1148,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // ── 落库:按 assistant item 分行,这一轮调用的账挂在第一行 ──
           // 上游按「一次模型调用一行 + 一条 thinking 行」落库,本分支按「一个
           // assistant item 一行」落库 —— 同一批文本的两种切法。合并规则:行按 item
-          // 切,envelope / citations / model_route 只挂第一行(一轮调用只结算一次账),
+          // 切,envelope / model_route 只挂第一行(一轮调用只结算一次账),
           // 没产出任何文本的纯工具轮仍然留一条空行来承载 envelope。
           const rowEnvelope = isModelCallRowEnvelope(envelope, message.stopReason)
             ? redactLlmCallEnvelope(envelope, (text) => redactText(text, redactionConfig))
@@ -1186,9 +1164,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               ...(rowEnvelope ? { llm_call: rowEnvelope } : {}),
               ...(!rowEnvelope && envelope && envelope.round > 0 ? { llm_round: envelope.round } : {}),
               ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
-              ...(pendingRowCitations.length > 0 ? { knowledge_citations: knowledgeCitationsMetadata(pendingRowCitations) } : {}),
             };
-            pendingRowCitations = [];
+            const citationMetadata = rowCitations.length > 0
+              ? { knowledge_citations: knowledgeCitationsMetadata(rowCitations) } : {};
             const rows: { content: string; item?: AssistantItem; metadata: Record<string, unknown> }[] =
               itemRows.length > 0
                 ? itemRows.map(({ item, cleaned }, index) => ({
@@ -1196,6 +1174,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                     item,
                     metadata: {
                       ...(index === 0 ? headMetadata : {}),
+                      ...(item.contentIndex === citationContentIndex ? citationMetadata : {}),
                       phase: item.phase ?? phase,
                       assistant_item: { ...item, text: undefined, status: "completed" },
                     } as Record<string, unknown>,

@@ -101,6 +101,47 @@ describe("consumeAgentSse — type-less extra events", () => {
 });
 
 describe("consumeAgentSse — assistant message flow", () => {
+  it.each([false, true])("keeps sources in the delivered final answer after commentary (re-cite: %s)", async (recite) => {
+    const sources = [{ title: "Runbook", url: "https://example.com/runbook", repoId: "repo-1" }];
+    const events = [
+      { type: "knowledge_sources", sources },
+      { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
+        { type: "text", text: "Checking nodes.", textSignature: JSON.stringify({ v: 1, id: "progress", phase: "commentary" }) },
+      ] } },
+      { type: "tool_execution_end", toolName: "lookup", result: { content: [] } },
+      ...(recite ? [{ type: "knowledge_sources", sources }] : []),
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [
+        { type: "text", text: "All nodes are healthy.", textSignature: JSON.stringify({ v: 1, id: "final", phase: "final_answer" }) },
+      ] } },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(result.resultText).toContain(sources[0].url);
+    expect(result.resultText.split(sources[0].url)).toHaveLength(2);
+    expect(appendCalls.at(-1).metadata.knowledge_citations.repo_ids).toEqual(["repo-1"]);
+  });
+
+  it("attaches citations to the final native item and bills the model call only once", async () => {
+    const sources = [{ title: "Runbook", url: "https://example.com/runbook", repoId: "repo-1", page: "runbook.md" }];
+    const result = await consumeAgentSse({
+      client: mkClient([
+        { type: "knowledge_sources", sources },
+        { type: "message_end", message: { role: "assistant", stopReason: "stop", llmCall: mkEnvelope(), content: [
+          { type: "text", text: "Checks complete.", textSignature: JSON.stringify({ v: 1, id: "progress", phase: "commentary" }) },
+          { type: "text", text: "All nodes are healthy.", textSignature: JSON.stringify({ v: 1, id: "final", phase: "final_answer" }) },
+        ] } },
+      ]), sessionId: "s", userId: "u", persistMessages: true,
+    });
+    expect(result.resultText).toContain(sources[0].url);
+    expect(appendCalls).toHaveLength(2);
+    expect(appendCalls[0].metadata.knowledge_citations).toBeUndefined();
+    expect(appendCalls[1].content).toBe(result.resultText);
+    expect(appendCalls[1].metadata.knowledge_citations).toEqual({
+      repo_ids: ["repo-1"], pages: [{ repo_id: "repo-1", page: "runbook.md", url: sources[0].url }],
+    });
+    expect(appendCalls.filter(row => row.metadata.llm_call)).toHaveLength(1);
+    expect(appendCalls[0].metadata.llm_call).toBeDefined();
+  });
+
   it("keeps attribution when a raw answer already contains the registered footer", async () => {
     const sources = [{ title: "Runbook", url: "https://example.com/runbook", repoId: "repo-1" }];
     const answer = appendKnowledgeSourceCitations("Answer", sources);
@@ -151,10 +192,9 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect((seen.filter(e => e.type === "message_end")[0].message.content[0].text as string)).toBe(result.resultText);
   });
 
-  it("renders each source exactly once across a turn's messages, never duplicating the union", async () => {
-    // Consumers assign (not merge) knowledge_sources. Cite A, narrate (that
-    // message renders A), then cite the growing union [A, B]: the final message
-    // must append ONLY B — the old code re-appended [A, B] and A showed twice.
+  it("includes the registered source union once in each independently delivered answer", async () => {
+    // Legacy messages have no phase. An earlier answer may render A, but the
+    // final answer still needs the complete registered union [A, B].
     const a = "https://docs.feishu.cn/wiki/a";
     const b = "https://docs.feishu.cn/wiki/b";
     const events = [
@@ -170,14 +210,13 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect(narration).toContain(a);
     expect(narration).not.toContain(b);
     expect(final).toContain(b);
-    expect(final).not.toContain(a); // A was already rendered on the narration — not repeated
+    expect(final.split(a)).toHaveLength(2);
+    expect(final.split(b)).toHaveLength(2);
   });
 
   it("does not lose references when a zero-fresh re-cite follows an intermediate message", async () => {
-    // Cite A, narrate (renders A), re-cite A right before the final answer.
-    // The source must still be present in the transcript exactly once — the old
-    // code nulled pending on the narration and the re-cite emitted nothing, so
-    // it vanished entirely.
+    // An earlier message must not consume the final answer's sources, even
+    // when re-citing A adds no fresh sources to the turn's union.
     const a = "https://docs.feishu.cn/wiki/a";
     const events = [
       { type: "knowledge_sources", sources: [{ title: "A", url: a }] },
@@ -186,9 +225,9 @@ describe("consumeAgentSse — assistant message flow", () => {
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } },
     ];
     const seen: any[] = [];
-    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
-    const combined = `${seen.filter(e => e.type === "message_end")[0].message.content[0].text}\n${seen.filter(e => e.type === "message_end")[1].message.content[0].text}`;
-    expect(combined.split(a).length - 1).toBe(1); // present exactly once, not lost, not doubled
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event) });
+    expect(result.resultText.split(a)).toHaveLength(2);
+    expect(seen.filter(e => e.type === "message_end")[1].message.content[0].text).toBe(result.resultText);
   });
 
   it("resets citation state at the user-message turn boundary so a source can re-render next turn", async () => {
@@ -1520,7 +1559,7 @@ describe("consumeAgentSse — onEvent callback", () => {
 });
 
 describe("consumeAgentSse — knowledge citation attribution", () => {
-  it("persists the cited repos/pages on the assistant row that rendered them, exactly once per turn", async () => {
+  it("persists all cited repos/pages on each answer row that renders them", async () => {
     const a = "https://docs.feishu.cn/wiki/a";
     const b = "https://docs.feishu.cn/wiki/b";
     const events = [
@@ -1540,15 +1579,18 @@ describe("consumeAgentSse — knowledge citation attribution", () => {
     const rows = appendCalls.filter((r) => r.role === "assistant");
     expect(rows).toHaveLength(2);
     expect(rows[0].metadata.llm_call).toMatchObject({ round: 1 });
-    // First row carries A; second row carries only the delta (B). Attribution
-    // mirrors the rendered text: each source lands on exactly one row.
+    // Attribution mirrors each independently delivered answer: A on the first,
+    // and the complete registered union [A, B] on the second.
     expect(rows[0].metadata.knowledge_citations).toEqual({
       repo_ids: ["repo-1"],
       pages: [{ repo_id: "repo-1", page: "repos/kb-1/a.md", url: a, claim: "A says so." }],
     });
     expect(rows[1].metadata.knowledge_citations).toEqual({
-      repo_ids: ["repo-2"],
-      pages: [{ repo_id: "repo-2", page: "repos/kb-2/b.md", url: b, evidence: "ev.b" }],
+      repo_ids: ["repo-1", "repo-2"],
+      pages: [
+        { repo_id: "repo-1", page: "repos/kb-1/a.md", url: a, claim: "A says so." },
+        { repo_id: "repo-2", page: "repos/kb-2/b.md", url: b, evidence: "ev.b" },
+      ],
     });
     // A row without citations carries no attribution key at all.
     const plain = [

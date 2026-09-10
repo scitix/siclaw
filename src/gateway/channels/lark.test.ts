@@ -3936,6 +3936,24 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toContain("[GPU Runbook](https://docs.feishu.cn/wiki/a)");
   });
 
+  it.each([false, true])("keeps sources in the delivered channel answer after commentary (re-cite: %s)", async (recite) => {
+    const sources = [{ title: "Runbook", url: "https://example.com/runbook" }];
+    const events = [
+      { type: "knowledge_sources", sources },
+      { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
+        { type: "text", text: "Checking nodes.", textSignature: JSON.stringify({ v: 1, id: "progress", phase: "commentary" }) },
+      ] } },
+      { type: "tool_execution_end", toolName: "lookup", result: { content: [] } },
+      ...(recite ? [{ type: "knowledge_sources", sources }] : []),
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [
+        { type: "text", text: "All nodes are healthy.", textSignature: JSON.stringify({ v: 1, id: "final", phase: "final_answer" }) },
+      ] } },
+    ];
+    const result = await collectChannelResponse(fakeClient(events), "s-citations");
+    expect(result.text).toContain(sources[0].url);
+    expect(result.text.split(sources[0].url)).toHaveLength(2);
+  });
+
   it("discards a failed primary's knowledge sources before rendering the fallback answer", async () => {
     const events = [
       { type: "model_route_start", candidateCount: 2 },
