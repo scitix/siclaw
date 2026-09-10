@@ -32,8 +32,7 @@ Config changes propagate via **session turnover**, not hot-swap.
 
 ## 2. Why immutable (and not hot-swap)
 
-MCP is structurally different from Skills and Knowledge, which *do*
-hot-reload via `brain.reload()`:
+MCP is structurally different from Skills and Knowledge:
 
 | Dimension | Skills / Knowledge | MCP |
 |---|---|---|
@@ -49,6 +48,18 @@ Hot-swapping the MCP tool-set mid-session would:
 3. **Break prompt caching** in ways that compound across turns.
 
 The immutable contract is simpler and kinder to cache.
+
+Skills and Knowledge also refresh the brain through deferred session
+invalidation. Although their tool names stay fixed, `brain.reload()` replaces
+Pi's extension runner and invalidates contexts still used by in-flight tools.
+Their files and indexes are materialized immediately; the current turn finishes
+before the brain is rebuilt. Detached work and pending completion notifications
+retain session ownership under the same rules as MCP.
+
+This lifecycle rule does not delay sandbox authorization: its broker checks
+current caller permissions and bindings on every operation and result chunk.
+Revocation rejects the next operation while the running script can still
+deliver its final result through the original, valid tool context.
 
 ---
 

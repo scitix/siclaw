@@ -1947,11 +1947,10 @@ export function createHttpServer(
         const payload = await handler.fetch(client ? client.toClientLike() : null);
         const count = await handler.materialize(payload);
 
-        // Build session list for postReload. Handlers choose whether to call
-        // brain.reload() (skills/knowledge — in-session hot-reload is safe) or
-        // invalidate() (mcp — session must be rebuilt to pick up the new
-        // toolset). invalidate() defers the release until any in-flight prompt
-        // completes so tool execution is not torn down mid-turn.
+        // Materialization above takes effect immediately. Session refresh uses
+        // invalidate(), including skills/knowledge: brain.reload() replaces Pi's
+        // extension contexts and would break in-flight tool result delivery.
+        // Invalidation defers teardown until the session's work has drained.
         const sessions = sessionManager.list().map((s) => ({
           id: s.id,
           brain: s.brain,

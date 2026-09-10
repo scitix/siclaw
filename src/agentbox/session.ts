@@ -131,7 +131,7 @@ export interface ManagedSession {
   skillNames: string[];
   /** SHA-256 of the actual SKILL.md loaded for each visible Skill. */
   skillDigests: Record<string, string>;
-  /** Re-read Skills after an in-session hot reload before recording evidence. */
+  /** Re-read loaded Skills before recording evidence. */
   getSkillSnapshot?: () => { skillNames: string[]; skillDigests: Record<string, string> };
   /** Exact on-demand prompt/tool inspection; never emitted through routine status or logs. */
   getPromptInspection: () => PromptInspection;
