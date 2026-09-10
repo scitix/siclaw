@@ -31,9 +31,32 @@ Current local verification:
 
 An mTLS test initially hit a local dual-stack connection failure. It now uses
 IPv4 with the original TLS server name and CA checks; its 118-test file and the
-full Siclaw suite passed afterwards. Expanded SiCore regression, fresh-image
-acceptance and remote PR checks are still in progress. E2B cloud acceptance is
-explicitly deferred until an environment is available.
+full Siclaw suite passed afterwards.
+
+GitHub PR #584 passed all six CI checks at code commit `80f63178`: type check,
+AgentBox build graph, backend tests, Portal tests, native amd64/arm64 container
+smoke, local HTTPS E2B relay and amd64 Kind smoke. The latter smoke checks run
+inside the two container jobs; they do not provision E2B cloud VMs.
+
+Expanded SiCore race testing is **not fully green**. Analysis filter fixtures,
+developer-navigation coverage, MCP observer race and MCP usage timeout also fail
+on an untouched `fdccded95` source snapshot. The MySQL lineage test requires a
+local Docker daemon unavailable on this machine. A broader proxy run hit its
+existing cancellation-test type assertion; the targeted full proxy race suite
+passed. These results are separate from the passing sandbox security checks.
+
+Fresh Runtime/Portal/AgentBox and SiCore API images were built from complete
+rebased build inputs as `sandbox-review-main-20260910`. The Siclaw images were
+deployed into the isolated test namespace. The chat Agent selected `run_script`,
+but both worker nodes had exhausted their Pod slots: the runner stayed Pending
+with `Too many pods`, then timed out at the 90-second startup limit before any
+tool call. Its Job/Pod were cleaned up. No unrelated workload or node setting
+was changed to obtain capacity. The new SiCore image has not yet been deployed.
+
+**Merge gate remains open:** repeat fresh-image acceptance of the Bash credential
+snapshot and both control-plane chains when execution capacity is available.
+PR/MR remain drafts. Earlier deployed results below do not replace this check.
+E2B cloud acceptance is explicitly deferred until an environment is available.
 
 ## Earlier deployed acceptance
 
