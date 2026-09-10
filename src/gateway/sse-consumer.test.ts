@@ -1048,6 +1048,30 @@ describe("consumeAgentSse — tool execution", () => {
     expect(updateCalls[0].outcome).toBe("error");
   });
 
+  it.each([true, false])("persists top-level tool failures with start frame present=%s", async (hasStart) => {
+    const events = [
+      ...(hasStart ? [{ type: "tool_execution_start", toolCallId: "failed-read", toolName: "grep", args: {} }] : []),
+      { type: "tool_execution_end", toolCallId: "failed-read", toolName: "grep", isError: true,
+        result: { content: [{ type: "text", text: "Search executable is unavailable" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const row = hasStart ? updateCalls[0] : appendCalls.find((call) => call.role === "tool");
+    expect(row).toMatchObject({ outcome: "error", content: "Search executable is unavailable" });
+  });
+
+  it("keeps blocked precedence and does not infer failure from output text", async () => {
+    const events = [
+      { type: "tool_execution_start", toolCallId: "blocked", toolName: "one", args: {} },
+      { type: "tool_execution_end", toolCallId: "blocked", toolName: "one", isError: true,
+        result: { content: [], details: { blocked: true } } },
+      { type: "tool_execution_start", toolCallId: "ok", toolName: "two", args: {} },
+      { type: "tool_execution_end", toolCallId: "ok", toolName: "two", isError: false,
+        result: { content: [{ type: "text", text: "Error handling documentation" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(updateCalls.map((call) => call.outcome)).toEqual(["blocked", "success"]);
+  });
+
   it("persists tool details as metadata (dropping blocked/error flags that are surfaced via outcome)", async () => {
     // Tools can attach a rich `details` object to their result; the UI
     // consumes it on history reload. Verify the structured payload survives

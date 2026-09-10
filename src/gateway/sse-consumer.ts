@@ -831,7 +831,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
 
         let outcome: "success" | "error" | "blocked" = "success";
         if (toolResult?.details?.blocked) outcome = "blocked";
-        else if (toolResult?.details?.error) outcome = "error";
+        else if (evt.isError === true || toolResult?.details?.error) outcome = "error";
 
         const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
         const eventToolset = typeof evt.toolset === "string" && evt.toolset.length > 0
