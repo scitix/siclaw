@@ -2851,6 +2851,11 @@ def main():
     test_deterministic_body_source_normalization()
     test_attribute_evidence_sections_derives_markers_from_statement_tags()
     test_attribute_evidence_sections_without_manifest_is_inert()
+    test_authored_evidence_ids_follow_frozen_source_identity()
+    test_trusted_evidence_check_rejects_self_consistent_unknown_id()
+    test_evidence_identity_repair_preserves_ambiguous_and_unstamped_ids()
+    test_frozen_identity_change_invalidates_selfcheck_key()
+    test_flow_source_rows_and_authored_markers_repair_together()
     test_attribution_reports_oversized_pages()
     test_spaced_markdown_links()
     test_media_verify_helpers()
@@ -2898,10 +2903,6 @@ def main():
     test_ticket_kind_gate_and_claim_identity()
     test_file_ticket_record_supersedes_by_claim_and_normalizer_never_guesses()
     print("ALL OK  test_selfcheck")
-
-
-if __name__ == "__main__":
-    main()
 
 
 def test_attribution_pairs_lines_by_newline_and_keeps_the_page_tail():
@@ -3026,3 +3027,7 @@ def test_flow_source_rows_and_authored_markers_repair_together():
             assert selfcheck._okf_evidence_violations("guide.md", fm, body) == []
             assert selfcheck.trusted_evidence_violations(td, {"guide.md": {"text": result}}) == []
             assert selfcheck.attribute_evidence_sections(td) == []
+
+
+if __name__ == "__main__":
+    main()

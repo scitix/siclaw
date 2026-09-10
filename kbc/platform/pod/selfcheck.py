@@ -2364,16 +2364,47 @@ def _attribute_page_text(
     return "".join(out), stats, unattributed
 
 
+
+def normalize_evidence_source_ids(workdir: str) -> list[dict[str, object]]:
+    """Rebind source identities across the draft without changing attribution.
+
+    A source row may be recreated with identical path/content, so the new
+    frozen identity also applies to pages outside an incremental changeset.
+    Only source-id scalars and existing marker source lists are rewritten.
+    """
+    fixes: list[dict[str, object]] = []
+    candidate = Path(workdir) / "candidate"
+    manifest_ids = load_manifest_source_ids(workdir)
+    if not manifest_ids or not candidate.is_dir():
+        return fixes
+    for path in sorted(candidate.rglob("*.md")):
+        rel = path.relative_to(candidate).as_posix()
+        if _is_reserved_page(rel):
+            continue
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # Existing Layer-1 read/format diagnostics own these errors.
+        stamped = _stamp_source_ids_text(text, manifest_ids)
+        if stamped is None:
+            continue
+        updated = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
+        if updated != text:
+            _write_text_atomic(path, updated)
+            fixes.append({"rule": "evidence_source_ids_rebound", "page": rel})
+    return fixes
+
+
 def attribute_evidence_sections(
     workdir: str,
     allowed_pages: set[str] | None = None,
 ) -> list[dict[str, object]]:
     """Stamp ``sources[].id`` and machine evidence markers on candidate pages.
 
-    Runs at the same seam and under the same page scope as
-    ``normalize_body_source_annotations``: incremental turns touch only pages
-    already editable, so this can never become a whole-library rewrite behind
-    an owner's scoped edit. Returns one audit record per rewritten page.
+    Section attribution stays within the same page scope as
+    ``normalize_body_source_annotations``. The driver separately rebinds source
+    identities across the draft with ``normalize_evidence_source_ids``.
+    Returns one audit record per rewritten page.
     """
     fixes: list[dict[str, object]] = []
     candidate = Path(workdir) / "candidate"

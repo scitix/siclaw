@@ -2955,6 +2955,29 @@ async def _post_turn_selfcheck(run) -> str | None:
             if restored_pages:
                 after = incremental.page_hashes(workdir)
                 incr_violations = incremental.integrity_violations(incr["before"], after, editable)
+    # First restore unauthorized body edits above. Only then apply deterministic
+    # identity changes globally: an unchanged Raw path/content can have a new
+    # source id after delete/reupload, outside the semantic changeset.
+    identity_before = incremental.page_hashes(workdir)
+    identity_fixes = selfcheck.normalize_evidence_source_ids(workdir)
+    if identity_fixes:
+        identity_after = incremental.page_hashes(workdir)
+        for fix in identity_fixes:
+            page = fix["page"]
+            if (incr and page not in editable and page not in incr_violations
+                    and page in incr["before"]):
+                # Preserve the exact restored prose as the next repair turn's
+                # baseline, with only the machine-owned source ids advanced.
+                # Do not widen editable/repair_pages or excuse failed restores.
+                incr["before"][page] = identity_after[page]
+                incr.setdefault("before_bytes", {})[page] = (
+                    Path(workdir) / "candidate" / page).read_bytes()
+            if (turn_format_guard and turn_format_guard.get("before", {}).get(page)
+                    == identity_before.get(page)):
+                # Identity-only repair is not a migration of inherited format.
+                turn_format_guard["before"][page] = identity_after[page]
+        after = identity_after
+        key = selfcheck.state_key(workdir)
     # Mechanical provenance repair belongs before Layer-1 and before the model
     # repair budget. It is deliberately scoped to pages already editable in an
     # incremental turn; ordinary guarded owner edits are limited to pages that
@@ -2968,9 +2991,8 @@ async def _post_turn_selfcheck(run) -> str | None:
             turn_format_guard.get("before") or {}, current))
     mechanical_fixes = selfcheck.normalize_body_source_annotations(
         workdir, allowed_pages=mechanical_allowed)
-    # Same seam, same scope: stamp sources[].id from the frozen manifest and
-    # derive one okf:evidence marker per section from the (source:) tags the
-    # model wrote, so knowledge_cite lands on a section's own originals.
+    # Section attribution remains scoped: derive markers from the (source:)
+    # tags the model wrote only on pages authorized for content changes.
     mechanical_fixes = mechanical_fixes + selfcheck.attribute_evidence_sections(
         workdir, allowed_pages=mechanical_allowed)
     if mechanical_fixes:
@@ -2986,6 +3008,9 @@ async def _post_turn_selfcheck(run) -> str | None:
         producer_stamps = sorted(set(producer_stamps) | set(mechanical_stamps))
         after = incremental.page_hashes(workdir)
         key = selfcheck.state_key(workdir)
+    # Identity-only repairs do not change generated.by/at or enlist untouched
+    # pages into a producer metadata migration, but remain visible in the audit.
+    mechanical_fixes = identity_fixes + mechanical_fixes
     run._selfcheck_key = key
     report = selfcheck.run_layer1(workdir)
     pending_stamp_failures = dict(
