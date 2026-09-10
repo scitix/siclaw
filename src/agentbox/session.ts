@@ -1720,7 +1720,7 @@ export class AgentBoxSessionManager {
   }
 
   private createJobStopExecutor(): JobStopExecutor {
-    // Shared stop logic lives on JobRegistry (same as the TUI path).
+    // Shared stop logic lives on JobRegistry (same as the CLI path).
     return async (jobId) => this.jobs.stopJob(jobId);
   }
 
@@ -1737,7 +1737,7 @@ export class AgentBoxSessionManager {
   }
 
   private createTaskOutputReader(parentSessionId: string): TaskOutputReader {
-    // Snapshot the job's live status so task_output can report running/terminal (same as TUI).
+    // Snapshot the job's live status so task_output can report running/terminal (same as CLI).
     return (jobId) => this.jobs.get(jobId)?.parentSessionId === parentSessionId
       ? this.jobs.snapshot(jobId) : { found: false };
   }
@@ -3330,7 +3330,7 @@ export class AgentBoxSessionManager {
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       // Prefer the per-user dir set by LocalSpawner; fall back to the
-      // config-driven global path (K8s mode and TUI both use this).
+      // config-driven global path (K8s mode and CLI both use this).
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
       credentialBroker: this.credentialBroker,
     };

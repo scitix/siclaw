@@ -4,10 +4,9 @@ import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.j
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { loadConfig } from "../../core/config.js";
@@ -120,19 +119,6 @@ Examples:
           }
         : {}),
     }),
-    renderCall(args: any, theme: any) {
-      const pod = args?.pod || "...";
-      const ns = args?.namespace || "default";
-      const cmd = args?.command || "...";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("pod_exec")) +
-          " " + theme.fg("accent", `${ns}/${pod}`) +
-          " " + theme.fg("toolTitle", theme.bold("$")) +
-          " " + cmd,
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = normalizeExecTarget(rawParams as PodExecParams);
 

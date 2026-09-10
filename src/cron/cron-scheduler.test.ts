@@ -231,4 +231,91 @@ describe("CronScheduler", () => {
     errSpy.mockRestore();
     logSpy.mockRestore();
   });
+
+  it("waits until an annual due time across multiple Node timer limits, then fires once", async () => {
+    const now = new Date(2026, 8, 10, 12);
+    const due = new Date(2027, 0, 1);
+    vi.setSystemTime(now);
+    const onFire = vi.fn(async () => {});
+    const s = new CronScheduler(onFire);
+    try {
+      s.addOrUpdate(makeJob({ schedule: "0 0 1 1 *" }));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onFire).not.toHaveBeenCalled(); // Overflow would fire after 1 ms.
+      await vi.advanceTimersByTimeAsync(due.getTime() - now.getTime() - 1001);
+      expect(onFire).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onFire).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(onFire).toHaveBeenCalledTimes(1);
+      expect(s.jobCount).toBe(1);
+    } finally { s.stop(); }
+  });
+
+  it("fires when a cron occurrence lands exactly on a timer chunk boundary", async () => {
+    const due = new Date(2027, 0, 1);
+    vi.setSystemTime(due.getTime() - 2 * 2_147_483_647);
+    const onFire = vi.fn(async () => {});
+    const s = new CronScheduler(onFire);
+    try {
+      s.addOrUpdate(makeJob({ schedule: "0 0 1 1 *" }));
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      expect(onFire).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      expect(onFire).toHaveBeenCalledTimes(1);
+    } finally { s.stop(); }
+  });
+
+  it.each(["cancel", "pause", "stop"])("%s prevents a long wait from re-arming", async (action) => {
+    vi.setSystemTime(new Date(2026, 8, 10));
+    const onFire = vi.fn(async () => {});
+    const s = new CronScheduler(onFire);
+    try {
+      const job = makeJob({ schedule: "0 0 1 1 *" });
+      s.addOrUpdate(job);
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      if (action === "cancel") s.cancel(job.id);
+      else if (action === "pause") s.addOrUpdate({ ...job, status: "paused" });
+      else s.stop();
+      await vi.advanceTimersByTimeAsync(365 * 24 * 60 * 60_000);
+      expect(onFire).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { s.stop(); }
+  });
+
+  it("replaces a long wait when its schedule changes", async () => {
+    vi.setSystemTime(new Date(2026, 8, 10));
+    const onFire = vi.fn(async () => {});
+    const s = new CronScheduler(onFire);
+    try {
+      s.addOrUpdate(makeJob({ schedule: "0 0 1 1 *" }));
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      s.addOrUpdate(makeJob({ schedule: "* * * * *" }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(onFire).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally { s.stop(); }
+  });
+
+  it.each(["cancel", "pause", "stop"])("%s during a fire prevents its completion from re-arming", async (action) => {
+    vi.setSystemTime(new Date(2026, 8, 10));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const onFire = vi.fn(() => gate);
+    const s = new CronScheduler(onFire);
+    try {
+      const job = makeJob({ schedule: "* * * * *" });
+      s.addOrUpdate(job);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(onFire).toHaveBeenCalledTimes(1);
+      if (action === "cancel") s.cancel(job.id);
+      else if (action === "pause") s.addOrUpdate({ ...job, status: "paused" });
+      else s.stop();
+      release();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(onFire).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release(); s.stop(); }
+  });
 });

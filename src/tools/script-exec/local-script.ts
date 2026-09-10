@@ -3,9 +3,8 @@ import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.j
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
@@ -50,16 +49,6 @@ export function createLocalScriptTool(
   return {
     name: "local_script",
     label: "Local Script",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("local_script")) +
-          " " + theme.fg("accent", args?.skill || "") +
-          "/" + theme.fg("accent", args?.script || "") +
-          (args?.args ? " " + theme.fg("muted", args.args) : ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Execute a skill script by skill name and script filename.
 
 Skills have helper scripts under their scripts/ directory. Use this tool to run them instead of calling bash directly.

@@ -2,11 +2,11 @@
  * `siclaw agents` — list Portal-configured agents and exit.
  *
  * Reaches into the running local Portal (same mechanism as `siclaw` itself:
- * read local-secrets.json, sign a short-lived admin JWT, hit /api/v1/cli-snapshot).
+ * read local-secrets.json, send the dedicated snapshot secret, hit /api/v1/cli-snapshot).
  * Prints the `availableAgents` list from the response. If no local Portal is
  * running, says so and exits non-zero.
  *
- * Meant as the "shell way" to discover agents without entering TUI — useful
+ * Discovers agents without starting a diagnostic invocation — useful
  * for CI, tab-completion scripts, or just quick `grep` queries.
  */
 
@@ -29,7 +29,7 @@ if (!snapshot) {
 
 if (snapshot.availableAgents.length === 0) {
   console.log("No agents configured. Open the Portal Web UI (Agents page) to create one,");
-  console.log("or run `siclaw` without --agent to use the global unscoped view.");
+  console.log('or run `siclaw --prompt "..."` without --agent to use the global unscoped view.');
   process.exit(0);
 }
 
@@ -47,4 +47,4 @@ console.log(`${"NAME".padEnd(nameW)}  ${"MODEL".padEnd(modelW)}  DESCRIPTION`);
 for (const r of rows) {
   console.log(`${r.name.padEnd(nameW)}  ${r.model.padEnd(modelW)}  ${r.description}`);
 }
-console.log(`\nUse: siclaw --agent <name>`);
+console.log(`\nUse: siclaw --agent <name> --prompt "..."`);

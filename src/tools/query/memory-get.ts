@@ -3,8 +3,7 @@ import { Type } from "@sinclair/typebox";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { isMemoryEnabled } from "../../core/config.js";
 
 interface MemoryGetParams {
@@ -17,14 +16,6 @@ export function createMemoryGetTool(memoryDir: string): ToolDefinition {
   return {
     name: "memory_get",
     label: "Memory Get",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("memory_get")) +
-          " " + theme.fg("accent", args?.path || ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Safe snippet read from MEMORY.md or memory/*.md with optional line range.
 Use after memory_search to read full or partial content of a matched file.
 

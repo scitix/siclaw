@@ -2,10 +2,9 @@ import { normalizeExecTarget } from "../infra/exec-utils.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
@@ -190,18 +189,6 @@ Examples (pass the id from host_list; names shown here for readability):
           }
         : {}),
     }),
-    renderCall(args: any, theme: any) {
-      const host = args?.host || "...";
-      const cmd = args?.command || "...";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("host_exec")) +
-          " " + theme.fg("accent", host) +
-          " " + theme.fg("toolTitle", theme.bold("$")) +
-          " " + cmd,
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = normalizeExecTarget(rawParams as HostExecParams);
 

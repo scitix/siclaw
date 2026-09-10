@@ -3,7 +3,7 @@
 This record supersedes the earlier prototype and draft acceptance notes. The
 current architecture and operator settings are in [script-sandbox.md](script-sandbox.md).
 E2B cloud provisioning remains a separate, deferred acceptance gate; the feature
-and optional network isolation still default off, and LocalSpawner/TUI disable it.
+and optional network isolation still default off, and LocalSpawner/headless CLI disable it.
 
 ## Code and automated checks
 

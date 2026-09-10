@@ -46,32 +46,33 @@ if (needsSqliteFlag) {
 Usage: siclaw [command] [options]
 
 Commands:
-  (default)    Start interactive TUI session
+  (default)    Show this help
   local        Start local gateway with web UI (single process, SQLite)
   agents       List Portal-configured agents and exit (requires local Portal)
 
 Options:
   --prompt <text>   Run in non-interactive print mode
-  --continue        Continue the most recent session
-  --agent <name>    Use a specific Portal agent (skip picker / override default)
+  --continue        Continue the most recent session (requires --prompt)
+  --agent <name>    Use a specific local Portal agent
   --debug           Enable debug logging
   --open            (local only) auto-open the Portal URL in the browser
   --help, -h        Show this help
   --version, -v     Show version
 
-In-session commands:
-  /setup            Configure credentials and model provider
-  /ls               Show current workspace snapshot (read-only)
-  /agent            Show current Portal agent + list available ones
+Examples:
+  siclaw local
+  siclaw --prompt "Why is my pod Pending?"
+  siclaw --agent sre-oncall --continue --prompt "Check recent events"
 `);
   }
 
-  if (args.includes("--help") || args.includes("-h")) {
+  if (args.length === 0 || ["--help", "-h"].includes(subcommand) ||
+      (["local", "agents"].includes(subcommand) && ["--help", "-h"].includes(args[1]))) {
     printHelp();
     process.exit(0);
   }
 
-  if (args.includes("--version") || args.includes("-v")) {
+  if (["--version", "-v"].includes(subcommand)) {
     console.log(pkg.version);
     process.exit(0);
   }

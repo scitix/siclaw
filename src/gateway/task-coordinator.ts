@@ -192,7 +192,9 @@ export class TaskCoordinator {
       };
       this.scheduler.addOrUpdate(cronJob);
     }
-    for (const scheduledId of this.scheduler.scheduledJobIds) {
+    // In-flight jobs have no timer, but must still be forgotten when removed.
+    // Otherwise the fire callback re-arms a task deleted during execution.
+    for (const scheduledId of this.jobPrompts.keys()) {
       if (!activeIds.has(scheduledId)) {
         this.scheduler.cancel(scheduledId);
         this.jobPrompts.delete(scheduledId);
@@ -235,6 +237,8 @@ export class TaskCoordinator {
         const current = statusResult.status;
         if (current !== "active") {
           console.log(`[task-coordinator] Skipping task ${job.id} (${job.name}) — status=${current ?? "missing"}`);
+          this.scheduler.cancel(job.id);
+          this.jobPrompts.delete(job.id);
           return;
         }
       } catch (err) {

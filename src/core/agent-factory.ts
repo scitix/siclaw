@@ -39,9 +39,6 @@ import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
-import setupExtension from "./extensions/setup.js";
-import lsExtension from "./extensions/ls.js";
-import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
@@ -111,16 +108,16 @@ export interface CreateSiclawSessionOpts {
   mcpServers?: Record<string, unknown>;
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
-  /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
+  /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (headless CLI). */
   agentId?: string | null;
   /**
    * Absolute knowledge directory override for an AgentBox. LocalSpawner uses
    * this to isolate agents that otherwise share one cwd. Unset keeps the
-   * config-driven pod/TUI path.
+   * config-driven pod/CLI path.
    */
   knowledgeDir?: string;
   /**
-   * Authoritative scoped resolved-skill directory. Portal-paired TUI and
+   * Authoritative scoped resolved-skill directory. Portal-paired CLI and
    * LocalSpawner pass this so the session never falls back to process-shared
    * skills while the scoped sync is missing or pending.
    */
@@ -132,24 +129,6 @@ export interface CreateSiclawSessionOpts {
    * markdown links and legacy `[[page]]` links to Portal-managed content.
    */
   portalKnowledgeDir?: string;
-  /**
-   * Absolute path to a directory that a local Portal snapshot has materialized
-   * credentials (kubeconfigs + SSH) into. CLI mode only: when set, replaces
-   * `config.paths.credentialsDir` so kubectl / ssh tools + `/setup` list
-   * see Portal-managed credentials. `/setup` writes in this mode go to the
-   * ephemeral dir and are lost on cleanup — edits should happen in Portal UI.
-   */
-  portalCredentialsDir?: string;
-  /** Metadata for all Portal-configured agents (used by /agent + /ls to show list). */
-  portalAvailableAgents?: import("../portal/cli-snapshot-types.js").CliSnapshotAgentMeta[];
-  /** The Portal agent this session is scoped to, null/undefined = unscoped. */
-  portalActiveAgent?: import("../portal/cli-snapshot-types.js").CliSnapshotActiveAgent | null;
-  /**
-   * Base URL of the live local Portal (e.g. http://127.0.0.1:3000). When set,
-   * `/setup` switches to read-only mode + opens Portal Web UI for writes so
-   * edits don't silently dead-end in the ephemeral `.portal-snapshot/` dirs.
-   */
-  portalUrl?: string;
   /**
    * Optional callback injected by agentbox. When present, tools may call it to
    * push custom events into the parent session's SSE stream (used by citation
@@ -173,9 +152,9 @@ export interface CreateSiclawSessionOpts {
   subagentTierMenu?: import("./subagent-models.js").SubagentTierMenu | null;
   /** Runtime bridge that cancels a background job — sub-agent or bash (design §7). */
   jobStopExecutor?: import("./tool-registry.js").JobStopExecutor;
-  /** Runtime bridge that launches a background bash command. Injected by agentbox / TUI host. */
+  /** Runtime bridge that launches a background bash command. Injected by agentbox / CLI host. */
   backgroundExecExecutor?: import("./tool-registry.js").BackgroundExecExecutor;
-  /** Runtime bridge that reads a background job's live status. Injected by agentbox / TUI host. */
+  /** Runtime bridge that reads a background job's live status. Injected by agentbox / CLI host. */
   taskOutputReader?: import("./tool-registry.js").TaskOutputReader;
   /** Runtime bridge for explicit IM-channel visible updates. Injected by agentbox. */
   channelMessageExecutor?: import("./tool-registry.js").ChannelMessageExecutor;
@@ -185,7 +164,7 @@ export interface SiclawSessionResult {
   brain: BrainSession;
   toolResultArtifactStore: ToolResultArtifactStore;
   session: AgentSession;  // backward compat — only set for pi-agent brain
-  /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the TUI */
+  /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the CLI */
   services: AgentSessionServices;
   /** Loaded extensions result — required when wrapping the session in an AgentSessionRuntime */
   extensionsResult: LoadExtensionsResult;
@@ -513,7 +492,7 @@ export async function createSiclawSession(
   // Knowledge routing is independent from investigation memory and embedding
   // configuration. Typed page labels become available after one local
   // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
-  // shared resolver, while standalone TUI owns this fallback instance.
+  // shared resolver, while standalone CLI owns this fallback instance.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
     let candidate: KnowledgeResolver | undefined;
@@ -743,7 +722,7 @@ export async function createSiclawSession(
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
   // K8s uses the pod-local shared resolved/ tree. LocalSpawner and Portal-paired
-  // TUI pass an authoritative scoped directory; if it does not exist yet, the
+  // CLI pass an authoritative scoped directory; if it does not exist yet, the
   // session intentionally sees no bound skills instead of falling back to a
   // process-shared tree.
   const resolvedSkillsDir = path.join(skillsBase, "resolved");
@@ -759,7 +738,7 @@ export async function createSiclawSession(
   const extensionPath = path.resolve(cwd, "skills", "extension");
   const platformPath = path.resolve(cwd, "skills", "platform");
   // A scoped Agent must not inherit pi's ambient ~/.pi/agent/skills discovery.
-  // Keep standalone SRE/TUI compatibility only when there is no Portal/Gateway
+  // Keep standalone SRE/CLI compatibility only when there is no Portal/Gateway
   // scope and the harness explicitly permits bundled operational skills.
   const filterSkillsToHarness =
     Boolean(opts?.portalSkillsDir) ||
@@ -772,39 +751,6 @@ export async function createSiclawSession(
   const overlayPolicyDir = opts?.portalSkillsDir
     ? path.dirname(path.resolve(opts.portalSkillsDir))
     : skillsBase;
-
-  // Resolve credentials directory for tools and /setup extension
-  // Credentials dir: Portal snapshot override > explicit kubeconfigRef > config default.
-  // Portal-materialized dir wins so kubectl / ssh / /setup list see the
-  // Portal-managed credentials in CLI mode with a live local Portal.
-  const credentialsDir = (opts?.portalCredentialsDir && fs.existsSync(opts.portalCredentialsDir))
-    ? opts.portalCredentialsDir
-    : (kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir));
-
-  // Forward-declared so the CLI-only /ls extension factory can close over it.
-  // Safe because extension command handlers run long after the constructor
-  // returns.
-  let loader!: DefaultResourceLoader;
-
-  const cliOnlyFactories = mode === "cli"
-    ? [
-        (api: ExtensionAPI) =>
-          lsExtension(api, {
-            getLoadedSkills: () => loader.getSkills().skills,
-            credentialsDir,
-            knowledgeDir,
-            activeAgentName: opts?.portalActiveAgent?.name ?? null,
-            availableAgents: opts?.portalAvailableAgents ?? [],
-            activeAgent: opts?.portalActiveAgent ?? null,
-          }),
-        (api: ExtensionAPI) =>
-          agentExtension(api, {
-            activeAgent: opts?.portalActiveAgent ?? null,
-            availableAgents: opts?.portalAvailableAgents ?? [],
-            portalUrl: opts?.portalUrl ?? null,
-          }),
-      ]
-    : [];
 
   // pi 0.73 split session creation into services + session. agentDir is the
   // global config root pi uses for personal skills/extensions (~/.pi/agent);
@@ -833,8 +779,6 @@ export async function createSiclawSession(
         compactionSafeguardExtension,
         ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
         (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
-        (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
-        ...cliOnlyFactories,
       ],
       // First enforce the context compiler's authoritative roots, then apply
       // the personal Preview's Built-in master switch / per-name mask. Both
@@ -860,7 +804,7 @@ export async function createSiclawSession(
       additionalSkillPaths: skillsDirs,
     },
   });
-  loader = services.resourceLoader as DefaultResourceLoader;
+  const loader = services.resourceLoader as DefaultResourceLoader;
 
   // Log discovered skills for diagnostics
   const { skills: loadedSkills, diagnostics: skillDiagnostics } = loader.getSkills();

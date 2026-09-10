@@ -1,5 +1,7 @@
 # Lark Group Context Mode: Shared vs Per-User
 
+> Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
+
 **Date**: 2026-07-11
 **Status**: Design approved, implementation pending
 **Branch**: `investigate/lark-group-context-mode`

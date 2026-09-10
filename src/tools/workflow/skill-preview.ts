@@ -124,7 +124,9 @@ description: >-
 
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
-          details: {},
+          // Chat persists details independently of the model's bounded text.
+          // Large previews must remain usable after artifact capture and reload.
+          details: { skillPreview: result },
         };
       } finally {
         // Always clean up draft directory

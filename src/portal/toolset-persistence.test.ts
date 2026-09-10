@@ -3,7 +3,7 @@ import { closeDb, getDb, initDb } from "../gateway/db.js";
 import { buildAdapterRpcHandlers } from "./adapter.js";
 import { runPortalMigrations } from "./migrate.js";
 
-describe("standalone Portal toolset persistence", () => {
+describe("standalone Portal tool result persistence", () => {
   beforeEach(async () => {
     initDb("sqlite::memory:");
     await runPortalMigrations();
@@ -44,5 +44,24 @@ describe("standalone Portal toolset persistence", () => {
     }, "a1");
     result = await getMessages({ session_id: "s1" }, "a1");
     expect(result.messages[0]).toMatchObject({ content: "finished", toolset: "mcp:storage", outcome: "success" });
+  });
+
+  it("round-trips skill preview metadata larger than 64 KiB across a repeated migration", async () => {
+    const handlers = buildAdapterRpcHandlers();
+    const specs = "Read-only check\n".repeat(6000) + "END_OF_SKILL";
+    const metadata = { skillPreview: { skill: { name: "large-preview", specs,
+      files: [{ path: "SKILL.md", content: specs }] } } };
+    expect(Buffer.byteLength(JSON.stringify(metadata))).toBeGreaterThan(65_535);
+    const { id } = await handlers.get("chat.appendMessage")!({
+      session_id: "s1", role: "tool", content: "started", tool_name: "skill_preview",
+    }, "a1");
+    await handlers.get("chat.updateMessage")!({
+      id, session_id: "s1", content: "artifact reference", tool_name: "skill_preview",
+      outcome: "success", metadata: JSON.stringify(metadata),
+    }, "a1");
+    await runPortalMigrations();
+    const result = await handlers.get("chat.getMessages")!({ session_id: "s1" }, "a1");
+    const stored = result.messages[0].metadata;
+    expect(typeof stored === "string" ? JSON.parse(stored) : stored).toEqual(metadata);
   });
 });

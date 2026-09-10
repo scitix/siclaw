@@ -280,7 +280,7 @@ export interface TaskOutputSnapshot {
 
 /**
  * Reads a background job's CURRENT status from the runtime's JobRegistry. Injected by the
- * agentbox session manager and the TUI host (they own the registry). Enables the task_output
+ * agentbox session manager and the CLI host (they own the registry). Enables the task_output
  * tool to return "running / completed / failed / stopped" instead of the model blindly
  * file-reading the output path (which 404s while the job has produced no output).
  */
@@ -386,7 +386,7 @@ export interface BackgroundExecWiring {
  * Callback a tool can invoke to push a custom event into the parent session's
  * SSE stream (e.g., forwarding a spawned sub-agent's events so the frontend
  * can render them in a nested block). Injected per-session from agentbox; may
- * be undefined in non-gateway contexts (TUI, tests).
+ * be undefined in non-gateway contexts (CLI, tests).
  */
 export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
@@ -396,7 +396,7 @@ export interface ToolRefs {
   scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   kubeconfigRef: KubeconfigRef;
   userId: string;
-  /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */
+  /** Agent ID — used for metrics labeling. Null when running outside an agent context (headless CLI). */
   agentId: string | null;
   sessionIdRef: { current: string };
   /**
@@ -467,7 +467,7 @@ export interface ToolRefs {
   /**
    * Launches a background exec job (run_in_background on bash / node_exec / pod_exec).
    * When absent, the `run_in_background` param is not exposed on those tools. Injected by
-   * the agentbox session manager and the TUI background host.
+   * the agentbox session manager and the CLI background host.
    */
   backgroundExecExecutor?: BackgroundExecExecutor;
   /** Reads a background job's live status from the runtime's JobRegistry. Enables task_output. */

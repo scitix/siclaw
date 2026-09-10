@@ -11,16 +11,17 @@ A pod in your production cluster is stuck in `CrashLoopBackOff` after a deployme
 ## Start Siclaw
 
 ```bash
-siclaw
+siclaw local
 ```
 
-If you want Siclaw to inspect a Kubernetes cluster, import a kubeconfig first with `/setup`.
+If you want Siclaw to inspect a Kubernetes cluster, import a kubeconfig in **Clusters** in the Web UI and bind it to your agent.
 
 ## Describe the Problem
 
-```
-? What would you like to investigate?
-> Pod payment-service is CrashLoopBackOff in namespace prod after deploying v2.3
+Open your agent's chat in the Web UI and enter:
+
+```text
+ Pod payment-service is CrashLoopBackOff in namespace prod after deploying v2.3
 ```
 
 <Tip>
@@ -91,10 +92,10 @@ The full trace is saved to `.siclaw/traces/deep-search-{timestamp}.md` (relative
 
 ## Deep Investigation Mode
 
-For complex issues, you can explicitly trigger a deep investigation:
+For complex issues, enable the magnifying-glass toggle next to the Web UI message input, then describe the problem:
 
 ```
-> /dp "Intermittent 5xx errors on the API gateway, happening every 30 minutes"
+Intermittent 5xx errors on the API gateway, happening every 30 minutes
 ```
 
 This activates the structured 4-phase workflow (triage → hypotheses → parallel validation → conclusion) for thorough investigation.
@@ -122,10 +123,10 @@ Siclaw will inspect node conditions, kubelet logs, kernel messages (dmesg), and 
 ### Intermittent Network Issues
 
 ```
-> /dp "Service mesh intermittent 503 errors between order-service and inventory-service"
+Service mesh intermittent 503 errors between order-service and inventory-service
 ```
 
-Using `/dp` triggers the full structured investigation — useful for complex cross-service issues.
+Enable Deep Investigation for complex cross-service issues.
 
 ## What's Next?
 

@@ -47,7 +47,7 @@ export interface PortalConfig {
   portalSecret: string;
   /**
    * Enable the `/api/v1/cli-snapshot` endpoint that returns provider/model/MCP
-   * config (including provider api_key values) for a local TUI to consume.
+   * config (including provider api_key values) for a local CLI to consume.
    *
    * LOCAL MODE ONLY. Leave undefined / false in K8s/prod Portal deployments:
    * the endpoint returns every provider's api_key, every cluster's kubeconfig,

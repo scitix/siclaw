@@ -9,20 +9,11 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../../tools/infra/tool-render.js";
 
 export function createTaskReportTool(): ToolDefinition {
   return {
     name: "task_report",
     label: "Task Report",
-    renderCall(_args: unknown, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("task_report")),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description:
       `Submit the final report for an automated scheduled task. ` +
       `You MUST call this tool exactly once at the end of your work to deliver the result. ` +

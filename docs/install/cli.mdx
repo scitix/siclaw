@@ -27,32 +27,27 @@ siclaw local
 
 Launches the Web UI at `http://localhost:3000`.
 
-On first launch, open the Web UI and **register the first user** — that account becomes the admin. Subsequent registrations require admin authentication.
+A fresh local workspace seeds **admin / admin**. Sign in and change its password in **Account**, then configure a provider in **Models**.
 
-## CLI (TUI)
-
-```bash
-siclaw
-```
-
-Personal terminal mode. Same investigation engine, no server.
-
-### Pairing with a local server
-
-If `siclaw local` is already running in the **same working directory**, the TUI detects it automatically and uses the Portal Web UI as the single source of truth for skills, knowledge, credentials, agents, MCP servers, and LLM providers. In that mode the TUI is strictly an observer:
-
-- `/ls [skills|knowledge|mcp|credentials|agents]` — inspect what the current session sees
-- `/agent` — show the active Portal agent and all available ones; create / edit happens in the Web UI
-- `/setup` — read-only view with "Open in Portal →" links (standalone mode still writes locally)
-
-Pass `--agent <name>` to scope the session to one Portal-configured agent:
+## Non-interactive CLI
 
 ```bash
-siclaw --agent sre-oncall
-siclaw agents            # list available agents non-interactively
+siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
+siclaw --continue --prompt "Check recent events"
 ```
 
-When `siclaw local` is running in the cwd and you start `siclaw` for the first time (no `settings.json` yet), the setup wizard prints Portal Web UI instructions, offers to open `http://localhost:3000/settings/models` in your browser, and exits — provider setup belongs in Portal, not in a per-workstation `settings.json`.
+Each invocation prints an answer and exits. `--prompt` is required; bare `siclaw` displays help. Missing configuration produces an error instead of an interactive setup wizard. `--print` remains accepted for existing scripts.
+
+### Pairing with a Local Server
+
+When `siclaw local` runs in the same working directory, the CLI reads an authenticated Portal snapshot containing providers, agents, and their bound resources. Configure them in the Web UI before running:
+
+```bash
+siclaw agents
+siclaw --agent sre-oncall --prompt "Check cluster health"
+```
+
+Use a name listed by `siclaw agents`. A single agent is selected automatically; multiple agents require `--agent`. Configuration changes apply to the next invocation. See [CLI + Local Portal Integration](/features/portal-cli-integration) for snapshot lifecycle and custom ports.
 
 ## From Source
 
@@ -62,9 +57,6 @@ cd siclaw
 npm ci
 make build-portal-web
 npm run build
-
-# TUI
-node siclaw.mjs
 
 # Local server
 node siclaw.mjs local
@@ -88,7 +80,7 @@ By default, Siclaw reads and writes these paths relative to your current working
 
 ### LLM Configuration
 
-Standalone TUI (no local Portal running in the cwd) reads `.siclaw/config/settings.json`. The easiest path is to let the first-run wizard create it for you. If a `siclaw local` server is running in the same cwd, the wizard redirects to Portal Web UI instead (see [Pairing with a local server](#pairing-with-a-local-server)) — provider setup for Portal-paired TUI happens in the Web UI's **Models** page and applies to every TUI that pairs with that Portal.
+When Portal is unavailable and no agent was selected, the headless CLI reads `.siclaw/config/settings.json`. A selected agent must load successfully or execution stops. Prepare it before running a diagnostic. When paired with Portal, configure providers in the Web UI's **Models** page.
 
 Minimal example:
 
@@ -104,14 +96,12 @@ Minimal example:
     "anthropic": {
       "baseUrl": "https://api.anthropic.com/v1",
       "apiKey": "sk-ant-...",
-      "api": "anthropic",
+      "api": "anthropic-messages",
       "models": [{ "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" }]
     }
   }
 }
 ```
-
-Once inside the TUI session, use `/setup` to manage providers, models, and credentials.
 
 In Local Server mode, configure providers and models in the **Models** page of the Web UI.
 
@@ -121,8 +111,7 @@ See [LLM Providers](/configuration/providers) for provider examples.
 
 Siclaw tools resolve kubeconfig from its own credential store, not from your shell's `KUBECONFIG`.
 
-- In TUI mode, use `/setup` to import a kubeconfig
-- In Local Server mode, add it in **Credentials**
+Import kubeconfigs in **Clusters** in the local Web UI. The paired CLI receives them on its next invocation. Import SSH access in **Hosts**.
 
 After import, Siclaw can route `kubectl` calls through that stored credential.
 

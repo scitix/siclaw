@@ -1,8 +1,7 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { MemoryIndexer } from "../../memory/index.js";
 import { isMemoryEnabled } from "../../core/config.js";
 
@@ -25,14 +24,6 @@ export function createMemorySearchTool(indexer: MemoryIndexer): ToolDefinition {
   return {
     name: "memory_search",
     label: "Memory Search",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("memory_search")) +
-          " " + theme.fg("accent", args?.query || ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Semantically search long-term memory files (memory/*.md) using hybrid vector + keyword search.
 Use this tool BEFORE answering questions about prior work, decisions, preferences, or historical context.
 

@@ -5,11 +5,11 @@
  *   - No ENGINE=... / COLLATE=... / CHARSET=... (MySQL uses server defaults)
  *   - No TIMESTAMP(3) millisecond precision (second precision only)
  *   - No ON UPDATE CURRENT_TIMESTAMP (application layer manages `updated_at`)
- *   - JSON columns stored as TEXT (application layer JSON.stringify/parse)
+ *   - JSON values stored in text columns (application layer JSON.stringify/parse)
  *   - Inline INDEX declarations moved to separate `ensureIndex()` calls
  *
- * Legacy MySQL production databases are preserved byte-for-byte thanks to
- * `CREATE TABLE IF NOT EXISTS` — no schema changes touch existing tables.
+ * `CREATE TABLE IF NOT EXISTS` preserves legacy MySQL table definitions.
+ * Explicit, idempotent upgrades below handle columns that require changes.
  * Indexes use names that match the historical MySQL DDL so `ensureIndex`
  * is idempotent on old deployments.
  */
@@ -334,7 +334,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     tool_input MEDIUMTEXT,
     outcome VARCHAR(16),
     duration_ms INT,
-    metadata MEDIUMTEXT,
+    metadata LONGTEXT,
     from_agent_id CHAR(36) DEFAULT NULL,
     parent_session_id CHAR(36) DEFAULT NULL,
     delegation_id VARCHAR(64) DEFAULT NULL,
@@ -750,7 +750,10 @@ export async function runPortalMigrations(): Promise<void> {
   // tool content and the structured result used to rebuild history. SQLite has
   // no corresponding width limit; widenColumn is a no-op there.
   await widenColumn(db, "chat_messages", "content", "MEDIUMTEXT DEFAULT NULL");
-  await widenColumn(db, "chat_messages", "metadata", "MEDIUMTEXT DEFAULT NULL");
+
+  // Complete skill preview packages exceed TEXT's 64 KiB capacity. Preserve
+  // legacy JSON columns; SQLite TEXT already has no equivalent width limit.
+  await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
 
   // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
   // indexes added later). Safe to run now that all referenced columns exist.

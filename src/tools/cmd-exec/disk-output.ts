@@ -310,11 +310,11 @@ export async function readTaskOutputPage(jobId: string, offset = 0, limit = 32_7
 const STALE_TASK_OUTPUT_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Best-effort GC of stale task-output files. The app otherwise never deletes them, so in a
- * long-lived process (local / TUI mode) they accumulate forever. Called opportunistically at
+ * Best-effort GC of stale task-output files left by long-lived local AgentBox
+ * processes or interrupted CLI runs. Called opportunistically at
  * each background launch — no scheduler needed, runtime-agnostic — and deletes `*.output`
  * files whose mtime is older than `maxAgeMs` (well past any read window). A K8s agentbox pod
- * is ephemeral and reclaims them on teardown anyway; this covers local/TUI and crash leftovers.
+ * is ephemeral and reclaims them on teardown anyway; this covers local/CLI and crash leftovers.
  *
  * Files with a live writer are ALWAYS skipped (via the process-wide liveTaskOutputs set), so a
  * silent long-running job — even one owned by another session/agent sharing this dir — is never

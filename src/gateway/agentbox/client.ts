@@ -107,7 +107,7 @@ export interface PromptOptions {
    * every child fell back; nothing errored and the whole suite stayed green.
    *
    * Required makes each site STATE its answer. Write `undefined` where a path has
-   * no tiers to forward (the TUI, which builds no sub-agents at all) — that is a
+   * no tiers to forward (the CLI, which builds no sub-agents at all) — that is a
    * decision recorded, not a field forgotten.
    */
   subagentTiers: unknown;

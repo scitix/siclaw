@@ -701,7 +701,7 @@ export function createHttpServer(
   // resolved allowedTools into THIS box's sessionManager and fetches with THIS
   // box's GatewayClient (correct mTLS cert → correct agentId), avoiding the
   // route loop's last-spawn-wins SICLAW_CERT_PATH client. Bound even when
-  // gatewayClient is absent (TUI/no-gateway): the reload route gates on
+  // gatewayClient is absent (CLI/no-gateway): the reload route gates on
   // requiresGatewayClient and skips before fetch in that case.
   perServerHandlers.tools = createToolsHandler(
     sessionManager,

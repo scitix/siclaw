@@ -13,7 +13,7 @@
 Production hosts (bare-metal, storage, GPU nodes) are frequently unreachable from
 the agentbox except through a bastion. Bastions are modeled with standard OpenSSH
 `ProxyJump` semantics rather than any platform-specific scheme, so the same host
-inventory works standalone (TUI + local Portal) and when driven by an external
+inventory works standalone (headless CLI + local Portal) and when driven by an external
 management server.
 
 The target's **whole** bastion chain is resolved **server-side**, by id, and

@@ -161,6 +161,7 @@ export function resolveAgentHarness(
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
       resolution === "resolved" &&
+      (input.mode === undefined || input.mode === "web" || input.mode === "channel") &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
     includeInfrastructureGuidance:
       resolution === "resolved" &&
@@ -208,7 +209,7 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,
     includeOperationalSafety: harness.includeOperationalSafety,
-    includeSkillAuthoring: harness.includePlatformSkills,
+    includeSkillAuthoring: harness.includePlatformSkills && hasAnyTool(harness.allowedTools, ["skill_preview"]),
     includePlanningGuidance: harness.includePlanningGuidance,
     includeSubagentGuidance: harness.includeSubagentGuidance,
   });

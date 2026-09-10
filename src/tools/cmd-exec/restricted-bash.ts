@@ -5,10 +5,9 @@ import { Type } from "@sinclair/typebox";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -169,14 +168,6 @@ export function createRestrictedBashTool(
   return {
     name: "bash",
     label: "Bash",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("bash")) +
-          " " + (args?.command || ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Execute kubectl and shell commands for Kubernetes cluster operations.
 This is the primary tool for all kubectl interactions. It runs through a shell, so pipes (|), &&, and redirections are fully supported.
 
