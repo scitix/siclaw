@@ -89,7 +89,7 @@ def main():
                     "Authorization": "Bearer " + token, "Content-Type": "application/json",
                 })
                 # No retries: a dropped response must never execute a call twice.
-                with opener.open(request, timeout=30) as response:
+                with opener.open(request, timeout=100 if isinstance(frame.get("call"), dict) and frame["call"].get("tool") == "node_exec" else 35) as response:
                     data = response.read(MAX_FRAME + 1)
                     if response.status != 200 or len(data) > MAX_FRAME:
                         raise RuntimeError("Tool response unavailable")

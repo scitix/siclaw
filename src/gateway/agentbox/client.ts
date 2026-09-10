@@ -209,13 +209,13 @@ export class AgentBoxClient {
   }
 
   /** A bounded, cancellable callback. Neither response bodies nor grants enter error logs. */
-  async sandboxBash(body: unknown, signal: AbortSignal): Promise<unknown> {
-    const url = new URL("/api/internal/sandbox-bash", this.endpoint);
+  async sandboxTool(body: unknown, signal: AbortSignal): Promise<unknown> {
+    const url = new URL("/api/internal/sandbox-tool", this.endpoint);
     if (url.protocol === "https:" && !this.httpsAgent) throw new Error("Sandbox callback requires mTLS");
     if (url.protocol !== "https:" && (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
       throw new Error("Local sandbox callback requires loopback");
     }
-    const bounded = AbortSignal.any([signal, AbortSignal.timeout(25_000)]);
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(95_000)]);
     return new Promise((resolve, reject) => {
       const client = url.protocol === "https:" ? https : http;
       const req = client.request(url, { method: "POST", signal: bounded,

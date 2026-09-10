@@ -50,7 +50,7 @@ export function registerSandboxIngress(router: RestRouter, handlers: Map<string,
     try {
       const body = await boundedBody(req, res);
       if (!record(body) || Object.keys(body).length !== 1 || !record(body.call) || lease.expires <= Date.now() || leases.get(hash) !== lease) throw denied();
-      const result = await connections.sendCommandToRuntime?.(lease.runtimeId, SANDBOX_TOOL_RPC, { run_id: lease.runId, token, call: body.call }, 30_000);
+      const result = await connections.sendCommandToRuntime?.(lease.runtimeId, SANDBOX_TOOL_RPC, { run_id: lease.runId, token, call: body.call }, body.call.tool === "node_exec" ? 95_000 : 30_000);
       if (!result?.ok || lease.expires <= Date.now() || leases.get(hash) !== lease || Buffer.byteLength(JSON.stringify(result.payload) ?? "") > SANDBOX_HTTP_LIMIT) throw denied();
       send(200, result.payload);
     } catch { send(403, { error: "Sandbox tool denied or unavailable" }); }

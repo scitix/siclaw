@@ -1,12 +1,14 @@
+import { SANDBOX_NODE_CONCURRENCY } from "../../tools/infra/sandbox-debug.js";
+import { createMcpToolDefinition } from "../../core/mcp-client.js";
 import { normalizeAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
 import { resolveCapabilities } from "../../core/tool-capabilities.js";
 import https from "node:https";
-import { createHash } from "node:crypto";
 import { kubeConnection } from "../../tools/infra/inline-kubeconfig.js";
 export { kubeConnection } from "../../tools/infra/inline-kubeconfig.js";
+import { validateSandboxExec } from "../../tools/infra/sandbox-tool-policy.js";
+import type { SandboxBuiltinApproval } from "../../shared/sandbox-tool-types.js";
 import { validateSandboxBash } from "../../tools/infra/sandbox-bash-policy.js";
 import { sanitizeSandboxResult } from "../../script-sandbox/sanitize.js";
-import { Client as SshClient } from "ssh2";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CredentialPayload } from "../../shared/credential-types.js";
@@ -48,19 +50,20 @@ function readKube(content: string, path: string, signal: AbortSignal, maxBytes =
   });
 }
 
-export type SandboxBuiltinExecutor = (principal: ScriptPrincipal, args: Record<string, unknown>, signal: AbortSignal, approvedKubeconfig: string) => Promise<unknown>;
+export type SandboxBuiltinExecutor = (principal: ScriptPrincipal, args: Record<string, unknown>, signal: AbortSignal, approval: SandboxBuiltinApproval) => Promise<unknown>;
 
 export class ReadOnlyScriptBroker implements ScriptBroker {
+  private activeNodeExecutions = 0;
   constructor(private readonly controlPlane: SandboxControlPlane, private readonly config: ScriptSandboxConfig, private readonly builtin?: SandboxBuiltinExecutor,
     private readonly verifyCaller?: (principal: ScriptPrincipal) => void) {}
 
-  private async resolve(p: ScriptPrincipal, source = "", name = "", signal: AbortSignal): Promise<SandboxGrant> {
+  private async resolve(p: ScriptPrincipal, source = "", name = "", signal: AbortSignal, requiredTool?: string): Promise<SandboxGrant> {
     signal.throwIfAborted();
     this.verifyCaller?.(p);
     const agent = await this.controlPlane.request("config.getAgent", { agentId: p.agentId }, 5000) as any;
     if (!agent || agent.status !== "active") throw new ScriptSandboxError("Sandbox authorization denied", 403);
     const tools = resolveCapabilities(effectiveCapabilityKeys(normalizeAgentType(agent.agent_type), agent.tool_capabilities ?? null));
-    if (tools !== null && !tools.includes("run_script")) throw new ScriptSandboxError("Sandbox capability denied", 403);
+    if (tools !== null && (!tools.includes("run_script") || (requiredTool !== undefined && !tools.includes(requiredTool)))) throw new ScriptSandboxError("Sandbox capability denied", 403);
     const value = await this.controlPlane.request("sandbox.resolve", { agent_id: p.agentId, session_id: p.sessionId, source, name }, 10_000) as SandboxGrant;
     signal.throwIfAborted();
     // The turn can end or change owner while either control-plane RPC is pending.
@@ -76,12 +79,12 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
     // This call is the immutable original operation, retained only after it
     // passed call()'s scope/argument checks. Transfer requests cannot replace it.
     const a = call.arguments;
-    if (call.tool === "bash" || ["k8s.list_nodes", "k8s.list_pods", "k8s.pod_logs"].includes(call.tool)) {
+    if (["bash", "node_exec", "pod_exec"].includes(call.tool) || ["k8s.list_nodes", "k8s.list_pods", "k8s.pod_logs"].includes(call.tool)) {
       if (!identifier(a.cluster) || !scope.clusters?.some(c => c.name === a.cluster)) throw new Error("Outside cluster scope");
-      await this.resolve(p, "cluster", a.cluster, signal);
-    } else if (call.tool === "host.inspect") {
+      await this.resolve(p, "cluster", a.cluster, signal, call.tool === "node_exec" || call.tool === "pod_exec" ? call.tool : "bash");
+    } else if (["host.inspect", "host_exec"].includes(call.tool)) {
       if (!identifier(a.host) || !scope.hosts?.includes(a.host)) throw new Error("Outside host scope");
-      await this.resolve(p, "host", a.host, signal);
+      await this.resolve(p, "host", a.host, signal, "host_exec");
     } else if (call.tool === "mcp.call") {
       if (!identifier(a.server) || !scope.mcp?.some(m => m.server === a.server && m.tools.includes(String(a.tool)))) throw new Error("Outside MCP scope");
       await this.resolve(p, "mcp", a.server, signal);
@@ -95,12 +98,41 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
       if (call.tool === "bash") {
         const request = validateSandboxBash(a, scope);
         if (!this.builtin || !p.callbackToken) throw new Error("Builtin tool unavailable");
-        const grant = await this.resolve(p, "cluster", request.cluster, signal);
+        const grant = await this.resolve(p, "cluster", request.cluster, signal, "bash");
         const file = grant.credential?.files.find(f => f.name.endsWith(".kubeconfig"));
         if (!file || grant.credential?.type !== "kubeconfig") throw new Error("No Kubernetes credential");
         kubeConnection(file.content);
-        const result = await this.builtin(p, a, signal, file.content);
+        const result = await this.builtin(p, a, signal, { tool: "bash", credential: grant.credential });
         allowed = true; return sanitizeSandboxResult(result);
+      }
+      if (call.tool === "host_exec" || call.tool === "node_exec" || call.tool === "pod_exec") {
+        const request = validateSandboxExec(call.tool, a, scope);
+        if (!this.builtin || !p.callbackToken) throw new Error("Builtin tool unavailable");
+        const source = call.tool === "host_exec" ? "host" : "cluster";
+        const grant = await this.resolve(p, source, request.host ?? request.cluster!, signal, call.tool);
+        if (!grant.credential) throw new Error("No approved credential");
+        const approval: SandboxBuiltinApproval = { tool: call.tool, credential: grant.credential };
+        if (source === "host") {
+          approval.hostKeyPins = {};
+          const hops = [{ name: request.host, metadata: grant.credential.metadata }, ...(grant.credential.jump_chain ?? [])];
+          for (const hop of hops) {
+            const pin = hop.name && Object.hasOwn(this.config.hostKeyPins, hop.name) ? this.config.hostKeyPins[hop.name] : undefined;
+            if (!pin || !hop.metadata) throw new Error("Host key pin required for every SSH hop");
+            approval.hostKeyPins[`${hop.metadata.ip}:${hop.metadata.port ?? 22}`] = pin;
+          }
+        } else {
+          const file = grant.credential.files.find(f => f.name.endsWith(".kubeconfig"));
+          if (grant.credential.type !== "kubeconfig" || !file) throw new Error("No Kubernetes credential");
+          kubeConnection(file.content);
+        }
+        const node = call.tool === "node_exec";
+        if (node && this.activeNodeExecutions >= SANDBOX_NODE_CONCURRENCY) throw new Error("Sandbox node diagnostics busy");
+        if (node) this.activeNodeExecutions++;
+        try {
+          signal.throwIfAborted();
+          const result = await this.builtin(p, a, signal, approval);
+          allowed = true; return sanitizeSandboxResult(result);
+        } finally { if (node) this.activeNodeExecutions--; }
       }
       if (call.tool === "k8s.list_nodes") {
         only(a, ["cluster", "continue"]);
@@ -153,12 +185,9 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
       if (call.tool === "host.inspect") {
         only(a, ["host", "check"]);
         if (!identifier(a.host) || !scope.hosts?.includes(a.host) || !["os", "memory", "sysctl"].includes(String(a.check))) throw new Error("Outside host scope");
-        const pin = this.config.hostKeyPins[a.host];
-        if (!pin) throw new Error("Host key pin required");
-        const grant = await this.resolve(p, "host", a.host, signal);
-        if (!grant.credential || grant.credential.type !== "ssh") throw new Error("No host credential");
-        const result = await inspectHost(grant.credential, pin, String(a.check), signal);
-        allowed = true; return sanitizeSandboxResult(result);
+        const commands: Record<string, string> = { os: "cat /etc/os-release", memory: "cat /proc/meminfo", sysctl: "sysctl -a" };
+        const result = await this.call(p, scope, { ...call, tool: "host_exec", arguments: { host: a.host, command: commands[String(a.check)] } }, signal);
+        allowed = true; return result;
       }
       if (call.tool === "mcp.call") {
         only(a, ["server", "tool", "arguments"]);
@@ -186,8 +215,13 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
         const client = new McpClient({ name: "siclaw-script-broker", version: "1.0.0" }, { capabilities: {} });
         try {
           await client.connect(transport);
-          const result = await client.callTool({ name: a.tool, arguments: { ...a.arguments, ...policy.fixedArguments } }, undefined, { signal: boundedSignal, timeout: 15_000 });
-          allowed = true; return sanitizeSandboxResult(result);
+          // Share the exact Agent MCP tool factory while keeping this transport's
+          // byte limits, credential snapshot, HTTPS and no-redirect policy.
+          const tool = createMcpToolDefinition(a.server, undefined, { name: a.tool }, client, 15_000, { includeRawResult: true });
+          const result = await tool.execute(call.id, { ...a.arguments, ...policy.fixedArguments }, boundedSignal, undefined, {} as any);
+          const details = result.details as { rawResult?: unknown };
+          if (!details?.rawResult) throw new Error("MCP tool failed");
+          allowed = true; return sanitizeSandboxResult(details.rawResult);
         } finally { await client.close().catch(() => {}); }
       }
       throw new Error("Unknown script tool");
@@ -196,40 +230,4 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
       console.info(JSON.stringify({ event: "script_tool", ...audit, tool: call.tool, allowed }));
     }
   }
-}
-
-/** No model command, script or path crosses SSH. Remote helper is root-owned and fixed. */
-function inspectHost(credential: CredentialPayload["credential"], pin: string, check: string, signal: AbortSignal): Promise<unknown> {
-  if (credential.jump_chain?.length || credential.metadata?.auth_type === "managed") throw new Error("Host helper requires a direct explicit credential");
-  const meta = credential.metadata ?? {};
-  const file = (name: string) => credential.files.find(f => f.name === name)?.content;
-  return new Promise((resolve, reject) => {
-    const client = new SshClient();
-    const timer = setTimeout(() => finish(new Error("Host inspection timed out")), 10_000);
-    const abort = () => finish(new Error("Host inspection cancelled"));
-    let settled = false;
-    const finish = (error?: Error, value?: unknown) => {
-      if (settled) return; settled = true;
-      clearTimeout(timer); signal.removeEventListener("abort", abort); client.destroy();
-      error ? reject(error) : resolve(value);
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    client.on("error", () => finish(new Error("Host connection failed")));
-    client.on("ready", () => client.exec("/usr/local/libexec/siclaw-inspect", (error, stream) => {
-      if (error) { finish(new Error("Host helper unavailable")); return; }
-      const chunks: Buffer[] = []; let size = 0;
-      stream.on("data", (chunk: Buffer) => { size += chunk.length; if (size > 64 * 1024) finish(new Error("Host output too large")); else chunks.push(chunk); });
-      stream.stderr.resume();
-      stream.on("error", () => finish(new Error("Host helper failed")));
-      stream.on("close", (code: number) => {
-        try { if (code !== 0) throw new Error(); finish(undefined, JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
-        catch { finish(new Error("Host helper failed")); }
-      });
-      stream.end(JSON.stringify({ check }) + "\n");
-    }));
-    if (signal.aborted) { abort(); return; }
-    client.connect({ host: String(meta.ip), port: Number(meta.port ?? 22), username: String(meta.username),
-      password: file("host.password"), privateKey: file("host.key"), passphrase: file("host.passphrase"), readyTimeout: 5000,
-      hostVerifier: (key: Buffer) => `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}` === pin });
-  });
 }

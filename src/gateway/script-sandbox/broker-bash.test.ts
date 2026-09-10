@@ -8,7 +8,7 @@ const scope = { language: "python" as const, code: "pass", clusters: [{ name: "p
 const p = () => ({ agentId: "a", sessionId: "s", boxId: "b", userId: "u", callbackToken: "private-callback-token" });
 const call = { id: "1", tool: "bash", arguments: { cluster: "prod", command: "kubectl get nodes" } };
 it("binds each trusted Bash callback to freshly authorized credentials and omits grants from audit", async () => {
-  let capabilities = ["run_sandbox"];
+  let capabilities = ["run_sandbox", "run_commands"];
   const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent"
     ? { status: "active", tool_capabilities: capabilities }
     : { user_id: "u", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kubeconfig }] } }) };
@@ -19,7 +19,7 @@ it("binds each trusted Bash callback to freshly authorized credentials and omits
     await expect(broker.call(p(), scope, call, new AbortController().signal)).resolves.toEqual({ text: "nodes" });
     expect(builtin).toHaveBeenCalledOnce();
     expect(builtin.mock.calls[0][1]).toEqual(call.arguments);
-    expect(builtin.mock.calls[0][3]).toBe(kubeconfig);
+    expect(builtin.mock.calls[0][3]).toMatchObject({ tool: "bash", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kubeconfig }] } });
     expect(JSON.stringify(builtin.mock.calls[0][1])).not.toContain("private-token");
     expect(JSON.stringify(log.mock.calls)).not.toContain("private-token");
     expect(JSON.stringify(log.mock.calls)).not.toContain("private-callback-token");

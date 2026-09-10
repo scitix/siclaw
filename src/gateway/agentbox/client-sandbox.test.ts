@@ -18,31 +18,31 @@ async function client(handler: http.RequestListener) {
 }
 it("permits authenticated invocation transport on local loopback without mTLS", async () => {
   const c = await client((req, res) => {
-    expect(req.url).toBe("/api/internal/sandbox-bash");
+    expect(req.url).toBe("/api/internal/sandbox-tool");
     expect(req.method).toBe("POST"); req.resume(); res.end(JSON.stringify({ text: "ok" }));
   });
-  await expect(c.sandboxBash({ callback_token: "fixture" }, new AbortController().signal)).resolves.toEqual({ text: "ok" });
+  await expect(c.sandboxTool({ callback_token: "fixture" }, new AbortController().signal)).resolves.toEqual({ text: "ok" });
 });
 it("rejects remote cleartext and HTTPS without credentials before connecting", async () => {
   for (const endpoint of ["http://192.0.2.1", "https://example.invalid"]) {
-    await expect(new AgentBoxClient(endpoint).sandboxBash({}, new AbortController().signal)).rejects.toThrow();
+    await expect(new AgentBoxClient(endpoint).sandboxTool({}, new AbortController().signal)).rejects.toThrow();
   }
 });
 it("bounds tool response memory", async () => {
   const c = await client((_req, res) => res.end(JSON.stringify({ text: "a".repeat(4 * 1024 * 1024) })));
-  await expect(c.sandboxBash({}, new AbortController().signal)).rejects.toThrow();
+  await expect(c.sandboxTool({}, new AbortController().signal)).rejects.toThrow();
 });
 it("transports complete data above the inline preview limit", async () => {
   const text = "node row\n".repeat(30_000);
   const c = await client((_req, res) => res.end(JSON.stringify({ text })));
-  await expect(c.sandboxBash({}, new AbortController().signal)).resolves.toEqual({ text });
+  await expect(c.sandboxTool({}, new AbortController().signal)).resolves.toEqual({ text });
 });
 it("cancels the HTTP connection while waiting for a tool", async () => {
   let started!: () => void;
   const entered = new Promise<void>(resolve => { started = resolve; });
   const c = await client(req => { req.resume(); started(); });
   const controller = new AbortController();
-  const result = c.sandboxBash({}, controller.signal);
+  const result = c.sandboxTool({}, controller.signal);
   const assertion = expect(result).rejects.toThrow();
   await entered; controller.abort(); await assertion;
 });

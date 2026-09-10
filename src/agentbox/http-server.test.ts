@@ -2428,7 +2428,7 @@ describe("handoff prompt trace acknowledgement", () => {
 describe("sandbox callback authentication", () => {
   it("rejects an unauthenticated local callback even to an existing session", async () => {
     await sm.getOrCreate("sandbox-session");
-    const r = await getJson(port, "/api/internal/sandbox-bash", "POST", {
+    const r = await getJson(port, "/api/internal/sandbox-tool", "POST", {
       session_id: "sandbox-session", callback_token: "a".repeat(64),
       arguments: { cluster: "prod", command: "kubectl get nodes" },
     });

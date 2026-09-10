@@ -84,11 +84,15 @@ retains both capabilities. Empty capability selection remains unrestricted.
 | `k8s.list_pods` | Fixed HTTPS GET of one declared namespace; up to 10 pod summaries per page with an opaque `continue` token. No spec/env/secret dump or condition messages. |
 | `k8s.list_nodes` | Fixed GET of `/api/v1/nodes`, up to 10 summaries per page with an opaque `continue` token. Requires explicit `clusters[].nodes: true` and Kubernetes `nodes/list` RBAC. Returns name, Ready/scheduling state, software versions, architecture, capacity and allocatable resources; no annotations, labels, addresses, image inventory or full node object. |
 | `k8s.pod_logs` | Fixed GET of one named pod's log, bounded to 64 KiB and 1–1,000 tail lines. |
-| `host.inspect` | Fixed SSH command `/usr/local/libexec/siclaw-inspect`; only `os`, `memory`, `sysctl` checks. No model-supplied command or path. |
+| `host_exec` | Same Agent SSH tool and sanitizer, using the current approved credential snapshot and pinned keys for every hop. Only the sandbox diagnostic command profile. |
+| `node_exec` | Same Agent node tool, in a dedicated managed diagnostic namespace. Requires explicit node scope, current `run_commands`, and diagnostic Job/exec RBAC. |
+| `pod_exec` | Same Agent Pod tool, scoped to a declared namespace. Only diagnostic commands with a remote timeout; the target image must provide `timeout`. |
+| `host.inspect` | Compatibility alias to `host_exec`: fixed OS, memory or sysctl read command. No host helper installation is required. |
 | `mcp.call` | Only an explicitly declared and operator-reviewed tool on a bound HTTPS Streamable HTTP MCP server. Operator fixed arguments cannot be overridden. |
 
-No Kubernetes mutation, exec, attach, proxy, Secret access or arbitrary API path
-is accepted by the broker. Kubernetes authentication accepts inline token or
+No caller-selected Kubernetes mutation, proxy, Secret access or arbitrary API path is accepted.
+`node_exec` and `pod_exec` deliberately use trusted exec infrastructure; `node_exec`
+provisions and removes diagnostic resources as described below. Kubernetes authentication accepts inline token or
 client certificate/key data with TLS verification; exec plugins, auth providers,
 file references, proxy settings and impersonation are rejected. HTTP redirects
 are not followed. MCP `readOnlyHint` is not authorization: the operator must
@@ -108,11 +112,15 @@ credential, never on the runner ServiceAccount.
 
 A script executing `ssh node rm ...` has no SSH credential in either profile.
 With network isolation enabled it also cannot create the socket, even via a
-subprocess or raw syscall. `siclaw.call("host.inspect", ...)` reaches only the
-fixed helper. Neither command string inspection nor a “read-only SSH account”
-alone is used to classify arbitrary shell programs as safe.
+subprocess or raw syscall. SDK exec calls reach the same Agent tools, with a
+strict additional diagnostic profile that excludes remote interpreters, network
+clients, arbitrary file reads, shell composition and background execution. Host
+binaries, configured diagnostic images and the operator-reviewed MCP server are
+trusted execution components; sharing a tool factory alone is not a proof of safety.
 
-Read-only concerns production mutations. The script can freely create/delete
+The diagnostic command profile excludes requested production mutations. Trusted
+execution supervision can still create temporary process files, and node diagnostics
+create Kubernetes namespaces, quotas, Jobs and Pods. The script can freely create/delete
 its own disposable work files. Reads may still produce server audit records,
 affect access times or retrieve sensitive diagnostic content such as logs.
 
@@ -146,10 +154,11 @@ Use `k8s.list_nodes` pagination for complete structured inventories.
 Runtime reauthorizes the current resource and routes only to the original
 AgentBox placement. AgentBox verifies a random, per-invocation callback grant,
 its original immutable scope, the Web session, and the strict command profile
-again before executing `createRestrictedBashTool`. Callback grants remain only
+again before executing the same `createRestrictedBashTool`, `createHostExecTool`,
+`createNodeExecTool` or `createPodExecTool` factory used by the Agent. Callback grants remain only
 between trusted processes, are omitted from audit, and expire on completion or
-cancellation. The endpoint does not accept tool names, environment, cwd or
-background execution, and does not wait on the model prompt queue. K8s callbacks
+cancellation. Only Runtime can select one of these four approved built-ins. The
+endpoint rejects arbitrary dispatch, environment, cwd or background execution, and does not wait on the model prompt queue. K8s callbacks
 require a CA-verified Runtime/Gateway certificate; checking its OU alone is
 insufficient. Local Runtime never exposes sandbox execution or callbacks.
 Runtime supplies the freshly authorized inline kubeconfig only to this trusted
@@ -166,6 +175,66 @@ All connector text, including logs and nested MCP text, passes through shared
 output redaction. Pattern-based redaction does not prove arbitrary diagnostic
 content contains no secret; reviewed MCP implementations and limited upstream
 credentials remain part of the trust boundary.
+
+## SDK diagnostic tools and concurrency
+
+Python and Shell use the same operation names and argument schemas:
+
+```python
+from siclaw import call, call_to_file
+print(call("node_exec", {"cluster": "prod", "node": "node-a", "command": "uname -r"})["text"])
+call_to_file("pod_exec", {"cluster": "prod", "namespace": "app", "pod": "api-1",
+                        "command": "cat /proc/meminfo"}, "/work/memory.json")
+```
+
+```bash
+siclaw-tool host_exec '{"host":"host-a","command":"uname -r"}'
+siclaw-tool --output /work/query.json mcp.call '{"server":"metrics","tool":"query","arguments":{}}'
+```
+
+Declare exact registered resource names in `clusters`, `hosts` and `mcp` on
+`run_script`. Node diagnostics need `nodes: true`; Pod exec needs the explicit
+namespace. The three exec tools require the Agent's current `run_commands`
+capability as well as `run_sandbox`. Each call and result chunk rechecks current
+user, Agent and resource permissions. Host UUID selection is not part of the
+sandbox resource-name contract. MCP uses the shared Agent MCP factory, including
+cancellation and structured results, with the broker's reviewed tool/fixed-argument
+policy, HTTPS-only transport, no redirects and bounded response streams.
+
+Prefer direct tools for simple queries. Use scripts for loops and aggregation;
+remote commands have a 1–15 second budget. Read-only command/flag validation and
+output redaction are shared with normal Agent tools. An additional SDK profile
+limits reads to diagnostics and fixed `/etc/os-release`/`/proc` files. The sandbox
+cannot supply images, credential paths, shell interpreters, background flags or
+execution environment. Capture truncation and oversized results fail instead of
+being reported as a complete file.
+
+Each run permits one in-flight SDK operation, even if code starts concurrent
+threads/processes. Runtime permits at most **10** in-flight sandbox `node_exec`
+callbacks across runs. Excess callbacks fail promptly, with no unbounded queue.
+The configured runner concurrency remains a separate limit.
+
+Node diagnostics use `siclaw-script-diagnostics` in the selected target cluster.
+The trusted tool creates only this dedicated, labeled namespace and its quota
+when missing. An existing unlabeled namespace, missing quota permissions,
+conflicting/scoped quota or quota above the hard ceiling causes refusal, never
+a fallback to the normal debug namespace. The quota uses `count/pods: 10` and
+`count/jobs.batch: 20`; it counts finished and terminating Pods too. Kubernetes
+admission enforces this across Runtime/AgentBox replicas and restarts. Operators
+can pre-provision a stricter quota. These limits cover sandbox node diagnostics;
+ordinary Agent node tools retain their existing namespace/lifecycle.
+
+Each call owns a separate diagnostic cache entry and deletes its Job with
+foreground propagation before disposing its credential snapshot. Success is
+reported only after normal cleanup. Cancellation/startup failure also attempts
+cleanup; failure is visible and must not be reported as success. Job
+`activeDeadlineSeconds: 120`, no retries, and a 60-second finished TTL bound
+orphans after process loss. If the control plane or GC is unavailable, the quota
+still prevents unbounded accumulation; it may block new diagnostics until cleanup
+recovers. Node callback budgets include startup and cleanup (90 seconds); the
+outer run deadline can cancel them earlier. E2B/Portal ingress adds transport grace
+without extending the run grant. Native Pod testing and E2B cloud validation are
+separate requirements.
 
 ## Large results and work files
 

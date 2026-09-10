@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import type { ScriptRequest } from "../script-sandbox/types.js";
-import { validateSandboxBash, type SandboxBashRequest } from "../tools/infra/sandbox-bash-policy.js";
+import type { ScriptRequest, ScriptToolCall } from "../script-sandbox/types.js";
+import { validateSandboxBuiltin } from "../tools/infra/sandbox-tool-policy.js";
 
 /** Per-box, ephemeral callback grants. Never sent to the runner or persisted. */
 export class SandboxInvocations {
@@ -22,16 +22,16 @@ export class SandboxInvocations {
     } };
   }
 
-  async execute<T>(token: string, sessionId: string, args: unknown, signal: AbortSignal,
-    executor: (request: SandboxBashRequest, signal: AbortSignal) => Promise<T>): Promise<T> {
+  async execute<T>(token: string, sessionId: string, call: ScriptToolCall, signal: AbortSignal,
+    executor: (request: ReturnType<typeof validateSandboxBuiltin>, signal: AbortSignal) => Promise<T>): Promise<T> {
     const entry = this.active.get(token);
     if (!entry || entry.sessionId !== sessionId || entry.controller.signal.aborted || entry.busy || ++entry.calls > 64) {
       throw new Error("Sandbox callback denied");
     }
-    const request = validateSandboxBash(args, entry.scope);
+    const request = validateSandboxBuiltin(call, entry.scope);
     entry.busy = true;
     try {
-      const bounded = AbortSignal.any([signal, entry.controller.signal, AbortSignal.timeout(20_000)]);
+      const bounded = AbortSignal.any([signal, entry.controller.signal, AbortSignal.timeout(90_000)]);
       bounded.throwIfAborted();
       return await executor(request, bounded);
     } finally { entry.busy = false; }

@@ -1,3 +1,4 @@
+import { ensureSandboxDebugQuota, SANDBOX_DEBUG_NAMESPACE } from "../infra/sandbox-debug.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -92,6 +93,7 @@ export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
   userId?: string,
   bg?: BackgroundExecWiring,
+  trustedOptions?: { outputMode?: "data"; sandboxDiagnostics?: boolean },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -416,7 +418,11 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       const fgUserShellEsc = (netnsPrefix + params.command).replace(/'/g, "'\\''");
       const fgPgidFile = backgroundPgidFile(toolCallId);
       const fgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${cap} sh -c '${fgUserShellEsc}'`, fgPgidFile)];
-      const fgSpec = { userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey };
+      if (trustedOptions?.sandboxDiagnostics) await ensureSandboxDebugQuota(env, signal);
+      const fgSpec = {
+        ...(trustedOptions?.sandboxDiagnostics ? { namespace: SANDBOX_DEBUG_NAMESPACE, activeDeadlineSeconds: 120, confirmCleanup: true } : {}),
+        userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey,
+      };
 
       // Ensure the (idempotent, cache-hit) pod up front, then PIN it for the duration of the exec.
       // runInDebugPod only resets the idle timer AFTER a successful exec, so without a pin a long
@@ -485,6 +491,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
           + "command rather than retrying it unchanged.]" : "");
       return {
         content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
+          outputMode: trustedOptions?.outputMode,
           stderr: filteredStderr || undefined,
           project: jsonPathProjector(params.json_path),
           // A `--tail=N` window that came back at exactly N lines reads like a complete answer; the
@@ -497,6 +504,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
             : {}),
         }) }],
         details: {
+          ...(trustedOptions?.outputMode === "data" && execResult.truncated ? { truncated: true } : {}),
           exitCode: execResult.exitCode ?? 0,
           exit_class: judgment.exitClass,
           ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),

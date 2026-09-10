@@ -289,8 +289,8 @@ latency are deferred at the user's request until an E2B environment exists.
 Local relay and protocol tests do not substitute for that validation.
 
 Dedicated SSH/MCP fixtures do not establish production helper installation or
-third-party tool semantics. SSH still requires the reviewed fixed helper and
-restricted key; MCP read-only behavior still requires operator review and
+third-party tool semantics. The original fixture used a reviewed fixed helper; the SDK extension now uses
+the shared host tool, strict diagnostic profile and pinned host keys; MCP read-only behavior still requires operator review and
 appropriate upstream permissions. Open-network mode permits ordinary external
 connections and must not inherit production credentials or ambient identity.
 Force network isolation when all infrastructure access must use the broker.

@@ -497,7 +497,7 @@ export class McpClientManager {
         console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
 
         for (const mcpTool of mcpTools) {
-          const toolDef = this.createToolDefinition(
+          const toolDef = createMcpToolDefinition(
             serverName,
             cfg.description,
             mcpTool,
@@ -600,84 +600,86 @@ export class McpClientManager {
     this.tools = [];
   }
 
-  /**
-   * Create a pi-agent ToolDefinition from an MCP tool descriptor.
-   */
-  private createToolDefinition(
-    serverName: string,
-    serverDescription: string | undefined,
-    mcpTool: {
-      name: string;
-      description?: string;
-      inputSchema?: any;
-      /**
-       * MCP 规范的工具注解。这里只用 `readOnlyHint` —— authority guard 靠它决定
-       * 这个工具算不算"读"。见 tool-registry 的 MCP_TOOL_EFFECTS。
-       */
-      annotations?: { readOnlyHint?: boolean };
+}
+
+/** Shared Agent/SDK MCP tool factory. Transport authorization belongs to its caller. */
+export function createMcpToolDefinition(
+  serverName: string,
+  serverDescription: string | undefined,
+  mcpTool: {
+    name: string;
+    description?: string;
+    inputSchema?: any;
+    /**
+     * MCP 规范的工具注解。这里只用 `readOnlyHint` —— authority guard 靠它决定
+     * 这个工具算不算"读"。见 tool-registry 的 MCP_TOOL_EFFECTS。
+     */
+    annotations?: { readOnlyHint?: boolean };
+  },
+  client: any,
+  requestTimeoutMs?: number,
+  trustedOptions?: { includeRawResult?: boolean },
+): ResolvedToolDefinition {
+  const fullName = buildMcpToolName(serverName, mcpTool.name);
+  const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
+  // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
+  // into a @sinclair/typebox TSchema. The pi runtime validates and coerces tool
+  // arguments with a *different* TypeBox package (`typebox` 1.x, bundled under
+  // @earendil-works/pi-ai) whose schema-kind detection (`~kind` string prop) is
+  // incompatible with @sinclair/typebox 0.34's metadata (`Symbol.for('TypeBox.Kind')`).
+  // Converting here silently disables string→number/boolean coercion (e.g. "10" → 10):
+  // `Value.Convert` no-ops and pi-ai's JSON-Schema coercion fallback is skipped because
+  // `hasTypeBoxMetadata` detects the 0.34 symbol — so integer/object params such as
+  // get_panel_image's `panelId` fail validation with "must be integer". Raw JSON Schema
+  // leaves the kind metadata absent, letting pi-ai's coercion path run, and providers
+  // advertise tools straight from `.properties`/`.required`. See scitix/siclaw#355.
+  const parameters = normalizeMcpInputSchema(inputSchema);
+
+  // Prepend the admin-provided server description so the model sees server-level
+  // context (e.g. monitoring tenant IDs) on every tool from that server.
+  const serverContext = serverDescription?.trim()
+    ? `[Server "${serverName}" context: ${serverDescription.trim()}]\n`
+    : "";
+  const toolDescription = mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`;
+
+  return {
+    name: fullName,
+    toolset: `mcp:${serverName}`,
+    label: `${serverName}/${mcpTool.name}`,
+    description: serverContext + toolDescription,
+    parameters,
+    execute: async (_toolCallId, args, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const result = await client.callTool(
+          {
+            name: mcpTool.name,
+            arguments: args ?? {},
+          },
+          undefined,
+          requestTimeoutMs === undefined && !signal ? undefined : { ...(requestTimeoutMs === undefined ? {} : { timeout: requestTimeoutMs }), ...(signal ? { signal } : {}) },
+        );
+
+        const isError = !!result.isError;
+        const { content, text } = mcpContentToAgentContent(result.content);
+
+        return {
+          content,
+          details: {
+            ...(trustedOptions?.includeRawResult ? { rawResult: result } : {}),
+            ...(isError ? { error: text } : {}),
+            ...(result.structuredContent !== undefined
+              ? { structuredContent: result.structuredContent }
+              : {}),
+          },
+        };
+      } catch (err: any) {
+        const errorMsg = err?.message ?? String(err);
+        return {
+          content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
+          details: { error: errorMsg },
+        };
+      }
     },
-    client: any,
-    requestTimeoutMs?: number,
-  ): ResolvedToolDefinition {
-    const fullName = buildMcpToolName(serverName, mcpTool.name);
-    const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
-    // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
-    // into a @sinclair/typebox TSchema. The pi runtime validates and coerces tool
-    // arguments with a *different* TypeBox package (`typebox` 1.x, bundled under
-    // @earendil-works/pi-ai) whose schema-kind detection (`~kind` string prop) is
-    // incompatible with @sinclair/typebox 0.34's metadata (`Symbol.for('TypeBox.Kind')`).
-    // Converting here silently disables string→number/boolean coercion (e.g. "10" → 10):
-    // `Value.Convert` no-ops and pi-ai's JSON-Schema coercion fallback is skipped because
-    // `hasTypeBoxMetadata` detects the 0.34 symbol — so integer/object params such as
-    // get_panel_image's `panelId` fail validation with "must be integer". Raw JSON Schema
-    // leaves the kind metadata absent, letting pi-ai's coercion path run, and providers
-    // advertise tools straight from `.properties`/`.required`. See scitix/siclaw#355.
-    const parameters = normalizeMcpInputSchema(inputSchema);
-
-    // Prepend the admin-provided server description so the model sees server-level
-    // context (e.g. monitoring tenant IDs) on every tool from that server.
-    const serverContext = serverDescription?.trim()
-      ? `[Server "${serverName}" context: ${serverDescription.trim()}]\n`
-      : "";
-    const toolDescription = mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`;
-
-    return {
-      name: fullName,
-      toolset: `mcp:${serverName}`,
-      label: `${serverName}/${mcpTool.name}`,
-      description: serverContext + toolDescription,
-      parameters,
-      execute: async (_toolCallId, args) => {
-        try {
-          const result = await client.callTool(
-            {
-              name: mcpTool.name,
-              arguments: args ?? {},
-            },
-            undefined,
-            requestTimeoutMs === undefined ? undefined : { timeout: requestTimeoutMs },
-          );
-
-          const isError = !!result.isError;
-          const { content, text } = mcpContentToAgentContent(result.content);
-
-          return {
-            content,
-            details: {
-              ...(isError ? { error: text } : {}),
-              ...(result.structuredContent !== undefined
-                ? { structuredContent: result.structuredContent }
-                : {}),
-            },
-          };
-        } catch (err: any) {
-          const errorMsg = err?.message ?? String(err);
-          return {
-            content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
-            details: { error: errorMsg },
-          };
-        }
-      },
-    };
-  }
+  };
 }

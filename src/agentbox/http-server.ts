@@ -923,7 +923,7 @@ export function createHttpServer(
    */
   // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
   // The unguessable per-invocation grant is required in BOTH local and mTLS modes.
-  addRoute("POST", "/api/internal/sandbox-bash", async (req, res) => {
+  addRoute("POST", "/api/internal/sandbox-tool", async (req, res) => {
     if (!useTls && !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")) {
       sendJson(res, 403, { error: "Sandbox callback denied" }); return;
     }
@@ -932,30 +932,17 @@ export function createHttpServer(
     res.once("close", abort);
     try {
       const body = await parseJsonBody(req);
-      if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approved_kubeconfig"].includes(k)) ||
-          typeof body.approved_kubeconfig !== "string" || body.approved_kubeconfig.length > 256 * 1024 ||
+      if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approval"].includes(k)) ||
+          !record(body.approval) || Buffer.byteLength(JSON.stringify(body.approval)) > 256 * 1024 ||
           typeof body.session_id !== "string" || typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token)) throw new Error();
       const managed = sessionManager.get(body.session_id);
       const invocations = sessionManager.gatewayClient?.sandboxInvocations;
       if (!managed || managed.mode !== "web" || managed.delegation || !invocations) throw new Error();
-      const result = await invocations.execute(body.callback_token, body.session_id, body.arguments, controller.signal, async (args, signal) => {
-        // Lazy imports keep the regular HTTP/health startup path lightweight.
-        const { createRestrictedBashTool } = await import("../tools/cmd-exec/restricted-bash.js");
-        const { kubeConnection } = await import("../tools/infra/inline-kubeconfig.js");
-        const { withSandboxKubeconfig } = await import("./sandbox-kubeconfig.js");
-        signal.throwIfAborted();
-        const output = await withSandboxKubeconfig(managed.kubeconfigRef.credentialsDir, body.approved_kubeconfig as string, async kubeconfigPath => {
-          const tool = createRestrictedBashTool(undefined, undefined, { kubeconfigPath, validateKubeconfig: kubeConnection, outputMode: "data" });
-          signal.throwIfAborted();
-          return tool.execute(`sandbox-${randomUUID()}`, args, signal, undefined, {} as Parameters<typeof tool.execute>[4]);
-        });
-        const details = output.details as { blocked?: boolean; error?: boolean } | undefined;
-        if (details?.blocked || details?.error) throw new Error();
-        const value = { text: output.content.filter(c => c.type === "text").map(c => (c as { text: string }).text).join("\n") };
-        const { SCRIPT_FILE_RESULT_BYTES } = await import("../script-sandbox/result-transfer.js");
-        if (Buffer.byteLength(JSON.stringify(value)) > SCRIPT_FILE_RESULT_BYTES) throw new Error();
-        return value;
-      });
+      const { executeSandboxBuiltin } = await import("./sandbox-tools.js");
+      const approval = body.approval as unknown as import("../shared/sandbox-tool-types.js").SandboxBuiltinApproval;
+      const result = await invocations.execute(body.callback_token, body.session_id,
+        { id: "callback", tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
+        (request, signal) => executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal));
       sendJson(res, 200, result);
     } catch { sendJson(res, 403, { error: "Sandbox tool denied or unavailable" }); }
     finally { res.off("close", abort); }

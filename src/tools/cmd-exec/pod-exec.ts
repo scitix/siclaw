@@ -36,7 +36,7 @@ interface PodExecParams {
 }
 
 
-export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring): ToolDefinition {
+export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring, trustedOptions?: { outputMode?: "data"; remoteTimeoutSeconds?: number }): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "pod_exec",
@@ -202,7 +202,10 @@ Examples:
 
       // Build kubectl exec args
       const cmdArgs = parseArgs(params.command);
-      const execArgs = cmdArgs;
+      // SDK calls require a remote bound too: closing kubectl does not kill a
+      // process in an existing Pod. Missing timeout in the target fails closed.
+      const execArgs = trustedOptions?.remoteTimeoutSeconds === undefined ? cmdArgs
+        : ["timeout", "-s", "KILL", String(trustedOptions.remoteTimeoutSeconds), ...cmdArgs];
       const kubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
@@ -258,6 +261,7 @@ Examples:
 
         return {
           content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
+            outputMode: trustedOptions?.outputMode,
             stderr: filterPodNoise(stderr.trim()) || undefined,
             project: jsonPathProjector(params.json_path),
           }) }],
@@ -285,6 +289,7 @@ Examples:
         });
         return {
           content: [{ type: "text", text: postExecSecurity(stdout, pre.action, {
+            outputMode: trustedOptions?.outputMode,
             stderr: stderr || undefined,
             project: jsonPathProjector(params.json_path),
             ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),

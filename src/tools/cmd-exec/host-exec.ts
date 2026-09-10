@@ -103,6 +103,7 @@ function noteSshFailure(host: string, stage: string): string {
 export function createHostExecTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
+  trustedOptions?: { outputMode?: "data"; hostKeyPins?: Record<string, string> },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -235,6 +236,13 @@ Examples (pass the id from host_list; names shown here for readability):
       let target;
       try {
         target = await acquireSshTarget(kubeconfigRef?.credentialBroker, params.host, "host_exec");
+        if (trustedOptions?.hostKeyPins) {
+          for (let hop = target; hop; hop = hop.jumpHost!) {
+            const key = `${hop.host}:${hop.port}`;
+            if (!Object.hasOwn(trustedOptions.hostKeyPins, key)) throw new Error("Host key pin required");
+            hop.expectedHostKey = trustedOptions.hostKeyPins[key];
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -378,6 +386,7 @@ Examples (pass the id from host_list; names shown here for readability):
         content: [{
           type: "text",
           text: postExecSecurity(result.stdout.trim(), pre.action, {
+            outputMode: trustedOptions?.outputMode,
             stderr: result.stderr.trim() || undefined,
             project: jsonPathProjector(params.json_path),
             ...(notes ? { notes } : {}),
@@ -391,6 +400,7 @@ Examples (pass the id from host_list; names shown here for readability):
           }),
         }],
         details: {
+          ...(trustedOptions?.outputMode === "data" && result.truncated ? { truncated: true } : {}),
           exitCode: result.exitCode,
           exit_class: judgment.exitClass,
           ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),

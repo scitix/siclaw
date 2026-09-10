@@ -120,7 +120,7 @@ export class ScriptSandboxService {
         ids.add(raw.id); pending = true;
         let response: unknown;
         try {
-          const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(25_000)]);
+          const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(raw.tool === "node_exec" ? 90_000 : 25_000)]);
           let value: unknown;
           if (isTransfer) {
             if (raw.delivery !== undefined) throw new Error("Invalid transfer delivery");

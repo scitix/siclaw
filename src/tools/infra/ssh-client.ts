@@ -48,6 +48,8 @@ const SSH_CONNECT_TIMEOUT_MS = 10_000;
 // ── Types ───────────────────────────────────────────────────────────
 
 export interface SshTarget {
+  /** Optional operator-pinned host key; no TOFU fallback when present. */
+  expectedHostKey?: string;
   host: string;
   port: number;
   username: string;
@@ -275,7 +277,7 @@ async function targetToHops(target: SshTarget): Promise<DialHop[]> {
     targetFirst.push(t);
   }
   const ordered = targetFirst.reverse();
-  return Promise.all(ordered.map((t) => hopFromTarget(t)));
+  return Promise.all(ordered.map(async (t) => ({ ...(await hopFromTarget(t)), ...(t.expectedHostKey ? { expectedHostKey: t.expectedHostKey } : {}) })));
 }
 
 async function hopFromTarget(t: SshTarget): Promise<DialHop> {

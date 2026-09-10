@@ -83,3 +83,10 @@ it("forwards file metadata and bounded chunks without widening the public respon
   expect((await s.post({ call: { id: "4", tool: "result.read", arguments: { transfer_id: transfer, offset: 49152 } } })).status).toBe(403);
   expect(s.sendCommandToRuntime).toHaveBeenCalledTimes(4);
 });
+
+it("allows diagnostic startup without broadening other callback deadlines", async () => {
+  const s = await setup(); await s.handlers.get(SANDBOX_LEASE_OPEN)!(s.grant(), "runtime-1");
+  const request = { id: "node", tool: "node_exec", arguments: { cluster: "test", node: "node-a", command: "uname" } };
+  expect((await s.post({ call: request })).status).toBe(200);
+  expect(s.sendCommandToRuntime).toHaveBeenLastCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call: request }, 95_000);
+});
