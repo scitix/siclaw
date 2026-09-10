@@ -1,6 +1,7 @@
 """KBC orchestration exercised through the real Pi worker and host tools."""
 
 import asyncio
+import json
 from copy import deepcopy
 import os
 
@@ -79,6 +80,30 @@ async def test_readonly_engine_uses_snapshot_tools_and_actual_sdk(tmp_path, monk
         names = {tool["function"]["name"] for tool in requests[0]["tools"]}
         assert names == {"Read", "Glob", "Grep"}
         assert compile_box._test_sdk_version() == "0.85.1"
+
+
+async def test_readonly_engine_returns_final_json_after_tool_commentary(tmp_path, monkeypatch):
+    (tmp_path / "page.md").write_text("The watchdog is 45 seconds.")
+    expected = {"questions": [{"question": "What is the watchdog timeout?"}]}
+
+    def respond(_, number):
+        if number > 1:
+            return completion(json.dumps(expected))
+        response = completion(tool=("Read", {"file_path": "page.md"}))
+        chunk = json.loads(response.text.split("\n")[0].removeprefix("data: "))
+        chunk["choices"][0]["delta"]["content"] = (
+            'Before reading, the draft is {"questions": []}. I will inspect the source.')
+        return web.Response(text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                            content_type="text/event-stream")
+
+    async with provider(respond) as (config, requests):
+        configure(monkeypatch, config)
+        answer = await selected_readonly_engine().run_readonly_agent(
+            cwd=str(tmp_path), system_prompt="Return the final questions as JSON.",
+            user_message="Read page.md and write a question.", model="fixture-model",
+            allowed_read_roots=[str(tmp_path)], timeout_secs=15)
+        assert json.loads(answer) == expected
+        assert len(requests) == 2
 
 
 async def test_test_session_model_failure_emits_error_and_remains_reusable(tmp_path, monkeypatch):

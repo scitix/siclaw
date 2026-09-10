@@ -144,8 +144,11 @@ class PiEngine:
                 await client.query(user_message)
                 async for event in client.receive_response():
                     if event.kind == "assistant":
-                        parts.extend(block["text"] for block in event.data.get("content", [])
-                                     if block.get("type") == "text" and block.get("text", "").strip())
+                        # Each event is a completed assistant message. Tool-call
+                        # commentary can contain provisional JSON; only the final
+                        # message is the read-only result consumed by the caller.
+                        parts = [block["text"] for block in event.data.get("content", [])
+                                 if block.get("type") == "text" and block.get("text", "").strip()]
                     elif event.kind == "result" and event.data["outcome"] != "completed":
                         raise RuntimeError(event.data.get("error") or "Read-only Pi execution did not complete")
         finally:
