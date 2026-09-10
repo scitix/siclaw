@@ -18,9 +18,30 @@ and schema rejection of image/background/Pod-netns overrides. Shared kubectl
 regressions cover endpoint/identity flags (including shorthands) and kubeconfig
 mutation. Public callback/lease and MCP transport regressions remain covered.
 
+Code revision `db7d9d38` passed all six CI checks, including both container
+architectures, and was deployed to the integrated test environment. Live results:
+
+- Python SDK called the built-in Bash tool for `kubectl get nodes -o json`, saved
+  a 142,141-byte result locally (larger than the inline limit), and called the
+  built-in node tool for all five kernel versions. Six SDK operations completed
+  in 30,412 ms, including 2,226 ms cold runner startup.
+- Shell SDK called the built-in Bash and Pod tools, saved both results and
+  processed them locally. Two operations completed in 3,626 ms, including
+  2,238 ms startup.
+- Seven negative SDK requests were rejected: mutation, endpoint override,
+  undeclared cluster, remote removal, image override, unmanaged Pod/netns
+  resolution and the retired fixed query API. Socket creation was denied and
+  the runner had no kubeconfig environment or service-account token.
+- Cancelling an in-flight node diagnostic reclaimed runner and diagnostic
+  Jobs/Pods in 5,046 ms. The temporary Pod fixture was deleted; both execution
+  namespaces had zero remaining Jobs/Pods. Runtime audit confirmed successful
+  Bash/node/Pod tool calls and no successful legacy query calls.
+
+Live host/MCP bindings and hosted E2B remain outside this acceptance run. Their
+previously stated validation limits still apply.
+
 The entries below are historical acceptance records for earlier revisions;
 their fixed query APIs and sandbox-specific command restrictions are superseded.
-Live acceptance for the unified contract is recorded separately after deployment.
 
 ## SDK diagnostic tools: 2026-09-11
 
