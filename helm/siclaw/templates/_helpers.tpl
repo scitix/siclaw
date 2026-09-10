@@ -151,6 +151,20 @@ global default stays off.
 {{- end }}
 
 {{/*
+Is a read-only source-code volume configured? Returns "true" or "".
+
+The code PVC is created and written OUTSIDE this chart (see
+docs/design/agentbox-code-volume.md) — this chart never provisions it. There is
+only one switch, and it is the claim name: whether a given agent actually gets
+the mount is decided by a ready marker the supplier writes on the volume, so a
+second "enabled" flag here could only disagree with the filesystem.
+*/}}
+{{- define "siclaw.codeVolume.available" -}}
+{{- $c := .Values.agentbox.codeVolume | default dict -}}
+{{- if ne ($c.claimName | default "") "" -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Name of the chart-managed Runtime CA Secret.
 */}}
 {{- define "siclaw.runtimeCaSecretName" -}}

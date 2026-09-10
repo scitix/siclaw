@@ -199,15 +199,35 @@ describe("buildKnowledgeOverview", () => {
     expect(result).not.toContain("### Accumulated Knowledge");
   });
 
-  it("uses content-aware footer when repos or docs present", () => {
+  it("names the mounted directories in the footer, and only those", () => {
     fs.mkdirSync(reposDir);
     const repo = path.join(reposDir, "svc");
     fs.mkdirSync(repo);
     fs.writeFileSync(path.join(repo, "x.ts"), "");
 
     const result = buildKnowledgeOverview({ reposDir });
-    expect(result).toContain("repos/");
-    expect(result).toContain("docs/");
+    // The real mount path, not the bare `repos/` the footer used to print. In a
+    // box that directory does not exist: the mount is `.siclaw/repos` (or
+    // whatever SICLAW_REPOS_DIR overrides it to).
+    expect(result).toContain(`\`${reposDir}\``);
+    expect(result).not.toContain("files in repos/");
+    // docs/ was never passed, so the footer must not advertise it either.
+    expect(result).not.toContain(docsDir);
+    expect(result).not.toContain("or docs/");
+  });
+
+  it("names both directories in the footer when both have content", () => {
+    fs.mkdirSync(reposDir);
+    const repo = path.join(reposDir, "svc");
+    fs.mkdirSync(repo);
+    fs.writeFileSync(path.join(repo, "x.ts"), "");
+    fs.mkdirSync(docsDir);
+    const category = path.join(docsDir, "runbooks");
+    fs.mkdirSync(category);
+    fs.writeFileSync(path.join(category, "a.md"), "");
+
+    const result = buildKnowledgeOverview({ reposDir, docsDir });
+    expect(result).toContain(`\`${reposDir}\` or \`${docsDir}\``);
   });
 
   // --- Intentional non-injection of investigations ---
@@ -239,6 +259,50 @@ describe("buildKnowledgeOverview", () => {
 
   // --- Budget ---
 
+  it("names the repositories the budget dropped instead of dropping them silently", () => {
+    // The repos table has a hard char budget and the loop BREAKS, so a project
+    // with many views loses its tail. Without the note the agent reads the
+    // surviving prefix as the complete set and answers "no such repository"
+    // about a directory that is mounted and readable.
+    fs.mkdirSync(reposDir);
+    for (let r = 0; r < 40; r++) {
+      const repo = path.join(reposDir, `repository-with-a-fairly-long-name-${String(r).padStart(2, "0")}`);
+      fs.mkdirSync(repo);
+      fs.writeFileSync(path.join(repo, "main.ts"), "");
+    }
+
+    const result = buildKnowledgeOverview({ reposDir });
+
+    const m = /… and (\d+) more repositories not listed/.exec(result);
+    expect(m, "truncation note missing").toBeTruthy();
+    // The count must be the real remainder, and it must agree with how many
+    // rows actually survived — a wrong number is worse than no number.
+    const listed = [...result.matchAll(/\n\| repository-with-a-fairly-long-name-\d\d \|/g)].length;
+    expect(Number(m![1])).toBe(40 - listed);
+    // The note must name the directory that is actually mounted. `repos/` is
+    // not it — `ls repos/` in a box hits nothing, which turns the one mitigation
+    // for an incomplete table into a dead end.
+    expect(result).toContain(`use the \`ls\` tool on \`${reposDir}\``);
+    expect(result).not.toContain("tool on `repos/`");
+    // The note is part of the budget, not an exemption from it. The footer and
+    // the note now carry the real mount path, and this fixture's lives under
+    // os.tmpdir() — absolute and long — so discount exactly what that adds
+    // rather than loosening the number the tables are held to.
+    expect(result.length).toBeLessThanOrEqual(1200 + 150 + 2 * reposDir.length);
+  });
+
+  it("says nothing about truncation when every repository fits", () => {
+    fs.mkdirSync(reposDir);
+    const repo = path.join(reposDir, "only-repo");
+    fs.mkdirSync(repo);
+    fs.writeFileSync(path.join(repo, "main.ts"), "");
+
+    const result = buildKnowledgeOverview({ reposDir });
+    expect(result).toContain("only-repo");
+    expect(result).not.toContain("more repositories");
+    expect(result).not.toContain("not listed");
+  });
+
   it("stays within budget with large repos + many docs", () => {
     // Large repos
     fs.mkdirSync(reposDir);
@@ -261,7 +325,10 @@ describe("buildKnowledgeOverview", () => {
     }
 
     const result = buildKnowledgeOverview({ reposDir, docsDir });
-    expect(result.length).toBeLessThanOrEqual(1200 + 150);
+    // Same discount as the truncation test: the footer names both real mount
+    // paths, which are absolute in this fixture and relative (`.siclaw/repos`)
+    // in a box.
+    expect(result.length).toBeLessThanOrEqual(1200 + 150 + reposDir.length + docsDir.length);
   });
 });
 
