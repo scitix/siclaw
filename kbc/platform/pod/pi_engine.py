@@ -47,8 +47,9 @@ def observe_sessions(observer):
 def worker_command() -> list[str]:
     pod = Path(__file__).resolve().parent
     packaged = pod / "pi-worker" / "dist" / "kbc" / "pi-worker.js"
-    source = pod.parents[2] / "dist" / "kbc" / "pi-worker.js"
-    worker = packaged if packaged.is_file() else source
+    worker = packaged if packaged.is_file() else (
+        pod / ".." / ".." / ".." / "dist" / "kbc" / "pi-worker.js"
+    ).resolve()
     node = shutil.which("node")
     if not node or not worker.is_file():
         raise AgentTransportError("Pi worker is not built or Node.js is unavailable")
