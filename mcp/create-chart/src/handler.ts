@@ -67,7 +67,7 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
     throw new Error("render_chart: output must be web, image, or both");
   }
   const id = `${args.type}-${randomUUID()}`;
-  const chart = args.type === "waterfall" ? { ...args, visual_id: id } : args;
+  const chart = args.type === "waterfall" ? normalizeWaterfallSpec({ ...args, visual_id: id }) : args;
   const markdownEmbed = "```chart\n" + JSON.stringify(chart) + "\n```";
   let png: Buffer | undefined;
   let exportFailed = false;

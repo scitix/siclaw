@@ -1,5 +1,6 @@
 import { ChartRenderer } from "./ChartRenderer"
 import { TraceHostContext } from "./TraceContext"
+import { useTraceNavigation } from "./trace-navigation"
 import { traceAttachments, attachedTraceIds } from "./trace-attachments"
 import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
@@ -339,6 +340,7 @@ export function PilotArea({
 }: PilotAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const { requestedVisualId, focusRequestedTrace, scheduleScroll } = useTraceNavigation(scrollContainerRef, sessionKey)
   const selectBoundaryRef = useRef<HTMLDivElement>(null)
   const prevMsgCountRef = useRef(0)
   const userScrolledAwayRef = useRef(false)
@@ -391,10 +393,10 @@ export function PilotArea({
   }, [abortResponse])
 
   const scrollToBottom = useCallback((smooth = true) => {
-    requestAnimationFrame(() => {
+    scheduleScroll(() => {
       scrollRef.current?.scrollIntoView(smooth ? { behavior: "smooth" } : undefined)
     })
-  }, [])
+  }, [scheduleScroll])
 
   // Find last assistant message id
   const lastAssistantMsgId = useMemo(() => {
@@ -569,6 +571,12 @@ export function PilotArea({
       prevMsgCountRef.current = messages.length
       return
     }
+    if (focusRequestedTrace()) {
+      needsScrollOnLoadRef.current = false
+      userScrolledAwayRef.current = true
+      prevMsgCountRef.current = messages.length
+      return
+    }
     if (needsScrollOnLoadRef.current && messages.length > 0) {
       needsScrollOnLoadRef.current = false
       userScrolledAwayRef.current = false
@@ -588,7 +596,7 @@ export function PilotArea({
       scrollToBottom(true)
     }
     prevMsgCountRef.current = messages.length
-  }, [messages, scrollToBottom])
+  }, [messages, scrollToBottom, focusRequestedTrace])
 
   // Detect user scrolling away.
   const handleScroll = useCallback(() => {
@@ -602,7 +610,7 @@ export function PilotArea({
   const visibleForCopy = useMemo(() => messages.filter(isVisibleChatMessage), [messages])
 
   return (
-    <TraceHostContext.Provider value={{ onFollowUp: readOnly ? undefined : wrappedSendMessage, attachedIds: attachedTraceIds(messages) }}>
+    <TraceHostContext.Provider value={{ onFollowUp: readOnly ? undefined : wrappedSendMessage, attachedIds: attachedTraceIds(messages), requestedVisualId }}>
     <div className="flex-1 flex flex-col h-full bg-card relative min-w-0">
       {visibleForCopy.length > 0 && (
         <div className="absolute top-2 left-3 z-10">

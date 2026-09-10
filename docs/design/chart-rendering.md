@@ -238,7 +238,8 @@ observed endpoints; attempt_id groups rows without rewriting the hierarchy.
 UTC nanosecond timestamps are subtracted before converting to milliseconds.
 Unknown ends stay null. Route/HTTP overlaps must never be added. HTTP timing is
 not provider queue/inference or token timing. At most 200 spans / 256 KiB;
-oversized input fails explicitly. Do not send raw attributes, bodies, headers,
+both input and the final normalized spec (including its visual ID) must fit.
+Oversized output fails before PNG export or a successful tool response. Do not send raw attributes, bodies, headers,
 URLs, ARN, prompts or credentials; only safe labels/IDs/evidence refs.
 
 `output=web` needs no exporter; `both` retains data if PNG fails; `image` requires
@@ -252,13 +253,19 @@ Conversation attachments start as a compact card (up to three key HTTP intervals
 observed root duration and evidence gaps). Unfinished calls stay visible; preview
 rows never sum nested durations. View timeline expands a scrollable detail region
 capped at 640px / 65dvh. Collapse and larger view retain the current selection and
-zoom. A visual deep link expands before scrolling to the card. The hidden full
+zoom. The transcript owns visual navigation and auto-follow: a visual deep link
+expands and takes precedence over initial scrolling, including when its history
+arrives later. New answers preserve that position; a new user turn resumes follow.
+Unknown or unloaded visuals leave normal scrolling available. The hidden full
 TraceSnapshot always contains every supplied span, so PNG export and message copy
 are independent of disclosure state. No new tool argument is required.
 
 Runtime persists details for Web, Lark, delegated and synthetic turns with the
 shared metadata helper. Direct Lark responses forward PNG and, when supported,
-request `chat.getVisualLink` from the host. The RPC accepts session_id,
+request `chat.getVisualLink` from the host. Hosted conversations use the tool
+event's `dbMessageId`, relayed after destination Runtime persistence, without
+writing the transcript again. Raw AgentBox events use the locally persisted row
+ID. Replayed message/visual pairs do not issue duplicate link requests. The RPC accepts session_id,
 message_id and visual_id and returns `{url:string|null}`. SiCore verifies the
 persisted attachment and Runtime/session relationship and returns its normal
 login-protected chat URL. No access token is created. Standalone Portal returns

@@ -233,6 +233,13 @@ export function normalizeWaterfallSpec(raw: unknown): WaterfallSpec {
   if (raw.title !== undefined) spec.title = text(raw.title, "title", 160);
   if (raw.visual_id !== undefined)
     spec.visual_id = id(raw.visual_id, "visual_id");
+  // Defaults and timestamp normalization can make the emitted spec larger than
+  // its input. Every accepted spec must remain readable by the same contract.
+  if (new TextEncoder().encode(JSON.stringify(spec)).length > MAX_TRACE_BYTES)
+    fail(
+      "data",
+      `exceeds ${MAX_TRACE_BYTES} bytes; narrow the trace rather than silently truncating it`,
+    );
   return spec;
 }
 export function traceDomain(spec: WaterfallSpec): [number, number] {

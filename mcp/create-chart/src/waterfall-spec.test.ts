@@ -5,14 +5,43 @@ import {
   traceSummary,
   utcNanoseconds,
   traceFollowUp,
+  MAX_TRACE_BYTES,
 } from "./waterfall-spec.js";
+import { traceAttachments } from "../../../portal-web/src/components/chat/trace-attachments.js";
 import { handleRenderChart } from "./handler.js";
 import { exportMarkdownVisualsWithVisualExportWeb } from "./visual-export.js";
 vi.mock("./visual-export.js", () => ({
   exportMarkdownVisualsWithVisualExportWeb: vi.fn(),
 }));
 const sample = () => structuredClone(fixture) as any;
+const byteSize = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+const largeTrace = (referenceLength = 145) => ({
+  type: "waterfall", data: {
+    origin_time: "2026-09-10T00:00:00Z",
+    coverage: { observed: ["synthetic trace"], missing: [], complete: true },
+    spans: Array.from({ length: 200 }, (_, i) => ({
+      span_id: `span-${i}`, label: `Span ${i}`, start_ms: i, end_ms: i + 1,
+      evidence_refs: Array.from({ length: 8 }, () => "a".repeat(referenceLength)),
+    })),
+  },
+});
+function traceAtNormalizedSize(bytes: number) {
+  const raw = largeTrace();
+  let remaining = bytes - byteSize(normalizeWaterfallSpec(raw));
+  for (const span of raw.data.spans) for (let i = 0; i < span.evidence_refs.length; i++) {
+    const extra = Math.min(remaining, 200 - span.evidence_refs[i].length);
+    span.evidence_refs[i] += "a".repeat(extra);
+    remaining -= extra;
+  }
+  expect(remaining).toBe(0);
+  return raw;
+}
 describe("request timeline evidence contract", () => {
+  it("rejects a bounded input whose normalized defaults exceed the byte budget", () => {
+    const raw = largeTrace(146);
+    expect(byteSize(raw)).toBeLessThan(MAX_TRACE_BYTES);
+    expect(() => normalizeWaterfallSpec(raw)).toThrow(/exceeds 262144 bytes/);
+  });
   it("keeps real sibling parents and counts HTTP rather than route layers", () => {
     const spec = normalizeWaterfallSpec(sample());
     expect(traceSummary(spec)).toEqual({
@@ -100,6 +129,22 @@ describe("request timeline evidence contract", () => {
   });
 });
 describe("independent Web and PNG outputs", () => {
+  it.each(["web", "both", "image"])("rejects %s before export if its final visual ID exceeds the byte budget", async (output) => {
+    vi.mocked(exportMarkdownVisualsWithVisualExportWeb).mockClear();
+    const raw = traceAtNormalizedSize(MAX_TRACE_BYTES - 20);
+    expect(byteSize(normalizeWaterfallSpec(raw))).toBe(MAX_TRACE_BYTES - 20);
+    await expect(handleRenderChart({ ...raw, output })).rejects.toThrow(/exceeds 262144 bytes/);
+    expect(exportMarkdownVisualsWithVisualExportWeb).not.toHaveBeenCalled();
+  });
+  it("round-trips a final attachment exactly at the byte limit through the Portal reader", async () => {
+    const idBytes = byteSize({ visual_id: `waterfall-${"0".repeat(36)}` }) - 1;
+    const result = await handleRenderChart({ ...traceAtNormalizedSize(MAX_TRACE_BYTES - idBytes), output: "web" });
+    const visual = result.structuredContent!.visuals[0];
+    expect(byteSize(visual.spec)).toBe(MAX_TRACE_BYTES);
+    const [attachment] = traceAttachments({ structuredContent: result.structuredContent });
+    expect(attachment.spec).toEqual(visual.spec);
+    expect(attachment.error).toBeUndefined();
+  });
   it("Web works with no exporter, stable IDs and no copied fence", async () => {
     vi.mocked(exportMarkdownVisualsWithVisualExportWeb).mockClear();
     const result = await handleRenderChart({ ...sample(), output: "web" });

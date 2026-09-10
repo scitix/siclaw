@@ -48,6 +48,7 @@ if (si >= 0) {
 if (si >= 0) {
   for (const [from, to] of [
     ["trace-attachments.ts", "trace-attachments.ts"],
+    ["trace-navigation.ts", "trace-navigation.ts"],
     ["trace-locale.ts", "trace-locale.ts"],
     ["trace-timeline.css", "trace-timeline.css"],
     ["TraceContext.tsx", "trace-context.tsx"],

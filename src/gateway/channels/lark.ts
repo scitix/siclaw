@@ -3145,6 +3145,7 @@ export async function collectChannelResponse(
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
   const visualLinks: string[] = [];
+  const seenVisualLinks = new Set<string>();
   const seenImageKeys = new Set<string>();
   // Track the latest assistant turn so we only reply with the *final* text
   // (tool-use turns emit intermediate message_end events that aren't meant
@@ -3374,6 +3375,11 @@ export async function collectChannelResponse(
         if (groupActivities.delete(toolKey(ev, ev.toolName || ev.name || "tool"))) publishActivity();
         if (ev.toolCallId) progressToolNames.delete(ev.toolCallId);
         if (options.includeImages) collectImageAttachments(ev.result?.content, images, seenImageKeys);
+        // Hosted conversation events are relayed after the destination Runtime
+        // persists the tool result. Raw AgentBox events cannot supply this identity.
+        let toolMessageId = client.conversationEvents && typeof ev.dbMessageId === "string"
+          ? ev.dbMessageId : null;
+        const detailsMetadata = persistableToolDetails(ev.result?.details, redact);
         if (persist) {
           const name = (ev.toolName as string) || (ev.name as string) || "tool";
           const resultText = Array.isArray(ev.result?.content)
@@ -3390,9 +3396,9 @@ export async function collectChannelResponse(
           const toolset = shiftQ(toolsets, key) ??
             (typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
           const roundMeta = shiftQ(toolRounds, key) ?? timeline.toolMetadata(ev);
-          const metadata: Record<string, unknown> = { ...persistableToolDetails(ev.result?.details, redact), ...roundMeta };
+          const metadata: Record<string, unknown> = { ...detailsMetadata, ...roundMeta };
           if (startedAt != null) metadata.started_at = new Date(startedAt).toISOString();
-          const toolMessageId = await persistRow({
+          toolMessageId = await persistRow({
             sessionId,
             role: "tool",
             content: redact(resultText),
@@ -3403,11 +3409,14 @@ export async function collectChannelResponse(
             durationMs: start ? toolDurationMs(start, endedAt) : null,
             metadata: Object.keys(metadata).length > 0 ? metadata : null,
           });
-          if (toolMessageId && options.includeImages) {
-            for (const visualId of traceVisualIds(metadata)) {
-              const link = await getVisualLink(sessionId, toolMessageId, visualId);
-              if (link && !visualLinks.includes(link)) visualLinks.push(link);
-            }
+        }
+        if (toolMessageId && options.includeImages) {
+          for (const visualId of traceVisualIds(detailsMetadata)) {
+            const key = JSON.stringify([toolMessageId, visualId]);
+            if (seenVisualLinks.has(key)) continue;
+            seenVisualLinks.add(key);
+            const link = await getVisualLink(sessionId, toolMessageId, visualId);
+            if (link && !visualLinks.includes(link)) visualLinks.push(link);
           }
         }
       }

@@ -52,7 +52,6 @@ export function TraceTimelineRenderer({
     [exportError, setExportError] = useState(false),
     [exporting, setExporting] = useState(false)
   const svgRef = useRef<SVGSVGElement>(null),
-    container = useRef<HTMLDivElement>(null),
     dialog = useRef<HTMLDialogElement>(null)
   const detailsId = useId()
   useEffect(() => {
@@ -62,16 +61,11 @@ export function TraceTimelineRenderer({
   useEffect(() => {
     if (
       spec.visual_id &&
-      new URLSearchParams(window.location.search).get("visual") ===
-        spec.visual_id
+      host.requestedVisualId === spec.visual_id
     ) {
       setExpanded(true)
-      const frame = requestAnimationFrame(() =>
-        container.current?.scrollIntoView({ block: "start" }),
-      )
-      return () => cancelAnimationFrame(frame)
     }
-  }, [spec.visual_id])
+  }, [spec.visual_id, host.requestedVisualId])
   const body = (
     <TraceTimeline
       spec={spec}
@@ -115,7 +109,6 @@ export function TraceTimelineRenderer({
   )
   return (
     <div
-      ref={container}
       className={`trace-card chart-host relative my-3 min-w-0 w-full rounded-lg border border-border bg-card p-3 ${expanded ? "" : "max-w-2xl"} ${className ?? ""}`}
       style={style}
       data-visual-id={spec.visual_id}

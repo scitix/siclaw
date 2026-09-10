@@ -85,11 +85,12 @@ const bindMessageTraceIdMock = vi.fn();
 
 const recordChannelFeedbackMock = vi.fn();
 const updateMessageMock = vi.fn();
+const getVisualLinkMock = vi.fn();
 
 vi.mock("../chat-repo.js", () => ({
   validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
   warnTraceBindFailure: vi.fn(),
-  getVisualLink: vi.fn(async () => "https://console.example/siclaw/chat?agent=a1&session=s1&visual=waterfall-one"),
+  getVisualLink: (...args: unknown[]) => getVisualLinkMock(...args),
   ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
   bindMessageTraceId: (...args: unknown[]) => bindMessageTraceIdMock(...args),
@@ -273,6 +274,7 @@ beforeEach(() => {
   resolveAgentModelBindingMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
+  getVisualLinkMock.mockReset().mockResolvedValue("https://console.example/siclaw/chat?agent=a1&session=s1&visual=waterfall-one");
   bindMessageTraceIdMock.mockReset();
   bindMessageTraceIdMock.mockResolvedValue(undefined);
   resolveAgentModelBindingMock.mockResolvedValue(null);
@@ -4287,6 +4289,38 @@ describe("collectChannelResponse — audit persistence", () => {
     const result=await collectChannelResponse(fakeClient(events), "s1", "lark", {includeImages:true,persist:{agentId:"a1"}});
     expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({role:"tool",metadata:details}));
     expect(result.images).toEqual([]); expect(result.visualLinks).toHaveLength(1);
+  });
+
+  it.each(["tool_execution_end", "tool_end"])("collects hosted links from %s without writing the transcript again", async (type) => {
+    const event = { type, dbMessageId: "remote-tool-row", toolName: "render_chart", result: {
+      content: [], details: { structuredContent: { schema_version: 2, visuals: [{
+        visual_id: "waterfall-one", kind: "chart", spec: { type: "waterfall", visual_id: "waterfall-one" },
+      }] } },
+    } };
+    const client = { ...fakeClient([event, event, {
+      type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Upstream wait." }] },
+    }]), conversationEvents: true };
+    const result = await collectChannelResponse(client, "remote-session", "lark", { includeImages: true });
+    expect(result.text).toBe("Upstream wait.");
+    expect(result.visualLinks).toHaveLength(1);
+    expect(getVisualLinkMock).toHaveBeenCalledExactlyOnceWith("remote-session", "remote-tool-row", "waterfall-one");
+    expect(appendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { conversationEvents: true, dbMessageId: undefined, includeImages: true },
+    { conversationEvents: false, dbMessageId: "untrusted-row", includeImages: true },
+    { conversationEvents: true, dbMessageId: "remote-row", includeImages: false },
+  ])("does not request links without a trusted persisted row and channel opt-in: %j", async (options) => {
+    const client = { ...fakeClient([{ type: "tool_execution_end", dbMessageId: options.dbMessageId, result: {
+      details: { structuredContent: { schema_version: 2, visuals: [{
+        visual_id: "waterfall-one", kind: "chart", spec: { type: "waterfall", visual_id: "waterfall-one" },
+      }] } },
+    } }]), conversationEvents: options.conversationEvents };
+    const result = await collectChannelResponse(client, "s1", "lark", { includeImages: options.includeImages });
+    expect(result.visualLinks).toEqual([]);
+    expect(getVisualLinkMock).not.toHaveBeenCalled();
+    expect(appendMessageMock).not.toHaveBeenCalled();
   });
 
   it("persists every assistant turn + each tool call when persist is set", async () => {
