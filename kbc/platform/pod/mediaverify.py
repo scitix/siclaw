@@ -194,8 +194,8 @@ async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict,
     system, user = _transcribe_prompts(locale)
     data = await _agent_json(
         engine, stage="transcribe", system=system,
-        user=user.format(img=f"raw/{img_rel}"),
-        model=_transcribe_model(), cwd=raw_dir, roots=[raw_dir],
+        user=user.format(img=str(img_path.resolve())),
+        model=_transcribe_model(), role="transcribe", cwd=raw_dir, roots=[raw_dir],
         timeout=float(_env("KBC_MV_TRANSCRIBE_TIMEOUT", "240")))
     if not isinstance(data, dict):
         return None
@@ -218,7 +218,7 @@ async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
         engine, stage="compare", system=system,
         user=user.format(page=page_rel, page_text=page_text[:24000],
                          transcripts_json=json.dumps(transcripts, ensure_ascii=False)),
-        model=_compare_model(), cwd=tmp_dir, roots=[tmp_dir],
+        model=_compare_model(), role="compare", cwd=tmp_dir, roots=[tmp_dir],
         timeout=float(_env("KBC_MV_COMPARE_TIMEOUT", "300")))
     findings = data.get("findings") if isinstance(data, dict) else None
     out = []

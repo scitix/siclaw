@@ -88,7 +88,7 @@ docker-ocr: ## Build OCR backend image
 	docker build -f Dockerfile.ocr $(DOCKER_LABELS) -t $(OCR_IMAGE) .
 
 docker-kbc: ## Build KB compile-box image siclaw-kbc-box (spawned per compile run; helm agentbox.compileBoxEnabled derives this tag)
-	cd kbc && docker build -f platform/pod/Dockerfile $(DOCKER_LABELS) -t $(KBC_IMAGE) .
+	docker build -f kbc/platform/pod/Dockerfile $(DOCKER_LABELS) -t $(KBC_IMAGE) .
 
 push: push-runtime push-agentbox push-portal push-ocr push-kbc ## Push all images to registry
 

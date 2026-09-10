@@ -36,13 +36,12 @@ describe("getBoxProfile", () => {
     expect(p.allowedTools).toBeNull();
   });
 
-  it("kb-compile-codex → compile shape plus the declared Bubblewrap requirement", () => {
+  it("historical compiler profile IDs rebuild with the Pi compile boundary", () => {
     const compile = getBoxProfile("kb-compile");
     const codex = getBoxProfile("kb-compile-codex");
     expect(codex).toMatchObject({
       ...compile,
       name: "kb-compile-codex",
-      nestedSandbox: "bubblewrap",
     });
   });
 

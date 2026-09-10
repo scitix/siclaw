@@ -1,9 +1,13 @@
-# platform/pod — compile box (Claude Agent SDK / Codex SDK + kbc brain)
+# platform/pod — Pi compiler harness
 
-The siclaw platform's **compile box**: runs the kbc compile brain as a **Claude Agent SDK** persistent session = a "headless
-Claude Code with a wrapped entry point". The engine / tools / compact are not rewritten by a single line; it only adds structured-signal tools for the kbc moat.
-Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to start it per BoxProfile
-(`kb-compile` / `kb-test`), and events are translated by the runtime into the generic `capability.*` and forwarded to consumers (a downstream platform, etc.).
+The compile box runs every compiler and verifier session through Siclaw's shared
+Pi execution core. Python owns the KB workflow, tools, durable workspace, quality
+gates and recovery; a private Node worker owns the Pi SDK session. No Claude Agent
+SDK or Codex SDK is installed. The ordinary Siclaw agent uses the same Pi session
+assembly while retaining its own prompts, tools and application services.
+
+The Runtime starts a dedicated box per capability run and relays its HTTP/SSE
+contract into `capability.*`. See [execution and rollout design](../../../docs/design/2026-09-10-pi-kbc-execution.md).
 
 ## Two forms (same brain)
 
@@ -17,7 +21,7 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
   - `GET  /events/{run_id}` → SSE structured events: `session` / `log` / `summary` / `turn_done` / `syncArtifacts` / `plan_proposed` / `error` / `end`
   - `POST /test-session/{run_id}` → **start a test session**: pin the parent run's current draft (`candidate/`) into an immutable snapshot + start a read-only consumer session (reuses this pod, zero new infra); returns `test_session_id` + `snapshot_hash` + `pages`
   - `POST /test-message/{tid}` / `GET /test-events/{tid}` / `POST /test-session/{tid}/close` → the test session's inject / live-stream / teardown
-  - `GET  /health` → `{status, runs, test_sessions}`
+  - `GET  /health` → `{status, runs, test_sessions, engine: "pi_agent"}`
 
   The moat relies on custom tools that let the agent **signal explicitly** (rather than guessing from output):
   `report_summary`→`summary`, `propose_plan`→`plan_proposed`,
@@ -37,39 +41,31 @@ The linear-wizard mode adds two pure-contract enhancements to the box (design: i
 - **`compile_agent.py` (one-shot, local debugging)** — a one-off `query()`: reads `workdir/drop/`+`constitution.md`→compiles→writes
   `workdir/bundle/`, no HTTP. Used to quickly verify "the brain can compile inside the container".
 
-## Run (local, subscription auth)
+## Local and container execution
+
+Build from the Siclaw repository root so the Node stage includes the shared core:
 
 ```bash
-# kbc repo root — one-shot form
-mkdir -p /tmp/wd/drop && cp drop/example-kb/*.md /tmp/wd/drop/ && cp constitution.md /tmp/wd/
-platform/pod/.venv/bin/python platform/pod/compile_agent.py --workdir /tmp/wd
+npm ci
+npm run build
+python3 -m venv /tmp/kbc-venv
+/tmp/kbc-venv/bin/pip install -r kbc/platform/pod/requirements.txt
+/tmp/kbc-venv/bin/python kbc/platform/pod/compile_agent.py --workdir /tmp/wd --config /private/path/execution.json
 
-# served form + protocol smoke test (fake driver, does not burn LLM)
-platform/pod/.venv/bin/python platform/pod/test_compile_box.py
+docker build -f kbc/platform/pod/Dockerfile -t siclaw-kbc-box:development .
+docker run --rm -p 3000:3000 -v /tmp/wd:/work siclaw-kbc-box:development
 ```
 
-## Run (container, production form)
-
-```bash
-docker build -f platform/pod/Dockerfile -t siclaw-kbc-box .
-docker run --rm -p 3000:3000 \
-  -e ANTHROPIC_BASE_URL=https://<model-proxy>/ \   # key is injected on the proxy side
-  -v /tmp/wd:/work \
-  siclaw-kbc-box
-# then:
-#   POST :3000/sources {"run_id":"r1","bundle_base64":"...","bundle_sha256":"..."}
-# or for Source Snapshot v2/v3:
-#   POST :3000/sources/begin  {"run_id":"r1","input_revision":"...","snapshot":{...}}
-#   POST :3000/sources/part   {"run_id":"r1","input_revision":"...","part_id":"part-000001","bundle_base64":"..."}
-#   POST :3000/sources/commit {"run_id":"r1","input_revision":"..."}
-#   POST :3000/authoring {"run_id":"r1","bundle_base64":"...","bundle_sha256":"..."}
-#   POST :3000/session/r1 {"instruction":"..."}
-#   POST :3000/message/r1 {"message":"compile raw/ into candidate pages"} → GET :3000/events/r1 (SSE)
-```
+`execution.json` contains the private execution object described below. It is an
+explicit local input and must not be committed. The served form receives this
+object in `/session/{run_id}` as `llm: {engine: "pi_agent", execution: ...}` along
+with the resolved `settings`. Upload `/sources` and `/authoring` first, then create
+the session and send `/message` or `/command`. Connecting alone never calls a model.
 
 ## Auth / mTLS
 
-- **LLM**: locally reuses the `~/.claude` subscription (no key needed). In production the consumer's whole `llm` block is authoritative; only when it is absent does Runtime send its Helm `ANTHROPIC_*` fallback in the authenticated `/session` body. Runtime credentials are never merged into a consumer block or copied into the KB PodSpec. A live SDK client keeps its session-start credential until the documented grace-window + box-respawn rotation.
+- **LLM**: the control plane resolves a complete version-1 execution object with five roles: `compile`, `blue`, `judge`, `transcribe`, `compare`. Each role supplies its model descriptor (`id`, `name`, `provider`, `api`, `baseUrl`, `input`, `reasoning`, `contextWindow`, `maxTokens`), API key, reasoning level and optional authentication/header policy. Ordinary Anthropic, OpenAI Chat Completions and Responses providers are supported. Role providers and credentials may differ. The SDK does not discover user settings, subscription sessions or environment credentials. The payload travels privately to the worker over stdin and is never placed in PodSpec or diagnostic records.
+- **Configuration and recovery**: the control plane freezes the model descriptors, credential references and compiler settings per authoring attempt. Recovery rehydrates that snapshot and resolves only its credential references again, allowing credential rotation. Active sessions retain their original configuration. New/rebuilt sessions require Pi configuration; historical policy remains visible until its owner explicitly saves Pi models in knowledge settings.
 - **Transport**: if `tls.crt/tls.key/ca.crt` exist under `SICLAW_CERT_PATH` (default `/etc/siclaw/certs`), the box serves HTTPS. `/health` remains certificate-optional for the in-container Kubernetes probe; every data/session/event route requires a verified client certificate whose OU is `Runtime` or `Gateway`. Partial TLS material fails startup. Without TLS material the server uses HTTP for explicit local development only.
 
 ## Layer-1 self-check: coverage ledger + lint (`selfcheck.py`)
@@ -80,22 +76,24 @@ The completion criterion moves from "the model certifies itself" to "code verifi
 - **Standalone package citations**: a direct-import producer may add root `.okf-citations.json` (`schema_version: 1`) mapping those exact resources to clean Feishu `/wiki/{token}` or `/file/{token}` URLs. The import service treats it as untrusted input and freezes validated mappings on the package version. Runtime materialization drops the uploaded copy; the model receives only the server-owned citation manifest.
 - **Check**: at each turn end, when the candidate state changed (idempotency key = candidate tree + EXCLUSIONS content) and `candidate/index.md` exists, mechanically verify "all raw text sources = union of `sources[].resource` + EXCLUSIONS matches" and run OKF v0.2 metadata/lint checks (missing provenance / broken links) plus high-confidence credential exposure. Credential findings carry only the credential kind and line number, never the matched value; normal internal names, addresses, URLs, and prose are not external-content-redacted. The result is written to `authoring/SELFCHECK.json` (synced to the consumer with the workspace, consumed by the publish card), with a one-line narration on the `summary` event.
 - **Repair**: `turn_done` still fires as usual (the never-stuck invariant holds); when something is unaccounted, a bounded repair instruction is injected (`KBC_L1_REPAIR_ROUNDS`, default 1). The budget is **per gap-episode** — it resets each time coverage closes, so a long restructuring compile that reopens and re-closes gaps can trigger repeated rounds (each episode still terminates; the count is not bounded over the whole run). Once the budget for the current episode is spent the report is marked `unconverged` and the rest is left to the owner. Fail-open throughout.
-- **Engine-neutral**: selfcheck.py is pure stdlib with zero SDK dependency; the driver only provides "when to trigger" plus one injection seam, `CompileRun.inject_user_message()` — swapping engines (e.g. Codex) only reimplements this one method.
+- **Engine-neutral**: selfcheck.py is pure stdlib with zero SDK dependency; the driver only provides "when to trigger" plus one injection seam, `CompileRun.inject_user_message()` — the Pi transport supplies this seam without changing the quality-gate rules.
 
 ## Layer-2 self-check: red-blue PK (`redblue.py` + `engine.py`)
 
-An asymmetric "one writer, many examiners" design: the **judge** (strong tier, reads raw + snapshot, `KBC_PK_JUDGE_MODEL` default claude-opus-4-6) surveys the question surface → writes questions (with variants, prioritizing conflict / WIP / boundary + flagged tickets) → grades with four-category attribution (coverage / routing / contract / medium; "correctly said not-covered" = pass); the **blue team** (gate tier = production consumer tier, `KBC_PK_BLUE_MODEL` default claude-sonnet-4-6, persona = TEST_ROLE, single-sourced) reads only the pinned wiki snapshot, with raw mechanically blocked by multi-root path guards.
+An asymmetric "one writer, many examiners" design: the **judge** (strong tier, reads raw + snapshot, the frozen `judge` role) surveys the question surface → writes questions (with variants, prioritizing conflict / WIP / boundary + flagged tickets) → grades with four-category attribution (coverage / routing / contract / medium; "correctly said not-covered" = pass); the **blue team** (gate tier = production consumer tier, the frozen `blue` role, persona = TEST_ROLE, single-sourced) reads only the pinned wiki snapshot, with raw mechanically blocked by multi-root path guards.
 
 - **Orchestration is all in code** (redblue.py): question budget = clamp(8, pages×1.5, 40); the question surface is cached by raw fingerprint (`authoring/PK_SURVEY_CACHE.json`); chunked answering/grading (`KBC_PK_CHUNK=5`, concurrency `KBC_PK_CONCURRENCY=2`); a targeted-retest primitive (`questions_override`); a global wall clock `KBC_PK_WALL_SECS=1800`; any stage's bad JSON is retried once, then fails open (state=failed, never raises).
-- **Engine-neutral** (engine.py): the `ReadonlyAgentEngine` Protocol is the only engine surface; structured output = text JSON + lenient parse (deliberately not SDK tool-forcing); swapping to a Codex base = adding one adapter, with model/effort as plain string knobs.
-- **S0 calibration runner = this module**: `python redblue.py --raw <dir> (--workdir <dir>|--wiki <dir>) [--questions N] [--retest last-result.json] [--out pk-result.json]` — offline calibration runs the exact production pipeline. Results are written to the `pk` section of SELFCHECK.json (single write point `selfcheck.update_pk_section`; an L1 re-check never wipes it).
+- **Engine-neutral** (engine.py): the `ReadonlyAgentEngine` Protocol is the only engine surface; structured output = text JSON + lenient parse (deliberately not SDK tool-forcing); its Pi implementation receives explicit role configuration and root-confined tools.
+- **S0 calibration runner = this module**: `python redblue.py --config /private/path/execution.json --raw <dir> (--workdir <dir>|--wiki <dir>) [--questions N] [--retest last-result.json] [--out pk-result.json]` — offline calibration runs the exact production pipeline. Results are written to the `pk` section of SELFCHECK.json (single write point `selfcheck.update_pk_section`; an L1 re-check never wipes it).
 - **Wiring pending S0 sign-off**: compile_box's automatic trigger (background run after L1 passes + repair injection + staleness detection) is wired in per design doc §9.4 once calibration passes.
 
-## Boundaries / next steps
+## Execution boundaries
 
-- **resume**: the session does not survive a box restart (`InMemorySessionStore`); the runtime side falls back on "re-hydrate a cold box" (re-materialize raw + durable workspace), with SDK `resume` + a file-backed `session_store` as a later increment.
-- **Codex writer isolation**: native shell/file tools run under the `kbc_writer` permission profile, which exposes only platform-minimal system files, the pinned Codex runtime, the current workspace, and its isolated shell home; network access and unified exec are disabled.
-- **Codex Linux host prerequisite**: writer runs use the dedicated `kb-compile-codex` Runtime profile. It permits the installed `bubblewrap` to create user, PID, and network namespaces while ordinary AgentBoxes, Claude `kb-compile`, and read-only `kb-test` boxes retain the outer RuntimeDefault policy. The writer runs a namespace/mount preflight before contacting the model; failure is explicit and never falls back to `full_access` or an unsandboxed shell.
-- **test session isolation**: the immutable snapshot is also the mechanical read boundary. Claude receives the exact effective `Read/Glob/Grep` subset plus a path guard; Codex disables native shell/file tools and exposes the same effective subset through root-confined KBC MCP tools. The effective contract is included in the consumer fingerprint.
-- Test-session cap `KBC_MAX_TEST_SESSIONS` (default 3), snapshots land in `KBC_TEST_SNAPSHOT_ROOT` (default `/tmp/kbc-tests`), destroyed on close.
-- `KBC_SMOKE=1` → fake driver (does not call the LLM), verifies the box↔runtime↔consumer wiring (events + artifact sync) for free in the cluster.
+- Pi supplies no built-in tools. Compiler sessions register KBC-owned Read/Write/Edit/Glob/Grep and structured KB tools. Read-only helpers receive only their profile's tools and roots. Bash, subagents, external browsing and arbitrary process execution are absent.
+- PDF Read renders at most 20 explicitly selected pages and applies the existing Raw slice guard. Text, image, search output, subprocess time and transport buffers are bounded. Office parsing and source provenance remain in the existing host pipeline.
+- Retry, model-call budget, watchdog, cancellation and checkpoint ACK belong to the KBC harness. Worker EOF, abort, transport failure and provider failure never imply successful compilation. A replacement resumes from the durable workspace/checkpoint; it does not restore an in-memory reasoning transcript.
+- The resolved model window bounds source batching, text slicing, PDF slicing and reduction. Planning reserves fixed instructions, output capacity and room for subsequent tool results. A model too small for the compiler is rejected during configuration.
+- Execution observations include model-envelope identity, role/session/turn, latency, usage, tool activity and classified outcomes. They omit prompts, tool arguments/results, response bodies and credentials. Bounded asynchronous forwarding prevents diagnostics from delaying artifact ACK or turn completion; queue loss is reported explicitly.
+- Historical `kb-compile-codex` profile IDs remain readable. New boxes for those IDs use the same Pi permissions. A live old-image session stays attached; an empty old-image box is replaced only after its Pi configuration and source revision resolve.
+- Test-session cap `KBC_MAX_TEST_SESSIONS` defaults to 3. Snapshots live under `KBC_TEST_SNAPSHOT_ROOT` (default `/tmp/kbc-tests`) and are removed on close.
+- `KBC_SMOKE=1` uses a fake driver for HTTP/SSE and artifact wiring without calling a model.

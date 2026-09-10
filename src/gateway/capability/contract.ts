@@ -29,6 +29,7 @@ export const CAPABILITY_START = "capability.start" as const;
 export const CAPABILITY_MESSAGE = "capability.message" as const;
 export const CAPABILITY_COMMAND = "capability.command" as const;
 export const CAPABILITY_CANCEL = "capability.cancel" as const;
+export const CAPABILITY_PERSIST_EXECUTION_OBSERVATION = "capability.persistExecutionObservation" as const;
 
 /**
  * Consumer → siclaw: read-only TEST SESSION over a run's pinned draft snapshot
@@ -541,13 +542,31 @@ export interface CapabilityFetchInputRequest {
  */
 export interface CapabilityLlmConfig {
   /** Agent harness selected by the consumer; absent preserves Claude compatibility. */
-  engine?: "claude_agent_sdk" | "codex_sdk";
+  engine?: "claude_agent_sdk" | "codex_sdk" | "pi_agent";
   /** Wire protocol expected by the selected engine/model provider. */
-  protocol?: "anthropic" | "openai_responses";
+  protocol?: "anthropic" | "openai_responses" | "openai_compatible" | "codex_responses";
   base_url?: string;
   auth_token?: string;
   api_key?: string;
   model?: string;
+  /** Complete role contracts. Credentials stay in this private setup payload. */
+  execution?: {
+    version: 1;
+    roles: Record<string, {
+      model: {
+        id: string; name: string; provider: string; api: string; baseUrl: string;
+        reasoning: boolean; input: Array<"text" | "image">;
+        contextWindow: number; maxTokens: number;
+        cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+        compat?: Record<string, unknown>;
+        thinkingLevelMap?: Record<string, string>;
+      };
+      api_key: string;
+      auth_header?: boolean;
+      thinking_level?: string;
+      headers?: Record<string, string | null>;
+    }>;
+  };
 }
 
 export interface CapabilityFetchInputResponse {

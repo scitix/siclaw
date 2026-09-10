@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { driveCapabilitySession } from "./session-driver.js";
+import { CapabilityRunManager } from "./run-manager.js";
 import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS } from "./contract.js";
 
 // Fake box client that yields a fixed sequence of box events over streamPath.
@@ -32,6 +33,22 @@ function fakeManager() {
 const emits = (fe: any) => fe.emitEvent.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_EVENT).map((c: any[]) => c[1]);
 
 describe("driveCapabilitySession — box event → capability wire mapping", () => {
+  it("a recoverable provider failure retains the real run for the owner's next turn", async () => {
+    const fe = fakeFrontend();
+    const manager = new CapabilityRunManager(fe);
+    const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+    await driveCapabilitySession({ client: fakeClient([
+      { type: "error", recoverable: true, code: "model_request_failed", message: "Retry this turn" },
+      { type: "turn_done", text: "Retry this turn" },
+    ]), runId, frontendClient: fe, manager });
+    expect(manager.get(runId)?.status).toBe("idle");
+    expect(manager.get(runId)?.correlationId).toBe("attempt");
+    expect(emits(fe).some((event: any) => event.type === "lifecycle")).toBe(false);
+    await manager.setStatus(runId, "running");
+    expect(manager.get(runId)?.status).toBe("running");
+    expect(fe.request.mock.calls.some(([, p]: any[]) => p?.status === "failed")).toBe(false);
+  });
+
   it("requests workspace replay only when re-attaching to a live box", async () => {
     const paths: string[] = [];
     const client = {

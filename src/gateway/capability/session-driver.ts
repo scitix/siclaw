@@ -29,6 +29,7 @@ import {
   isTerminalCapabilityStatus,
 } from "./contract.js";
 import { structuredBoxFailure } from "./failure.js";
+import { ExecutionObservationRelay, type ExecutionObservation } from "./execution-observation.js";
 
 interface BoxEvent {
   type: string;
@@ -42,6 +43,8 @@ interface BoxEvent {
   text?: string;
   /** Owner-facing error text only — never logs/checkpoint. */
   error?: string;
+  /** Only this owner turn failed; the connected session can accept another. */
+  recoverable?: boolean;
   /** `deleted` entries are tombstones — the box removed a previously-synced file. */
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
   /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
@@ -58,6 +61,7 @@ interface BoxEvent {
   /** Exception type name token only. */
   exception_class?: string;
   reason?: string;
+  observation?: ExecutionObservation;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -87,166 +91,183 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   // reaps a healthy run and kills its box. It is deliberately NOT touch(): a box
   // that ONLY heartbeats (a wedged turn) must still be reaped at dataStaleMs.
   const eventPath = `/events/${runId}${opts.replayWorkspace ? "?replay=1" : ""}`;
-  for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
-    const evt = raw as BoxEvent;
-    // ANY box event means the box is alive → bump activity so the watchdog never
-    // reaps an actively-working run (e.g. a long compile emitting only `log`).
-    // touch() is in-memory only (no persist), so it is cheap to call every event.
-    manager.touch(runId);
-    if (evt.type === "error") {
-      // Log only the safe contract fields — never evt.error (may hold paths /
-      // provider fragments). Production triage previously saw only "error".
-      const safe = structuredBoxFailure(evt);
-      console.error(
-        `[capability] run=${runId} box event: error` +
-          ` code=${safe.code} stage=${safe.stage}` +
-          ` exception_class=${safe.exception_class ?? "-"}` +
-          ` last_sdk_message=${safe.last_sdk_message ?? "-"}` +
-          ` message=${truncateForLog(safe.message ?? "")}`,
-      );
-    } else {
-      console.log(`[capability] run=${runId} box event: ${evt.type}`);
-    }
-    switch (evt.type) {
-      case "log":
-        emit("log", { text: evt.text ?? "" });
-        break;
-      case "summary":
-        emit("summary", { text: evt.summary ?? "" });
-        break;
-      case "turn_done":
-        // A conversational/compile turn ended. Surface the reply LIVE, then persist
-        // it durably (the frontend renders from a DB refetch, not the live frame) —
-        // this is the generalization of compile.assistantTurn. The run is now idle
-        // (awaiting the next turn) — NOT terminal.
-        emit("turn", { text: evt.text ?? "" });
-        try {
-          const turn: CapabilityPersistTurnRequest = { run_id: runId, text: evt.text ?? "" };
-          await frontendClient.request(CAPABILITY_PERSIST_TURN, turn);
-        } catch (err) {
-          console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
-        }
-        await manager.setStatus(runId, "idle");
-        break;
-      case "syncArtifacts":
-        // One box sync event is one consumer transaction. Keep retrying the
-        // SAME batch until acknowledged; consuming later turn_done/done frames
-        // before its workspace is durable would expose a torn draft.
-        {
-          const artifacts = (evt.artifacts ?? []).flatMap((a) => {
-            if (!a || typeof a.path !== "string" || !a.path) {
-              console.error(`[capability] run=${runId} malformed artifact entry skipped`);
-              return [];
-            }
-            if (!a.deleted && a.content !== undefined && typeof a.content !== "string") {
-              console.error(`[capability] run=${runId} malformed artifact entry (${a.path}) skipped`);
-              return [];
-            }
-            return [a.deleted
-              ? { path: a.path, deleted: true }
-              : {
-                  path: a.path,
-                  content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
-                }];
-          });
-          const inputRevision = manager.get(runId)?.inputRevision?.trim();
-          const commitInput = evt.commit_input === true && Boolean(inputRevision);
-          if (evt.commit_input && !commitInput) {
-            const warning =
-              "Source provenance was not advanced because this run has no pinned input revision. Any artifact changes will be saved without committing the input baseline; start a new compile run after source materialization recovers.";
-            console.error(`[capability] run=${runId} commit_input downgraded to content-only persistence: missing input revision`);
-            emit("summary", { text: warning });
+  const observations = new ExecutionObservationRelay(frontendClient, runId, () => {
+    emit("summary", { text: "Some execution diagnostics could not be saved. Compilation continues; its artifact checkpoints remain authoritative." });
+  });
+  try {
+    for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
+      const evt = raw as BoxEvent;
+      // ANY box event means the box is alive → bump activity so the watchdog never
+      // reaps an actively-working run (e.g. a long compile emitting only `log`).
+      // touch() is in-memory only (no persist), so it is cheap to call every event.
+      manager.touch(runId);
+      if (evt.type === "error") {
+        // Log only the safe contract fields — never evt.error (may hold paths /
+        // provider fragments). Production triage previously saw only "error".
+        const safe = structuredBoxFailure(evt);
+        console.error(
+          `[capability] run=${runId} box event: error` +
+            ` code=${safe.code} stage=${safe.stage}` +
+            ` exception_class=${safe.exception_class ?? "-"}` +
+            ` last_sdk_message=${safe.last_sdk_message ?? "-"}` +
+            ` message=${truncateForLog(safe.message ?? "")}`,
+        );
+      } else {
+        console.log(`[capability] run=${runId} box event: ${evt.type}`);
+      }
+      switch (evt.type) {
+        case "execution_observation":
+          observations.enqueue(evt.observation);
+          break;
+        case "log":
+          emit("log", { text: evt.text ?? "" });
+          break;
+        case "summary":
+          emit("summary", { text: evt.summary ?? "" });
+          break;
+        case "turn_done":
+          // A conversational/compile turn ended. Surface the reply LIVE, then persist
+          // it durably (the frontend renders from a DB refetch, not the live frame) —
+          // this is the generalization of compile.assistantTurn. The run is now idle
+          // (awaiting the next turn) — NOT terminal.
+          emit("turn", { text: evt.text ?? "" });
+          try {
+            const turn: CapabilityPersistTurnRequest = { run_id: runId, text: evt.text ?? "" };
+            await frontendClient.request(CAPABILITY_PERSIST_TURN, turn);
+          } catch (err) {
+            console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
           }
-          if (artifacts.length === 0 && !commitInput) break;
-          const request: CapabilityPersistArtifactsRequest = {
-            run_id: runId,
-            ...(inputRevision ? { input_revision: inputRevision } : {}),
-            ...(commitInput ? { commit_input: true } : {}),
-            artifacts,
-          };
-          let delayMs = 250;
-          for (;;) {
-            try {
-              await frontendClient.request(CAPABILITY_PERSIST_ARTIFACTS, request);
-              break;
-            } catch (err) {
-              const rec = manager.get(runId);
-              if (!rec || isTerminalCapabilityStatus(rec.status)) {
-                throw new Error(
-                  `persistArtifacts retry aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
-                );
+          await manager.setStatus(runId, "idle");
+          break;
+        case "syncArtifacts":
+          // One box sync event is one consumer transaction. Keep retrying the
+          // SAME batch until acknowledged; consuming later turn_done/done frames
+          // before its workspace is durable would expose a torn draft.
+          {
+            const artifacts = (evt.artifacts ?? []).flatMap((a) => {
+              if (!a || typeof a.path !== "string" || !a.path) {
+                console.error(`[capability] run=${runId} malformed artifact entry skipped`);
+                return [];
               }
-              console.error(
-                `[capability] run=${runId} persistArtifacts failed; retrying in ${delayMs}ms:`,
-                err instanceof Error ? err.message : String(err),
-              );
-              await new Promise((resolve) => setTimeout(resolve, delayMs));
-              delayMs = Math.min(delayMs * 2, 5000);
+              if (!a.deleted && a.content !== undefined && typeof a.content !== "string") {
+                console.error(`[capability] run=${runId} malformed artifact entry (${a.path}) skipped`);
+                return [];
+              }
+              return [a.deleted
+                ? { path: a.path, deleted: true }
+                : {
+                    path: a.path,
+                    content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
+                  }];
+            });
+            const inputRevision = manager.get(runId)?.inputRevision?.trim();
+            const commitInput = evt.commit_input === true && Boolean(inputRevision);
+            if (evt.commit_input && !commitInput) {
+              const warning =
+                "Source provenance was not advanced because this run has no pinned input revision. Any artifact changes will be saved without committing the input baseline; start a new compile run after source materialization recovers.";
+              console.error(`[capability] run=${runId} commit_input downgraded to content-only persistence: missing input revision`);
+              emit("summary", { text: warning });
             }
-          }
-          if (evt.sync_id !== undefined) {
-            if (typeof evt.sync_id !== "string" || !evt.sync_id || evt.sync_id.length > 128) {
-              throw new Error(`invalid artifact sync id for run ${runId}`);
-            }
-            // Persistence acknowledgement is a second, idempotent hop back to
-            // KBC. Until it lands, the box must not start the next batch. A WS
-            // reconnect may replay the same sync_id; the control plane upserts atomically
-            // and this endpoint accepts duplicate ACKs.
-            let ackDelayMs = 250;
+            if (artifacts.length === 0 && !commitInput) break;
+            const request: CapabilityPersistArtifactsRequest = {
+              run_id: runId,
+              ...(inputRevision ? { input_revision: inputRevision } : {}),
+              ...(commitInput ? { commit_input: true } : {}),
+              artifacts,
+            };
+            let delayMs = 250;
             for (;;) {
               try {
-                await client.postJson(`/artifacts/ack/${runId}`, { sync_id: evt.sync_id }, 10_000);
+                await frontendClient.request(CAPABILITY_PERSIST_ARTIFACTS, request);
                 break;
               } catch (err) {
                 const rec = manager.get(runId);
                 if (!rec || isTerminalCapabilityStatus(rec.status)) {
                   throw new Error(
-                    `artifact acknowledgement aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
+                    `persistArtifacts retry aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
                   );
                 }
                 console.error(
-                  `[capability] run=${runId} artifact ACK failed; retrying in ${ackDelayMs}ms:`,
+                  `[capability] run=${runId} persistArtifacts failed; retrying in ${delayMs}ms:`,
                   err instanceof Error ? err.message : String(err),
                 );
-                await new Promise((resolve) => setTimeout(resolve, ackDelayMs));
-                ackDelayMs = Math.min(ackDelayMs * 2, 5000);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+                delayMs = Math.min(delayMs * 2, 5000);
+              }
+            }
+            if (evt.sync_id !== undefined) {
+              if (typeof evt.sync_id !== "string" || !evt.sync_id || evt.sync_id.length > 128) {
+                throw new Error(`invalid artifact sync id for run ${runId}`);
+              }
+              // Persistence acknowledgement is a second, idempotent hop back to
+              // KBC. Until it lands, the box must not start the next batch. A WS
+              // reconnect may replay the same sync_id; the control plane upserts atomically
+              // and this endpoint accepts duplicate ACKs.
+              let ackDelayMs = 250;
+              for (;;) {
+                try {
+                  await client.postJson(`/artifacts/ack/${runId}`, { sync_id: evt.sync_id }, 10_000);
+                  break;
+                } catch (err) {
+                  const rec = manager.get(runId);
+                  if (!rec || isTerminalCapabilityStatus(rec.status)) {
+                    throw new Error(
+                      `artifact acknowledgement aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
+                    );
+                  }
+                  console.error(
+                    `[capability] run=${runId} artifact ACK failed; retrying in ${ackDelayMs}ms:`,
+                    err instanceof Error ? err.message : String(err),
+                  );
+                  await new Promise((resolve) => setTimeout(resolve, ackDelayMs));
+                  ackDelayMs = Math.min(ackDelayMs * 2, 5000);
+                }
               }
             }
           }
-        }
-        break;
-      case "done":
-        emit("lifecycle", { status: "done" });
-        await manager.endRun(runId, "done");
-        break;
-      case "error":
-        emit("lifecycle", { status: "failed", error: evt.error ?? "" });
-        // Always persist a structured failure. Bare box errors (error string
-        // only, no code/stage) used to call endRun without a failure object, so
-        // the consumer checkpoint and auto-resume detail were empty.
-        await manager.endRun(runId, "failed", structuredBoxFailure(evt));
-        break;
-      case "end": {
-        // The box's session coroutine exited (clean stream close: max_turns
-        // exhaustion, subprocess EOF). This run can never take another turn —
-        // the box keeps its RUNS entry with a dead client, so every /message
-        // 409s. Left non-terminal it wedges the consumer for the whole idle TTL
-        // (find-or-start only replaces TERMINAL runs) and the watchdog then
-        // blesses the dead session as a 2h-idle "done". Terminalize now instead:
-        // the consumer starts a fresh run on the next message and the workspace
-        // rehydrates — the designed recovery path. endRun is sticky, so a done/
-        // error that arrived before `end` keeps its outcome; the lifecycle frame
-        // is skipped in that case to avoid a duplicate.
-        const rec = manager.get(runId);
-        if (rec && !isTerminalCapabilityStatus(rec.status)) {
+          break;
+        case "done":
           emit("lifecycle", { status: "done" });
+          await manager.endRun(runId, "done");
+          break;
+        case "error":
+          if (evt.recoverable === true) {
+            // A provider refusal ended one conversational turn; the worker and
+            // its workspace remain usable. turn_done returns this run to idle.
+            emit("summary", { text: evt.error ?? evt.message ?? "Model request failed" });
+            break;
+          }
+          emit("lifecycle", { status: "failed", error: evt.error ?? "" });
+          // Always persist a structured failure. Bare box errors (error string
+          // only, no code/stage) used to call endRun without a failure object, so
+          // the consumer checkpoint and auto-resume detail were empty.
+          await manager.endRun(runId, "failed", structuredBoxFailure(evt));
+          break;
+        case "end": {
+          // The box's session coroutine exited (clean stream close: max_turns
+          // exhaustion, subprocess EOF). This run can never take another turn —
+          // the box keeps its RUNS entry with a dead client, so every /message
+          // 409s. Left non-terminal it wedges the consumer for the whole idle TTL
+          // (find-or-start only replaces TERMINAL runs) and the watchdog then
+          // blesses the dead session as a 2h-idle "done". Terminalize now instead:
+          // the consumer starts a fresh run on the next message and the workspace
+          // rehydrates — the designed recovery path. endRun is sticky, so a done/
+          // error that arrived before `end` keeps its outcome; the lifecycle frame
+          // is skipped in that case to avoid a duplicate.
+          const rec = manager.get(runId);
+          if (rec && !isTerminalCapabilityStatus(rec.status)) {
+            emit("lifecycle", { status: "done" });
+          }
+          await manager.endRun(runId, "done");
+          break;
         }
-        await manager.endRun(runId, "done");
-        break;
+        default:
+          break;
       }
-      default:
-        break;
     }
+  } finally {
+    // Bounded background drain; terminal state and artifact ACKs do not await it.
+    void observations.close();
   }
 }
 

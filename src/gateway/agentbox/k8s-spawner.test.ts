@@ -444,7 +444,7 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
-  it("allows nested Bubblewrap only for Codex compile boxes", async () => {
+  it("keeps standard outer isolation for current and historical compiler profile IDs", async () => {
     const cm = new FakeCertManager();
     const s = new K8sSpawner({ namespace: "siclaw-debug" });
     s.setCertManager(cm as any);
@@ -462,14 +462,10 @@ describe("K8sSpawner — spawn branches", () => {
     await s.spawn({ agentId: "codex-test", profile: "kb-test" });
 
     const [agentPod, claudePod, codexPod, testPod] = calls.createNamespacedPod.map((call: any) => call.body);
-    for (const pod of [agentPod, claudePod, testPod]) {
+    for (const pod of [agentPod, claudePod, codexPod, testPod]) {
       expect(pod.spec.securityContext.seccompProfile).toEqual({ type: "RuntimeDefault" });
       expect(pod.metadata.annotations?.["container.apparmor.security.beta.kubernetes.io/agentbox"]).toBeUndefined();
     }
-    expect(codexPod.spec.securityContext.seccompProfile).toEqual({ type: "Unconfined" });
-    expect(codexPod.metadata.annotations).toMatchObject({
-      "container.apparmor.security.beta.kubernetes.io/agentbox": "unconfined",
-    });
     expect(codexPod.spec.automountServiceAccountToken).toBe(false);
     expect(codexPod.spec.containers[0].securityContext).toEqual({
       readOnlyRootFilesystem: true,

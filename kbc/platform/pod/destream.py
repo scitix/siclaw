@@ -26,6 +26,7 @@ the siclaw-kbc-box pod; runtime/agentbox/control-plane LLM callers never see it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 
@@ -34,6 +35,7 @@ from aiohttp import web
 
 _PORT: int | None = None
 _UPSTREAM: str | None = None
+_PI_UPSTREAMS: dict[str, str] = {}
 _HOP_BY_HOP = {"host", "content-length", "connection", "transfer-encoding",
                "keep-alive", "upgrade", "te", "trailers", "proxy-authorization"}
 
@@ -65,8 +67,6 @@ def enabled() -> bool:
     are out of scope."""
     if _PORT is None or _explicitly_off():
         return False
-    if os.environ.get("KBC_ENGINE", "claude_agent_sdk") == "codex_sdk":
-        return False
     return bool(_UPSTREAM or os.environ.get("ANTHROPIC_BASE_URL"))
 
 
@@ -77,6 +77,18 @@ def session_env(kind: str) -> dict:
     if kind not in ("authoring", "verify") or not enabled():
         return {}
     return {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{_PORT}"}
+
+
+def session_endpoint(kind: str, upstream: str) -> str:
+    """Route a resolved Pi role through its own upstream without changing
+    process-wide model configuration. Only the in-process control plane can
+    register targets; a request cannot supply an arbitrary destination."""
+    if kind not in ("authoring", "verify") or _PORT is None or _explicitly_off():
+        return upstream
+    upstream = upstream.rstrip("/")
+    token = hashlib.sha256(upstream.encode("utf-8")).hexdigest()
+    _PI_UPSTREAMS[token] = upstream
+    return f"http://127.0.0.1:{_PORT}/_pi/{token}"
 
 
 def model_idle_floor() -> float:
@@ -122,7 +134,7 @@ def synth_events(msg: dict) -> list[bytes]:
     head["content"] = []
     head["stop_reason"] = None
     head["stop_sequence"] = None
-    head["usage"] = {"input_tokens": usage.get("input_tokens", 0),
+    head["usage"] = {**usage, "input_tokens": usage.get("input_tokens", 0),
                      "output_tokens": 0}
     out = [_sse("message_start", {"type": "message_start", "message": head})]
     for i, block in enumerate(msg.get("content") or []):
@@ -163,7 +175,7 @@ def synth_events(msg: dict) -> list[bytes]:
     return out
 
 
-async def _destream_messages(request: web.Request, body: dict) -> web.StreamResponse:
+async def _destream_messages(request: web.Request, body: dict, url: str) -> web.StreamResponse:
     resp = web.StreamResponse(status=200, headers={
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -177,7 +189,6 @@ async def _destream_messages(request: web.Request, body: dict) -> web.StreamResp
 
     ping_task = asyncio.create_task(_pings())
     try:
-        url = (_upstream_url() or "").rstrip("/") + request.path_qs
         timeout = aiohttp.ClientTimeout(total=_upstream_timeout())
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json={**body, "stream": False},
@@ -208,9 +219,8 @@ async def _destream_messages(request: web.Request, body: dict) -> web.StreamResp
         ping_task.cancel()
 
 
-async def _passthrough(request: web.Request, body_bytes: bytes) -> web.StreamResponse:
+async def _passthrough(request: web.Request, body_bytes: bytes, url: str) -> web.StreamResponse:
     """Verbatim relay, RAW BYTES both ways — never decode here."""
-    url = (_upstream_url() or "").rstrip("/") + request.path_qs
     timeout = aiohttp.ClientTimeout(total=_upstream_timeout())
     async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
         async with session.request(request.method, url, data=body_bytes,
@@ -225,12 +235,18 @@ async def _passthrough(request: web.Request, body_bytes: bytes) -> web.StreamRes
 
 
 async def _handle(request: web.Request) -> web.StreamResponse:
-    if not _upstream_url():
+    upstream, route = _upstream_url(), request.path_qs
+    if request.path.startswith("/_pi/"):
+        parts = request.path_qs.split("/", 3)
+        upstream = _PI_UPSTREAMS.get(parts[2]) if len(parts) == 4 else None
+        route = "/" + parts[3] if len(parts) == 4 else ""
+    if not upstream:
         return web.json_response(
             {"type": "error",
              "error": {"type": "api_error",
                        "message": "destream shim: no upstream configured"}},
             status=502)
+    url = upstream.rstrip("/") + route
     body_bytes = await request.read()
     if request.method == "POST" and request.path.rstrip("/").endswith("/messages"):
         try:
@@ -238,14 +254,15 @@ async def _handle(request: web.Request) -> web.StreamResponse:
         except (ValueError, UnicodeDecodeError):
             body = None
         if isinstance(body, dict) and body.get("stream"):
-            return await _destream_messages(request, body)
-    return await _passthrough(request, body_bytes)
+            return await _destream_messages(request, body, url)
+    return await _passthrough(request, body_bytes, url)
 
 
 async def start(app: web.Application) -> None:
     """on_startup hook: bind the shim on an ephemeral localhost port. Costs one
     idle listener when the profile never opts in."""
     global _PORT
+    _PI_UPSTREAMS.clear()
     shim = web.Application(client_max_size=64 * 1024 * 1024)
     shim.router.add_route("*", "/{tail:.*}", _handle)
     runner = web.AppRunner(shim)
@@ -254,4 +271,10 @@ async def start(app: web.Application) -> None:
     await site.start()
     _PORT = site._server.sockets[0].getsockname()[1]
     app["_destream_runner"] = runner
-    app.on_shutdown.append(lambda _app: runner.cleanup())
+    async def stop(_app):
+        global _PORT
+        await runner.cleanup()
+        _PORT = None
+        _PI_UPSTREAMS.clear()
+
+    app.on_shutdown.append(stop)

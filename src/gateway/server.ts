@@ -1425,7 +1425,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     let pending = capabilitySessions.get(runId);
     if (!pending) {
       pending = (async () => {
-        const { client, created } = await capabilityBoxClient(runId, profile, orgId);
+        let { client, created } = await capabilityBoxClient(runId, profile, orgId);
         let replayWorkspace = opts.replayWorkspace === true;
         try {
           // Raw sources + (fresh box only) the durable authoring workspace, both
@@ -1437,13 +1437,21 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             backend: frontendClient,
             runId,
             inputRevision: capabilityRunManager.get(runId)?.inputRevision,
+            // The local endpoint can serve different run IDs and is not owned
+            // by this manager. Its run count cannot prove this run is alive.
+            reuseExisting: !created && !localCapabilityBoxEndpoint,
+            replaceEmptyLegacyBox: async () => {
+              await agentBoxManager.stop(runId, profile);
+              ({ client, created } = await capabilityBoxClient(runId, profile, orgId));
+              return client;
+            },
           });
           replayWorkspace = replayWorkspace || materialized.reattached === true;
           if (materialized.inputRevision) {
             await capabilityRunManager.setInputRevision(runId, materialized.inputRevision);
           }
           const allowedTools = getBoxProfile(profile).allowedTools ?? null;
-          await client.postJson(`/session/${runId}`, {
+          if (!materialized.reattached) await client.postJson(`/session/${runId}`, {
             instruction: instruction ?? "",
             allowed_tools: allowedTools,
             locale: materialized.locale,

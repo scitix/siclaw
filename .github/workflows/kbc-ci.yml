@@ -1,15 +1,13 @@
 name: KBC Box CI
 
-# Path-filtered: the kbc compile box is Python and its deps include the
-# claude-agent-sdk (which vendors the Claude Code binary, ~200MB) — only
-# spend that download when kbc/ actually changed.
+# Exercise the Python domain harness and the shared, pinned Pi worker together.
 on:
   push:
     branches: [main]
-    paths: ["kbc/**", ".github/workflows/kbc-ci.yml"]
+    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
   pull_request:
     branches: [main]
-    paths: ["kbc/**", ".github/workflows/kbc-ci.yml"]
+    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
 
 # Least-privilege: this job only reads the repo (no PR writes, no packages).
 permissions:
@@ -21,25 +19,24 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # Codex's named filesystem profiles use bubblewrap on Linux. Installing
-      # the distro package also supplies the Ubuntu AppArmor allowance for its
-      # executable; the bundled fallback is intentionally not trusted by that
-      # host policy.
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
-      # GitHub's Ubuntu 24.04 image additionally blocks the network namespace
-      # that the fail-closed Codex profile requires. The production host must
-      # supply an equivalent bubblewrap/userns allowance; relax only this
-      # ephemeral runner so the real sandbox contract can be exercised.
-      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - run: pip install -r kbc/platform/pod/requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils ripgrep
+      - run: pip install -r kbc/platform/pod/requirements.txt pytest pytest-asyncio
+      - run: python -m pytest -q -p pytest_asyncio.plugin -o asyncio_mode=auto test_pi_engine.py test_pi_file_tools.py test_pi_harness.py
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        working-directory: kbc/platform/pod
       - run: python test_compile_box.py
         working-directory: kbc/platform/pod
       - run: python test_destream.py
-        working-directory: kbc/platform/pod
-      - run: python test_codex_engine.py
         working-directory: kbc/platform/pod
       - run: python test_office_ingest.py
         working-directory: kbc/platform/pod

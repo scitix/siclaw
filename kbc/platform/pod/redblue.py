@@ -227,14 +227,14 @@ class PKStageError(RuntimeError):
 
 async def _agent_json(engine: ReadonlyAgentEngine, *, stage: str, system: str, user: str,
                       model: str, cwd: str, roots: list[str], timeout: float,
-                      locale: str | None = None):
+                      locale: str | None = None, role: str | None = None):
     """One engine call expected to yield JSON; on parse failure retry ONCE with
     an explicit re-emit instruction (new one-shot session), then fail the stage."""
     last_err = "?"
     for attempt in range(2):
         text = await engine.run_readonly_agent(
             cwd=cwd, system_prompt=system, user_message=user, model=model,
-            allowed_read_roots=roots, timeout_secs=timeout)
+            allowed_read_roots=roots, timeout_secs=timeout, role=role)
         try:
             return parse_json_lenient(text)
         except ValueError as e:
@@ -598,7 +598,7 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     user=_t(locale, SURVEY_USER_EN, SURVEY_USER_ZH).format(
                         raw_dir=raw_dir, wiki_dir=wiki_dir,
                         areas="\n".join(f"- {a}" for a in areas)),
-                    model=judge_m, cwd=wiki_dir, roots=judge_roots,
+                    model=judge_m, role="judge", cwd=wiki_dir, roots=judge_roots,
                     timeout=_env_float("KBC_PK_SURVEY_TIMEOUT", 600), locale=locale)
                 topics = data.get("topics", []) if isinstance(data, dict) else []
                 if not topics:
@@ -623,7 +623,7 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     n=n, topics_json=json.dumps(topics, ensure_ascii=False),
                     contradictions_block=cblock, contradictions_hint=chint,
                     media_block=_media_block(media_pages, locale=locale)),
-                model=judge_m, cwd=wiki_dir, roots=judge_roots,
+                model=judge_m, role="judge", cwd=wiki_dir, roots=judge_roots,
                 timeout=_env_float("KBC_PK_QUESTIONS_TIMEOUT", 300), locale=locale)
             questions = data.get("questions", []) if isinstance(data, dict) else []
             questions = [q for q in questions if isinstance(q, dict) and q.get("question")][:n]
@@ -649,7 +649,7 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                 try:
                     text = await engine.run_readonly_agent(
                         cwd=wiki_dir, system_prompt=blue_role,
-                        user_message=q["question"], model=blue_m,
+                        user_message=q["question"], model=blue_m, role="blue",
                         allowed_read_roots=[wiki_dir],
                         timeout_secs=_env_float("KBC_PK_BLUE_TIMEOUT", 300))
                 except (Exception, asyncio.TimeoutError) as e:
@@ -703,7 +703,7 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     verdicts = await _agent_json(
                         engine, stage="verdict", system=verdict_system,
                         user=_t(locale, VERDICT_USER_EN, VERDICT_USER_ZH).format(qa_block=qa),
-                        model=verdict_m, cwd=wiki_dir, roots=[wiki_dir],
+                        model=verdict_m, role="blue", cwd=wiki_dir, roots=[wiki_dir],
                         timeout=_env_float("KBC_PK_VERDICT_TIMEOUT", 180), locale=locale)
                 except (Exception, asyncio.TimeoutError) as e:
                     _record_error("verdict", [q["id"] for q in chunk], e)
@@ -818,6 +818,7 @@ def _cli():
     import argparse
     ap = argparse.ArgumentParser(description="Red-blue PK self-check (S0 calibration runner)")
     ap.add_argument("--raw", required=True, help="raw corpus dir (ground truth)")
+    ap.add_argument("--config", required=True, help="private JSON file containing the resolved Pi execution configuration")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--workdir", help="authoring workdir (contains candidate/, pinned as a snapshot; "
                                        "uses authoring/ caches and tickets)")
@@ -831,7 +832,12 @@ def _cli():
                     help="prompt/narration language (default en, the platform default)")
     args = ap.parse_args()
 
-    from engine import ClaudeEngine  # real engine only in CLI/production paths
+    from engine import PiEngine
+    import pi_config
+    pi_config.configure(json.loads(Path(args.config).read_text(encoding="utf-8")))
+    os.environ["KBC_PK_BLUE_MODEL"] = pi_config.role_model("blue")
+    os.environ["KBC_PK_JUDGE_MODEL"] = pi_config.role_model("judge")
+    os.environ["KBC_PK_VERDICT_MODEL"] = pi_config.role_model("blue")
 
     async def _main():
         tmp = tempfile.mkdtemp(prefix="kbc-pk-")
@@ -853,7 +859,7 @@ def _cli():
             if not override:
                 print("no failed questions in the previous result — nothing to re-test"); return
         summary, detail = await run_pk(
-            ClaudeEngine(), wiki_dir=tmp, raw_dir=str(Path(args.raw).resolve()),
+            PiEngine(), wiki_dir=tmp, raw_dir=str(Path(args.raw).resolve()),
             page_count=pages, authoring_dir=authoring_dir, constitution_path=constitution,
             questions_budget=args.questions, questions_override=override,
             blue_model=args.blue_model, judge_model=args.judge_model, progress=print,

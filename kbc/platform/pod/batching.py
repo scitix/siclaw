@@ -883,11 +883,10 @@ def build_plan(
         else hierarchical_text_budget_bytes() if mode == "hierarchical"
         else None
     )
-    # These are compiler-internal planning facts, not deployment knobs. The
-    # selected Claude model has a 1M window; we deliberately plan each session
-    # around half of it so retrieval and reasoning have headroom.
-    context_window = DEFAULT_CONTEXT_WINDOW_TOKENS
-    context_target = DEFAULT_CONTEXT_TARGET_TOKENS
+    # The control plane freezes these together with the selected compile model and caps
+    # every source/slice/reduction budget to its real available context.
+    context_window = int(os.environ.get("KBC_CONTEXT_WINDOW_TOKENS", str(DEFAULT_CONTEXT_WINDOW_TOKENS)))
+    context_target = int(os.environ.get("KBC_CONTEXT_TARGET_TOKENS", str(DEFAULT_CONTEXT_TARGET_TOKENS)))
     batch_sizes = sorted(int(batch.get("bytes") or 0) for batch in batches)
     estimated_source_bytes = resolved_text_budget or resolved_budget
     return {

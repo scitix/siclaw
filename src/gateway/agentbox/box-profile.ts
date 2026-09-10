@@ -89,8 +89,8 @@ export function isCompileCapable(): boolean {
 
 /**
  * kb-compile — a KB compile box. Reproduces the pre-refactor compile special-case
- * DECLARATIVELY: dedicated image, Anthropic-compatible LLM env (the lean box does
- * not phone home for settings), a writable /work with HOME pointed at it.
+ * DECLARATIVELY: dedicated image, private per-session model configuration,
+ * and a writable /work with HOME pointed at it.
  *
  * Built lazily so the image env var is read at spawn time, not module load.
  */
@@ -106,7 +106,7 @@ function kbCompileProfile(): BoxProfile {
     envForward: ["ANTHROPIC_BASE_URL", "KBC_*"],
     home: "/work",
     volumes: [{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }], // installer allows 2GB unpacked raw + candidate output — 1Gi evicted large-corpus pods
-    // A compile box realistically runs 1-2Gi (Claude Code + candidate tree +
+    // A compile box realistically runs 1-2Gi (worker + candidate tree +
     // snapshots); the 256Mi default request let the scheduler bin-pack ~10 hot
     // compiles onto a node they then burst to 4Gi each on (audit finding:
     // oversubscription → OOMKills). Request near real usage; limit stays 4Gi.
@@ -117,23 +117,17 @@ function kbCompileProfile(): BoxProfile {
   };
 }
 
-/**
- * kb-compile-codex — the same authoring capability and image as kb-compile,
- * with the outer exception Codex needs to install its *narrower* Bubblewrap
- * sandbox. Keeping this as a distinct profile means Claude authoring boxes
- * retain Kubernetes' RuntimeDefault seccomp/AppArmor policy.
- */
+/** Historical run profile ID. Rebuilt boxes use the same Pi tool boundary. */
 function kbCompileCodexProfile(): BoxProfile {
   return {
     ...kbCompileProfile(),
     name: "kb-compile-codex",
-    nestedSandbox: "bubblewrap",
   };
 }
 
 /**
  * kb-test — a read-only, zero-infra KB consumer box (start-a-test-session). Same kbc image +
- * writable /work (Claude Code's ~/.claude) as kb-compile, but a RESTRICTED tool
+ * writable /work as kb-compile, but a RESTRICTED tool
  * envelope: Read/Glob/Grep only — no Write/Edit/Bash and no compile MCP tools, so
  * it can measure the wiki without mutating it or touching infra. The trust
  * difference is expressed purely as allowedTools; the box shape is identical.

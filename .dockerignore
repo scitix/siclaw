@@ -11,3 +11,5 @@ coverage
 *.log
 __pycache__
 *.pyc
+
+kbc/platform/pod/test_*.py

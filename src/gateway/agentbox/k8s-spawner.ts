@@ -454,6 +454,7 @@ export class K8sSpawner implements BoxSpawner {
     const profile = getBoxProfile(boxConfig.profile);
     const healthProbe = healthProbeFor(profile.name);
     const needsBubblewrap = profile.nestedSandbox === "bubblewrap";
+    const isCompiler = ["kb-compile", "kb-compile-codex", "kb-test"].includes(profile.name);
     const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
@@ -856,7 +857,7 @@ export class K8sSpawner implements BoxSpawner {
             image,
             imagePullPolicy,
             securityContext: {
-              capabilities: needsBubblewrap
+              capabilities: needsBubblewrap || isCompiler
                 ? { drop: ["ALL"] }
                 : {
                     drop: ["ALL"],

@@ -16,7 +16,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-cp -R "$KBC_TEST_ROOT/kbc/." "$KBC_TEST_CONTEXT/"
+cp "$KBC_TEST_ROOT/package.json" "$KBC_TEST_ROOT/package-lock.json" "$KBC_TEST_ROOT/tsconfig.json" "$KBC_TEST_ROOT/.dockerignore" "$KBC_TEST_CONTEXT/"
+cp -R "$KBC_TEST_ROOT/src" "$KBC_TEST_ROOT/kbc" "$KBC_TEST_CONTEXT/"
 
 # Reproduce a checkout/build context created under a restrictive umask. Docker
 # can read these files as the builder user, but USER kbc must not depend on the
@@ -25,7 +26,7 @@ find "$KBC_TEST_CONTEXT" -type d -exec chmod 0700 {} +
 find "$KBC_TEST_CONTEXT" -type f -exec chmod 0600 {} +
 
 docker build \
-  -f "$KBC_TEST_CONTEXT/platform/pod/Dockerfile" \
+  -f "$KBC_TEST_CONTEXT/kbc/platform/pod/Dockerfile" \
   -t "$KBC_TEST_IMAGE" \
   "$KBC_TEST_CONTEXT"
 
@@ -45,6 +46,27 @@ for path in Path("/app").rglob("*"):
         unreadable.append(f"{path}: {exc}")
 assert not unreadable, "unreadable application files:\n" + "\n".join(unreadable)
 import compile_box  # noqa: F401
+from importlib.util import find_spec
+assert find_spec("claude_agent_sdk") is None
+assert find_spec("codex") is None
+import asyncio
+import tempfile
+from pi_engine import PiAgentClient, sdk_version
+assert sdk_version() == "0.85.1"
+async def worker_smoke():
+    with tempfile.TemporaryDirectory() as cwd:
+        client = PiAgentClient(cwd=cwd, system_prompt="Image smoke", session_id="image-smoke", tools=[],
+            model_config={"model": {"id": "smoke", "name": "smoke", "provider": "smoke",
+                "api": "openai-completions", "baseUrl": "http://127.0.0.1:1/v1", "input": ["text"],
+                "reasoning": False, "contextWindow": 128000, "maxTokens": 2048,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}},
+                "api_key": "unused-smoke-credential"})
+        try:
+            await client.connect()
+            assert client.sdk_version == "0.85.1"
+        finally:
+            await client.disconnect()
+asyncio.run(worker_smoke())
 '
 
 KBC_TEST_CONTAINER=$(docker run -d -p 127.0.0.1:0:3000 "$KBC_TEST_IMAGE")

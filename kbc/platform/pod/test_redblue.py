@@ -43,7 +43,7 @@ class FakeEngine:
         self.uncovered_verdict_ids = set(uncovered_verdict_ids)  # judge grades 正确标未覆盖
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
-                                 model, effort=None, allowed_read_roots, timeout_secs):
+                                 model, effort=None, role=None, allowed_read_roots, timeout_secs):
         # route on stage keywords in EITHER locale (en is the platform default)
         if "question-surface survey" in user_message or "出题面调研" in user_message:
             stage = "survey"

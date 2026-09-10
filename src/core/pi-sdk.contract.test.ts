@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
-  createAgentSessionFromServices,
   createAgentSessionServices,
   ModelRuntime,
   SessionManager,
@@ -13,8 +12,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
-import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
-import { LlmCallRecorder } from "./llm-call-recorder.js";
+import { createPiExecutionSession } from "./pi-execution.js";
 import { summarizeWithFallback } from "./compaction.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 
@@ -79,6 +77,7 @@ async function createFixture(
   });
   await modelRuntime.setRuntimeApiKey("contract-provider", "contract-key");
   const model = modelRuntime.getModel("contract-provider", "contract-model")!;
+  const sessionStarts = vi.fn();
   const services = await createAgentSessionServices({
     cwd, agentDir: cwd, modelRuntime,
     settingsManager: SettingsManager.inMemory({
@@ -89,20 +88,18 @@ async function createFixture(
     resourceLoaderOptions: {
       noExtensions: true, noSkills: true, noPromptTemplates: true,
       noThemes: true, noContextFiles: true, systemPrompt: "Exercise the supplied tools.",
+      extensionFactories: [api => { api.on("session_start", sessionStarts); }],
     },
   });
   const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
-  const { session } = await createAgentSessionFromServices({
-    services, sessionManager, model, noTools: "builtin", customTools,
+  const onModelEnvelope = vi.fn();
+  const { session, llmCallRecorder, modelEnvelopeInspectionRef } = await createPiExecutionSession({
+    services, sessionManager, model, customTools, onModelEnvelope,
     thinkingLevel: resolveSessionThinkingLevel(services.settingsManager, model),
   });
-  await session.bindExtensions({});
   cleanups.push(() => session.dispose());
-  const recorder = new LlmCallRecorder();
-  session.agent.streamFunction = recorder.wrapStreamFn(session.agent.streamFunction);
-  installGuardPipeline(createGuardRegistry(model.contextWindow), { agent: session.agent, sessionManager });
-  const brain = new PiAgentBrain(session, new Map(), recorder);
-  return { brain, session, sessionManager, model, services, modelRuntime };
+  const brain = new PiAgentBrain(session, new Map(), llmCallRecorder);
+  return { brain, session, sessionManager, model, services, modelRuntime, onModelEnvelope, modelEnvelopeInspectionRef, sessionStarts };
 }
 
 function resultTool(execute = vi.fn(async () => ({
@@ -157,9 +154,14 @@ describe("installed Pi SDK contract", () => {
     const requests = mockNetwork(() => requests.length === 1
       ? resultCall(" submit_result ") : completion({ content: "Completed." }));
     const tool = resultTool();
-    const { brain, session, sessionManager } = await createFixture([tool]);
+    const { brain, session, sessionManager, onModelEnvelope, modelEnvelopeInspectionRef, sessionStarts } = await createFixture([tool]);
+    expect(sessionStarts).toHaveBeenCalledTimes(1);
     const payloads: unknown[] = [];
-    session.agent.onPayload = (payload) => { payloads.push(payload); return payload; };
+    const previousOnPayload = session.agent.onPayload;
+    session.agent.onPayload = (payload, model) => {
+      payloads.push(payload);
+      return previousOnPayload?.(payload, model);
+    };
     const events: any[] = [];
     brain.subscribe(event => events.push(event));
 
@@ -170,6 +172,8 @@ describe("installed Pi SDK contract", () => {
     expect(requests).toHaveLength(2);
     expect(requests[0].request.headers.get("authorization")).toBe("Bearer contract-key");
     expect(payloads).toHaveLength(2);
+    expect(onModelEnvelope).toHaveBeenCalledTimes(1);
+    expect(modelEnvelopeInspectionRef.current?.systemPrompt).toContain("Exercise the supplied tools.");
     expect(requests[1].body.messages.some((m: any) => m.role === "tool")).toBe(true);
     const assistants = events.filter(e => e.type === "message_end" && e.message.role === "assistant");
     expect(assistants).toHaveLength(2);
@@ -255,5 +259,30 @@ describe("installed Pi SDK contract", () => {
     expect(summary).toBe("Summary or answer.");
     expect(requests.at(-1)!.request.headers.get("x-remove-me")).toBeNull();
     expect(requests.at(-1)!.request.headers.get("x-keep-me")).toBe("present");
+  });
+
+  it("keeps tools, histories and call recording separate across concurrent harnesses", async () => {
+    const requests = mockNetwork((_request, body) => completion({ content: `Answer for ${body.messages.at(-1).content}` }));
+    const first = await createFixture([{ ...resultTool(), name: "first_result" }]);
+    const second = await createFixture([{ ...resultTool(), name: "second_result" }]);
+    const firstEvents: any[] = [];
+    const secondEvents: any[] = [];
+    first.brain.subscribe(event => firstEvents.push(event));
+    second.brain.subscribe(event => secondEvents.push(event));
+
+    await Promise.all([first.brain.prompt("First private task."), second.brain.prompt("Second private task.")]);
+
+    expect(requests).toHaveLength(2);
+    const firstRequest = requests.find(({ body }) => JSON.stringify(body).includes("First private task."))!;
+    const secondRequest = requests.find(({ body }) => JSON.stringify(body).includes("Second private task."))!;
+    expect(firstRequest.body.tools.map((t: any) => t.function.name)).toEqual(["first_result"]);
+    expect(secondRequest.body.tools.map((t: any) => t.function.name)).toEqual(["second_result"]);
+    expect(JSON.stringify(first.session.messages)).not.toContain("Second private task.");
+    expect(JSON.stringify(second.session.messages)).not.toContain("First private task.");
+    for (const events of [firstEvents, secondEvents]) {
+      expect(events.filter(e => e.type === "message_end" && e.message.role === "assistant")
+        .map(e => e.message.llmCall.round)).toEqual([1]);
+    }
+    expect(first.sessionManager.getSessionFile()).not.toBe(second.sessionManager.getSessionFile());
   });
 });

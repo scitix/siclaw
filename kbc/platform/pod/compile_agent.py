@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""compile_agent —— 编译 pod 的入口:用 Claude Agent SDK 把 kbc 编译大脑跑成一个 query() 任务。
+"""Run the standalone drop-to-bundle compiler through the pinned Pi worker.
 
-证明"kbc 大脑能当 Agent SDK 任务在容器里跑":
-  读 workdir/drop + constitution → 按 playbook 编译 → 写 workdir/bundle。
-
-LLM 鉴权走 SDK 默认:
-  - 本地:复用订阅(SDK 自带的 claude 二进制读 ~/.claude 鉴权)。
-  - 生产 pod:设 ANTHROPIC_BASE_URL → 模型代理(key 容器外注入)。
-
-用法:python compile_agent.py --workdir /path/to/workdir
+Pass --config with a private JSON file containing the resolved execution v1
+roles. This entry point never loads user SDK settings or subscription secrets.
+The served authoring workflow remains compile_box.py.
 """
 import argparse
 import asyncio
@@ -16,7 +11,13 @@ import os
 import sys
 from pathlib import Path
 
-from claude_agent_sdk import query, ClaudeAgentOptions
+import json
+import uuid
+
+from engine import _make_multiroot_guard
+from pi_engine import PiAgentClient
+from pi_file_tools import FileTools
+import pi_config
 
 def _find_playbook():
     """找 kbc playbook(编译纪律):优先 KBC_PLAYBOOK 环境变量,否则向上找 CLAUDE.md。"""
@@ -39,54 +40,39 @@ TASK = """你是这个知识库的编译器。工作目录里有 `drop/`(原始�
 完成后用三五句话总结:产出哪些页、自动并了哪些矛盾、标了哪些存疑。"""
 
 
-async def run(workdir: str, max_turns: int) -> int:
-    wd = str(Path(workdir).resolve())
+async def run(workdir: str, max_turns: int, config_path: str) -> int:
+    wd = Path(workdir).resolve()
+    pi_config.configure(json.loads(Path(config_path).read_text(encoding="utf-8")))
     pb_path = _find_playbook()
     playbook = pb_path.read_text() if pb_path and pb_path.exists() else ""
-
-    opts = ClaudeAgentOptions(
-        cwd=wd,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-        permission_mode="bypassPermissions",    # pod 本身就是 sandbox
-        max_turns=max_turns,
-        max_buffer_size=int(os.environ.get("KBC_SDK_MAX_BUFFER_BYTES", str(16 * 1024 * 1024))),
-        setting_sources=[],                      # 多租户隔离:不加载外部 settings/CLAUDE.md
+    client = PiAgentClient(
+        cwd=str(wd), system_prompt=playbook, session_id=str(uuid.uuid4()),
+        model_config=pi_config.for_role("compile", session_kind="authoring"),
+        tools=FileTools(str(wd), ["Read", "Write", "Edit", "Glob", "Grep"], _make_multiroot_guard([wd])).tools(),
+        max_model_calls=max_turns,
     )
-    # kbc playbook(编译纪律)+ 任务 一起作为 prompt(生产可改 system_prompt 的 preset append 形式)
-    full_prompt = (playbook + "\n\n---\n\n# 本次任务\n\n" + TASK) if playbook else TASK
-    print(f"[compile_agent] workdir={wd}  playbook={'loaded' if playbook else 'MISSING'}  max_turns={max_turns}", flush=True)
-
-    result_text = ""
-    async for msg in query(prompt=full_prompt, options=opts):
-        cls = type(msg).__name__
-        if cls == "AssistantMessage":
-            for block in getattr(msg, "content", []) or []:
-                bt = type(block).__name__
-                if bt == "TextBlock":
-                    t = getattr(block, "text", "").strip()
-                    if t:
-                        print(f"  🤖 {t[:280]}", flush=True)
-                elif bt == "ToolUseBlock":
-                    print(f"  🔧 {getattr(block, 'name', '?')}  {str(getattr(block, 'input', ''))[:90]}", flush=True)
-        elif cls == "ResultMessage":
-            result_text = str(getattr(msg, "result", "") or "")
-            cost = getattr(msg, "total_cost_usd", None)
-            print(f"  ✅ {result_text[:500]}", flush=True)
-            if cost is not None:
-                print(f"     cost=${cost}", flush=True)
-
-    bundle = Path(wd) / "bundle"
-    pages = sorted(bundle.glob("*.md")) if bundle.exists() else []
-    print(f"[compile_agent] done. bundle pages ({len(pages)}): {[p.name for p in pages]}", flush=True)
-    return 0 if pages else 1
+    try:
+        await client.connect()
+        await client.query(TASK)
+        async for event in client.receive_response():
+            if event.kind == "assistant":
+                for block in event.data.get("content", []):
+                    if block.get("type") == "text":
+                        print(block["text"], flush=True)
+            elif event.kind == "result" and event.data["outcome"] != "completed":
+                raise RuntimeError(event.data.get("error") or "Compilation did not complete")
+    finally:
+        await client.disconnect()
+    return 0 if any((wd / "bundle").glob("*.md")) else 1
 
 
 def main():
-    ap = argparse.ArgumentParser(description="编译 pod 入口:Agent SDK 跑 kbc 编译大脑")
+    ap = argparse.ArgumentParser(description="Compile drop/ into bundle/ using Pi Agent")
     ap.add_argument("--workdir", required=True, help="含 drop/ + constitution.md 的工作目录")
     ap.add_argument("--max-turns", type=int, default=80)
+    ap.add_argument("--config", required=True, help="private JSON file with resolved Pi execution roles")
     a = ap.parse_args()
-    sys.exit(asyncio.run(run(a.workdir, a.max_turns)))
+    sys.exit(asyncio.run(run(a.workdir, a.max_turns, a.config)))
 
 
 if __name__ == "__main__":
