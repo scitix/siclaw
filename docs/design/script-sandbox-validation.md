@@ -2,16 +2,18 @@
 
 ## Review against current main
 
-The feature worktrees were rebased onto Siclaw `e0b7626f` and SiCore
-`fdccded95`. The older deployed acceptance below is retained as historical
-evidence; it does not certify the rebased build.
+The feature branch is rebased onto Siclaw main `01cad1ba`. The older deployed
+acceptance below is retained as historical evidence; it does not certify the
+rebased build.
+
+The rebase preserves the complete pre-rebase code tree, including the RPC
+contract assertion originally added in a merge commit. The targeted security
+and compatibility regression passed after rebasing: 27 files, 588 tests.
+Main/AgentBox type checks and the backend build also passed after rebasing.
 
 Review fixes preserve the current handoff routing, harness MCP gate and MCP
-artifact recovery. The SiCore callback package is `internal/siclaw/scriptsandbox`,
-separate from its existing developer-preview `sandbox` package. Existing exact
-Runtime routing callers retain their API, with a cancellable variant for scripts.
-The cross-Runtime authorization invariant now exercises `sandbox.resolve` with
-both a successful owner control and a denied foreign Runtime.
+artifact recovery. The external control-plane adapter was reviewed separately
+for compatibility with the same callback and authorization contract.
 
 The broker rechecks the live caller after asynchronous authorization. Bash
 callbacks use the freshly authorized kubeconfig through a private per-call
@@ -19,39 +21,50 @@ AgentBox snapshot, so a shared cached credential or concurrent refresh cannot
 change the approved target. Neither credentials nor snapshot paths enter the
 code runner or model-facing tool arguments.
 
-Current local verification:
+Verification before the history-only rebase:
 
-- Siclaw: 351 files, 7,287 passed, 2 existing skips.
-- Portal frontend: 26 files, 249 passed; production build passed.
+- Siclaw after main `01cad1ba`: 353 files, 7,318 passed, 2 existing skips.
+- Portal frontend: 30 files, 268 passed; production build passed.
 - Main/AgentBox TypeScript checks and backend build passed.
 - Python runner: 10 process/protocol tests passed.
 - Helm lint and Kubernetes/E2B profile rendering passed.
-- SiCore proxy, adapter, scriptsandbox, WebSocket and RBAC race checks passed;
-  targeted vet passed and server/config packages compiled.
 
 An mTLS test initially hit a local dual-stack connection failure. It now uses
 IPv4 with the original TLS server name and CA checks; its 118-test file and the
 full Siclaw suite passed afterwards.
 
-GitHub PR #584 passed all six CI checks at code commit `80f63178`: type check,
-AgentBox build graph, backend tests, Portal tests, native amd64/arm64 container
+Before this rebase, GitHub PR #584 passed all six CI checks at `309750b1`:
+type check, AgentBox build graph, backend tests, Portal tests, native amd64/arm64 container
 smoke, local HTTPS E2B relay and amd64 Kind smoke. The latter smoke checks run
 inside the two container jobs; they do not provision E2B cloud VMs.
 
-Expanded SiCore race testing is **not fully green**. Analysis filter fixtures,
-developer-navigation coverage, MCP observer race and MCP usage timeout also fail
-on an untouched `fdccded95` source snapshot. The MySQL lineage test requires a
-local Docker daemon unavailable on this machine. A broader proxy run hit its
-existing cancellation-test type assertion; the targeted full proxy race suite
-passed. These results are separate from the passing sandbox security checks.
+A later CI merge with main's new `chat.getVisualLink` exposed a brittle handler
+count assertion (62 actual versus 61 expected). After integrating that main,
+the test compares the complete declared RPC name set, including the two existing
+session-ordering/lineage entries previously omitted from its partial list. This
+retains exact coverage without a manually duplicated count. The updated local
+suite, type checks, builds and remote checks passed. The complete-name assertion
+is retained as a separate commit when rebasing the former merge history; CI
+runs again on the rebased PR head.
 
-Fresh Runtime/Portal/AgentBox and SiCore API images were built from complete
-rebased build inputs as `sandbox-review-main-20260910`. The Siclaw images were
+External control-plane adapter verification and its remaining test limitations
+are documented in that adapter's repository, separately from Siclaw CI.
+
+Fresh Runtime/Portal/AgentBox and external control-plane API images were built
+from complete rebased inputs as `sandbox-review-main-20260910`. The Siclaw images were
 deployed into the isolated test namespace. The chat Agent selected `run_script`,
 but both worker nodes had exhausted their Pod slots: the runner stayed Pending
 with `Too many pods`, then timed out at the 90-second startup limit before any
 tool call. Its Job/Pod were cleaned up. No unrelated workload or node setting
-was changed to obtain capacity. The new SiCore image has not yet been deployed.
+was changed to obtain capacity. The new external control-plane image has not
+yet been deployed. These images predate the final
+`01cad1ba` integration and need rebuilding for that final acceptance.
+
+The already deployed AgentBox independently passed a real Linux snapshot smoke:
+mode 0640, arbitrary sandbox-user file access denied with EACCES, setgid kubectl
+able to read the dummy context, and snapshot cleanup confirmed. Only an inert
+test credential was used and no cluster connection was made. This checks the
+OS permission path without claiming an SDK/Runtime/Pod end-to-end result.
 
 **Merge gate remains open:** repeat fresh-image acceptance of the Bash credential
 snapshot and both control-plane chains when execution capacity is available.
@@ -70,7 +83,7 @@ Both supported control planes were exercised through their real Web chat APIs:
 | Control plane | Tested chain | Identity |
 | --- | --- | --- |
 | Standalone Portal | Portal → Runtime → AgentBox → Kubernetes Job → broker | Administrator, plus denied ordinary user |
-| SiCore | API + MySQL/Redis → Runtime → AgentBox → Kubernetes Job → broker | Ordinary organization reader with explicit Agent/resource group grants |
+| External control plane | API + MySQL/Redis → Runtime → AgentBox → Kubernetes Job → broker | Ordinary organization reader with explicit Agent/resource group grants |
 
 The deployment used local `kubectl` with an explicitly selected context. The
 cluster's friendly name was not independently established. Kubernetes connector
@@ -78,8 +91,9 @@ tests used a dedicated read identity for node metadata and fixture-namespace
 data; the local deployment administrator's kubeconfig was not delivered to the
 Agent or runner. SSH and HTTPS MCP used dedicated fixture services.
 
-Runtime, Portal and AgentBox used `sandbox-ownership-v2-20260910`; SiCore API used
-`sandbox-ownership-v3-20260910`; the runner used `sandbox-acceptance-20260910`.
+Runtime, Portal and AgentBox used `sandbox-ownership-v2-20260910`; the external
+control-plane API used `sandbox-ownership-v3-20260910`; the runner used
+`sandbox-acceptance-20260910`.
 The final ownership fix did not change runner code or its protocol. The tested
 configuration forced network isolation, used no warm pool, and required no CNI
 NetworkPolicy support. Product defaults remain feature disabled and optional
@@ -87,7 +101,8 @@ network isolation disabled.
 
 ## Security issue found and corrected
 
-An ordinary SiCore reader could submit another user's existing Web session ID.
+An ordinary reader in the external control plane could submit another user's
+existing Web session ID.
 Before the fix, the sandbox adopted the persisted owner's authorization. A
 harmless marker script reproduced the problem; no destructive command was run.
 
@@ -104,9 +119,9 @@ The fix adds two independent checks:
    caller authority from the session database or an LRU registry. Conflicting
    overlapping turns remain blocked until all of them finish.
 
-The original request was replayed against the new Runtime with the old SiCore
-API: the broker returned 403. With the final SiCore API, the Web entry returned
-404 before dispatch. Portal returned 404 for the same cross-user pattern. An
+The original request was replayed against the new Runtime with the old external
+control-plane API: the broker returned 403. With the final API, the Web entry
+returned 404 before dispatch. Portal returned 404 for the same cross-user pattern. An
 Agent API key could not enable sandbox execution by reusing an existing Web
 session ID (`Active Web caller required`). The legitimate owner could resume
 after these denials, and Portal retained both successful turns in history.
@@ -116,12 +131,12 @@ after these denials, and Portal retained both successful turns in history.
 | Coverage | Result |
 | --- | --- |
 | Portal regression suite | 14/14 passed |
-| SiCore ordinary-reader suite | 8/8 passed |
+| External control plane ordinary-reader suite | 8/8 passed |
 | Portal cross-user session, owner resume and ordinary-user denial | Passed |
-| SiCore cross-user session, revoked Agent access, non-Web entry and owner resume | Passed |
-| SiCore live cluster group revocation | Next read denied; grant restored |
-| SiCore live Agent cluster-binding removal | Next read denied; binding restored |
-| SiCore live MCP revocation during file transfer | Next chunk denied; server restored |
+| External control plane cross-user session, revoked Agent access, non-Web entry and owner resume | Passed |
+| External control plane live cluster group revocation | Next read denied; grant restored |
+| External control plane live Agent cluster-binding removal | Next read denied; binding restored |
+| External control plane live MCP revocation during file transfer | Next chunk denied; server restored |
 | Portal live MCP revocation during file transfer | Next chunk denied; server restored |
 | Cancellation | Run cancelled and execution Pod removal confirmed in 696 ms |
 | Long-output persistence | Truncated output and structured tool result restored through history API |
@@ -147,9 +162,6 @@ file. Chunk revocation did not re-execute the source tool.
   the subsequent Web server ownership fix.
 - Main and AgentBox TypeScript checks, build and Helm validation passed.
   Final Runtime/Portal image builds also compiled the final source.
-- SiCore proxy, adapter, sandbox, WebSocket and RBAC race checks and relevant
-  `go vet` passed; the server package compiled. Proxy race/vet were repeated
-  after the final MySQL conflict-clause correction.
 - Native Linux amd64 Docker/Kubernetes smoke and local HTTPS E2B-relay smoke
   passed. The relay smoke used fixtures and did not provision an E2B cloud VM.
 - The real ARM64 runner image was built from the production Dockerfile in a
@@ -191,12 +203,12 @@ file verification.
 ## Startup observations
 
 With images cached and `warmPoolSize=0`, the final mixed Portal suite had median
-startup 1,567.5 ms and median complete-tool duration 1,893 ms (14 runs). SiCore's
-eight-run suite had medians of 1,535 ms and 1,939.5 ms respectively. These are
+startup 1,567.5 ms and median complete-tool duration 1,893 ms (14 runs). The external
+control plane's eight-run suite had medians of 1,535 ms and 1,939.5 ms respectively. These are
 mixed acceptance samples, not a controlled performance benchmark or an SLA.
 
-The two worker nodes reached their Pod count limits during testing. One SiCore
-startup took 54,510 ms while waiting for a slot. Only this task's idle services
+The two worker nodes reached their Pod count limits during testing. One external
+control-plane startup took 54,510 ms while waiting for a slot. Only this task's idle services
 were scaled down to release capacity; unrelated workloads and node settings
 were not changed. Prewarming cannot replace available scheduler capacity.
 
@@ -220,6 +232,7 @@ image reruns; earlier failed reproduction logs are retained as evidence of the
 fixed issue.
 
 The standalone Portal test deployment and local port-forward were restored.
-SiCore test services were scaled to zero with their database volume retained.
+External control-plane test services were scaled to zero with their database
+volume retained.
 Temporary pagination Pods were removed, and both execution namespaces were
 checked for leftover Jobs/Pods after the runs.
