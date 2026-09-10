@@ -338,13 +338,13 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     id CHAR(36) PRIMARY KEY,
     session_id CHAR(36) NOT NULL,
     role VARCHAR(20) NOT NULL,
-    content TEXT,
+    content MEDIUMTEXT,
     tool_name VARCHAR(100),
     toolset VARCHAR(255) DEFAULT NULL,
     tool_input MEDIUMTEXT,
     outcome VARCHAR(16),
     duration_ms INT,
-    metadata TEXT,
+    metadata MEDIUMTEXT,
     from_agent_id CHAR(36) DEFAULT NULL,
     parent_session_id CHAR(36) DEFAULT NULL,
     delegation_id VARCHAR(64) DEFAULT NULL,
@@ -759,6 +759,11 @@ export async function runPortalMigrations(): Promise<void> {
   // above only ADDs missing columns; widenColumn MODIFYs the existing type (idempotent, MySQL-only).
   await widenColumn(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await widenColumn(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  // Bounded script output can exceed MySQL TEXT's 64 KiB, both in the displayed
+  // tool content and the structured result used to rebuild history. SQLite has
+  // no corresponding width limit; widenColumn is a no-op there.
+  await widenColumn(db, "chat_messages", "content", "MEDIUMTEXT DEFAULT NULL");
+  await widenColumn(db, "chat_messages", "metadata", "MEDIUMTEXT DEFAULT NULL");
 
   // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
   // indexes added later). Safe to run now that all referenced columns exist.

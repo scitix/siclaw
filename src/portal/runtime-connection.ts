@@ -28,6 +28,7 @@ export interface RpcResult {
 }
 
 interface PendingRpc {
+  ws: WebSocket;
   resolve: (result: RpcResult) => void;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -44,6 +45,8 @@ export interface RuntimeConnectionMap {
     params: unknown,
     timeoutMs?: number,
   ): Promise<RpcResult>;
+  /** Exact Runtime routing; credential-bearing callbacks must never use fallback. */
+  sendCommandToRuntime?(runtimeId: string, method: string, params: unknown, timeoutMs?: number): Promise<RpcResult>;
   notify(agentId: string, method: string, params: unknown): void;
   notifyMany(agentIds: string[], method: string, params: unknown): void;
   /**
@@ -88,7 +91,7 @@ export function createConnectionMap(): RuntimeConnectionMap {
   // regardless of agentId key. Subscribers already filter by sessionId.
   const subscribers = new Map<string, Map<string, Set<EventHandler>>>();
 
-  function handleMessage(_registeredId: string, raw: WebSocket.Data): void {
+  function handleMessage(source: WebSocket, raw: WebSocket.Data): void {
     let msg: any;
     try {
       msg = JSON.parse(String(raw));
@@ -98,7 +101,7 @@ export function createConnectionMap(): RuntimeConnectionMap {
 
     if (msg.type === "res" && typeof msg.id === "string") {
       const entry = pending.get(msg.id);
-      if (entry) {
+      if (entry && entry.ws === source) {
         clearTimeout(entry.timer);
         pending.delete(msg.id);
         const errorDetail = isErrorDetail(msg.error) ? msg.error : undefined;
@@ -144,9 +147,10 @@ export function createConnectionMap(): RuntimeConnectionMap {
    * Deployment is pinned to one replica with `strategy: Recreate` for this reason; anything
    * that lifts that pin has to replace this fallback with real ownership routing.
    */
-  function getWs(agentId: string): WebSocket | null {
+  function getWs(agentId: string, exactOnly = false): WebSocket | null {
     const exact = connections.get(agentId);
     if (exact && exact.size > 0) return exact.values().next().value!;
+    if (exactOnly) return null;
     warnOnMultipleRuntimes();
     // Fallback: pick any connected Runtime
     for (const set of connections.values()) {
@@ -175,6 +179,25 @@ export function createConnectionMap(): RuntimeConnectionMap {
     );
   }
 
+  async function dispatch(agentId: string, method: string, params: unknown, timeoutMs: number, exact: boolean): Promise<RpcResult> {
+    const ws = getWs(agentId, exact);
+    if (!ws) return { ok: false, error: `Agent ${agentId} is not connected` };
+    const id = crypto.randomUUID();
+    const frame = JSON.stringify({ type: "req", id, method, params });
+    return new Promise<RpcResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        resolve({ ok: false, error: `RPC ${method} timed out after ${timeoutMs}ms` });
+      }, timeoutMs);
+      timer.unref?.();
+      pending.set(id, { ws, resolve, timer });
+      try { ws.send(frame); } catch {
+        clearTimeout(timer); pending.delete(id);
+        resolve({ ok: false, error: "Runtime connection unavailable" });
+      }
+    });
+  }
+
   const map: RuntimeConnectionMap = {
     register(agentId, ws) {
       let set = connections.get(agentId);
@@ -184,7 +207,7 @@ export function createConnectionMap(): RuntimeConnectionMap {
       }
       set.add(ws);
 
-      const onMessage = (data: WebSocket.Data) => handleMessage(agentId, data);
+      const onMessage = (data: WebSocket.Data) => handleMessage(ws, data);
       ws.on("message", onMessage);
 
       const cleanup = () => {
@@ -211,24 +234,11 @@ export function createConnectionMap(): RuntimeConnectionMap {
     },
 
     async sendCommand(agentId, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
-      const ws = getWs(agentId);
-      if (!ws) {
-        return { ok: false, error: `Agent ${agentId} is not connected` };
-      }
+      return dispatch(agentId, method, params, timeoutMs, false);
+    },
 
-      const id = crypto.randomUUID().slice(0, 8);
-      const frame = JSON.stringify({ type: "req", id, method, params });
-
-      return new Promise<RpcResult>((resolve) => {
-        const timer = setTimeout(() => {
-          pending.delete(id);
-          resolve({ ok: false, error: `RPC ${method} timed out after ${timeoutMs}ms` });
-        }, timeoutMs);
-        timer.unref?.();
-
-        pending.set(id, { resolve, timer });
-        ws.send(frame);
-      });
+    async sendCommandToRuntime(runtimeId, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
+      return dispatch(runtimeId, method, params, timeoutMs, true);
     },
 
     notify(agentId, method, params) {

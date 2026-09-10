@@ -4,6 +4,9 @@ sidebarTitle: "Tools"
 description: "How to add, modify, and organize tools in the Siclaw agent."
 ---
 
+The opt-in `run_script` container, broker authorization, network profiles and
+one-use warm pool are specified in [Disposable script sandbox](script-sandbox.md).
+
 # Tool Development Guide
 
 > **Purpose**: Guide contributors on how tools are organized, how to add new ones,

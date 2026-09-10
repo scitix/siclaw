@@ -25,6 +25,10 @@ spec:
               containerPort: 3003
               protocol: TCP
           env:
+            {{- if .Values.scriptSandbox.publicUrl }}
+            - name: SICLAW_SANDBOX_PUBLIC_URL
+              value: {{ .Values.scriptSandbox.publicUrl | quote }}
+            {{- end }}
             - name: NODE_ENV
               value: "production"
             - name: PORTAL_PORT

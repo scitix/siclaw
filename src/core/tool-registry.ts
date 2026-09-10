@@ -422,6 +422,7 @@ export type DelegateToAgentExecutor = (
 
 /** All dependencies shared by tool factory functions. */
 export interface ToolRefs {
+  scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
   kubeconfigRef: KubeconfigRef;
   userId: string;
   /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */

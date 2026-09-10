@@ -5,6 +5,8 @@
  * Supports mTLS when TLS options are provided.
  */
 
+import { SCRIPT_FILE_RESULT_BYTES } from "../../script-sandbox/result-transfer.js";
+import http from "node:http";
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
@@ -204,6 +206,38 @@ export class AgentBoxClient {
         rejectUnauthorized: true,
       });
     }
+  }
+
+  /** A bounded, cancellable callback. Neither response bodies nor grants enter error logs. */
+  async sandboxBash(body: unknown, signal: AbortSignal): Promise<unknown> {
+    const url = new URL("/api/internal/sandbox-bash", this.endpoint);
+    if (url.protocol === "https:" && !this.httpsAgent) throw new Error("Sandbox callback requires mTLS");
+    if (url.protocol !== "https:" && (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
+      throw new Error("Local sandbox callback requires loopback");
+    }
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(25_000)]);
+    return new Promise((resolve, reject) => {
+      const client = url.protocol === "https:" ? https : http;
+      const req = client.request(url, { method: "POST", signal: bounded,
+        ...(url.protocol === "https:" ? { agent: this.httpsAgent! } : {}),
+        headers: { "Content-Type": "application/json" } }, res => {
+        const chunks: Buffer[] = []; let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > SCRIPT_FILE_RESULT_BYTES) req.destroy(new Error("Sandbox callback response too large"));
+          else chunks.push(chunk);
+        });
+        res.on("error", reject);
+        res.on("end", () => {
+          try {
+            if (res.statusCode !== 200) throw new Error();
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          } catch { reject(new Error("Sandbox callback denied or unavailable")); }
+        });
+      });
+      req.on("error", () => reject(new Error("Sandbox callback interrupted or unavailable")));
+      req.end(JSON.stringify(body));
+    });
   }
 
   /**

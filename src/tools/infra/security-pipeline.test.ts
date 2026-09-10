@@ -331,3 +331,15 @@ describe("stderr is redacted too", () => {
     expect(out).toContain("Warning: v1beta1 is deprecated");
   });
 });
+
+
+describe("trusted sandbox data output", () => {
+  it("preserves complete data while sanitizing both channels and terminal controls", () => {
+    const rows = "healthy-node\n".repeat(30_000);
+    const result = postExecSecurity(rows + "TOKEN\x1b[31mlast-node\x1b[0m", {
+      type: "sanitize", sanitize: s => s.replace("TOKEN", "[REDACTED]"),
+    }, { outputMode: "data", stderr: "password: private-value" });
+    expect(result.startsWith(rows)).toBe(true); expect(result).toContain("last-node");
+    expect(result).not.toMatch(/TOKEN|private-value|siclaw-output|truncated|\x1b/);
+  });
+});

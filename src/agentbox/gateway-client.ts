@@ -5,6 +5,7 @@
  * Used by AgentBox to query metadata (settings, agent tasks, etc.)
  */
 
+import { SandboxInvocations } from "./sandbox-invocations.js";
 import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
@@ -43,6 +44,7 @@ export interface AgentTask {
 }
 
 export class GatewayClient {
+  readonly sandboxInvocations = new SandboxInvocations();
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
   private sessionId?: string;
@@ -316,10 +318,22 @@ export class GatewayClient {
     };
   }
 
+  async scriptSandboxEnabled(): Promise<boolean> {
+    try { return (await this.request("/api/internal/script-runs", "GET"))?.enabled === true; }
+    catch { return false; }
+  }
+
+  async runScript(request: import("../script-sandbox/types.js").ScriptRequest, sessionId: string, signal?: AbortSignal): Promise<import("../script-sandbox/types.js").ScriptResult> {
+    const invocation = this.sandboxInvocations.open(sessionId, request, signal);
+    try {
+      return await this.request("/api/internal/script-runs", "POST", { session_id: sessionId, callback_token: invocation.token, request }, 720_000, signal);
+    } finally { invocation.close(); }
+  }
+
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000): Promise<any> {
+  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000, signal?: AbortSignal): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -329,6 +343,7 @@ export class GatewayClient {
         port: url.port || (isHttps ? 443 : 80),
         path: url.pathname + url.search,
         method,
+        signal,
         headers: {
           "Content-Type": "application/json",
         },

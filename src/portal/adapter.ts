@@ -5,6 +5,7 @@
  * Auth: X-Auth-Token header (shared secret).
  */
 
+import { sandboxResolveHandler } from "./script-sandbox.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import { getDb, type Db } from "../gateway/db.js";
@@ -2121,6 +2122,8 @@ export async function buildTracingConfig(): Promise<TracingConfig> {
 
 export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: string) => Promise<any>> {
   const handlers = new Map<string, (params: any, agentId: string) => Promise<any>>();
+
+  handlers.set("sandbox.resolve", sandboxResolveHandler(handlers));
 
   // --- config.* ---
 

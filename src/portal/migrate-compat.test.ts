@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { safeAlterTable, setColumnDefault } from "./migrate-compat.js";
+import { safeAlterTable, setColumnDefault, widenColumn } from "./migrate-compat.js";
 import type { Db } from "../gateway/db.js";
 
 /**
@@ -36,6 +36,18 @@ function fakeMysql(currentDefault: string | null, columnPresent = true): {
 }
 
 const alters = (queries: Array<{ sql: string }>) => queries.filter((q) => q.sql.startsWith("ALTER TABLE"));
+
+describe("chat result text capacity", () => {
+  it.each(["text", "mediumtext", "longtext"])("widens %s only when needed", async current => {
+    const queries: string[] = [];
+    const db = { driver: "mysql", query: async (sql: string) => {
+      queries.push(sql);
+      return [sql.includes("SELECT COLUMN_NAME") ? [{ COLUMN_NAME: "content" }] : [{ COLUMN_TYPE: current }], undefined];
+    } } as unknown as Db;
+    await widenColumn(db, "chat_messages", "content", "MEDIUMTEXT DEFAULT NULL");
+    expect(queries.filter(sql => sql.startsWith("ALTER TABLE"))).toHaveLength(current === "text" ? 1 : 0);
+  });
+});
 
 describe("setColumnDefault", () => {
   it("corrects a legacy default on an existing MySQL table", async () => {

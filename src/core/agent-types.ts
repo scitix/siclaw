@@ -276,7 +276,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     // here because a REGIONAL SRE agent (one leg of a multi-region facade) is an
     // sre, and without it that leg could be handed a conversation it can never
     // hand back.
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "run_sandbox", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
     defaultPrompt: SRE_DEFAULT_PROMPT,
     defaultNoSkills: false,
   },

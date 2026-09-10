@@ -14,7 +14,7 @@ import {
   redactSensitiveContent,
   type OutputAction,
 } from "./output-sanitizer.js";
-import { processToolOutput } from "./tool-render.js";
+import { processToolOutput, sanitizeOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
 import { detectSensitiveResource, redactDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
 
@@ -61,6 +61,8 @@ export function preExecSecurity(
 // ── Post-exec ───────────────────────────────────────────────────────
 
 export interface PostExecOptions {
+  /** Trusted, separately bounded data consumers keep complete sanitized text. */
+  outputMode?: "data";
   /** Stderr output — appended after sanitization with "\n\nSTDERR:\n" prefix */
   stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
@@ -97,17 +99,18 @@ export interface PostExecOptions {
 }
 
 /**
- * Post-execution security: sanitize stdout → combine with stderr → truncate.
+ * Post-execution security: sanitize stdout and stderr → combine → render.
  *
- * Sanitization (applySanitizer, redactSensitiveContent) applies to stdout ONLY,
- * not stderr — this preserves JSON validity when kubectl outputs valid JSON to
- * stdout and deprecation warnings to stderr.
+ * Structural stdout sanitization and document stderr redaction run separately
+ * to preserve JSON validity before combining output.
  *
  * This is the ONLY place processToolOutput is called. All tools (cmd-exec and
  * script-exec) must route their final output through this function.
  *
  * For cmd-exec tools: pass the action from preExecSecurity().
- * For script-exec tools: pass null (no command sanitization, just truncate).
+ * Pass null when there is no command-specific output action. Trusted data
+ * consumers may opt out of display truncation/host temp files with outputMode;
+ * they must enforce their own transport and memory budgets.
  */
 export function postExecSecurity(
   stdout: string,
@@ -164,7 +167,7 @@ export function postExecSecurity(
       combined += REDACTION_NOTICE;
     }
   }
-  return processToolOutput(combined);
+  return opts?.outputMode === "data" ? sanitizeOutput(combined) : processToolOutput(combined);
 }
 
 // ── Internal: resolve output action by strategy ─────────────────────

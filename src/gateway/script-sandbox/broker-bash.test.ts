@@ -1,0 +1,31 @@
+import { expect, it, vi } from "vitest";
+import { ReadOnlyScriptBroker } from "./broker.js";
+import { loadScriptSandboxConfig } from "../../script-sandbox/config.js";
+
+const kubeconfig = JSON.stringify({ "current-context": "c", contexts: [{ name: "c", context: { cluster: "c", user: "u" } }],
+  clusters: [{ name: "c", cluster: { server: "https://example.test" } }], users: [{ name: "u", user: { token: "private-token" } }] });
+const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod", nodes: true }] };
+const p = () => ({ agentId: "a", sessionId: "s", boxId: "b", userId: "u", callbackToken: "private-callback-token" });
+const call = { id: "1", tool: "bash", arguments: { cluster: "prod", command: "kubectl get nodes" } };
+it("reauthorizes each Bash callback, never passes credentials and omits callback grants from audit", async () => {
+  let capabilities = ["run_sandbox"];
+  const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent"
+    ? { status: "active", tool_capabilities: capabilities }
+    : { user_id: "u", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kubeconfig }] } }) };
+  const builtin = vi.fn(async () => ({ text: "nodes" }));
+  const log = vi.spyOn(console, "info").mockImplementation(() => {});
+  try {
+    const broker = new ReadOnlyScriptBroker(rpc, loadScriptSandboxConfig(), builtin);
+    await expect(broker.call(p(), scope, call, new AbortController().signal)).resolves.toEqual({ text: "nodes" });
+    expect(builtin).toHaveBeenCalledOnce();
+    expect(builtin.mock.calls[0][1]).toEqual(call.arguments);
+    expect(JSON.stringify(builtin.mock.calls)).not.toContain("private-token");
+    expect(JSON.stringify(log.mock.calls)).not.toContain("private-callback-token");
+    capabilities = ["run_scripts"];
+    await expect(broker.call(p(), scope, call, new AbortController().signal)).rejects.toThrow();
+    expect(builtin).toHaveBeenCalledOnce();
+    const calls = rpc.request.mock.calls.length;
+    await expect(broker.call(p(), scope, { ...call, arguments: { ...call.arguments, command: "kubectl delete node x" } }, new AbortController().signal)).rejects.toThrow();
+    expect(rpc.request.mock.calls.length).toBe(calls);
+  } finally { log.mockRestore(); }
+});

@@ -3523,7 +3523,9 @@ export class AgentBoxSessionManager {
         }
       : undefined;
 
+    const scriptEnabled = effectiveMode === "web" && !delegation && gc && await gc.scriptSandboxEnabled();
     const result = await createSiclawSession({
+      scriptExecutor: scriptEnabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,

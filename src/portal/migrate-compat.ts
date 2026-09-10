@@ -148,6 +148,10 @@ export async function widenColumn(
   // Target column type = the definition up to its first attribute keyword (DEFAULT/NULL/NOT).
   const targetType = definition.trim().split(/\s+(?=default\b|null\b|not\b)/i)[0].toLowerCase();
   if (!targetType || current === targetType) return; // already at the target type — skip the copy
+  // Existing installations may already use LONGTEXT. A width migration must
+  // never shrink that column or discard previously accepted tool output.
+  const textWidths = ["tinytext", "text", "mediumtext", "longtext"];
+  if (textWidths.includes(targetType) && textWidths.indexOf(current) > textWidths.indexOf(targetType)) return;
   await db.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
   console.log(`[portal-migrate] widened ${table}.${column}: ${current} → ${targetType}`);
 }

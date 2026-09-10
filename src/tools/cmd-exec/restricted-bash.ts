@@ -6,6 +6,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { readFileSync } from "node:fs";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { loadConfig } from "../../core/config.js";
@@ -160,6 +161,7 @@ interface RestrictedBashParams {
 export function createRestrictedBashTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
+  trustedOptions?: { validateKubeconfig?: (content: string) => unknown; outputMode?: "data" },
 ): ToolDefinition {
   // run_in_background is exposed to the model only when the master switch is on AND a
   // runtime executor was injected — otherwise the param stays out of the schema.
@@ -269,6 +271,12 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           };
         }
         selectedKubeconfigPath = r.path ?? "/dev/null";
+        // A sandbox callback accepts inline authentication only, even if another
+        // trusted tool supports a wider kubeconfig format. Never expose parser errors.
+        if (trustedOptions?.validateKubeconfig) {
+          try { trustedOptions.validateKubeconfig(readFileSync(selectedKubeconfigPath, "utf8")); }
+          catch { return { content: [{ type: "text", text: "Kubernetes authentication denied" }], details: { blocked: true } }; }
+        }
       }
 
       // Pre-exec security: validate command + determine output sanitizer
@@ -425,6 +433,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           + (tailTruncationNote(params.command, okStdout) ? `\n${tailTruncationNote(params.command, okStdout)}` : "");
         return {
           content: [{ type: "text", text: postExecSecurity(okStdout.trim(), pre.action, {
+            outputMode: trustedOptions?.outputMode,
             stderr: stderr.trim() || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
             ...(okNotes ? { notes: okNotes } : {}),
@@ -480,6 +489,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           + (hitCap ? `\n[cap in force: ${sandboxTimeoutS}s]` : "");
         return {
           content: [{ type: "text", text: postExecSecurity(errStdout, pre.action, {
+            outputMode: trustedOptions?.outputMode,
             stderr: errStderr || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
             ...(notes ? { notes } : {}),

@@ -268,6 +268,24 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     await mgr.release("running-b");
   });
 
+  it.each([false, true])("only supplies the sandbox executor when Runtime advertises enabled=%s", async enabled => {
+    const mgr = new AgentBoxSessionManager();
+    const runScript = vi.fn(async () => ({ status: "completed" }));
+    mgr.gatewayClient = { scriptSandboxEnabled: vi.fn(async () => enabled), runScript } as any;
+    await mgr.getOrCreate("sandbox-session", "web");
+    const executor = lastCreateSiclawSession.calls[0].scriptExecutor;
+    if (enabled) {
+      const signal = new AbortController().signal;
+      const request = { language: "python", code: "print(1)" };
+      await executor(request, "untrusted-session-override", signal);
+      expect(runScript).toHaveBeenCalledWith(request, "sandbox-session", signal);
+    } else {
+      expect(executor).toBeUndefined();
+      expect(runScript).not.toHaveBeenCalled();
+    }
+    await mgr.closeAll();
+  });
+
   it("creates a new session on first call and caches it", async () => {
     const mgr = new AgentBoxSessionManager();
     const s1 = await mgr.getOrCreate("sess-1");

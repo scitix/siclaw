@@ -2488,7 +2488,7 @@ describe("buildAdapterRpcHandlers", () => {
   it("all expected handler names are registered", () => {
     const handlers = buildAdapterRpcHandlers();
     const expected = [
-      "config.getAgent", "config.getResources", "config.getSettings",
+      "sandbox.resolve", "config.getAgent", "config.getResources", "config.getSettings",
       "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel", "config.getTracingConfig",
       "config.getDelegates",
