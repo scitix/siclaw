@@ -18,10 +18,12 @@ vi.mock("../core/tool-output-cleanup.js", () => ({ scheduleToolOutputCleanup: ()
 
 // ── Fakes/mocks (hoisted) ─────────────────────────────────────────────
 
-vi.mock("@earendil-works/pi-coding-agent", () => {
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const native = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
   const g = globalThis as any;
   g.__frameworkEntriesState = g.__frameworkEntriesState ?? { entries: [] };
   class FakeFrameworkSessionManager {
+    static open = native.SessionManager.open;
     constructor(public cwd: string, public sessionDir: string) {}
     static continueRecent(cwd: string, sessionDir: string) {
       return new FakeFrameworkSessionManager(cwd, sessionDir);
@@ -2342,8 +2344,11 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
     success();
     const first = await mgr.createSpawnSubagentExecutor()(request());
     expect(first.resumeHandle).toMatch(/^tra_/);
-    // The fake pi session manager does not write JSONL; simulate its persisted transcript.
-    fs.writeFileSync(path.join(mgr.getSessionDir(first.childSessionId), "transcript.jsonl"), "{}\n");
+    // Use native persistence for resume: mocks must not accept an invalid transcript.
+    const native = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
+    const transcript = native.SessionManager.create("/previous-runtime-cwd", mgr.getSessionDir(first.childSessionId));
+    transcript.appendMessage({ role: "user", content: "Inspect eth0", timestamp: Date.now() });
+    transcript.appendMessage({ role: "assistant", content: [{ type: "text", text: "eth0 verified" }], api: "openai-responses", provider: "fixture", model: "fixture", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() });
     const restored = new AgentBoxSessionManager() as any;
     const events: any[] = [];
     restored.gatewayClient = { sendDelegationPersistenceEvent: async (event: any) => { events.push(event); return { ok: true, id: "persisted" }; } };
@@ -2351,7 +2356,10 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
     const next = await restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, spawnId: "spawn-followup", renderedTasks: [{ item: "follow-up", prompt: "Explain the second interface" }] }));
     expect(next.childSessionId).toBe(first.childSessionId);
     expect(next.resumeHandle).toBe(first.resumeHandle);
-    expect((globalThis as any).__createSessionCalls.at(-1).sessionManager.sessionDir).toBe(mgr.getSessionDir(first.childSessionId));
+    const resumedManager = (globalThis as any).__createSessionCalls.at(-1).sessionManager;
+    expect(resumedManager.getSessionFile()).toBe(transcript.getSessionFile());
+    expect(resumedManager.getCwd()).toBe("/previous-runtime-cwd");
+    expect(JSON.stringify(resumedManager.buildSessionContext())).toContain("eth0 verified");
     expect(JSON.stringify(events)).toContain("spawn-followup");
     expect(restored.subagentRuns.size).toBe(0);
   });
@@ -2394,4 +2402,92 @@ it("does not let an older group's cleanup remove a newer continuation mailbox", 
   expect(mgr.subagentRuns.get("child")).toBe(current);
   mgr.releaseSubagentRun("child", "new-run");
   expect(mgr.subagentRuns.has("child")).toBe(false);
+});
+
+it("persists guidance delivered to a live child", async () => {
+  const mgr = new AgentBoxSessionManager() as any;
+  const persisted: any[] = [];
+  mgr.persistEnsureChatSession = async () => {};
+  mgr.persistAppendMessage = async (row: any) => {persisted.push(row); return "row";};
+  mgr.persistAppendDelegationEvent = async () => {};
+  let finish!: () => void;
+  let started!: () => void;
+  const startedPromise = new Promise<void>(r => {started = r;});
+  const blocked = new Promise<void>(r => {finish = r;});
+  (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+    steer: async (text: string) => {
+      emitter.emit("event", {type: "message_start", message: {role: "user", content: [{type: "text", text}]}});
+      emitter.emit("event", {type: "message_end", message: {role: "user", content: [{type: "text", text}]}});
+    },
+    prompt: async () => {
+      started(); await blocked;
+      emitter.emit("event", {type: "message_end", message: {role: "assistant", content: [{type: "text", text: "Verified both interfaces"}]}});
+    },
+  }));
+  const req = { description: "Inspect node", renderedTasks: [{item: "node", prompt: "Inspect eth0"}],
+    subagentType: "general-purpose", runInBackground: true, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "initial" };
+  const execute = mgr.createSpawnSubagentExecutor();
+  const launch = await execute(req);
+  await startedPromise;
+  try {
+    const ack = await execute({...req, runInBackground: false, spawnId: "guidance", resumeHandle: launch.resumeHandle,
+      renderedTasks: [{item: "guidance", prompt: "Also inspect eth1"}]});
+    expect(ack.steered).toBe(true);
+  } finally {finish();}
+  await vi.waitFor(() => expect(mgr.subagentRuns.size).toBe(0));
+  expect(persisted.filter(row => row.role === "user" && row.content === "Also inspect eth1")).toEqual([
+    expect.objectContaining({ delegationId: "initial", parentSessionId: "parent", sessionId: launch.childSessionId, metadata: { kind: "steer" } }),
+  ]);
+});
+
+
+it("rejects an unusable transcript instead of silently resuming empty context", async () => {
+  const mgr = new AgentBoxSessionManager() as any;
+  const req = {description: "Inspect", renderedTasks: [{item: "node", prompt: "Inspect"}],
+    subagentType: "general-purpose", runInBackground: false, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "first"};
+  const success = () => (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({prompt: async () => {
+    emitter.emit("event", {type: "message_end", message: {role: "assistant", content: [{type: "text", text: "Report"}]}});
+  }}));
+  success();
+  const first = await mgr.createSpawnSubagentExecutor()(req);
+  fs.writeFileSync(path.join(mgr.getSessionDir(first.childSessionId), "corrupt.jsonl"), "{}\n");
+  const count = (globalThis as any).__createSessionCalls.length;
+  await expect(mgr.createSpawnSubagentExecutor()({...req, spawnId: "followup", resumeHandle: first.resumeHandle})).rejects.toThrow(/transcript/);
+  expect((globalThis as any).__createSessionCalls).toHaveLength(count);
+  expect(mgr.subagentRuns.size).toBe(0);
+});
+
+it("persists assessment-boundary guidance without exposing internal assessment prompts", async () => {
+  const mgr = new AgentBoxSessionManager() as any;
+  const persisted: any[] = [];
+  mgr.persistEnsureChatSession = async () => {};
+  mgr.persistAppendMessage = async (row: any) => { persisted.push(row); return "row"; };
+  mgr.persistAppendDelegationEvent = async () => {};
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const req = { description: "Inspect node", renderedTasks: [{ item: "node", prompt: "Inspect eth0" }],
+    subagentType: "general-purpose", runInBackground: true, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "initial" };
+  const execute = mgr.createSpawnSubagentExecutor();
+  let launch: any;
+  let assessments = 0;
+  (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+    prompt: async (text: string) => {
+      await blocked;
+      emitter.emit("event", { type: "message_end", message: { role: "user", content: text } });
+      emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Verified" }] } });
+    },
+    assessTaskCompletion: async () => {
+      if (assessments++ === 0) {
+        await execute({ ...req, spawnId: "steer", resumeHandle: launch.resumeHandle, renderedTasks: [{ item: "guidance", prompt: "Check eth1 too" }] });
+      }
+      emitter.emit("event", { type: "message_end", message: { role: "user", content: "Internal assessment prompt" } });
+      return { status: "complete", reason: "verified" };
+    },
+  }));
+  launch = await execute(req);
+  release();
+  await vi.waitFor(() => expect(mgr.subagentRuns.size).toBe(0));
+  expect(assessments).toBe(2);
+  expect(persisted.filter(row => row.role === "user").map(row => row.content)).toEqual(["Inspect eth0", "Check eth1 too"]);
+  expect(persisted.find(row => row.content === "Check eth1 too")).toMatchObject({ metadata: { kind: "steer" }, delegationId: "initial" });
 });

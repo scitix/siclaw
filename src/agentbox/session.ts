@@ -79,6 +79,7 @@ import { ToolResultArtifactStore, toolResultArtifactRoot, formatToolResultArtifa
 import { prepareReduceEvidence } from "./subagent-evidence.js";
 import { finishTargetCoverage } from "./subagent-targets.js";
 import { createSubagentTickets, readSubagentTicket, SubagentMailbox } from "./subagent-lifecycle.js";
+import { openSubagentTranscript } from "./subagent-transcript.js";
 import { runSubagentToAcceptance } from "./subagent-completion.js";
 import { captureSubagentContext, materializeSubagentContext, validateSubagentContextSelection } from "./subagent-context.js";
 import { restoreTaskLedgerFromHistory } from "./task-ledger-recovery.js";
@@ -388,7 +389,7 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
-  private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string }>();
+  private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string; restoredSession?: SessionManager }>();
   // Retain the launching request owner until notification, even if Stop/handoff
   // replaces the session's current request before a late child/process exit.
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
@@ -1048,6 +1049,7 @@ export class AgentBoxSessionManager {
         rootDir: toolResultArtifactRoot(this.getSessionDir(request.parentSessionId)),
         getScope: () => ({ agentId: request.parentAgentId ?? `user:${request.userId}`, sessionId: request.parentSessionId }),
       });
+      let restoredSession: SessionManager | undefined;
       if (request.resumeHandle) {
         if (request.renderedTasks.length !== 1 || request.reducePrompt || request.modelTier) throw new Error("Follow-up requires one task without reduce or tier override");
         const ticket = await readSubagentTicket(store, request.resumeHandle, request.userId);
@@ -1057,10 +1059,7 @@ export class AgentBoxSessionManager {
           return { status: "launched", jobId: active.jobId, childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle, steered: true };
         }
         // A ticket is not proof of an executed transcript (a queued task may have been skipped).
-        const directory = this.getSessionDir(ticket.childSessionId);
-        if (!fs.existsSync(directory) || !fs.readdirSync(directory).some(name => name.endsWith(".jsonl"))) {
-          throw new Error("This child has no recoverable transcript; launch a new task explicitly");
-        }
+        restoredSession = openSubagentTranscript(this.getSessionDir(ticket.childSessionId));
         request = { ...request, subagentType: ticket.subagentType, renderedTasks: [{ ...request.renderedTasks[0], childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle }] };
       } else {
         const tickets = await createSubagentTickets(store, request.userId, request.subagentType, request.renderedTasks.length);
@@ -1071,7 +1070,7 @@ export class AgentBoxSessionManager {
       // Reserve all IDs before yielding: concurrent follow-ups never start two brains for one transcript.
       for (const task of request.renderedTasks) {
         if (this.subagentRuns.has(task.childSessionId!)) throw new Error("Subagent is already running; retry with its handle");
-        this.subagentRuns.set(task.childSessionId!, { mailbox: new SubagentMailbox(), jobId: request.spawnId });
+        this.subagentRuns.set(task.childSessionId!, { mailbox: new SubagentMailbox(), jobId: request.spawnId, restoredSession });
       }
       let detached = false;
       try {
@@ -2771,7 +2770,8 @@ export class AgentBoxSessionManager {
     const mainTraceId = opts?.mainTraceId;
     const spawnSpanContext = opts?.spawnSpanContext;
     const childSessionDir = this.getSessionDir(childSessionId);
-    const childSessionManager = SessionManager.continueRecent(process.cwd(), childSessionDir);
+    const childSessionManager = this.subagentRuns.get(childSessionId)?.restoredSession
+      ?? SessionManager.continueRecent(process.cwd(), childSessionDir);
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
@@ -2971,6 +2971,18 @@ export class AgentBoxSessionManager {
       // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
       if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
       if (reviewing) return;
+      if (event?.type === "message_end" && event.message?.role === "user") {
+        const text = typeof event.message.content === "string" ? event.message.content : extractEventText(event.message.content);
+        for (const guidance of mailbox?.consumeGuidance(text) ?? []) {
+          enqueuePersist(async () => {
+            await this.persistAppendMessage({
+              sessionId: childSessionId, role: "user", content: redactText(guidance, redactionConfig),
+              metadata: { kind: "steer" }, fromAgentId: agentId,
+              parentSessionId: request.parentSessionId, delegationId, targetAgentId: agentId, traceId: mainTraceId,
+            });
+          });
+        }
+      }
       if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
         toolCalls++;
         const toolName = (event.toolName as string) || (event.name as string) || "tool";

@@ -28,6 +28,21 @@ describe("subagent tickets", () => {
 });
 
 describe("subagent guidance", () => {
+  it("records only consumed guidance once, including queued combined instructions", async () => {
+    const mailbox = new SubagentMailbox();
+    await mailbox.send("Check eth1");
+    await mailbox.send("Keep it read-only");
+    expect(mailbox.consumeGuidance("Unrelated initial assignment")).toEqual([]);
+    expect(mailbox.consumeGuidance("Check eth1 after the initial assignment")).toEqual([]);
+    const pending = await mailbox.takePending();
+    expect(mailbox.consumeGuidance(`Initial assignment\n\nCaller guidance:\n${pending}`)).toEqual(["Check eth1", "Keep it read-only"]);
+    expect(mailbox.consumeGuidance(pending!)).toEqual([]);
+    await mailbox.send("Check eth1");
+    expect(mailbox.consumeGuidance("Check eth1")).toEqual(["Check eth1"]);
+    await mailbox.send("Not consumed before cancellation");
+    mailbox.close();
+    expect(mailbox.consumeGuidance("Done")).toEqual([]);
+  });
   function fixture() {
     const mailbox = new SubagentMailbox();
     let queued: string[] = [];

@@ -43,6 +43,8 @@ export class SubagentMailbox {
   private accepting = true;
   private pending: string[] = [];
   private updates: string[] = [];
+  private unrecorded: string[] = [];
+  private combinedGuidance = new Map<string, string[]>();
   private delivery: Promise<void> = Promise.resolve();
 
   attach(brain: BrainSession) { this.brain = brain; }
@@ -52,6 +54,7 @@ export class SubagentMailbox {
     if (!this.accepting) throw new Error("Subagent is finishing; retry the follow-up after its result arrives");
     if (this.updates.length >= 32) throw new Error("This run has reached its guidance limit; wait for its result before following up");
     this.updates.push(text);
+    this.unrecorded.push(text);
     this.pending.push(text);
     this.delivery = this.delivery.then(async () => {
       if (!this.brain || this.reviewing || !this.accepting) return;
@@ -68,7 +71,29 @@ export class SubagentMailbox {
     const queued = this.brain?.clearQueue();
     const messages = [...(queued?.steering ?? []), ...(queued?.followUp ?? []), ...this.pending];
     this.pending = [];
-    return messages.length ? messages.join("\n\n") : undefined;
+    if (!messages.length) return undefined;
+    const prompt = messages.join("\n\n");
+    this.combinedGuidance.set(prompt, messages);
+    return prompt;
+  }
+  /** Only caller guidance observed in a consumed native user message is audited.
+   * Pending/repair guidance may be combined into a prompt; repeated lifecycle
+   * events must not duplicate it, and internal assessment prompts never call this. */
+  consumeGuidance(prompt: string): string[] {
+    // Match exact native steering or a batch attached by runSubagentToAcceptance.
+    // A substring in the original assignment is not proof of guidance delivery.
+    const batch = [...this.combinedGuidance.keys()].find(text =>
+      prompt === text || prompt.endsWith(`\n\nCaller guidance:\n${text}`));
+    const delivered = batch === undefined ? [prompt] : this.combinedGuidance.get(batch)!;
+    if (batch !== undefined) this.combinedGuidance.delete(batch);
+    const consumed: string[] = [];
+    for (const text of delivered) {
+      const index = this.unrecorded.indexOf(text);
+      if (index < 0) continue;
+      this.unrecorded.splice(index, 1);
+      consumed.push(text);
+    }
+    return consumed;
   }
   /** Synchronous seal after checking pending updates: no acknowledgement can race past completion. */
   seal(): boolean {
