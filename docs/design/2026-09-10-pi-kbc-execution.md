@@ -93,6 +93,17 @@ when supplied. Managed instructions are excluded from that metadata.
 
 ## Rollout and rollback
 
+Oversized text and PDF sources select the slice-aware planner even when the
+total corpus is below the hierarchical threshold. Text slices prefer complete
+lines. A line longer than the source budget uses contiguous, UTF-8-safe byte
+ranges; the original Raw remains the citation identity. Legacy line-only plans
+remain readable. Coverage validates the entire byte range, and recovery rebuilds
+only pending excerpt files from the durable Raw snapshot.
+
+The real-worker Responses fixture covers API-key requests, encrypted reasoning
+continuity and host-tool results, including a failed Read returned to the model.
+It does not establish compatibility or output quality for an untested gateway.
+
 The Pi SDK upgrade is a separate dependency PR. The KBC feature requires the
 paired control-plane API/Web change with execution/observation table migrations and the
 Siclaw Runtime/AgentBox/KBC images from exact commits.

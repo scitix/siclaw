@@ -3724,17 +3724,30 @@ def _materialize_one_batch_slices(
                 end = int(source_range["end_line"])
             except (KeyError, TypeError, ValueError) as error:
                 raise BatchOutputError(f"malformed text slice for {source}") from error
-            lines = source_path.read_bytes().splitlines(keepends=True)
+            data = source_path.read_bytes()
+            lines = data.splitlines(keepends=True)
             if start < 1 or end < start or end > len(lines):
                 raise BatchOutputError(
                     f"text slice range {start}-{end} is invalid for {source} ({len(lines)} lines)"
                 )
+            excerpt = b"".join(lines[start - 1:end])
+            location = f"lines {start}-{end}"
+            if "start_byte" in source_range or "end_byte" in source_range:
+                try:
+                    byte_start = int(source_range["start_byte"])
+                    byte_end = int(source_range["end_byte"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise BatchOutputError(f"malformed byte slice for {source}") from error
+                if not 0 <= byte_start < byte_end <= len(data):
+                    raise BatchOutputError(f"invalid byte slice for {source}")
+                excerpt = data[byte_start:byte_end]
+                location += f", bytes [{byte_start},{byte_end})"
             header = (
-                f"<!-- KBC read-only excerpt: raw/{source}, lines {start}-{end}. "
+                f"<!-- KBC read-only excerpt: raw/{source}, {location}. "
                 f"Candidate sources[].resource must cite raw/{source}, never this helper path. -->\n"
             ).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(header + b"".join(lines[start - 1:end]))
+            target.write_bytes(header + excerpt)
 
 
 def _auto_exclude_batch_sources(run: "CompileRun", sources: list[str], reason: str) -> list[dict]:
@@ -4097,8 +4110,12 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             part = source_range["part"]
             parts = source_range["parts"]
             slice_file = source_range["slice_file"]
+            byte_location = (
+                f", bytes [{source_range['start_byte']},{source_range['end_byte']})"
+                if "start_byte" in source_range else ""
+            )
             listing_lines.append(
-                f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}, part {part}/{parts})"
+                f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}{byte_location}, part {part}/{parts})"
             )
             sliced_sources.append(path)
         elif isinstance(page_range, dict):

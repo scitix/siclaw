@@ -30,7 +30,7 @@ def completion(text="done", *, tool=None):
 
 
 @asynccontextmanager
-async def provider(respond):
+async def provider(respond, *, api="openai-completions"):
     requests = []
 
     async def handler(request):
@@ -40,7 +40,7 @@ async def provider(respond):
         return respond(body, len(requests))
 
     app = web.Application(client_max_size=4 * 1024 * 1024)
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post("/v1/responses" if api == "openai-responses" else "/v1/chat/completions", handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -49,7 +49,7 @@ async def provider(respond):
     try:
         yield {"model": {
             "id": "fixture-model", "name": "Fixture model", "provider": "kbc-fixture",
-            "api": "openai-completions", "baseUrl": f"http://127.0.0.1:{port}/v1",
+            "api": api, "baseUrl": f"http://127.0.0.1:{port}/v1",
             "reasoning": False, "input": ["text", "image"], "contextWindow": 128000,
             "maxTokens": 2048, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         }, "api_key": "private-fixture-key", "thinking_level": "off"}, requests

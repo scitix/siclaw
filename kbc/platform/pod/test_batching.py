@@ -78,6 +78,46 @@ def test_every_text_format_can_be_sliced_not_only_markdown(tmp_path):
     assert len(item.get("text_slices") or []) > 1, "non-Markdown text must slice"
 
 
+def test_medium_corpus_routes_oversized_sources_to_slices(tmp_path, monkeypatch):
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_BUDGET_BYTES", "192000")
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_SLICE_BYTES", "192000")
+    raw = _mk_text(tmp_path, {"manual.md": "bounded operational facts\n" * 40000})
+    inventory = bt.scan_sources(raw)
+    assert bt.corpus_effective_bytes(inventory) < 192000 * 8
+    assert bt.should_hierarchical(inventory, threshold=192000 * 8)
+    batches = bt.pack_hierarchical_batches(inventory, budget=192000, text_budget=192000)
+    assert len(batches) > 1
+    assert max(batch["bytes"] for batch in batches) <= 192000
+    assert bt.validate_plan(bt.build_plan(inventory, batches, planner="hierarchical-code"),
+                            inventory, budget=192000, text_budget=192000) == []
+    assert bt.should_hierarchical([{"path": "manual.pdf", "bytes": 100,
+                                  "pdf_slices": [{"start_page": 1, "end_page": 20}]}])
+
+
+def test_single_line_slices_preserve_utf8_and_reject_gaps(tmp_path, monkeypatch):
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_BUDGET_BYTES", "1000")
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_SLICE_BYTES", "1000")
+    body = ('{"facts":"' + "恢复🚀。" * 3000 + 'TAIL-FACT-291"}\n').encode()
+    raw = _mk_text(tmp_path, {"manual.json": body.decode()})
+    inventory = bt.scan_sources(raw)
+    slices = inventory[0]["text_slices"]
+    excerpts = [body[item["start_byte"]:item["end_byte"]] for item in slices]
+    assert b"".join(excerpts) == body
+    assert all(len(excerpt) <= 1000 and excerpt.decode("utf-8") for excerpt in excerpts)
+    batches = bt.pack_hierarchical_batches(inventory, budget=1000, text_budget=1000)
+    plan = bt.build_plan(inventory, batches, planner="hierarchical-code")
+    assert bt.validate_plan(plan, inventory, budget=1000, text_budget=1000) == []
+    final = batches[-1]["source_ranges"]["manual.json"]
+    final["end_byte"] -= 1
+    final["bytes"] -= 1
+    assert any("cover all bytes" in error for error in bt.validate_plan(plan, inventory))
+    final["end_byte"] += 1
+    final["bytes"] += 1
+    final["start_byte"] += 1
+    final["bytes"] -= 1
+    assert any("not contiguous" in error for error in bt.validate_plan(plan, inventory))
+
+
 def test_partial_slices_are_still_rejected_for_ordinary_documents(tmp_path):
     """Every line of an oversized source must reach some session. A plan that
     stops short of the last line is incomplete, and there is no longer any

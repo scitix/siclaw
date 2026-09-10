@@ -4612,6 +4612,29 @@ def test_small_kb_batch_gate_skips_poppler_metadata():
     print("\u2713 small KB route: no Poppler metadata subprocess")
 
 
+def test_long_line_slices_materialize_identically_after_resume(tmp_path, monkeypatch):
+    import batching
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_BUDGET_BYTES", "1000")
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_SLICE_BYTES", "1000")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    body = ("header\n" + "中文🚀事实" * 1000 + "TAIL-812\nend\n").encode()
+    (raw / "manual.txt").write_bytes(body)
+    inventory = batching.scan_sources(raw)
+    plan = batching.build_plan(inventory, batching.pack_hierarchical_batches(inventory),
+                               planner="hierarchical-code")
+    run = compile_box.CompileRun("long-line-materialize", str(tmp_path), 1)
+    assert compile_box._materialize_batch_slices(run, plan) == {}
+    views = [tmp_path / batch["source_ranges"]["manual.txt"]["slice_file"] for batch in plan["batches"]]
+    original = [view.read_bytes() for view in views]
+    assert b"".join(view.split(b"\n", 1)[1] for view in original) == body
+    assert all(view.decode("utf-8") for view in original)
+    plan["batches"][0]["status"] = "done"
+    assert compile_box._materialize_batch_slices(run, plan) == {}
+    assert not views[0].exists()
+    assert [view.read_bytes() for view in views[1:]] == original[1:]
+
+
 def test_hierarchical_text_slice_materialization_and_directive():
     """Oversized-text helpers are bounded, ephemeral views of Raw. The model
     reads the helper, but durable Candidate provenance still names the original
