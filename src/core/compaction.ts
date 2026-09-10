@@ -4,6 +4,8 @@
  * Ported from OpenClaw's src/agents/compaction.ts — wraps pi-coding-agent SDK
  * functions with security filtering and multi-stage summarization.
  */
+import type { ProviderHeaders } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { estimateTokens, generateSummary } from "@earendil-works/pi-coding-agent";
@@ -344,7 +346,7 @@ async function summarizeChunks(params: {
   messages: AgentMessage[];
   model: NonNullable<ExtensionContext["model"]>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   signal: AbortSignal;
   reserveTokens: number;
   maxChunkTokens: number;
@@ -370,10 +372,18 @@ async function summarizeChunks(params: {
           params.model,
           params.reserveTokens,
           params.apiKey,
-          params.headers,
+          undefined,
           params.signal,
           effectiveInstructions,
           summary,
+          undefined,
+          // The SDK summary helper still types its positional headers as
+          // strings. Pass through the stream hook to preserve null deletion
+          // markers used to suppress provider default headers.
+          (model, context, options) => streamSimple(model, context, {
+            ...options,
+            headers: params.headers,
+          }),
         );
         lastError = undefined;
         break;
@@ -411,7 +421,7 @@ export async function summarizeWithFallback(params: {
   messages: AgentMessage[];
   model: NonNullable<ExtensionContext["model"]>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   signal: AbortSignal;
   reserveTokens: number;
   maxChunkTokens: number;
@@ -477,7 +487,7 @@ export async function summarizeInStages(params: {
   messages: AgentMessage[];
   model: NonNullable<ExtensionContext["model"]>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   signal: AbortSignal;
   reserveTokens: number;
   maxChunkTokens: number;

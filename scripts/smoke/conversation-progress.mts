@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { createInterface } from "node:readline";
 import { writeFileSync } from "node:fs";
 import { Agent } from "@earendil-works/pi-agent-core";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { Type } from "@sinclair/typebox";
 import { PiAgentBrain } from "../../src/core/brains/pi-agent-brain.js";
 import { consumeAgentSse } from "../../src/gateway/sse-consumer.js";
@@ -50,7 +51,8 @@ for (const { api, thinkingLevel } of configurations) {
     sessionId: `public-test-${mode}`, userId: "synthetic", agentId: "inventory-test",
     onEvent: (e, _kind, extras) => relayed.push({ ...e, ...extras }),
   });
-  const agent = new Agent({ getApiKey: () => key,
+  const agent = new Agent({
+    streamFn: (model, context, options) => streamSimple(model, context, { ...options, apiKey: key }),
     initialState: {
       systemPrompt: "You are a helpful assistant. This is a fictional test inventory. Briefly explain what you will check in the user's language before tool batches. After results, connect the observed finding to the next check. Never invent evidence or expose private reasoning. Prefer ordinary assistant text alongside tool calls. Finish with one self-contained answer.",
       model: { id: process.env.SICLAW_TEST_MODEL ?? "gpt-5.6-sol", name: "Test model", api, provider: "test", baseUrl,

@@ -31,7 +31,7 @@ function makeStream(events: unknown[], finalMessage: unknown): any {
 
 function makeAgent(streamFn?: any, transformContext?: any) {
   return {
-    streamFn: streamFn ?? ((_m: any, _c: any, _o: any) => makeStream([], {})),
+    streamFunction: streamFn ?? ((_m: any, _c: any, _o: any) => makeStream([], {})),
     transformContext,
   };
 }
@@ -103,7 +103,7 @@ describe("installGuardPipeline — input/output wrap", () => {
     };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
 
-    agent.streamFn("model", { messages: originalMsgs, extra: 1 }, {});
+    agent.streamFunction("model", { messages: originalMsgs, extra: 1 }, {});
     expect(calls[0]).toBe(replaced);
   });
 
@@ -124,7 +124,7 @@ describe("installGuardPipeline — input/output wrap", () => {
       context: [],
     };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
-    agent.streamFn("m", ctxObj, {});
+    agent.streamFunction("m", ctxObj, {});
     expect(baseFn).toHaveBeenCalled();
     expect(baseFn.mock.calls[0][1]).toBe(ctxObj);
   });
@@ -139,7 +139,7 @@ describe("installGuardPipeline — input/output wrap", () => {
       context: [],
     };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
-    agent.streamFn("model", { messages: "not-array" }, {});
+    agent.streamFunction("model", { messages: "not-array" }, {});
     expect(baseFn).toHaveBeenCalled();
   });
 
@@ -162,7 +162,7 @@ describe("installGuardPipeline — input/output wrap", () => {
     };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
 
-    const stream = agent.streamFn("m", { messages: [] }, {});
+    const stream = agent.streamFunction("m", { messages: [] }, {});
     const iterated: unknown[] = [];
     for await (const evt of stream) iterated.push(evt);
     const result = await stream.result();
@@ -188,7 +188,7 @@ describe("installGuardPipeline — input/output wrap", () => {
       context: [],
     };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
-    const p = agent.streamFn("m", { messages: [] }, {});
+    const p = agent.streamFunction("m", { messages: [] }, {});
     expect(typeof (p as Promise<any>).then).toBe("function");
     const stream = await p;
     for await (const _e of stream) {}
@@ -204,7 +204,7 @@ describe("installGuardPipeline — input/output wrap", () => {
     const registry: GuardRegistry = { input: [], output: [], persist: [], context: [] };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
 
-    const s = agent.streamFn("m", { messages: [] }, {});
+    const s = agent.streamFunction("m", { messages: [] }, {});
     expect(s).toBe(rawStream);
   });
 });
@@ -334,7 +334,7 @@ describe("guardLog triggers on input guard change", () => {
       output: [], persist: [], context: [],
     };
     installGuardPipeline(registry, { agent, sessionManager: makeSessionManager() });
-    agent.streamFn("m", { messages: msgs }, {});
+    agent.streamFunction("m", { messages: msgs }, {});
     const any = warn.mock.calls.map((c) => String(c[0])).join("|");
     expect(any).toMatch(/changer/);
     expect(any).toMatch(/transformed/);

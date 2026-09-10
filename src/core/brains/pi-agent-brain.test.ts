@@ -23,7 +23,7 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     agent: {
       onResponse: vi.fn(async () => {}),
       state: { messages: [] },
-      streamFn: vi.fn((_model: any, _context: any, _options?: any) => ({})),
+      streamFunction: vi.fn((_model: any, _context: any, _options?: any) => ({})),
     },
     getActiveToolNames: vi.fn(() => [...activeToolNames]),
     setActiveToolsByName: vi.fn((names: string[]) => { activeToolNames = [...names]; }),
@@ -31,8 +31,8 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     settingsManager: {
       getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16, keepRecentTokens: 20 })),
     },
-    modelRegistry: {
-      find: vi.fn((provider: string, id: string) => ({
+    modelRuntime: {
+      getModel: vi.fn((provider: string, id: string) => ({
         id, name: id, provider, contextWindow: 1000, maxTokens: 100, reasoning: false,
       })),
       registerProvider: vi.fn(),
@@ -98,7 +98,7 @@ describe("PiAgentBrain", () => {
   it("repairs one missing required result with only that tool and a forced first provider call", async () => {
     const requiredTool = "mcp__result__submit";
     const session = makeFakeSession();
-    const originalStreamFn = session.agent.streamFn;
+    const originalStreamFn = session.agent.streamFunction;
     let promptCount = 0;
     session.prompt = vi.fn(async (_text: string) => {
       promptCount++;
@@ -112,7 +112,7 @@ describe("PiAgentBrain", () => {
       }
 
       expect(session.getActiveToolNames()).toEqual([requiredTool]);
-      session.agent.streamFn(
+      session.agent.streamFunction(
         { api: "openai-completions" },
         { tools: [{ name: requiredTool }] },
         { reasoning: "high" },
@@ -144,7 +144,7 @@ describe("PiAgentBrain", () => {
       },
     );
     expect(session.getActiveToolNames()).toEqual(["read", requiredTool]);
-    expect(session.agent.streamFn).toBe(originalStreamFn);
+    expect(session.agent.streamFunction).toBe(originalStreamFn);
     expect(events).toContainEqual({ type: "required_result_repair_start", toolName: requiredTool });
     expect(events).toContainEqual({ type: "required_result_repair_end", toolName: requiredTool, success: true });
   });
@@ -212,7 +212,7 @@ describe("PiAgentBrain", () => {
   it("does not spend the repair force on pre-prompt compaction", async () => {
     const requiredTool = "mcp__result__submit";
     const session = makeFakeSession();
-    const originalStreamFn = session.agent.streamFn;
+    const originalStreamFn = session.agent.streamFunction;
     let promptCount = 0;
     session.prompt = vi.fn(async () => {
       promptCount++;
@@ -226,8 +226,8 @@ describe("PiAgentBrain", () => {
 
       // AgentSession.prompt may compact before its actual agent request. That
       // request has no tools and must pass through untouched.
-      session.agent.streamFn({ api: "openai-completions" }, { tools: [] }, { phase: "compaction" });
-      session.agent.streamFn(
+      session.agent.streamFunction({ api: "openai-completions" }, { tools: [] }, { phase: "compaction" });
+      session.agent.streamFunction(
         { api: "openai-completions" },
         { tools: [{ name: requiredTool }] },
         { phase: "repair" },
@@ -757,17 +757,17 @@ describe("PiAgentBrain", () => {
     expect(brain.getModel()).toBeUndefined();
   });
 
-  it("setModel looks up via modelRegistry and calls session.setModel", async () => {
+  it("setModel looks up via modelRuntime and calls session.setModel", async () => {
     const session = makeFakeSession();
     const brain = new PiAgentBrain(session);
     await brain.setModel({ id: "m2", name: "M2", provider: "p", contextWindow: 0, maxTokens: 0, reasoning: false });
-    expect(session.modelRegistry.find).toHaveBeenCalledWith("p", "m2");
+    expect(session.modelRuntime.getModel).toHaveBeenCalledWith("p", "m2");
     expect(session.setModel).toHaveBeenCalled();
   });
 
   it("setModel is a no-op when model not found", async () => {
     const session = makeFakeSession({
-      modelRegistry: { find: vi.fn(() => undefined), registerProvider: vi.fn() },
+      modelRuntime: { getModel: vi.fn(() => undefined), registerProvider: vi.fn() },
     });
     const brain = new PiAgentBrain(session);
     await brain.setModel({ id: "x", name: "x", provider: "x", contextWindow: 0, maxTokens: 0, reasoning: false });
@@ -776,7 +776,7 @@ describe("PiAgentBrain", () => {
 
   it("findModel returns undefined when registry returns undefined", () => {
     const session = makeFakeSession({
-      modelRegistry: { find: vi.fn(() => undefined), registerProvider: vi.fn() },
+      modelRuntime: { getModel: vi.fn(() => undefined), registerProvider: vi.fn() },
     });
     const brain = new PiAgentBrain(session);
     expect(brain.findModel("p", "id")).toBeUndefined();
@@ -789,11 +789,11 @@ describe("PiAgentBrain", () => {
     expect(info).toMatchObject({ id: "id", provider: "prov" });
   });
 
-  it("registerProvider delegates to modelRegistry", () => {
+  it("registerProvider delegates to modelRuntime", () => {
     const session = makeFakeSession();
     const brain = new PiAgentBrain(session);
     brain.registerProvider!("name", { baseUrl: "u", models: [] });
-    expect(session.modelRegistry.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
+    expect(session.modelRuntime.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
   });
 
   it("restores a checkpoint by branching the session leaf and rebuilding agent messages", () => {
