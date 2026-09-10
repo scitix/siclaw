@@ -122,3 +122,17 @@ describe("TaskLedger", () => {
     expect(a).not.toBe(c);
   });
 });
+
+it("keeps the task title through blank status updates while allowing a real rename", () => {
+  const ledger = new TaskLedger();
+  ledger.create({ subject: "Inspect request timing", description: "Check the trace", owner: "worker" });
+  for (const subject of ["", " \t\n", undefined]) {
+    expect(ledger.update("1", { subject, status: "in_progress" })).toMatchObject({
+      subject: "Inspect request timing", status: "in_progress",
+    });
+  }
+  expect(ledger.update("1", { subject: "Verify timing evidence", status: "completed", owner: "" })).toMatchObject({
+    subject: "Verify timing evidence", status: "completed", owner: "",
+  });
+  expect(ledger.update("1", { subject: "", status: "completed" })?.subject).toBe("Verify timing evidence");
+});

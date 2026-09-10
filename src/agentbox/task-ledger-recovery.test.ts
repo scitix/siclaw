@@ -21,3 +21,22 @@ it("does not erase a local plan when history has no valid plan events", () => {
   expect(restoreTaskLedgerFromHistory("s", [{ metadata: "bad json" }])).toBe(false);
   expect(getOrCreateLedger("s").size).toBe(1);
 });
+
+it("recovers the last nonblank title from legacy snapshots without mutating history", () => {
+  const created = upsert("7");
+  const completed = { metadata: { ...created.metadata, task: { ...created.metadata.task, subject: " \t", status: "completed" } } };
+  const messages = [created, { metadata: JSON.stringify(completed.metadata) }];
+  const before = JSON.stringify(messages);
+  restoreTaskLedgerFromHistory("s", messages);
+  expect(getOrCreateLedger("s").get("7")).toMatchObject({ subject: "Check nodes", status: "completed" });
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+it("does not recover a title from a deleted or reset plan", () => {
+  for (const boundary of [{ action: "delete", taskId: "7" }, { action: "reset" }]) {
+    const blank = upsert("7");
+    blank.metadata.task.subject = "";
+    restoreTaskLedgerFromHistory("s", [upsert("7"), { metadata: { kind: "task_event", taskListId: "s", ...boundary } }, blank]);
+    expect(getOrCreateLedger("s").get("7")?.subject).toBe("");
+  }
+});

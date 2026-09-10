@@ -65,7 +65,9 @@ export class TaskLedger {
   update(id: string, patch: UpdateTaskPatch): LedgerTask | null {
     const task = this.tasks.get(id);
     if (!task) return null;
-    if (patch.subject !== undefined) task.subject = patch.subject;
+    // Status-only model calls may fill optional strings with empty placeholders.
+    // A task title cannot be cleared; a nonblank value still performs a rename.
+    if (patch.subject?.trim()) task.subject = patch.subject;
     if (patch.description !== undefined) task.description = patch.description;
     if (patch.activeForm !== undefined) task.activeForm = patch.activeForm;
     if (patch.status !== undefined) task.status = patch.status;

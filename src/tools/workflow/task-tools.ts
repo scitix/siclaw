@@ -64,7 +64,7 @@ const TaskStatusLiteral = Type.Union([
 const TaskUpdateItem = Type.Object({
   id: Type.String({ description: "The task id returned by task_create" }),
   status: Type.Optional(TaskStatusLiteral),
-  subject: Type.Optional(Type.String()),
+  subject: Type.Optional(Type.String({ description: "Non-empty new title; omitted or blank keeps the current title" })),
   description: Type.Optional(Type.String()),
   activeForm: Type.Optional(Type.String()),
   owner: Type.Optional(Type.String()),
@@ -256,7 +256,7 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       // Single-update form: the common case, and what rides along with a real tool call.
       id: Type.Optional(Type.String()),
       status: Type.Optional(TaskStatusLiteral),
-      subject: Type.Optional(Type.String()),
+      subject: Type.Optional(Type.String({ description: "Non-empty new title; omitted or blank keeps the current title" })),
       description: Type.Optional(Type.String()),
       activeForm: Type.Optional(Type.String()),
       owner: Type.Optional(Type.String()),

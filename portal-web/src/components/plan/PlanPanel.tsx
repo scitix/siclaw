@@ -24,7 +24,7 @@ function ProgressRow({ task }: { task: PlanTaskView }) {
       </span>
       <div className="min-w-0 flex-1">
         <p className={`text-[13px] leading-snug ${done ? "text-muted-foreground" : "text-foreground"}`}>
-          {task.subject}
+          {task.subject.trim() || `Task #${task.id}`}
         </p>
         {task.group === "blocked" && task.blockedBy.length > 0 && (
           <p className="text-[10px] text-muted-foreground/60">
