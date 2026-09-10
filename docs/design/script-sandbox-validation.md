@@ -1,5 +1,50 @@
 # Script sandbox validation — 2026-09-11
 
+## SDK diagnostic tools: 2026-09-11
+
+Code revision `7c201031` reuses the Agent's Bash/host/node/Pod tool factories
+and MCP wrapper. The SDK applies current capability/resource checks, immutable
+credential snapshots, pinned SSH hops and a strict diagnostic command profile.
+Node execution has a ten-callback Runtime limit and a dedicated namespace with
+`count/pods: 10` and `count/jobs.batch: 20` enforced by Kubernetes admission.
+
+Verification for this extension:
+
+- Full backend run: 357 files, 7,529 tests passed, two existing skips. A subsequent
+  focused transport run passed 54 tests. Main and AgentBox type checks/build passed.
+- All six CI checks passed on `7c201031`, including native amd64/arm64 container
+  smoke, AgentBox build graph and Portal frontend tests. Python SDK: ten tests passed.
+- Shared tool/policy tests cover command mutation, arbitrary paths/interpreters,
+  scope/capability denial, credential snapshots, truncation, cancellation, each
+  SSH hop's pin, MCP structured data, and ten-versus-eleven callback admission.
+- Real-model Python SDK enumerated five cluster nodes, called `node_exec` for
+  each, saved sanitized results with `call_to_file`, and returned all five kernel
+  versions. With no warm pool and mirrored BusyBox 1.36, runner startup was
+  2,116 ms and total script duration 30,134 ms (six tool operations).
+- Real-model Shell SDK invoked `pod_exec`, saved the result and read it locally.
+  Total duration was 2,808 ms, including 1,982 ms runner startup.
+- Kubernetes admitted ten unscheduled quota fixtures and rejected the eleventh.
+  Marking one fixture terminal did not free its count; deleting it did. All
+  fixture Pods were then deleted. These were quota admission tests, not ten
+  simultaneous production node commands.
+- Cancelling an in-flight node diagnostic removed runner and diagnostic Jobs/Pods
+  in 2,862 ms. The runner had no credential mounts, environment or service-account
+  token. Mutation/image-override/out-of-scope host/Pod/MCP requests and socket
+  creation were rejected in a real isolated script.
+- An initial Docker Hub image-pull failure also left zero diagnostic Jobs/Pods.
+  Configuration was corrected through the existing control-plane Runtime
+  `debug_pod_image` setting, using a mirrored BusyBox digest. No image was
+  hardcoded into tool code or accepted from the script.
+
+Positive SSH/MCP paths in this extension are covered by shared-tool/transport
+regressions; no new live host or MCP resource was bound for the cluster run.
+Reviewed MCP policy and SSH host key pins remain required. Hosted E2B cloud
+validation remains deferred; local/CI relay tests do not establish cloud behavior.
+The integrated test deployment has been updated with these Runtime/AgentBox and
+companion callback changes. Its dedicated diagnostic namespace/quota remains,
+with zero test Jobs/Pods after cleanup. Earlier sections below record prior
+revisions and broader baseline acceptance.
+
 ## Fresh-image acceptance after rebase — 2026-09-11
 
 Runtime and AgentBox were rebuilt from `4c027594`, including the resource-update
