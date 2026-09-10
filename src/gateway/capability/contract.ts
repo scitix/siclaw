@@ -551,7 +551,13 @@ export interface CapabilityLlmConfig {
   model?: string;
   /** Complete role contracts. Credentials stay in this private setup payload. */
   execution?: {
-    version: 1;
+    version: 1 | 2;
+    /** Required by version 2; version 1 preserves pre-type Pi attempts. */
+    agent_type?: {
+      slug: "knowledge_compiler"; release_id: string; revision_id: string;
+      release_version: number; harness: "kb-compile"; harness_version: 1;
+      system_prompt?: string;
+    } | null;
     roles: Record<string, {
       model: {
         id: string; name: string; provider: string; api: string; baseUrl: string;

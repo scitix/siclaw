@@ -10,15 +10,16 @@ import json
 from urllib.parse import urlsplit
 
 _roles: dict[str, dict] = {}
+_agent_type: dict | None = None
 _REQUIRED_ROLES = {"compile", "blue", "judge", "transcribe", "compare"}
 _APIS = {"anthropic-messages", "openai-completions", "openai-responses"}
 _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
 def configure(execution: object) -> None:
-    global _roles
-    if not isinstance(execution, dict) or execution.get("version") != 1:
-        raise ValueError("Pi compilation requires execution configuration version 1")
+    global _roles, _agent_type
+    if not isinstance(execution, dict) or execution.get("version") not in (1, 2):
+        raise ValueError("Pi compilation requires execution configuration version 1 or 2")
     roles = execution.get("roles")
     if not isinstance(roles, dict) or not _REQUIRED_ROLES.issubset(roles):
         raise ValueError("Pi execution configuration is missing required model roles")
@@ -49,6 +50,22 @@ def configure(execution: object) -> None:
                                               (value is not None and not isinstance(value, str))
                                               for key, value in headers.items()):
             raise ValueError(f"Invalid Pi model headers for role {role}")
+    agent_type = execution.get("agent_type")
+    if execution["version"] == 2 and agent_type is None:
+        raise ValueError("Pi execution version 2 requires its compiler Agent Type")
+    if execution["version"] == 1 and agent_type is not None:
+        raise ValueError("Compiler Agent Type requires Pi execution version 2")
+    if agent_type is not None:
+        if not isinstance(agent_type, dict) or agent_type.get("slug") != "knowledge_compiler" or \
+                agent_type.get("harness") != "kb-compile" or agent_type.get("harness_version") != 1:
+            raise ValueError("Unsupported compiler Agent Type harness")
+        if not all(isinstance(agent_type.get(key), str) and agent_type[key].strip()
+                   for key in ("release_id", "revision_id")) or \
+                type(agent_type.get("release_version")) is not int or agent_type["release_version"] < 1:
+            raise ValueError("Compiler Agent Type requires a published release identity")
+        if not isinstance(agent_type.get("system_prompt", ""), str):
+            raise ValueError("Invalid compiler Agent Type instructions")
+    _agent_type = deepcopy(agent_type)
     _roles = deepcopy(roles)
 
 
@@ -58,6 +75,10 @@ def for_role(role: str, *, model: str | None = None, effort: str | None = None,
         raise ValueError(f"Pi model role {role} is not configured")
     config = deepcopy(_roles[role])
     config["role"] = role
+    if _agent_type is not None:
+        config["agent_type"] = {key: _agent_type[key] for key in ("slug", "release_id", "revision_id", "release_version", "harness", "harness_version")}
+        if role == "compile":
+            config["system_prompt_append"] = _agent_type.get("system_prompt", "")
     if model and config["model"]["id"] != model:
         raise ValueError(f"Pi model role {role} differs from the requested model; refresh its execution configuration")
     if effort is not None:

@@ -26,6 +26,61 @@ def configure(monkeypatch, config, settings=None):
     }}, "settings": settings or {}})
 
 
+async def test_compiler_type_prompt_and_release_reach_real_worker(tmp_path, monkeypatch):
+    from pi_engine import observe_sessions
+    from test_pi_engine import collect
+
+    async with provider(lambda *_: completion()) as (config, requests):
+        monkeypatch.setattr(pi_config, "_roles", {})
+        monkeypatch.setattr(pi_config, "_agent_type", None)
+        execution = {"version": 2, "roles": {role: deepcopy(config) for role in
+                     ("compile", "blue", "judge", "transcribe", "compare")},
+                     "agent_type": {"slug": "knowledge_compiler", "release_id": "release-one",
+                                    "revision_id": "revision-one", "release_version": 2,
+                                    "harness": "kb-compile", "harness_version": 1,
+                                    "system_prompt": "Keep source versions separate."}}
+        pi_config.configure(execution)
+        assert "system_prompt_append" not in pi_config.for_role("blue")
+        observed = []
+
+        async def observe(event):
+            observed.append(event)
+
+        with observe_sessions(observe):
+            client = PiAgentClient(cwd=str(tmp_path), system_prompt="Compiler tool contract.",
+                                   session_id="pinned-type-session", model_config=pi_config.for_role("compile"), tools=[])
+            # A later configuration must not change the session already created.
+            execution["agent_type"]["system_prompt"] = "New instructions."
+            execution["agent_type"]["release_id"] = "release-two"
+            pi_config.configure(execution)
+            try:
+                await client.connect()
+                await client.query("Compile the sources.")
+                assert (await collect(client))[-1].data["outcome"] == "completed"
+            finally:
+                await client.disconnect()
+        system = json.dumps([message for message in requests[0]["messages"] if message["role"] in {"system", "developer"}])
+        assert "Compiler tool contract." in system and "Keep source versions separate." in system
+        assert "New instructions." not in system
+        ready = next(event for event in observed if event["kind"] == "ready")
+        assert ready["data"]["agent_type"]["release_id"] == "release-one"
+        assert "Keep source versions separate." not in json.dumps(observed)
+        assert "private-fixture-key" not in json.dumps(observed)
+
+
+async def test_unknown_compiler_harness_rejected_before_configuration_changes(monkeypatch):
+    async with provider(lambda *_: completion()) as (config, _):
+        configure(monkeypatch, config)
+        before = deepcopy(pi_config._roles)
+        with pytest.raises(ValueError, match="Unsupported compiler"):
+            pi_config.configure({"version": 2, "roles": before, "agent_type": {
+                "slug": "knowledge_compiler", "harness": "kb-compile", "harness_version": 999}})
+        assert pi_config._roles == before
+        with pytest.raises(ValueError, match="requires its compiler Agent Type"):
+            pi_config.configure({"version": 2, "roles": before})
+        assert pi_config._roles == before
+
+
 async def test_recovery_applies_frozen_switches_and_cached_watchdogs(tmp_path, monkeypatch):
     async with provider(lambda *_: completion()) as (config, _):
         monkeypatch.setattr(compile_box, "_PK_KILL_AT_BOOT", False)

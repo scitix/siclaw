@@ -12,6 +12,22 @@ slicing, plan and candidate artifacts, contradiction tickets, deterministic lint
 red-blue checks, media verification, artifact acknowledgements and recovery.
 The migration changes execution without changing these product contracts.
 
+The control plane can manage compilation as a system Agent Type named
+`knowledge_compiler`. It supplies a published release identity and the
+`kb-compile` harness contract version 1, together with the resolved execution
+configuration. Compiler role instructions are appended to the harness's own
+instructions for compile sessions; other model roles keep their dedicated
+instructions. This does not create an ordinary conversational Agent instance.
+
+The type's primary model serves compile/judge/compare, and its optional fast
+model serves blue/transcribe. Organization overrides are resolved by the control
+plane before execution. KBC receives complete roles and never queries a mutable
+type or model catalogue. Historical Pi attempts without a type identity remain
+supported; a supplied unknown harness version is rejected before a worker starts.
+Type-bearing setup payloads use execution configuration version 2, which older
+Pi images reject instead of silently ignoring managed instructions. Version 1
+remains the compatibility contract for previously frozen Pi attempts.
+
 ## Data flow
 
 1. The control plane resolves the owner's primary/light model choices into five explicit
@@ -72,6 +88,8 @@ timings, tool activity and classified outcomes. Prompt text, tool payloads,
 provider error bodies and credentials stay outside the diagnostic projection.
 The queue holds at most 128 records of 64 KiB; bounded RPC retries use stable event
 IDs and duplicate inserts are ignored. A dropped record produces an explicit gap.
+Readiness observations also include the pinned type/release/harness identity
+when supplied. Managed instructions are excluded from that metadata.
 
 ## Rollout and rollback
 

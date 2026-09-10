@@ -74,7 +74,9 @@ class PiAgentClient:
                  model_config: dict, tools: list[EngineTool],
                  max_model_calls: int = 150, command: list[str] | None = None):
         self.cwd = str(Path(cwd).resolve())
-        self.system_prompt = system_prompt
+        managed_prompt = model_config.get("system_prompt_append", "").strip()
+        self.system_prompt = system_prompt + ("\n\n---\n\n# Managed compiler instructions\n\n" + managed_prompt
+                                               if managed_prompt else "")
         self.session_id = session_id
         self.config = model_config
         self.tools = {tool.name: tool for tool in tools}
@@ -117,6 +119,8 @@ class PiAgentClient:
         if fields is None:
             return
         metadata = _observation_metadata({key: data[key] for key in fields if key in data})
+        if kind == "ready" and self.config.get("agent_type"):
+            metadata["agent_type"] = self.config["agent_type"]
         if kind == "result" and data.get("outcome") != "completed":
             metadata["failure_code"] = "interrupted" if data.get("outcome") == "aborted" else "model_request_failed"
         elif kind == "transport_error":
