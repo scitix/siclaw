@@ -1,6 +1,7 @@
 import {
   KnowledgeLabelIndex,
   type KnowledgeLabelCatalogResult,
+  type KnowledgeLibrarySummary,
   type KnowledgeResolutionResult,
 } from "./labels.js";
 
@@ -22,12 +23,19 @@ export class KnowledgeResolver {
     await this.labels.sync();
   }
 
-  search(query: string, topK = 10): KnowledgeResolutionResult {
+  search(query: string, topK = 10, opts: { library?: string } = {}): KnowledgeResolutionResult {
     if (this.closed) return {
       pages: [], matchedPages: 0, totalPages: 0, totalLabels: 0,
-      invalidLabeledPages: 0, unlabeledPages: 0, unreachableLabeledPages: 0,
+      libraries: [], routing: { multiLibrary: false, selected: [], fallback: false, margin: null }, staleCandidates: 0,
+      unknownLibrary: false, invalidLabeledPages: 0, unlabeledPages: 0, unreachableLabeledPages: 0,
     };
-    return this.labels.search(query, topK);
+    return this.labels.search(query, topK, opts);
+  }
+
+  /** Libraries of the mount with their dominant labels; one root "" entry for a single library. */
+  libraries(): KnowledgeLibrarySummary[] {
+    if (this.closed) return [];
+    return this.labels.listLibraries();
   }
 
   catalog(opts: { query?: string; facet?: string; offset?: number; limit?: number } = {}): KnowledgeLabelCatalogResult {
