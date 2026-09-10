@@ -418,6 +418,44 @@ async def test_broken_json_fails_open():
     print("OK  broken JSON → one retry → state=failed (fail-open, never raises)")
 
 
+async def test_question_shape_failure_retries_with_required_contract():
+    class WrongShapeOnce(FakeEngine):
+        async def run_readonly_agent(self, **kwargs):
+            result = await super().run_readonly_agent(**kwargs)
+            if "question officer" in kwargs["user_message"] and self.calls["questions"] == 1:
+                return '{"topics": [{"knowledge_point": "not a question"}]}'
+            return result
+
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = WrongShapeOnce()
+        summary, detail = await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw,
+                                             page_count=3, questions_budget=2)
+        assert fake.calls["questions"] == 2
+        assert len(detail["questions"]) == 2
+        assert summary["state"] != "failed", summary
+        assert '"questions"' in fake.users["questions"]
+
+
+async def test_question_shape_failure_is_bounded_and_diagnosable():
+    class WrongShape(FakeEngine):
+        async def run_readonly_agent(self, **kwargs):
+            result = await super().run_readonly_agent(**kwargs)
+            if "question officer" in kwargs["user_message"]:
+                return '{"topics": []}'
+            return result
+
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = WrongShape()
+        summary, detail = await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3)
+        assert fake.calls["questions"] == 2
+        assert fake.calls["blue"] == 0
+        assert summary["state"] == "failed"
+        assert "questions" in summary["error"] and "topics" in summary["error"]
+        assert detail["questions"] == []
+
+
 async def test_contract_artifacts_judge_only():
     """INTENT/EXCLUSIONS (owner contract) reach every JUDGE stage; the blue
     team gets none of it — a real consumer doesn't know the scope deal."""

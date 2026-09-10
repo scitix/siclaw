@@ -228,23 +228,39 @@ class PKStageError(RuntimeError):
 async def _agent_json(engine: ReadonlyAgentEngine, *, stage: str, system: str, user: str,
                       model: str, cwd: str, roots: list[str], timeout: float,
                       locale: str | None = None, role: str | None = None):
-    """One engine call expected to yield JSON; on parse failure retry ONCE with
-    an explicit re-emit instruction (new one-shot session), then fail the stage."""
+    """Validate the JSON result before the one bounded re-emit retry.
+
+    A parseable object with no usable questions is still a failed result.
+    Keep that failure inside the same retry boundary as malformed JSON.
+    """
     last_err = "?"
     for attempt in range(2):
         text = await engine.run_readonly_agent(
             cwd=cwd, system_prompt=system, user_message=user, model=model,
             allowed_read_roots=roots, timeout_secs=timeout, role=role)
         try:
-            return parse_json_lenient(text)
+            data = parse_json_lenient(text)
+            if stage == "questions":
+                questions = data.get("questions") if isinstance(data, dict) else None
+                if not isinstance(questions, list) or not any(
+                    isinstance(q, dict) and isinstance(q.get("question"), str) and q["question"].strip()
+                    for q in questions
+                ):
+                    shape = f"object keys={list(data)[:8]}" if isinstance(data, dict) else type(data).__name__
+                    raise ValueError(f'expected a nonempty "questions" array with question text; received {shape}')
+            return data
         except ValueError as e:
             last_err = f"{e}; output head: {text[:200]!r}"
             user = user + _t(
                 locale,
-                "\n\n(Your previous output could not be parsed as JSON. Answer again and output "
+                "\n\n(Your previous output did not match the requested JSON result. Answer again and output "
                 "**valid JSON only**, with no other text.)",
-                "\n\n(你上一次的输出无法解析为 JSON。请重新作答,**只输出合法 JSON**,不带任何其他文字。)")
-    raise PKStageError(stage, f"unparseable JSON after retry: {last_err}")
+                "\n\n(你上一次的输出不符合要求的 JSON 结果。请重新作答,**只输出合法 JSON**,不带任何其他文字。)")
+            if stage == "questions":
+                user += _t(locale,
+                    '\nReturn one object with a nonempty "questions" array; every item must contain "question" text.',
+                    '\n返回一个包含非空 "questions" 数组的对象，每项必须包含 "question" 问题文本。')
+    raise PKStageError(stage, f"invalid JSON result after retry: {last_err}")
 
 
 # ── inputs derivation ──
