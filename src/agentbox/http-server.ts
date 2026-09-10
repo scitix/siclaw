@@ -932,7 +932,8 @@ export function createHttpServer(
     res.once("close", abort);
     try {
       const body = await parseJsonBody(req);
-      if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments"].includes(k)) ||
+      if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approved_kubeconfig"].includes(k)) ||
+          typeof body.approved_kubeconfig !== "string" || body.approved_kubeconfig.length > 256 * 1024 ||
           typeof body.session_id !== "string" || typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token)) throw new Error();
       const managed = sessionManager.get(body.session_id);
       const invocations = sessionManager.gatewayClient?.sandboxInvocations;
@@ -941,9 +942,13 @@ export function createHttpServer(
         // Lazy imports keep the regular HTTP/health startup path lightweight.
         const { createRestrictedBashTool } = await import("../tools/cmd-exec/restricted-bash.js");
         const { kubeConnection } = await import("../tools/infra/inline-kubeconfig.js");
+        const { withSandboxKubeconfig } = await import("./sandbox-kubeconfig.js");
         signal.throwIfAborted();
-        const tool = createRestrictedBashTool(managed.kubeconfigRef, undefined, { validateKubeconfig: kubeConnection, outputMode: "data" });
-        const output = await tool.execute(`sandbox-${randomUUID()}`, args, signal, undefined, {} as Parameters<typeof tool.execute>[4]);
+        const output = await withSandboxKubeconfig(managed.kubeconfigRef.credentialsDir, body.approved_kubeconfig as string, async kubeconfigPath => {
+          const tool = createRestrictedBashTool(undefined, undefined, { kubeconfigPath, validateKubeconfig: kubeConnection, outputMode: "data" });
+          signal.throwIfAborted();
+          return tool.execute(`sandbox-${randomUUID()}`, args, signal, undefined, {} as Parameters<typeof tool.execute>[4]);
+        });
         const details = output.details as { blocked?: boolean; error?: boolean } | undefined;
         if (details?.blocked || details?.error) throw new Error();
         const value = { text: output.content.filter(c => c.type === "text").map(c => (c as { text: string }).text).join("\n") };

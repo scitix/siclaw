@@ -598,6 +598,8 @@ export async function createSiclawSession(
 
   // -- MCP external tools (dynamic discovery, not in registry) --
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
+  const sandboxOnly = allowedTools?.length && allowedTools.every(name => name === "run_script");
+  const mcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
   const toolResultArtifactStore = new ToolResultArtifactStore({
     rootDir: toolResultArtifactsDir,
     getScope: () => ({
@@ -615,7 +617,7 @@ export async function createSiclawSession(
   }
   const { mcpManager, mcpTools: discoveredMcpTools } = await resolveSessionMcpTools({
     enabled: exposeConfiguredMcp, allowedTools,
-    mcpServers: opts?.mcpServers ?? config.mcpServers,
+    mcpServers,
     mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
   });
   const mcpTools = discoveredMcpTools.map(tool => withToolResultArtifactCapture(tool, toolResultArtifactStore));

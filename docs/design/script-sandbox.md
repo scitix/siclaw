@@ -152,6 +152,13 @@ cancellation. The endpoint does not accept tool names, environment, cwd or
 background execution, and does not wait on the model prompt queue. K8s callbacks
 require a CA-verified Runtime/Gateway certificate; checking its OU alone is
 insufficient. Local Runtime never exposes sandbox execution or callbacks.
+Runtime supplies the freshly authorized inline kubeconfig only to this trusted
+AgentBox endpoint. AgentBox validates it and writes a unique per-call snapshot,
+readable only by its owner and the existing setgid kubectl reader. The callback
+uses that snapshot instead of the shared credential cache and removes it in a
+`finally` block. A concurrent credential refresh or cluster-name rebind cannot
+substitute an older/different credential after authorization. This material is
+never included in the script request, SDK channel, audit or tool result.
 Cancellation propagates to the built-in
 tool and callback responses are bounded.
 

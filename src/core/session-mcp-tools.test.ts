@@ -14,6 +14,16 @@ afterEach(() => vi.clearAllMocks());
 const mcpServers = { bound: { transport: "streamable-http" as const, url: "https://mcp.test" } };
 
 describe("sandbox-only dynamic tool boundary", () => {
+  it("honors a disabled harness for both configured and shared MCP tools", async () => {
+    expect(await resolveSessionMcpTools({ enabled: false, allowedTools: ["bash"], mcpServers })).toEqual({ mcpTools: [] });
+    expect(await resolveSessionMcpTools({ enabled: false, mcpManager: mock as unknown as McpClientManager,
+      mcpTools: [{ name: "mcp__mutate" }] as any })).toEqual({ mcpTools: [] });
+    expect(mock.construct).not.toHaveBeenCalled();
+    expect(mock.initialize).not.toHaveBeenCalled();
+    expect(mock.getTools).not.toHaveBeenCalled();
+    expect(mock.shutdown).not.toHaveBeenCalled();
+  });
+
   it("does not connect to a bound MCP server or inject its tools", async () => {
     expect(await resolveSessionMcpTools({ allowedTools: resolveCapabilities(["run_sandbox"]), mcpServers })).toEqual({ mcpTools: [] });
     expect(mock.construct).not.toHaveBeenCalled(); expect(mock.initialize).not.toHaveBeenCalled();

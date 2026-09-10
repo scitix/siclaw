@@ -2453,7 +2453,7 @@ describe("sandbox callback authentication", () => {
     const tlsServer = createHttpServer(sm as any, { disableIdleShutdown: true });
     const tlsPort = await startServer(tlsServer);
     const request = (pathname: string, client?: { cert: string; key: string }) => new Promise<number>((resolve, reject) => {
-      const req = https.request({ hostname: "localhost", port: tlsPort, path: pathname,
+      const req = https.request({ hostname: "127.0.0.1", servername: "localhost", family: 4, port: tlsPort, path: pathname,
         ca: trusted.getCACertificate(), ...client, agent: false }, res => { res.resume(); resolve(res.statusCode!); });
       req.on("error", reject); req.end();
     });

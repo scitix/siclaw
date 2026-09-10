@@ -1,9 +1,44 @@
 # Script sandbox validation — 2026-09-10
 
-This is the latest acceptance record for the `codex/script-sandbox` worktrees in
-Siclaw and SiCore. It supersedes the validation status in earlier implementation
-notes. The implementation and fixes have not been committed or pushed to Git;
-test container images were published and deployed to isolated test namespaces.
+## Review against current main
+
+The feature worktrees were rebased onto Siclaw `e0b7626f` and SiCore
+`fdccded95`. The older deployed acceptance below is retained as historical
+evidence; it does not certify the rebased build.
+
+Review fixes preserve the current handoff routing, harness MCP gate and MCP
+artifact recovery. The SiCore callback package is `internal/siclaw/scriptsandbox`,
+separate from its existing developer-preview `sandbox` package. Existing exact
+Runtime routing callers retain their API, with a cancellable variant for scripts.
+The cross-Runtime authorization invariant now exercises `sandbox.resolve` with
+both a successful owner control and a denied foreign Runtime.
+
+The broker rechecks the live caller after asynchronous authorization. Bash
+callbacks use the freshly authorized kubeconfig through a private per-call
+AgentBox snapshot, so a shared cached credential or concurrent refresh cannot
+change the approved target. Neither credentials nor snapshot paths enter the
+code runner or model-facing tool arguments.
+
+Current local verification:
+
+- Siclaw: 351 files, 7,287 passed, 2 existing skips.
+- Portal frontend: 26 files, 249 passed; production build passed.
+- Main/AgentBox TypeScript checks and backend build passed.
+- Python runner: 10 process/protocol tests passed.
+- Helm lint and Kubernetes/E2B profile rendering passed.
+- SiCore proxy, adapter, scriptsandbox, WebSocket and RBAC race checks passed;
+  targeted vet passed and server/config packages compiled.
+
+An mTLS test initially hit a local dual-stack connection failure. It now uses
+IPv4 with the original TLS server name and CA checks; its 118-test file and the
+full Siclaw suite passed afterwards. Expanded SiCore regression, fresh-image
+acceptance and remote PR checks are still in progress. E2B cloud acceptance is
+explicitly deferred until an environment is available.
+
+## Earlier deployed acceptance
+
+The following results are from the pre-rebase acceptance images. Test images
+were published only to the isolated test namespaces.
 
 ## Deployment and identity boundary
 

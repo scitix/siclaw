@@ -34,6 +34,30 @@ describe("script connectors", () => {
     expect(rpc.request).not.toHaveBeenCalled();
   });
   const kube = (user: object, cluster: object = {}) => JSON.stringify({ "current-context": "c", contexts: [{ name: "c", context: { cluster: "c", user: "u" } }], clusters: [{ name: "c", cluster: { server: "https://example.test", ...cluster } }], users: [{ name: "u", user }] });
+  it("does not execute when the live caller disappears during authorization", async () => {
+    let release!: (value: unknown) => void;
+    let pending!: () => void;
+    const resolving = new Promise<void>(resolve => { pending = resolve; });
+    const rpc = { request: vi.fn(async (method: string) => {
+      if (method === "config.getAgent") return { status: "active" };
+      pending();
+      return new Promise(resolve => { release = resolve; });
+    }) };
+    let live = true;
+    const request = vi.spyOn(https, "request");
+    try {
+      const broker = new ReadOnlyScriptBroker(rpc, config(), undefined, () => {
+        if (!live) throw new Error("Caller is no longer active");
+      });
+      const call = broker.call(p(), scope, { id: "i", tool: "k8s.list_pods", arguments: { cluster: "prod", namespace: "allowed" } }, new AbortController().signal);
+      await resolving;
+      live = false;
+      release({ user_id: "u", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kube({ token: "t" }) }] } });
+      await expect(call).rejects.toThrow("Caller is no longer active");
+      expect(request).not.toHaveBeenCalled();
+    } finally { request.mockRestore(); }
+  });
+
   it("executes only fixed GET operations and reauthorizes each read", async () => {
     const sent: Array<{ path: string; method: string }> = [];
     const request = vi.spyOn(https, "request").mockImplementation(((url: URL, options: https.RequestOptions, callback: (res: any) => void) => {

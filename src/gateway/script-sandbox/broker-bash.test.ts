@@ -7,7 +7,7 @@ const kubeconfig = JSON.stringify({ "current-context": "c", contexts: [{ name: "
 const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod", nodes: true }] };
 const p = () => ({ agentId: "a", sessionId: "s", boxId: "b", userId: "u", callbackToken: "private-callback-token" });
 const call = { id: "1", tool: "bash", arguments: { cluster: "prod", command: "kubectl get nodes" } };
-it("reauthorizes each Bash callback, never passes credentials and omits callback grants from audit", async () => {
+it("binds each trusted Bash callback to freshly authorized credentials and omits grants from audit", async () => {
   let capabilities = ["run_sandbox"];
   const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent"
     ? { status: "active", tool_capabilities: capabilities }
@@ -19,7 +19,9 @@ it("reauthorizes each Bash callback, never passes credentials and omits callback
     await expect(broker.call(p(), scope, call, new AbortController().signal)).resolves.toEqual({ text: "nodes" });
     expect(builtin).toHaveBeenCalledOnce();
     expect(builtin.mock.calls[0][1]).toEqual(call.arguments);
-    expect(JSON.stringify(builtin.mock.calls)).not.toContain("private-token");
+    expect(builtin.mock.calls[0][3]).toBe(kubeconfig);
+    expect(JSON.stringify(builtin.mock.calls[0][1])).not.toContain("private-token");
+    expect(JSON.stringify(log.mock.calls)).not.toContain("private-token");
     expect(JSON.stringify(log.mock.calls)).not.toContain("private-callback-token");
     capabilities = ["run_scripts"];
     await expect(broker.call(p(), scope, call, new AbortController().signal)).rejects.toThrow();

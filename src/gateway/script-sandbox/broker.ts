@@ -48,7 +48,7 @@ function readKube(content: string, path: string, signal: AbortSignal, maxBytes =
   });
 }
 
-export type SandboxBuiltinExecutor = (principal: ScriptPrincipal, args: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>;
+export type SandboxBuiltinExecutor = (principal: ScriptPrincipal, args: Record<string, unknown>, signal: AbortSignal, approvedKubeconfig: string) => Promise<unknown>;
 
 export class ReadOnlyScriptBroker implements ScriptBroker {
   constructor(private readonly controlPlane: SandboxControlPlane, private readonly config: ScriptSandboxConfig, private readonly builtin?: SandboxBuiltinExecutor,
@@ -63,6 +63,8 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
     if (tools !== null && !tools.includes("run_script")) throw new ScriptSandboxError("Sandbox capability denied", 403);
     const value = await this.controlPlane.request("sandbox.resolve", { agent_id: p.agentId, session_id: p.sessionId, source, name }, 10_000) as SandboxGrant;
     signal.throwIfAborted();
+    // The turn can end or change owner while either control-plane RPC is pending.
+    this.verifyCaller?.(p);
     if (!value?.user_id || (p.userId && p.userId !== value.user_id)) throw new ScriptSandboxError("Sandbox authorization denied", 403);
     p.userId = value.user_id;
     return value;
@@ -97,7 +99,7 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
         const file = grant.credential?.files.find(f => f.name.endsWith(".kubeconfig"));
         if (!file || grant.credential?.type !== "kubeconfig") throw new Error("No Kubernetes credential");
         kubeConnection(file.content);
-        const result = await this.builtin(p, a, signal);
+        const result = await this.builtin(p, a, signal, file.content);
         allowed = true; return sanitizeSandboxResult(result);
       }
       if (call.tool === "k8s.list_nodes") {

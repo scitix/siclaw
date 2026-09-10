@@ -161,7 +161,7 @@ interface RestrictedBashParams {
 export function createRestrictedBashTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
-  trustedOptions?: { validateKubeconfig?: (content: string) => unknown; outputMode?: "data" },
+  trustedOptions?: { validateKubeconfig?: (content: string) => unknown; kubeconfigPath?: string; outputMode?: "data" },
 ): ToolDefinition {
   // run_in_background is exposed to the model only when the master switch is on AND a
   // runtime executor was injected — otherwise the param stays out of the schema.
@@ -243,7 +243,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
       // Async prefetch: load the cluster named by the `cluster` param into the
       // broker registry before the synchronous resolver runs.
-      if (params.cluster) {
+      if (params.cluster && !trustedOptions?.kubeconfigPath) {
         try {
           await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "restricted_bash");
         } catch (err) {
@@ -263,7 +263,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       // prompting the model to pass `cluster` (it decides — no command sniffing).
       let selectedKubeconfigPath = "/dev/null";
       if (params.cluster) {
-        const r = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
+        const r = trustedOptions?.kubeconfigPath ? { path: trustedOptions.kubeconfigPath }
+          : resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
         if ("error" in r) {
           return {
             content: [{ type: "text", text: JSON.stringify({ error: true, message: r.error, available_clusters: r.availableNames }) }],

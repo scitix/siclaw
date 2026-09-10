@@ -270,7 +270,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   const sandboxTurns = new SandboxTurnContext();
-  const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal) => {
+  const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approvedKubeconfig) => {
     const handle = await agentBoxManager.getForSession(principal.agentId, principal.sessionId);
     // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
     // Route by the live session binding; only its originating box holds the active
@@ -281,6 +281,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     signal.throwIfAborted();
     return new AgentBoxClient(handle.endpoint, 25_000, agentBoxTlsOptions).sandboxBash({
       session_id: principal.sessionId, callback_token: principal.callbackToken, arguments: args,
+      approved_kubeconfig: approvedKubeconfig,
     }, signal);
   }, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId));
 
