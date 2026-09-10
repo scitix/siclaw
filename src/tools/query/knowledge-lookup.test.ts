@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createKnowledgeResolver } from "../../knowledge/indexer.js";
 import { createKnowledgeCitationSupport } from "../../core/knowledge-citation-tool.js";
+import { ToolResultArtifactStore, withToolResultArtifactCapture } from "../../core/tool-result-artifact.js";
 import { createKnowledgeLookupTool, registration } from "./knowledge-lookup.js";
 import type { ToolRefs } from "../../core/tool-registry.js";
 
@@ -54,6 +55,30 @@ describe("knowledge_lookup tool evidence registration", () => {
       expect(page.content).toBeUndefined();
       expect((await cite(page.file)).details).toEqual({ cited: 0 });
     }
+  });
+
+  it.each([
+    { name: "ASCII page above the inline character limit", text: "x".repeat(8_500), full: false },
+    { name: "multibyte page within both inline limits", text: "内容".repeat(1_400), full: true },
+  ])("keeps evidence registration aligned with the runtime wrapper: $name", async ({ text, full }) => {
+    const { root, tool, cite } = fixture();
+    fs.appendFileSync(path.join(root, "guide.md"), `\nINLINE_BOUNDARY_EVIDENCE\n${text}`);
+    const artifactRoot = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-lookup-artifacts-"));
+    cleanup.push(() => fs.rmSync(artifactRoot, { recursive: true, force: true }));
+    const store = new ToolResultArtifactStore({
+      rootDir: artifactRoot,
+      getScope: () => ({ agentId: "agent", sessionId: "session" }),
+    });
+    await store.initialize();
+    const wrapped = withToolResultArtifactCapture(tool, store, 4096);
+    const output = await wrapped.execute("lookup", { query: "INLINE_BOUNDARY_EVIDENCE", topK: 1, readCount: 1 });
+    const visible = (output.content[0] as { text: string }).text;
+    const result = JSON.parse(visible);
+    expect(visible.length).toBeLessThanOrEqual(8000);
+    expect(Buffer.byteLength(visible)).toBeLessThanOrEqual(12000);
+    expect(result.results[0].readStatus).toBe(full ? "full" : "budget_exceeded");
+    expect(result.results[0].content).toBe(full ? fs.readFileSync(path.join(root, "guide.md"), "utf8") : undefined);
+    expect((await cite(result.results[0].file)).details).toEqual({ cited: full ? 1 : 0 });
   });
 
   it("refuses to register evidence if the citation mount changes across lookup", async () => {
