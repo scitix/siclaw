@@ -1,6 +1,30 @@
 # Script sandbox validation — 2026-09-11
 
-## Unified built-in execution contract
+## Latest default-branch rebase and deployment
+
+The feature branch was rebased without conflicts onto `main` revision
+`d78fd7bf`. Range-diff preserved all eleven feature commits. Runtime and AgentBox
+images built from `8d6880e2` were deployed to the integrated test environment.
+
+- Full suite: 7,328 passed, two existing skips; Portal: 271 passed; Python SDK:
+  ten passed. Both TypeScript checks, build and all six remote CI checks passed.
+- Live Python node inspection, Shell Bash/Pod queries and seven negative SDK
+  calls passed. The 142,141-byte node result was processed from a sandbox file.
+- A natural-language request produced a five-node CPU/kernel/kubelet/readiness
+  table through one SDK Bash call. Script duration was 3,911 ms, including
+  3,381 ms startup; the full model turn took approximately 36 seconds.
+- Cancellation reclaimed runner and diagnostic Jobs/Pods in 2,591 ms. An initial
+  cancellation prompt returned model text without dispatching a tool; the
+  repeated request exercised cancellation successfully. It was not an initial
+  successful cancellation sample.
+- Browser history rendered the real results without page errors or failed HTTP
+  responses. Browser authentication used an existing API-validated test session;
+  login itself was not part of this check. Live SSE prevented network-idle.
+
+Hosted E2B and live host/MCP binding validation remain deferred. Startup timings
+above are individual observations, not performance guarantees.
+
+## Unified built-in execution contract — previous acceptance
 
 The current implementation removes the independent Kubernetes read connector,
 legacy inspection helper and duplicate sandbox command policies. Every cluster
