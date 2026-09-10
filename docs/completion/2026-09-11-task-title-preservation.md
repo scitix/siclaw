@@ -20,5 +20,16 @@ Validation:
 - Runtime TypeScript build and Portal production build pass.
 - `git diff --check` passes; no production dependencies were added.
 
-The change has not been deployed. It does not rewrite existing persisted data;
-recovering an old title requires an earlier valid event in the loaded history.
+The production Runtime and Portal images built from `9735b22b` were also tested in
+an isolated Kubernetes namespace. Executing the compiled task tools inside the
+Runtime container preserved titles for single empty-title and batched whitespace
+updates, including the emitted snapshots. Historical damaged events were written
+through the Portal Runtime RPC into a temporary database. The production Portal
+displayed the original completed, active and pending task names before and after
+a browser reload.
+
+The temporary namespace and port forwards were removed after acceptance. This
+was a tool and persisted-history integration test using synthetic events, not a
+live model evaluation. No existing deployment or persisted conversation was
+modified. Recovering an old title still requires an earlier valid event in the
+loaded history.
