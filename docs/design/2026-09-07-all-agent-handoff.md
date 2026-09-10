@@ -13,7 +13,7 @@ Web, API and A2A use the web session mode. CLI, channel and scheduled-task modes
 remain excluded because they do not implement control-plane ownership transfer.
 Delegated peers and spawned children cannot transfer the parent's conversation.
 An unresolved harness remains closed. Runtime terminates the successful sender;
-SiCore remains the sole owner of authorization and active-agent updates.
+The external portal remains the sole owner of authorization and active-agent updates.
 
 > The static destination menu described below is superseded by
 > [on-demand handoff discovery](2026-09-08-handoff-discovery.md).
@@ -34,7 +34,7 @@ product bindings. Only labels are queried; no MCP connection configuration,
 credentials, full skill content or private knowledge authoring instructions are exposed.
 
 Runtime expands built-in allowances using its own Agent type/capability registry,
-so Go does not maintain a second permission mapping. SiCore currently sends explicit
+so Go does not maintain a second permission mapping. The external portal currently sends explicit
 null for toolCapabilities, matching GetAgentInfo; built-in types use their locked
 lists and Custom retains its legacy defaults. Other control planes can send a
 restricted Custom selection. Missing or unknown type/selection is described as

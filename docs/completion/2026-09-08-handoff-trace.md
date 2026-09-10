@@ -3,7 +3,7 @@
 ## Implemented
 
 - Capture the source transfer tool span before eviction, then propagate its trace
-  context through SiCore to the receiving Runtime / AgentBox.
+  context through the external portal to the receiving Runtime / AgentBox.
 - Reuse the logical turn trace ID with distinct Agent execution spans, including
   A→B→A. A new question gets an independent trace.
 - Preserve inherited audit IDs with export disabled or no recorder attachment.
@@ -21,7 +21,7 @@ serialization of copied context. Results on the target worktrees:
 
 - Runtime: 8 suites, 391 tests passed.
 - Runtime: TypeScript `tsc --noEmit` passed.
-- SiCore: full proxy and agentroute suites passed with `go test -race`.
+- The external portal: full proxy and agentroute suites passed with `go test -race`.
 - OpenAPI YAML and internal trace schema references validated.
 - Whitespace / conflict-marker diff checks passed.
 

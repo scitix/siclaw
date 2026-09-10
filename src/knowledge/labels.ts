@@ -76,7 +76,7 @@ const MAX_TEXT = 100;
 const MAX_CATALOG_PAGES_PER_LABEL = 100;
 
 function validationKey(value: string): string {
-  // Keep duplicate validation aligned with the Python producer and Sicore's
+  // Keep duplicate validation aligned with the Python producer and the external portal's
   // Go validator. Search normalization below is intentionally broader.
   return value.trim().toLocaleLowerCase();
 }

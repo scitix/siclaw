@@ -8,7 +8,7 @@ import {
 
 describe("CHAT_MESSAGE_KINDS", () => {
   // Pinned as an exact list. Every value here is written by this runtime and
-  // read by the frontend and by sicore; a kind joining or leaving changes what
+  // read by the frontend and by external portals; a kind joining or leaving changes what
   // those readers see. Two of these were found by the compiler rather than by
   // the author when metadata.kind was first narrowed to this union, which is
   // the argument for keeping the list explicit instead of inferred.
@@ -27,10 +27,8 @@ describe("CHAT_MESSAGE_KINDS", () => {
 });
 
 describe("SYNTHETIC_USER_KINDS", () => {
-  // No cross-repo parity is asserted, deliberately: sicore counts prompts with
-  // no kind filter at all, and the sets it does have answer adjacent questions
-  // (a trace's title, feedback attribution). An earlier version of this test
-  // named a sicore symbol that does not exist. See the file header.
+  // Prompt counts, trace titles and feedback attribution classify rows for
+  // different purposes. This test pins only the prompt-count contract.
   it("is the agreed set", () => {
     expect([...SYNTHETIC_USER_KINDS]).toEqual([
       "delegation_event",

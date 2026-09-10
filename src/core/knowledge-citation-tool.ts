@@ -27,7 +27,7 @@ interface PageEvidence { id: string; sourceIds: string[] }
 interface PageProvenance { sources: PageSource[]; evidence: Map<string, PageEvidence> }
 
 const EVIDENCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-/** Canonical grammar: space/tab only. Must stay identical to selfcheck.py and Sicore. */
+/** Canonical grammar: space/tab only. Must stay identical to selfcheck.py and external importers. */
 export const EVIDENCE_MARKER_START = /<!--[ \t]*okf:evidence\b/g;
 export const EVIDENCE_MARKER = /<!--[ \t]*okf:evidence[ \t]+(\{[^\r\n]*\})[ \t]*-->/g;
 

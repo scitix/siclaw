@@ -2,14 +2,13 @@
 
 Verified routes are maintainer-curated fast paths into a knowledge base: a
 high-frequency question mapped to an ordered list of leaf pages that answer it.
-They are authored and published in Sicore (see the Sicore repo's
-`docs/design/kb-verified-routes.md`); this document is the **consumer/runtime**
+They are authored and published by an external knowledge service; this document is the **consumer/runtime**
 side that lives in Siclaw — what reaches a bound agent, and the trust rules that
 gate it. It records contracts and rationale, not call order.
 
 ## Producer → consumer shape
 
-The Sicore renderer owns three projections, deterministically regenerated after
+The external knowledge renderer owns three projections, deterministically regenerated after
 every compile commit and shipped inside the published knowledge version:
 
 1. `candidate/.okf-routes.json` — the machine contract (routes + load-bearing
@@ -69,7 +68,7 @@ the machine contract is not lifted) but is not a cryptographic proof of
 provenance — an attacker who also crafts a matching `.okf-routes.json` in the
 same package would pass it. The complete fix is server-side provenance (only
 versions produced by the authoring/compile pipeline may carry routes); that
-belongs on the Sicore side and is out of scope here. The flat TUI+Portal
+belongs on the external portal side and is out of scope here. The flat TUI+Portal
 materializer writes no citation-manifest today, so it lifts no routes — routes
 in that mode are follow-up work, not a silent partial.
 

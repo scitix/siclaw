@@ -116,8 +116,8 @@ chat rows use the inherited ID. With export disabled or no attached recorder,
 the audit ID is still inherited, but no spans are emitted by that AgentBox.
 When only an ID is available, no actual source tool span can be linked.
 
-Upgrade both SiCore and SiClaw. Old events without context remain accepted, but
+Upgrade both the external portal and SiClaw. Old events without context remain accepted, but
 trace continuity is not guaranteed and existing records are not merged. This
-covers the web handoff loop: the SiCore `/run` and A2A handlers do not yet drive
+covers the web handoff loop: the external portal `/run` and A2A handlers do not yet drive
 an equivalent transfer loop. Export remains best effort; this change does not
 instrument every HTTP, WebSocket or database operation in the control plane.

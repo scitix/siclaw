@@ -35,6 +35,20 @@ export interface K8sSpawnerConfig {
     claimName: string;
   };
   /**
+   * Optional read-only source-code volume — see
+   * docs/design/agentbox-code-volume.md.
+   *
+   * A separate PVC, written by an external supplier that lays out
+   * `agents/<agentId>/<repo>@<view>/` trees, and mounted read-only at the
+   * agent's `.siclaw/repos`. Absent (the default) ⇒ this spawner emits no code
+   * volume and no code mount at all, so a deployment that does not configure
+   * one produces byte-identical pods.
+   */
+  codeVolume?: {
+    /** Name of the pre-existing RWX PVC holding the per-agent code trees. */
+    claimName: string;
+  };
+  /**
    * Node selector applied to every spawned AgentBox pod. Constrains pods to
    * nodes carrying all of these labels. Empty/undefined ⇒ no constraint
    * (scheduler picks any eligible node).
@@ -42,7 +56,7 @@ export interface K8sSpawnerConfig {
   nodeSelector?: Record<string, string>;
 }
 
-const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelector">> = {
+const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence" | "codeVolume" | "nodeSelector">> = {
   namespace: "default",
   image: "siclaw-agentbox:latest",
   imagePullPolicy: "Always",
@@ -91,6 +105,51 @@ function defaultBoxResources(): { cpu: string; cpuRequest: string; memory: strin
     memoryRequest: process.env.SICLAW_AGENTBOX_MEMORY_REQUEST || "1Gi",
   };
 }
+
+// ── Read-only source-code volume ─────────────────────────────────────────────
+// See docs/design/agentbox-code-volume.md. The supplier of that PVC is outside
+// this repository; the only contract between the two sides is the layout below.
+
+/**
+ * Where the RUNTIME mounts the code PVC, read-only, so it can see the marker
+ * before it decides what to give a pod. The AgentBox pod gets its own,
+ * subPath-scoped mount at CODE_MOUNT_PATH — this path is never handed to a box.
+ */
+const CODE_ROOT_DIR = "/app/.siclaw/code-root";
+
+/**
+ * Where a box sees its own source trees. It MUST equal `config.paths.reposDir`
+ * (src/core/config.ts) resolved against the box's /app: that directory is
+ * already in the file tools' read whitelist and is already scanned into the
+ * system prompt, which is why this feature needs no change inside the box.
+ */
+const CODE_MOUNT_PATH = "/app/.siclaw/repos";
+
+/**
+ * Per-agent marker file the supplier writes once a tree is complete.
+ *
+ * 🔴 THIS FILE, NOT A CONTROL-PLANE FLAG, IS THE GATE. kubelet CREATES a missing
+ * subPath directory (as root, on the underlying writable mount), so mounting
+ * without checking does not fail — it silently hands the agent an empty
+ * directory, and an agent that reads no files concludes the code says nothing.
+ * The marker is also the ONLY signal available: nothing in the pod spec or the
+ * model binding says whether a supplier has prepared this agent.
+ */
+const CODE_READY_MARKER = ".ready";
+
+/**
+ * One retry, after a short pause, before concluding a tree is absent.
+ *
+ * The volume is NFS-backed, so a negative lookup for a file the supplier has
+ * just created can be served from the client attribute cache. The cost of
+ * being wrong is asymmetric and long-lived: a spawn decision is stamped into
+ * the pod, and `spawn()` does NOT re-evaluate mounts for a pod it reuses (see
+ * the reuse checks above) — so a box that comes up without code stays without
+ * code for its whole life, up to its idle self-destruct.
+ *
+ * Paid only on the miss path, and only when a code PVC is configured at all.
+ */
+const CODE_READY_RETRY_DELAY_MS = 200;
 
 /**
  * How long a box gets to shut down cleanly before SIGKILL.
@@ -201,7 +260,7 @@ export class K8sSpawner implements BoxSpawner {
 
   private kc: k8s.KubeConfig;
   private coreApi: k8s.CoreV1Api;
-  private config: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelector">> & Pick<K8sSpawnerConfig, "persistence" | "nodeSelector">;
+  private config: Required<Omit<K8sSpawnerConfig, "persistence" | "codeVolume" | "nodeSelector">> & Pick<K8sSpawnerConfig, "persistence" | "codeVolume" | "nodeSelector">;
   private certManager: CertificateManager | null = null;
 
   constructor(config?: K8sSpawnerConfig) {
@@ -728,6 +787,18 @@ export class K8sSpawner implements BoxSpawner {
       ? { name: "user-data", persistentVolumeClaim: { claimName: persistenceClaimName } }
       : { name: "user-data", emptyDir: {} };
 
+    // Read-only source-code volume — see docs/design/agentbox-code-volume.md.
+    //
+    // Two independent conditions, in this order:
+    //   1. a code PVC is configured for this runtime, and
+    //   2. THIS agent's tree carries the supplier's ready marker.
+    //
+    // Short-circuit order is load-bearing: with no claimName configured the
+    // filesystem is never touched, so a deployment without this feature does no
+    // extra work and emits neither a volume nor a mount.
+    const codeClaimName = this.config.codeVolume?.claimName;
+    const codeVolumeEnabled = !!codeClaimName && await this.codeTreeReady(agentId, safeAgentId);
+
     // Pod definition
     const pod: k8s.V1Pod = {
       apiVersion: "v1",
@@ -832,6 +903,14 @@ export class K8sSpawner implements BoxSpawner {
             emptyDir: {},
           },
           userDataVolume,
+          // 🔴 readOnly belongs on the MOUNT, never here. A `readOnly: true` on
+          // the persistentVolumeClaim volume SOURCE makes the CSI driver stage
+          // the volume read-only, and the pod then sits in ContainerCreating
+          // until POD_READY_TIMEOUT_MS gives up — a 7-minute failure whose
+          // events blame the driver, not this line.
+          ...(codeVolumeEnabled && codeClaimName
+            ? [{ name: "code", persistentVolumeClaim: { claimName: codeClaimName } } as k8s.V1Volume]
+            : []),
           {
             name: "client-cert",
             secret: { secretName: certSecretName },
@@ -892,6 +971,17 @@ export class K8sSpawner implements BoxSpawner {
                   ? { subPath: `agents/${safeAgentId}` }
                   : {}),
               },
+              // The agent's source snapshot. subPath scopes the box to its own
+              // agents/<id>/ subtree — a box can never read another agent's
+              // trees, nor the supplier's private state at the volume root.
+              ...(codeVolumeEnabled
+                ? [{
+                    name: "code",
+                    mountPath: CODE_MOUNT_PATH,
+                    subPath: `agents/${safeAgentId}`,
+                    readOnly: true,
+                  } as k8s.V1VolumeMount]
+                : []),
               {
                 name: "client-cert",
                 mountPath: "/etc/siclaw/certs",
@@ -990,6 +1080,41 @@ export class K8sSpawner implements BoxSpawner {
       throw new Error(`[k8s-spawner] Path traversal detected: ${dir}`);
     }
     fs.mkdirSync(dir, { recursive: true });
+  }
+
+  /**
+   * Has an external supplier finished preparing this agent's source trees?
+   *
+   * Answers from the runtime's own read-only view of the code PVC
+   * (CODE_ROOT_DIR), by looking for `agents/<safeAgentId>/.ready`. See
+   * docs/design/agentbox-code-volume.md ("The ready marker") for why the
+   * filesystem, and not a control-plane field, is the authority.
+   *
+   * A miss is retried ONCE after CODE_READY_RETRY_DELAY_MS. Any other outcome —
+   * the runtime has no code mount, the agent has no directory, the marker is
+   * absent on both looks — is a definite "no": the box spawns without the mount
+   * and the reason is logged. This is deliberately NOT fail-fast. The supplier
+   * is an independent system, and "it has not prepared this agent (yet)" is its
+   * normal steady state for every agent that has no source configured; turning
+   * that into a spawn failure would take chat down for agents this feature was
+   * never enabled for.
+   */
+  private async codeTreeReady(agentId: string, safeAgentId: string): Promise<boolean> {
+    const base = path.resolve(CODE_ROOT_DIR);
+    const marker = path.join(base, "agents", safeAgentId, CODE_READY_MARKER);
+    if (!marker.startsWith(base)) {
+      throw new Error(`[k8s-spawner] Path traversal detected in code volume path: ${marker}`);
+    }
+    if (fs.existsSync(marker)) return true;
+
+    await new Promise((resolve) => setTimeout(resolve, CODE_READY_RETRY_DELAY_MS));
+    if (fs.existsSync(marker)) return true;
+
+    console.warn(
+      `[k8s-spawner] Agent ${agentId}: a code PVC is configured but "${marker}" is absent after a retry; ` +
+      `spawning WITHOUT the read-only code mount (the agent will see no source tree until its next cold start)`,
+    );
+    return false;
   }
 
   /**

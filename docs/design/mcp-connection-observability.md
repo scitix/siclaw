@@ -39,7 +39,7 @@ Each entry (`ObservedMcpServer`):
 
 `classifyMcpConnectError` (`src/core/mcp-client.ts`) maps whatever the MCP SDK
 throws into a closed set: `invalid_config, dns, connection_refused, timeout,
-tls, auth, not_found, not_mcp, http, protocol, unknown`. Sicore stores and
+tls, auth, not_found, not_mcp, http, protocol, unknown`. The external portal stores and
 renders the kind; it never re-classifies. `not_found` + `contentType:
 "text/html"` is the signature of a page URL pasted as an MCP endpoint, and is
 why the HTML case gets its own handling: the message is reduced to `HTML page:
@@ -84,4 +84,4 @@ arbitrary command in the Runtime process, and a box start already observes them.
 | Box report | `src/agentbox/http-server.ts` `/api/sync-status` |
 | Replica consensus, flat aggregate | `src/gateway/server.ts` `agent.syncStatus` |
 | On-demand probe | `src/gateway/server.ts` `mcp.probe` |
-| Control-plane storage and console | sicore `internal/siclaw/mcpobs` |
+| Control-plane storage and console | the external portal `internal/siclaw/mcpobs` |

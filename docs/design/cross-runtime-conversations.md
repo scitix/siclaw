@@ -1,6 +1,6 @@
 # Cross-Runtime conversation ingress
 
-SiCore-managed channels and scheduled tasks submit to the control plane's
+The external portal-managed channels and scheduled tasks submit to the control plane's
 `conversation.start` RPC. They subscribe to `conversation.event` before dispatch
 and correlate by session ID plus the persisted original user-message ID.
 
@@ -48,7 +48,7 @@ are separate migrations, not automatic consequences of enabling handoff.
 
 The affected factory/session/tool/HTTP server/channel/task/consumer suites passed
 (756 tests, 1 skipped in the broad run), followed by 417 passing channel/task
-checks including managed `/new`; TypeScript build passed. SiCore race tests cover
+checks including managed `/new`; TypeScript build passed. The external portal race tests cover
 cross-Runtime handoff, source loss after transfer, deduplicated dispatch, RPC
 ownership checks and logical A2A completion. No production channel sends or
 production configuration changes were performed.
@@ -63,4 +63,4 @@ The controller repeats the budget/self-transfer/revisit checks. Evidence compari
 
 After an incompatible executor emits a refused handoff and a confirmed terminal, the controller advances the same owner's epoch using `ResumeForTurn` and dispatches at most one closure continuation. `handoff.recovery=true` distinguishes it from a real transfer; history restoration, skipInitialPersistence and trace propagation use the existing continuation path. It emits no agent_switch or fake user row. It has handoffSupported=false and remaining=0. Cancellation is checked atomically before the new epoch. A second refusal, transport failure or model failure remains an explicit failure; no infinite recovery, fabricated final answer or success downgrade is allowed.
 
-Deployment requires matching SiCore and Runtime versions. The bounded controller fallback supports a refused event from an older executor but cannot make an old model/tool stack obey the closure instruction. No database migration or new public REST endpoint is added.
+Deployment requires matching the external portal and Runtime versions. The bounded controller fallback supports a refused event from an older executor but cannot make an old model/tool stack obey the closure instruction. No database migration or new public REST endpoint is added.

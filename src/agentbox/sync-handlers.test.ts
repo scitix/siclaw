@@ -19,6 +19,7 @@ import {
   skillsHandler,
 } from "./sync-handlers.js";
 import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
+import { AGENT_TYPES } from "../core/agent-types.js";
 import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { resolveSkillDirectories } from "../core/skill-directories.js";
@@ -210,6 +211,21 @@ describe("createToolsHandler", () => {
     });
   });
 
+  it("accepts every type in the registry — the accepted set is derived, not re-listed", async () => {
+    // materialize() THROWS on an unknown agentType, so a hand-maintained copy of
+    // the registry that falls behind does not weaken a new type: it leaves every
+    // box of that type with no resolved tool schema at all.
+    for (const agentType of Object.keys(AGENT_TYPES)) {
+      const target = { allowedToolsState: null as string[] | null, harnessResolvedState: false, agentTypeState: "custom" };
+      const handler = createToolsHandler(target, null);
+      await expect(
+        handler.materialize({ allowedTools: ["read", "grep"], agentType }),
+        `tools reload rejects the registered type ${agentType}`,
+      ).resolves.toBe(2);
+      expect(target.agentTypeState).toBe(agentType);
+    }
+  });
+
   it("materialize treats null as 'no restriction' (whitelist off), returns 0", async () => {
     const target = { allowedToolsState: ["read"] as string[] | null };
     const handler = createToolsHandler(target, null);
@@ -218,7 +234,7 @@ describe("createToolsHandler", () => {
     expect(target.allowedToolsState).toBeNull();
   });
 
-  it.each(["sre", "coordinator", "knowledge_qa", "product_support"])(
+  it.each(["sre", "coordinator", "knowledge_qa", "product_support", "coding"])(
     "rejects unrestricted tools for built-in agent type %s",
     async (agentType) => {
       const target = {

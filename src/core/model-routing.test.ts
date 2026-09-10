@@ -497,7 +497,7 @@ describe("resolveEffectivePolicy (single routing entry)", () => {
   // the primary's config, and has to invent that decision above the policy.
   it("prefers this turn's binding over the current model, config included", () => {
     const binding = {
-      provider: "sicore-custom-x",
+      provider: "portal-custom-x",
       modelId: "claude-fable-5",
       modelConfig: { baseUrl: "https://x/v1", apiKey: "sk", api: "anthropic-messages" },
     };

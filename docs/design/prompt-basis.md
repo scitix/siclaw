@@ -128,32 +128,16 @@ TypeScript 会拒绝**内联字面量**里的未登记 kind，但一个以 `Reco
 四处调用点走 `nonTraceOriginPredicate()`。两者是**两根正交的轴**，都需要：合成行落在普通用户
 会话里，origin 过滤根本看不见它们。
 
-## 与 sicore 的关系：**没有对等清单**
+## External portal semantics
 
-本次改动的早期版本（含 PR 描述与代码注释）声称本清单与 sicore 的
-`chatfields.syntheticUserKinds`（`internal/siclaw/chatfields/message_kind.go`）逐字相同。
-**这三点全是错的**：那个文件不存在（`chatfields/` 下只有 `title.go`），那个符号不存在，
-sicore 也没有反向指认的注释。已核对 sicore 当前 main。
+This registry defines prompt counts in Siclaw. External portals own their metric
+readers and must verify equivalent filtering independently. Trace-title selection
+and feedback attribution answer different questions and need different sets.
+For example, `steer` may be unsuitable as a session title but is still a question
+from a person, so it must not be classified as synthetic here.
 
-sicore 的实际情况：
+## Effect on reported prompt counts
 
-| 位置 | 回答的问题 | 状态 |
-|---|---|---|
-| `internal/siclaw/metrics/handler.go` totalPrompts | 提问总数 | **完全没有 kind 过滤**，注释写的就是 "user messages (role=user)" |
-| `internal/siclaw/adapter/rpc.go` metrics.summary | 同上 | 同上 |
-| `internal/siclaw/metrics/trace_kinds.go` `TraceNonPromptUserKinds` | 哪条 user 行可以当 trace 的标题 / 分析输入 | 8 个 kind，**含 `steer`** |
-| `internal/siclaw/chat/service.go` `previousUserMessageSnapshot` | 某条 assistant 回复的是哪条提问（反馈归属） | 3 个 kind 的 LIKE，缺 `exec_job_event` |
-
-所以 sicore 面板上的提问数比本仓库改动前**还要虚高**——它连 `delegation_event` 都没排除。
-这是一个跨仓库问题，不在本 PR 范围内，但应当单独处理。
-
-至于 `trace_kinds.go`，它和本清单**问题不同**，正因如此集合也不同：`steer` 属于它（一句中途
-插话当会话标题很差），但必须**不**属于本清单（那是真人问的真问题）。把任一份清单照抄到另一边，
-两个方向都是错的。
-
-结论：本清单只对本仓库负责，不声明任何跨仓库等价。
-
-## ⚠️ 这会让 Portal 上的提问数明显下降
-
-与 sicore 在 2026-08-24 经历的是同一件事：数字变小是因为口径变准，不是用量下滑。发布时应当
-说明变更日期与原因——那次没有说明，结果是有人发现数字不对再回头查，本次改动即由此而来。
+Excluding synthetic rows reduces reported prompt counts without implying lower
+usage. Release notes should explain the change in counting semantics and the
+date it took effect.

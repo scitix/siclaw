@@ -12,12 +12,12 @@
 
 Brain 仅对已包装工具拆分公开说明和业务参数，产出内部 publicProgress 字段。Gateway 先处理原生正文；没有正文的工具批次才补一条 progress_update，按工具调用身份关联，以 assistant/commentary/source=tool_intent 持久化，再转发工具开始事件。此行不进入最终结果累积器、不伪造 message_end、不展示 thinking。每个模型 step 最多补一条，模型的下一轮才能产生新的证据说明；长时间工具内部运行期间不会编造动态发现。
 
-SiCore 按当前 hop 的真实作者标注事件，复制共享 map 后再加字段。前端用持久化 ID 更新独立旁白，完成时继续复用整体折叠行为；命令项保持独立可展开。未持久化工具使用唯一客户端 ID，避免毫秒碰撞；已知调用的重复结束事件不得关闭其他调用。
+外部 Portal 按当前 hop 的真实作者标注事件，复制共享 map 后再加字段。前端用持久化 ID 更新独立旁白，完成时继续复用整体折叠行为；命令项保持独立可展开。未持久化工具使用唯一客户端 ID，避免毫秒碰撞；已知调用的重复结束事件不得关闭其他调用。
 
 ## 验证与部署边界
 
 真实接口测试用虚构实验室数据，不访问集群，不发送仓库完整提示词。路径包括原生正文与强制 tool-only 两种，实际运行 pi engine → Brain → Gateway SSE，再用这些事件回放前端。生产数据库、完整 Agent prompt、在线交接和部署仍需环境验收。
 
-先发布 SiCore API/web 的 progress_update 支持，再发布 SiClaw Runtime 和 AgentBox。AgentBox 工具 schema/提示词在创建 session 时生效；只更新 web 或只更新 Runtime 不会启用完整生成链路。已有会话应在确认执行结束后重新创建 brain，禁止中断在途工具后假定它已停止。
+先发布 外部 Portal API/web 的 progress_update 支持，再发布 SiClaw Runtime 和 AgentBox。AgentBox 工具 schema/提示词在创建 session 时生效；只更新 web 或只更新 Runtime 不会启用完整生成链路。已有会话应在确认执行结束后重新创建 brain，禁止中断在途工具后假定它已停止。
 
 实测该模型网关对 Chat Completions + 工具 + high 返回 400；Responses + high、Chat Completions 不启用 reasoning 均完成测试。生产如需 high，应核查模型 API 绑定支持 Responses，不能默默降低用户配置，也不能在已有工具副作用后自动切换 API 重跑。

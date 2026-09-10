@@ -42,7 +42,7 @@
  *
  * Scoped to what it can prove, deliberately. It is not "every kind that exists
  * in the column": the Portal frontend synthesizes display-only rows that are
- * never persisted (`delegation_status_notice`), and sicore's own readers know
+ * never persisted (`delegation_status_notice`), and external portal readers know
  * kinds this runtime does not write (`investigation_plan_snapshot`,
  * `task_prompt`). A registry that claimed those would be asserting something
  * nothing in this tree can check.
@@ -87,22 +87,11 @@ export type ChatMessageKind = (typeof CHAT_MESSAGE_KINDS)[number];
  * The `role='user'` rows that are workflow plumbing rather than a person's
  * question — i.e. the rows a prompt count must exclude.
  *
- * **This list has no counterpart in sicore, and earlier revisions of this
- * comment claimed one that does not exist.** For the record, because the wrong
- * pointer is worse than none: sicore counts prompts as every `role='user'` row
- * with no kind filter at all (`internal/siclaw/metrics/handler.go`,
- * `internal/siclaw/adapter/rpc.go`), so its figure is inflated by MORE than
- * this one was. What sicore does have is
- * `internal/siclaw/metrics/trace_kinds.go`, whose `TraceNonPromptUserKinds`
- * answers an ADJACENT question — which user row may be a trace's title or an
- * analysis input — and `internal/siclaw/chat/service.go`'s
- * feedback-attribution LIKE list, which answers a third. Neither is this.
- *
- * That the questions differ is why the sets differ, and `steer` is the case to
- * understand before syncing anything: it belongs in sicore's set (a mid-turn
- * steer is a poor session title) and must stay OUT of this one (it is a real
- * question a person asked). Copying one list into the other would be wrong in
- * both directions.
+ * This registry defines prompt-count semantics for this runtime. External
+ * portals may classify rows differently for trace titles or feedback attribution;
+ * those lists answer different questions and must not be copied here.
+ * In particular, `steer` is a real user question even when it would make a poor
+ * session title, so it must stay out of this list.
  *
  * The SQL that consumes this list lives in `portal/human-prompt.ts`: it needs
  * the database driver to pick a dialect, and `src/shared` is bundled into the

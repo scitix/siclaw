@@ -693,14 +693,14 @@ wrongly conclude that the Wiki did not cover a question. Content indexes that
 require FTS/vector construction or embedding hydration add another cold-start
 dependency and can take minutes or fail under provider rate limits. A
 package-specific hardcoded route would solve only the observed question.
-Labels also need to survive compiler → control plane → AgentBox without Sicore
+Labels also need to survive compiler → control plane → AgentBox without the external portal
 and Siclaw independently inferring different taxonomies.
 
 **Decision**:
 Store typed Knowledge Labels in each OKF v0.2 concept page's frontmatter. A
 label has one facet (`entity`, `topic`, `task`, `component`, `environment`, or
 `version`), a canonical human-readable value, and optional aliases. Siclaw KBC
-generates labels; Sicore validates their shape and transports them unchanged.
+generates labels; the external portal validates their shape and transports them unchanged.
 
 The complete root `index.md` is injected into the model prompt as the common
 navigation baseline. AgentBox also derives an in-memory, paginated Label Catalog

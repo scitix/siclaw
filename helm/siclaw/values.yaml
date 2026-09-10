@@ -283,6 +283,29 @@ agentbox:
     # Ignored when referencing an existing PVC via claimName (enabled:false).
     storageClassName: ""
     size: "10Gi"
+  # Optional read-only source-code volume for AgentBox pods.
+  # Full contract: docs/design/agentbox-code-volume.md.
+  #
+  # A SEPARATE, pre-existing RWX PVC laid out as agents/<agentId>/<repo>@<view>/
+  # by an external supplier. The chart never provisions it and nothing in Siclaw
+  # ever writes to it: the Runtime mounts it read-only to read each agent's
+  # `.ready` marker, and each AgentBox gets a read-only, subPath-scoped mount of
+  # its own agents/<agentId>/ subtree at /app/.siclaw/repos.
+  #
+  # There is deliberately no `enabled` flag beside the name. Whether a given
+  # agent gets the mount is decided by that ready marker on the volume itself —
+  # a chart-level policy flag could only disagree with the filesystem.
+  #
+  # 🔴 Do NOT add fsGroup to make this readable. kubelet chowns the volume
+  # RECURSIVELY on mount; on an NFS-backed tree of hundreds of thousands of
+  # files that is one SETATTR per file, it consumes the whole startupProbe
+  # window and the container is killed before it answers once (the same failure
+  # docker/agentbox-entrypoint.sh records for user-data). The supplier writes
+  # 0755/0644 instead, and the box reads through the other bits.
+  codeVolume:
+    # Name of the pre-existing RWX PVC. Empty (the default) ⇒ the feature is off
+    # and pods are byte-identical to a deployment that never had it.
+    claimName: ""
 
 # -- Metrics & Observability
 metrics:

@@ -2427,7 +2427,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       observedBoxes: observed.length,
       consistent,
       observations,
-      // Keep the legacy aggregate while old Sicore versions roll forward. A
+      // Keep the legacy aggregate while older portal versions roll forward. A
       // model is proof only when every running box agrees; otherwise null keeps
       // the old verifier in sync_pending rather than producing a false success.
       knowledge: first.knowledge ?? { syncedAt: null, repos: [] },

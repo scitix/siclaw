@@ -413,7 +413,7 @@ describe("withResolvedModelCompat (control-plane configs)", () => {
   // forwards it verbatim, so the descriptor never runs on that path. Fixing the
   // descriptor alone left the 400 exactly as it was — which is what happened.
   const cfg = (overrides?: Record<string, unknown>) => ({
-    name: "sicore-custom", baseUrl: "https://api.x/v1", apiKey: "sk", api: "anthropic-messages",
+    name: "portal-custom", baseUrl: "https://api.x/v1", apiKey: "sk", api: "anthropic-messages",
     models: [{ id: "claude-opus-5", name: "Opus 5", reasoning: true, contextWindow: 200000, maxTokens: 64000, ...overrides }],
   });
 

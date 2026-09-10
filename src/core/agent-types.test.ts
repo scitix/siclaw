@@ -6,6 +6,7 @@ import {
   LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT,
   PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT,
   PRODUCT_SUPPORT_DEFAULT_PROMPT,
+  CODING_DEFAULT_PROMPT,
   normalizeAgentType,
   requireAgentType,
   effectiveAgentPrompt,
@@ -14,8 +15,8 @@ import {
 } from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the five designed types; built-ins lock capabilities and own their runtime contracts", () => {
-    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "knowledge_qa", "product_support", "sre"]);
+  it("has the six designed types; built-ins lock capabilities and own their runtime contracts", () => {
+    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coding", "coordinator", "custom", "knowledge_qa", "product_support", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.coordinator.capabilities).toContain("delegate_agents");
@@ -28,8 +29,16 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.product_support.capabilities).toEqual(["read_files"]);
     expect(AGENT_TYPES.product_support.defaultPrompt).toBe(PRODUCT_SUPPORT_DEFAULT_PROMPT);
     expect(AGENT_TYPES.product_support.defaultNoSkills).toBe(true);
+    expect(AGENT_TYPES["coding"].defaultPrompt).toBe(CODING_DEFAULT_PROMPT);
+    expect(AGENT_TYPES["coding"].defaultNoSkills).toBe(false);
     expect(AGENT_TYPES.custom.capabilities).toBeNull();
     expect(AGENT_TYPES.custom.defaultPrompt).toBeNull();
+  });
+
+  it("coding locks byte-identical capabilities to sre", () => {
+    // The type exists to add a read-only source mount, not tools. Divergence
+    // here would be a capability grant nobody reviewed — in either direction.
+    expect(AGENT_TYPES["coding"].capabilities).toEqual(AGENT_TYPES.sre.capabilities);
   });
 
   it("the Portal mirror matches this registry (locked capabilities + description)", () => {
@@ -68,6 +77,7 @@ describe("agent-types", () => {
     expect(normalizeAgentType("coordinator")).toBe("coordinator");
     expect(normalizeAgentType("knowledge_qa")).toBe("knowledge_qa");
     expect(normalizeAgentType("product_support")).toBe("product_support");
+    expect(normalizeAgentType("coding")).toBe("coding");
     expect(normalizeAgentType("custom")).toBe("custom");
     expect(normalizeAgentType(undefined)).toBe("custom");
     expect(normalizeAgentType("bogus")).toBe("custom");
@@ -76,6 +86,25 @@ describe("agent-types", () => {
   it("requireAgentType accepts product_support at the fail-closed harness boundary", () => {
     expect(requireAgentType("product_support")).toBe("product_support");
     expect(() => requireAgentType("future_type")).toThrow("Invalid or missing agent_type");
+  });
+
+  it("requireAgentType accepts every registered type — it is a hand-written second enumeration", () => {
+    // requireAgentType() compares against literals, so widening the AgentType
+    // union does NOT make TypeScript flag a forgotten entry. It THROWS rather
+    // than degrading, and it is on the path of every session build, so a
+    // forgotten type is not a weaker agent — it is an agent that cannot start.
+    // Driving this from the registry is what makes the omission visible.
+    for (const key of Object.keys(AGENT_TYPES)) {
+      expect(() => requireAgentType(key), `requireAgentType rejects the registered type ${key}`).not.toThrow();
+      expect(requireAgentType(key)).toBe(key);
+    }
+    expect(requireAgentType("coding")).toBe("coding");
+  });
+
+  it("normalizeAgentType accepts every registered type — a missing case silently downgrades to custom", () => {
+    for (const key of Object.keys(AGENT_TYPES)) {
+      expect(normalizeAgentType(key), `normalizeAgentType downgrades the registered type ${key}`).toBe(key);
+    }
   });
 
   it("effectiveCapabilityKeys: built-in types override, custom uses own selection", () => {

@@ -38,6 +38,18 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     return "";
   }
 
+  // 🔴 NAME THE REAL PATHS, NEVER `repos/` OR `docs/`. Those two do not exist
+  // in a box: the mounts are `config.paths.reposDir` / `docsDir`, which default
+  // to `.siclaw/repos` and `.siclaw/docs` and are overridable
+  // (SICLAW_REPOS_DIR). A prompt that says `ls repos/` sends the agent to a
+  // directory that is not there — and the truncation note below is the one
+  // mitigation for a table that may be incomplete, so a wrong path there means
+  // no mitigation at all. modelKnowledgePath is the same helper the wiki
+  // catalog uses: workspace-relative when the mount is under cwd, absolute
+  // otherwise.
+  const reposPath = reposDir ? modelKnowledgePath(reposDir) : "";
+  const docsPath = docsDir ? modelKnowledgePath(docsDir) : "";
+
   const parts: string[] = ["# Knowledge Overview"];
   let currentLen = parts[0].length;
 
@@ -47,17 +59,34 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 
     const rows: string[] = [];
     let sectionLen = header.length;
-    for (const entry of repoEntries) {
+    // How many repositories the budget dropped. Rows are ordered by file count
+    // DESCENDING, so the tail this loses is not the least relevant — it is
+    // whichever repositories happen to be smallest.
+    let omitted = 0;
+    for (const [i, entry] of repoEntries.entries()) {
       const langs = entry.topExtensions.length > 0 ? entry.topExtensions.join(", ") : "-";
       const row = `\n| ${entry.name} | ${entry.fileCount} | ${langs} |`;
-      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 400) break; // reserve for docs + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 400) { // reserve for docs + footer
+        omitted = repoEntries.length - i;
+        break;
+      }
       rows.push(row);
       sectionLen += row.length;
     }
 
     if (rows.length > 0) {
-      parts.push(header + rows.join(""));
-      currentLen += sectionLen;
+      // 🔴 Truncation must be VISIBLE. A silently dropped tail presents the
+      // surviving prefix as if it were the complete list, and the agent has no
+      // way to notice: it answers "that repository does not exist here" instead
+      // of reading a directory that is mounted and readable. One line naming the
+      // count and the tool that lists the rest turns a wrong answer into a
+      // cheap second step. See docs/design/agentbox-code-volume.md
+      // ("Prompt table truncation").
+      const note = omitted > 0
+        ? `\n\n… and ${omitted} more ${omitted === 1 ? "repository" : "repositories"} not listed — use the \`ls\` tool on \`${reposPath}\` for the full set.`
+        : "";
+      parts.push(header + rows.join("") + note);
+      currentLen += sectionLen + note.length;
     }
   }
 
@@ -81,9 +110,16 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   }
 
   // --- Footer ---
+  // Only the directories that actually produced rows, at the paths the file
+  // tools accept. The old text named `repos/ or docs/` unconditionally: two
+  // paths that do not exist, one of which is not even mounted on most agents.
+  const locations = [
+    repoEntries.length > 0 ? `\`${reposPath}\`` : "",
+    docEntries.length > 0 ? `\`${docsPath}\`` : "",
+  ].filter(Boolean).join(" or ");
   parts.push(memoryEnabled
-    ? '\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.'
-    : '\n\nUse `read` to view files in repos/ or docs/.');
+    ? `\n\nUse \`read\` to view files in ${locations}, or \`memory_search\` to find specific facts.`
+    : `\n\nUse \`read\` to view files in ${locations}.`);
 
   return parts.join("");
 }

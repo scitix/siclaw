@@ -38,19 +38,19 @@ contracts.
 
 ## Authorization boundary
 
-Session sharing does not bypass access control. Sicore resolves every incoming
+Session sharing does not bypass access control. The external portal resolves every incoming
 turn with the current sender identity before returning the Topic session. An
 unauthorized sender receives no reusable binding for an unmentioned follow-up;
 an explicit mention follows the normal access-denied flow.
 
 Standalone Siclaw supports the same session-key and existing-only rules for its
-open group bots. Gated, platform-authorized groups remain a Sicore capability.
+open group bots. Gated, platform-authorized groups remain a the external portal capability.
 
 ## Product controls
 
 Topic mode is available from:
 
-- the Sicore channel-binding selector;
+- The external portal channel-binding selector;
 - the standalone Siclaw Agent settings selector; and
 - the Feishu `/mode` card.
 

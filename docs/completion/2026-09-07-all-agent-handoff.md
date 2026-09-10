@@ -13,7 +13,7 @@ its existing capability registry. Only labels cross the discovery interface;
 connection configuration and private content do not. Unknown metadata remains
 unknown. The main-conversation contract distinguishes handoff from delegation.
 
-SiCore's roster topology and execution authorization remain unchanged. A roster
+The external portal's roster topology and execution authorization remain unchanged. A roster
 must still be configured; this is not unrestricted Agent-to-Agent discovery.
 See ../design/2026-09-07-all-agent-handoff.md for compatibility and limitations.
 
@@ -24,7 +24,7 @@ See ../design/2026-09-07-all-agent-handoff.md for compatibility and limitations.
   Repeated on the actual a2a-runtime-p1 worktree after synchronizing the tested
   implementation from the temporary overlay.
 - Runtime TypeScript: tsc --noEmit passed on the synchronized-source overlay.
-- SiCore: go test -race ./internal/siclaw/adapter ./internal/siclaw/roster
+- The external portal: go test -race ./internal/siclaw/adapter ./internal/siclaw/roster
   ./internal/siclaw/agentroute passed. Tests cover every Agent type in rosters,
   bound-only label disclosure, MCP secret exclusion, unknown lookup failures,
   and existing authorization/session ownership constraints.

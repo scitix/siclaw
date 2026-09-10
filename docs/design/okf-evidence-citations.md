@@ -17,7 +17,7 @@ Three implementations must agree on the grammar:
 
 - compile box: `selfcheck.py` in `SICLAW_COMPILE_BOX_IMAGE`
 - agentbox: `knowledge-citation-tool.ts` in `SICLAW_AGENTBOX_IMAGE`
-- Sicore import: `okf_citations.go` (`okfEvidenceMarker` / `okfEvidenceMarkerStart`)
+- The external portal import: `okf_citations.go` (`okfEvidenceMarker` / `okfEvidenceMarkerStart`)
 
 Shared recognition cases live in `okf-evidence-marker-fixtures.json` and are
 exercised by both `test_selfcheck.py` and `knowledge-citation-tool.test.ts`.
@@ -142,7 +142,7 @@ agentbox image leaves Feishu / SSE rendering on the old 3-link ceiling.
 - Agentbox (`SICLAW_AGENTBOX_IMAGE`): grammar, snapshots, mixed call.
 - Gateway / Runtime image: the shared render cap.
 - Compile box (`SICLAW_COMPILE_BOX_IMAGE`): `selfcheck.py` marker scan.
-- Sicore apiserver: `okf_citations.go` import gate. A compile-green page
+- The external portal apiserver: `okf_citations.go` import gate. A compile-green page
   can still fail package import if Go's start regex or scan range differs.
 
 Live sessions keep the box they already have.
