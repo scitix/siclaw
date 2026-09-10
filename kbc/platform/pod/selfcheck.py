@@ -23,6 +23,7 @@ import posixpath
 import re
 import unicodedata
 import uuid
+from collections.abc import Collection
 from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -220,14 +221,27 @@ def _explicit_external_source(resource: str) -> bool:
     managed-source namespace. Bare values remain a legacy compatibility case
     when (and only when) they exactly match the current Raw inventory.
     """
-    value = posixpath.normpath(resource.strip().replace("\\", "/"))
+    value = resource.strip().replace("\\", "/")
+    # Filesystem normalization collapses URI separators (https:// -> https:/).
+    # Recognize schemes before interpreting the value as a path.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value):
+        return True
+    value = posixpath.normpath(value)
     lowered = value.lower()
     return (
-        "://" in value
-        or lowered.startswith(("mailto:", "urn:", "doi:"))
-        or value.startswith(("/", "../"))
+        value.startswith(("/", "../"))
         or lowered.startswith("references/")
     )
+
+
+def _managed_source_entry(resource: str, managed_sources: Collection[str] | None) -> str:
+    """Resolve explicit Raw paths or exact legacy inventory matches only."""
+    if _explicit_external_source(resource):
+        return ""
+    entry = _norm_source_entry(resource)
+    if _explicit_managed_source(resource) or (managed_sources is not None and entry in managed_sources):
+        return entry
+    return ""
 
 
 def parse_okf_sources(
@@ -256,20 +270,12 @@ def parse_okf_sources(
             resource = item.get("resource")
             if not isinstance(resource, str):
                 continue
-            if _explicit_managed_source(resource):
-                entry = _norm_source_entry(resource)
-                if entry:
-                    resources.append(entry)
-                continue
-            if _explicit_external_source(resource):
-                continue
             # Clean v0.2 packages use an explicit managed namespace. Preserve
             # the old bare-path dialect only when it exactly identifies a Raw
             # inventory entry; every other value is an OKF scope descriptor.
-            if managed_sources is not None:
-                entry = _norm_source_entry(resource)
-                if entry in managed_sources:
-                    resources.append(entry)
+            entry = _managed_source_entry(resource, managed_sources)
+            if entry:
+                resources.append(entry)
     return resources, derived, has_key
 
 
@@ -2051,6 +2057,7 @@ def _stamp_source_ids_text(
     frontmatter = "".join(lines[1:end])
     try:
         root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
+        tokens = list(yaml.scan(frontmatter, Loader=yaml.SafeLoader))
     except yaml.YAMLError:
         return None
     if not isinstance(root, yaml.MappingNode):
@@ -2075,8 +2082,9 @@ def _stamp_source_ids_text(
                 id_pair = (key, value)
         if resource_pair is None or not isinstance(resource_pair[1], yaml.ScalarNode):
             continue
-        entry = _norm_source_entry(resource_pair[1].value)
-        wanted = manifest_ids.get(entry)
+        resource = resource_pair[1].value
+        entry = _norm_source_entry(resource)
+        wanted = manifest_ids.get(_managed_source_entry(resource, manifest_ids))
         existing = None
         if id_pair is not None and isinstance(id_pair[1], yaml.ScalarNode):
             candidate = id_pair[1].value.strip()
@@ -2094,7 +2102,10 @@ def _stamp_source_ids_text(
         ids[entry] = wanted
         if id_pair is None and item.flow_style:
             insert_at = item.end_mark.index - 1
-            prefix = " " if frontmatter[:insert_at].rstrip().endswith(",") else ", "
+            # Scanner tokens exclude comments, including comments following a
+            # trailing comma. Text suffix checks would insert a second comma.
+            previous = next(token for token in reversed(tokens) if token.end_mark.index <= insert_at)
+            prefix = " " if isinstance(previous, yaml.tokens.FlowEntryToken) else ", "
             edits.append((insert_at, insert_at, f"{prefix}id: {json.dumps(wanted)}"))
         elif id_pair is None:
             key_node, value_node = resource_pair
@@ -2114,6 +2125,10 @@ def _stamp_source_ids_text(
     for start, finish, replacement in sorted(edits, key=lambda edit: edit[0], reverse=True):
         frontmatter = frontmatter[:start] + replacement + frontmatter[finish:]
     if edits:
+        try:
+            yaml.safe_load(frontmatter)
+        except yaml.YAMLError:
+            return None  # Never persist invalid YAML from a lossless splice.
         text = lines[0] + frontmatter + "".join(lines[end:])
     return text, ids
 
@@ -2129,7 +2144,8 @@ def _remap_evidence_source_ids(text: str, original: str, manifest_ids: dict[str,
             continue
         old, resource = source.get("id"), source.get("resource")
         if isinstance(old, str) and isinstance(resource, str):
-            destinations.setdefault(old.strip(), set()).add(manifest_ids.get(_norm_source_entry(resource)))
+            entry = _managed_source_entry(resource, manifest_ids)
+            destinations.setdefault(old.strip(), set()).add(manifest_ids.get(entry))
     stamped_fm, _, _ = parse_okf_frontmatter(text)
     stamped_ids = {source.get("id") for source in (stamped_fm or {}).get("sources", [])
                    if isinstance(source, dict) and isinstance(source.get("id"), str)}
@@ -2158,6 +2174,7 @@ def _remap_evidence_source_ids(text: str, original: str, manifest_ids: dict[str,
 def trusted_evidence_violations(workdir: str, pages: dict[str, dict]) -> list[dict]:
     """Check Raw evidence against frozen identity, not only page-local ids."""
     manifest_ids = load_manifest_source_ids(workdir)
+    managed_sources = set(source_inventory(workdir)) | manifest_ids.keys()
     violations = []
     for rel, page in sorted(pages.items()):
         fm, body, error = parse_okf_frontmatter(page.get("text", ""))
@@ -2177,8 +2194,8 @@ def trusted_evidence_violations(workdir: str, pages: dict[str, dict]) -> list[di
             source_id, resource = source.get("id"), source.get("resource")
             if not isinstance(source_id, str) or not isinstance(resource, str) or source_id.strip() not in used:
                 continue
-            entry = _norm_source_entry(resource)
-            if _explicit_external_source(resource):
+            entry = _managed_source_entry(resource, managed_sources)
+            if not entry:
                 continue  # External citation declarations are inspected by the package boundary.
             if manifest_ids.get(entry) != source_id.strip():
                 violations.append({"page": rel, "kind": "evidence_source_mapping",
