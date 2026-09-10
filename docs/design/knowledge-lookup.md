@@ -25,7 +25,9 @@ it does not establish an improvement in real answers or end-to-end latency.
    or general spelling correction. No embeddings or production dependency is added.
 3. Return up to six candidates with original file paths, library identity,
    version when provided, and content hash. Read the first two complete pages
-   when they fit inside the 12,000-byte serialized UTF-8 output budget.
+   when the serialized output fits both 12,000 UTF-8 bytes and 8,000 characters.
+   The character limit keeps the runtime artifact wrapper from replacing
+   complete evidence with a preview after citation-read registration.
    `readCount=0` returns metadata only. A page that does not fit is explicitly
    `budget_exceeded` and still has a path for `Read`; pages are never truncated
    and described as complete. These are relevance ranks, not confidence scores.

@@ -8,8 +8,10 @@ import { parseKnowledgeLabels } from "./labels.js";
 import { modelKnowledgePath } from "./model-path.js";
 import { isKnowledgeNavigationPage } from "./page-kind.js";
 
-// Keep the entire serialized result below the runtime's tool-output guard.
+// The runtime artifact wrapper also replaces outputs above 8,000 characters.
+// Both limits must hold before a page is registered as completely read.
 export const LOOKUP_OUTPUT_BYTES = 12_000;
+const LOOKUP_OUTPUT_CHARS = 8_000;
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const MAX_INDEX_BYTES = 64 * 1024 * 1024;
 const MAX_INDEX_PAGES = 10_000;
@@ -43,7 +45,10 @@ export interface LookupResult {
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const encoded = (term: string) => `t${Buffer.from(term).toString("hex")}`;
-const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+function fitsOutput(value: unknown, reserve = 0): boolean {
+  const text = JSON.stringify(value);
+  return text.length <= LOOKUP_OUTPUT_CHARS - reserve && Buffer.byteLength(text) <= LOOKUP_OUTPUT_BYTES - reserve;
+}
 
 /** Identical document/query tokenization: retain numbers, negations and identifiers. */
 export function knowledgeTerms(text: string, expandIdentifiers = true): string[] {
@@ -224,7 +229,7 @@ export class KnowledgeLookupIndex {
           title: page.title, library: page.library, contentHash: page.hash, readStatus: "candidate",
         };
         result.results.push(candidate);
-        if (bytes(result) > LOOKUP_OUTPUT_BYTES - 100) { result.results.pop(); result.hasMore = true; break; }
+        if (!fitsOutput(result, 100)) { result.results.pop(); result.hasMore = true; break; }
       }
       for (let i = 0; i < Math.min(readCount, result.results.length); i++) {
         signal?.throwIfAborted();
@@ -234,7 +239,7 @@ export class KnowledgeLookupIndex {
         if (content === undefined || digest(content) !== page.hash) { stale = true; break; }
         candidate.content = content;
         candidate.readStatus = "full";
-        if (bytes(result) > LOOKUP_OUTPUT_BYTES) {
+        if (!fitsOutput(result)) {
           delete candidate.content;
           candidate.readStatus = "budget_exceeded";
         }
