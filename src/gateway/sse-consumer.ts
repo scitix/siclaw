@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import { AssistantItemStream } from "./assistant-item-stream.js";
 import { assistantTextBlocks, type AssistantItem } from "../shared/assistant-items.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
+import { persistableToolDetails } from "../shared/tool-result-metadata.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
@@ -163,40 +164,6 @@ const EMPTY_REDACTION: RedactionConfig = { patterns: [] };
  */
 function stripEmptyResponseMarkers(text: string): string {
   return text.replace(/\s*\(Empty response:\s*\{[\s\S]*?\}\)\s*/g, "").trimEnd();
-}
-
-/**
- * Pick the subset of tool-result `details` worth persisting as message
- * metadata. The `blocked`/`error` flags are already surfaced via the message's
- * `outcome` column — dropping them here avoids duplicate storage. Anything
- * else (structured data a tool attaches to its result) is passed through so
- * the UI can rebuild from the DB row on history reload without depending on
- * the ephemeral live stream.
- *
- * Redaction is applied via a JSON round-trip so patterns hit string values
- * nested inside arrays/objects. If redaction somehow produces invalid JSON
- * (defensive only — current redactText just substitutes `[REDACTED]` which is
- * safe inside JSON strings), the metadata is dropped rather than persisted
- * corrupt.
- */
-function extractPersistableDetails(
-  details: Record<string, unknown> | undefined,
-  redactionConfig: RedactionConfig,
-): Record<string, unknown> | null {
-  if (!details) return null;
-
-  const { blocked: _blocked, error: _error, ...rest } = details;
-  if (Object.keys(rest).length === 0) return null;
-
-  if (redactionConfig.patterns.length === 0) return rest;
-
-  const serialized = JSON.stringify(rest);
-  const redacted = redactText(serialized, redactionConfig);
-  try {
-    return JSON.parse(redacted) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -850,8 +817,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         }
         const toolInput = pendingCall?.input || "";
         const existingMessageId = pendingCall?.messageId;
-        const detailsMeta = extractPersistableDetails(toolResult?.details, redactionConfig);
-        // Re-stamp the round markers — extractPersistableDetails only looks at
+        const detailsMeta = persistableToolDetails(toolResult?.details, value => redactText(value, redactionConfig));
+        // Re-stamp the round markers — persistableToolDetails only looks at
         // the tool *result*, and updateMessage REPLACES metadata wholesale.
         const roundMeta = pendingCall?.roundMeta ?? timeline.toolMetadata(evt);
         const merged: Record<string, unknown> = { ...(detailsMeta ?? {}), ...roundMeta };

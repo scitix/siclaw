@@ -12,6 +12,7 @@
  */
 
 import type { BackgroundWorkTurn } from "./background-work-turn.js";
+import { persistableToolDetails } from "../shared/tool-result-metadata.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -2443,7 +2444,7 @@ export class AgentBoxSessionManager {
         ? { kind: "task_notification" }
         : role === "assistant" && modelRouteMetadata
           ? { model_route: modelRouteMetadata }
-          : null,
+          : role === "tool" ? persistableToolDetails(message.details, value => redactText(value, buildRedactionConfigForModelConfig(this.delegationModelConfig))) : null,
       // A COMPLETED tool row must persist a terminal outcome. Without this a successful tool call
       // in a synthetic (background-completion) turn was written with outcome=null, which the
       // frontend maps to "running" → a spinner that never resolves and a recovered-run poller stuck
@@ -2903,10 +2904,10 @@ export class AgentBoxSessionManager {
             sessionId: childSessionId,
             role: "tool",
             content: resultText,
+            metadata: { ...persistableToolDetails(event.result?.details, value => redactText(value, redactionConfig)), ...getToolResultArtifactDetails(event.result?.details) },
             toolName,
             toolset: pending?.toolset ?? (typeof event.toolset === "string" ? event.toolset : null),
             toolInput: pending?.toolInput,
-            metadata: getToolResultArtifactDetails(event.result?.details) ?? undefined,
             outcome,
             durationMs,
             fromAgentId: agentId,

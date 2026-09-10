@@ -1,3 +1,5 @@
+import { normalizeWaterfallSpec, type WaterfallSpec } from "./waterfall-spec"
+
 /**
  * Pure (DOM-free) logic for the chart renderer: the ChartSpec contract, number
  * / axis math, legend layout, plot geometry, canvas sizing, and the trust-
@@ -25,6 +27,7 @@ export interface CommonOpts {
 }
 
 export type ChartSpec =
+  | (WaterfallSpec & CommonOpts)
   | ({ type: "pie"; data: { slices: PieSlice[] } } & CommonOpts)
   | ({ type: "bar"; data: { categories: string[]; series: BarSeries[] } } & CommonOpts)
   | ({ type: "line"; data: { series: LineSeries[] } } & CommonOpts)
@@ -202,6 +205,7 @@ export function logBeneficial(values: number[]): boolean {
 }
 
 export function collectChartValues(spec: ChartSpec): number[] {
+  if (spec.type === "waterfall") return []
   if (spec.type === "bar") return spec.data.series.flatMap((s) => s.values)
   if (spec.type === "line") return spec.data.series.flatMap((s) => s.points.map((p) => p.y))
   return []
@@ -337,6 +341,7 @@ export function defaultSize(type: ChartSpec["type"]): { width: number; height: n
 }
 
 export function describeChart(spec: ChartSpec): string {
+  if (spec.type === "waterfall") return `Request timeline with ${spec.data.spans.length} spans.`
   if (spec.type === "pie") return `Pie chart with ${spec.data.slices.length} segment(s).`
   if (spec.type === "bar") {
     return `Bar chart with ${spec.data.categories.length} categories and ${spec.data.series.length} series.`
@@ -460,6 +465,7 @@ export function tryParseChartSpec(raw: string): ChartSpec | null {
   try {
     const obj = JSON.parse(raw) as Record<string, unknown>
     if (!obj || typeof obj !== "object") return null
+    if (obj.type === "waterfall") return normalizeWaterfallSpec(obj)
     const data = obj.data as Record<string, unknown> | undefined
     if (!data || typeof data !== "object") return null
     const common = pickCommonOpts(obj)

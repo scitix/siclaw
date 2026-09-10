@@ -5,6 +5,7 @@ import { api } from "../api"
 import { AgentChat } from "../components/AgentChat"
 import {
   chatSessionForAgent,
+  buildChatSearchParams,
   readChatSelection,
   rememberChatAgent,
   rememberChatSession,
@@ -45,9 +46,8 @@ export function Chat() {
       const pathname = typeof window === "undefined" ? location.pathname : window.location.pathname
       if (!pathname.startsWith("/chat")) return
 
-      const next = new URLSearchParams()
-      next.set("agent", agentId)
-      if (sessionId) next.set("session", sessionId)
+      const current = new URLSearchParams(typeof window === "undefined" ? "" : window.location.search)
+      const next = buildChatSearchParams(agentId, sessionId, current)
       setSearchParams(next, { replace })
     },
     [location.pathname, setSearchParams],

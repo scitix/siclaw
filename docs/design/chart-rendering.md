@@ -14,8 +14,9 @@ description: "Contract between MCP chart tools and the Portal frontend renderer.
 
 ## How It Works
 
-The frontend recognises chart output through a single convention: a fenced
-Markdown code block with the language tag `chart`.
+The frontend recognises legacy pie/bar/line output through a fenced Markdown
+block tagged `chart`. Request timelines additionally use versioned structured
+tool attachments, rendered directly from persisted message metadata.
 
 ```
 ```chart
@@ -51,7 +52,8 @@ ChartRenderer  (portal-web/src/components/chat/ChartRenderer.tsx)
   └── wrapped in React.memo — skips re-render when spec is unchanged
         ├── spec.type === "pie"  → renderPie
         ├── spec.type === "bar"  → renderBar
-        └── spec.type === "line" → renderLine
+        ├── spec.type === "line" → renderLine
+        └── spec.type === "waterfall" → TraceTimelineRenderer
 ```
 
 ## Mermaid Diagram Rendering
@@ -218,3 +220,112 @@ automatically.
   copy/download toolbar, log-scale toggle).
 - **Streaming partial charts**: the spinner is the only streaming state; there
   is no incremental render of partially-arrived data.
+
+
+## Structured request timelines
+
+Request timelines visualize observed spans from HTTP services, gateway retries,
+agent/tool executions, or other timed operations. Callers and diagnostic skills
+collect and correlate the evidence; the chart tool and clients share one span
+contract across these scenarios. The fixture uses a service request with two
+upstream attempts to illustrate overlap and missing observations.
+
+`render_chart(type="waterfall")` returns a short summary and
+`structuredContent = {schema_version:2, visuals:[{visual_id,kind:"chart",spec,exports:{png:{status}}}]}`.
+The normalized `spec` has `schema_version:1` and the same `visual_id`. Supported
+clients render tool attachments automatically; the assistant should explain the
+finding without repeating the JSON or a chart fence. Legacy fences still work;
+a fence matching an already attached visual ID is suppressed.
+
+Canonical fields/validation live in `mcp/create-chart/src/waterfall-spec.ts`.
+`data` carries origin_time, request_id/trace_id/root_span_id, verified scope,
+coverage and spans. Every span preserves its true parent, status, layer and
+observed endpoints; attempt_id groups rows without rewriting the hierarchy.
+UTC nanosecond timestamps are subtracted before converting to milliseconds.
+Unknown ends stay null. Route/HTTP overlaps must never be added. HTTP timing is
+not provider queue/inference or token timing. At most 200 spans / 256 KiB;
+both input and the final normalized spec (including its visual ID) must fit.
+Oversized output fails before PNG export or a successful tool response. Do not send raw attributes, bodies, headers,
+URLs, ARN, prompts or credentials; only safe labels/IDs/evidence refs.
+
+`output=web` needs no exporter; `both` retains data if PNG fails; `image` requires
+successful PNG. Default waterfall=both, legacy=image. PNG uses a deterministic
+SVG of the same data including coverage. Web interaction provides grouping,
+zoom/brush, keyboard, detail selection and larger view. Only an explicit
+investigate action sends evidence context back into the current conversation;
+read-only hosts omit that callback.
+
+Conversation attachments start as a compact card (up to three key HTTP intervals,
+observed root duration and evidence gaps). Unfinished calls stay visible; preview
+rows never sum nested durations. View timeline expands a scrollable detail region
+capped at 640px / 65dvh. Collapse and larger view retain the current selection and
+zoom. The transcript owns visual navigation and auto-follow: a visual deep link
+expands and takes precedence over initial scrolling, including when its history
+arrives later. New answers preserve that position; a new user turn resumes follow.
+Unknown or unloaded visuals leave normal scrolling available. The hidden full
+TraceSnapshot always contains every supplied span, so PNG export and message copy
+are independent of disclosure state. No new tool argument is required.
+
+Runtime persists details for Web, Lark, delegated and synthetic turns with the
+shared metadata helper. Direct Lark responses forward PNG and, when supported,
+request `chat.getVisualLink` from the host. Hosted conversations use the tool
+event's `dbMessageId`, relayed after destination Runtime persistence, without
+writing the transcript again. Raw AgentBox events use the locally persisted row
+ID. Replayed message/visual pairs do not issue duplicate link requests. The RPC accepts session_id,
+message_id and visual_id and returns `{url:string|null}`. The host verifies the
+persisted attachment and Runtime/session relationship and returns its normal
+login-protected chat URL. No access token is created. Standalone Portal returns
+null because it has no comparable user permission model. Old hosts and export
+failures retain text output. Background notification PNG forwarding is not
+implemented; its tool attachment remains available in conversation history.
+
+Keep frontend copies synchronized without a new package dependency. The optional
+`--host-dir` points directly to an existing host chat-component directory; omit it
+to sync only the Portal contract:
+
+```sh
+node scripts/sync-waterfall-contract.mjs --host-dir /absolute/path/to/host/chat-components
+node scripts/sync-waterfall-contract.mjs --check --host-dir /absolute/path/to/host/chat-components
+```
+
+Source interaction code is Portal's `TraceTimeline.tsx`; wrappers use each
+product's own components and locale. Run contract, metadata, message and browser
+checks before changing a shared field. Deploy readers before tools/skills.
+
+
+## Standalone Portal PNG export
+
+Portal serves a stateless `/siclaw-visual-export` page using the same chart and
+Mermaid renderers as chat. The headless MCP browser passes data in the URL
+fragment, so the server and access logs do not receive the chart payload.
+The page does not read chat history or grant access to a session.
+
+Set `SICLAW_VISUAL_EXPORT_URL` in the **create-chart MCP server's `env` config**
+to the Portal URL reachable from AgentBox, for example
+`http://siclaw-portal:3003/siclaw-visual-export`. Setting it only on Runtime is
+insufficient: stdio MCP processes receive their configured environment.
+`output=web` needs no exporter; `output=both` retains the structured timeline
+when PNG export fails. Portal exports charts and Mermaid.
+
+
+## Timeline language and responsive layout
+
+The chart provides Auto / 中文 / English. Auto follows the host platform locale,
+or browser language in standalone Portal; `TraceHostContext.locale` can supply a
+host override. The explicit preference is stored under `siclaw.traceLanguage.v1`
+and updates every chart without resetting selection or zoom. Controls, statuses,
+help, follow-up prompts and user-downloaded PNG use the selected language. Original
+span labels and evidence remain unchanged. This does not localize Portal navigation
+or select a Feishu recipient's language for the headless exporter.
+
+Layout follows the chart container through ResizeObserver: at 980px it splits
+into a timeline and 288px inspector; below that details are stacked, and plot
+containers below 580px use mobile rows and a compact view selector. Dialog headers
+remain fixed while rows and evidence scroll within bounded regions. The dialog is
+at most 1240px wide and keeps a 12px viewport margin. Styles use host fonts/theme,
+include coarse-pointer targets and respect reduced motion. `trace-locale.ts` and
+`trace-timeline.css` are included in the shared sync/check script.
+
+The PNG is a complete independent SVG. The partial-trace badge also accounts for
+missing coverage, open spans and spans outside the root interval, even when trace
+collection itself reports complete.

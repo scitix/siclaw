@@ -166,3 +166,19 @@ export const chatPathFromStoredSelection = (basePath = "/chat"): string => {
     basePath,
   )
 }
+
+/** Retain a linked visual only while resolving the same conversation. */
+export const buildChatSearchParams = (
+  agentId: string,
+  sessionId: string | null,
+  current: URLSearchParams,
+): URLSearchParams => {
+  const next = new URLSearchParams()
+  next.set("agent", agentId)
+  if (sessionId) next.set("session", sessionId)
+  const visual = current.get("visual")
+  if (visual && sessionId && current.get("agent") === agentId && current.get("session") === sessionId) {
+    next.set("visual", visual)
+  }
+  return next
+}
