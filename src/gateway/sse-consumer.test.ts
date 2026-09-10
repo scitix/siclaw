@@ -2,6 +2,7 @@ import { appendMessage } from "./chat-repo.js";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { AgentBoxClient } from "./agentbox/client.js";
+import { appendKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
 
 // ── Mock chat-repo ──────────────────────────────────────
 // Replace the module-scoped appendMessage/incrementMessageCount so tests run
@@ -100,6 +101,42 @@ describe("consumeAgentSse — type-less extra events", () => {
 });
 
 describe("consumeAgentSse — assistant message flow", () => {
+  it("keeps attribution when a raw answer already contains the registered footer", async () => {
+    const sources = [{ title: "Runbook", url: "https://example.com/runbook", repoId: "repo-1" }];
+    const answer = appendKnowledgeSourceCitations("Answer", sources);
+    const result = await consumeAgentSse({
+      client: mkClient([
+        { type: "knowledge_sources", sources },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } },
+      ]),
+      sessionId: "s", userId: "u", persistMessages: true,
+    });
+    expect(result.resultText).toBe(answer);
+    expect(appendCalls[0].content).toBe(answer);
+    expect(appendCalls[0].metadata.knowledge_citations.repo_ids).toEqual(["repo-1"]);
+  });
+
+  it("preserves citations when a conversation forwards already-consumed runtime events", async () => {
+    const sources = Array.from({ length: 8 }, (_, i) => ({
+      title: `Source ${i + 1}`, url: `https://example.com/source-${i + 1}`,
+    }));
+    const forwarded: any[] = [];
+    const original = await consumeAgentSse({
+      client: mkClient([
+        { type: "knowledge_sources", sources },
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Answer" }] } },
+      ]),
+      sessionId: "s", userId: "u", onEvent: event => forwarded.push(event),
+    });
+    const result = await consumeAgentSse({
+      client: Object.assign(mkClient(forwarded), { conversationEvents: true }),
+      sessionId: "s", userId: "u", persistMessages: false,
+    });
+    expect(original.resultText.match(/### Original sources/g)).toHaveLength(1);
+    expect(original.resultText).toContain("Source 8");
+    expect(result.resultText).toBe(original.resultText);
+  });
+
   it("appends registered knowledge sources to the final answer event and result", async () => {
     const events = [
       { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },

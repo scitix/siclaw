@@ -2588,6 +2588,37 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(appendMessageMock.mock.calls.filter(([row]) => row.role === "assistant")).toHaveLength(0);
   });
 
+  it("renders forwarded runtime citations once in the final card", async () => {
+    supportsConversationsMock.mockResolvedValue(true);
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    appendMessageMock.mockResolvedValue("original-user-row");
+    const sources = Array.from({ length: 8 }, (_, i) => ({
+      title: `Source ${i + 1}`, url: `https://example.com/source-${i + 1}`,
+    }));
+    const answer = "Answer\n\n### Original sources\n\n" + sources
+      .map(source => `- [${source.title}](${source.url})`).join("\n");
+    let receive: (data: unknown) => void = () => {};
+    const frontend = {
+      connected: true,
+      subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
+      request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.start") {
+          for (const event of [
+            { type: "knowledge_sources", sources },
+            { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } },
+            { type: "prompt_done" },
+          ]) receive({ sessionId: input.sessionId, requestId: input.userMessageId, event });
+          return { sessionId: input.sessionId };
+        }
+        return {};
+      }),
+    };
+    const lark = makeCardAwareLarkClient();
+    await handleLarkMessage(makeTextEvent("Explain the sources"), lark, "lark", makeAgentBoxManager() as any, undefined, frontend as any);
+    const content = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content;
+    expect(content).toBe(answer);
+  });
+
   function makeCardAwareLarkClient() {
     return {
       im: {

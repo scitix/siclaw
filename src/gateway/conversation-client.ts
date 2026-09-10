@@ -16,6 +16,7 @@ export async function supportsConversations(frontend: FrontendWsClient): Promise
 /** Observe a logical request at the control plane. This client never starts a
  * destination AgentBox locally and never receives the destination's credentials. */
 export class ConversationClient {
+  /** Events already processed by the destination runtime, including citations. */
   readonly conversationEvents = true;
   private events: unknown[] = [];
   private wake?: () => void;

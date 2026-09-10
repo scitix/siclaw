@@ -3107,7 +3107,7 @@ export interface ChannelPersistContext {
 }
 
 export async function collectChannelResponse(
-  client: Pick<AgentBoxClient, "streamEvents">,
+  client: Pick<AgentBoxClient, "streamEvents"> & { readonly conversationEvents?: boolean },
   sessionId: string,
   logPrefix = "lark",
   options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale; throwOnError?: boolean } = {},
@@ -3321,7 +3321,10 @@ export async function collectChannelResponse(
           });
         }
       }
-      if (ev.type === "knowledge_sources") {
+      // Conversation events already passed through the destination runtime's
+      // SSE consumer, which appended citations to message_end. Only raw
+      // AgentBox streams need this channel to render their source list.
+      if (ev.type === "knowledge_sources" && !client.conversationEvents) {
         pendingKnowledgeSources = ev.sources;
       }
 

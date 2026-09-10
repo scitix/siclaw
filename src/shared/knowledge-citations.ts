@@ -101,5 +101,9 @@ export function appendKnowledgeSourceCitations(text: string, value: unknown): st
     const destination = source.url.replaceAll("(", "%28").replaceAll(")", "%29");
     return `- [${source.title.replace(/[\[\]]/g, "")}](${destination})`;
   });
-  return `${text.trimEnd()}\n\n### ${heading}\n\n${lines.join("\n")}`;
+  const footer = `\n\n### ${heading}\n\n${lines.join("\n")}`;
+  // A relayed or pre-rendered answer can already carry this exact footer.
+  // Match the complete generated block, not arbitrary URLs in answer prose.
+  if (text.trimEnd().endsWith(footer)) return text;
+  return `${text.trimEnd()}${footer}`;
 }

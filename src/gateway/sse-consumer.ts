@@ -94,7 +94,7 @@ const HANDOFF_PAIRED_CLOSERS = new Set([
 ]);
 
 export interface ConsumeAgentSseOptions {
-  client: Pick<AgentBoxClient, "streamEvents">;
+  client: Pick<AgentBoxClient, "streamEvents"> & { readonly conversationEvents?: boolean };
   sessionId: string;
   userId: string;
   /**
@@ -672,7 +672,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         renderedKnowledgeSourceUrls.clear();
       }
 
-      if (eventType === "knowledge_sources") {
+      // A ConversationClient observes output already rendered by the owning
+      // runtime. Re-registering its sources would append them a second time
+      // when scheduled tasks consume the forwarded message_end.
+      if (eventType === "knowledge_sources" && !client.conversationEvents) {
         pendingKnowledgeSources = (evt as Record<string, unknown>).sources;
       }
 
@@ -1134,9 +1137,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                     if (lastText) lastText.text += cited.slice(base.length);
                     message.content = parts;
                   } else message.content = cited;
-                  for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
-                  pendingRowCitations = freshSources;
                 }
+                // An identical footer may already exist; attribution still
+                // belongs to this row even when rendering is a no-op.
+                for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
+                pendingRowCitations = freshSources;
               }
             }
           }
