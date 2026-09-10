@@ -44,8 +44,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/redirect-target")
             self.end_headers()
             return
-        if call["tool"] == "k8s.list_nodes" and call["arguments"] == {"cluster": "test"}:
-            value = {"id": call["id"], "result": {"nodes": [{"name": "node-1"}]}}
+        if call["tool"] == "bash" and call["arguments"] == {"cluster": "test", "command": "kubectl get nodes -o json"}:
+            value = {"id": call["id"], "result": {"text": json.dumps({"items": [{"metadata": {"name": "node-1"}}]})}}
         elif call["tool"] == "test.echo":
             value = {"id": call["id"], "result": call["arguments"]}
         elif call["tool"] == "test.large" and call.get("delivery") == "file":
@@ -102,7 +102,7 @@ endpoint = "https://127.0.0.1:%s/api/v1/siclaw/sandbox/tools" % server.server_po
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     common = r'''
-import os, pathlib, socket, subprocess
+import json, os, pathlib, socket, subprocess
 from siclaw import call
 assert os.getuid() == 10001
 assert "NoNewPrivs:\t1" in pathlib.Path("/proc/self/status").read_text()
@@ -118,7 +118,7 @@ try:
     raise AssertionError("privilege escalation")
 except PermissionError:
     pass
-assert call("k8s.list_nodes", {"cluster":"test"})["nodes"][0]["name"] == "node-1"
+assert json.loads(call("bash", {"cluster":"test", "command":"kubectl get nodes -o json"})["text"])["items"][0]["metadata"]["name"] == "node-1"
 try:
     call("bash", {"cluster":"test", "command":"kubectl delete nodes node-1"})
     raise AssertionError("write accepted")
@@ -137,7 +137,7 @@ print("PASS")
 '''
     run(common + isolated)
     run(common + '\nsocket.socket().close()\nprint("PASS")\n', isolated=False)
-    run('siclaw-tool k8s.list_nodes \'{"cluster":"test"}\'\necho PASS\n', language="shell")
+    run('siclaw-tool bash \'{"cluster":"test","command":"kubectl get nodes -o json"}\'\necho PASS\n', language="shell")
     assert len(calls) == 5
     run('''import json
 from siclaw import call, call_to_file
@@ -151,7 +151,7 @@ siclaw-tool --output data.json test.large '{}' > receipt.json
 python3 -c 'import json; assert len(json.load(open("data.json"))["rows"]) == 40000; print("PASS")'
 ''', language="shell")
     redirect = True
-    run('from siclaw import call\ncall("k8s.list_nodes", {"cluster":"test"})\n', fail=True)
+    run('from siclaw import call\ncall("bash", {"cluster":"test", "command":"kubectl get nodes -o json"})\n', fail=True)
     assert not redirected
     print("HTTPS redirect rejection: passed")
 finally:

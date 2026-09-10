@@ -10,18 +10,17 @@ environment settings. Docker is only used by the standalone smoke harness.
 
 ```mermaid
 flowchart LR
-  A[AgentBox: run_script] -->|Authenticated request + session ID| R[Runtime controller]
-  R -->|One-use pipe channel: code and input| S[Disposable Python/Bash container]
-  S -->|Untrusted operation + arguments| B[Runtime read-only broker]
-  B -->|Reauthorize user and resource| P[Upstream control plane or Portal]
-  P -->|Connection material, Runtime only| B
-  B -->|Bound callback with mTLS| T[AgentBox: restricted Bash adapter]
-  T --> K[Bound Kubernetes cluster]
-  B --> K[Fixed Kubernetes read API]
-  B --> H[Fixed SSH inspection helper]
-  B --> M[Operator-reviewed HTTP MCP]
-  B -->|Bounded tool result| S
+  A[AgentBox: run_script] -->|Authenticated session| R[Runtime]
+  R -->|Code and input over pipes| S[Disposable Python/Bash container]
+  S -->|SDK tool call| R
+  R -->|Reauthorize caller and resource| P[Control plane or Portal]
+  R -->|Bound callback and credential snapshot| T[AgentBox: existing Bash/host/node/Pod tools]
+  R --> M[Existing MCP tool implementation]
+  T --> K[Authorized cluster or host]
+  M --> H[Bound MCP server]
+  R -->|Sanitized, bounded tool result| S
 ```
+
 
 The runner has no AgentBox filesystem, service account token, kubeconfig, SSH
 key, MCP token, cloud environment or Runtime certificate. It receives only code,
@@ -76,165 +75,108 @@ Bound MCP resources remain accessible through the reviewed broker policy.
 The SRE preset intentionally
 retains both capabilities. Empty capability selection remains unrestricted.
 
-## What “read-only” means
+## One tool execution policy
 
-| Sandbox operation | Enforced behavior |
+The sandbox executes Python/Bash orchestration and local data processing. Its
+SDK invokes the existing Agent tools; Runtime does not implement Kubernetes
+queries or inspect command syntax. There is no second command whitelist,
+fixed Kubernetes GET implementation, or remote inspection helper.
+
+| SDK operation | Implementation |
 | --- | --- |
-| `bash` | Single scoped `kubectl get nodes/pods` through the existing restricted Bash tool. No arbitrary shell, Skill, connection flags, pipeline or other resource types. |
-| `k8s.list_pods` | Fixed HTTPS GET of one declared namespace; up to 10 pod summaries per page with an opaque `continue` token. No spec/env/secret dump or condition messages. |
-| `k8s.list_nodes` | Fixed GET of `/api/v1/nodes`, up to 10 summaries per page with an opaque `continue` token. Requires explicit `clusters[].nodes: true` and Kubernetes `nodes/list` RBAC. Returns name, Ready/scheduling state, software versions, architecture, capacity and allocatable resources; no annotations, labels, addresses, image inventory or full node object. |
-| `k8s.pod_logs` | Fixed GET of one named pod's log, bounded to 64 KiB and 1–1,000 tail lines. |
-| `host_exec` | Same Agent SSH tool and sanitizer, using the current approved credential snapshot and pinned keys for every hop. Only the sandbox diagnostic command profile. |
-| `node_exec` | Same Agent node tool, in a dedicated managed diagnostic namespace. Requires explicit node scope, current `run_commands`, and diagnostic Job/exec RBAC. |
-| `pod_exec` | Same Agent Pod tool, scoped to a declared namespace. Only diagnostic commands with a remote timeout; the target image must provide `timeout`. |
-| `host.inspect` | Compatibility alias to `host_exec`: fixed OS, memory or sysctl read command. No host helper installation is required. |
-| `mcp.call` | Only an explicitly declared and operator-reviewed tool on a bound HTTPS Streamable HTTP MCP server. Operator fixed arguments cannot be overridden. |
+| `bash` | Existing `createRestrictedBashTool`, including the shared kubectl read policy, command whitelist, rate limits and output sanitizers. Use it for get/describe/logs and other queries allowed by that tool. |
+| `host_exec` | Existing `createHostExecTool` and its host command policy, with an approved credential snapshot and pinned SSH hops. |
+| `node_exec` | Existing `createNodeExecTool` and its node command policy, with bounded diagnostic Job lifecycle. |
+| `pod_exec` | Existing `createPodExecTool` and its Pod command policy, with a remote timeout. The target container must provide `timeout`. |
+| `mcp.call` | Shared `createMcpToolDefinition`; bound server/tool authorization and fixed resource arguments apply before dispatch. |
 
-No caller-selected Kubernetes mutation, proxy, Secret access or arbitrary API path is accepted.
-`node_exec` and `pod_exec` deliberately use trusted exec infrastructure; `node_exec`
-provisions and removes diagnostic resources as described below. Kubernetes authentication accepts inline token or
-client certificate/key data with TLS verification; exec plugins, auth providers,
-file references, proxy settings and impersonation are rejected. HTTP redirects
-are not followed. MCP `readOnlyHint` is not authorization: the operator must
-review the tool implementation and constrain tenant/resource arguments, or leave
-it disabled. MCP credentials should independently carry read-only permissions.
-An operator-reviewed MCP tool is a trusted extension of the broker boundary.
+Command acceptance is owned by the normal built-in implementations. Their
+existing `preExecSecurity` and `postExecSecurity` paths run once at execution;
+the SDK does not maintain an additional command/flag/file list. The trusted
+callback validates arguments against the selected built-in's own published
+schema. A future command-policy fix therefore affects both direct Agent calls
+and scripts. Connection/identity overrides and kubeconfig mutation are rejected
+by the shared kubectl policy, including shorthand flags and all subcommands.
 
-Node scope is cluster-wide and independent of namespace scope. Declaring a
-namespace does not allow node reads; declaring `nodes: true` does not allow Pod
-reads. Node and Pod pages are limited to 1 MiB upstream, then projected to fixed fields.
-Continuation tokens are bounded to 4,096 characters and encoded as query data;
-they cannot change the API path, HTTP method or page size. Every page is
-reauthorized. Scripts must follow pagination to enumerate all nodes/pods and surface
-an incomplete result if execution or tool-call budgets are exhausted. The chart
-does not grant node permissions; configure them only on the selected diagnostic
-credential, never on the runner ServiceAccount.
+Each SDK call still reauthorizes the current user, Agent capabilities, Web turn
+and resource binding. `run_sandbox` does not grant another tool's capabilities:
+Bash/host/node/Pod tools also require current `run_commands`. Cluster selection
+is explicit: `clusters: [{"name": "prod"}]` permits calls only to that currently
+bound cluster. Namespace/resource permissions are those of the existing tools
+and the approved credential's Kubernetes RBAC. The sandbox does not create a
+second namespace/resource authorization system. Earlier `nodes`/`namespaces`
+request fields are rejected, never silently ignored. Deprecated fixed query
+operation names are rejected before obtaining credentials.
 
-A script executing `ssh node rm ...` has no SSH credential in either profile.
-With network isolation enabled it also cannot create the socket, even via a
-subprocess or raw syscall. SDK exec calls reach the same Agent tools, with a
-strict additional diagnostic profile that excludes remote interpreters, network
-clients, arbitrary file reads, shell composition and background execution. Host
-binaries, configured diagnostic images and the operator-reviewed MCP server are
-trusted execution components; sharing a tool factory alone is not a proof of safety.
+Runtime selects only the four registered built-in callback targets above. The
+AgentBox callback verifies the original immutable resource scope, owning Web
+session, random per-run grant and Runtime mTLS identity. No command goes through
+the model prompt queue. The callback uses a fresh, private credential snapshot
+instead of the ambient credential cache, so rebinding/refresh cannot substitute
+a different credential. Snapshots are removed after tool cleanup. They are
+never serialized to the runner, SDK output or audit. Inline kubeconfig validation
+rejects credential plugins, file references, proxy settings and impersonation.
 
-The diagnostic command profile excludes requested production mutations. Trusted
-execution supervision can still create temporary process files, and node diagnostics
-create Kubernetes namespaces, quotas, Jobs and Pods. The script can freely create/delete
-its own disposable work files. Reads may still produce server audit records,
-affect access times or retrieve sensitive diagnostic content such as logs.
+MCP server/tool eligibility and fixed tenant/resource arguments are authorization,
+not a second command review. Only configured bound HTTPS Streamable HTTP servers
+are supported, using the shared Agent MCP tool factory with bounded transport,
+no redirects and cancellation. MCP `readOnlyHint` alone does not authorize a
+call; server implementation and upstream credential permissions remain trusted.
+SSH key pins are required on every hop, and the existing host tool verifies them.
 
-## Built-in tool callback
-
-Python calls `call("bash", {"cluster": "prod", "command": "kubectl get nodes -o wide"})`;
-Bash calls `siclaw-tool bash '{"cluster":"prod","command":"kubectl get nodes -o wide"}'`.
-A declared cluster/node or namespace scope is still required. Supported output
-formats are default table, `wide`, `name`, and `custom-columns` using fixed
-non-secret diagnostic paths. For example:
+Python and Shell share the same SDK protocol and tools:
 
 ```python
+import json
 from siclaw import call
-print(call("bash", {
-    "cluster": "prod",
-    "command": "kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.capacity.cpu,VERSION:.status.nodeInfo.kubeletVersion"
-})["text"])
-```
-
-The strict grammar allows only `get nodes/pods`, an optional name, one explicit
-namespace for Pods, and one output format. Node custom columns allow name,
-kubelet/kernel/OS/architecture/container runtime versions, CPU/memory capacity
-and allocatable, and scheduling status. Pod columns allow name, namespace,
-phase and node name. JSON/YAML, arbitrary JSONPath/templates, Secret/ConfigMap,
-resource aliases/groups, watches, subresources and endpoint/auth overrides are
-rejected. Canonical quoted argv are rebuilt and checked by the shared pre-exec
-and read-only kubectl policies. Tools have a 10-second API request deadline and
-1–15 second command budget; output uses the existing Bash sanitizer and limits.
-Use `k8s.list_nodes` pagination for complete structured inventories.
-
-Runtime reauthorizes the current resource and routes only to the original
-AgentBox placement. AgentBox verifies a random, per-invocation callback grant,
-its original immutable scope, the Web session, and the strict command profile
-again before executing the same `createRestrictedBashTool`, `createHostExecTool`,
-`createNodeExecTool` or `createPodExecTool` factory used by the Agent. Callback grants remain only
-between trusted processes, are omitted from audit, and expire on completion or
-cancellation. Only Runtime can select one of these four approved built-ins. The
-endpoint rejects arbitrary dispatch, environment, cwd or background execution, and does not wait on the model prompt queue. K8s callbacks
-require a CA-verified Runtime/Gateway certificate; checking its OU alone is
-insufficient. Local Runtime never exposes sandbox execution or callbacks.
-Runtime supplies the freshly authorized inline kubeconfig only to this trusted
-AgentBox endpoint. AgentBox validates it and writes a unique per-call snapshot,
-readable only by its owner and the existing setgid kubectl reader. The callback
-uses that snapshot instead of the shared credential cache and removes it in a
-`finally` block. A concurrent credential refresh or cluster-name rebind cannot
-substitute an older/different credential after authorization. This material is
-never included in the script request, SDK channel, audit or tool result.
-Cancellation propagates to the built-in
-tool and callback responses are bounded.
-
-All connector text, including logs and nested MCP text, passes through shared
-output redaction. Pattern-based redaction does not prove arbitrary diagnostic
-content contains no secret; reviewed MCP implementations and limited upstream
-credentials remain part of the trust boundary.
-
-## SDK diagnostic tools and concurrency
-
-Python and Shell use the same operation names and argument schemas:
-
-```python
-from siclaw import call, call_to_file
-print(call("node_exec", {"cluster": "prod", "node": "node-a", "command": "uname -r"})["text"])
-call_to_file("pod_exec", {"cluster": "prod", "namespace": "app", "pod": "api-1",
-                        "command": "cat /proc/meminfo"}, "/work/memory.json")
+result = call("bash", {"cluster": "prod", "command": "kubectl get nodes -o json"})
+for node in json.loads(result["text"])["items"]:
+    print(node["metadata"]["name"], node["status"]["nodeInfo"]["kernelVersion"])
 ```
 
 ```bash
+siclaw-tool bash '{"cluster":"prod","command":"kubectl logs api -n app --tail=100"}'
 siclaw-tool host_exec '{"host":"host-a","command":"uname -r"}'
-siclaw-tool --output /work/query.json mcp.call '{"server":"metrics","tool":"query","arguments":{}}'
 ```
 
-Declare exact registered resource names in `clusters`, `hosts` and `mcp` on
-`run_script`. Node diagnostics need `nodes: true`; Pod exec needs the explicit
-namespace. The three exec tools require the Agent's current `run_commands`
-capability as well as `run_sandbox`. Each call and result chunk rechecks current
-user, Agent and resource permissions. Host UUID selection is not part of the
-sandbox resource-name contract. MCP uses the shared Agent MCP factory, including
-cancellation and structured results, with the broker's reviewed tool/fixed-argument
-policy, HTTPS-only transport, no redirects and bounded response streams.
+The shell in the runner performs local orchestration. `siclaw-tool bash` invokes
+the remote Agent tool; it does not run kubectl inside the runner. Both languages
+have the same resource authorization, tool policies, limits and cancellation.
+Prefer direct Agent tools for simple diagnostics and scripts for aggregation.
+There is no package installation or direct production credential access.
 
-Prefer direct tools for simple queries. Use scripts for loops and aggregation;
-remote commands have a 1–15 second budget. Read-only command/flag validation and
-output redaction are shared with normal Agent tools. An additional SDK profile
-limits reads to diagnostics and fixed `/etc/os-release`/`/proc` files. The sandbox
-cannot supply images, credential paths, shell interpreters, background flags or
-execution environment. Capture truncation and oversized results fail instead of
-being reported as a complete file.
+## Tool budgets and diagnostic cleanup
 
-Each run permits one in-flight SDK operation, even if code starts concurrent
-threads/processes. Runtime permits at most **10** in-flight sandbox `node_exec`
-callbacks across runs. Excess callbacks fail promptly, with no unbounded queue.
-The configured runner concurrency remains a separate limit.
+Tool commands have a 1–15 second budget. Background execution is unavailable
+without background wiring, and node diagnostic images come from service
+configuration; these choices are represented in the existing tools' schemas.
+Each run permits one in-flight SDK operation, even with multiple child threads
+or processes. Runtime permits at most **10** in-flight sandbox `node_exec`
+callbacks across runs; excess calls fail promptly. Runner concurrency is
+configured independently.
 
-Node diagnostics use `siclaw-script-diagnostics` in the selected target cluster.
-The trusted tool creates only this dedicated, labeled namespace and its quota
-when missing. An existing unlabeled namespace, missing quota permissions,
-conflicting/scoped quota or quota above the hard ceiling causes refusal, never
-a fallback to the normal debug namespace. The quota uses `count/pods: 10` and
-`count/jobs.batch: 20`; it counts finished and terminating Pods too. Kubernetes
-admission enforces this across Runtime/AgentBox replicas and restarts. Operators
-can pre-provision a stricter quota. These limits cover sandbox node diagnostics;
-ordinary Agent node tools retain their existing namespace/lifecycle.
+Node diagnostics use `siclaw-script-diagnostics` in the target cluster. The
+trusted node tool creates only this labeled namespace and its quota when absent.
+An existing unlabeled namespace, conflicting/scoped quota, missing permissions
+or quota above the ceiling causes refusal. `count/pods: 10` and
+`count/jobs.batch: 20` include terminal/terminating objects and apply across
+Runtime/AgentBox replicas and restarts. Operators may provision a stricter quota.
+Ordinary direct node tools keep their existing namespace/lifecycle.
 
-Each call owns a separate diagnostic cache entry and deletes its Job with
-foreground propagation before disposing its credential snapshot. Success is
-reported only after normal cleanup. Cancellation/startup failure also attempts
-cleanup; failure is visible and must not be reported as success. Job
-`activeDeadlineSeconds: 120`, no retries, and a 60-second finished TTL bound
-orphans after process loss. If the control plane or GC is unavailable, the quota
-still prevents unbounded accumulation; it may block new diagnostics until cleanup
-recovers. Node callback budgets include startup and cleanup (90 seconds); the
-outer run deadline can cancel them earlier. E2B/Portal ingress adds transport grace
-without extending the run grant. Native Pod testing and E2B cloud validation are
-separate requirements.
+Every callback owns its diagnostic cache entry, with foreground Job cleanup
+before credential disposal. Normal success requires confirmed cleanup; startup
+failure and cancellation also clean up. Jobs have no retries, an active deadline
+of 120 seconds and finished TTL of 60 seconds. Admission quota prevents unbounded
+accumulation if control-plane cleanup is unavailable. The node callback budget
+includes startup/cleanup (90 seconds); outer script deadlines may cancel earlier.
+External ingress adds transport grace without extending the run's grant.
+
+Read-only means the existing tools' diagnostic command policies. Node diagnostics
+create and delete Kubernetes infrastructure; scripts can create/delete their own
+work files. Diagnostics can produce audit records and retrieve sensitive output.
+Shared output redaction is not a proof that arbitrary service data contains no
+secret. Tool implementations, host binaries, configured images and reviewed MCP
+services are trusted parts of the execution boundary.
 
 ## Large results and work files
 
@@ -431,65 +373,32 @@ Example tool request:
 ```json
 {
   "language": "python",
-  "code": "from siclaw import call\nfor ns in ('team-a', 'team-b'):\n    args = {'cluster': 'prod', 'namespace': ns}\n    while True:\n        page = call('k8s.list_pods', args)\n        print(ns, page['pods'])\n        if not page['continue']: break\n        args['continue'] = page['continue']",
-  "clusters": [{"name": "prod", "namespaces": ["team-a", "team-b"]}],
+  "code": "import json\nfrom siclaw import call\nresult = call(\"bash\", {\"cluster\": \"prod\", \"command\": \"kubectl get nodes -o json\"})\nfor node in json.loads(result[\"text\"])[\"items\"]:\n    print(node[\"metadata\"][\"name\"], node[\"status\"][\"nodeInfo\"][\"kernelVersion\"])",
+  "clusters": [
+    {
+      "name": "prod"
+    }
+  ],
   "network_isolation": true,
   "timeout_seconds": 30
 }
 ```
 
-Python uses `from siclaw import call, input_data`; Bash uses
+Python uses `from siclaw import call, call_to_file, input_data`; Bash uses
 `siclaw-tool TOOL '{"argument":"value"}'` and reads `$SICLAW_INPUT_FILE`.
-The SDK serializes cross-process calls using a file lock and paired pipes.
-Broker calls are serial and bounded. Scripts can combine/filter results locally.
+The SDK serializes cross-process calls through a file lock and paired pipes.
+Bash/exec results have a `text` field. With `kubectl -o json`, parse that field
+as JSON. File delivery saves the same result envelope, not a different API.
 
-The `run_script` tool description supplies the Python/Shell SDK contract, the
-supported operations, node field names and pagination rules to the model.
-A sandbox-only Agent has no general resource-discovery or direct MCP tool set.
-Use exact bound resource names from the user or existing conversation context;
-ask for missing names instead of guessing or inspecting credential files. MCP
-tool arguments must also be known from reviewed tool documentation; this version
-does not dynamically publish MCP schemas into the sandbox tool description.
+The `run_script` description gives the model the SDK contract and points it to
+the existing tools' command rules. Use exact bound resource names from the user
+or available context. Scripts cannot discover credentials or select arbitrary
+connection URLs. MCP operation arguments must be known from the bound tool's
+documentation; this version does not dynamically publish its schemas through SDK.
 
-For example: "Use the script sandbox to list every node in `my-cluster`, follow
-all pages, and return a table of node name, kubelet version and allocatable CPU.
-Report any incomplete result." The model chooses Python or Bash and declares
-the resource scope; neither the end user nor the model supplies a kubeconfig,
-callback token or SDK connection URL.
-
-For cluster-wide node summaries, declare `clusters: [{"name": "prod", "nodes": true}]`
-and use the fixed node operation. This example follows every page, then emits
-one row per node:
-
-```python
-from siclaw import call
-
-nodes = []
-arguments = {"cluster": "prod"}
-while True:
-    page = call("k8s.list_nodes", arguments)
-    nodes.extend(page["nodes"])
-    if not page["continue"]:
-        break
-    arguments["continue"] = page["continue"]
-for node in sorted(nodes, key=lambda n: n["name"]):
-    print(node["name"], node["kubelet_version"], node["ready"], node["capacity"].get("cpu", "unknown"))
-```
-
-For host checks, install `docker/script-sandbox/siclaw-inspect` as root-owned
-mode 0755 at `/usr/local/libexec/siclaw-inspect`, use a dedicated unprivileged
-SSH account, and restrict its key:
-
-```text
-restrict,command="/usr/local/libexec/siclaw-inspect" ssh-ed25519 PUBLIC_KEY
-```
-
-Do not grant sudo, port forwarding or arbitrary remote shell to that key. The
-broker also verifies the operator-pinned SHA256 host key. Direct hosts with
-explicit credentials are supported initially; managed bastion credential
-discovery and jump chains are rejected on this path. Missing helpers/pins fail
-closed. Additional config checks require adding fixed, non-secret paths to the
-root-owned helper and updating the broker allowlist together.
+For example: "Use the script sandbox and the built-in Bash tool to list every
+node in my-cluster and aggregate node name, kernel version and allocatable CPU.
+Save raw tool results locally, print the final table and report incomplete data."
 
 ## Validation
 

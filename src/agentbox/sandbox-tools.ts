@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { Value } from "@sinclair/typebox/value";
+import type { TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { SandboxBuiltinApproval } from "../shared/sandbox-tool-types.js";
 import { CredentialBroker, resolveGroupGid } from "./credential-broker.js";
@@ -14,18 +16,20 @@ import { debugPodCache } from "../tools/infra/debug-pod.js";
 import { withSandboxKubeconfig } from "./sandbox-kubeconfig.js";
 import { SCRIPT_FILE_RESULT_BYTES } from "../script-sandbox/result-transfer.js";
 import { record } from "../script-sandbox/validation.js";
-import type { validateSandboxBuiltin } from "../tools/infra/sandbox-tool-policy.js";
-
-type Request = ReturnType<typeof validateSandboxBuiltin>;
+import type { SandboxBuiltinRequest } from "../script-sandbox/tool-dispatch.js";
 
 /** Run the SAME tool factories used by the Agent, against an immutable,
  * freshly authorized credential snapshot. No fallback to its ambient broker.
  */
-export async function executeSandboxBuiltin(request: Request, approval: SandboxBuiltinApproval,
+export async function executeSandboxBuiltin(request: SandboxBuiltinRequest, approval: SandboxBuiltinApproval,
   credentialsDir: string | undefined, signal: AbortSignal): Promise<unknown> {
   if (!credentialsDir || approval.tool !== request.tool) throw new Error("Invalid sandbox approval");
   signal.throwIfAborted();
   const execute = async (tool: ToolDefinition) => {
+    // The same schema advertised by the built-in, including which optional
+    // execution features are available. Do not maintain a second SDK schema.
+    const parameters = tool.parameters as unknown as TSchema;
+    if (!Value.Check({ ...parameters, additionalProperties: false }, request.arguments)) throw new Error("Invalid built-in tool arguments");
     const output = await tool.execute(`sandbox-${randomUUID()}`, request.arguments, signal, undefined, {} as Parameters<typeof tool.execute>[4]);
     const details = output.details as { blocked?: boolean; error?: unknown; truncated?: boolean } | undefined;
     if (details?.blocked || details?.error || details?.truncated) throw new Error("Sandbox tool failed");

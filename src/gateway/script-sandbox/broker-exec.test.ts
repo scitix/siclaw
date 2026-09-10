@@ -5,7 +5,7 @@ import type { SandboxBuiltinExecutor } from "./broker.js";
 
 const kubeconfig = JSON.stringify({ "current-context": "c", contexts: [{ name: "c", context: { cluster: "c", user: "u" } }],
   clusters: [{ name: "c", cluster: { server: "https://example.test" } }], users: [{ name: "u", user: { token: "private-token" } }] });
-const scope = { language: "python" as const, code: "pass", hosts: ["host-a"], clusters: [{ name: "prod", nodes: true, namespaces: ["app"] }] };
+const scope = { language: "python" as const, code: "pass", hosts: ["host-a"], clusters: [{ name: "prod" }] };
 const p = () => ({ agentId: "a", sessionId: "s", boxId: "b", userId: "u", callbackToken: "private-grant" });
 const nodeCall = { id: "1", tool: "node_exec", arguments: { cluster: "prod", node: "node-a", command: "uname -r" } };
 const credential = { name: "prod", type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kubeconfig }] };

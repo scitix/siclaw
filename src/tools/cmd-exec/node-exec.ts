@@ -183,7 +183,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         description:
           'Diagnostic command to run on the node (e.g. "ip addr show", "nvidia-smi")',
       }),
-      pod: Type.Optional(
+      ...(!trustedOptions?.sandboxDiagnostics ? { pod: Type.Optional(
         Type.String({
           description: "Target pod name. When set, the command runs inside THIS POD's network namespace using host tools (one step — the node + netns are resolved automatically). Use for RDMA/RoCE checks on a pod that lacks the tools (show_gids, ib_write_bw…).",
         }),
@@ -198,17 +198,17 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         Type.String({
           description: 'Advanced: a pre-resolved network namespace name + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
         }),
-      ),
+      ) } : {}),
       cluster: Type.Optional(
         Type.String({
           description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         })
       ),
-      image: Type.Optional(
+      ...(!trustedOptions?.sandboxDiagnostics ? { image: Type.Optional(
         Type.String({
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
         })
-      ),
+      ) } : {}),
       json_path: Type.Optional(
         Type.String({
           description:
@@ -248,6 +248,11 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
+      if (trustedOptions?.sandboxDiagnostics && [params.image, params.pod, params.namespace, params.container, params.netns].some(v => v !== undefined)) {
+        // Pod/netns discovery owns a separate debug-pod lifecycle. This managed
+        // invocation must stay on its explicit node and quota-controlled Job.
+        return { content: [{ type: "text", text: "Managed node diagnostics require an explicit node and service-selected image." }], details: { blocked: true } };
+      }
 
       // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
       // would answer with a kubeconfig error and hide the actual mistake.

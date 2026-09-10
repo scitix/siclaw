@@ -1473,8 +1473,8 @@ describe("validateKubectlInPipeline — sensitive resources rely on sanitization
     expect(validateKubectlInPipeline(["kubectl --namespace kube-system get deploy -o wide"])).toBeNull();
   });
 
-  it("allows kubectl --context prod -n monitoring get svc", () => {
-    expect(validateKubectlInPipeline(["kubectl --context prod -n monitoring get svc"])).toBeNull();
+  it("requires the tool's cluster parameter instead of a context override", () => {
+    expect(validateKubectlInPipeline(["kubectl --context prod -n monitoring get svc"])).toContain("overrides");
   });
 });
 
@@ -1807,10 +1807,9 @@ describe("the subcommand and the rollout verb come from one reader", () => {
     expect(check("kubectl rollout history deployment/foo")).toBeNull();
   });
 
-  it("leaves ordinary namespaced and impersonated reads alone", () => {
+  it("leaves ordinary namespaced reads and request budgets alone", () => {
     for (const cmd of ["kubectl get pods", "kubectl -n kube-system get pods",
-                       "kubectl --as user get pods", "kubectl --request-timeout 30s get pods",
-                       "kubectl --context prod -n x get pods -o json"]) {
+                       "kubectl --request-timeout 30s get pods", "kubectl -n x get pods -o json"]) {
       expect(check(cmd), cmd).toBeNull();
     }
   });

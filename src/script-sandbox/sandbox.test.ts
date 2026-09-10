@@ -29,21 +29,20 @@ describe("script contract", () => {
   it.each(["credentials", "userId", "sessionId", "image", "url", "env", "kubeconfig"])("rejects authority injection: %s", key => {
     expect(() => validateScriptRequest({ ...request, [key]: "injected" })).toThrow();
   });
-  it("requires explicit namespaces and distinct resources", () => {
+  it("rejects unsupported scope fields and duplicate resources", () => {
     expect(() => validateScriptRequest({ ...request, clusters: [{ name: "prod", namespaces: [] }] })).toThrow();
     expect(() => validateScriptRequest({ ...request, hosts: ["host", "host"] })).toThrow();
     expect(() => validateScriptRequest({ ...request, code: "a".repeat(131073) })).toThrow();
     expect(() => validateScriptRequest({ ...request, clusters: [{ name: "prod", namespaces: ["../secrets"] }] })).toThrow();
   });
-  it("requires explicit node scope without implicitly granting namespaces", () => {
-    const nodeRequest = { ...request, clusters: [{ name: "prod", nodes: true }] };
-    expect(validateScriptRequest(nodeRequest)).toEqual(nodeRequest);
-    expect(validateScriptRequest({ ...request, clusters: [{ name: "prod", nodes: true, namespaces: ["team"] }] }).clusters).toHaveLength(1);
-    for (const cluster of [{ name: "prod" }, { name: "prod", nodes: false }, { name: "prod", nodes: "true" },
-      { name: "prod", nodes: true, namespaces: [] }, { name: "prod", nodes: true, resources: ["secrets"] }]) {
+  it("declares whole bound clusters and rejects legacy scopes rather than silently broadening them", () => {
+    const scoped = { ...request, clusters: [{ name: "prod" }] };
+    expect(validateScriptRequest(scoped)).toEqual(scoped);
+    for (const cluster of [{ name: "prod", nodes: true }, { name: "prod", namespaces: ["team"] },
+      { name: "prod", resources: ["pods"] }]) {
       expect(() => validateScriptRequest({ ...request, clusters: [cluster] })).toThrow();
     }
-    expect(() => validateScriptRequest({ ...request, clusters: [{ name: "prod", nodes: true }, { name: "prod", namespaces: ["team"] }] })).toThrow();
+    expect(() => validateScriptRequest({ ...request, clusters: [{ name: "prod" }, { name: "prod" }] })).toThrow();
   });
   it("frames split UTF-8 and rejects oversized/incomplete protocol", () => {
     const parser = new ScriptFrameParser(); const raw = Buffer.from('{"text":"测试"}\n');

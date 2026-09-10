@@ -29,11 +29,8 @@ export function validateScriptRequest(value: unknown): ScriptRequest {
   if (value.clusters !== undefined) {
     const entries = value.clusters;
     if (!Array.isArray(entries) || entries.length > 32 || entries.some(e => !record(e) ||
-      Object.keys(e).some(k => !["name", "namespaces", "nodes"].includes(k)) || !identifier(e.name) ||
-      (e.nodes !== undefined && typeof e.nodes !== "boolean") ||
-      (e.namespaces !== undefined && (!strings(e.namespaces) || e.namespaces.length === 0)) ||
-      (e.namespaces === undefined && e.nodes !== true))) {
-      throw new ScriptSandboxError("Invalid clusters scope; provide registered names and explicit namespaces or nodes: true");
+      Object.keys(e).some(k => k !== "name") || !identifier(e.name))) {
+      throw new ScriptSandboxError("Invalid clusters scope; provide registered names only. Namespace and resource permissions are enforced by the built-in tools and the cluster credential's RBAC.");
     }
     if (new Set(entries.map(e => e.name)).size !== entries.length) throw new ScriptSandboxError("Duplicate clusters scope");
   }

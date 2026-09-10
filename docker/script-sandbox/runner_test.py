@@ -55,7 +55,7 @@ from siclaw import call, input_data
 assert "FAKE_PRODUCTION_SECRET" not in os.environ
 assert input_data() == {"count": 2}
 for _ in range(2):
-    print(call("k8s.list_pods", {"cluster": "c", "namespace": "ns"}))
+    print(call("bash", {"cluster": "c", "command": "kubectl get pods -n ns"}))
 ''', input_data={"count": 2})
         self.assertEqual(len(calls), 2)
         self.assertIn("one", out)

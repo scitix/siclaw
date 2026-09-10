@@ -3,10 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ create: vi.fn(), evict: vi.fn() }));
-vi.mock("../tools/cmd-exec/restricted-bash.js", () => ({ createRestrictedBashTool: (...args: unknown[]) => state.create("bash", ...args) }));
-vi.mock("../tools/cmd-exec/host-exec.js", () => ({ createHostExecTool: (...args: unknown[]) => state.create("host_exec", ...args) }));
-vi.mock("../tools/cmd-exec/node-exec.js", () => ({ createNodeExecTool: (...args: unknown[]) => state.create("node_exec", ...args) }));
-vi.mock("../tools/cmd-exec/pod-exec.js", () => ({ createPodExecTool: (...args: unknown[]) => state.create("pod_exec", ...args) }));
+const fixture = await vi.hoisted(async () => {
+  const { Type } = await import("@sinclair/typebox");
+  const parameters = Type.Object({ command: Type.String(), timeout_seconds: Type.Number(),
+    cluster: Type.Optional(Type.String()), host: Type.Optional(Type.String()), node: Type.Optional(Type.String()),
+    namespace: Type.Optional(Type.String()), pod: Type.Optional(Type.String()) });
+  return (name: string, ...args: unknown[]) => ({ parameters, ...state.create(name, ...args) });
+});
+vi.mock("../tools/cmd-exec/restricted-bash.js", () => ({ createRestrictedBashTool: (...args: unknown[]) => fixture("bash", ...args) }));
+vi.mock("../tools/cmd-exec/host-exec.js", () => ({ createHostExecTool: (...args: unknown[]) => fixture("host_exec", ...args) }));
+vi.mock("../tools/cmd-exec/node-exec.js", () => ({ createNodeExecTool: (...args: unknown[]) => fixture("node_exec", ...args) }));
+vi.mock("../tools/cmd-exec/pod-exec.js", () => ({ createPodExecTool: (...args: unknown[]) => fixture("pod_exec", ...args) }));
 vi.mock("../tools/infra/debug-pod.js", () => ({ debugPodCache: { evictFor: state.evict } }));
 import { executeSandboxBuiltin } from "./sandbox-tools.js";
 import type { SandboxBuiltinApproval } from "../shared/sandbox-tool-types.js";

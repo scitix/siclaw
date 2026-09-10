@@ -4,7 +4,7 @@ import { loadScriptSandboxConfig } from "../../script-sandbox/config.js";
 
 const kubeconfig = JSON.stringify({ "current-context": "c", contexts: [{ name: "c", context: { cluster: "c", user: "u" } }],
   clusters: [{ name: "c", cluster: { server: "https://example.test" } }], users: [{ name: "u", user: { token: "private-token" } }] });
-const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod", nodes: true }] };
+const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod" }] };
 const p = () => ({ agentId: "a", sessionId: "s", boxId: "b", userId: "u", callbackToken: "private-callback-token" });
 const call = { id: "1", tool: "bash", arguments: { cluster: "prod", command: "kubectl get nodes" } };
 it("binds each trusted Bash callback to freshly authorized credentials and omits grants from audit", async () => {
@@ -26,8 +26,5 @@ it("binds each trusted Bash callback to freshly authorized credentials and omits
     capabilities = ["run_scripts"];
     await expect(broker.call(p(), scope, call, new AbortController().signal)).rejects.toThrow();
     expect(builtin).toHaveBeenCalledOnce();
-    const calls = rpc.request.mock.calls.length;
-    await expect(broker.call(p(), scope, { ...call, arguments: { ...call.arguments, command: "kubectl delete node x" } }, new AbortController().signal)).rejects.toThrow();
-    expect(rpc.request.mock.calls.length).toBe(calls);
   } finally { log.mockRestore(); }
 });

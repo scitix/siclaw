@@ -4,15 +4,15 @@ import { loadScriptSandboxConfig } from "../../script-sandbox/config.js";
 import { scriptJob, validateRunnerPod } from "./k8s-provider.js";
 import { dockerScriptArgs } from "./docker-provider.js";
 import https from "node:https";
-import { EventEmitter } from "node:events";
 
 const config = () => loadScriptSandboxConfig({ SICLAW_SCRIPT_SANDBOX_IMAGE: "runner:latest" });
-const p = () => ({ agentId: "a", userId: "u", sessionId: "s", boxId: "b" });
-const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod", namespaces: ["allowed"] }], hosts: ["node"], mcp: [{ server: "metrics", tools: ["query"] }] };
+const p = () => ({ agentId: "a", userId: "u", sessionId: "s", boxId: "b", callbackToken: "private-grant" });
+const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod" }], hosts: ["node"], mcp: [{ server: "metrics", tools: ["query"] }] };
 describe("script connectors", () => {
   it.each([
     ["ssh", { command: "rm -rf /" }], ["k8s.delete_pod", { cluster: "prod" }],
-    ["k8s.list_pods", { cluster: "prod", namespace: "other" }],
+    ["k8s.list_nodes", { cluster: "prod" }],
+    ["k8s.list_pods", { cluster: "prod", namespace: "allowed" }],
     ["k8s.pod_logs", { cluster: "prod", namespace: "allowed", command: "rm" }],
     ["host.inspect", { host: "node", check: "os", command: "rm" }],
     ["mcp.call", { server: "metrics", tool: "query", arguments: {} }],
@@ -46,40 +46,33 @@ describe("script connectors", () => {
     let live = true;
     const request = vi.spyOn(https, "request");
     try {
-      const broker = new ReadOnlyScriptBroker(rpc, config(), undefined, () => {
+      const builtin = vi.fn();
+      const broker = new ReadOnlyScriptBroker(rpc, config(), builtin, () => {
         if (!live) throw new Error("Caller is no longer active");
       });
-      const call = broker.call(p(), scope, { id: "i", tool: "k8s.list_pods", arguments: { cluster: "prod", namespace: "allowed" } }, new AbortController().signal);
+      const call = broker.call(p(), scope, { id: "i", tool: "bash", arguments: { cluster: "prod", command: "kubectl get pods -n allowed -o json" } }, new AbortController().signal);
       await resolving;
       live = false;
       release({ user_id: "u", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kube({ token: "t" }) }] } });
       await expect(call).rejects.toThrow("Caller is no longer active");
       expect(request).not.toHaveBeenCalled();
+      expect(builtin).not.toHaveBeenCalled();
     } finally { request.mockRestore(); }
   });
 
-  it("executes only fixed GET operations and reauthorizes each read", async () => {
-    const sent: Array<{ path: string; method: string }> = [];
-    const request = vi.spyOn(https, "request").mockImplementation(((url: URL, options: https.RequestOptions, callback: (res: any) => void) => {
-      sent.push({ path: url.pathname, method: options.method! });
-      const req = new EventEmitter() as any;
-      req.end = () => {
-        const res = new EventEmitter() as any; res.statusCode = 200; callback(res);
-        res.emit("data", Buffer.from(JSON.stringify({ items: [{ metadata: { name: "p", namespace: "allowed" }, spec: { nodeName: "node", containers: [{ env: [{ value: "secret" }] }] }, status: { phase: "Running" } }] })));
-        res.emit("end");
-      };
-      return req;
-    }) as any);
+  it("routes every cluster query to the built-in without opening a Kubernetes connection", async () => {
+    const request = vi.spyOn(https, "request");
+    const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent" ? { status: "active" } :
+      { user_id: "u", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kube({ token: "private-token" }) }] } }) };
+    const builtin = vi.fn(async () => ({ text: "rows" }));
     try {
-      const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent" ? { status: "active" } :
-        { user_id: "u", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kube({ token: "private-token" }) }] } }) };
-      const b = new ReadOnlyScriptBroker(rpc, config());
-      for (let i = 0; i < 2; i++) {
-        const result = await b.call(p(), scope, { id: String(i), tool: "k8s.list_pods", arguments: { cluster: "prod", namespace: "allowed" } }, new AbortController().signal);
-        expect(JSON.stringify(result)).not.toMatch(/secret|private-token|containers/);
-        expect(result).toMatchObject({ pods: [{ name: "p", phase: "Running" }] });
+      const b = new ReadOnlyScriptBroker(rpc, config(), builtin);
+      for (const command of ["kubectl get deployments -n allowed -o json", "kubectl logs api -n allowed --tail=100 | grep ERROR"]) {
+        const result = await b.call(p(), scope, { id: command, tool: "bash", arguments: { cluster: "prod", command } }, new AbortController().signal);
+        expect(result).toEqual({ text: "rows" });
+        expect(builtin).toHaveBeenLastCalledWith(expect.anything(), { cluster: "prod", command }, expect.anything(), expect.objectContaining({ tool: "bash" }));
       }
-      expect(sent).toEqual(Array(2).fill({ path: "/api/v1/namespaces/allowed/pods", method: "GET" }));
+      expect(request).not.toHaveBeenCalled();
       expect(rpc.request.mock.calls.filter(c => c[0] === "sandbox.resolve")).toHaveLength(2);
     } finally { request.mockRestore(); }
   });

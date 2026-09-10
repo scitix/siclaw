@@ -20,7 +20,7 @@ describe("model-visible script tool", () => {
     const [tool] = registry().resolve({ mode: "web", refs: refs({ scriptExecutor: executor }), allowedTools: ["run_script"] });
     expect(tool.name).toBe("run_script");
     expect(tool.description).toContain("from siclaw import call"); expect(tool.description).toContain("siclaw-tool");
-    const request = { language, code: language === "python" ? 'from siclaw import call\nprint(call("k8s.list_nodes", {"cluster":"test"}))' : 'siclaw-tool k8s.list_nodes \'{"cluster":"test"}\'', clusters: [{ name: "test", nodes: true }] };
+    const request = { language, code: language === "python" ? 'from siclaw import call\nprint(call("bash", {"cluster":"test","command":"kubectl get nodes -o json"}))' : 'siclaw-tool bash \'{"cluster":"test","command":"kubectl get nodes -o json"}\'', clusters: [{ name: "test" }] };
     const signal = new AbortController().signal;
     const response = await tool.execute("call", request, signal);
     expect(executor).toHaveBeenCalledWith(request, "s", signal);

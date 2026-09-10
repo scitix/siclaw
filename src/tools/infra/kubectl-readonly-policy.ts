@@ -14,7 +14,7 @@ import {
   getCommandBinary,
   parseArgs,
 } from "./command-sets.js";
-import { kubectlSubcommand } from "./kubectl-sanitize.js";
+import { kubectlSubcommand, kubectlConnectionOverride } from "./kubectl-sanitize.js";
 
 /** The path given to `--raw`, or undefined when the flag is absent. */
 function rawPassthroughPath(args: string[]): string | undefined {
@@ -91,6 +91,11 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     // Extract the kubectl arguments from the command string
     const stripped = cmd.trim().replace(/^\S+\s+/, ""); // remove "kubectl" prefix
     const args = parseArgs(stripped);
+    const override = kubectlConnectionOverride(args);
+    if (override) {
+      return JSON.stringify({ error: `kubectl ${override} is not allowed: connection and identity overrides are not supported.`,
+        hint: "Select the bound cluster with the tool's cluster parameter." }, null, 2);
+    }
     // ONE reader, with the shared flag-arity table. A local copy of the value-flag list is how
     // `kubectl --as get delete pod victim` got through: `--as` was missing from it, so `get` was taken
     // as the subcommand and the mutating `delete` was never examined. The table lives with the
@@ -145,17 +150,6 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       return JSON.stringify({
         error: `kubectl subcommand "${subcommand || "(empty)"}" is not allowed in read-only mode.`,
         allowed: [...SAFE_SUBCOMMANDS],
-      }, null, 2);
-    }
-
-    // The inline --kubeconfig flag is removed — selecting a cluster is done via the
-    // tool's `cluster` parameter (whole-command KUBECONFIG injection). This also
-    // closes the file-path-in-flag footgun. To query a different cluster, make a
-    // separate bash call with that `cluster`.
-    if (args.some((a) => a === "--kubeconfig" || a.startsWith("--kubeconfig="))) {
-      return JSON.stringify({
-        error: "The --kubeconfig flag is not supported.",
-        hint: "Set the `cluster` parameter to the target cluster's name (from cluster_list) instead. For multiple clusters, make a separate bash call per cluster.",
       }, null, 2);
     }
 
@@ -219,6 +213,10 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
 
     // Block "kubectl config view --raw" — leaks full kubeconfig with certs/tokens
     if (subcommand === "config") {
+      const verb = kubectlSubcommand(args.slice(args.indexOf("config") + 1));
+      if (!verb || !["view", "current-context", "get-contexts", "get-clusters", "get-users"].includes(verb)) {
+        return JSON.stringify({ error: "Only read-only kubectl config subcommands are allowed." }, null, 2);
+      }
       const configSub = args.filter((a) => !a.startsWith("-"));
       const hasView = configSub.includes("view");
       // `--raw` is a BOOLEAN flag, so kubectl accepts `--raw`, `--raw=true` and `--raw=1` alike — an

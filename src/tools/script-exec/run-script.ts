@@ -10,24 +10,19 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
       "Python: from siclaw import call, call_to_file, input_data; Shell: siclaw-tool TOOL JSON. " +
       "Large results: call_to_file(TOOL, ARGS, '/work/result.json') or siclaw-tool --output /work/result.json TOOL JSON saves complete sanitized JSON and returns only path/bytes/checksum. " +
       "Inline results are capped at 128 KiB; file results at 4 MiB each and 16 MiB per run. Read/process files inside the same run and print only the final summary; files disappear afterward. " +
-      "Controlled operations: bash {cluster,command,timeout_seconds?} (single scoped kubectl get nodes/pods; table, wide, name, or approved custom-columns), k8s.list_pods {cluster,namespace,continue?} returns up to 10 pod summaries per page; k8s.pod_logs {cluster,namespace,pod,container?,tail_lines?}; " +
-      "k8s.list_nodes {cluster,continue?} requires clusters[].nodes=true and returns up to 10 node summaries. For both list operations, pass the returned continue token on subsequent calls until null; report incomplete inventories on any failure or budget limit. " +
-      "host_exec {host,command,timeout_seconds?}, node_exec {cluster,node,command,timeout_seconds?}, pod_exec {cluster,namespace,pod,container?,command,timeout_seconds?} reuse the Agent's built-in tools. " +
-      "Diagnostic commands only: uname, free, lscpu, ip show, ss, sysctl reads, nvidia-smi queries, or cat of /etc/os-release and approved /proc diagnostic files. No remote scripts/interpreters, arbitrary file reads, network clients, pipelines, background mode or credential/image overrides. Exec requires run_commands; timeouts are 1-15 seconds. " +
-      "node_exec requires clusters[].nodes=true and creates a short-lived managed diagnostic Job: at most 10 concurrent node callbacks per Runtime and 10 diagnostic Pods per target cluster, with cleanup and deadline/TTL backstops. pod_exec needs timeout in the target container. " +
-      "host.inspect {host,check:os|memory|sysctl} is a host_exec alias; mcp.call {server,tool,arguments} uses the shared Agent MCP implementation with operator-reviewed tool/argument policy. Declare each resource in the run scope. " +
+      "SDK operations call the Agent's existing tools with their normal command policies: bash {cluster,command,timeout_seconds?}, host_exec {host,command,timeout_seconds?}, node_exec {cluster,node,command,timeout_seconds?}, pod_exec {cluster,namespace?,pod,container?,command,timeout_seconds?}. " +
+      "Use bash for all Kubernetes queries, for example kubectl get nodes -o json, kubectl describe pod NAME -n NAMESPACE, or kubectl logs NAME -n NAMESPACE --tail=100. Follow the existing tool's whitelist, rate limits and output sanitization; there is no separate sandbox Kubernetes API or command whitelist. " +
+      "These tools require run_commands and an explicit declared cluster or host. Tool timeouts are 1-15 seconds; background execution and image/credential overrides are unavailable. node_exec needs an explicit node and creates a managed diagnostic Job: at most 10 concurrent node callbacks per Runtime and 10 diagnostic Pods per target cluster. pod_exec needs timeout in the target container. " +
+      "mcp.call {server,tool,arguments} uses the shared Agent MCP implementation with service-authorized tools and resource arguments. Declare each resource in the run scope. " +
       "Use exact bound resource names supplied by the user or available context; if discovery tools are unavailable, ask for missing names. Do not guess names or read credential files. " +
-      "Node fields: name, ready, unschedulable, kubelet_version, kernel_version, os_image, architecture, container_runtime, capacity, allocatable. " +
-      "Access is reauthorized for every call and result chunk. Always follow resource pagination even with file delivery; log reads are bounded windows, not complete history. Never embed secrets in code/input. Network isolation defaults off unless configured or required by the administrator; " +
+      "Built-in command results use a text field. For kubectl -o json, parse that text as JSON; call_to_file saves the same result envelope. File delivery does not bypass the tool's limits: logs are bounded windows and truncated/failed queries are not complete inventories. " +
+      "Access is reauthorized for every call and result chunk. Cluster declarations name bound resources; namespace/resource permissions remain with the existing tools and the credential's Kubernetes RBAC. Never embed secrets in code/input. Network isolation defaults off unless configured or required by the administrator; " +
       "when on, socket creation is denied, including SSH/HTTP from subprocesses. Controlled tools work over pipes in both modes.",
     parameters: Type.Object({
       language: Type.Union([Type.Literal("python"), Type.Literal("shell")]), code: Type.String({ maxLength: 131072 }),
       input: Type.Optional(Type.Unknown()), network_isolation: Type.Optional(Type.Boolean()),
       timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
-      clusters: Type.Optional(Type.Array(Type.Object({ name: Type.String(),
-        namespaces: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
-        nodes: Type.Optional(Type.Boolean({ description: "Explicitly permit node summaries and bounded node_exec diagnostics; each operation still requires current authorization and its Kubernetes RBAC." })),
-      }, { additionalProperties: false }))),
+      clusters: Type.Optional(Type.Array(Type.Object({ name: Type.String() }, { additionalProperties: false }))),
       hosts: Type.Optional(Type.Array(Type.String())),
       mcp: Type.Optional(Type.Array(Type.Object({ server: Type.String(), tools: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false }))),
     }, { additionalProperties: false }),

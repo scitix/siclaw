@@ -9,7 +9,7 @@ import type { ScriptToolBinding, ScriptChannel } from "../../script-sandbox/type
 
 const principal = { runId: "run-1", agentId: "agent-1", sessionId: "session-1", userId: "user-1", boxId: "box-1", callbackToken: "private-agentbox-token" };
 const endpoint = "https://portal.example" + SANDBOX_TOOL_PATH;
-const call = { id: "call-1", tool: "k8s.list_nodes", arguments: { cluster: "test" } };
+const call = { id: "call-1", tool: "bash", arguments: { cluster: "test", command: "kubectl get nodes -o json" } };
 function setup() {
   const request = vi.fn(async () => ({ endpoint }));
   const controller = new AbortController();
@@ -68,10 +68,10 @@ describe("external run grants", () => {
     let runId = "";
     const bind = c.bindTools!; c.bindTools = async binding => { runId = binding.principal.runId!; await bind(binding); };
     const config = loadScriptSandboxConfig({ SICLAW_SCRIPT_SANDBOX_ENABLED: "true", SICLAW_SCRIPT_SANDBOX_IMAGE: "image", SICLAW_SCRIPT_SANDBOX_MAX_TOOL_CALLS: "1" });
-    const result = await new ScriptSandboxService(config, { start: async () => c }, broker).run({ language: "python", code: "pass", clusters: [{ name: "test", nodes: true }] }, principal);
+    const result = await new ScriptSandboxService(config, { start: async () => c }, broker).run({ language: "python", code: "pass", clusters: [{ name: "test" }] }, principal);
     await assertions;
     expect(result.status).toBe("failed");
     expect(broker.call).toHaveBeenCalledOnce();
-    expect(broker.call.mock.calls[0][1]).toMatchObject({ clusters: [{ name: "test", nodes: true }] });
+    expect(broker.call.mock.calls[0][1]).toMatchObject({ clusters: [{ name: "test" }] });
   });
 });

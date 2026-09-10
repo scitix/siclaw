@@ -5,16 +5,15 @@ import type { ScriptToolCall } from "../../script-sandbox/types.js";
 
 const config = () => ({ ...loadScriptSandboxConfig({ SICLAW_SCRIPT_SANDBOX_IMAGE: "fixture" }),
   mcpPolicy: { metrics: { query: { fixedArguments: { tenant: "fixture" } } } } });
-const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod", nodes: true }],
+const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod" }],
   hosts: ["node"], mcp: [{ server: "metrics", tools: ["query"] }] };
 const principal = () => ({ agentId: "a", userId: "u", sessionId: "s", boxId: "b" });
 const signal = () => new AbortController().signal;
 afterEach(() => vi.unstubAllGlobals());
 
 it.each([
-  ["k8s.list_nodes", { cluster: "prod" }, "cluster", "prod"],
   ["bash", { cluster: "prod", command: "kubectl get nodes" }, "cluster", "prod"],
-  ["host.inspect", { host: "node", check: "os" }, "host", "node"],
+  ["host_exec", { host: "node", command: "uname" }, "host", "node"],
   ["mcp.call", { server: "metrics", tool: "query", arguments: {} }, "mcp", "metrics"],
 ])("reauthorizes %s's original resource and rejects revocation or identity changes", async (tool, args, source, name) => {
   const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent" ? { status: "active" } : { user_id: "u" }) };

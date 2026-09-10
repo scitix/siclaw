@@ -45,7 +45,7 @@ describe("E2B service integration", () => {
         if (frame.type === "hello") emit({ type: "ready", version: 2 });
         else {
           token = frame.token;
-          const call = { id: "tool-1", tool: "k8s.list_nodes", arguments: { cluster: "test" } };
+          const call = { id: "tool-1", tool: "bash", arguments: { cluster: "test", command: "kubectl get nodes -o json" } };
           const response = await tools.call({ run_id: runId, token, call });
           emit({ type: "stdout", data: Buffer.from(JSON.stringify(response)).toString("base64") });
           emit({ type: "exit", code: 0 });
@@ -60,9 +60,9 @@ describe("E2B service integration", () => {
     const c = config();
     const provider = new ReadyScriptSandboxProvider(new E2bScriptSandboxProvider(c, tools, new E2bClient(c.e2b!, http)));
     const broker = { authorize: vi.fn(async () => {}), call: vi.fn(async () => ({ nodes: [{ name: "node-1" }] })) };
-    const result = await new ScriptSandboxService(c, provider, broker).run({ language: "python", code: "from siclaw import call", network_isolation: true, clusters: [{ name: "test", nodes: true }] }, principal);
+    const result = await new ScriptSandboxService(c, provider, broker).run({ language: "python", code: "from siclaw import call", network_isolation: true, clusters: [{ name: "test" }] }, principal);
     expect(result.status).toBe("completed"); expect(result.tool_calls).toBe(1); expect(result.stdout).toContain("node-1");
-    expect(broker.call.mock.calls[0][1]).toMatchObject({ clusters: [{ name: "test", nodes: true }] });
+    expect(broker.call.mock.calls[0][1]).toMatchObject({ clusters: [{ name: "test" }] });
     const create = JSON.parse(requests[0].init.body as string);
     expect(create).toMatchObject({ secure: true, network: { allowPublicTraffic: false }, templateID: "siclaw-runner-v1" });
     expect(create.envVars).toBeUndefined(); expect(create.mcp).toBeUndefined();

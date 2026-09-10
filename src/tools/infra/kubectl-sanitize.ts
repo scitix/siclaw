@@ -523,6 +523,36 @@ export function detectSensitiveResource(
  */
 const SHORT_FLAGS_WITH_VALUE = new Set(["o", "n", "l", "c", "s", "v", "L", "k", "f"]);
 
+const CONNECTION_OVERRIDE_FLAGS = new Set([
+  "--kubeconfig", "--server", "--context", "--cluster", "--user", "--username", "--password", "--token",
+  "--client-certificate", "--client-key", "--certificate-authority", "--insecure-skip-tls-verify",
+  "--tls-server-name", "--proxy-url", "--as", "--as-group", "--as-uid",
+]);
+
+/** Connection and identity are selected by the tool's credential binding.
+ * Reuse the same flag arities as the output/resource readers, including -AsURL.
+ */
+export function kubectlConnectionOverride(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const key = arg.split("=", 1)[0];
+      if (CONNECTION_OVERRIDE_FLAGS.has(key)) return key;
+      if (!arg.includes("=") && FLAGS_WITH_VALUE.has(key)) i++;
+    } else if (arg.startsWith("-")) {
+      for (let k = 1; k < arg.length; k++) {
+        if (arg[k] === "s") return "-s";
+        if (SHORT_FLAGS_WITH_VALUE.has(arg[k])) {
+          if (k === arg.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
  * Every output-format declaration in an argv, in the order kubectl sees them.
  *

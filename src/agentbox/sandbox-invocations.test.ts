@@ -1,7 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { SandboxInvocations } from "./sandbox-invocations.js";
 
-const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod", nodes: true }] };
+const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod" }] };
 const args = { id: "1", tool: "bash", arguments: { cluster: "prod", command: "kubectl get nodes" } };
 const signal = () => new AbortController().signal;
 it("binds callbacks to the active invocation, owning box, session and immutable scope", async () => {
@@ -12,7 +12,7 @@ it("binds callbacks to the active invocation, owning box, session and immutable 
   await expect(box.execute("forged", "session-a", args, signal(), exec)).rejects.toThrow();
   await expect(box.execute(grant.token, "session-b", args, signal(), exec)).rejects.toThrow();
   await expect(other.execute(grant.token, "session-a", args, signal(), exec)).rejects.toThrow();
-  await expect(box.execute(grant.token, "session-a", { ...args, arguments: { ...args.arguments, command: "ssh prod rm /x" } }, signal(), exec)).rejects.toThrow();
+  await expect(box.execute(grant.token, "session-a", { ...args, arguments: { ...args.arguments, cluster: "other" } }, signal(), exec)).rejects.toThrow();
   expect(exec).not.toHaveBeenCalled();
   await expect(box.execute(grant.token, "session-a", args, signal(), exec)).resolves.toEqual({ text: "ok" });
   grant.close();

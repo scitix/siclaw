@@ -1,5 +1,27 @@
 # Script sandbox validation — 2026-09-11
 
+## Unified built-in execution contract
+
+The current implementation removes the independent Kubernetes read connector,
+legacy inspection helper and duplicate sandbox command policies. Every cluster
+query uses the existing Bash tool; host/node/Pod execution uses those existing
+tool factories. Schemas and command policies are owned by the tools. Cluster
+declarations contain only registered names; obsolete finer scope fields fail
+validation rather than being silently ignored. Current behavior is specified in
+[Disposable script sandbox](script-sandbox.md).
+
+Local verification: 356 files, 7,324 tests passed, two existing skips; main and
+AgentBox TypeScript checks and build passed. Python SDK: ten tests passed.
+Native-tool regressions exercise normal get/describe/logs/pipeline queries,
+one shared command check per execution, mutation refusal, credential snapshots,
+and schema rejection of image/background/Pod-netns overrides. Shared kubectl
+regressions cover endpoint/identity flags (including shorthands) and kubeconfig
+mutation. Public callback/lease and MCP transport regressions remain covered.
+
+The entries below are historical acceptance records for earlier revisions;
+their fixed query APIs and sandbox-specific command restrictions are superseded.
+Live acceptance for the unified contract is recorded separately after deployment.
+
 ## SDK diagnostic tools: 2026-09-11
 
 Code revision `7c201031` reuses the Agent's Bash/host/node/Pod tool factories

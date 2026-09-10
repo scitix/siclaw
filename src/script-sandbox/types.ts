@@ -5,7 +5,8 @@ export interface ScriptRequest {
   input?: unknown;
   network_isolation?: boolean;
   timeout_seconds?: number;
-  clusters?: Array<{ name: string; namespaces?: string[]; nodes?: boolean }>;
+  /** Resource names only. Kubernetes permissions come from the bound credential. */
+  clusters?: Array<{ name: string }>;
   hosts?: string[];
   mcp?: Array<{ server: string; tools: string[] }>;
 }

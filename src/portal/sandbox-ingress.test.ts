@@ -7,7 +7,7 @@ import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { SANDBOX_LEASE_CLOSE, SANDBOX_LEASE_OPEN, SANDBOX_TOOL_PATH } from "../script-sandbox/external-protocol.js";
 
 const token = "a".repeat(64), hash = createHash("sha256").update(token).digest("hex");
-const call = { id: "1", tool: "k8s.list_nodes", arguments: { cluster: "test" } };
+const call = { id: "1", tool: "bash", arguments: { cluster: "test", command: "kubectl get nodes -o json" } };
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); vi.restoreAllMocks(); });
 async function setup(publicUrl: string | undefined = "https://portal.example") {
