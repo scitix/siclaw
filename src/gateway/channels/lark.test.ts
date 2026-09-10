@@ -89,6 +89,7 @@ const updateMessageMock = vi.fn();
 vi.mock("../chat-repo.js", () => ({
   validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
   warnTraceBindFailure: vi.fn(),
+  getVisualLink: vi.fn(async () => "https://console.example/siclaw/chat?agent=a1&session=s1&visual=waterfall-one"),
   ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
   bindMessageTraceId: (...args: unknown[]) => bindMessageTraceIdMock(...args),
@@ -4278,6 +4279,14 @@ describe("collectChannelResponse — audit persistence", () => {
     thinking_visible: false,
     tool_call_ids: [],
     ...overrides,
+  });
+
+  it("preserves trace data and returns an authorized Web entry even without a PNG", async () => {
+    const details = { structuredContent: { schema_version: 2, visuals: [{ visual_id: "waterfall-one", kind: "chart", spec: {type: "waterfall", visual_id: "waterfall-one"}, exports: {png:{status:"failed"}} }] } };
+    const events = [{type:"tool_execution_end",toolName:"render_chart",result:{content:[{type:"text",text:"PNG unavailable; two HTTP calls."}],details}}];
+    const result=await collectChannelResponse(fakeClient(events), "s1", "lark", {includeImages:true,persist:{agentId:"a1"}});
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({role:"tool",metadata:details}));
+    expect(result.images).toEqual([]); expect(result.visualLinks).toHaveLength(1);
   });
 
   it("persists every assistant turn + each tool call when persist is set", async () => {

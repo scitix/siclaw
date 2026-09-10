@@ -30,6 +30,7 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
       "pie",
       "bar",
       "line",
+      "waterfall",
     ]);
     for (const k of ["title", "width", "height", "x_label", "y_label"]) {
       expect(RENDER_CHART_INPUT_SCHEMA.properties).toHaveProperty(k);
@@ -78,7 +79,7 @@ describe("validate", () => {
 
   it("rejects unknown chart types", () => {
     expect(() => validate({ type: "scatter", data: {} })).toThrow(
-      /type must be pie, bar, or line/,
+      /type must be pie, bar, line, or waterfall/,
     );
   });
 

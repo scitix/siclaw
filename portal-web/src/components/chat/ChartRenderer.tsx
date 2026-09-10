@@ -1,3 +1,4 @@
+import { TraceTimelineRenderer } from "./TraceTimelineRenderer"
 /**
  * Client-side chart renderer (React + SVG).
  *
@@ -623,7 +624,7 @@ interface ChartRendererProps {
 // tooltip (px relative to the chart-area wrapper, already edge-clamped).
 interface HoverState { index: number; left: number; top: number }
 
-function ChartRendererImpl({ spec, className, style, allowPreview = true }: ChartRendererProps) {
+function ChartRendererImpl({ spec, className, style, allowPreview = true }: Omit<ChartRendererProps, "spec"> & { spec: Exclude<ChartSpec, { type: "waterfall" }> }) {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const svgRef = useRef<SVGSVGElement | null>(null)
   const [status, setStatus] = useState<null | { kind: "ok" | "err"; text: string }>(null)
@@ -990,7 +991,9 @@ function ChartRendererImpl({ spec, className, style, allowPreview = true }: Char
 // takes the model to finish the reply. We compare by serialised spec (cheap —
 // specs are small JSON) so a freshly-parsed-but-equal spec object
 // short-circuits identically to a referentially-stable one.
-export const ChartRenderer = memo(ChartRendererImpl, (prev, next) => {
+export const ChartRenderer = memo(function ChartRendererDispatch(props: ChartRendererProps) {
+  return props.spec.type === "waterfall" ? <TraceTimelineRenderer spec={props.spec} className={props.className} style={props.style}/> : <ChartRendererImpl {...props} spec={props.spec}/>
+}, (prev, next) => {
   if (prev.className !== next.className) return false
   if (prev.style !== next.style) return false
   if (prev.allowPreview !== next.allowPreview) return false

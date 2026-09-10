@@ -9,6 +9,7 @@ import { ConversationClient, supportsConversations } from "../conversation-clien
 
 import { AssistantItemStream } from "../assistant-item-stream.js";
 import { assistantTextBlocks } from "../../shared/assistant-items.js";
+import { persistableToolDetails, traceVisualIds } from "../../shared/tool-result-metadata.js";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
@@ -37,7 +38,7 @@ import {
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { sessionTurnLocks } from "../session-turn-lock.js";
-import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback, updateMessage, warnTraceBindFailure } from "../chat-repo.js";
+import { appendMessage, getVisualLink, bindMessageTraceId, ensureChatSession, recordChannelFeedback, updateMessage, warnTraceBindFailure } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
@@ -2082,7 +2083,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       persist: remoteConversation ? undefined : { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
       throwOnError: remoteConversation,
     });
-    resultText = collected.text;
+    const linkLabel = locale === "zh-CN" ? "打开交互时间线（需要登录及会话权限）" : "Open interactive timeline (sign-in and session access required)";
+    resultText = [collected.text, ...collected.visualLinks.map(url => `[${linkLabel}](${url})`)].filter(Boolean).join("\n\n");
     replyImages = collected.images;
     assistantMessageId = collected.assistantMessageId;
   } catch (err) {
@@ -3079,6 +3081,7 @@ async function replyVisualImages(
 export interface CollectedChannelResponse {
   text: string;
   images: RenderedReplyImage[];
+  visualLinks: string[];
   /** Persisted id of the final assistant turn, or null when audit persistence failed/was disabled. */
   assistantMessageId: string | null;
 }
@@ -3141,6 +3144,7 @@ export async function collectChannelResponse(
   };
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
+  const visualLinks: string[] = [];
   const seenImageKeys = new Set<string>();
   // Track the latest assistant turn so we only reply with the *final* text
   // (tool-use turns emit intermediate message_end events that aren't meant
@@ -3386,9 +3390,9 @@ export async function collectChannelResponse(
           const toolset = shiftQ(toolsets, key) ??
             (typeof ev.toolset === "string" && ev.toolset.length > 0 ? ev.toolset : undefined);
           const roundMeta = shiftQ(toolRounds, key) ?? timeline.toolMetadata(ev);
-          const metadata: Record<string, unknown> = { ...roundMeta };
+          const metadata: Record<string, unknown> = { ...persistableToolDetails(ev.result?.details, redact), ...roundMeta };
           if (startedAt != null) metadata.started_at = new Date(startedAt).toISOString();
-          await persistRow({
+          const toolMessageId = await persistRow({
             sessionId,
             role: "tool",
             content: redact(resultText),
@@ -3399,6 +3403,12 @@ export async function collectChannelResponse(
             durationMs: start ? toolDurationMs(start, endedAt) : null,
             metadata: Object.keys(metadata).length > 0 ? metadata : null,
           });
+          if (toolMessageId && options.includeImages) {
+            for (const visualId of traceVisualIds(metadata)) {
+              const link = await getVisualLink(sessionId, toolMessageId, visualId);
+              if (link && !visualLinks.includes(link)) visualLinks.push(link);
+            }
+          }
         }
       }
 
@@ -3519,7 +3529,7 @@ export async function collectChannelResponse(
       content: redact(text),
     });
   }
-  return { text, images, assistantMessageId: lastAssistantMessageId };
+  return { text, images, visualLinks, assistantMessageId: lastAssistantMessageId };
 }
 
 /**

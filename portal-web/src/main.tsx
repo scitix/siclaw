@@ -22,6 +22,7 @@ import { Channels } from "./pages/Channels"
 import { Metrics } from "./pages/Metrics"
 import { SkillImport } from "./pages/SkillImport"
 import { KnowledgeAdmin } from "./pages/KnowledgeAdmin"
+import { VisualExport } from "./pages/VisualExport"
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("token")
@@ -34,6 +35,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <ConfirmProvider>
   <BrowserRouter>
     <Routes>
+      <Route path="/siclaw-visual-export" element={<VisualExport />} />
       <Route path="/login" element={<Login />} />
       <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
         <Route index element={<Navigate to="/agents" replace />} />

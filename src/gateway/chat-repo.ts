@@ -444,3 +444,15 @@ export async function getMessages(
     };
   }).reverse();
 }
+
+/** Normal authenticated chat URL; never an access-granting token or a share URL. */
+export async function getVisualLink(sessionId: string, messageId: string, visualId: string): Promise<string | null> {
+  try {
+    const result = await getClient().request("chat.getVisualLink", {
+      session_id: sessionId, message_id: messageId, visual_id: visualId,
+    }, 3000);
+    if (!result.url) return null;
+    const url = new URL(result.url);
+    return ["https:", "http:"].includes(url.protocol) && !url.username && !url.password ? url.href : null;
+  } catch { return null; } // An older host keeps PNG/text delivery working.
+}

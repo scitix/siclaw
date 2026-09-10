@@ -1,0 +1,86 @@
+/* Scoped to trace surfaces; colour and type remain owned by the host product. */
+.trace-card {
+  container-type: inline-size;
+}
+.trace-button {
+  min-height: 32px;
+}
+.trace-language {
+  min-height: 30px;
+}
+.trace-dialog {
+  width: min(1240px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  max-height: calc(100dvh - 24px);
+  overflow: hidden;
+}
+.trace-dialog-layout {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-height: calc(100dvh - 24px);
+}
+.trace-dialog-header {
+  flex: none;
+}
+.trace-dialog-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.trace-inline {
+  max-height: min(640px, 65dvh);
+}
+.trace-rows {
+  max-height: min(440px, 50dvh);
+  scrollbar-gutter: stable;
+}
+.trace-inspector-body {
+  max-height: min(370px, 42dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.trace-row-bar {
+  touch-action: pan-y;
+}
+.trace-view[data-trace-layout="mobile"] .trace-row-bar {
+  height: 24px;
+}
+.trace-view[data-trace-layout="mobile"] .trace-row-bar svg {
+  height: 22px;
+}
+.trace-view[data-trace-layout="mobile"] .trace-row-label {
+  min-height: 40px;
+}
+.trace-view[data-trace-layout="mobile"] .trace-rows {
+  max-height: min(360px, 45dvh);
+}
+@media (pointer: coarse) {
+  .trace-button,
+  .trace-language {
+    min-height: 44px;
+  }
+  .trace-row-label,
+  .trace-row-toggle {
+    min-height: 44px;
+  }
+  .trace-row-toggle {
+    width: 32px;
+  }
+  .trace-overview {
+    min-height: 44px;
+  }
+}
+@media (max-width: 480px) {
+  .trace-dialog-header,
+  .trace-dialog-body {
+    padding: 12px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .trace-card *,
+  .trace-dialog * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

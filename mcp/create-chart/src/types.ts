@@ -1,3 +1,4 @@
+import type { WaterfallSpec } from "./waterfall-spec.js";
 export interface PieSlice {
   label: string;
   value: number;
@@ -27,6 +28,7 @@ export interface ChartCommonOpts {
 }
 
 export type RenderChartArgs =
+  | WaterfallSpec
   | ({ type: "pie"; data: { slices: PieSlice[] } } & ChartCommonOpts)
   | ({
       type: "bar";
@@ -39,8 +41,6 @@ export type RenderChartToolContent =
   | { type: "image"; data: string; mimeType: "image/png" };
 
 export interface RenderChartToolResponse {
-  content: [
-    { type: "text"; text: string },
-    { type: "image"; data: string; mimeType: "image/png" },
-  ];
+  content: RenderChartToolContent[];
+  structuredContent?: Record<string, unknown>;
 }

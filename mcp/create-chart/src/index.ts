@@ -43,6 +43,7 @@ async function main(): Promise<void> {
         name: "render_chart",
         description: RENDER_CHART_DESCRIPTION,
         inputSchema: RENDER_CHART_INPUT_SCHEMA,
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       },
       {
         name: "render_mermaid",

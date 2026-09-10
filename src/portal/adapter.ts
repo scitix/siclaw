@@ -2814,6 +2814,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return Number(rows[0]?.next_seq ?? 1);
   };
 
+  handlers.set("chat.getVisualLink", async () => ({ url: null }));
+
   handlers.set("chat.appendMessage", async (params) => {
     const id = crypto.randomUUID();
     const db = getDb();

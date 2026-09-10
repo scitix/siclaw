@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   buildChatPath,
+  buildChatSearchParams,
   chatPathFromStoredSelection,
   chatSessionForAgent,
   readChatSelection,
@@ -62,4 +63,17 @@ describe("chatSelection", () => {
     expect(chatSessionForAgent("agent-b", selection)).toBe("session-b1")
     expect(chatPathFromStoredSelection()).toBe("/chat?agent=agent-a")
   })
+})
+
+describe("chat visual deep links", () => {
+  const current = new URLSearchParams("agent=agent-a&session=session-1&visual=trace-a")
+  it("keeps the visual while initializing its conversation", () => {
+    expect(buildChatSearchParams("agent-a", "session-1", current).get("visual")).toBe("trace-a")
+  })
+  it.each([["agent-b", "session-1"], ["agent-a", "session-2"], ["agent-a", null]])(
+    "clears the linked visual when switching to %s / %s",
+    (agent, session) => {
+      expect(buildChatSearchParams(agent!, session, current).has("visual")).toBe(false)
+    },
+  )
 })

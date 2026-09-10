@@ -1,3 +1,4 @@
+import { TraceHostContext } from "./TraceContext"
 import { createContext, useContext, useMemo } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -202,9 +203,11 @@ function CodeBlock({ language, text }: { language: string; text: string }) {
 // which lets ChartRenderer's React.memo short-circuit cleanly while the LLM
 // continues streaming prose after the chart fence has closed.
 function ChartFence({ text }: { text: string }) {
+  const { attachedIds } = useContext(TraceHostContext)
   const isStreaming = useContext(ChartStreamingContext)
   const trimmed = text.trim()
   const spec = useMemo(() => tryParseChartSpec(trimmed), [trimmed])
+  if (spec?.type === "waterfall" && spec.visual_id && attachedIds?.has(spec.visual_id)) return null
   if (spec) return <ChartRenderer spec={spec} />
   // Don't show the red parse-failed box mid-stream — ReactMarkdown re-renders
   // on every token, so an unclosed chart fence would otherwise flash the

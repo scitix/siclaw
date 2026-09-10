@@ -9,6 +9,7 @@ import {
   updateDelegationToolMessage,
   incrementMessageCount,
   getMessages,
+  getVisualLink,
 } from "./chat-repo.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 
@@ -441,5 +442,19 @@ describe("getMessages", () => {
     fake.responses.set("chat.getMessages", { messages: [] });
     await getMessages("sid", { limit: 10 });
     expect(fake.calls[0].params.limit).toBe(10);
+  });
+});
+
+describe("getVisualLink", () => {
+  it("passes the exact persisted attachment pair without granting authority", async () => {
+    fake.responses.set("chat.getVisualLink", {url:"https://console.example/siclaw/chat?session=s&visual=v"});
+    expect(await getVisualLink("s","m","v")).toContain("session=s");
+    expect(fake.calls[0]).toEqual({method:"chat.getVisualLink",params:{session_id:"s",message_id:"m",visual_id:"v"}});
+  });
+  it("older hosts and unsafe URLs cannot break image/text delivery", async () => {
+    fake.nextError=new Error("unknown method"); expect(await getVisualLink("s","m","v")).toBeNull();
+    for(const url of ["javascript:alert(1)","https://secret@console.example/chat",null]) {
+      fake.responses.set("chat.getVisualLink",{url});expect(await getVisualLink("s","m","v")).toBeNull();
+    }
   });
 });
