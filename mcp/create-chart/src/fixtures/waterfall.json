@@ -2,7 +2,7 @@
   "type": "waterfall",
   "schema_version": 1,
   "visual_id": "waterfall-example",
-  "title": "MaaS request \u00b7 upstream retries",
+  "title": "Service request \u00b7 upstream retries",
   "data": {
     "origin_time": "2026-09-10T06:25:02.913915Z",
     "request_id": "request-example",
@@ -15,20 +15,20 @@
     },
     "coverage": {
       "observed": [
-        "model-api root and stage spans",
+        "gateway root and stage spans",
         "2 outbound HTTP attempts"
       ],
       "missing": [
         "client upload",
-        "provider queue and engine internals",
-        "token timing"
+        "upstream queue and service internals",
+        "response streaming timing"
       ],
       "complete": true
     },
     "spans": [
       {
         "span_id": "root",
-        "label": "model-api request",
+        "label": "gateway request",
         "start_ms": 0,
         "end_ms": 67574.573,
         "layer": "server",
@@ -184,7 +184,7 @@
       },
       {
         "span_id": "route1",
-        "label": "Provider A \u00b7 route",
+        "label": "Upstream A \u00b7 route",
         "start_ms": 1120.307,
         "end_ms": 65687.627,
         "layer": "route",
@@ -197,7 +197,7 @@
       },
       {
         "span_id": "http1",
-        "label": "Provider A \u00b7 HTTP",
+        "label": "Upstream A \u00b7 HTTP",
         "start_ms": 1123.68,
         "end_ms": 65687.465,
         "layer": "http",
@@ -211,7 +211,7 @@
       },
       {
         "span_id": "route2",
-        "label": "Provider B \u00b7 route",
+        "label": "Upstream B \u00b7 route",
         "start_ms": 65687.654,
         "end_ms": 67534.942,
         "layer": "route",
@@ -224,7 +224,7 @@
       },
       {
         "span_id": "http2",
-        "label": "Provider B \u00b7 HTTP",
+        "label": "Upstream B \u00b7 HTTP",
         "start_ms": 65700.139,
         "end_ms": 67534.888,
         "layer": "http",

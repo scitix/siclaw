@@ -224,6 +224,12 @@ automatically.
 
 ## Structured request timelines
 
+Request timelines visualize observed spans from HTTP services, gateway retries,
+agent/tool executions, or other timed operations. Callers and diagnostic skills
+collect and correlate the evidence; the chart tool and clients share one span
+contract across these scenarios. The fixture uses a service request with two
+upstream attempts to illustrate overlap and missing observations.
+
 `render_chart(type="waterfall")` returns a short summary and
 `structuredContent = {schema_version:2, visuals:[{visual_id,kind:"chart",spec,exports:{png:{status}}}]}`.
 The normalized `spec` has `schema_version:1` and the same `visual_id`. Supported
