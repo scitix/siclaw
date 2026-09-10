@@ -6,7 +6,7 @@
 const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
 const needsSqliteFlag =
   nodeMajor < 24 &&
-  process.argv[2] === "local" &&
+  ["local", "knowledge"].includes(process.argv[2]) &&
   !process.execArgv.includes("--experimental-sqlite") &&
   !process.env.SICLAW_REEXEC_SQLITE;
 
@@ -49,6 +49,7 @@ Commands:
   (default)    Start interactive TUI session
   local        Start local gateway with web UI (single process, SQLite)
   agents       List Portal-configured agents and exit (requires local Portal)
+  knowledge    Search mounted knowledge locally (knowledge --help)
 
 Options:
   --prompt <text>   Run in non-interactive print mode
@@ -66,7 +67,7 @@ In-session commands:
 `);
   }
 
-  if (args.includes("--help") || args.includes("-h")) {
+  if (subcommand !== "knowledge" && (args.includes("--help") || args.includes("-h"))) {
     printHelp();
     process.exit(0);
   }
@@ -76,7 +77,15 @@ In-session commands:
     process.exit(0);
   }
 
-  if (subcommand === "local") {
+  if (subcommand === "knowledge") {
+    try {
+      const { runKnowledgeCli } = await import("./dist/cli-knowledge.js");
+      await runKnowledgeCli(args.slice(1));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+  } else if (subcommand === "local") {
     process.argv.splice(2, 1);
     await import("./dist/cli-local.js");
   } else if (subcommand === "agents") {

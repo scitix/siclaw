@@ -196,7 +196,7 @@ describe("conversation handoff across Agent types", () => {
   });
   it("does not grant operations to a read-only knowledge agent", () => {
     const harness = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false, handoffAvailable: true });
-    expect(harness.allowedTools).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "transfer_to_agent", "search_handoff_targets"]);
+    expect(harness.allowedTools).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite", "transfer_to_agent", "search_handoff_targets"]);
     expect(harness.includeSubagentGuidance).toBe(false);
   });
   it("keeps an unresolved harness closed even with a roster", () => {
