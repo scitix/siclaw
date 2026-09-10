@@ -512,7 +512,7 @@ export async function createSiclawSession(
 
   // Knowledge routing is independent from investigation memory and embedding
   // configuration. Typed page labels become available after one local
-  // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
+  // frontmatter scan; body lookup builds its FTS index lazily. AgentBox passes a
   // shared resolver, while standalone CLI owns this fallback instance.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
@@ -525,7 +525,7 @@ export async function createSiclawSession(
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
       knowledgeIndexer = undefined;
-      console.warn("[agent-factory] Knowledge label resolver init failed; the complete Wiki catalog and Read remain available:", err);
+      console.warn("[agent-factory] Knowledge resolver init failed; the complete Wiki catalog and Read remain available:", err);
     }
   }
 
@@ -553,6 +553,7 @@ export async function createSiclawSession(
       handoffSupported: opts?.handoffSupported === true,
       handoffPolicy: opts?.handoffPolicy,
       knowledgeCitationTool: citationSupport?.tool,
+      knowledgeReadSupport: citationSupport,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       readToolResult: async (id) => (await toolResultArtifactStore.readFull(id)).text,
       // Channels currently deliver one foreground response. Do not advertise

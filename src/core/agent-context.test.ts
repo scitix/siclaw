@@ -44,7 +44,7 @@ describe("resolveAgentHarness", () => {
     });
 
     expect(harness.allowedTools).toEqual([
-      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite",
       "local_script", "write", "edit", "skill_preview",
       "task_create", "task_update", "task_list", "task_get",
       "spawn_subagent", "task_output", "job_stop",
@@ -70,7 +70,7 @@ describe("resolveAgentHarness", () => {
     });
 
     expect(harness.allowedTools).toEqual([
-      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite",
     ]);
     expect(harness.mcpExposure).toBe("configured");
     expect(harness.memoryEnabled).toBe(false);
@@ -110,7 +110,7 @@ describe("compileAgentContext", () => {
   it("uses Product Support's managed persisted prompt without SRE guidance", () => {
     const context = compileAgentContext({
       agentType: "product_support",
-      allowedTools: ["read", "knowledge_search", "knowledge_cite"],
+      allowedTools: ["read", "knowledge_search", "knowledge_lookup", "knowledge_cite"],
       memoryConfigured: true,
       mode: "channel",
       agentPrompt: "Managed product support contract",
@@ -127,7 +127,7 @@ describe("compileAgentContext", () => {
   it("gives Knowledge QA a role-clean prompt with no SRE or memory guidance", () => {
     const context = compileAgentContext({
       agentType: "knowledge_qa",
-      allowedTools: ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"],
+      allowedTools: ["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite"],
       memoryConfigured: true,
       mode: "channel",
     });

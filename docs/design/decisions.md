@@ -876,3 +876,28 @@ workflows in Portal reduces maintenance while preserving scriptable diagnostics.
   carry its own terminal packages transitively; Siclaw does not expose that UI.
 - Builds clear `dist/` before compiling, so removed terminal modules cannot leak
   into packages built in an existing checkout.
+
+---
+
+## ADR-021: Add Bounded Body Lookup Alongside Wiki Navigation
+
+**Status**: Experimental
+
+**Context**: Label routing cannot recall facts that occur only in compiled page
+bodies. Each successful navigation still requires another tool call to read
+evidence. Multiple mounted libraries make these costs visible.
+
+**Decision**: Add `knowledge_lookup` and an offline CLI over a disposable, lazy
+FTS5 index scoped to the agent mount. Search all mounted libraries and return
+bounded complete pages with their original paths and authoritative library
+identities. Register only the full contents actually returned with the existing
+citation support. Keep label search, complete catalogs and Read available.
+
+**Consequences**: Lookup introduces a measurable cold-index cost, amortized over
+warm agent sessions. It needs no embedding service or mount-schema migration.
+Long pages still require Read. Real-corpus answer quality, tool usage and
+downstream knowledge-usage analytics must be validated before broad rollout.
+ADR-017's label-search semantics remain intact; its no-content-index claim
+applies to label navigation, while ordinary lookup now has a lazy index.
+
+See [the retrieval contract and evaluation procedure](knowledge-lookup.md).

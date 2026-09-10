@@ -560,7 +560,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(status).toBe(200);
     expect(body.activeAgent.agentType).toBe("knowledge_qa");
     expect(body.activeAgent.allowedTools).toEqual(expect.arrayContaining([
-      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite",
       "local_script", "write", "edit", "skill_preview", "task_create", "spawn_subagent", "task_output", "job_stop",
     ]));
     for (const name of ["bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script", "memory_search", "memory_get"]) {
@@ -681,7 +681,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     expect(status).toBe(200);
     expect(new Set(body.activeAgent.allowedTools)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "manage_schedule"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite", "manage_schedule"]),
     );
   });
 

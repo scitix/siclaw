@@ -27,6 +27,7 @@ import { registration as hostList } from "./query/host-list.js";
 import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
 import { registration as knowledgeSearch } from "./query/knowledge-search.js";
+import { registration as knowledgeLookup } from "./query/knowledge-lookup.js";
 import { registration as knowledgeCite } from "./query/knowledge-cite.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
 // end_investigation removed as part of the DP state-machine teardown
@@ -54,7 +55,7 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript, runScript,
   // ── query ──
   clusterList, hostList, k8sInspect,
-  memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
+  memorySearch, memoryGet, knowledgeLookup, knowledgeSearch, knowledgeCite,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, requestInput,
