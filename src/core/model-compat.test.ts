@@ -303,14 +303,12 @@ describe("Anthropic thinking compat", () => {
     expect(compatOf("claude-opus-5").forceAdaptiveThinking).toBe(true);
   });
 
-  // The reason a plain table lookup does not solve this: pi's table is a release
-  // snapshot, and the id that broke is not in it. The lag window is exactly when
-  // a model is newest — when someone is most likely to add it.
+  // A synthetic future id keeps this test independent of catalog updates.
   it("does not rely on pi knowing the id", () => {
-    expect(ANTHROPIC_MODELS["claude-opus-5" as keyof typeof ANTHROPIC_MODELS]).toBeUndefined();
-    expect(builtinAnthropicCompat("claude-opus-5")).toBeUndefined();
-    // …and an id nobody has seen yet resolves the same way.
-    expect(resolveAnthropicCompat("claude-opus-7-20270101").forceAdaptiveThinking).toBe(true);
+    const id = "claude-opus-99-contract-fixture";
+    expect(ANTHROPIC_MODELS[id as keyof typeof ANTHROPIC_MODELS]).toBeUndefined();
+    expect(builtinAnthropicCompat(id)).toBeUndefined();
+    expect(resolveAnthropicCompat(id).forceAdaptiveThinking).toBe(true);
   });
 
   it("takes pi's answer where pi has one", () => {

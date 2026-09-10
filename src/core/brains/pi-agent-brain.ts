@@ -354,7 +354,7 @@ export class PiAgentBrain implements BrainSession {
     const session = this.session as AgentSession & {
       getActiveToolNames?: () => string[];
       setActiveToolsByName?: (names: string[]) => void;
-      agent: AgentSession["agent"] & { streamFn: (...args: any[]) => any };
+      agent: AgentSession["agent"];
     };
     const activeToolNames = session.getActiveToolNames?.() ?? [];
     if (!activeToolNames.includes(requiredToolName) || !session.setActiveToolsByName) {
@@ -369,9 +369,9 @@ export class PiAgentBrain implements BrainSession {
       return;
     }
 
-    const originalStreamFn = session.agent.streamFn;
+    const originalStreamFn = session.agent.streamFunction;
     let forceNextProviderRequest = true;
-    session.agent.streamFn = ((model: any, context: any, options?: Record<string, unknown>) => {
+    session.agent.streamFunction = ((model: any, context: any, options?: Record<string, unknown>) => {
       // AgentSession can auto-compact before starting the repair turn. Compaction
       // uses the same streamFn but carries no result tool; do not spend the
       // one-shot force on that unrelated provider request.
@@ -380,7 +380,7 @@ export class PiAgentBrain implements BrainSession {
       return originalStreamFn(model, context, forceThisRequest
         ? requiredResultRepairOptions(model, options, requiredToolName)
         : options);
-    }) as typeof session.agent.streamFn;
+    }) as typeof session.agent.streamFunction;
 
     this.emit({ type: "required_result_repair_start", toolName: requiredToolName });
     this.requiredResultRepairActive = true;
@@ -388,7 +388,7 @@ export class PiAgentBrain implements BrainSession {
     try {
       await session.prompt(PiAgentBrain.REQUIRED_RESULT_REPAIR_PROMPT);
     } finally {
-      session.agent.streamFn = originalStreamFn;
+      session.agent.streamFunction = originalStreamFn;
       session.setActiveToolsByName(activeToolNames);
       this.requiredResultRepairActive = false;
       this.emit({
@@ -455,7 +455,12 @@ export class PiAgentBrain implements BrainSession {
     this.extraListeners.add(listener);
     const unsubSession = this.session.subscribe((event: any) => {
       if (event?.message?.role === "assistant") this.llmCalls?.attachPendingFailure(event.message);
-      listener(this.enrichToolEvent(event));
+      // Pi renamed these events and now emits them for manual compaction too.
+      // Keep BrainSession's lifecycle contract stable for gateway, CLI and UI.
+      const brainEvent = event.type === "compaction_start" || event.type === "compaction_end"
+        ? { ...event, type: `auto_${event.type}` }
+        : event;
+      listener(this.enrichToolEvent(brainEvent));
     });
     return () => {
       this.extraListeners.delete(listener);
@@ -539,14 +544,14 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async setModel(info: BrainModelInfo): Promise<void> {
-    const model = this.session.modelRegistry.find(info.provider, info.id);
+    const model = this.session.modelRuntime.getModel(info.provider, info.id);
     if (model) {
       await this.session.setModel(model);
     }
   }
 
   findModel(provider: string, modelId: string): BrainModelInfo | undefined {
-    const model = this.session.modelRegistry.find(provider, modelId);
+    const model = this.session.modelRuntime.getModel(provider, modelId);
     if (!model) return undefined;
     return {
       id: model.id,
@@ -562,7 +567,7 @@ export class PiAgentBrain implements BrainSession {
   }
 
   registerProvider(name: string, config: Record<string, unknown>): void {
-    this.session.modelRegistry.registerProvider(name, config as any);
+    this.session.modelRuntime.registerProvider(name, config as any);
   }
 
   /**

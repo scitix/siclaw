@@ -358,10 +358,10 @@ if (debugMode) {
         log(`tool_end name=${event.toolName} isError=${event.isError} result=${resultText}`);
         break;
       }
-      case "auto_compaction_start":
+      case "compaction_start":
         log(`compaction_start reason=${event.reason}`);
         break;
-      case "auto_compaction_end":
+      case "compaction_end":
         log(`compaction_end aborted=${event.aborted} willRetry=${event.willRetry} error=${event.errorMessage}`);
         break;
       case "auto_retry_start":

@@ -11,7 +11,7 @@
  * - context: in-place context transforms (before context sent to LLM)
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { guardLog } from "./guard-log.js";
 import { sanitizeToolCallInputs } from "./tool-call-repair.js";
@@ -66,8 +66,10 @@ export interface GuardRegistry {
   context: Array<{ name: string; handler: ContextGuard }>;
 }
 
+type GuardAgent = Pick<Agent, "streamFunction" | "transformContext">;
+
 export interface GuardPipelineTarget {
-  agent: any; // session.agent from pi-coding-agent
+  agent: GuardAgent;
   sessionManager: SessionManager;
 }
 
@@ -103,21 +105,21 @@ export function installGuardPipeline(
   installContextPipeline(target.agent, registry.context);
 }
 
-// ── Input + Output pipeline (single streamFn wrap) ──────────────────────
+// ── Input + Output pipeline (single streamFunction wrap) ────────────────
 
 type TransformContextFn = (
   messages: AgentMessage[],
-  signal: AbortSignal,
+  signal?: AbortSignal,
 ) => AgentMessage[] | Promise<AgentMessage[]>;
 
 function installInputOutputPipeline(
-  agent: any,
+  agent: GuardAgent,
   inputGuards: Array<{ name: string; handler: InputGuard }>,
   outputGuards: Array<{ name: string; handler: OutputGuard }>,
 ): void {
-  const baseFn = agent.streamFn;
+  const baseFn = agent.streamFunction;
 
-  agent.streamFn = (model: any, context: any, options: any) => {
+  agent.streamFunction = (model: any, context: any, options: any) => {
     // ── Input stage: run message transforms in order ──
     let messages = context?.messages;
     if (Array.isArray(messages)) {
@@ -208,13 +210,13 @@ function installPersistPipeline(
 // ── Context pipeline (single transformContext wrap) ──────────────────────
 
 function installContextPipeline(
-  agent: any,
+  agent: GuardAgent,
   guards: Array<{ name: string; handler: ContextGuard }>,
 ): void {
   const mutableAgent = agent as { transformContext?: TransformContextFn };
   const originalTransformContext = mutableAgent.transformContext;
 
-  mutableAgent.transformContext = (async (messages: AgentMessage[], signal: AbortSignal) => {
+  mutableAgent.transformContext = (async (messages: AgentMessage[], signal?: AbortSignal) => {
     const transformed = originalTransformContext
       ? await originalTransformContext.call(mutableAgent, messages, signal)
       : messages;
