@@ -3107,7 +3107,7 @@ export interface ChannelPersistContext {
 }
 
 export async function collectChannelResponse(
-  client: Pick<AgentBoxClient, "streamEvents">,
+  client: Pick<AgentBoxClient, "streamEvents"> & { readonly conversationEvents?: boolean },
   sessionId: string,
   logPrefix = "lark",
   options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale; throwOnError?: boolean } = {},
@@ -3151,14 +3151,8 @@ export async function collectChannelResponse(
   let lastRowContent = "";
   let lastRowMetadata: Record<string, unknown> = {};
   let pendingKnowledgeSources: unknown = null;
-  // Same contract as sse-consumer: the citations appended to THIS assistant row
-  // ride on its metadata for feedback attribution.
-  let pendingRowCitations: KnowledgeSourceCitation[] = [];
-  // URLs already rendered into an assistant reply this stream (= one turn).
-  // Append only the not-yet-rendered delta and keep pending, so an intermediate
-  // narration turn no longer steals the references off the final answer, nor
-  // duplicates them across bubbles when the model cites twice.
-  const renderedKnowledgeSourceUrls = new Set<string>();
+  // Keep the source union for the final delivered answer; an intermediate
+  // message must not consume references needed by a later reply.
 
   // ── Audit persistence (opt-in) ──────────────────────────────────────────
   // Mirrors the field mapping in sse-consumer.ts so a channel transcript looks
@@ -3243,7 +3237,6 @@ export async function collectChannelResponse(
         lastAssistantMessageId = null;
         parts.length = 0;
         pendingKnowledgeSources = null;
-        renderedKnowledgeSourceUrls.clear();
         assistantItems.begin();
       }
       if (!persist && ev.type === "item/completed" && ev.item?.type === "agentMessage" && ev.dbMessageId) lastAssistantMessageId = String(ev.dbMessageId);
@@ -3269,8 +3262,6 @@ export async function collectChannelResponse(
 
       if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
         pendingKnowledgeSources = null;
-        renderedKnowledgeSourceUrls.clear();
-        pendingRowCitations = [];
         if (ev.type === "model_route_rollback") {
           // The failed call is NOT dropped here: the switch notice that follows a
           // rollback is its carrier. Only the user-visible error goes, because a
@@ -3321,7 +3312,10 @@ export async function collectChannelResponse(
           });
         }
       }
-      if (ev.type === "knowledge_sources") {
+      // Conversation events already passed through the destination runtime's
+      // SSE consumer, which appended citations to message_end. Only raw
+      // AgentBox streams need this channel to render their source list.
+      if (ev.type === "knowledge_sources" && !client.conversationEvents) {
         pendingKnowledgeSources = ev.sources;
       }
 
@@ -3454,22 +3448,19 @@ export async function collectChannelResponse(
         const rowEnvelope = isModelCallRowEnvelope(envelope, ev.message?.stopReason)
           ? redactLlmCallEnvelope(envelope, redact)
           : undefined;
-        let turnText = assistantTextBlocks(ev.message).map(block => block.text).join("");
+        const textBlocks = assistantTextBlocks(ev.message);
+        let turnText = textBlocks.map(block => block.text).join("");
+        let rowCitations: KnowledgeSourceCitation[] = [];
         // The SHARED rule, not a second copy of it. The local re-derivation read
         // only `blocks`, so a recovered turn whose final message carries STRING
         // content looked like no output — the error stayed pending and a terminal
         // error_response was written over a successful answer.
         if (pendingError && messageProducedOutput(ev.message)) await flushRecoveredLlmCalls();
-        if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error") {
-          const freshSources = normalizeKnowledgeSourceCitations(pendingKnowledgeSources)
-            .filter((source) => !renderedKnowledgeSourceUrls.has(source.url));
-          if (freshSources.length > 0) {
-            turnText = appendKnowledgeSourceCitations(turnText, freshSources);
-            for (const source of freshSources) renderedKnowledgeSourceUrls.add(source.url);
-            pendingRowCitations = freshSources;
-          }
-          // Keep pending: a later assistant message this turn may carry sources
-          // cited after this one; the rendered-set prevents any double-append.
+        const isProgress = ev.message?.stopReason === "toolUse" || ev.awaitingBackgroundJobs === true || ev.awaitingSubagents === true;
+        if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error" && !isProgress &&
+            textBlocks.some(block => block.phase !== "commentary" && block.text.trim())) {
+          rowCitations = normalizeKnowledgeSourceCitations(pendingKnowledgeSources);
+          turnText = appendKnowledgeSourceCitations(turnText, rowCitations);
         }
         if (turnText) {
           lastAssistantText = turnText;
@@ -3493,9 +3484,8 @@ export async function collectChannelResponse(
           // is not a card and must leave the id alone.
           const rowMetadata = {
             ...(rowEnvelope ? { llm_call: rowEnvelope } : {}),
-            ...(pendingRowCitations.length > 0 ? { knowledge_citations: knowledgeCitationsMetadata(pendingRowCitations) } : {}),
+            ...(rowCitations.length > 0 ? { knowledge_citations: knowledgeCitationsMetadata(rowCitations) } : {}),
           };
-          pendingRowCitations = [];
           const rowId = await persistRow({
             sessionId,
             role: "assistant",

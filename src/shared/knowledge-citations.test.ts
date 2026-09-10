@@ -2,6 +2,22 @@ import { describe, expect, it } from "vitest";
 import { appendKnowledgeSourceCitations, normalizeKnowledgeSourceCitations, knowledgeCitationsMetadata } from "./knowledge-citations.js";
 
 describe("knowledge source citation rendering", () => {
+  it.each([
+    ["Answer", "Source"],
+    ["结论", "Source"],
+    ["Answer", "来源"],
+    ["结论", "来源"],
+  ])("does not append an identical source footer twice: %s / %s", (answer, title) => {
+    const sources = Array.from({ length: 8 }, (_, i) => ({
+      title: `${title} ${i + 1}`, url: `https://example.com/source-${i + 1}`,
+    }));
+    const rendered = appendKnowledgeSourceCitations(answer, sources);
+    expect(appendKnowledgeSourceCitations(rendered, sources)).toBe(rendered);
+    expect(appendKnowledgeSourceCitations(`${rendered}\n`, sources)).toBe(`${rendered}\n`);
+    // A URL in ordinary answer text must not suppress the trusted footer.
+    expect(appendKnowledgeSourceCitations(`See ${sources[0].url}`, sources)).toContain("### Original sources");
+  });
+
   it("deduplicates, caps and appends trusted source links", () => {
     const sources = [
       { title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" },

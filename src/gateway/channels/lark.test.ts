@@ -2588,6 +2588,37 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(appendMessageMock.mock.calls.filter(([row]) => row.role === "assistant")).toHaveLength(0);
   });
 
+  it("renders forwarded runtime citations once in the final card", async () => {
+    supportsConversationsMock.mockResolvedValue(true);
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    appendMessageMock.mockResolvedValue("original-user-row");
+    const sources = Array.from({ length: 8 }, (_, i) => ({
+      title: `Source ${i + 1}`, url: `https://example.com/source-${i + 1}`,
+    }));
+    const answer = "Answer\n\n### Original sources\n\n" + sources
+      .map(source => `- [${source.title}](${source.url})`).join("\n");
+    let receive: (data: unknown) => void = () => {};
+    const frontend = {
+      connected: true,
+      subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
+      request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.start") {
+          for (const event of [
+            { type: "knowledge_sources", sources },
+            { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } },
+            { type: "prompt_done" },
+          ]) receive({ sessionId: input.sessionId, requestId: input.userMessageId, event });
+          return { sessionId: input.sessionId };
+        }
+        return {};
+      }),
+    };
+    const lark = makeCardAwareLarkClient();
+    await handleLarkMessage(makeTextEvent("Explain the sources"), lark, "lark", makeAgentBoxManager() as any, undefined, frontend as any);
+    const content = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content;
+    expect(content).toBe(answer);
+  });
+
   function makeCardAwareLarkClient() {
     return {
       im: {
@@ -3903,6 +3934,24 @@ describe("collectResponse — SSE event flattening", () => {
     const text = await collectResponse(fakeClient(events), "s-citations");
     expect(text).toContain("### 参考原文");
     expect(text).toContain("[GPU Runbook](https://docs.feishu.cn/wiki/a)");
+  });
+
+  it.each([false, true])("keeps sources in the delivered channel answer after commentary (re-cite: %s)", async (recite) => {
+    const sources = [{ title: "Runbook", url: "https://example.com/runbook" }];
+    const events = [
+      { type: "knowledge_sources", sources },
+      { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
+        { type: "text", text: "Checking nodes.", textSignature: JSON.stringify({ v: 1, id: "progress", phase: "commentary" }) },
+      ] } },
+      { type: "tool_execution_end", toolName: "lookup", result: { content: [] } },
+      ...(recite ? [{ type: "knowledge_sources", sources }] : []),
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [
+        { type: "text", text: "All nodes are healthy.", textSignature: JSON.stringify({ v: 1, id: "final", phase: "final_answer" }) },
+      ] } },
+    ];
+    const result = await collectChannelResponse(fakeClient(events), "s-citations");
+    expect(result.text).toContain(sources[0].url);
+    expect(result.text.split(sources[0].url)).toHaveLength(2);
   });
 
   it("discards a failed primary's knowledge sources before rendering the fallback answer", async () => {
