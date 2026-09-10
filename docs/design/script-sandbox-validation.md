@@ -1,6 +1,76 @@
-# Script sandbox validation — 2026-09-10
+# Script sandbox validation — 2026-09-11
 
-## Review against current main
+## Fresh-image acceptance after rebase — 2026-09-11
+
+Runtime and AgentBox were rebuilt from `4c027594`, including the resource-update
+fix below, and deployed to both isolated Kubernetes test environments. Portal
+and the Python/Bash runner retain the already verified `58b6c68a` images because
+those components did not change. The companion API was rebuilt separately.
+Both environments remain available together; no unrelated workload was changed.
+
+### Issues found and fixed
+
+- Skills/Knowledge updates replaced Pi extension contexts during a running tool,
+  so revoking a resource correctly rejected the next operation but lost the
+  final script result. These updates now use the existing deferred session
+  invalidation path. File/index updates and per-operation broker authorization
+  remain immediate. Two regression cases exercise the installed Pi SDK, fail
+  before the fix, and verify successful tool events and persisted results after it.
+- The companion API's MySQL cancellation path relied on UPDATE RETURNING and
+  could return HTTP 500. Its fix captures the current execution generation under
+  a transaction lock. Real MySQL and SQLite regressions verify repeated Stop,
+  caller routing scope, and protection against stale cancellation acknowledgments.
+  The adapter repository records its implementation and validation separately.
+
+### Verified coverage
+
+- Siclaw: 353 test files, 7,320 passed, two existing skips; main and AgentBox type
+  checks plus backend build passed. The relevant session/SDK/HTTP/sync subset
+  passed 301 tests. The earlier frontend, runner, Helm and native smoke results
+  remain applicable to their unchanged components.
+- Portal: 17 script cases covering isolation, scoped Kubernetes/SSH/reviewed MCP,
+  controlled Bash, mutation/credential denials, timeout, output limits, clean
+  execution state, node scope, real pagination and Python/Shell file processing.
+- Companion API: nine reader cases covering the same scoped connector and file
+  paths; owner/foreign-session checks, revoked Agent access, API-key reuse of a
+  Web session, live cluster RBAC/binding revocation and MCP chunk revocation.
+- Live binding revocation now both rejects the second read and delivers the
+  script's successful final result. All temporary grants were restored.
+- Both chains ran at once with distinct Running runner Pods and run IDs, then
+  removed their Jobs/Pods. Running-script cancellation and actual Pod specs were
+  checked separately (Portal 2,121 ms; companion API 1,538 ms). The companion
+  API returns HTTP 200/stopped for both first and repeated Stop. Pods have no
+  credential mounts or environment, no service-account
+  token, read-only root filesystem, no privilege escalation, dropped capabilities.
+- The 128 KiB truncated stdout and every structured result field were recovered
+  intact through the Portal history API after the final Runtime/AgentBox update.
+
+Startup samples used ordinary containers, forced inherited network isolation,
+no RuntimeClass, no CNI policy requirement and `warmPoolSize=0`. Across the 17
+Portal cases, startup was 1,025–3,204 ms (median 1,888 ms); across the nine companion
+cases it was 973–2,071 ms (median 1,259 ms). These are mixed acceptance samples,
+not a dedicated performance benchmark.
+
+### Real-model exercise and evidence limits
+
+Before the resource-update hotfix, the complete rebased Portal deployment also
+passed real-model node aggregation and Python/Shell large-result processing via
+an authenticated CLI bridge. The model selected the tools: one script for nodes,
+two for Python (it corrected its initial MCP-envelope interpretation), and one
+for Shell. Both file workflows processed 1,560,109 bytes / 40,000 rows with a
+value sum of 180,000. The node table was visible in Portal history. This is not
+an external provider API-key test. The temporary model/bridge was removed.
+
+The final Runtime/AgentBox rerun uses deterministic model fixtures through the
+real agent loop. It does not re-label the earlier real-model runs as hotfix-image
+runs. Hosted E2B provisioning, templates, public routing and latency remain
+explicitly deferred. Local relay tests do not certify E2B cloud service.
+
+Kubernetes live acceptance is complete; PR/MR remain drafts pending review and
+current CI. The following older entries are historical and their previous
+capacity block is resolved by the fresh-image results above.
+
+## Historical: review before fresh-image acceptance
 
 The feature branch is rebased onto Siclaw main `01cad1ba`. The older deployed
 acceptance below is retained as historical evidence; it does not certify the
