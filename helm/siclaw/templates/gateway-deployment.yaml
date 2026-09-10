@@ -126,6 +126,13 @@ spec:
             - name: SICLAW_PERSISTENCE_CLAIM_NAME
               value: {{ include "siclaw.dataPvcName" . | quote }}
             {{- end }}
+            {{- if eq (include "siclaw.codeVolume.available" .) "true" }}
+            # Read-only per-agent source trees (docs/design/agentbox-code-volume.md).
+            # A PVC written by an external supplier; unset ⇒ AgentBox pods get no
+            # code volume and no code mount at all.
+            - name: SICLAW_CODE_CLAIM_NAME
+              value: {{ .Values.agentbox.codeVolume.claimName | quote }}
+            {{- end }}
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
@@ -223,6 +230,17 @@ spec:
             - name: user-data
               mountPath: /app/.siclaw/user-data
             {{- end }}
+            {{- if eq (include "siclaw.codeVolume.available" .) "true" }}
+            # The Runtime needs its OWN view of the code volume to read each
+            # agent's ready marker before it decides what to give a pod. Read-only
+            # on the MOUNT, never on the volume source below: a read-only PVC
+            # source is staged read-only by the CSI driver and leaves pods stuck in
+            # ContainerCreating. This path is never handed to an AgentBox — each
+            # box gets a subPath-scoped mount of its own agents/<id>/ subtree.
+            - name: code-root
+              mountPath: /app/.siclaw/code-root
+              readOnly: true
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /api/health
@@ -242,5 +260,10 @@ spec:
         - name: user-data
           persistentVolumeClaim:
             claimName: {{ include "siclaw.dataPvcName" . }}
+        {{- end }}
+        {{- if eq (include "siclaw.codeVolume.available" .) "true" }}
+        - name: code-root
+          persistentVolumeClaim:
+            claimName: {{ .Values.agentbox.codeVolume.claimName }}
         {{- end }}
 {{- end }}

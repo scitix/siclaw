@@ -18,6 +18,10 @@
  *   - product_support — managed front-door customer support. Its persisted
  *                       prompt and bound MCP define the intake/result contract;
  *                       built-in filesystem access stays read-only.
+ *   - siforge-agent — managed per-project delivery agent driven by the control
+ *                     plane. Same hands-on capability set as `sre`, plus an optional
+ *                     read-only mount of the project's source trees under
+ *                     `.siclaw/repos` (see docs/design/agentbox-code-volume.md).
  *   - custom      — the legacy free-form agent. Standalone Portal may persist
  *                   an operator's tool_capabilities selection; integrations
  *                   that omit it intentionally retain unrestricted built-ins.
@@ -27,7 +31,7 @@
  * is the built-in type contract; Custom has no built-in contract.
  */
 
-export type AgentType = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "custom";
+export type AgentType = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "siforge-agent" | "custom";
 
 export interface AgentTypeDef {
   label: string;
@@ -249,11 +253,45 @@ export const PRODUCT_SUPPORT_DEFAULT_PROMPT =
   "When the current turn provides a result-submission tool, call it exactly once with a machine-readable outcome that follows its declared schema. " +
   "Do not claim that downstream actions such as ticket creation or human handoff succeeded unless the caller confirms them.";
 
+/**
+ * Public runtime invariant for a managed project delivery agent. The control plane owns
+ * the released business prompt (what a project's environments mean, how to read
+ * the deployment ledger); this layer only states the three facts that belong to
+ * THIS runtime and that the agent cannot discover on its own:
+ *
+ *   1. The source trees under `.siclaw/repos` are a read-only snapshot, one
+ *      top-level directory per `<repo>@<view>` — not a working copy and not a
+ *      git repository (the box image ships no git).
+ *   2. They are reachable ONLY through the file tools. `restricted_bash` runs a
+ *      command whitelist that contains no `ls`/`cat`/`find` and refuses text
+ *      operands containing `/`, so a shell attempt returns a refusal rather
+ *      than an empty result.
+ *   3. `.siclaw/repos/.revision.json` is the authoritative manifest of the
+ *      snapshot. The "Code Repositories" table injected by the knowledge
+ *      overview has a character budget and truncates, so it is a hint, not a
+ *      listing — an agent that trusts it will report a mounted repository as
+ *      absent. The manifest is written by whoever prepares the volume and names
+ *      every directory with the commit it holds.
+ *
+ * See docs/design/agentbox-code-volume.md ("What the agent sees").
+ */
+export const SIFORGE_AGENT_DEFAULT_PROMPT =
+  "You are a project delivery agent. You work hands-on within the clusters and environments of the one " +
+  "project you are bound to: inspect, diagnose, and (only when explicitly asked) remediate. " +
+  "When a read-only snapshot of the project's source is mounted, it appears as top-level directories under " +
+  "`.siclaw/repos`, one per repository-and-view, and is reachable only through the `read`, `grep`, `find` and " +
+  "`ls` tools — it is not a git checkout and the shell cannot reach it. " +
+  "`.siclaw/repos/.revision.json` is the authoritative manifest of that snapshot: read it for the full set of " +
+  "directories and the commit each one holds, and do not treat any repository table in this prompt as complete. " +
+  "Ground every conclusion in the code and the live state you actually read, and say so when the snapshot " +
+  "does not cover what you were asked about.";
+
 const MATERIALIZED_TYPE_PROMPTS: Record<Exclude<AgentType, "custom">, ReadonlySet<string>> = {
   sre: new Set([SRE_DEFAULT_PROMPT]),
   coordinator: new Set([COORDINATOR_DEFAULT_PROMPT, PREVIOUS_COORDINATOR_DEFAULT_PROMPT]),
   knowledge_qa: REPLACED_KNOWLEDGE_QA_DEFAULT_PROMPTS,
   product_support: new Set([PRODUCT_SUPPORT_DEFAULT_PROMPT]),
+  "siforge-agent": new Set([SIFORGE_AGENT_DEFAULT_PROMPT]),
 };
 
 export interface AgentPromptLayers {
@@ -306,6 +344,21 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     defaultPrompt: PRODUCT_SUPPORT_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
+  "siforge-agent": {
+    label: "Project Delivery Agent",
+    description: "Managed per-project delivery agent: inspects the project's clusters with a read-only snapshot of its source at hand.",
+    // Deliberately byte-identical to `sre`. This type is an SRE that additionally
+    // gets its project's source mounted read-only; nothing about the mount changes
+    // which tools it needs, and every rationale on the sre entry above (the
+    // run_commands / spawn_subagents / session_output triangle, and the
+    // transfer_conversation leg) applies here unchanged. Keep the two lists in
+    // step: a divergence here is a capability grant nobody asked for.
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    // The control plane (its released type definition) owns the business
+    // prompt; this is only the runtime invariant, so the two stay single-source.
+    defaultPrompt: SIFORGE_AGENT_DEFAULT_PROMPT,
+    defaultNoSkills: false,
+  },
   custom: {
     label: "Custom Agent",
     description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
@@ -317,7 +370,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
 
 /** Normalize an unknown stored value to a valid AgentType (default custom). */
 export function normalizeAgentType(v: unknown): AgentType {
-  return v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "product_support" ? v : "custom";
+  return v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "product_support" || v === "siforge-agent" ? v : "custom";
 }
 
 /**
@@ -326,9 +379,19 @@ export function normalizeAgentType(v: unknown): AgentType {
  * Unlike normalizeAgentType(), this must never turn missing or future values
  * into the legacy unrestricted Custom harness. Callers that decide which
  * tools enter a model session must fail closed when provenance is absent.
+ *
+ * 🔴 ADDING A TYPE MEANS EDITING THIS LIST BY HAND. The comparison chain below
+ * is a second, independent enumeration of AgentType — widening the union does
+ * NOT make TypeScript flag it here, because every literal it compares against
+ * is still a member. And this function THROWS rather than degrading, so a
+ * forgotten entry does not produce a weaker agent: it makes every session of
+ * that type fail to build (agent-context.ts, gateway/internal-api.ts,
+ * agentbox/local-spawner.ts, portal/cli-snapshot-api.ts all call it). The four
+ * places a new type must appear are the AgentType union, AGENT_TYPES,
+ * normalizeAgentType() and this function; agent-types.test.ts pins all four.
  */
 export function requireAgentType(v: unknown): AgentType {
-  if (v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "product_support" || v === "custom") {
+  if (v === "sre" || v === "coordinator" || v === "knowledge_qa" || v === "product_support" || v === "siforge-agent" || v === "custom") {
     return v;
   }
   throw new Error(`Invalid or missing agent_type: ${String(v)}`);

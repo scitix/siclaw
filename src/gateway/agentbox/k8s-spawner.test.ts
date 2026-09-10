@@ -65,16 +65,39 @@ vi.mock("@kubernetes/client-node", () => {
   return { KubeConfig: FakeKubeConfig, CoreV1Api: FakeCoreV1Api };
 });
 
-// Mock fs.mkdirSync used by ensureUserDir (persistence enabled).
+// Mock fs.mkdirSync used by ensureUserDir (persistence enabled), and make
+// fs.existsSync steerable for the read-only code volume, whose gate is a marker
+// FILE on a volume this process does not have in a test.
+//
+// existsSync consults an opt-in path set and otherwise DELEGATES to the real
+// implementation, so no other suite in this file sees a different filesystem.
+// Every lookup is recorded, which is how the "checked twice" retry contract is
+// asserted — that retry exists for an NFS attribute-cache miss and is otherwise
+// invisible from the outside.
 vi.mock("node:fs", async () => {
   const real = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const g = globalThis as any;
+  g.__fakeExistingPaths = new Set<string>();
+  g.__fsExistsCalls = [] as string[];
+  g.__onExistsSync = undefined as ((p: string) => void) | undefined;
+  const existsSync = ((p: any, ...rest: any[]) => {
+    const key = String(p);
+    g.__fsExistsCalls.push(key);
+    const hit = g.__fakeExistingPaths.has(key);
+    // Fired AFTER the verdict is read, so a hook that creates the file models a
+    // file appearing BETWEEN two looks rather than during one.
+    g.__onExistsSync?.(key);
+    return hit ? true : (real.existsSync as any)(p, ...rest);
+  }) as typeof real.existsSync;
   return {
     ...real,
     default: {
       ...real,
       mkdirSync: vi.fn((_p: string, _o?: any) => undefined as any),
+      existsSync,
     },
     mkdirSync: vi.fn((_p: string, _o?: any) => undefined as any),
+    existsSync,
   };
 });
 
@@ -1127,6 +1150,159 @@ describe("K8sSpawner — per-agent persistence (PVC override)", () => {
     expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
     expect(userDataVolume().emptyDir).toEqual({});
     expect(userDataMount().subPath).toBeUndefined();
+  });
+});
+
+describe("K8sSpawner — read-only code volume", () => {
+  // The contract this suite pins lives in docs/design/agentbox-code-volume.md.
+  const READY = "/app/.siclaw/code-root/agents/proj-a/.ready";
+
+  function readReturnsRunningAfter404() {
+    let r = 0;
+    readPodImpl.fn = async () => {
+      r++;
+      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { name: "agentbox-proj-a", labels: {} },
+      };
+    };
+  }
+
+  function podBody() {
+    return calls.createNamespacedPod[0].body;
+  }
+  function volumeNames(): string[] {
+    return (podBody().spec.volumes as any[]).map((v) => v.name);
+  }
+  function mounts(): any[] {
+    return podBody().spec.containers[0].volumeMounts as any[];
+  }
+  function codeMount() {
+    return mounts().find((m) => m.name === "code");
+  }
+  function readyLookups(): string[] {
+    return (g.__fsExistsCalls as string[]).filter((p) => p.endsWith("/.ready"));
+  }
+
+  beforeEach(() => {
+    g.__fakeExistingPaths.clear();
+    g.__fsExistsCalls.length = 0;
+    g.__onExistsSync = undefined;
+    readReturnsRunningAfter404();
+  });
+
+  afterEach(() => {
+    g.__onExistsSync = undefined;
+  });
+
+  it("no code claim configured → the pod is unchanged and the volume is never consulted", async () => {
+    // The regression this guards is not "the mount is wrong", it is "a
+    // deployment that never opted in got a different pod". Assert the FULL
+    // volume/mount shape rather than the absence of one name, and assert that
+    // the marker was not even looked for — the claim check must short-circuit
+    // before any filesystem work.
+    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
+    s.setCertManager(new FakeCertManager() as any);
+
+    await s.spawn({ agentId: "proj-a" });
+
+    expect(volumeNames()).toEqual([
+      "credentials", "config", "skills-local", "knowledge-local", "user-data", "client-cert", "tmp",
+    ]);
+    expect(mounts().map((m) => m.mountPath)).toEqual([
+      "/app/.siclaw/credentials",
+      "/app/.siclaw/config",
+      "/app/.siclaw/skills",
+      "/app/.siclaw/knowledge",
+      "/app/.siclaw/user-data",
+      "/etc/siclaw/certs",
+      "/tmp",
+    ]);
+    expect(readyLookups()).toEqual([]);
+  });
+
+  it("code claim + ready marker → read-only mount at the repos dir, scoped by subPath", async () => {
+    g.__fakeExistingPaths.add(READY);
+    const s = new K8sSpawner({ codeVolume: { claimName: "siforge-code" } });
+    s.setCertManager(new FakeCertManager() as any);
+
+    await s.spawn({ agentId: "proj-a" });
+
+    const vol = (podBody().spec.volumes as any[]).find((v) => v.name === "code");
+    expect(vol.persistentVolumeClaim).toEqual({ claimName: "siforge-code" });
+    // 🔴 readOnly on the volume SOURCE stages the CSI volume read-only and hangs
+    // the pod in ContainerCreating until the spawn deadline. It belongs on the
+    // mount, and only on the mount.
+    expect(vol.persistentVolumeClaim.readOnly).toBeUndefined();
+    expect(vol.readOnly).toBeUndefined();
+
+    expect(codeMount()).toEqual({
+      name: "code",
+      mountPath: "/app/.siclaw/repos",
+      subPath: "agents/proj-a",
+      readOnly: true,
+    });
+    // The mount path must stay the configured reposDir: that directory is
+    // already in the file tools' read whitelist and already scanned into the
+    // system prompt, which is why the box itself needs no change.
+    expect(codeMount().mountPath).toBe("/app/.siclaw/repos");
+  });
+
+  it("code claim but no ready marker → no volume, no mount, and the marker is checked twice", async () => {
+    const s = new K8sSpawner({ codeVolume: { claimName: "siforge-code" } });
+    s.setCertManager(new FakeCertManager() as any);
+
+    await s.spawn({ agentId: "proj-a" });
+
+    expect(volumeNames()).not.toContain("code");
+    expect(codeMount()).toBeUndefined();
+    // kubelet would happily CREATE the missing subPath directory, so an
+    // unchecked mount hands the agent an empty tree it cannot tell from a
+    // codebase that says nothing. The retry is the NFS attribute-cache hedge.
+    expect(readyLookups()).toEqual([READY, READY]);
+  });
+
+  it("a marker that appears between the two looks is honoured (NFS attribute-cache hedge)", async () => {
+    g.__onExistsSync = (p: string) => { if (p === READY) g.__fakeExistingPaths.add(READY); };
+    const s = new K8sSpawner({ codeVolume: { claimName: "siforge-code" } });
+    s.setCertManager(new FakeCertManager() as any);
+
+    await s.spawn({ agentId: "proj-a" });
+
+    expect(readyLookups()).toEqual([READY, READY]);
+    expect(codeMount()?.subPath).toBe("agents/proj-a");
+  });
+
+  it("the agent directory is sanitized exactly like the user-data subPath", async () => {
+    // The supplier writes these directory names from its own side of the wire;
+    // the two must agree character for character or the mount silently points
+    // at a directory nobody fills.
+    g.__fakeExistingPaths.add("/app/.siclaw/code-root/agents/proj_a_b/.ready");
+    const s = new K8sSpawner({
+      codeVolume: { claimName: "siforge-code" },
+      persistence: { enabled: true, claimName: "siclaw-data" },
+    });
+    s.setCertManager(new FakeCertManager() as any);
+
+    await s.spawn({ agentId: "proj/a b" });
+
+    const userData = mounts().find((m) => m.name === "user-data");
+    expect(codeMount().subPath).toBe("agents/proj_a_b");
+    expect(codeMount().subPath).toBe(userData.subPath);
+  });
+
+  it("the code volume is independent of persistence — either can be on without the other", async () => {
+    g.__fakeExistingPaths.add(READY);
+    const s = new K8sSpawner({ codeVolume: { claimName: "siforge-code" } });
+    s.setCertManager(new FakeCertManager() as any);
+
+    await s.spawn({ agentId: "proj-a" });
+
+    const userData = (podBody().spec.volumes as any[]).find((v) => v.name === "user-data");
+    expect(userData.emptyDir).toEqual({});
+    expect(userData.persistentVolumeClaim).toBeUndefined();
+    expect(codeMount()).toBeTruthy();
   });
 });
 

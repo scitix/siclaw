@@ -2,7 +2,7 @@
 // capability set and provide an immutable type contract. The Portal edits only
 // an optional Agent Addendum; it never replaces that contract.
 
-export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "custom"
+export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "siforge-agent" | "custom"
 
 export interface AgentTypeOption {
   key: AgentTypeKey
@@ -42,6 +42,13 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     description: "Answers product questions and prepares structured customer-support handoffs through its bound result tool.",
     capabilities: ["read_files"],
     defaultNoSkills: true,
+  },
+  {
+    key: "siforge-agent",
+    label: "Project Delivery Agent",
+    description: "Managed per-project delivery agent: inspects the project's clusters with a read-only snapshot of its source at hand.",
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    defaultNoSkills: false,
   },
   {
     key: "custom",
