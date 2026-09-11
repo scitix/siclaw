@@ -54,6 +54,26 @@ describe("Runtime sandbox deployment gate", () => {
     expect(constructed.k8s).toHaveBeenCalledOnce(); expect(prewarm).toHaveBeenCalledOnce();
     await api.shutdown();
   });
+
+  it.each([30, 120])("publishes only public execution budgets with a %ss timeout ceiling", async maximum => {
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_ENABLED", "true");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVIDER", "k8s");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_IMAGE", "runner:private-deployment");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_MAX_TIMEOUT_SECONDS", String(maximum));
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_MAX_TOOL_CALLS", "12");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_MAX_OUTPUT_BYTES", "8192");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_REQUIRE_NETWORK_ISOLATION", "true");
+    vi.spyOn(ScriptSandboxPool.prototype, "prewarm").mockImplementation(() => {});
+    const api = createScriptSandboxApi("k8s", { request: vi.fn() });
+    try {
+      expect(await request(api, "GET")).toEqual({ status: 200, body: {
+        enabled: true, network_isolation: true, require_network_isolation: true,
+        limits: { default_timeout_seconds: Math.min(60, maximum), max_timeout_seconds: maximum,
+          max_tool_calls: 12, max_output_bytes: 8192 },
+      } });
+      expect((await request(api, "GET", false)).status).toBe(401);
+    } finally { await api.shutdown(); }
+  });
 });
 
 describe("current caller binding", () => {

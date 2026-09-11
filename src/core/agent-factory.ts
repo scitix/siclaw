@@ -74,6 +74,7 @@ import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateR
 
 export interface CreateSiclawSessionOpts {
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
+  scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
@@ -553,6 +554,7 @@ export async function createSiclawSession(
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
       scriptExecutor: opts?.scriptExecutor,
+      scriptSandboxInfo: opts?.scriptSandboxInfo,
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,

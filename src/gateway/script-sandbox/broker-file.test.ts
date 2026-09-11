@@ -54,3 +54,29 @@ it("uses the real MCP client with bounded large, fully sanitized file results", 
   text = "x".repeat(4 * 1024 * 1024);
   await expect(broker.call(principal(), scope, call, signal())).rejects.toThrow();
 });
+
+it("keeps the fixed SDK MCP result shape and original tool name, with service arguments supplied outside the runner", async () => {
+  const calls: unknown[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init: RequestInit) => {
+    if (init.method !== "POST") return new Response(null, { status: 405 });
+    const body = JSON.parse(String(init.body));
+    if (body.id === undefined) return new Response(null, { status: 202 });
+    let result: unknown;
+    if (body.method === "initialize") result = { protocolVersion: body.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } };
+    else {
+      expect(body.method).toBe("tools/call");
+      calls.push(body.params);
+      result = { content: [{ type: "text", text: '{"count":2}' }], structuredContent: { count: 2 }, isError: false };
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), { headers: { "content-type": "application/json" } });
+  }));
+  const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent" ? { status: "active" } :
+    { user_id: "u", mcp: { transport: "streamable-http", url: "https://fixture.example/mcp", headers: { Authorization: "Bearer private-fixture-credential" } } }) };
+  const broker = new ReadOnlyScriptBroker(rpc, config());
+  for (const delivery of [undefined, "file"] as const) {
+    const result = await broker.call(principal(), scope, { id: "query", tool: "mcp.call", arguments: { server: "metrics", tool: "query", arguments: { query: "up" } }, delivery }, signal());
+    expect(result).toEqual({ content: [{ type: "text", text: '{"count":2}' }], structuredContent: { count: 2 }, isError: false });
+    expect(JSON.stringify(result)).not.toMatch(/private-fixture|tenant|fixture.example/);
+  }
+  expect(calls).toEqual(Array(2).fill({ name: "query", arguments: { query: "up", tenant: "fixture" } }));
+});

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ToolRegistry, type ToolRefs } from "../../core/tool-registry.js";
 import { registration } from "./run-script.js";
+import { Value } from "@sinclair/typebox/value";
 
 function refs(overrides: Partial<ToolRefs> = {}): ToolRefs {
   return { kubeconfigRef: {}, userId: "u", agentId: "a", sessionIdRef: { current: "s" }, memoryRef: {}, dpStateRef: { active: false }, ...overrides };
@@ -13,6 +14,16 @@ describe("model-visible script tool", () => {
   });
   it.each(["cli", "channel", "api", "task"] as const)("is absent in %s even with an executor", mode => {
     expect(registry().resolve({ mode, refs: refs({ scriptExecutor: vi.fn() }) })).toEqual([]);
+  });
+  it("exposes the Runtime timeout ceiling and default in the model's executable schema", () => {
+    const [tool] = registry().resolve({ mode: "web", refs: refs({ scriptExecutor: vi.fn(), scriptSandboxInfo: {
+      enabled: true, network_isolation: true, require_network_isolation: true,
+      limits: { default_timeout_seconds: 30, max_timeout_seconds: 45, max_tool_calls: 8, max_output_bytes: 8192 },
+    } }) });
+    const request = { language: "python", code: "print(1)" };
+    expect(Value.Check(tool.parameters, { ...request, timeout_seconds: 45 })).toBe(true);
+    expect(Value.Check(tool.parameters, { ...request, timeout_seconds: 46 })).toBe(false);
+    expect(Value.Default(tool.parameters, { ...request })).toMatchObject({ timeout_seconds: 30 });
   });
   it.each(["python", "shell"] as const)("is usable with the published %s schema and returns the execution result", async language => {
     const result = { status: "completed", exit_code: 0, stdout: "node-a 8\n", tool_calls: 1 };

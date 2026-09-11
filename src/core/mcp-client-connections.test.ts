@@ -192,6 +192,83 @@ describe("McpClientManager closes clients that fail after the transport is up", 
   });
 });
 
+describe("McpClientManager paginated tool inventory", () => {
+  const tool = (name: string) => ({ name, inputSchema: { type: "object", properties: {} } });
+  async function paginated(page: (params: any) => unknown) {
+    const requests: any[] = [];
+    const url = await listen((req, body, res) => {
+      if (req.method !== "POST") { res.writeHead(405).end(); return; }
+      const message = JSON.parse(body);
+      if (message.method !== "tools/list") { fakeMcpServer([])(req, body, res); return; }
+      requests.push(message.params);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, ...page(message.params) as object }));
+    });
+    const manager = new McpClientManager({ mcpServers: { metrics: { transport: "streamable-http", url } } });
+    await manager.initialize();
+    return { manager, requests };
+  }
+
+  it("publishes second-page tool descriptions and complete schemas to the main Agent", async () => {
+    const schema = { type: "object", properties: { query: { type: "string" }, limit: { type: "integer", minimum: 1 } }, required: ["query"], additionalProperties: false };
+    const { manager, requests } = await paginated(params => ({ result: params?.cursor
+      ? { tools: [{ name: "query", description: "Read metric samples", inputSchema: schema }] }
+      : { tools: [tool("status")], nextCursor: "page-2" } }));
+    try {
+      expect(requests).toEqual([undefined, { cursor: "page-2" }]);
+      expect(manager.getTools().map(t => t.name)).toEqual(["mcp__metrics__status", "mcp__metrics__query"]);
+      expect(manager.getTools()[1]).toMatchObject({ description: "Read metric samples", parameters: schema });
+      expect(manager.getServerConnections()[0]).toMatchObject({ state: "connected", toolCount: 2, toolNames: ["query", "status"] });
+    } finally { await manager.shutdown(); }
+  });
+
+  it.each(["later-page-error", "repeated-cursor", "duplicate-name", "tool-budget", "byte-budget", "page-budget"])("fails closed without a partial inventory on %s", async failure => {
+    let pages = 0;
+    const { manager, requests } = await paginated(() => {
+      pages++;
+      if (pages === 1) return { result: { tools: [tool("first")], nextCursor: "next" } };
+      if (failure === "later-page-error") return { error: { code: -32603, message: "Discovery unavailable" } };
+      if (failure === "repeated-cursor") return { result: { tools: [], nextCursor: "next" } };
+      if (failure === "duplicate-name") return { result: { tools: [tool("first")] } };
+      if (failure === "tool-budget") return { result: { tools: Array.from({ length: 1000 }, (_, i) => tool(`tool-${i}`)) } };
+      if (failure === "byte-budget") return { result: { tools: [{ ...tool("large"), description: "x".repeat(4 * 1024 * 1024) }] } };
+      return { result: { tools: [], nextCursor: `page-${pages}` } };
+    });
+    try {
+      expect(manager.getTools()).toEqual([]);
+      expect(manager.getServerConnections()[0]).toMatchObject({ state: "failed", toolCount: 0, error: { kind: "protocol" } });
+      expect(requests).toHaveLength(failure === "page-budget" ? 32 : 2);
+    } finally { await manager.shutdown(); }
+  });
+
+  it("does not fetch another page or publish tools after shutdown during pagination", async () => {
+    let release!: () => void;
+    let reached!: () => void;
+    const waiting = new Promise<void>(resolve => { reached = resolve; });
+    let pages = 0;
+    const url = await listen((req, body, res) => {
+      if (req.method !== "POST") { res.writeHead(405).end(); return; }
+      const message = JSON.parse(body);
+      if (message.method !== "tools/list") { fakeMcpServer([])(req, body, res); return; }
+      pages++;
+      const reply = () => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [tool(`tool-${pages}`)], nextCursor: `page-${pages}` } }));
+      };
+      if (pages === 2) { release = reply; reached(); } else reply();
+    });
+    const manager = new McpClientManager({ mcpServers: { metrics: { transport: "streamable-http", url } } });
+    const initializing = manager.initialize();
+    await waiting;
+    await manager.shutdown();
+    release();
+    await initializing;
+    expect(pages).toBe(2);
+    expect(manager.getTools()).toEqual([]);
+    expect(manager.getServerConnections()[0]).toMatchObject({ state: "failed", error: { kind: "timeout" } });
+  });
+});
+
 describe("McpClientManager.shutdown during initialize", () => {
   it("closes a connection that completes after shutdown instead of leaking it", async () => {
     let handshakes = 0;

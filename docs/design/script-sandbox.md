@@ -96,6 +96,31 @@ fixed Kubernetes GET implementation, or remote inspection helper.
 | `pod_exec` | Existing `createPodExecTool` and its Pod command policy, with a remote timeout. The target container must provide `timeout`. |
 | `mcp.call` | Shared `createMcpToolDefinition`; bound server/tool authorization and fixed resource arguments apply before dispatch. |
 
+The main Agent obtains MCP names, descriptions and parameter schemas through its
+existing MCP tool inventory. Discovery follows `tools/list` pagination before
+publishing a server's inventory. Repeated cursors, duplicate names, a later-page
+failure, or the 32-page/1,000-tool/4-MiB/30-second discovery budget fail the server's
+discovery without publishing a partial list. These are transport safety budgets,
+not an additional schema copy for scripts.
+It writes the complete orchestration script from
+that information. The runner SDK exposes fixed `call`, `call_to_file` and Shell
+entry points; it does not discover tools, generate per-tool wrappers, or rewrite
+scripts at execution time. An Agent tool named `mcp__metrics__query` maps to SDK
+operation `mcp.call` with `server: "metrics"`, `tool: "query"`, and `arguments`
+matching that MCP tool's schema. The run must declare the same server/tool.
+
+MCP returns its standard `content`, optional `structuredContent`, and `isError`,
+not the Bash `text` envelope. Check `isError`, prefer `structuredContent` when
+present, and otherwise interpret text content using the tool's documented format.
+SDK file delivery stores this same MCP result shape without a new wrapper.
+Knowing a tool's schema does not grant permission to execute it: the broker
+still checks the current binding and reviewed operation policy.
+
+The sandbox-only capability selection intentionally suppresses direct MCP tool
+injection. It does not have the ordinary Agent's MCP inventory; required schemas
+must already be supplied in its task/context. This remains a distinct limitation,
+not a reason to add discovery or credential access inside the runner.
+
 Command acceptance is owned by the normal built-in implementations. Their
 existing `preExecSecurity` and `postExecSecurity` paths run once at execution;
 the SDK does not maintain an additional command/flag/file list. The trusted
@@ -153,7 +178,33 @@ There is no package installation or direct production credential access.
 
 The model receives the SDK imports, operation arguments, result contract and
 filesystem guidance through the registered `run_script` tool description and
-parameter schema. Its working directory is `/work`; scripts can create, read,
+parameter schema. This compact contract reuses the main Agent's existing MCP
+schemas without copying them into `run_script` or generating SDK functions.
+Detailed examples and architecture remain in this document, outside the model's
+tool description. A representative serialization including the parameter schema
+is 962 tokens with `o200k_base` (949 with `cl100k_base`), down from 1,008 (1,000)
+before the planning/budget update. These counts exclude provider-specific tool
+wrapping, other tools and conversation history; prompt caching does not remove
+context occupancy.
+
+For a remote batch, reuse an already successful representative sample or make
+one ordinary direct tool call to check arguments, authorization and result
+shape. Then write the complete script. When direct tools are unavailable, check
+the first SDK response in that script before continuing the batch. Prefer a
+bulk query or existing input over repeated remote queries, validate required
+fields, and report per-resource errors alongside successes. This is planning
+guidance, not an extra permission gate or an unconditional probe per request.
+
+The existing authenticated Runtime capability endpoint publishes only public
+timeout, SDK call and stdout/stderr budgets plus network-isolation defaults.
+AgentBox projects these fields into the tool description and timeout schema;
+provider configuration and credentials are never forwarded. Missing budgets
+from an older Runtime use conservative guidance, and Runtime still enforces its
+limits independently. Batch planning must account for sequential SDK operations
+and node diagnostic startup/cleanup; a command's own timeout is not the whole
+callback duration.
+
+Its working directory is `/work`; scripts can create, read,
 modify and delete their own work files and use `/tmp` for scratch space. These
 local operations need no SDK call. Files disappear after the run and are not
 shared with later runs. Native Kubernetes runners have a read-only image root,

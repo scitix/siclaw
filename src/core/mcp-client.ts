@@ -10,6 +10,7 @@
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type ResolvedToolDefinition } from "./tool-registry.js";
+import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,6 +58,10 @@ const MCP_STDIO_FORWARDED_ENV = [
 ] as const;
 const DEFAULT_VISUAL_EXPORT_TIMEOUT_MS = 60_000;
 const VISUAL_EXPORT_MCP_GRACE_MS = 5_000;
+const MCP_DISCOVERY_MAX_PAGES = 32;
+const MCP_DISCOVERY_MAX_TOOLS = 1000;
+const MCP_DISCOVERY_MAX_BYTES = 4 * 1024 * 1024;
+const MCP_DISCOVERY_TIMEOUT_MS = 30_000;
 
 /**
  * Optionally forward the platform-owned renderer contract into a bundled stdio MCP.
@@ -488,8 +493,35 @@ export class McpClientManager {
         console.log(`[mcp-client] Connected to "${serverName}" (${detectedTransport})`);
         const serverImplementationName = client.getServerVersion()?.name;
 
-        // Discover tools
-        const { tools: mcpTools } = await client.listTools();
+        // Publish a complete per-server inventory. A failed later page must not
+        // leave a partial tool set that silently hides capabilities from the model.
+        const mcpTools: McpTool[] = [];
+        const names = new Set<string>();
+        const cursors = new Set<string>();
+        const discoverySignal = AbortSignal.timeout(MCP_DISCOVERY_TIMEOUT_MS);
+        let cursor: string | undefined;
+        let schemaBytes = 0;
+        for (let page = 0; page < MCP_DISCOVERY_MAX_PAGES; page++) {
+          const result = await client.listTools(cursor ? { cursor } : undefined, { signal: discoverySignal });
+          if (this.disposed) break;
+          schemaBytes += Buffer.byteLength(JSON.stringify(result.tools));
+          if (schemaBytes > MCP_DISCOVERY_MAX_BYTES || mcpTools.length + result.tools.length > MCP_DISCOVERY_MAX_TOOLS) {
+            throw Object.assign(new Error("MCP tool inventory exceeds discovery budget"), { name: "ProtocolError" });
+          }
+          for (const tool of result.tools) {
+            if (!tool.name || names.has(tool.name)) {
+              throw Object.assign(new Error("MCP tool inventory contains missing or duplicate names"), { name: "ProtocolError" });
+            }
+            names.add(tool.name);
+            mcpTools.push(tool);
+          }
+          if (!result.nextCursor) break;
+          cursor = result.nextCursor;
+          if (cursor.length > 4096 || cursors.has(cursor) || page + 1 === MCP_DISCOVERY_MAX_PAGES) {
+            throw Object.assign(new Error("MCP tool pagination is invalid or exceeds discovery budget"), { name: "ProtocolError" });
+          }
+          cursors.add(cursor);
+        }
         if (this.disposed) {
           await this.closeLate(serverName, client, startedAt, detectedTransport);
           continue;

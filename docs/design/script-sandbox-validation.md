@@ -1,5 +1,32 @@
 # Script sandbox validation — 2026-09-11
 
+## Compact planning contract and complete MCP inventory
+
+The model contract now recommends reusing a successful sample or validating one
+direct call before batching, then writing a complete script with per-resource
+error handling. Runtime's public capability response supplies the actual timeout,
+SDK-call and stdout/stderr budgets; AgentBox projects only these public fields
+into the tool contract. A 120-second deployment ceiling is now represented in
+the timeout parameter rather than the generic 600-second maximum.
+
+The fixed SDK reuses the main Agent's MCP schemas. MCP discovery now follows
+pagination and rejects duplicate/cyclic or over-budget inventories without
+publishing a partial list. Real local HTTP MCP tests cover a second page's full
+schema, later-page failure, shutdown and discovery limits. The shared MCP client
+also preserves the same standard result envelope through inline/file delivery
+while applying service-owned fixed arguments outside the runner.
+
+The complete representative `run_script` JSON definition shrank from 4,689 to
+4,368 characters: 1,008 to 962 tokens with `o200k_base`, or 1,000 to 949 with
+`cl100k_base`. The description alone is 3,220 characters / 700 `o200k_base`
+tokens. Counts exclude provider framing and other conversation/tool content;
+no MCP schemas are duplicated in this definition.
+
+Verification: 7,379 tests passed with two existing skips across 356 files; main
+and AgentBox TypeScript checks and backend build passed. This contract update
+has not been redeployed or rechecked with a live model; the fresh-image results
+below remain tied to `b01205a6`. No runner SDK or companion API code changed.
+
 ## Review fixes: fresh-image model acceptance
 
 Runtime, AgentBox and runner images built from `b01205a6`, including the review
@@ -30,8 +57,10 @@ code or changing the Agent prompt:
 The deployed AgentBox tool definition includes local file rules, Python/Shell
 SDK entry points, operation arguments, `input_data()` and result-file semantics.
 Tool metadata teaches the model how to operate; container and shared-tool
-enforcement remains independent of model compliance. MCP has a generic invocation
-contract here; dynamic publication of each MCP tool's schema is not implemented.
+enforcement remains independent of model compliance. The `run_script` description
+uses a generic MCP invocation contract; ordinary Agents already receive individual
+schemas through the existing MCP tool inventory. Sandbox-only Agents suppress
+that inventory and need the relevant schemas in their task/context.
 
 All seven results were recovered unchanged from the history API. Observed cold
 runner startup was 1,043–1,579 ms (median 1,375 ms), with no warm pool; these are

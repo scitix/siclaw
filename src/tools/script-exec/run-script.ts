@@ -4,31 +4,36 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { validateScriptRequest } from "../../script-sandbox/validation.js";
 
 export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
+  const info = refs.scriptSandboxInfo;
+  const limits = info?.limits;
+  const budget = limits
+    ? `Per run: default ${limits.default_timeout_seconds}s, max ${limits.max_timeout_seconds}s after startup; ${limits.max_tool_calls} SDK calls; ${limits.max_output_bytes} stdout/stderr bytes. `
+    : "Runtime budgets unavailable; use small batches and conservative timeouts. ";
+  const network = info?.require_network_isolation ? "required" : info?.network_isolation ? "on by default" : "off by default";
   return {
     name: "run_script", label: "Run Script",
-    description: "Prefer direct built-in tools for simple diagnostics. Use this for multi-step aggregation or batch processing. Run Python stdlib or Bash in a disposable container. No production credentials, AgentBox/host files or package installation. " +
-      "The working directory is /work. You may create, read, update and delete your own files in /work and use /tmp for scratch data, subject to storage, memory and execution limits. Files exist only for this run and cannot be shared with later runs. Treat image and SDK files as read-only. " +
-      "Local Python/Shell file processing needs no SDK call. To access a cluster, host, Pod or MCP service, use the SDK tools below; local file access does not grant access to remote files or production credentials. " +
-      "Python: from siclaw import call, call_to_file, input_data. " +
-      "input_data() is a zero-argument function that returns the input parameter as a decoded JSON value; omitted or null input returns None. " +
-      "Example with input {\"numbers\": [1, 2, 3]}:\n```python\nfrom siclaw import input_data\npayload = input_data()\nprint(sum(payload[\"numbers\"]))\n```\n" +
-      "Shell: siclaw-tool TOOL JSON; read the input JSON from $SICLAW_INPUT_FILE. " +
-      "Large results: call_to_file(TOOL, ARGS, '/work/result.json') or siclaw-tool --output /work/result.json TOOL JSON saves complete sanitized JSON and returns only path/bytes/checksum. " +
-      "Inline results are capped at 128 KiB; file results at 4 MiB each and 16 MiB per run. Read/process files inside the same run and print only the final summary; files disappear afterward. " +
-      "SDK operations call the Agent's existing tools with their normal command policies: bash {cluster,command,timeout_seconds?}, host_exec {host,command,timeout_seconds?}, node_exec {cluster,node,command,timeout_seconds?}, pod_exec {cluster,namespace?,pod,container?,command,timeout_seconds?}. " +
-      "Use bash for all Kubernetes queries, for example kubectl get nodes -o json, kubectl describe pod NAME -n NAMESPACE, or kubectl logs NAME -n NAMESPACE --tail=100. Follow the existing tool's whitelist, rate limits and output sanitization; there is no separate sandbox Kubernetes API or command whitelist. " +
-      "These tools require run_commands and an explicit declared cluster or host. Tool timeouts are 1-15 seconds; background execution and image/credential overrides are unavailable. node_exec needs an explicit node and creates a managed diagnostic Job: at most 10 concurrent node callbacks per Runtime and 10 diagnostic Pods per target cluster. pod_exec needs timeout in the target container. " +
-      "mcp.call {server,tool,arguments} uses the shared Agent MCP implementation with service-authorized tools and resource arguments. Declare each resource in the run scope. " +
-      "Use exact bound resource names supplied by the user or available context; if discovery tools are unavailable, ask for missing names. Do not guess names or read credential files. " +
-      "Built-in command results contain text (sanitized stdout only), stderr, notices, exit_code and exit_class. For kubectl -o json, parse result['text'] as JSON; warnings and redaction notices are separate. call_to_file saves the same result envelope. Inspect exit_class and notices before treating output as complete; failed/truncated calls are rejected. File delivery does not bypass the tool's limits: logs are bounded windows. " +
-      "Access is reauthorized for every call and result chunk. Cluster declarations name bound resources; namespace/resource permissions remain with the existing tools and the credential's Kubernetes RBAC. Never embed secrets in code/input. Network isolation defaults off unless configured or required by the administrator; " +
-      "when on, socket creation is denied, including SSH/HTTP from subprocesses. Controlled tools work over pipes in both modes.",
+    description: "Run Python stdlib or Bash in a disposable container for batch orchestration and aggregation. Prefer direct tools for simple tasks. " +
+      "Before batching, reuse a successful sample or validate one representative direct tool call for arguments, authorization and output shape. If direct tools are unavailable, validate the first SDK result before continuing the batch. " +
+      "Write the complete script from known tool schemas; avoid sandbox probes. Reuse existing input or one bulk query for local processing. Validate fields, catch per-resource errors, report successes and failures; do not retry denials or blindly repeat batches. " +
+      budget + "SDK calls are sequential; include diagnostic startup/cleanup in the budget and split batches beforehand. " +
+      "No production credentials, AgentBox/host files or package installation. /work and /tmp are writable scratch space within storage/memory limits; files vanish after this run. Image/SDK files are read-only. Local file processing needs no SDK. " +
+      "Python: from siclaw import call, call_to_file, input_data. input_data() takes no arguments and returns decoded input JSON (None if omitted/null). Example for input {\"numbers\":[1,2,3]}: payload = input_data(); print(sum(payload[\"numbers\"])). " +
+      "call(TOOL, ARGS) returns a result; call_to_file(TOOL, ARGS, '/work/result.json') saves the same sanitized JSON envelope and returns path/bytes/checksum. Shell: siclaw-tool TOOL JSON; siclaw-tool --output /work/result.json TOOL JSON; input is $SICLAW_INPUT_FILE. " +
+      "Inline results: 128 KiB; files: 4 MiB each, 16 MiB/run. Process files here and print a concise final summary. File delivery retains tool output limits; logs are bounded windows. " +
+      "Remote access uses existing Agent tools and their policies: bash {cluster,command,timeout_seconds?}, host_exec {host,command,timeout_seconds?}, node_exec {cluster,node,command,timeout_seconds?}, pod_exec {cluster,namespace?,pod,container?,command,timeout_seconds?}. " +
+      "Declare bound clusters/hosts; these calls require run_commands. Use bash for kubectl queries. Command timeout: 1-15s; no background or image/credential overrides. node_exec creates a managed diagnostic Job; pod_exec requires timeout in the target container. " +
+      "Command results: text (sanitized stdout), stderr, notices, exit_code, exit_class. Parse text for kubectl JSON; inspect exit_class/notices for completeness. Failed/truncated calls are rejected. " +
+      "MCP: use the main Agent's existing tool schemas. mcp__metrics__query maps to call('mcp.call', {'server':'metrics','tool':'query','arguments':{...}}), with mcp:[{server:'metrics',tools:['query']}] declared. tool is the original MCP name. SDK entry points are fixed; no discovery or generated wrappers. " +
+      "MCP results have content, optional structuredContent, and isError, not command text. Check isError; prefer structuredContent, otherwise parse text content per that tool's format. " +
+      "Every call/chunk reauthorizes the caller and declared resources; existing tool policies and credential RBAC apply. Use known bound names; ask if missing. Never embed secrets. " +
+      `Network isolation: ${network}. When on, sockets (including subprocess SSH/HTTP) are denied; SDK tools work over pipes.`,
     parameters: Type.Object({
       language: Type.Union([Type.Literal("python"), Type.Literal("shell")]), code: Type.String({ maxLength: 131072 }),
       input: Type.Optional(Type.Unknown({
         description: "JSON value supplied to this script. Python reads it by calling input_data() with no arguments; Shell reads $SICLAW_INPUT_FILE. Omitted or null input becomes Python None.",
       })), network_isolation: Type.Optional(Type.Boolean()),
-      timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
+      timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: limits?.max_timeout_seconds ?? 600,
+        ...(limits ? { default: limits.default_timeout_seconds } : {}), description: "Execution budget after runner startup. Include sequential SDK calls and diagnostic cleanup; choose a batch that fits this limit." })),
       clusters: Type.Optional(Type.Array(Type.Object({ name: Type.String() }, { additionalProperties: false }))),
       hosts: Type.Optional(Type.Array(Type.String())),
       mcp: Type.Optional(Type.Array(Type.Object({ server: Type.String(), tools: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false }))),

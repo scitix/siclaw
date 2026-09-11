@@ -33,7 +33,13 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
     async handle(req: IncomingMessage, res: ServerResponse, identity: CertificateIdentity | undefined): Promise<void> {
       const send = (status: number, value: unknown) => { if (!res.destroyed) { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); } };
       if (!identity) { send(401, { error: "Client identity required" }); return; }
-      if (req.method === "GET") { send(200, { enabled: !!service, network_isolation: config.requireNetworkIsolation || config.networkIsolation, require_network_isolation: config.requireNetworkIsolation }); return; }
+      if (req.method === "GET") {
+        send(200, { enabled: !!service, network_isolation: config.requireNetworkIsolation || config.networkIsolation,
+          require_network_isolation: config.requireNetworkIsolation,
+          ...(service ? { limits: { default_timeout_seconds: Math.min(60, config.maxTimeoutSeconds),
+            max_timeout_seconds: config.maxTimeoutSeconds, max_tool_calls: config.maxToolCalls, max_output_bytes: config.maxOutputBytes } } : {}) });
+        return;
+      }
       if (!service) { send(503, { error: "Script sandbox is disabled" }); return; }
       const controller = new AbortController();
       const abort = () => controller.abort();

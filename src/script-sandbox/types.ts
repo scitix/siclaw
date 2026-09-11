@@ -46,6 +46,19 @@ export interface ScriptToolCall {
 
 export type ScriptExecutor = (request: ScriptRequest, sessionId: string, signal?: AbortSignal) => Promise<ScriptResult>;
 
+/** Public execution budgets only; provider configuration and credentials stay in Runtime. */
+export interface ScriptSandboxInfo {
+  enabled: boolean;
+  network_isolation: boolean;
+  require_network_isolation: boolean;
+  limits?: {
+    default_timeout_seconds: number;
+    max_timeout_seconds: number;
+    max_tool_calls: number;
+    max_output_bytes: number;
+  };
+}
+
 export interface ScriptSandboxConfig {
   enabled: boolean;
   provider: "k8s" | "docker" | "e2b";
