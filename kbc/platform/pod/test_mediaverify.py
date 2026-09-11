@@ -28,7 +28,7 @@ class FakeEngine:
         self.users = {"transcribe": [], "compare": []}
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
-                                 model, effort=None, allowed_read_roots, timeout_secs):
+                                 model, effort=None, role=None, allowed_read_roots, timeout_secs):
         if "You are an image transcriber" in system_prompt or "图像转写员" in system_prompt:
             stage = "transcribe"
         elif "You are the comparer" in system_prompt or "比对员" in system_prompt:
@@ -104,13 +104,13 @@ class _PartialEngine(FakeEngine):
     """Transcription fails for one of the two images on the page."""
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
-                                 model, effort=None, allowed_read_roots, timeout_secs):
+                                 model, effort=None, role=None, allowed_read_roots, timeout_secs):
         if ("You are an image transcriber" in system_prompt or "图像转写员" in system_prompt) \
                 and "s/bad.png" in user_message:
             raise RuntimeError("vision API choked")
         return await super().run_readonly_agent(
             cwd=cwd, system_prompt=system_prompt, user_message=user_message, model=model,
-            effort=effort, allowed_read_roots=allowed_read_roots, timeout_secs=timeout_secs)
+            effort=effort, role=role, allowed_read_roots=allowed_read_roots, timeout_secs=timeout_secs)
 
 
 async def test_partial_transcription_skips_comparison():

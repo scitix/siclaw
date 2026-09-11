@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
-"""compile_box — the served form of the compile box: a "cloud Claude Code"
-spawned by the siclaw runtime and driven over the box's own HTTP+SSE contract
-(the runtime translates events into generic capability.* for consumers, e.g. a downstream platform).
+"""Knowledge compiler service using the shared Pi execution core.
 
-Shape: the box is 90% "headless Claude Code behind a wrapped entrypoint" (Agent
-SDK = Claude Code as a library; engine/tools/compaction reused verbatim); the
-remaining 10% is the kbc moat — custom tools that make the agent emit explicit
-structured signals:
-  - report_summary  → SSE `summary` (compile progress, for the verify UI)
-  - propose_plan    → SSE `plan_proposed` (Plan→Execute alignment)
-  - file_ticket     → the ONLY sanctioned way to open a contradiction ticket in
-                      authoring/CONTRADICTIONS.json; ticket_kind is gated by the
-                      ticket's own evidence (model_gap / source_conflict), the
-                      id is a code-computed claim fingerprint (same claim →
-                      supersede, never duplicate)
-  - resolve_ticket  → writes agent_report into authoring/CONTRADICTIONS.json
-                      (contradiction-ticket patch registration; never blocks)
+Python owns source snapshots, scoped tools, quality gates, artifact ACKs and
+recovery. A private Node worker owns the pinned Pi SDK session and reports typed
+model/tool events. The Runtime translates HTTP/SSE into the capability protocol.
 
 Surface (driven by the runtime):
   POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install the frozen raw bundle → workdir/raw
@@ -33,9 +21,8 @@ Surface (driven by the runtime):
   POST /test-message/{tid} · GET /test-events/{tid} · POST /test-session/{tid}/close
   GET  /health
 
-LLM auth: local runs reuse the subscription (the SDK ships the claude binary);
-production config arrives as one authoritative /session llm block (consumer, or
-Runtime Helm fallback when absent), keeping credentials out of the KB PodSpec.
+LLM initialization requires a complete consumer-supplied Pi execution block.
+Credentials travel in the private session body, outside the KB PodSpec.
 mTLS: with SICLAW_CERT_PATH certs present the box serves HTTPS and requires a
 client cert (runtime/gateway); otherwise plain HTTP (local).
 """
@@ -57,20 +44,10 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version as package_version
+from functools import wraps
 from pathlib import Path, PurePosixPath
 
 from aiohttp import web
-from claude_agent_sdk import (
-    ClaudeSDKClient,
-    ClaudeAgentOptions,
-    HookMatcher,
-    tool,
-    create_sdk_mcp_server,
-    InMemorySessionStore,
-    CLIConnectionError,
-    ProcessError,
-)
 
 import batching
 import destream
@@ -83,30 +60,14 @@ from mtls_auth import (
 )
 import redblue
 import selfcheck
-from engine import selected_readonly_engine
-from codex_engine import CodexSDKClient, EngineTool, isolated_readonly_workspace
+from engine import selected_readonly_engine, engine_kind, create_agent_client
+from agent_protocol import AgentClient, AgentEvent, AgentTransportError, EngineTool, is_result as message_is_result, message_field
+from execution_observation import observe_sessions
+from pi_engine import sdk_version as pi_sdk_version
+from pi_file_tools import FileTools
+import pi_config
 import source_snapshot
 from source_inspector import SourceInspector
-
-# The proxy/Bedrock path rejects the `context_management` field Claude Code attaches
-# (HTTP 400 "context_management: Extra inputs are not permitted").
-# ROOT CAUSE (settled 2026-07-06 by reading bundled CLI 2.1.191): the field is
-# NOT autocompact — it is the thinking-clear context edit, attached whenever a
-# turn has thinking enabled AND the context-management beta is in the betas
-# list. The proxy presents itself as a first-party endpoint, so the CLI auto-enables
-# that beta for modern models; adaptive thinking then decides per-turn → the
-# 400 is intermittent (respawn-rehydrate first turns, image-heavy turns).
-# The gate: `if (o1(provider) && !E2e() && enabled) push(contextManagementBeta)`
-# where E2e() = CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS || hipaa. So THIS is the
-# kill switch. Correct posture on a Bedrock-proxied gateway anyway: any
-# experimental beta that changes the request shape is a 400 hazard here.
-os.environ.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
-# Autocompact stays off too (kept from the earlier mitigation): a compile is a
-# long multi-turn session and the proxy has no compaction affordances. BOTH
-# spellings: CLI 0.2.110 read DISABLE_AUTO_COMPACT (underscored).
-# setdefault → an explicit deployment override still wins.
-os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
-os.environ.setdefault("DISABLE_AUTO_COMPACT", "1")
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
@@ -351,7 +312,7 @@ async def _record_turn_usage(run: "CompileRun", client, msg) -> None:
 
     output = 0
     held = 0
-    usage = getattr(msg, "usage", None)
+    usage = message_field(msg, "usage")
     if isinstance(usage, dict):
         def _n(key: str) -> int:
             value = usage.get(key)
@@ -471,24 +432,9 @@ def _error_event(
 
 
 def _client_process_exited(client) -> int | None:
-    """Best-effort exit code of the SDK's CLI subprocess if it has terminated,
-    else None (still alive, or unknown).
-
-    Duck-typed on the Claude Agent SDK's subprocess transport internals; any
-    deviation (CodexSDKClient, a swapped-in fake, an SDK refactor) simply returns
-    None and the idle-latency watchdog remains the backstop. NEVER raises — a
-    liveness probe that itself throws would be worse than the stall it guards.
-
-    Motivation (07-24): a half-dead CLI child whose stdout never closes leaves
-    receive_messages() blocked forever; the model-idle clock alone then takes the
-    full de-stream floor to react. Polling the process return code catches an
-    exited/killed subprocess in one watchdog tick instead."""
-    try:
-        transport = getattr(client, "_transport", None)
-        proc = getattr(transport, "_process", None) if transport is not None else None
-        return getattr(proc, "returncode", None) if proc is not None else None
-    except Exception:
-        return None
+    """Pi transport exposes process exit without leaking SDK internals."""
+    returncode = getattr(client, "returncode", None)
+    return returncode if type(returncode) is int else None
 
 
 def _touch_test_activity(run: "TestRun") -> None:
@@ -666,10 +612,10 @@ class CompileRun:
         self.events: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
         self.done = False
-        # Persistent Claude Code session (set by run_session). The box is a
+        # Persistent Pi session (set by run_session). The box is a
         # long-lived conversational + compiling session, not a one-shot query();
         # POST /message injects follow-up user turns into this same session.
-        self.client: ClaudeSDKClient | None = None
+        self.client: AgentClient | None = None
         self.session_id: str | None = None
         # Tool whitelist declared by the runtime BoxProfile (via POST /session).
         # None → use the driver default (DEFAULT_COMPILE_ALLOWED_TOOLS). A restrictive
@@ -884,7 +830,7 @@ class TestRun:
         self.events: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
         self.done = False
-        self.client: ClaudeSDKClient | None = None
+        self.client: AgentClient | None = None
         self.session_id: str | None = None
         self.connected: asyncio.Event = asyncio.Event()
         self._turn_text: list[str] = []
@@ -968,7 +914,6 @@ RECOVERY_RESET_PATH = "authoring/RECOVERY_RESET.json"
 # SDK stdio JSON reader buffer. The SDK default is 1MB, and one oversized tool
 # result (a Read of a big source file) kills the whole session with a fatal
 # "exceeded maximum buffer size" — seen live on a 139-source compile (2026-07-06).
-SDK_MAX_BUFFER_BYTES = int(os.environ.get("KBC_SDK_MAX_BUFFER_BYTES", str(16 * 1024 * 1024)))
 _SYNC_TOMBSTONE = "__deleted__"
 
 
@@ -2259,27 +2204,6 @@ def _compile_engine_tools(
     return tools
 
 
-def _make_compile_tools(run: CompileRun, raw_scope: dict | None = None):
-    """Assemble the engine-neutral compile tool bodies for Claude's in-process MCP."""
-    wrapped = []
-    for item in _compile_engine_tools(run, raw_scope=raw_scope):
-        schema = {
-            name: {
-                "array": list,
-                "boolean": bool,
-                "integer": int,
-                "number": float,
-            }.get(spec.get("type"), str)
-            for name, spec in item.input_schema.get("properties", {}).items()
-        }
-
-        async def handler(args, _item=item):
-            text = await _item.handler(args)
-            return {"content": [{"type": "text", "text": text}]}
-
-        wrapped.append(tool(item.name, item.description, schema)(handler))
-
-    return create_sdk_mcp_server("compile", tools=wrapped)
 
 
 def _seed_workdir(workdir: str):
@@ -2491,6 +2415,18 @@ def _maybe_start_media_verify(run, drain: bool = False) -> bool:
     return True
 
 
+def _observe_pi_sessions(fn):
+    @wraps(fn)
+    async def observed(run, *args, **kwargs):
+        async def emit_observation(observation):
+            await run.emit({"type": "execution_observation", "observation": observation})
+
+        with observe_sessions(emit_observation):
+            return await fn(run, *args, **kwargs)
+    return observed
+
+
+@_observe_pi_sessions
 async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     """Blind transcription + text-only comparison over one chunk, then ONE
     repair turn for confirmed findings. De-anchored by construction: the
@@ -2608,7 +2544,7 @@ _PK_ANSWER_PERSIST_CAP = 4000  # chars per answer in the persisted detail
 
 
 def _pk_mode() -> str:
-    return os.environ.get("KBC_PK_MODE", "auto")
+    return os.environ.get("KBC_PK_MODE", "off")
 
 
 def _pk_repair_rounds() -> int:
@@ -2716,6 +2652,7 @@ def _pk_narration(summary: dict, locale: str | None = None) -> str:
     return f"自检(红蓝队)失败:{summary.get('error', '?')}"
 
 
+@_observe_pi_sessions
 async def _run_pk_flow(run, kind: str) -> None:
     """One PK round over a pinned snapshot of the current draft. Fail-open at
     every boundary — a PK crash costs the PK, never the compile session."""
@@ -2831,7 +2768,7 @@ async def _run_pk_flow(run, kind: str) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def _post_turn_selfcheck(run) -> str | None:
+async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
     """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
     design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
     lives in selfcheck.py (engine-neutral); this driver only decides WHEN
@@ -3080,7 +3017,7 @@ async def _post_turn_selfcheck(run) -> str | None:
         run._l1_repairs_used = 0
         run._l1_round_limit = 0
         report["state"] = "passed"
-    elif run._l1_repairs_used < run._l1_round_limit:
+    elif allow_repair and run._l1_repairs_used < run._l1_round_limit:
         report["state"] = "repairing"
         # The report carries the PREVIOUS converge_phase (possibly "settled");
         # the pre-turn_done sync would ship repairing+settled for one window
@@ -3176,23 +3113,23 @@ async def _emit_message(run: CompileRun, msg) -> None:
     TEST sessions additionally surface each tool call as a `step` frame (the
     collapsible retrieval trace in the test UI). Compile runs do not: their
     live narration contract is the `log` stream alone."""
-    name = type(msg).__name__
-    if name == "AssistantMessage":
-        for block in getattr(msg, "content", []) or []:
-            btype = type(block).__name__
-            if btype == "TextBlock":
-                t = (getattr(block, "text", "") or "").strip()
+    name = msg.kind
+    blocks = msg.data.get("content", [])
+    if name == "assistant":
+        for block in blocks:
+            if block.get("type") == "text":
+                t = (block.get("text") or "").strip()
                 if t:
                     run._turn_text.append(t)
                     await run.emit({"type": "log", "text": t})
-            elif btype == "ToolUseBlock" and isinstance(run, TestRun):
+            elif block.get("type") == "toolCall" and isinstance(run, TestRun):
                 label = _test_step_label(
                     run,
-                    str(getattr(block, "name", "") or ""),
-                    getattr(block, "input", None) or {},
+                    str(block.get("name") or ""),
+                    block.get("arguments") or {},
                 )
                 await run.emit({"type": "step", "text": label})
-    elif name == "ResultMessage":
+    elif name == "result":
         if isinstance(run, CompileRun):
             # The nonce is a fact about one accepted apply_rulings turn, not
             # persistent session state. Tool calls for that turn have already
@@ -3363,365 +3300,50 @@ COMPILE_DISALLOWED_TOOLS = [
 
 
 def _compile_model() -> str:
-    """Resolve the model shared by every compiler-owned SDK session."""
-    return (os.environ.get("KBC_COMPILE_MODEL")
-            or os.environ.get("ANTHROPIC_MODEL")
-            or os.environ.get("OPENAI_MODEL")
-            or "claude-opus-4-6")
+    return pi_config.role_model("compile")
 
 
 def _engine_kind() -> str:
-    kind = os.environ.get("KBC_ENGINE", "claude_agent_sdk").strip().lower()
-    aliases = {
-        "claude": "claude_agent_sdk",
-        "codex": "codex_sdk",
-    }
-    kind = aliases.get(kind, kind)
-    if kind not in {"claude_agent_sdk", "codex_sdk"}:
-        raise ValueError(f"unknown KBC_ENGINE {kind!r}")
-    return kind
+    return engine_kind()
 
 
 def _reference_assist_model() -> str:
-    """Use the consumer's LIGHT tier for short answer-authoring work.
-
-    ControlPlane materializes the administrator-selected LIGHT model as the blue-team
-    role. Keep an explicit override for operators, then fall back to the compile
-    tier only when an older consumer has not supplied the LIGHT role yet.
-    """
-    return (os.environ.get("KBC_REFERENCE_ASSIST_MODEL")
-            or os.environ.get("KBC_PK_BLUE_MODEL")
-            or _compile_model())
+    return pi_config.role_model("blue")
 
 
-def _long_context_model(model: str) -> str:
-    """Append the `[1m]` tag that asks for the 1M context window.
-
-    Claude Code parses the tag CLIENT-SIDE: it strips `[1m]` from the model field
-    and sends `anthropic-beta: context-1m-2025-08-07` as a header. That is a
-    different path from the SDK's `betas` option, which puts the beta on the
-    CLI's beta LIST — and a non-empty list is what makes the CLI also attach
-    `context_management`, the field this Bedrock-proxied gateway rejects (see the
-    note at the top of this file). Asking that way killed sessions outright; the
-    tag route carries no such passenger and has been serving the operator's own
-    CLI wrapper against this same gateway, measured at 468K input tokens.
-
-    Not configurable, and deliberately so. There is no scenario where a compile
-    is better off with a fifth of the window it could have, so a switch would
-    only ever be a switch nobody should flip. The two conditions that DO vary are
-    read from real state rather than from configuration:
-
-      * the engine — Codex has no such tag;
-      * the model id — a `gpt-*` served by the same gateway is left alone.
-
-    Scope is one call site, `_compile_session_opts`, which builds the compile and
-    batch sessions and nothing else. If some future model on this engine cannot
-    serve the window, that is a change in what the platform offers and belongs in
-    this function, not in a deployment's environment.
-
-    The compile box never had the window because it pins the model explicitly and
-    so bypassed the client-side default that carries the tag — it took control of
-    the model and then forgot to ask for the context.
-    """
-    if _engine_kind() != "claude_agent_sdk":
-        return model
-    if not model.lower().startswith("claude-"):
-        return model
-    return model if model.endswith("[1m]") else f"{model}[1m]"
 
 
-def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
-                          pdf_page_ranges: dict | None = None,
-                          raw_scope: dict | None = None) -> "ClaudeAgentOptions":
-    """One options builder for the persistent session AND every batch session —
-    identical role/tools/model so a batch page is written under exactly the same
-    conventions as a single-session page."""
-    return ClaudeAgentOptions(
-        cwd=wd,
-        # Keep the Claude Code preset (agentic tool conventions) and append the
-        # KB authoring role on top, rather than replacing it.
-        system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
-        allowed_tools=run.allowed_tools or DEFAULT_COMPILE_ALLOWED_TOOLS,
-        disallowed_tools=list(COMPILE_DISALLOWED_TOOLS),
-        mcp_servers={"compile": _make_compile_tools(run, raw_scope=raw_scope)},
-        permission_mode="bypassPermissions",  # the pod itself is the sandbox
-        setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
-        # Pin the compile model explicitly: the box talks to an Anthropic-compatible proxy (backed by Bedrock),
-        # which serves specific ids — the SDK default may not be one, and the KB
-        # compile default is opus by product decision. Overridable per-deploy.
-        model=_long_context_model(_compile_model()),
-        max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
-        max_buffer_size=SDK_MAX_BUFFER_BYTES,
-        session_id=session_id,
-        session_store=InMemorySessionStore(),
-        # Non-interactive session → de-streamed Anthropic route (charset fix);
-        # merged over the inherited env by the SDK, so credentials stay put.
-        env=destream.session_env("authoring"),
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(
-            Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges,
-            raw_scope=raw_scope,
-        )])]},
-        # Stream partial deltas so the stall watchdog sees fine-grained model
-        # liveness: a live-but-slow generation keeps emitting StreamEvents (idle
-        # clock stays fresh), while a black-holed request emits nothing at all.
-        # _emit_message ignores StreamEvent by name, so the log/turn stream and
-        # the batch driver's ResultMessage detection are unchanged.
-        include_partial_messages=True,
-    )
 
 
-def _batch_raw_target(root: Path, source: str) -> Path:
-    """Resolve one plan-owned Raw source without allowing lexical or symlink escape."""
-    if not isinstance(source, str) or not source.strip():
-        raise BatchOutputError("batch Raw source must be a non-empty relative path")
-    raw_root = (root / "raw").resolve()
-    target = (raw_root / source).resolve()
-    try:
-        target.relative_to(raw_root)
-    except ValueError as error:
-        raise BatchOutputError(f"batch Raw source escapes workspace: {source}") from error
-    return target
 
 
-def _codex_batch_filesystem_access(
-    root: Path,
-    raw_read_allowlist: list[str] | None,
-    source_view: Path | None,
-) -> dict[str, str] | None:
-    """Translate the engine-neutral batch scope into a Codex permission profile.
-
-    The workspace remains writable for Candidate/authoring state, but Raw is a
-    deny-by-default subtree. Linux bubblewrap cannot reliably carve a readable
-    child back out of a denied parent, so allowed non-sliced sources live in a
-    disposable read-only view outside Raw. Page-sliced PDFs stay denied to
-    shell/file tools and are exposed only by the fixed-range
-    ``read_assigned_pdf_pages`` MCP tool below.
-    """
-    if raw_read_allowlist is None:
-        return None
-    root = root.resolve()
-    raw_root = (root / "raw").resolve()
-    access = {str(raw_root): "deny"}
-    if source_view is not None:
-        resolved_view = source_view.resolve()
-        try:
-            resolved_view.relative_to(root)
-        except ValueError as error:
-            raise BatchOutputError("Codex batch source view escapes workspace") from error
-        access[str(resolved_view)] = "read"
-    return access
 
 
-def _materialize_codex_batch_source_view(
-    root: Path,
-    raw_read_allowlist: list[str] | None,
-    pdf_page_ranges: dict | None,
-    session_id: str,
-) -> Path | None:
-    """Copy this batch's shell-readable Raw sources into an ephemeral view.
-
-    The view avoids platform-dependent deny-parent/read-child sandbox rules.
-    It intentionally contains no page-sliced PDF: those bytes remain reachable
-    only through ``read_assigned_pdf_pages``. Copies, rather than links, keep
-    the original frozen Raw inode isolated even before the view is mounted
-    read-only by Codex.
-    """
-    if raw_read_allowlist is None:
-        return None
-    root = root.resolve()
-    page_sources = set(pdf_page_ranges) if isinstance(pdf_page_ranges, dict) else set()
-    readable_sources = sorted({
-        source for source in raw_read_allowlist
-        if isinstance(source, str) and source not in page_sources
-    })
-    if not readable_sources:
-        return None
-    if not isinstance(session_id, str) or not session_id:
-        raise BatchOutputError("Codex batch source view requires a session id")
-    source_view = (root / f".kbc-batch-sources-{session_id}").resolve()
-    try:
-        source_view.relative_to(root)
-    except ValueError as error:
-        raise BatchOutputError("Codex batch source view escapes workspace") from error
-    shutil.rmtree(source_view, ignore_errors=True)
-    try:
-        for source in readable_sources:
-            source_path = _batch_raw_target(root, source)
-            if not source_path.is_file():
-                raise BatchOutputError(f"batch Raw source is missing: {source}")
-            relative_source = PurePosixPath(source)
-            if not relative_source.parts or ".." in relative_source.parts:
-                raise BatchOutputError(f"unsafe batch Raw source path: {source}")
-            target = (source_view / Path(*relative_source.parts)).resolve()
-            try:
-                target.relative_to(source_view)
-            except ValueError as error:
-                raise BatchOutputError(f"batch source view path escapes workspace: {source}") from error
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, target)
-    except BaseException:
-        shutil.rmtree(source_view, ignore_errors=True)
-        raise
-    return source_view
 
 
-def _codex_batch_source_view_note(
-    root: Path,
-    source_view: Path | None,
-    raw_read_allowlist: list[str] | None,
-    pdf_page_ranges: dict | None,
-    locale: str | None,
-) -> str:
-    """Explain the disposable view without changing durable Raw provenance."""
-    if source_view is None or raw_read_allowlist is None:
-        return ""
-    root = root.resolve()
-    view_rel = source_view.resolve().relative_to(root).as_posix()
-    page_sources = set(pdf_page_ranges) if isinstance(pdf_page_ranges, dict) else set()
-    sources = sorted({
-        source for source in raw_read_allowlist
-        if isinstance(source, str) and source not in page_sources
-    })
-    mappings = "\n".join(
-        f"- raw/{source} -> {view_rel}/{source}"
-        for source in sources
-    )
-    if selfcheck._is_en(locale):
-        return (
-            "\n\nCodex batch source view: original Raw is mechanically hidden from shell/file "
-            "tools. Read the batch copies below instead. These helper paths are temporary; "
-            "sources[].resource must still cite the original raw/... path shown on the left:\n"
-            + mappings
-        )
-    return (
-        "\n\nCodex 批次原料视图:原 Raw 已对 shell/文件工具机械隐藏,请改读下列本批只读副本。"
-        "这些辅助路径是临时的;sources[].resource 仍必须引用左侧原 raw/... 路径:\n"
-        + mappings
-    )
 
 
-def _codex_pdf_pages_engine_tool(root: Path, page_ranges: dict) -> EngineTool:
-    """Expose exactly one validated PDF page slice to a Codex batch session.
-
-    Codex writer sessions use native shell rather than Claude's guarded Read
-    tool. Their Raw permission profile denies the original sliced PDF, while
-    this host-side tool runs Poppler with fixed ``-f/-l`` arguments and returns
-    only the assigned pages' text. Derived page images remain separate source
-    batches, preserving visual evidence without widening this text slice.
-    """
-    if not isinstance(page_ranges, dict) or len(page_ranges) != 1:
-        raise BatchOutputError("a Codex PDF page batch must contain exactly one source range")
-    source, raw_range = next(iter(page_ranges.items()))
-    if not isinstance(raw_range, dict):
-        raise BatchOutputError(f"malformed PDF page range for {source}")
-    try:
-        start = int(raw_range["start_page"])
-        end = int(raw_range["end_page"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise BatchOutputError(f"malformed PDF page range for {source}") from error
-    if start < 1 or end < start or end - start + 1 > batching.hierarchical_pdf_slice_pages():
-        raise BatchOutputError(f"invalid PDF page range {start}-{end} for {source}")
-    target = _batch_raw_target(root.resolve(), source)
-    max_chars = max(1, int(os.environ.get("KBC_CODEX_PDF_TEXT_MAX_CHARS", "500000")))
-
-    async def read_assigned_pages(args: dict) -> str:
-        if args:
-            raise ValueError("read_assigned_pdf_pages does not accept arguments")
-        executable = shutil.which("pdftotext")
-        if executable is None:
-            # Tell the compiler, do not kill the compile. This tool failing is a
-            # fact about ONE source; raising made it a fact about the whole run,
-            # and a corpus of 900 documents does not deserve to go uncompiled
-            # because one PDF could not be opened. The model has a sanctioned way
-            # to handle "I cannot read this" — say what it could not read, mark
-            # it, ticket it — and it can only use that way if the tool says so
-            # in words instead of throwing.
-            return (
-                f"raw/{source} pages {start}-{end}: cannot be extracted — the PDF "
-                "text extractor is unavailable in this image. Do not guess at the "
-                "contents. Use any separately assigned page-image sources for this "
-                "PDF if they exist, and record what remains unread."
-            )
-
-        def extract() -> str:
-            result = subprocess.run(
-                [
-                    executable, "-f", str(start), "-l", str(end),
-                    "-layout", "-enc", "UTF-8", str(target), "-",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode != 0:
-                # Same rule as the missing-extractor branch above: one unreadable
-                # PDF is a fact about one source, never a reason to end the run.
-                detail = (result.stderr or "pdftotext failed").strip()[:1000]
-                return (
-                    f"raw/{source} pages {start}-{end}: could not be extracted "
-                    f"({detail}). Do not guess at the contents. Use any separately "
-                    "assigned page-image sources for this PDF if they exist, and "
-                    "record what remains unread."
-                )
-            text = result.stdout or ""
-            if not text.strip():
-                return (
-                    f"raw/{source} pages {start}-{end}: no extractable text; "
-                    "use the separately assigned derived page-image sources for visual evidence"
-                )
-            suffix = "\n[PDF page text truncated at the KBC batch limit]" if len(text) > max_chars else ""
-            return (
-                f"raw/{source} (PDF pages {start}-{end})\n"
-                + text[:max_chars]
-                + suffix
-            )
-
-        return await asyncio.to_thread(extract)
-
-    return EngineTool(
-        "read_assigned_pdf_pages",
-        f"Read the fixed assigned text slice raw/{source}, PDF pages {start}-{end}. "
-        "This tool accepts no arguments and cannot read any other page range.",
-        {"type": "object", "properties": {}, "additionalProperties": False},
-        read_assigned_pages,
-    )
 
 
 def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
                             pdf_page_ranges: dict | None = None,
-                            raw_scope: dict | None = None,
-                            codex_source_view: Path | None = None):
-    """Create the selected persistent compiler adapter.
+                            raw_scope: dict | None = None):
+    """Create the selected SDK session with the compiler tool contract.
 
     The mature turn/sync/watchdog orchestration consumes the same client shape
-    for both engines; only this construction seam knows which SDK is active.
+    with an engine-neutral event protocol and host-owned tools.
     """
-    if _engine_kind() == "codex_sdk":
-        tools = _compile_engine_tools(run, raw_scope=raw_scope)
-        if pdf_page_ranges:
-            tools.append(_codex_pdf_pages_engine_tool(Path(wd), pdf_page_ranges))
-        return CodexSDKClient(
-            cwd=wd,
-            system_prompt=system_prompt,
-            model=_compile_model(),
-            session_id=session_id,
-            tools=tools,
-            writer_filesystem_access=_codex_batch_filesystem_access(
-                # `None` means "no batch scope" to the Codex profile, so a scope
-                # with a missing/empty account must still resolve to [] (deny
-                # Raw), never to None (allow all of Raw).
-                Path(wd), (raw_scope.get("account") or []) if raw_scope is not None else None,
-                codex_source_view
-            ),
-            max_tool_calls=int(os.environ.get("KBC_MAX_TURNS", "150")),
-        )
-    return ClaudeSDKClient(options=_compile_session_opts(
-        run, wd, system_prompt, session_id,
-        pdf_page_ranges=pdf_page_ranges,
-        raw_scope=raw_scope,
-    ))
+    allowed = DEFAULT_COMPILE_ALLOWED_TOOLS if run.allowed_tools is None else run.allowed_tools
+    guard = _make_compile_path_guard(Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges, raw_scope=raw_scope)
+    tools = FileTools(wd, allowed, guard).tools()
+    # Keep the published tool names and allowlist while using the single
+    # KBC-owned handler/schema registry for every compiler phase.
+    tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
+                 for tool in _compile_engine_tools(run, raw_scope=raw_scope)
+                 if f"mcp__compile__{tool.name}" in allowed)
+    return create_agent_client(cwd=wd, system_prompt=system_prompt, session_id=session_id,
+                         model_config=pi_config.for_role("compile", session_kind="authoring"), tools=tools,
+                         max_model_calls=int(os.environ.get("KBC_MAX_TURNS", "150")))
 
 
 def _compile_system_prompt(run: "CompileRun") -> str:
@@ -4100,17 +3722,30 @@ def _materialize_one_batch_slices(
                 end = int(source_range["end_line"])
             except (KeyError, TypeError, ValueError) as error:
                 raise BatchOutputError(f"malformed text slice for {source}") from error
-            lines = source_path.read_bytes().splitlines(keepends=True)
+            data = source_path.read_bytes()
+            lines = data.splitlines(keepends=True)
             if start < 1 or end < start or end > len(lines):
                 raise BatchOutputError(
                     f"text slice range {start}-{end} is invalid for {source} ({len(lines)} lines)"
                 )
+            excerpt = b"".join(lines[start - 1:end])
+            location = f"lines {start}-{end}"
+            if "start_byte" in source_range or "end_byte" in source_range:
+                try:
+                    byte_start = int(source_range["start_byte"])
+                    byte_end = int(source_range["end_byte"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise BatchOutputError(f"malformed byte slice for {source}") from error
+                if not 0 <= byte_start < byte_end <= len(data):
+                    raise BatchOutputError(f"invalid byte slice for {source}")
+                excerpt = data[byte_start:byte_end]
+                location += f", bytes [{byte_start},{byte_end})"
             header = (
-                f"<!-- KBC read-only excerpt: raw/{source}, lines {start}-{end}. "
+                f"<!-- KBC read-only excerpt: raw/{source}, {location}. "
                 f"Candidate sources[].resource must cite raw/{source}, never this helper path. -->\n"
             ).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(header + b"".join(lines[start - 1:end]))
+            target.write_bytes(header + excerpt)
 
 
 def _auto_exclude_batch_sources(run: "CompileRun", sources: list[str], reason: str) -> list[dict]:
@@ -4167,6 +3802,7 @@ def _assert_exclusions_landed(run: "CompileRun", batch: dict) -> None:
             f"({len(leftover)} source(s) could be neither cited nor excluded)")
 
 
+@_observe_pi_sessions
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                                pdf_page_ranges: dict | None = None,
                                raw_scope: dict | None = None) -> str:
@@ -4187,7 +3823,6 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
     always safe."""
     root = Path(run.workdir).resolve()
     wd = str(root)
-    source_view = None
     client = None
     prev_client = run.client
     run._suppress_turn_done = True
@@ -4198,19 +3833,10 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
             session_id = str(uuid.uuid4())
             directive_full = directive
             try:
-                if _engine_kind() == "codex_sdk" and raw_scope is not None:
-                    account = (raw_scope or {}).get("account") or []
-                    source_view = _materialize_codex_batch_source_view(
-                        root, account, pdf_page_ranges, session_id)
-                    directive_full = directive + _codex_batch_source_view_note(
-                        root, source_view, account, pdf_page_ranges,
-                        getattr(run, "locale", None),
-                    )
                 client = _compile_session_client(
                     run, wd, _compile_system_prompt(run), session_id,
                     pdf_page_ranges=pdf_page_ranges,
                     raw_scope=raw_scope,
-                    codex_source_view=source_view,
                 )
                 await client.connect()
                 run.client = client
@@ -4230,7 +3856,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                     run, client, stop_on_result=True, fail_on_error_result=True)
                 _print_compile_lifecycle("turn.done", run, extra=f"label={label}")
                 return run._last_turn_reply
-            except (ModelStallError, CLIConnectionError, ProcessError) as exc:
+            except (ModelStallError, AgentTransportError) as exc:
                 attempt += 1
                 # Tear down the dead/wedged client before rebuilding. Disconnect
                 # may itself raise on a broken transport — best-effort.
@@ -4239,9 +3865,6 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                         await client.disconnect()
                     client = None
                 run.client = prev_client
-                if source_view is not None:
-                    shutil.rmtree(source_view, ignore_errors=True)
-                    source_view = None
                 if attempt > _BATCH_REBUILD_MAX_RETRIES:
                     _print_compile_lifecycle(
                         "turn.rebuild_exhausted", run,
@@ -4266,8 +3889,6 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                 await client.disconnect()
             except Exception:
                 pass
-        if source_view is not None:
-            shutil.rmtree(source_view, ignore_errors=True)
         # The exclusion ledger is machine-owned: whatever the model did this
         # session, the file at rest is canonical strict JSON again (parseable
         # hand-written rows survive; mechanical slips are absorbed).
@@ -4487,8 +4108,12 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             part = source_range["part"]
             parts = source_range["parts"]
             slice_file = source_range["slice_file"]
+            byte_location = (
+                f", bytes [{source_range['start_byte']},{source_range['end_byte']})"
+                if "start_byte" in source_range else ""
+            )
             listing_lines.append(
-                f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}, part {part}/{parts})"
+                f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}{byte_location}, part {part}/{parts})"
             )
             sliced_sources.append(path)
         elif isinstance(page_range, dict):
@@ -4829,34 +4454,11 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
         wd = str(Path(run.workdir).resolve())
         planner_prompt = _planner_role(getattr(run, "locale", None))
         planner_session_id = str(uuid.uuid4())
-        if _engine_kind() == "codex_sdk":
-            client = CodexSDKClient(
-                cwd=wd,
-                system_prompt=planner_prompt,
-                model=_compile_model(),
-                session_id=planner_session_id,
-                max_tool_calls=8,
-            )
-        else:
-            opts = ClaudeAgentOptions(
-                cwd=wd,
-                system_prompt={"type": "preset", "preset": "claude_code", "append": planner_prompt},
-                allowed_tools=["Read", "Write", "Glob"],
-                # The planner writes the batch plan every later session obeys;
-                # it must not be able to fan the planning decision out to
-                # sub-agents whose reading the plan cannot record.
-                disallowed_tools=list(COMPILE_DISALLOWED_TOOLS),
-                permission_mode="bypassPermissions",
-                hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(Path(wd), run.locale)])]},
-                setting_sources=[],
-                model=_compile_model(),
-                max_turns=8,
-                max_buffer_size=SDK_MAX_BUFFER_BYTES,
-                session_id=planner_session_id,
-                session_store=InMemorySessionStore(),
-                env=destream.session_env("authoring"),
-            )
-            client = ClaudeSDKClient(options=opts)
+        client = create_agent_client(
+            cwd=wd, system_prompt=planner_prompt, session_id=planner_session_id,
+            model_config=pi_config.for_role("compile", session_kind="authoring"), max_model_calls=8,
+            tools=FileTools(wd, ["Read", "Write", "Glob"],
+                            _make_compile_path_guard(Path(wd), run.locale)).tools())
         prev = run.client
         run._suppress_turn_done = True
         try:
@@ -5021,6 +4623,7 @@ async def _commit_batch_compile(run: "CompileRun", plan: dict, replies: list[str
                     or _loc(run, "Batch compile complete.", "分批编译完成。")})
 
 
+@_observe_pi_sessions
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
     the end), many bounded sessions inside. Crash-resumable across map, optional
@@ -5537,47 +5140,30 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
 
 
 def _note_model_activity(run: CompileRun, msg) -> None:
-    """Every inbound SDK message (StreamEvent delta, assistant/user turn, result)
-    proves the model link is alive → reset the idle clock. An assistant message
-    that asks for a tool flips tool_pending so the watchdog uses the longer bound
-    while the CLI runs Read/Bash (that gap is not a model stall).
-
-    Partial StreamEvents are transport liveness only.  The Agent SDK emits
-    assistant-tail events (content_block_stop/message_delta/message_stop) after
-    a ToolUseBlock and before the UserMessage containing the tool result; those
-    events must not clear tool_pending or a legitimate long-running tool is
-    measured against the much shorter model-idle bound.
-    """
+    """Refresh model liveness while keeping parallel tool calls on their longer deadline."""
     run._last_model_activity = time.monotonic()
-    message_type = type(msg).__name__
-    run._last_sdk_message_type = message_type
-    if message_type == "AssistantMessage":
-        blocks = getattr(msg, "content", None) or []
-        run._tool_pending = any(type(b).__name__ == "ToolUseBlock" for b in blocks)
-    elif message_type in ("UserMessage", "ResultMessage"):
+    run._last_sdk_message_type = msg.kind
+    if msg.kind == "assistant":
+        run._tool_pending = any(block.get("type") == "toolCall" for block in msg.data.get("content", []))
+    elif msg.kind == "tool_start":
+        pending = getattr(run, "_pi_pending_tools", set())
+        pending.add(msg.data["call_id"])
+        run._pi_pending_tools = pending
+        run._tool_pending = True
+    elif msg.kind == "tool_end":
+        pending = getattr(run, "_pi_pending_tools", set())
+        pending.discard(msg.data["call_id"])
+        run._tool_pending = bool(pending)
+    elif msg.kind == "result":
+        run._pi_pending_tools = set()
         run._tool_pending = False
 
 
 async def _guarded_model_stream(run: "CompileRun", client):
-    """Pull the SDK message stream, normalizing a dead-transport surprise into a
-    rebuildable ModelStallError.
+    """Normalize a Pi transport failure into a checkpoint-based rebuild.
 
-    claude-agent-sdk 0.2.110's background reader (Query._read_messages) CONSUMES a
-    ProcessError when the CLI subprocess dies and re-emits it as a
-    ``{"type": "error"}`` frame, which receive_messages() then re-raises as a
-    PLAIN ``Exception`` (see the SDK's _internal/query.py). _drive_batch_session
-    only catches ModelStallError / CLIConnectionError / ProcessError, so without
-    this normalization that plain Exception escapes the rebuild loop and kills the
-    whole run — a dead subprocess with the turn still 'active'. Any exception
-    raised while CONSUMING the stream — except cancellation and our own control
-    exceptions — is therefore a transport fault: discard the dead attempt's
-    partial text and re-raise as ModelStallError so the existing rebuild loop
-    disconnects the dead client and continues from the checkpoint.
-
-    Only the SDK PULL is wrapped (per-message __anext__): deliberate control
-    raises from the consume BODY (ModelStallError on stall exhaustion,
-    ModelResultError on an is_error result) originate in _consume_turn_stream, not
-    here, and propagate unchanged."""
+    Model failures and programming errors propagate without transport retries.
+    """
     stream = client.receive_messages()
     while True:
         try:
@@ -5586,7 +5172,7 @@ async def _guarded_model_stream(run: "CompileRun", client):
             return
         except (asyncio.CancelledError, ModelStallError, ModelResultError, BatchOutputError):
             raise
-        except Exception as exc:  # dead subprocess / broken transport surfaced as a plain error
+        except AgentTransportError as exc:
             run._turn_active = False
             run._turn_text = []
             raise ModelStallError(f"transport: {type(exc).__name__}") from exc
@@ -5611,7 +5197,21 @@ async def _consume_turn_stream(
     SDK surfaces as a plain Exception becomes a rebuildable ModelStallError."""
     async for msg in _guarded_model_stream(run, client):
         _note_model_activity(run, msg)
-        if type(msg).__name__ == "ResultMessage":
+        if message_is_result(msg):
+            if (isinstance(msg, AgentEvent) and msg.data.get("tool_calls", 0)
+                    and (run._stall_retrying or msg.data["outcome"] == "aborted"
+                         or msg.data.get("api_error_status") in _MODEL_RATE_STATUSES)):
+                # A failed request after tools may have changed the draft. Let
+                # the domain rebuild the pending batch from its checkpoint;
+                # re-sending the original owner directive in the same session
+                # would silently replay already applied tool effects.
+                run._turn_text = []
+                run._last_turn_reply = ""
+                if fail_on_error_result:
+                    raise ModelStallError("Compiler turn interrupted after tool execution; reconstruct the pending domain operation")
+                # An owner conversation remains usable, but must not replay a
+                # directive whose tool effects may already be on disk.
+                run._stall_retrying = False
             if run._stall_retrying:
                 run._turn_text = []           # the wedged attempt produced nothing usable
                 run._stall_retrying = False
@@ -5627,8 +5227,8 @@ async def _consume_turn_stream(
             # C2: a rate-limited / overloaded model call ends the turn with
             # is_error + api_error_status. Back off and re-issue rather than
             # surfacing it as a finished turn.
-            status = getattr(msg, "api_error_status", None)
-            is_error = bool(getattr(msg, "is_error", False))
+            status = message_field(msg, "api_error_status")
+            is_error = bool(message_field(msg, "is_error", False))
             # A spend cap, before the rate-limit branch it would otherwise fall
             # past: backing off 5 times over 30s cannot clear a billing refusal.
             # Gated on fail_on_error_result so this changes NOTHING outside the
@@ -5642,7 +5242,7 @@ async def _consume_turn_stream(
                 run._last_turn_reply = ""
                 raise ModelQuotaExhausted(
                     f"model provider refused on billing (HTTP {status})")
-            if is_error and status in _MODEL_RATE_STATUSES:
+            if is_error and status in _MODEL_RATE_STATUSES and not msg.data.get("tool_calls", 0):
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1
                     delay = _rate_backoff_delay(run._rate_retries)
@@ -5666,7 +5266,7 @@ async def _consume_turn_stream(
                                  f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。"),
                 })
                 # fall through: end the turn (run goes idle), do not crash
-            if is_error and fail_on_error_result:
+            if is_error:
                 # Never let an internal map/reduce/final session stamp its unit
                 # done when the SDK itself says the turn failed. Keep the
                 # diagnostic deliberately bounded: subtype/status are enough to
@@ -5674,10 +5274,33 @@ async def _consume_turn_stream(
                 run._turn_active = False
                 run._turn_text = []
                 run._last_turn_reply = ""
-                subtype = str(getattr(msg, "subtype", "unknown") or "unknown")[:80]
-                raise ModelResultError(
-                    f"model result failed (subtype={subtype}, api_status={status})"
-                )
+                subtype = str(message_field(msg, "subtype", "unknown") or "unknown")[:80]
+                if fail_on_error_result:
+                    raise ModelResultError(f"model result failed (subtype={subtype}, api_status={status})")
+                # The failed turn can already have edited files. Reconcile its
+                # scope now, without scheduling another model call or committing
+                # full-generation provenance. An unrelated owner turn must never
+                # inherit this operation's restoration snapshot.
+                try:
+                    await _post_turn_selfcheck(run, allow_repair=False)
+                finally:
+                    run._incr_pending = None
+                    run._full_compile_pending = False
+                    run._l1_repair_pending = False
+                    run._turn_page_hashes = None
+                    run._turn_format_guard = None
+                    run._turn_selfcheck_key = None
+                    run.apply_dispatch_nonce = ""
+                if getattr(run, "_sync_sent", None) is not None:
+                    await _sync_workspace(run, run._sync_sent)
+                note = _loc(run, "The model request failed; this session remains available for retry.",
+                            "模型请求失败，此会话仍可重试。")
+                await run.emit({"type": "error", "code": "model_request_failed", "error": note,
+                                "message": "model_request_failed", "recoverable": True})
+                await run.emit({"type": "turn_done", "text": note})
+                if stop_on_result:
+                    return
+                continue
             await _record_turn_usage(run, client, msg)
             run._turn_active = False
             await _emit_message(run, msg)
@@ -5863,7 +5486,7 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
 
 
 async def run_session(run: CompileRun):
-    """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
+    """Persistent driver: host one long-lived Pi worker session
     for this KB. BOX_ROLE (+ the playbook + the attempt instruction) is the standing
     system prompt; the session then takes turns via POST /message — continuous
     prepare + compile in one session, through the model proxy, with the compile tools.
@@ -5884,7 +5507,6 @@ async def run_session(run: CompileRun):
         await client.connect()
         run.client = client
         run.connected.set()
-        # Codex replaces the provisional UUID with its resumable thread id.
         sid = str(getattr(client, "session_id", sid) or sid)
         run.session_id = sid
         await run.emit({"type": "session", "session_id": sid})
@@ -5903,6 +5525,7 @@ async def run_session(run: CompileRun):
         await client.disconnect()
 
 
+@_observe_pi_sessions
 async def _run_wrapper(run: CompileRun):
     """Unified lifecycle: run the driver + periodically sync mid-flight state →
     catch-all error → always finish with end. A CLEAN driver exit (max_turns
@@ -6013,16 +5636,7 @@ READONLY_CONSUMER_DISALLOWED_TOOLS = [
 
 
 def _test_model() -> str:
-    # The interactive kb-test consumer is the same production-consumer tier as
-    # PK's blue team. ControlPlane resolves that role to the selected provider model
-    # and sends it as KBC_PK_BLUE_MODEL. Keep KBC_TEST_MODEL as an explicit
-    # override, but never fall back to a Claude model after a Codex session has
-    # already supplied the blue-tier GPT model.
-    return (
-        os.environ.get("KBC_TEST_MODEL")
-        or os.environ.get("KBC_PK_BLUE_MODEL")
-        or "claude-sonnet-4-6"
-    )
+    return pi_config.role_model("blue")
 
 
 def _test_max_turns() -> int:
@@ -6030,11 +5644,10 @@ def _test_max_turns() -> int:
 
 
 def _test_sdk_version() -> str:
-    try:
-        package = "openai-codex" if _engine_kind() == "codex_sdk" else "claude-agent-sdk"
-        return package_version(package)
-    except PackageNotFoundError:
-        return "unknown"
+    if _engine_kind() == "claude_agent_sdk":
+        from claude_engine import sdk_version
+        return sdk_version()
+    return pi_sdk_version()
 
 
 def _effective_test_allowed_tools(allowed_tools: list[str] | None) -> list[str]:
@@ -6069,6 +5682,9 @@ def _test_consumer_fingerprint(
         # configured value as local tool calls inside one user turn.
         "turn_budget": max_turns if max_turns is not None else _test_max_turns(),
     }
+    if _engine_kind() in {"pi_agent", "claude_agent_sdk"}:
+        execution = pi_config.for_role("blue", session_kind="test")
+        contract["execution"] = {"model": execution["model"], "thinking_level": execution.get("thinking_level", "off")}
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -6418,7 +6034,7 @@ async def _consume_test_turn_stream(run: "TestRun", client) -> None:
     drain; those below the armed generation are dropped so a late ResultMessage can
     never terminate — nor a late partial contaminate — the current turn."""
     async for msg in client.receive_messages():
-        is_result = type(msg).__name__ == "ResultMessage"
+        is_result = message_is_result(msg)
         frame_gen = run._results_seen + 1
         if frame_gen < run._turn_generation:
             # A superseded (reaped) turn's straggler. Drop it without touching the
@@ -6445,6 +6061,16 @@ async def _consume_test_turn_stream(run: "TestRun", client) -> None:
                 continue
             was_active = run._turn_active
             run._turn_active = False
+            if isinstance(msg, AgentEvent) and msg.data["outcome"] != "completed":
+                run._turn_text = []
+                await run.emit(_error_event(
+                    msg.data.get("error") or "The model request did not complete",
+                    code="test_model_failed", stage="test",
+                    api_error_status=msg.data.get("api_error_status")))
+                await run.emit({"type": "turn_done", "text": _loc(
+                    run, "The model request failed. You can retry this question.",
+                    "模型请求失败，可以重新发送此问题。")})
+                continue
             if was_active:
                 _print_test_lifecycle("turn.done", run)
             await _emit_message(run, msg)
@@ -6587,39 +6213,11 @@ def _build_test_client(run: "TestRun", sid: str):
     out so both the first connect and a post-stall rebuild build an identical
     client (same snapshot, same profile) — only the SDK session id differs."""
     effective_tools = _effective_test_allowed_tools(run.allowed_tools)
-    if _engine_kind() == "codex_sdk":
-        return CodexSDKClient(
-            cwd=run.cwd,
-            system_prompt=_prompt("test_role", run.locale),
-            model=run.consumer_model or _test_model(),
-            session_id=sid,
-            read_only=True,
-            allowed_read_roots=[run.cwd],
-            allowed_read_tools=effective_tools,
-            max_tool_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
-        )
-    opts = ClaudeAgentOptions(
-        cwd=run.cwd,
-        system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
-        tools=effective_tools,                    # actual context matches the fingerprinted profile contract
-        allowed_tools=effective_tools,
-        disallowed_tools=list(READONLY_CONSUMER_DISALLOWED_TOOLS),  # belt-and-suspenders under bypass
-        mcp_servers={},                            # no compile signal tools
-        strict_mcp_config=True,                    # ignore project/user/plugin MCP configs
-        skills=[],                                 # no skills for a read-only consumer
-        permission_mode="bypassPermissions",       # the pod itself is the sandbox
-        # C4: path confinement — absolute/../ reads must not escape the snapshot
-        # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
-        setting_sources=[],                        # tenant isolation
-        # The test session mimics the REAL consumer → the gate/consumer tier
-        # (sonnet), not the compile tier. Proxy-served id; overridable per-deploy.
-        model=run.consumer_model or _test_model(),
-        max_turns=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
-        session_id=sid,
-        session_store=InMemorySessionStore(),
-    )
-    return ClaudeSDKClient(options=opts)
+    return create_agent_client(
+        cwd=run.cwd, system_prompt=_prompt("test_role", run.locale), session_id=sid,
+        model_config=pi_config.for_role("blue", model=run.consumer_model or _test_model(), session_kind="test"),
+        tools=FileTools(run.cwd, effective_tools, _make_test_path_guard(Path(run.cwd), run.locale)).tools(),
+        max_model_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns())
 
 
 def _reset_test_turn_state(run: "TestRun") -> None:
@@ -6640,7 +6238,7 @@ def _reset_test_turn_state(run: "TestRun") -> None:
 
 
 async def test_session_driver(run: "TestRun"):
-    """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
+    """Read-only consumer driver: host a Pi session over the pinned snapshot
     dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
     persona = test_role pack, no MCP, no kickoff. A conversational session — connects and
     waits for the first /test-message; each turn streams log + turn_done over GET
@@ -6777,26 +6375,6 @@ RECOMMENDATION_DISALLOWED_TOOLS = [
 ]
 
 
-def _make_recommendation_submit_tool(root: Path, parent: "CompileRun", captured: dict):
-    """Build the single structured output tool for one recommendation call."""
-    tool_description = _loc(
-        parent,
-        "Submit exactly one simple, valuable regression question with its raw-grounded reference answer and evidence paths.",
-        "提交且仅提交 1 个简单但有价值的回归问题、基于原料的明确参考答案及证据路径。",
-    )
-
-    @tool("submit_recommended_test", tool_description, {
-        "question": str,
-        "reference_answer": str,
-        "evidence_paths": list,
-    })
-    async def submit_recommended_test(args):
-        if captured:
-            return {"content": [{"type": "text", "text": "A recommendation was already submitted."}]}
-        captured.update(_validate_test_recommendation(root, args))
-        return {"content": [{"type": "text", "text": "Recommendation accepted. Stop now."}]}
-
-    return submit_recommended_test
 
 
 def _recommendation_engine_tool(root: Path, parent: "CompileRun", captured: dict) -> EngineTool:
@@ -6828,38 +6406,6 @@ def _recommendation_engine_tool(root: Path, parent: "CompileRun", captured: dict
     )
 
 
-def _recommendation_session_opts(
-    parent: "CompileRun", root: Path, submit_recommended_test
-) -> "ClaudeAgentOptions":
-    """Create an isolated SDK profile for explicit test recommendation.
-
-    `allowed_tools` only bypasses permission prompts; it does not hide Claude
-    Code's default tool catalogue. Supplying `tools` and a plain system prompt
-    is what makes this a minimal reviewer instead of a compiler-shaped session.
-    """
-    return ClaudeAgentOptions(
-        cwd=str(root),
-        system_prompt=_prompt("recommend_test_role", parent.locale),
-        tools=list(RECOMMENDATION_BUILTIN_TOOLS),
-        allowed_tools=[*RECOMMENDATION_BUILTIN_TOOLS, RECOMMENDATION_SUBMIT_TOOL],
-        disallowed_tools=list(RECOMMENDATION_DISALLOWED_TOOLS),
-        mcp_servers={
-            "recommend": create_sdk_mcp_server("recommend", tools=[submit_recommended_test]),
-        },
-        strict_mcp_config=True,
-        permission_mode="bypassPermissions",
-        setting_sources=[],
-        skills=[],
-        model=_compile_model(),
-        max_turns=int(os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS", "20")),
-        max_buffer_size=SDK_MAX_BUFFER_BYTES,
-        session_id=str(uuid.uuid4()),
-        session_store=InMemorySessionStore(),
-        # Non-interactive red-team reviewer → de-streamed Anthropic route
-        # (charset fix); merged over the inherited env by the SDK.
-        env=destream.session_env("verify"),
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_recommendation_path_guard(root, parent.locale)])]},
-    )
 
 
 async def _run_structured_tool_session(client, directive: str):
@@ -6869,7 +6415,7 @@ async def _run_structured_tool_session(client, directive: str):
         await client.connect()
         await client.query(directive)
         async for msg in client.receive_messages():
-            if type(msg).__name__ == "ResultMessage":
+            if message_is_result(msg):
                 terminal_result = msg
                 break
     finally:
@@ -6877,6 +6423,7 @@ async def _run_structured_tool_session(client, directive: str):
     return terminal_result
 
 
+@_observe_pi_sessions
 async def recommend_test_question(parent: "CompileRun") -> dict:
     """Run one fresh, read-only red-team session over raw/ + candidate/.
 
@@ -6896,32 +6443,16 @@ async def recommend_test_question(parent: "CompileRun") -> dict:
         "Inspect raw/ and candidate/, then call submit_recommended_test exactly once. Do not merely print JSON.",
         "检查 raw/ 与 candidate/，然后仅调用一次 submit_recommended_test；不要只输出 JSON。",
     )
-    if _engine_kind() == "codex_sdk":
-        # The model sees only these two immutable views.  This preserves the
-        # Claude path guard's blind-review contract with an OS-enforced Codex
-        # workspace boundary instead of trusting model instructions/hooks.
-        with isolated_readonly_workspace({
-            "raw": root / "raw",
-            "candidate": root / "candidate",
-        }) as session_root:
-            client = CodexSDKClient(
-                cwd=str(session_root),
-                system_prompt=_prompt("recommend_test_role", parent.locale),
-                model=_compile_model(),
-                session_id=str(uuid.uuid4()),
-                read_only=True,
-                allowed_read_roots=[str(session_root)],
-                tools=[_recommendation_engine_tool(root, parent, captured)],
-                max_tool_calls=int(os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS", "20")),
-            )
-            terminal_result = await _run_structured_tool_session(client, directive)
-    else:
-        submit_recommended_test = _make_recommendation_submit_tool(root, parent, captured)
-        opts = _recommendation_session_opts(parent, root, submit_recommended_test)
-        client = ClaudeSDKClient(options=opts)
-        terminal_result = await _run_structured_tool_session(client, directive)
+    client = create_agent_client(
+        cwd=str(root), system_prompt=_prompt("recommend_test_role", parent.locale), session_id=str(uuid.uuid4()),
+        model_config=pi_config.for_role("compile"),
+        tools=[*FileTools(str(root), RECOMMENDATION_BUILTIN_TOOLS,
+                          _make_recommendation_path_guard(root, parent.locale)).tools(),
+               _recommendation_engine_tool(root, parent, captured)],
+        max_model_calls=int(os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS", "20")))
+    terminal_result = await _run_structured_tool_session(client, directive)
     if not captured:
-        if getattr(terminal_result, "subtype", "") == "error_max_turns":
+        if message_field(terminal_result, "subtype", "") == "error_max_turns":
             raise ValueError(
                 "the red-team reviewer exhausted its turn budget before submitting a recommendation"
             )
@@ -7031,33 +6562,6 @@ def _validate_polished_reference(root: Path, args: dict) -> dict:
     }
 
 
-def _make_reference_assist_submit_tool(root: Path, parent: "CompileRun", mode: str, captured: dict):
-    if mode == "suggest":
-        @tool("submit_reference_suggestions", _loc(
-            parent,
-            "Submit 2-3 distinct raw-grounded reference-answer candidates.",
-            "提交 2-3 个各有侧重且基于原料的参考答案候选。",
-        ), {"candidates": list})
-        async def submit_reference_suggestions(args):
-            if captured:
-                return {"content": [{"type": "text", "text": "Suggestions were already submitted."}]}
-            captured.update(_validate_reference_suggestions(root, args))
-            return {"content": [{"type": "text", "text": "Suggestions accepted. Stop now."}]}
-
-        return submit_reference_suggestions, "mcp__reference_assist__submit_reference_suggestions"
-
-    @tool("submit_polished_reference", _loc(
-        parent,
-        "Submit one polished raw-grounded answer plus any source-conflict warnings.",
-        "提交 1 个基于原料的润色答案，以及必要的原料冲突警告。",
-    ), {"polished_answer": str, "evidence_paths": list, "warnings": list})
-    async def submit_polished_reference(args):
-        if captured:
-            return {"content": [{"type": "text", "text": "A polished answer was already submitted."}]}
-        captured.update(_validate_polished_reference(root, args))
-        return {"content": [{"type": "text", "text": "Polished answer accepted. Stop now."}]}
-
-    return submit_polished_reference, "mcp__reference_assist__submit_polished_reference"
 
 
 def _reference_assist_engine_tool(root: Path, parent: "CompileRun", mode: str, captured: dict) -> EngineTool:
@@ -7105,36 +6609,9 @@ def _reference_assist_engine_tool(root: Path, parent: "CompileRun", mode: str, c
     return EngineTool(name, description, schema, submit)
 
 
-def _reference_assist_session_opts(parent: "CompileRun", root: Path, submit_tool, allowed_submit_tool: str):
-    return ClaudeAgentOptions(
-        cwd=str(root),
-        system_prompt=_prompt("reference_assist_role", parent.locale),
-        tools=list(REFERENCE_ASSIST_BUILTIN_TOOLS),
-        allowed_tools=[*REFERENCE_ASSIST_BUILTIN_TOOLS, allowed_submit_tool],
-        disallowed_tools=list(REFERENCE_ASSIST_DISALLOWED_TOOLS),
-        mcp_servers={
-            "reference_assist": create_sdk_mcp_server("reference_assist", tools=[submit_tool]),
-        },
-        strict_mcp_config=True,
-        permission_mode="bypassPermissions",
-        setting_sources=[],
-        skills=[],
-        model=_reference_assist_model(),
-        # The LIGHT reviewer often needs several narrow reads before it can
-        # ground 2-3 candidates. Eight turns proved too small in real KBs and
-        # could end before the mandatory submit call. The wall-clock timeout
-        # remains the hard boundary.
-        max_turns=int(os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS", "20")),
-        max_buffer_size=SDK_MAX_BUFFER_BYTES,
-        session_id=str(uuid.uuid4()),
-        session_store=InMemorySessionStore(),
-        # Non-interactive reference-answer assistant → de-streamed Anthropic
-        # route (charset fix); merged over the inherited env by the SDK.
-        env=destream.session_env("verify"),
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_recommendation_path_guard(root, parent.locale)])]},
-    )
 
 
+@_observe_pi_sessions
 async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
     """Run one fast, isolated reference-answer edit over raw/ + candidate/."""
     root = Path(parent.workdir).resolve()
@@ -7166,36 +6643,22 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
         "\n\nTimebox retrieval. Once the necessary evidence is found, stop reading and call the submit tool; always reserve a turn for submission.",
         "\n\n请限制检索范围。找到足以回答的证据后立即停止读取并调用提交工具，务必为提交保留一轮。",
     )
-    if _engine_kind() == "codex_sdk":
-        with isolated_readonly_workspace({
-            "raw": root / "raw",
-            "candidate": root / "candidate",
-        }) as session_root:
-            client = CodexSDKClient(
-                cwd=str(session_root),
-                system_prompt=_prompt("reference_assist_role", parent.locale),
-                model=_reference_assist_model(),
-                session_id=str(uuid.uuid4()),
-                read_only=True,
-                allowed_read_roots=[str(session_root)],
-                tools=[_reference_assist_engine_tool(root, parent, request_payload["mode"], captured)],
-                max_tool_calls=int(os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS", "20")),
-            )
-            terminal_result = await _run_structured_tool_session(client, directive)
-    else:
-        submit_tool, allowed_submit_tool = _make_reference_assist_submit_tool(
-            root, parent, request_payload["mode"], captured
-        )
-        opts = _reference_assist_session_opts(parent, root, submit_tool, allowed_submit_tool)
-        client = ClaudeSDKClient(options=opts)
-        terminal_result = await _run_structured_tool_session(client, directive)
+    client = create_agent_client(
+        cwd=str(root), system_prompt=_prompt("reference_assist_role", parent.locale), session_id=str(uuid.uuid4()),
+        model_config=pi_config.for_role("blue"),
+        tools=[*FileTools(str(root), REFERENCE_ASSIST_BUILTIN_TOOLS,
+                          _make_recommendation_path_guard(root, parent.locale)).tools(),
+               _reference_assist_engine_tool(root, parent, request_payload["mode"], captured)],
+        max_model_calls=int(os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS", "20")))
+    terminal_result = await _run_structured_tool_session(client, directive)
     if not captured:
-        if getattr(terminal_result, "subtype", "") == "error_max_turns":
+        if message_field(terminal_result, "subtype", "") == "error_max_turns":
             raise ValueError("the reference assistant exhausted its turn budget before submitting")
         raise ValueError("the reference assistant returned no structured result")
     return captured
 
 
+@_observe_pi_sessions
 async def _test_session_wrapper(run: "TestRun"):
     """Lifecycle for a read-only test session: run the driver under a turn-stall
     watchdog, turn a crash into an `error` event, always close with `end`. No
@@ -7266,64 +6729,63 @@ def _apply_session_config(body: dict) -> None:
     credential/tiers. If multi-run pods ever become real, carry llm/settings
     per-run (SDK client env) instead of mutating the process environment."""
     llm = body.get("llm")
-    if isinstance(llm, dict):
-        engine = str(llm.get("engine") or "claude_agent_sdk").strip().lower()
-        engine = {"claude": "claude_agent_sdk", "codex": "codex_sdk"}.get(engine, engine)
-        if engine not in {"claude_agent_sdk", "codex_sdk"}:
-            raise ValueError(f"unsupported llm.engine {engine!r}")
-        protocol = str(llm.get("protocol") or "").strip().lower()
-        expected_protocol = "openai_responses" if engine == "codex_sdk" else "anthropic"
-        if protocol and protocol != expected_protocol:
-            raise ValueError(
-                f"llm.engine {engine!r} requires protocol {expected_protocol!r}, got {protocol!r}"
-            )
-        os.environ["KBC_ENGINE"] = engine
-        # The LLM object is one authority block, not field-level overrides. If
-        # the consumer supplied it, omitted fields must not inherit a Runtime or
-        # image credential that belongs to another endpoint.
-        prefix = "OPENAI" if engine == "codex_sdk" else "ANTHROPIC"
-        other_prefix = "ANTHROPIC" if prefix == "OPENAI" else "OPENAI"
-        for field, env_name in (
-            ("base_url", f"{prefix}_BASE_URL"),
-            ("model", f"{prefix}_MODEL"),
-        ):
-            value = llm.get(field)
-            if value:
-                os.environ[env_name] = str(value)
-            else:
-                os.environ.pop(env_name, None)
-
-        token = llm.get("api_key") or llm.get("auth_token")
-        if engine == "codex_sdk":
-            if token:
-                os.environ["OPENAI_API_KEY"] = str(token)
-            else:
-                os.environ.pop("OPENAI_API_KEY", None)
-            os.environ.pop("OPENAI_AUTH_TOKEN", None)
-        else:
-            if llm.get("auth_token"):
-                os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
-                os.environ.pop("ANTHROPIC_API_KEY", None)
-            elif llm.get("api_key"):
-                os.environ["ANTHROPIC_API_KEY"] = str(llm["api_key"])
-                os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-            else:
-                os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-                os.environ.pop("ANTHROPIC_API_KEY", None)
-
-        # A present consumer block is authoritative for one engine. Never leave
-        # the other engine's endpoint or credential in the process environment.
+    if not isinstance(llm, dict) or str(llm.get("engine", "")).strip().lower() not in {"pi", "pi_agent", "claude", "claude_agent_sdk"}:
+        if os.environ.get("KBC_SMOKE") == "1" and llm is None:
+            return
+        raise ValueError("This compiler image requires complete Claude Agent SDK or Pi Agent model configuration")
+    kind = {"pi": "pi_agent", "claude": "claude_agent_sdk"}.get(llm["engine"].strip().lower(), llm["engine"].strip().lower())
+    execution = llm.get("execution")
+    if kind == "claude_agent_sdk" and isinstance(execution, dict):
+        for config in (execution.get("roles") or {}).values():
+            if not isinstance(config, dict) or config.get("model", {}).get("api") != "anthropic-messages":
+                raise ValueError("Claude Agent SDK requires Anthropic models for every role")
+    pi_config.configure(execution)
+    os.environ["KBC_ENGINE"] = kind
+    for prefix in ("ANTHROPIC", "OPENAI"):
         for suffix in ("BASE_URL", "MODEL", "API_KEY", "AUTH_TOKEN"):
-            os.environ.pop(f"{other_prefix}_{suffix}", None)
+            os.environ.pop(f"{prefix}_{suffix}", None)
+    # The existing charset-preserving shim forwards the request's own
+    # credential. It needs only the compile endpoint in the parent.
+    compile_model = pi_config.for_role("compile", session_kind="test")["model"]
+    if compile_model["api"] == "anthropic-messages":
+        os.environ["ANTHROPIC_BASE_URL"] = compile_model["baseUrl"]
+    for key, role in {
+        "KBC_COMPILE_MODEL": "compile", "KBC_PK_BLUE_MODEL": "blue",
+        "KBC_PK_JUDGE_MODEL": "judge", "KBC_PK_VERDICT_MODEL": "blue",
+        "KBC_MV_TRANSCRIBE_MODEL": "transcribe", "KBC_MV_COMPARE_MODEL": "compare",
+        "KBC_REFERENCE_ASSIST_MODEL": "blue",
+    }.items():
+        os.environ[key] = pi_config.role_model(role)
     settings = body.get("settings")
     if isinstance(settings, dict):
         for key, value in settings.items():
             k = str(key)
             if not k.startswith("KBC_") or value is None or k == "KBC_ENGINE":
                 continue  # whitelist: only the box's own knob vocabulary
+            if k.endswith("_MODEL"):
+                continue  # Resolved execution roles own model selection.
             if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
                 continue  # ops kill switch outranks consumer config
             os.environ[k] = str(value)
+        # These watchdog/transport bounds are cached at import time. Applying
+        # only os.environ leaves them at the new Pod's boot values on recovery.
+        # One compile box owns one run; install the resolved policy before its
+        # first session and keep live reattachment on that original policy.
+        for key, name in _CACHED_SESSION_SETTINGS.items():
+            if key in settings and settings[key] is not None:
+                globals()[name] = type(globals()[name])(settings[key])
+
+
+_CACHED_SESSION_SETTINGS = {
+    "KBC_" + name.lstrip("_"): name for name in (
+        "_MODEL_IDLE_TIMEOUT_S", "_MODEL_TOOL_IDLE_TIMEOUT_S", "_MODEL_MAX_RETRIES",
+        "_MODEL_WATCHDOG_POLL_S", "_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "_BATCH_REBUILD_MAX_RETRIES",
+        "_TEST_MODEL_IDLE_TIMEOUT_S", "_TEST_SESSION_IDLE_TTL_S", "_TEST_SESSION_REAP_POLL_S",
+        "_TEST_STALL_REBUILD_WINDOW_S", "_TEST_REBUILD_DEADLINE_S", "_MODEL_RATE_MAX_RETRIES",
+        "_MODEL_RATE_BACKOFF_BASE_S", "_MODEL_RATE_BACKOFF_CAP_S", "_SHUTDOWN_DRAIN_S", "_SHUTDOWN_DRAIN_MAX_S",
+        "SYNC_INTERVAL_SECS", "MAX_SYNC_FILE_BYTES", "_STALL_INTERRUPT_DEADLINE_S",
+    )
+}
 
 
 async def handle_session(request: web.Request):
@@ -7784,7 +7246,8 @@ async def handle_events(request: web.Request):
 
 
 async def handle_health(request: web.Request):
-    return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS)})
+    return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS),
+                              "engine": _engine_kind()})
 
 
 def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | None = None) -> tuple[str, int]:

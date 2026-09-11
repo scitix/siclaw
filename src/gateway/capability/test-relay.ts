@@ -17,12 +17,14 @@ import type { AgentBoxClient } from "../agentbox/client.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import type { CapabilityEventFrame } from "./contract.js";
 import { CAPABILITY_EVENT } from "./contract.js";
+import { ExecutionObservationRelay, type ExecutionObservation } from "./execution-observation.js";
 
 interface TestBoxEvent {
   type: string;
   text?: string;
   error?: string;
   session_id?: string;
+  observation?: ExecutionObservation;
 }
 
 export interface DriveTestSessionOptions {
@@ -59,19 +61,28 @@ export function shouldRelayTestSession(opened: { idempotent_replay?: boolean }):
  */
 export async function driveTestSession(opts: DriveTestSessionOptions): Promise<void> {
   const { client, runId, testSessionId, frontendClient, touch } = opts;
-  for await (const raw of client.streamPath(`/test-events/${testSessionId}`)) {
-    const evt = raw as TestBoxEvent;
-    touch?.();
-    const frame: CapabilityEventFrame = {
-      run_id: runId,
-      type: "test",
-      payload: {
-        test_session_id: testSessionId,
-        kind: evt.type,
-        text: evt.text ?? evt.error ?? "",
-      },
-    };
-    frontendClient.emitEvent(CAPABILITY_EVENT, frame);
-    if (evt.type === "end") break;
+  const observations = new ExecutionObservationRelay(frontendClient, runId);
+  try {
+    for await (const raw of client.streamPath(`/test-events/${testSessionId}`)) {
+      const evt = raw as TestBoxEvent;
+      touch?.();
+      if (evt.type === "execution_observation") {
+        observations.enqueue(evt.observation);
+        continue;
+      }
+      const frame: CapabilityEventFrame = {
+        run_id: runId,
+        type: "test",
+        payload: {
+          test_session_id: testSessionId,
+          kind: evt.type,
+          text: evt.text ?? evt.error ?? "",
+        },
+      };
+      frontendClient.emitEvent(CAPABILITY_EVENT, frame);
+      if (evt.type === "end") break;
+    }
+  } finally {
+    void observations.close();
   }
 }

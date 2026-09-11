@@ -56,6 +56,66 @@ beforeEach(() => {
 });
 
 describe("materializeCapabilityInputs", () => {
+  it("reattaches a live legacy box without resolving changed or retired model policy", async () => {
+    const client = { getJson: vi.fn().mockResolvedValue({ status: "ok", runs: 1 }), postJson: vi.fn() };
+    const backend = { request: vi.fn().mockRejectedValue(new Error("legacy model lacks explicit limits")) };
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r1", inputRevision: "pinned", reuseExisting: true });
+    expect(result).toEqual({ reattached: true, inputRevision: "pinned" });
+    expect(backend.request).not.toHaveBeenCalled();
+    expect(client.postJson).not.toHaveBeenCalled();
+  });
+
+  it.each(["pi_agent", "claude_agent_sdk"])("a restarted %s container with no live session must rehydrate the pinned attempt", async engine => {
+    const { client, backend, posts } = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned" } });
+    const result = await materializeCapabilityInputs({
+      client: { ...client, getJson: vi.fn().mockResolvedValue({ runs: 0, engine }) }, backend,
+      runId: "r1", inputRevision: "pinned", reuseExisting: true,
+    });
+    expect(result.reattached).not.toBe(true);
+    expect(posts[0].path).toBe("/sources");
+    expect(backend.request).toHaveBeenCalledWith(CAPABILITY_FETCH_INPUT, { run_id: "r1", input_revision: "pinned" });
+  });
+
+  it.each(["pi_agent", "claude_agent_sdk"])("replaces an empty restarted legacy box only after %s configuration resolves", async engine => {
+    const old = { getJson: vi.fn().mockResolvedValue({ runs: 0, test_sessions: 0 }), postJson: vi.fn() };
+    const fresh = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned", llm: { engine } },
+      workspace: { bundle_base64: "V1M=" } });
+    const replace = vi.fn(async () => {
+      expect(fresh.backend.request).toHaveBeenCalledTimes(1);
+      return fresh.client;
+    });
+    await materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      inputRevision: "pinned", reuseExisting: true, replaceEmptyLegacyBox: replace });
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(old.postJson).not.toHaveBeenCalled();
+    expect(fresh.posts.map(p => p.path)).toEqual(["/sources", "/authoring"]);
+
+    replace.mockClear();
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      inputRevision: "different", reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("input revision mismatch");
+    expect(replace).not.toHaveBeenCalled();
+    old.getJson.mockResolvedValue({ runs: 0, test_sessions: 1 });
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("active test sessions");
+    expect(replace).not.toHaveBeenCalled();
+
+    old.getJson.mockResolvedValue({ runs: 0, test_sessions: 0 });
+    fresh.backend.request.mockRejectedValue(new Error("configure the engine first"));
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("configure the engine first");
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("a shared local endpoint never uses another run's health count to skip setup", async () => {
+    const { client, backend, posts } = fakes({ raw: { bundle_base64: "UkFX" } });
+    const health = vi.fn().mockResolvedValue({ runs: 1 });
+    const result = await materializeCapabilityInputs({ client: { ...client, getJson: health },
+      backend, runId: "different-run", reuseExisting: false });
+    expect(result.reattached).not.toBe(true);
+    expect(health).not.toHaveBeenCalled();
+    expect(posts[0].body.run_id).toBe("different-run");
+  });
+
   it("fresh box: posts raw sources, then rehydrates the authoring workspace (locale rides along)", async () => {
     const { client, backend, posts } = fakes({
       raw: { bundle_base64: "UkFX", bundle_sha256: "aa", locale: "zh", input_revision: "manifest-1" },

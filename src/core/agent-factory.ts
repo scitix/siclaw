@@ -7,7 +7,6 @@ import { buildKnowledgeOverview, buildKnowledgeWikiCatalog } from "../memory/ove
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
   createAgentSessionServices,
-  createAgentSessionFromServices,
   getAgentDir,
   DefaultResourceLoader,
   SessionManager,
@@ -46,11 +45,8 @@ import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
-import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
+import { createPiExecutionSession } from "./pi-execution.js";
 import {
-  extractModelEnvelopeInspection,
-  inspectModelEnvelope,
-  type ModelEnvelopeInspection,
   type ModelEnvelopeManifest,
 } from "./model-envelope.js";
 import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
@@ -58,8 +54,6 @@ import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
-import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
-import { LlmCallRecorder } from "./llm-call-recorder.js";
 import {
   ToolResultArtifactStore,
   createToolResultArtifactTools,
@@ -920,8 +914,6 @@ export async function createSiclawSession(
     knowledgeMounted: fs.existsSync(knowledgeDir),
   });
   console.log(`[agent-context] ${JSON.stringify(contextManifest)}`);
-  const modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest } = {};
-  const modelEnvelopeInspectionRef: { current?: ModelEnvelopeInspection } = {};
 
   // Resolve the initial model: prefer the user's configured default over pi-agent's built-in
   const configuredModel = defaultLlm
@@ -931,64 +923,23 @@ export async function createSiclawSession(
       )
     : undefined;
 
-  // restrictedFileTools are registered via customTools (pushed above); suppress
-  // pi's default built-in read/bash/edit/write so only siclaw's path-restricted
-  // tools are exposed (security: no unrestricted bash/file access).
-  const { session, extensionsResult, modelFallbackMessage } = await createAgentSessionFromServices({
+  const {
+    session, extensionsResult, modelFallbackMessage, llmCallRecorder,
+    modelEnvelopeManifestRef, modelEnvelopeInspectionRef,
+  } = await createPiExecutionSession({
     services,
     sessionManager,
     model: configuredModel,
     thinkingLevel: resolveSessionThinkingLevel(services.settingsManager, configuredModel),
-    noTools: "builtin",
     customTools,
-  });
-
-  // Trigger session_start for extension state restoration.
-  // In web/gateway mode, bindExtensions() is never called by the TUI layer,
-  // so session_start doesn't fire and extensions can't restore persisted state
-  // (e.g. DP mode flag after session release/rebuild).
-  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings,
-  // session_start fires again — but the DP handler resets state first
-  // (dpActive=false) then restores from JSONL, so double-fire is idempotent.
-  await session.bindExtensions({});
-
-  const agentWithPayloadHook = session.agent as unknown as {
-    onPayload?: (payload: unknown, model: unknown) => unknown | Promise<unknown>;
-  };
-  const previousOnPayload = agentWithPayloadHook.onPayload;
-  agentWithPayloadHook.onPayload = async (payload, model) => {
-    const converted = convertOpenAIPdfPayload(payload);
-    const next = previousOnPayload
-      ? await previousOnPayload(converted, model)
-      : converted;
-    const finalPayload = convertOpenAIPdfPayload(next ?? converted);
-    const manifest = inspectModelEnvelope(finalPayload);
-    modelEnvelopeInspectionRef.current = extractModelEnvelopeInspection(finalPayload);
-    const previous = modelEnvelopeManifestRef.current;
-    modelEnvelopeManifestRef.current = manifest;
-    if (!previous ||
-        previous.system.sha256 !== manifest.system.sha256 ||
-        previous.tools.schemaSha256 !== manifest.tools.schemaSha256) {
+    onModelEnvelope: (manifest) => {
       console.log(`[model-envelope] ${JSON.stringify({
         agentType: compiledContext.harness.agentType,
         mode,
         ...manifest,
       })}`);
-    }
-    return finalPayload;
-  };
-
-  // ── LLM call recorder: innermost streamFn wrap, BEFORE the guard pipeline ──
-  // Installed closest to the network so guard transforms and context work land
-  // in setup / tool-group time, not in net_ttft. Stamps `message.llmCall`,
-  // which the gateway persists as metadata.llm_call (the timing source of truth).
-  const llmCallRecorder = new LlmCallRecorder();
-  session.agent.streamFunction = llmCallRecorder.wrapStreamFn(session.agent.streamFunction);
-
-  // ── Guard pipeline: unified guard registration and installation ──
-  const contextWindow = configuredModel?.contextWindow ?? 128_000;
-  const guardRegistry = createGuardRegistry(contextWindow);
-  installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
+    },
+  });
 
   const toolsetsByName = new Map(
     customTools.flatMap((tool) => {

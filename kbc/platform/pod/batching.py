@@ -145,19 +145,40 @@ def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | No
     lines = path.read_bytes().splitlines(keepends=True)
     if not lines:
         return None
-    target = min(_hierarchical_text_slice_bytes(), hierarchical_text_budget_bytes())
+    # A UTF-8 code point needs at most four bytes. Prefer whole lines, but a
+    # minified JSON document or long CSV field must not defeat the budget.
+    target = max(4, min(_hierarchical_text_slice_bytes(), hierarchical_text_budget_bytes()))
+    byte_ranges = any(len(line) > target for line in lines)
+    units: list[tuple[int, int, int]] = []
+    offset = 0
+    for number, line in enumerate(lines, 1):
+        start = 0
+        while start < len(line):
+            end = min(start + target, len(line))
+            if end < len(line):
+                while end > start and 0x80 <= line[end] <= 0xBF:
+                    end -= 1
+                # Invalid UTF-8 is still preserved byte-for-byte for the
+                # existing text reader to diagnose; always make progress.
+                if end == start:
+                    end = min(start + target, len(line))
+            units.append((number, offset + start, offset + end))
+            start = end
+        offset += len(line)
     slices: list[dict[str, int]] = []
     start = 0
-    while start < len(lines):
+    while start < len(units):
         end = start
         total = 0
-        while end < len(lines) and (total + len(lines[end]) <= target or end == start):
-            total += len(lines[end])
+        while end < len(units) and total + units[end][2] - units[end][1] <= target:
+            total += units[end][2] - units[end][1]
             end += 1
         slices.append({
-            "start_line": start + 1,
-            "end_line": end,
+            "start_line": units[start][0],
+            "end_line": units[end - 1][0],
             "bytes": total,
+            **({"start_byte": units[start][1], "end_byte": units[end - 1][2]}
+               if byte_ranges else {}),
         })
         start = end
     return len(lines), slices
@@ -382,11 +403,11 @@ def should_batch(inventory: list[dict[str, Any]], threshold: int | None = None) 
 def should_hierarchical(
     inventory: list[dict[str, Any]], threshold: int | None = None
 ) -> bool:
-    """The second routing gate. Keeping it separate from ``should_batch`` is
-    intentional: changing the large-corpus strategy must not move the existing
-    small/single-session or medium/flat-batch boundaries."""
+    """Use the slice-aware planner whenever an individual source needs it,
+    even when the total corpus is below the large-corpus threshold."""
     limit = threshold if threshold is not None else hierarchical_threshold_bytes()
-    return corpus_effective_bytes(inventory) > limit
+    return (corpus_effective_bytes(inventory) > limit
+            or any(item.get("text_slices") or item.get("pdf_slices") for item in inventory))
 
 
 # Crossing a top-level section is a preference, not a reason to spend an almost
@@ -883,11 +904,10 @@ def build_plan(
         else hierarchical_text_budget_bytes() if mode == "hierarchical"
         else None
     )
-    # These are compiler-internal planning facts, not deployment knobs. The
-    # selected Claude model has a 1M window; we deliberately plan each session
-    # around half of it so retrieval and reasoning have headroom.
-    context_window = DEFAULT_CONTEXT_WINDOW_TOKENS
-    context_target = DEFAULT_CONTEXT_TARGET_TOKENS
+    # The control plane freezes these together with the selected compile model and caps
+    # every source/slice/reduction budget to its real available context.
+    context_window = int(os.environ.get("KBC_CONTEXT_WINDOW_TOKENS", str(DEFAULT_CONTEXT_WINDOW_TOKENS)))
+    context_target = int(os.environ.get("KBC_CONTEXT_TARGET_TOKENS", str(DEFAULT_CONTEXT_TARGET_TOKENS)))
     batch_sizes = sorted(int(batch.get("bytes") or 0) for batch in batches)
     estimated_source_bytes = resolved_text_budget or resolved_budget
     return {
@@ -1087,6 +1107,9 @@ def validate_plan(
                         "slice_file": str(source_range["slice_file"]),
                         "defer_accounting": bool(batch.get("defer_accounting", False)),
                     }
+                    if "start_byte" in source_range or "end_byte" in source_range:
+                        parsed_range["start_byte"] = int(source_range["start_byte"])
+                        parsed_range["end_byte"] = int(source_range["end_byte"])
                 except (KeyError, TypeError, ValueError):
                     errors.append(f"batch {bid}: malformed source range for {path}")
                     continue
@@ -1094,6 +1117,13 @@ def validate_plan(
                     errors.append(f"batch {bid}: invalid line range for {path}")
                 if parsed_range["bytes"] < 1:
                     errors.append(f"batch {bid}: empty text slice for {path}")
+                if "start_byte" in parsed_range and (
+                    parsed_range["start_byte"] < 0
+                    or parsed_range["end_byte"] - parsed_range["start_byte"] != parsed_range["bytes"]
+                ):
+                    errors.append(f"batch {bid}: invalid byte range for {path}")
+                if parsed_range["bytes"] > min(b, text_budget if text_budget is not None else b):
+                    errors.append(f"batch {bid}: text slice exceeds budget for {path}")
                 if not parsed_range["slice_file"].startswith(".kbc-batch-slices/"):
                     errors.append(f"batch {bid}: unsafe slice file for {path}")
                 slice_appearances.setdefault(path, []).append(parsed_range)
@@ -1191,17 +1221,22 @@ def validate_plan(
             continue
         if [item["part"] for item in ordered] != list(range(1, len(ordered) + 1)):
             errors.append(f"source {path} has non-sequential text slices")
-        expected_start = 1
+        byte_ranges = any("start_byte" in item for item in ordered)
+        if byte_ranges and not all("start_byte" in item for item in ordered):
+            errors.append(f"source {path} mixes byte and line slices")
+            continue
+        expected_start = 0 if byte_ranges else 1
         for index, item in enumerate(ordered):
-            if item["start_line"] != expected_start:
+            if item["start_byte" if byte_ranges else "start_line"] != expected_start:
                 errors.append(f"source {path} text slices are not contiguous")
                 break
-            expected_start = item["end_line"] + 1
+            expected_start = item["end_byte"] if byte_ranges else item["end_line"] + 1
             should_defer = index < len(ordered) - 1
             if item["defer_accounting"] != should_defer:
                 errors.append(f"source {path} has invalid deferred-accounting boundary")
-        if expected_start != line_count + 1:
-            errors.append(f"source {path} text slices do not cover all {line_count} lines")
+        expected_end = int(records[path]["bytes"]) if byte_ranges else line_count + 1
+        if expected_start != expected_end:
+            errors.append(f"source {path} text slices do not cover all {'bytes' if byte_ranges else str(line_count) + ' lines'}")
     for path, appearances in page_slice_appearances.items():
         page_count = int(records.get(path, {}).get("page_count", 0))
         ordered = sorted(appearances, key=lambda item: item["part"])

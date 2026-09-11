@@ -24,6 +24,41 @@ import compile_box
 import source_inspector
 import source_snapshot
 
+from copy import deepcopy
+from types import SimpleNamespace
+import pi_config
+from agent_protocol import AgentEvent, AgentTransportError
+
+
+def execution_fixture():
+    roles = {}
+    for role in ("compile", "blue", "judge", "transcribe", "compare"):
+        roles[role] = {"model": {
+            "id": "fixture-" + role, "name": "Fixture " + role,
+            "provider": "fixture", "api": "openai-completions",
+            "baseUrl": "http://127.0.0.1:1/v1", "input": ["text", "image"],
+            "reasoning": False, "contextWindow": 1_000_000, "maxTokens": 32768,
+        }, "api_key": "fixture-key", "thinking_level": "off"}
+    return {"engine": "pi_agent", "execution": {"version": 1, "roles": roles}}
+
+
+# Domain HTTP fixtures still exercise production validation, with an explicit
+# complete model contract. Tests of missing/invalid authority call it directly.
+class TestClient(TestClient):
+    async def _request(self, method, path, **kwargs):
+        if method == "POST" and str(path).startswith("/session/"):
+            body = dict(kwargs.get("json") or {})
+            body.setdefault("llm", execution_fixture())
+            kwargs["json"] = body
+        return await super()._request(method, path, **kwargs)
+
+
+pi_config.configure(execution_fixture()["execution"])
+
+
+def tool_names(options):
+    return [tool.name for tool in options.tools]
+
 
 async def fake_driver(run):
     """模拟一轮编译会话:summary → 写 candidate 页 → turn_done。不烧 LLM、永不阻塞
@@ -308,57 +343,52 @@ async def test_run_wrapper_terminal_signals():
 
 # Test doubles for the Agent SDK message stream. _emit_message dispatches on
 # type(msg).__name__, so these MUST be named exactly like the SDK's classes.
-class TextBlock:
-    def __init__(self, text):
-        self.text = text
+def text_block(text):
+    return {"type": "text", "text": text}
 
 
-class AssistantMessage:
-    def __init__(self, text):
-        self.content = [TextBlock(text)]
+def tool_block(name="Read", input=None):
+    return {"type": "toolCall", "name": name, "arguments": input or {}}
 
 
-class ResultMessage:
-    def __init__(self, subtype="success", is_error=False):
-        self.subtype = subtype
-        self.is_error = is_error
+def assistant_event(text):
+    return AgentEvent("assistant", "fixture", data={"content": [text_block(text)]})
 
 
-# Stand-ins for the SDK's other message/block types — only the class NAME matters
-# to the watchdog (_note_model_activity dispatches on type(msg).__name__).
-class StreamEvent:  # partial-delta liveness (include_partial_messages)
-    pass
+def result_event(subtype="success", is_error=False):
+    return AgentEvent("result", "fixture", data={
+        "outcome": "failed" if is_error else "completed",
+        "error": "KBC_MODEL_CALL_BUDGET_EXCEEDED" if subtype == "error_max_turns" else subtype,
+    })
 
 
-class UserMessage:  # tool_result carrier
-    pass
+def activity_event():
+    return AgentEvent("activity", "fixture")
 
 
-class ToolUseBlock:  # a content block that requests a tool
-    def __init__(self, name="", input=None):
-        self.name = name
-        self.input = input or {}
+def tool_end_event():
+    return AgentEvent("tool_end", "fixture", data={"call_id": "fixture-tool"})
 
 
-class _FakeSDKClient:
-    """Stands in for ClaudeSDKClient: records connect/query, yields preloaded
+class _FakeAgentClient:
+    """Stands in for PiAgentClient: records connect/query, yields preloaded
     messages then stops (the real client blocks for the next turn)."""
     last = None
 
-    def __init__(self, options=None):
-        self.options = options
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.connected_prompt = None
         self.queries = []
         self._pending = []
-        _FakeSDKClient.last = self
+        _FakeAgentClient.last = self
 
     async def connect(self, prompt=None):
         self.connected_prompt = prompt
-        self._pending = [AssistantMessage("seed reply"), ResultMessage()]
+        self._pending = [assistant_event("seed reply"), result_event()]
 
     async def query(self, prompt, session_id="default"):
         self.queries.append(prompt)
-        self._pending += [AssistantMessage("reply: " + prompt), ResultMessage()]
+        self._pending += [assistant_event("reply: " + prompt), result_event()]
 
     async def receive_messages(self):
         while self._pending:
@@ -371,8 +401,8 @@ class _FakeSDKClient:
 async def test_session_driver_conversational():
     """run_session connects WITHOUT a prompt (conversational by construction) and
     relays assistant text + turn_done; the session id is minted and announced."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _FakeSDKClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("ps1", td, 1, instruction="authoring/CLAUDE.md present")
@@ -383,25 +413,25 @@ async def test_session_driver_conversational():
             types = [e["type"] for e in evs]
             assert "session" in types and "log" in types and "turn_done" in types, types
             assert run.session_id, "session_id not set"
-            assert _FakeSDKClient.last.connected_prompt is None, "session must connect with no kickoff"
+            assert _FakeAgentClient.last.connected_prompt is None, "session must connect with no kickoff"
             turn = next(e for e in evs if e["type"] == "turn_done")
             assert turn.get("text") == "seed reply", turn
     finally:
-        compile_box.ClaudeSDKClient = orig
+        compile_box.create_agent_client = orig
     print("✓ session driver is conversational (no kickoff, log + turn_done)")
 
 
 async def test_conversational_session():
     """P2.2: a conversational session (no kickoff) connects WITHOUT a prompt and
     waits — a later /message (query) drives the turn that relays log + turn_done."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _FakeSDKClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("cs1", td, 1)
             # No kickoff → connect() with no prompt. Pre-load a queued turn so the
             # fake's receive_messages yields it (mirrors a /message arriving).
-            client = _FakeSDKClient()
+            client = _FakeAgentClient()
             await client.query("what should this KB cover?")  # queue one turn
             run.client = client
             run.session_id = "sid-cs1"
@@ -416,7 +446,7 @@ async def test_conversational_session():
             turn = next(e for e in evs if e["type"] == "turn_done")
             assert turn.get("text") == "reply: what should this KB cover?", turn
     finally:
-        compile_box.ClaudeSDKClient = orig
+        compile_box.create_agent_client = orig
     print("✓ conversational session (P2.2)")
 
 
@@ -706,41 +736,31 @@ async def test_test_path_escape_guard():
     print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
 
 
+
 async def test_batch_planner_uses_compile_path_guard():
-    """The model planner can Write under bypassPermissions, so it must carry the
-    same workspace confinement hook and model policy as every other compiler session."""
-    orig = compile_box.ClaudeSDKClient
-    previous_mode = os.environ.get("KBC_BATCH_PLANNER")
-    previous_compile_model = os.environ.get("KBC_COMPILE_MODEL")
-    previous_anthropic_model = os.environ.get("ANTHROPIC_MODEL")
-    compile_box.ClaudeSDKClient = _FakeSDKClient
+    original = compile_box.create_agent_client
+    previous = os.environ.get("KBC_BATCH_PLANNER")
+    compile_box.create_agent_client = _FakeAgentClient
     os.environ["KBC_BATCH_PLANNER"] = "model"
-    os.environ.pop("KBC_COMPILE_MODEL", None)
-    os.environ["ANTHROPIC_MODEL"] = "consumer-selected-model"
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("planner-guard", td, 1)
-            inventory = [{"path": "a.md", "bytes": 10, "effective": 10}]
-            await compile_box._plan_batches(run, inventory)
-            opts = _FakeSDKClient.last.options
-            assert opts.allowed_tools == ["Read", "Write", "Glob"], opts.allowed_tools
-            assert opts.hooks and opts.hooks.get("PreToolUse"), opts.hooks
-            assert opts.model == "consumer-selected-model", opts.model
+            await compile_box._plan_batches(run, [{"path": "a.md", "bytes": 10, "effective": 10}])
+            opts = _FakeAgentClient.last.options
+            assert tool_names(opts) == ["Read", "Write", "Glob"]
+            assert opts.model_config["model"]["id"] == pi_config.role_model("compile")
+            write = next(t for t in opts.tools if t.name == "Write")
+            try:
+                await write.handler({"file_path": "../outside.md", "content": "escape"})
+                raise AssertionError("planner escaped its workspace")
+            except PermissionError:
+                pass
     finally:
-        compile_box.ClaudeSDKClient = orig
-        if previous_mode is None:
+        compile_box.create_agent_client = original
+        if previous is None:
             os.environ.pop("KBC_BATCH_PLANNER", None)
         else:
-            os.environ["KBC_BATCH_PLANNER"] = previous_mode
-        if previous_compile_model is None:
-            os.environ.pop("KBC_COMPILE_MODEL", None)
-        else:
-            os.environ["KBC_COMPILE_MODEL"] = previous_compile_model
-        if previous_anthropic_model is None:
-            os.environ.pop("ANTHROPIC_MODEL", None)
-        else:
-            os.environ["ANTHROPIC_MODEL"] = previous_anthropic_model
-    print("✓ batch planner uses compile workspace path guard and model policy")
+            os.environ["KBC_BATCH_PLANNER"] = previous
 
 
 
@@ -827,64 +847,55 @@ def test_pack_candidates_symlink_confinement():
     print("✓ pack candidates symlink confinement (no host-file exfil into snapshot)")
 
 
+
 async def test_test_session_driver_readonly():
-    """The read-only consumer driver configures Read/Glob/Grep ONLY (no Write/Edit/
-    Bash, no MCP), cwd = the snapshot dir, persona = TEST_ROLE, no kickoff; it emits
-    session + log + turn_done like the authoring session."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _FakeSDKClient
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as snap:
             run = compile_box.TestRun("t-drv", snap, parent_run_id="p1", snapshot_hash="h")
-            await compile_box.test_session_driver(run)  # fake yields seed reply + result, then ends
-            opts = _FakeSDKClient.last.options
-            assert opts.allowed_tools == ["Read", "Glob", "Grep"], opts.allowed_tools
-            assert "Write" not in opts.allowed_tools and "Bash" not in opts.allowed_tools
-            # Read-only contract enforced at the tool-availability layer, not just the
-            # path hook: Bash/Write/WebFetch removed from context so a wandering
-            # consumer cannot shell out of the snapshot or break the closed-book test.
-            assert opts.tools == ["Read", "Glob", "Grep"], opts.tools
-            assert opts.strict_mcp_config is True
-            assert opts.skills == [], opts.skills
-            assert set(opts.disallowed_tools) >= {
-                "Bash", "Write", "Edit", "WebFetch", "WebSearch",
-            }, opts.disallowed_tools
-            assert opts.cwd == snap, opts.cwd
-            assert opts.mcp_servers == {}, opts.mcp_servers
-            # persona comes from the locale pack (TestRun without locale → en default)
-            assert compile_box._prompt("test_role", None) in opts.system_prompt["append"]
-            assert _FakeSDKClient.last.connected_prompt is None, "test session must not kickoff"
-            # C4: the snapshot path guard is wired as a PreToolUse hook
-            assert opts.hooks and "PreToolUse" in opts.hooks and opts.hooks["PreToolUse"], opts.hooks
-            types = []
-            while not run.events.empty():
-                types.append(run.events.get_nowait()["type"])
-            assert "session" in types and "log" in types and "turn_done" in types, types
+            await compile_box.test_session_driver(run)
+            opts = _FakeAgentClient.last.options
+            assert tool_names(opts) == ["Read", "Glob", "Grep"]
+            assert opts.cwd == snap
+            assert opts.system_prompt == compile_box._prompt("test_role", None)
+            assert _FakeAgentClient.last.connected_prompt is None
+            read = next(t for t in opts.tools if t.name == "Read")
+            try:
+                await read.handler({"file_path": "../outside.md"})
+                raise AssertionError("consumer escaped its pinned snapshot")
+            except PermissionError:
+                pass
+            types = [event["type"] for event in _drain(run)]
+            assert {"session", "log", "turn_done"}.issubset(types)
             assert run.session_id
     finally:
-        compile_box.ClaudeSDKClient = orig
-    print("✓ test session driver is read-only (Read/Glob/Grep, no MCP, no kickoff)")
+        compile_box.create_agent_client = original
+
 
 
 async def test_test_session_driver_uses_captured_contract():
-    """The fingerprinted tool/model/turn contract is the one passed to the SDK."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _FakeSDKClient
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as snap:
             run = compile_box.TestRun("t-contract", snap, parent_run_id="p1", snapshot_hash="h")
             run.allowed_tools = ["Read", "Bash"]
-            run.consumer_model = "captured-model"
+            run.consumer_model = pi_config.role_model("blue")
             run.consumer_max_turns = 7
             await compile_box.test_session_driver(run)
-            opts = _FakeSDKClient.last.options
-            assert opts.tools == ["Read"], opts.tools
-            assert opts.allowed_tools == ["Read"], opts.allowed_tools
-            assert opts.model == "captured-model", opts.model
-            assert opts.max_turns == 7, opts.max_turns
+            opts = _FakeAgentClient.last.options
+            assert tool_names(opts) == ["Read"]
+            assert opts.model_config["model"]["id"] == run.consumer_model
+            assert opts.max_model_calls == 7
+            run.consumer_model = "changed-catalog-model"
+            try:
+                compile_box._build_test_client(run, "rebuild")
+                raise AssertionError("captured model silently changed")
+            except ValueError:
+                pass
     finally:
-        compile_box.ClaudeSDKClient = orig
-    print("✓ test session driver uses its captured consumer contract")
+        compile_box.create_agent_client = original
 
 
 async def test_open_close_test_session_http():
@@ -892,8 +903,8 @@ async def test_open_close_test_session_http():
     session (200 + snapshot/consumer hashes + pages); unknown parent → 404;
     missing index.md → 400; concurrency cap → 429; close tears down
     (snapshot dir + registry entry gone)."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _FakeSDKClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     snap_root = tempfile.mkdtemp()
@@ -979,7 +990,7 @@ async def test_open_close_test_session_http():
         assert r.status == 400, await r.text()
     finally:
         await client.close()
-        compile_box.ClaudeSDKClient = orig
+        compile_box.create_agent_client = orig
         compile_box.RUNS.clear()
         compile_box.TEST_SESSIONS.clear()
         os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
@@ -991,12 +1002,12 @@ async def test_open_close_test_session_http():
 class _AliveFakeClient:
     """A test-session SDK stand-in that connects and then BLOCKS in receive
     (emits nothing, session stays live / not-done) until disconnect. The default
-    _FakeSDKClient self-completes almost immediately, which would race the
+    _FakeAgentClient self-completes almost immediately, which would race the
     idempotency replay against the session going done — this keeps it live so the
     replay deterministically hits an active session."""
 
-    def __init__(self, options=None):
-        self.options = options
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self._closed = asyncio.Event()
 
     async def connect(self, prompt=None):
@@ -1019,8 +1030,8 @@ async def test_open_test_session_idempotency():
     same tid/snapshot_hash/pages, flagged idempotent_replay, no new session, no new
     concurrency slot. A different key opens a new session. Teardown drops the key
     so a later same-key open starts fresh (never replays a dead tid)."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _AliveFakeClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _AliveFakeClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -1073,7 +1084,7 @@ async def test_open_test_session_idempotency():
             await client.post(f"/test-session/{t}/close")
     finally:
         await client.close()
-        compile_box.ClaudeSDKClient = orig
+        compile_box.create_agent_client = orig
         compile_box.RUNS.clear()
         compile_box.TEST_SESSIONS.clear()
         compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -1125,11 +1136,11 @@ async def test_test_session_step_frames():
 
     # zh consumer: localized labels; Read strips the dir prefix and .md
     zh = compile_box.TestRun("t-step-zh", "/tmp", "p1", "h", locale="zh")
-    am = AssistantMessage("结论文本")
-    am.content = [
-        ToolUseBlock("Read", {"file_path": ".siclaw/knowledge/skill-guide.md"}),
-        ToolUseBlock("Grep", {"pattern": "重置卡"}),
-        TextBlock("结论文本"),
+    am = assistant_event("结论文本")
+    am.data["content"] = [
+        tool_block("Read", {"file_path": ".siclaw/knowledge/skill-guide.md"}),
+        tool_block("Grep", {"pattern": "重置卡"}),
+        text_block("结论文本"),
     ]
     await compile_box._emit_message(zh, am)
     evs = await drain(zh)
@@ -1140,8 +1151,8 @@ async def test_test_session_step_frames():
 
     # platform default locale (en); unknown tool falls back to the generic label
     en = compile_box.TestRun("t-step-en", "/tmp", "p1", "h")
-    am2 = AssistantMessage("x")
-    am2.content = [ToolUseBlock("Read", {"file_path": "index.md"}), ToolUseBlock("TodoWrite", {})]
+    am2 = assistant_event("x")
+    am2.data["content"] = [tool_block("Read", {"file_path": "index.md"}), tool_block("TodoWrite", {})]
     await compile_box._emit_message(en, am2)
     steps = [e["text"] for e in await drain(en) if e["type"] == "step"]
     assert steps == ['Reading "index"', "Consulting material"], steps
@@ -1149,8 +1160,8 @@ async def test_test_session_step_frames():
     # the SAME blocks on a compile run emit NO step frames (contract unchanged)
     with tempfile.TemporaryDirectory() as td:
         comp = compile_box.CompileRun("c-step", td, 1)
-        am3 = AssistantMessage("calling read")
-        am3.content = [ToolUseBlock("Read", {"file_path": "a.md"}), TextBlock("calling read")]
+        am3 = assistant_event("calling read")
+        am3.data["content"] = [tool_block("Read", {"file_path": "a.md"}), text_block("calling read")]
         await compile_box._emit_message(comp, am3)
         evs = await drain(comp)
         assert all(e["type"] != "step" for e in evs), evs
@@ -1160,7 +1171,7 @@ async def test_test_session_step_frames():
 
 class _TestStallFake:
     """First query black-holes (receive blocks on a gate) so the watchdog must
-    reap it; interrupt() yields the torn-down ResultMessage. A SECOND query
+    reap it; interrupt() yields the torn-down result_event. A SECOND query
     produces a real answer then closes → proves the session stayed live after the
     reap (the whole point of defect 1: recover the UI without killing the session)."""
 
@@ -1192,10 +1203,10 @@ class _TestStallFake:
             await self._gate.wait()
             self._gate.clear()
             if self._mode == "interrupted":
-                yield ResultMessage()             # the reaped attempt ends
+                yield result_event()             # the reaped attempt ends
             elif self._mode == "produce":
-                yield AssistantMessage("RoCE is a transport")
-                yield ResultMessage()
+                yield assistant_event("RoCE is a transport")
+                yield result_event()
                 self._closed = True
                 return
 
@@ -1264,7 +1275,7 @@ class _QueuedFrameFake:
     """A test-session SDK stand-in whose receive stream is fed one frame at a time
     by the test via an asyncio.Queue. Unlike _TestStallFake's single _mode, this
     lets a test enqueue a reaped turn's LATE frames (a partial + its torn-down
-    ResultMessage) AFTER the next turn is armed, reproducing the exact stall→reap→
+    result_event) AFTER the next turn is armed, reproducing the exact stall→reap→
     immediate-new-query→late-frame race. connect/query record only; interrupt is
     counted but injects no frame (the test controls when the reaped result lands)."""
 
@@ -1302,7 +1313,7 @@ class _QueuedFrameFake:
 async def test_test_session_late_reaped_frames_never_terminate_new_turn():
     """Race guard (per-turn generation): the stall watchdog frees the UI the instant
     it reaps a wedged turn, so a new /test-message can arm the NEXT turn before the
-    reaped turn's straggler frames (a partial + its interrupted ResultMessage) drain
+    reaped turn's straggler frames (a partial + its interrupted result_event) drain
     from the stream. Those stale frames must be dropped (logged), never fold into or
     terminate the freshly-armed turn — the new answer must complete on its OWN result.
     Drives the real watchdog for the reap, then injects the late frames deterministically."""
@@ -1341,9 +1352,9 @@ async def test_test_session_late_reaped_frames_never_terminate_new_turn():
                 assert run._turn_generation == 2 and not run._stall_reaped
 
                 # NOW turn 1's stragglers arrive late — a partial then its torn-down
-                # ResultMessage. Both belong to gen 1 < armed gen 2 → dropped.
-                fake.push(AssistantMessage("stale text from the reaped turn"))
-                fake.push(ResultMessage())
+                # result_event. Both belong to gen 1 < armed gen 2 → dropped.
+                fake.push(assistant_event("stale text from the reaped turn"))
+                fake.push(result_event())
                 drain_deadline = time.monotonic() + 3
                 while time.monotonic() < drain_deadline and run._results_seen < 1:
                     await asyncio.sleep(0.01)
@@ -1352,8 +1363,8 @@ async def test_test_session_late_reaped_frames_never_terminate_new_turn():
                 assert run._turn_active is True, "a stale reaped frame terminated the new turn"
 
                 # turn 2's real answer completes the turn on its own result frame
-                fake.push(AssistantMessage("real answer for the second question"))
-                fake.push(ResultMessage())
+                fake.push(assistant_event("real answer for the second question"))
+                fake.push(result_event())
                 fake.close_stream()
                 await asyncio.wait_for(consume, timeout=3)
             finally:
@@ -1387,9 +1398,9 @@ class _RebuildFake:
     interrupt() behaviour is scenario-driven:
       - "interrupt_fails":      interrupt() RAISES → the torn-down result can never
                                 come, so the watchdog flags a rebuild at once.
-      - "terminator_never":     interrupt() is accepted but no ResultMessage is ever
+      - "terminator_never":     interrupt() is accepted but no result_event is ever
                                 delivered → the post-interrupt window elapses → rebuild.
-      - "terminator_in_window": interrupt() delivers the torn-down ResultMessage →
+      - "terminator_in_window": interrupt() delivers the torn-down result_event →
                                 the generation stream realigns → NO rebuild.
     A SECOND instance (built by the driver's rebuild) answers the next turn normally.
     Instances are tracked class-side so a test asserts how many connects happened
@@ -1398,8 +1409,8 @@ class _RebuildFake:
     instances: list = []
     scenario = "interrupt_fails"
 
-    def __init__(self, options=None):
-        self.options = options
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.idx = len(_RebuildFake.instances)
         _RebuildFake.instances.append(self)
         self.queries = []
@@ -1414,15 +1425,15 @@ class _RebuildFake:
         self.queries.append(text)
         if self.idx == 0 and len(self.queries) == 1:
             return  # first turn on the first client black-holes (push nothing)
-        self._q.put_nowait(AssistantMessage("answer: " + text))
-        self._q.put_nowait(ResultMessage())
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
 
     async def interrupt(self):
         self.interrupts += 1
         if _RebuildFake.scenario == "interrupt_fails":
             raise RuntimeError("interrupt swallowed by the black hole")
         if _RebuildFake.scenario == "terminator_in_window":
-            self._q.put_nowait(ResultMessage())  # the torn-down terminator lands
+            self._q.put_nowait(result_event())  # the torn-down terminator lands
         # "terminator_never": accepted, but nothing is ever delivered
 
     async def receive_messages(self):
@@ -1445,8 +1456,8 @@ class _RetryRebuildFake:
 
     instances: list = []
 
-    def __init__(self, options=None):
-        self.options = options
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.idx = len(_RetryRebuildFake.instances)
         _RetryRebuildFake.instances.append(self)
         self.queries = []
@@ -1461,8 +1472,8 @@ class _RetryRebuildFake:
         self.queries.append(text)
         if self.idx == 0:
             return  # black-hole every turn on the doomed first client
-        self._q.put_nowait(AssistantMessage("answer: " + text))
-        self._q.put_nowait(ResultMessage())
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
 
     async def interrupt(self):
         raise RuntimeError("interrupt swallowed by the black hole")
@@ -1481,16 +1492,16 @@ class _RetryRebuildFake:
 
 class _ImmediateRetryFake:
     """Immediate-retry-within-window stand-in: instance 0 black-holes query 1;
-    its interrupt() is ACCEPTED but the torn-down ResultMessage never arrives
+    its interrupt() is ACCEPTED but the torn-down result_event never arrives
     (terminator lost, window pending). Any LATER query on instance 0 answers
     normally — pre-fix, those frames landed while the window was still pending
-    and were dropped one generation behind, with their ResultMessage mistaken
+    and were dropped one generation behind, with their result_event mistaken
     for the lost terminator. Instance 1 (the rebuild) answers normally."""
 
     instances: list = []
 
-    def __init__(self, options=None):
-        self.options = options
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.idx = len(_ImmediateRetryFake.instances)
         _ImmediateRetryFake.instances.append(self)
         self.queries = []
@@ -1504,11 +1515,11 @@ class _ImmediateRetryFake:
         self.queries.append(text)
         if self.idx == 0 and len(self.queries) == 1:
             return  # black-hole the first turn only
-        self._q.put_nowait(AssistantMessage("answer: " + text))
-        self._q.put_nowait(ResultMessage())
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
 
     async def interrupt(self):
-        pass  # accepted — but no torn-down ResultMessage is ever delivered
+        pass  # accepted — but no torn-down result_event is ever delivered
 
     async def receive_messages(self):
         while not self._closed:
@@ -1535,8 +1546,8 @@ class _BlockedInterruptFake:
     interrupt_entered: asyncio.Event
     interrupt_release: asyncio.Event
 
-    def __init__(self, options=None):
-        self.options = options
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.idx = len(_BlockedInterruptFake.instances)
         _BlockedInterruptFake.instances.append(self)
         self.queries = []
@@ -1550,13 +1561,13 @@ class _BlockedInterruptFake:
         self.queries.append(text)
         if self.idx == 0 and len(self.queries) == 1:
             return  # black-hole the first turn only
-        self._q.put_nowait(AssistantMessage("answer: " + text))
-        self._q.put_nowait(ResultMessage())
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
 
     async def interrupt(self):
         _BlockedInterruptFake.interrupt_entered.set()
         await _BlockedInterruptFake.interrupt_release.wait()
-        # released: accepted, but the torn-down ResultMessage never arrives
+        # released: accepted, but the torn-down result_event never arrives
 
     async def receive_messages(self):
         while not self._closed:
@@ -1588,13 +1599,13 @@ async def _drive_rebuild_scenario(scenario):
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.ClaudeSDKClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
     _RebuildFake.instances = []
     _RebuildFake.scenario = scenario
-    compile_box.ClaudeSDKClient = _RebuildFake
+    compile_box.create_agent_client = _RebuildFake
     buf = io.StringIO()
     snap = tempfile.mkdtemp()
     run = compile_box.TestRun("t-rb", snap, parent_run_id="p-rb", snapshot_hash="h")
@@ -1634,12 +1645,12 @@ async def _drive_rebuild_scenario(scenario):
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.ClaudeSDKClient) = saved
+         compile_box.create_agent_client) = saved
 
 
 async def test_test_session_rebuild_after_failed_interrupt():
     """Review P1 (a): the stall reaper's interrupt() can FAIL, so the wedged turn's
-    torn-down ResultMessage never arrives — _results_seen can never catch up to the
+    torn-down result_event never arrives — _results_seen can never catch up to the
     armed generation, and every later turn would be dropped forever. The watchdog
     now flags _needs_rebuild the instant interrupt() raises; the next /test-message
     reconnects a fresh SDK client (2nd connect) with a clean generation, and the new
@@ -1658,7 +1669,7 @@ async def test_test_session_rebuild_after_failed_interrupt():
 
 
 async def test_test_session_rebuild_after_lost_terminator():
-    """Review P1 (b): interrupt() is ACCEPTED but its torn-down ResultMessage never
+    """Review P1 (b): interrupt() is ACCEPTED but its torn-down result_event never
     lands (a true black-hole swallows it too). The post-interrupt window elapses
     with _results_seen unchanged → the watchdog flags a rebuild → the next
     /test-message reconnects a fresh client and the new turn answers normally."""
@@ -1675,7 +1686,7 @@ async def test_test_session_rebuild_after_lost_terminator():
 
 async def test_test_session_terminator_in_window_no_rebuild():
     """Review P1 (c) — regression guard: when interrupt() DOES deliver the torn-down
-    ResultMessage within the window, _results_seen realigns, no rebuild is flagged,
+    result_event within the window, _results_seen realigns, no rebuild is flagged,
     and the next turn is served on the SAME client via the existing generation-drop
     path (only ONE connect ever happens)."""
     run, buf, rebuilt, evs = await _drive_rebuild_scenario("terminator_in_window")
@@ -1694,7 +1705,7 @@ async def test_test_session_immediate_retry_within_terminator_window():
     and the user retries IMMEDIATELY after the stall turn_done — inside the
     pending-terminator window. Pre-fix, arming that retry on the old client
     counted its frames one generation behind (all silently dropped), and its own
-    ResultMessage was mistaken for the lost terminator, cancelling the rebuild
+    result_event was mistaken for the lost terminator, cancelling the rebuild
     decision: the user's valid retry was never displayed and timed out again.
     Now /test-message treats an unresolved window like _needs_rebuild: the retry
     rebuilds a fresh client, exactly ONE stall timeout is ever surfaced, and the
@@ -1702,12 +1713,12 @@ async def test_test_session_immediate_retry_within_terminator_window():
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.ClaudeSDKClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0  # wide: the retry always lands inside it
     _ImmediateRetryFake.instances = []
-    compile_box.ClaudeSDKClient = _ImmediateRetryFake
+    compile_box.create_agent_client = _ImmediateRetryFake
     compile_box.TEST_SESSIONS.clear()
     buf = io.StringIO()
     snap = tempfile.mkdtemp()
@@ -1753,7 +1764,7 @@ async def test_test_session_immediate_retry_within_terminator_window():
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.ClaudeSDKClient) = saved
+         compile_box.create_agent_client) = saved
     print("✓ test-session immediate retry inside the terminator window rebuilds; one timeout, answer shown")
 
 
@@ -1763,7 +1774,7 @@ async def test_test_session_retry_during_interrupt_in_flight():
     window used to be armed only after interrupt() returned — a retry in that gap
     saw neither _needs_rebuild nor a pending window, armed a misaligned turn on
     the wedged client, and (with the terminator lost) every later frame was
-    silently dropped until the idle TTL, while the retry's own ResultMessage
+    silently dropped until the idle TTL, while the retry's own result_event
     impersonated the lost terminator and cancelled the rebuild decision. The
     window is now armed at the reap itself (before any await) and the resolver
     compares against the reaped turn's generation, so the in-flight-interrupt
@@ -1772,14 +1783,14 @@ async def test_test_session_retry_during_interrupt_in_flight():
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.ClaudeSDKClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0
     _BlockedInterruptFake.instances = []
     _BlockedInterruptFake.interrupt_entered = asyncio.Event()
     _BlockedInterruptFake.interrupt_release = asyncio.Event()
-    compile_box.ClaudeSDKClient = _BlockedInterruptFake
+    compile_box.create_agent_client = _BlockedInterruptFake
     compile_box.TEST_SESSIONS.clear()
     buf = io.StringIO()
     snap = tempfile.mkdtemp()
@@ -1825,7 +1836,7 @@ async def test_test_session_retry_during_interrupt_in_flight():
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.ClaudeSDKClient) = saved
+         compile_box.create_agent_client) = saved
     print("✓ test-session retry during an in-flight interrupt rebuilds; one stall, answer shown")
 
 
@@ -1840,12 +1851,12 @@ async def test_test_session_rebuild_retry_after_failed_reconnect():
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.ClaudeSDKClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
     _RetryRebuildFake.instances = []
-    compile_box.ClaudeSDKClient = _RetryRebuildFake
+    compile_box.create_agent_client = _RetryRebuildFake
     # keep the pre-fix failure mode fast: the old ordering would eat this timeout
     # on every retry instead of ever reaching the rebuild
     os.environ["KBC_CONNECT_TIMEOUT_SECS"] = "1"
@@ -1898,7 +1909,7 @@ async def test_test_session_rebuild_retry_after_failed_reconnect():
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.ClaudeSDKClient) = saved
+         compile_box.create_agent_client) = saved
     print("✓ test-session rebuild retry: a failed reconnect 503s fast and the next retry rebuilds")
 
 
@@ -1907,8 +1918,8 @@ async def test_open_test_session_idempotency_is_run_scoped():
     box two runs that mint the SAME client_request_id must each open their OWN session
     (no cross-run aliasing of tid/snapshot/fingerprint); the same key on the SAME run
     still replays. Teardown drops only the run-scoped key."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _AliveFakeClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _AliveFakeClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -1946,7 +1957,7 @@ async def test_open_test_session_idempotency_is_run_scoped():
         assert compile_box.TEST_SESSION_IDEMPOTENCY == {}, compile_box.TEST_SESSION_IDEMPOTENCY
     finally:
         await client.close()
-        compile_box.ClaudeSDKClient = orig
+        compile_box.create_agent_client = orig
         compile_box.RUNS.clear()
         compile_box.TEST_SESSIONS.clear()
         compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -2200,36 +2211,30 @@ async def test_reference_assist_http_and_validation():
 
 
 async def test_reference_assist_driver_is_fast_isolated_and_structured():
-    original_client = compile_box.ClaudeSDKClient
-    original_server_factory = compile_box.create_sdk_mcp_server
+    original_client = compile_box.create_agent_client
     previous_turns = os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS")
     previous_light_model = os.environ.get("KBC_PK_BLUE_MODEL")
     seen = {}
 
-    def capture_server(name, *, tools):
-        seen["server_name"] = name
-        seen["tools"] = tools
-        return {"type": "sdk", "name": name, "tools": tools}
-
     class SubmittingClient:
-        def __init__(self, options=None):
-            self.options = options
+        def __init__(self, **kwargs):
+            self.options = SimpleNamespace(**kwargs)
             self.pending = []
-            seen["options"] = options
+            seen["options"] = self.options
 
         async def connect(self):
             pass
 
         async def query(self, directive, session_id="default"):
             seen["directive"] = directive
-            registered = self.options.mcp_servers["reference_assist"]["tools"]
+            registered = [t for t in self.options.tools if t.name == "submit_reference_suggestions"]
             await registered[0].handler({
                 "candidates": [
                     {"style": "concise", "answer": "Three attempts.", "evidence_paths": ["raw/policy.md"]},
                     {"style": "complete", "answer": "Retry no more than three times.", "evidence_paths": ["raw/policy.md"]},
                 ],
             })
-            self.pending.append(ResultMessage())
+            self.pending.append(result_event())
 
         async def receive_messages(self):
             while self.pending:
@@ -2238,8 +2243,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
         async def disconnect(self):
             pass
 
-    compile_box.ClaudeSDKClient = SubmittingClient
-    compile_box.create_sdk_mcp_server = capture_server
+    compile_box.create_agent_client = SubmittingClient
     os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
     os.environ["KBC_PK_BLUE_MODEL"] = "claude-light-admin-config"
     try:
@@ -2257,20 +2261,13 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
             assert result["mode"] == "suggest", result
             opts = seen["options"]
             assert opts.system_prompt == compile_box._prompt("reference_assist_role", "en")
-            assert opts.tools == ["Read", "Glob", "Grep"]
-            assert opts.allowed_tools == [
-                "Read", "Glob", "Grep", "mcp__reference_assist__submit_reference_suggestions",
-            ]
-            assert opts.max_turns == 20
-            assert opts.model == "claude-light-admin-config"
-            assert opts.setting_sources == [] and opts.skills == [] and opts.strict_mcp_config is True
-            assert set(opts.disallowed_tools) >= {"Bash", "Write", "Edit", "Agent", "WebSearch"}
-            assert seen["server_name"] == "reference_assist"
+            assert tool_names(opts) == ["Read", "Glob", "Grep", "submit_reference_suggestions"]
+            assert opts.max_model_calls == 20
+            assert opts.model_config["role"] == "blue"
             assert '"question": "What is the retry limit?"' in seen["directive"]
             assert "2-3 independently usable candidates" in seen["directive"]
     finally:
-        compile_box.ClaudeSDKClient = original_client
-        compile_box.create_sdk_mcp_server = original_server_factory
+        compile_box.create_agent_client = original_client
         if previous_turns is None:
             os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
         else:
@@ -2289,36 +2286,30 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
     by invoking the exact SDK MCP tool registered in its options. This keeps the
     test sensitive to both option drift and callback wiring.
     """
-    original_client = compile_box.ClaudeSDKClient
-    original_server_factory = compile_box.create_sdk_mcp_server
+    original_client = compile_box.create_agent_client
     previous_turns = os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS")
     seen = {}
 
-    def capture_server(name, *, tools):
-        seen["server_name"] = name
-        seen["tools"] = tools
-        return {"type": "sdk", "name": name, "tools": tools}
-
     class SubmittingClient:
-        def __init__(self, options=None):
-            self.options = options
+        def __init__(self, **kwargs):
+            self.options = SimpleNamespace(**kwargs)
             self.pending = []
-            seen["options"] = options
+            seen["options"] = self.options
 
         async def connect(self):
             seen["connected"] = True
 
         async def query(self, directive, session_id="default"):
             seen["directive"] = directive
-            registered = self.options.mcp_servers["recommend"]["tools"]
+            registered = [t for t in self.options.tools if t.name == "submit_recommended_test"]
             assert len(registered) == 1
             result = await registered[0].handler({
                 "question": "What retry limit does the source require?",
                 "reference_answer": "Three attempts.",
                 "evidence_paths": ["raw/policy.md"],
             })
-            assert "accepted" in result["content"][0]["text"].lower(), result
-            self.pending.append(ResultMessage())
+            assert "accepted" in result.lower(), result
+            self.pending.append(result_event())
 
         async def receive_messages(self):
             while self.pending:
@@ -2327,8 +2318,7 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
         async def disconnect(self):
             seen["disconnected"] = True
 
-    compile_box.ClaudeSDKClient = SubmittingClient
-    compile_box.create_sdk_mcp_server = capture_server
+    compile_box.create_agent_client = SubmittingClient
     os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = "20"
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -2350,22 +2340,12 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
             opts = seen["options"]
             assert isinstance(opts.system_prompt, str), opts.system_prompt
             assert opts.system_prompt == compile_box._prompt("recommend_test_role", "en")
-            assert opts.tools == ["Read", "Glob", "Grep"], opts.tools
-            assert opts.allowed_tools == [
-                "Read", "Glob", "Grep", "mcp__recommend__submit_recommended_test",
-            ], opts.allowed_tools
-            assert opts.strict_mcp_config is True
-            assert set(opts.disallowed_tools) >= {
-                "Bash", "Write", "Edit", "Agent", "WebFetch", "WebSearch",
-            }, opts.disallowed_tools
-            assert opts.setting_sources == []
-            assert opts.max_turns == 20
-            assert seen["server_name"] == "recommend"
-            assert seen["tools"][0].name == "submit_recommended_test"
+            assert tool_names(opts) == ["Read", "Glob", "Grep", "submit_recommended_test"]
+            assert opts.max_model_calls == 20
+            assert opts.model_config["role"] == "compile"
             assert seen["connected"] and seen["disconnected"]
     finally:
-        compile_box.ClaudeSDKClient = original_client
-        compile_box.create_sdk_mcp_server = original_server_factory
+        compile_box.create_agent_client = original_client
         if previous_turns is None:
             os.environ.pop("KBC_TEST_RECOMMEND_MAX_TURNS", None)
         else:
@@ -2376,11 +2356,11 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
 async def test_recommendation_driver_reports_max_turn_exhaustion():
     """A reviewer that spends its bounded turn budget without submitting must
     surface a distinct diagnostic instead of the generic no-result error."""
-    original_client = compile_box.ClaudeSDKClient
+    original_client = compile_box.create_agent_client
 
     class ExhaustedClient:
-        def __init__(self, options=None):
-            self.options = options
+        def __init__(self, **kwargs):
+            self.options = SimpleNamespace(**kwargs)
 
         async def connect(self):
             pass
@@ -2389,12 +2369,12 @@ async def test_recommendation_driver_reports_max_turn_exhaustion():
             pass
 
         async def receive_messages(self):
-            yield ResultMessage("error_max_turns", True)
+            yield result_event("error_max_turns", True)
 
         async def disconnect(self):
             pass
 
-    compile_box.ClaudeSDKClient = ExhaustedClient
+    compile_box.create_agent_client = ExhaustedClient
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2410,7 +2390,7 @@ async def test_recommendation_driver_reports_max_turn_exhaustion():
             except ValueError as exc:
                 assert "turn budget" in str(exc) and "submitting" in str(exc), exc
     finally:
-        compile_box.ClaudeSDKClient = original_client
+        compile_box.create_agent_client = original_client
     print("✓ recommendation driver: max-turn exhaustion is explicit")
 
 
@@ -2689,7 +2669,7 @@ async def test_a_session_records_what_it_actually_spent():
     evidence at all.
 
     The source has to be get_context_usage(), which reports what `/context`
-    shows: tokens resident in the window right now. ResultMessage.usage is the
+    shows: tokens resident in the window right now. result_event.usage is the
     last API request's own counts — a live session holding real context
     reported 748, the increment of one tool result — so reading that answered a
     different question than the one the budget asks."""
@@ -2704,9 +2684,9 @@ async def test_a_session_records_what_it_actually_spent():
                                        {"name": "system prompt", "tokens": 20_000},
                                        {"name": "tools", "tokens": 14_000}]}
 
-        class Result:
-            num_turns = 12
-            usage = {"input_tokens": 748, "output_tokens": 9_000}
+        def Result():
+            return AgentEvent("result", "fixture", data={"outcome": "completed", "num_turns": 12,
+                "usage": {"input_tokens": 748, "output_tokens": 9_000}})
 
         await compile_box._record_turn_usage(run, Client(), Result())
         assert run._turn_usage["context_tokens"] == 214_000, run._turn_usage
@@ -2740,59 +2720,35 @@ async def test_a_session_records_what_it_actually_spent():
     print("\u2713 a session measures its real context share; the peak rides the plan")
 
 
+
 def test_compile_session_denies_subagents():
-    """A compile session runs under bypassPermissions, where `allowed_tools`
-    only skips approval prompts and removes nothing from context. So the ledger
-    invariant — every Raw source lands either in a page's sources[].resource or in
-    the exclusion ledger — is enforceable only if Agent/Task are DENIED: a
-    sub-agent reads sources in its own context, and the parent that must call
-    report_summary never saw those files and cannot attest to what they
-    covered. Pin the deny list to the session builder, and pin it against
-    overlapping the allowlist (a tool both allowed and denied is denied — a
-    dead end created by permissions instead of instructions)."""
-    with tempfile.TemporaryDirectory() as td:
-        run = compile_box.CompileRun("deny", td, 1)
-        opts = compile_box._compile_session_opts(run, td, "role", "sess-1")
-    denied = set(opts.disallowed_tools or [])
-    for tool in ("Agent", "Task"):
-        assert tool in denied, f"{tool} must be denied a compile session: {sorted(denied)}"
-    # Outside text must not reach a KB whose provenance claim is "from raw/".
-    for tool in ("WebFetch", "WebSearch", "Bash"):
-        assert tool in denied, f"{tool} must be denied a compile session"
-    overlap = sorted(denied & set(compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS))
-    assert not overlap, f"tools both allowed and denied (deny wins → dead end): {overlap}"
-    print("✓ compile session denies sub-agents (ledger stays attestable), no allow/deny overlap")
+    """Only the parent compiler sees Raw and owns its accounting ledger."""
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("deny", td, 1)
+            client = compile_box._compile_session_client(run, td, "role", "sess-1")
+            names = set(tool_names(client.options))
+            assert not names.intersection({"Agent", "Task", "WebFetch", "WebSearch", "Bash"})
+            assert names == set(compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS)
+    finally:
+        compile_box.create_agent_client = original
+
 
 
 def test_compile_surface_excludes_auto_question_proposals():
-    """The owner-managed question set is independent from compilation. Once
-    the downstream UI stopped consuming AI proposals, the compile prompt and
-    tool surface must not keep spending an agent turn producing hidden files."""
+    """Owner-managed questions stay separate from compilation."""
     for locale in ("en", "zh"):
         role = compile_box._prompt("box_role", locale)
-        assert "propose_questions" not in role, locale
-        assert "QUESTIONS_PROPOSED" not in role, locale
-        assert "propose_questions" not in compile_box._tool_strings(locale), locale
-
-    captured = []
-    original = compile_box.create_sdk_mcp_server
-
-    class FakeRun:
-        locale = "en"
-
-    def capture(_name, tools):
-        captured.extend(tool.name for tool in tools)
-        return object()
-
-    compile_box.create_sdk_mcp_server = capture
-    try:
-        compile_box._make_compile_tools(FakeRun())
-    finally:
-        compile_box.create_sdk_mcp_server = original
-
-    assert "propose_questions" not in captured, captured
+        assert "propose_questions" not in role
+        assert "QUESTIONS_PROPOSED" not in role
+        assert "propose_questions" not in compile_box._tool_strings(locale)
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("surface", td, 1)
+            run.locale = locale
+            assert "propose_questions" not in [t.name for t in compile_box._compile_engine_tools(run)]
     assert "mcp__compile__propose_questions" not in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
-    print("✓ compile surface excludes unused AI question proposals")
 
 
 def test_ledger_instructions_agree_across_surfaces():
@@ -2848,24 +2804,13 @@ async def test_propose_plan_never_bounces():
             async def emit(self, ev):
                 events.append(ev)
 
-        captured = {}
-        orig = compile_box.create_sdk_mcp_server
-
-        def capture(name, tools):
-            captured.update({t.name: t for t in tools})
-            return orig(name, tools=tools)
-
-        compile_box.create_sdk_mcp_server = capture
-        try:
-            compile_box._make_compile_tools(FakeRun())
-        finally:
-            compile_box.create_sdk_mcp_server = orig
-        pp = captured["propose_plan"].handler
+        pp = next(t.handler for t in compile_box._compile_engine_tools(FakeRun())
+                  if t.name == "propose_plan")
 
         # no PLAN.md checkboxes at all → STILL proposes (advisory reminder only)
         r1 = await pp({"plan": "## 计划\n- 00 概览\n- 10 用法"})
         assert events and events[0]["type"] == "plan_proposed"
-        assert "提醒" in r1["content"][0]["text"]
+        assert "提醒" in r1
         proposal = json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))
         assert proposal["text"].startswith("## 计划") and proposal["proposed_at"]
 
@@ -2875,13 +2820,13 @@ async def test_propose_plan_never_bounces():
         )
         r2 = await pp({"plan": "v2"})
         assert len(events) == 2
-        assert "提醒" not in r2["content"][0]["text"]
+        assert "提醒" not in r2
         assert json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))["text"] == "v2"
     print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
 async def test_delete_candidate_page_is_scoped():
-    """Both compiler engines can remove a merged-away page without Bash."""
+    """The compiler can remove a merged-away page without Bash."""
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
         (wd / "candidate/guide").mkdir(parents=True)
@@ -2890,8 +2835,8 @@ async def test_delete_candidate_page_is_scoped():
         (wd / "candidate/guide/index.md").write_text("# Guide", encoding="utf-8")
         engine_dead = wd / "candidate/guide/engine-dead.md"
         engine_dead.write_text("old", encoding="utf-8")
-        claude_dead = wd / "candidate/guide/claude-dead.md"
-        claude_dead.write_text("old", encoding="utf-8")
+        second_dead = wd / "candidate/guide/second-dead.md"
+        second_dead.write_text("old", encoding="utf-8")
         outside = wd / "raw/source.md"
         outside.write_text("raw", encoding="utf-8")
         events = []
@@ -2916,29 +2861,17 @@ async def test_delete_candidate_page_is_scoped():
         assert not engine_dead.exists(), engine_result
         assert "deleted candidate page" in engine_result
 
-        captured = {}
-        original = compile_box.create_sdk_mcp_server
-
-        def capture(name, tools):
-            captured.update({t.name: t for t in tools})
-            return original(name, tools=tools)
-
-        compile_box.create_sdk_mcp_server = capture
-        try:
-            compile_box._make_compile_tools(FakeRun())
-        finally:
-            compile_box.create_sdk_mcp_server = original
-        delete = captured["delete_candidate_page"].handler
+        delete = engine_delete.handler
 
         assert "mcp__compile__delete_candidate_page" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
-        result = await delete({"path": "guide/claude-dead.md"})
-        assert not claude_dead.exists(), result
+        result = await delete({"path": "guide/second-dead.md"})
+        assert not second_dead.exists(), result
         assert len(events) == 2 and events[-1]["type"] == "summary", events
 
         for refused in ("../raw/source.md", "/tmp/out.md", "index.md",
                         "guide/index.md", "guide/data.json"):
             result = await delete({"path": refused})
-            assert "deleted candidate page" not in result["content"][0]["text"], (refused, result)
+            assert "deleted candidate page" not in result, (refused, result)
         assert outside.read_text(encoding="utf-8") == "raw"
     print("✓ delete_candidate_page is engine-neutral and confined to non-routing candidate Markdown files")
 
@@ -2976,111 +2909,43 @@ def test_install_wiki_snapshot_size_guard():
 
 # ── Protocol v3: brief consumption + append-only proposed questions ──
 
+
 def test_apply_session_config():
-    """Consumer-managed llm/settings from /session body (DESIGN-kb-llm-binding-v2):
-    llm applies + clears a stale forwarded API key; settings whitelisted to
-    KBC_*; the boot-time KBC_PK_MODE=off kill switch outranks consumer config."""
-    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
-            "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY", "OPENAI_AUTH_TOKEN",
-            "KBC_ENGINE", "KBC_COMPILE_MODEL", "KBC_TEST_MODEL", "KBC_PK_BLUE_MODEL",
-            "KBC_PK_MODE")
-    backup = {k: os.environ.get(k) for k in keys}
-    kill_backup = compile_box._PK_KILL_AT_BOOT
+    """One complete authority, frozen roles, namespaced policy, operational stop."""
+    backup = dict(os.environ)
+    roles = deepcopy(pi_config._roles)
+    kill = compile_box._PK_KILL_AT_BOOT
     try:
-        os.environ["ANTHROPIC_API_KEY"] = "stale-forwarded-key"
-        os.environ.pop("KBC_PK_MODE", None)
-        os.environ.pop("KBC_COMPILE_MODEL", None)
         compile_box._PK_KILL_AT_BOOT = False
-        compile_box._apply_session_config({
-            "llm": {"base_url": "https://model-gateway.example.com/model-api",
-                    "auth_token": "tok-1", "model": "claude-sonnet-4-6"},
-            "settings": {"KBC_COMPILE_MODEL": "claude-opus-4-8",
-                         "KBC_PK_MODE": "auto",
-                         "EVIL_KEY": "nope", "PATH": "/pwn"},
-        })
-        assert os.environ["ANTHROPIC_BASE_URL"] == "https://model-gateway.example.com/model-api"
-        assert os.environ["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
-        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-1"
-        assert "ANTHROPIC_API_KEY" not in os.environ           # stale key cleared
-        assert os.environ["KBC_COMPILE_MODEL"] == "claude-opus-4-8"
+        os.environ["ANTHROPIC_API_KEY"] = "stale-key"
+        body = {"llm": execution_fixture(), "settings": {
+            "KBC_COMPILE_MODEL": "untrusted-override", "KBC_ENGINE": "codex_sdk",
+            "KBC_PK_MODE": "auto", "EVIL_KEY": "nope", "PATH": "/pwn"}}
+        compile_box._apply_session_config(body)
+        assert compile_box._engine_kind() == "pi_agent"
+        assert compile_box._compile_model() == "fixture-compile"
+        assert compile_box._test_model() == "fixture-blue"
+        assert "ANTHROPIC_API_KEY" not in os.environ
         assert os.environ["KBC_PK_MODE"] == "auto"
-        assert "EVIL_KEY" not in os.environ and os.environ.get("PATH") != "/pwn"
-
-        run = compile_box.CompileRun("config-test", "/tmp", 1, "")
-        opts = compile_box._compile_session_opts(run, "/tmp", "role", "session-1")
-        # Explicit KBC setting still wins — and the compile path now also asks
-        # for the 1M window by tagging the model `[1m]`, which Claude Code
-        # strips client-side into an anthropic-beta header. Assert both: the id
-        # the operator chose, and the window the compiler asks for.
-        assert opts.model.removesuffix("[1m]") == "claude-opus-4-8"
-        assert opts.model.endswith("[1m]"), opts.model
-        os.environ.pop("KBC_COMPILE_MODEL")
-        opts = compile_box._compile_session_opts(run, "/tmp", "role", "session-2")
-        assert opts.model.removesuffix("[1m]") == "claude-sonnet-4-6"  # Helm LLM model fallback
-        assert opts.model.endswith("[1m]"), opts.model                 # tagged on every claude route
-
-        # A present consumer block is authoritative as a whole: absent fields
-        # clear the previous endpoint/token instead of mixing authorities.
-        compile_box._apply_session_config({"llm": {"api_key": "api-key-2"}})
-        assert "ANTHROPIC_BASE_URL" not in os.environ
-        assert "ANTHROPIC_MODEL" not in os.environ
-        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        assert os.environ["ANTHROPIC_API_KEY"] == "api-key-2"
-
-        # Codex is an ordinary API-key Responses provider, never the
-        # subscription-only codex_responses path. Switching engines clears the
-        # previous SDK's complete authority block.
-        compile_box._apply_session_config({
-            "llm": {
-                "engine": "codex_sdk",
-                "protocol": "openai_responses",
-                "base_url": "https://model-gateway.example.com/model-api",
-                "api_key": "mass-key",
-                "model": "gpt-5.6-luna",
-            },
-            "settings": {"KBC_ENGINE": "claude_agent_sdk"},
-        })
-        assert os.environ["KBC_ENGINE"] == "codex_sdk"
-        assert os.environ["OPENAI_BASE_URL"] == "https://model-gateway.example.com/model-api"
-        assert os.environ["OPENAI_API_KEY"] == "mass-key"
-        assert os.environ["OPENAI_MODEL"] == "gpt-5.6-luna"
-        assert not any(key in os.environ for key in (
-            "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-        ))
-
-        # kb-test is the production-consumer/blue tier. The selected blue role
-        # must therefore drive the interactive test session as well, while an
-        # explicit test-only override still wins.
-        os.environ["KBC_PK_BLUE_MODEL"] = "gpt-5.6-luna"
-        assert compile_box._test_model() == "gpt-5.6-luna"
-        os.environ["KBC_TEST_MODEL"] = "gpt-5.6-luna-test"
-        assert compile_box._test_model() == "gpt-5.6-luna-test"
-        os.environ.pop("KBC_TEST_MODEL")
-        try:
-            compile_box._apply_session_config({"llm": {
-                "engine": "codex_sdk", "protocol": "anthropic",
-            }})
-            raise AssertionError("mismatched engine/protocol must fail closed")
-        except ValueError as exc:
-            assert "requires protocol" in str(exc), exc
-
-        # ops kill switch: runtime-level off beats consumer "auto"
+        assert "EVIL_KEY" not in os.environ and os.environ["PATH"] != "/pwn"
+        body["llm"]["execution"]["roles"]["compile"]["model"]["id"] = "changed"
+        assert compile_box._compile_model() == "fixture-compile"
+        for invalid in ({}, {"llm": None}, {"llm": {"engine": "claude_agent_sdk"}},
+                        {"llm": {"engine": "pi_agent", "execution": {}}}):
+            try:
+                compile_box._apply_session_config(invalid)
+                raise AssertionError("incomplete execution authority accepted")
+            except ValueError:
+                pass
         os.environ["KBC_PK_MODE"] = "off"
         compile_box._PK_KILL_AT_BOOT = True
-        compile_box._apply_session_config({"settings": {"KBC_PK_MODE": "auto"}})
+        compile_box._apply_session_config({"llm": execution_fixture(), "settings": {"KBC_PK_MODE": "auto"}})
         assert os.environ["KBC_PK_MODE"] == "off"
-
-        # absent/None fields are a clean no-op
-        compile_box._apply_session_config({})
-        compile_box._apply_session_config({"llm": None, "settings": None})
     finally:
-        for k, v in backup.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-        compile_box._PK_KILL_AT_BOOT = kill_backup
-    print("\u2713 _apply_session_config: llm + whitelist + kill-switch precedence")
+        os.environ.clear()
+        os.environ.update(backup)
+        pi_config._roles = roles
+        compile_box._PK_KILL_AT_BOOT = kill
 def test_parse_brief_block():
     """The wizard's 定调标签 block parses into the BRIEF.json record (tags split on
     Chinese separators, raw kept from the marker); an ordinary message → None."""
@@ -3171,7 +3036,7 @@ async def test_incremental_route():
         assert compile_box._should_route_to_incremental(run, "请增量重编")
         assert not compile_box._should_route_to_incremental(run, "随便聊两句")  # non-trigger never routes
 
-        fake = _FakeSDKClient()
+        fake = _FakeAgentClient()
         run.client = fake
         await compile_box._start_incremental(run, "请增量重编")
         # CHANGESET.json materialized: affected page reverse-looked-up + the consumer's diff
@@ -4747,6 +4612,29 @@ def test_small_kb_batch_gate_skips_poppler_metadata():
     print("\u2713 small KB route: no Poppler metadata subprocess")
 
 
+def test_long_line_slices_materialize_identically_after_resume(tmp_path, monkeypatch):
+    import batching
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_BUDGET_BYTES", "1000")
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_SLICE_BYTES", "1000")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    body = ("header\n" + "中文🚀事实" * 1000 + "TAIL-812\nend\n").encode()
+    (raw / "manual.txt").write_bytes(body)
+    inventory = batching.scan_sources(raw)
+    plan = batching.build_plan(inventory, batching.pack_hierarchical_batches(inventory),
+                               planner="hierarchical-code")
+    run = compile_box.CompileRun("long-line-materialize", str(tmp_path), 1)
+    assert compile_box._materialize_batch_slices(run, plan) == {}
+    views = [tmp_path / batch["source_ranges"]["manual.txt"]["slice_file"] for batch in plan["batches"]]
+    original = [view.read_bytes() for view in views]
+    assert b"".join(view.split(b"\n", 1)[1] for view in original) == body
+    assert all(view.decode("utf-8") for view in original)
+    plan["batches"][0]["status"] = "done"
+    assert compile_box._materialize_batch_slices(run, plan) == {}
+    assert not views[0].exists()
+    assert [view.read_bytes() for view in views[1:]] == original[1:]
+
+
 def test_hierarchical_text_slice_materialization_and_directive():
     """Oversized-text helpers are bounded, ephemeral views of Raw. The model
     reads the helper, but durable Candidate provenance still names the original
@@ -4997,7 +4885,7 @@ def test_hierarchical_pdf_page_directive():
         "defer_accounting": False,
     }
     previous_engine = os.environ.get("KBC_ENGINE")
-    os.environ["KBC_ENGINE"] = "claude_agent_sdk"
+    os.environ["KBC_ENGINE"] = "pi_agent"
     try:
         directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
         assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
@@ -5017,128 +4905,7 @@ def test_hierarchical_pdf_page_directive():
     print("\u2713 hierarchical PDF slices: exact Read.pages directive and Raw provenance")
 
 
-async def test_codex_batch_scope_and_pdf_page_tool():
-    """Codex gets the same batch Raw boundary through its filesystem profile;
-    a page-sliced PDF is withheld from shell and exposed only through a fixed
-    host-side Poppler tool."""
-    previous_engine = os.environ.get("KBC_ENGINE")
-    original_client = compile_box.CodexSDKClient
-    original_client_factory = compile_box._compile_session_client
-    original_which = compile_box.shutil.which
-    original_run = compile_box.subprocess.run
-    captured = {}
 
-    class FakeClient:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    class FakeResult:
-        returncode = 0
-        stdout = "page forty-one\npage forty-two\n"
-        stderr = ""
-
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "raw" / "gpu").mkdir(parents=True)
-            (root / "raw" / "gpu" / "manual.pdf").write_bytes(b"%PDF-test")
-            (root / "raw" / "gpu" / "anchor.md").write_text("anchor")
-            page_ranges = {
-                "gpu/manual.pdf": {
-                    "start_page": 41,
-                    "end_page": 53,
-                    "part": 3,
-                    "parts": 3,
-                }
-            }
-            allowlist = ["gpu/anchor.md", "gpu/manual.pdf"]
-            source_view = compile_box._materialize_codex_batch_source_view(
-                root, allowlist, page_ranges, "test-session")
-            assert source_view is not None
-            assert (source_view / "gpu" / "anchor.md").read_text() == "anchor"
-            assert not (source_view / "gpu" / "manual.pdf").exists()
-            access = compile_box._codex_batch_filesystem_access(
-                root, allowlist, source_view)
-            assert access == {
-                str((root / "raw").resolve()): "deny",
-                str(source_view.resolve()): "read",
-            }
-            note = compile_box._codex_batch_source_view_note(
-                root, source_view, allowlist, page_ranges, "en")
-            assert "raw/gpu/anchor.md -> .kbc-batch-sources-test-session/gpu/anchor.md" in note
-            assert "sources[].resource must still cite the original raw/... path" in note
-
-            os.environ["KBC_ENGINE"] = "codex_sdk"
-            compile_box.CodexSDKClient = FakeClient
-            run = compile_box.CompileRun("codex-pdf-slice", td, 1)
-            client = compile_box._compile_session_client(
-                run, td, "system", "session",
-                pdf_page_ranges=page_ranges,
-                raw_scope={"account": allowlist, "deny_read": [], "consult": False},
-                codex_source_view=source_view,
-            )
-            assert isinstance(client, FakeClient)
-            assert captured["writer_filesystem_access"] == access
-            pdf_tools = [
-                item for item in captured["tools"]
-                if item.name == "read_assigned_pdf_pages"
-            ]
-            assert len(pdf_tools) == 1
-
-            observed_commands = []
-            compile_box.shutil.which = lambda name: "/usr/bin/pdftotext" if name == "pdftotext" else None
-
-            def fake_run(command, **kwargs):
-                observed_commands.append(command)
-                return FakeResult()
-
-            compile_box.subprocess.run = fake_run
-            extracted = await pdf_tools[0].handler({})
-            assert "raw/gpu/manual.pdf (PDF pages 41-53)" in extracted
-            assert observed_commands and observed_commands[0][1:5] == ["-f", "41", "-l", "53"]
-
-            batch = {
-                "id": "h042",
-                "sources": ["gpu/manual.pdf"],
-                "context_sources": [],
-                "source_page_ranges": page_ranges,
-                "defer_accounting": False,
-            }
-            directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
-            assert "read_assigned_pdf_pages" in directive
-            assert "mechanically hidden from shell/file tools" in directive
-            assert "Read tool's `pages`" not in directive
-
-            cleanup = {}
-
-            def exploding_factory(*args, codex_source_view=None, **kwargs):
-                cleanup["view"] = codex_source_view
-                raise RuntimeError("client construction failed")
-
-            compile_box._compile_session_client = exploding_factory
-            try:
-                await compile_box._drive_batch_session(
-                    run, "compile anchor", "cleanup probe",
-                    raw_scope={"account": ["gpu/anchor.md"], "deny_read": [],
-                               "consult": False},
-                )
-                raise AssertionError("expected client construction failure")
-            except RuntimeError as error:
-                assert str(error) == "client construction failed"
-            finally:
-                compile_box._compile_session_client = original_client_factory
-            assert cleanup["view"] is not None
-            assert not cleanup["view"].exists()
-    finally:
-        compile_box.CodexSDKClient = original_client
-        compile_box._compile_session_client = original_client_factory
-        compile_box.shutil.which = original_which
-        compile_box.subprocess.run = original_run
-        if previous_engine is None:
-            os.environ.pop("KBC_ENGINE", None)
-        else:
-            os.environ["KBC_ENGINE"] = previous_engine
-    print("\u2713 Codex batch scope: Raw deny-by-default + fixed PDF page tool")
 
 
 async def test_hierarchical_batch_plan_and_section_reduce():
@@ -5521,15 +5288,15 @@ async def test_batch_orchestrator_review_fixes():
             assert "【批 1/1】" in turn["text"] and "【终审】" in turn["text"], turn
 
         # (e) The real GPU corpus exposed this path: Claude Code returned an
-        # authentication error ResultMessage with no assistant output. Treating
+        # authentication error result_event with no assistant output. Treating
         # it like a successful empty result stamped every map batch done. The
         # batch must remain pending so the next valid run can resume honestly.
         compile_box._drive_batch_session = real_drive
         compile_box._unaccounted_batch_sources = real_accounted
 
         class _ErrorResultClient:
-            def __init__(self, options=None):
-                self.options = options
+            def __init__(self, **kwargs):
+                self.options = SimpleNamespace(**kwargs)
 
             async def connect(self, prompt=None):
                 pass
@@ -5538,13 +5305,13 @@ async def test_batch_orchestrator_review_fixes():
                 pass
 
             async def receive_messages(self):
-                yield ResultMessage("error_during_execution", is_error=True)
+                yield result_event("error_during_execution", is_error=True)
 
             async def disconnect(self):
                 pass
 
-        real_client = compile_box.ClaudeSDKClient
-        compile_box.ClaudeSDKClient = _ErrorResultClient
+        real_client = compile_box.create_agent_client
+        compile_box.create_agent_client = _ErrorResultClient
         try:
             with tempfile.TemporaryDirectory() as td:
                 wd = Path(td)
@@ -5559,16 +5326,16 @@ async def test_batch_orchestrator_review_fixes():
                            for e in evs), evs
                 assert sum(e["type"] == "turn_done" for e in evs) == 1, evs
         finally:
-            compile_box.ClaudeSDKClient = real_client
+            compile_box.create_agent_client = real_client
 
         # (f) is_error=False is necessary but not sufficient: a provider/SDK
         # regression may return an empty successful result. Every assigned
         # source must now be cited or explicitly excluded before the done stamp.
         class _NoopResultClient(_ErrorResultClient):
             async def receive_messages(self):
-                yield ResultMessage()
+                yield result_event()
 
-        compile_box.ClaudeSDKClient = _NoopResultClient
+        compile_box.create_agent_client = _NoopResultClient
         try:
             with tempfile.TemporaryDirectory() as td:
                 wd = Path(td)
@@ -5582,7 +5349,7 @@ async def test_batch_orchestrator_review_fixes():
                 assert any(e["type"] == "error" and "BatchOutputError" in e.get("error", "")
                            for e in evs), evs
         finally:
-            compile_box.ClaudeSDKClient = real_client
+            compile_box.create_agent_client = real_client
     finally:
         compile_box._drive_batch_session = real_drive
         compile_box._unaccounted_batch_sources = real_accounted
@@ -5704,12 +5471,12 @@ def _drain(run):
 
 class _StallingFakeClient:
     """Black-holes each attempt (receive blocks on a gate) until the Nth query;
-    interrupt() unblocks with a bare ResultMessage (the interrupted attempt). The
-    Nth query produces a real reply + ResultMessage. `produce_on_query=999` never
+    interrupt() unblocks with a bare result_event (the interrupted attempt). The
+    Nth query produces a real reply + result_event. `produce_on_query=999` never
     recovers (exhaustion path)."""
 
-    def __init__(self, options=None, produce_on_query=2):
-        self.options = options
+    def __init__(self, produce_on_query=2, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.queries = []
         self.interrupts = 0
         self._produce_on = produce_on_query
@@ -5739,10 +5506,10 @@ class _StallingFakeClient:
             await self._gate.wait()
             self._gate.clear()
             if self._mode == "interrupted":
-                yield ResultMessage()          # the interrupted attempt ends
+                yield result_event()          # the interrupted attempt ends
             elif self._mode == "produce":
-                yield AssistantMessage("批 1/10 完成")
-                yield ResultMessage()
+                yield assistant_event("批 1/10 完成")
+                yield result_event()
                 self._closed = True
                 return
             # blackhole → loop back and block on the gate again
@@ -5752,11 +5519,11 @@ class _StallingFakeClient:
 
 
 class _LiveStreamFake:
-    """A live-but-slow generation: emits StreamEvent liveness faster than the idle
+    """A live-but-slow generation: emits activity_event liveness faster than the idle
     bound, so the watchdog must never reap it."""
 
-    def __init__(self, options=None, ticks=6, dt=0.05):
-        self.options = options
+    def __init__(self, ticks=6, dt=0.05, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.queries = []
         self.interrupts = 0
         self._ticks = ticks
@@ -5774,9 +5541,9 @@ class _LiveStreamFake:
     async def receive_messages(self):
         for _ in range(self._ticks):
             await asyncio.sleep(self._dt)
-            yield StreamEvent()
-        yield AssistantMessage("done streaming")
-        yield ResultMessage()
+            yield activity_event()
+        yield assistant_event("done streaming")
+        yield result_event()
 
     async def disconnect(self):
         pass
@@ -5787,8 +5554,8 @@ class _ToolGapFake:
     (tool_pending), there is a model-silent gap longer than the idle bound but
     shorter than the tool bound — must NOT be reaped."""
 
-    def __init__(self, options=None, gap=0.3):
-        self.options = options
+    def __init__(self, gap=0.3, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.queries = []
         self.interrupts = 0
         self._gap = gap
@@ -5803,20 +5570,20 @@ class _ToolGapFake:
         self.interrupts += 1
 
     async def receive_messages(self):
-        am = AssistantMessage("calling read")
-        am.content = [TextBlock("calling read"), ToolUseBlock()]
+        am = assistant_event("calling read")
+        am.data["content"] = [text_block("calling read"), tool_block()]
         yield am                                # tool_pending = True
-        # The real Agent SDK emits assistant-tail StreamEvents
+        # The real Agent SDK emits assistant-tail activity_events
         # (content_block_stop/message_delta/message_stop) before the CLI
-        # returns the UserMessage carrying the tool result.  Those events prove
+        # returns the tool_end_event carrying the tool result.  Those events prove
         # transport liveness, but they do not mean the tool has finished.
-        yield StreamEvent()
-        yield StreamEvent()
-        yield StreamEvent()
+        yield activity_event()
+        yield activity_event()
+        yield activity_event()
         await asyncio.sleep(self._gap)          # model-silent while the CLI runs the tool
-        yield UserMessage()                     # tool_result → tool_pending = False
-        yield AssistantMessage("read done")
-        yield ResultMessage()
+        yield tool_end_event()                     # tool_result → tool_pending = False
+        yield assistant_event("read done")
+        yield result_event()
 
     async def disconnect(self):
         pass
@@ -5890,7 +5657,7 @@ async def test_model_stall_retries_then_completes():
 
 
 async def test_model_stall_live_stream_not_reaped():
-    """A live-but-slow generation (StreamEvents flowing) is never reaped (I4)."""
+    """A live-but-slow generation (activity_events flowing) is never reaped (I4)."""
     fake = _LiveStreamFake(ticks=6, dt=0.05)
     run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3)
     assert raised is None, raised
@@ -5932,33 +5699,24 @@ async def test_model_stall_exhausts_to_error():
 # ── Batch-path stall recovery: client rebuild + continue (07-24 incident) ─────
 
 
-class _FakeExitedTransport:
-    """Duck-types the SDK subprocess transport so _client_process_exited(client)
-    reads a terminated child (returncode set)."""
 
-    def __init__(self, returncode):
-        self._process = type("_P", (), {"returncode": returncode})()
 
 
 class _BatchTurnFake:
     """A per-attempt fake compile-session client for _drive_batch_session.
 
     mode:
-      'ok'          — a clean turn: AssistantMessage(reply) + ResultMessage.
-      'lost_term'   — emit the content once (AssistantMessage), then black-hole
+      'ok'          — a clean turn: assistant_event(reply) + result_event.
+      'lost_term'   — emit the content once (assistant_event), then black-hole
                       the terminator forever; interrupt() is SWALLOWED (produces
                       nothing), reproducing the 07-24 incident (stream terminator
                       lost AND interrupt black-holed).
       'dead'        — the CLI subprocess has exited (returncode set) and the
                       stream hangs; the watchdog's liveness probe must reap it.
-      'plain_exc'   — emit the content once, then receive_messages() raises a
-                      PLAIN RuntimeError mid-turn (no watchdog involved): the
-                      real claude-agent-sdk 0.2.110 shape when its background
-                      reader consumes a dead-subprocess ProcessError and re-raises
-                      it as a bare Exception. Must still trigger a client rebuild.
+      'plain_exc'   — emit content, then a typed Pi worker transport failure.
       'interrupt_raises' — the stream NEVER yields (a black hole) AND interrupt()
                       RAISES, with a live subprocess (no returncode), so neither
-                      the liveness probe nor any ResultMessage can ever fire.
+                      the liveness probe nor any result_event can ever fire.
                       Pre-fix the watchdog just cleared the retry latch and
                       re-interrupted forever; the reap is the only way out.
     """
@@ -5971,7 +5729,7 @@ class _BatchTurnFake:
         self._gate = asyncio.Event()
         self._closed = False
         if returncode is not None:
-            self._transport = _FakeExitedTransport(returncode)
+            self.returncode = returncode
 
     async def connect(self, prompt=None):
         pass
@@ -5992,16 +5750,16 @@ class _BatchTurnFake:
             await self._gate.wait()
             self._gate.clear()
             if self.mode == "ok":
-                yield AssistantMessage(self.reply)
-                yield ResultMessage()
+                yield assistant_event(self.reply)
+                yield result_event()
                 self._closed = True
                 return
             if self.mode == "plain_exc":
-                yield AssistantMessage(self.reply)   # content lands…
+                yield assistant_event(self.reply)   # content lands…
                 # …then the SDK surfaces a dead subprocess as a plain Exception.
-                raise RuntimeError("SDK background reader surfaced a dead subprocess")
+                raise AgentTransportError("Pi worker exited during the turn")
             if self.mode == "lost_term":
-                yield AssistantMessage(self.reply)   # content lands…
+                yield assistant_event(self.reply)   # content lands…
                 self.mode = "blackhole"              # …then the terminator never comes
             # blackhole / dead → loop back and block on the (cleared) gate
 
@@ -6047,7 +5805,7 @@ async def _drive_batch_with_watchdog(modes, *, label="batch 1/2", batch_active=T
     compile_box._BATCH_REBUILD_MAX_RETRIES = rebuild_max
     compile_box._compile_session_client = factory
     compile_box._compile_system_prompt = lambda run: "sys"
-    compile_box._engine_kind = lambda: "claude_agent_sdk"
+    compile_box._engine_kind = lambda: "pi_agent"
     raised = None
     reply = None
     try:
@@ -6109,15 +5867,8 @@ async def test_batch_subprocess_death_rebuilds_and_continues():
     print("✓ batch stall: dead subprocess detected by liveness probe → rebuilt → batch continues")
 
 
-async def test_batch_plain_sdk_exception_rebuilds_and_continues():
-    """Finding 1 (07-24 review): claude-agent-sdk 0.2.110 can consume a dead
-    subprocess's ProcessError inside its background reader and re-raise a PLAIN
-    Exception out of receive_messages(). _drive_batch_session only names
-    ModelStallError/CLIConnectionError/ProcessError, so that plain Exception would
-    escape the rebuild loop and kill the run with the turn still active. The SDK
-    boundary now normalizes ANY consume-stream exception into a rebuildable stall:
-    the dead client is torn down and the batch completes on a fresh one. No
-    watchdog is involved — the exception is synchronous, mid-turn."""
+async def test_batch_transport_failure_rebuilds_and_continues():
+    """A typed Pi transport fault destroys the old worker and resumes the batch."""
     run, evs, reply, raised, built = await _drive_batch_with_watchdog(
         ["plain_exc", "ok"])
     assert raised is None, raised
@@ -6132,7 +5883,7 @@ async def test_batch_interrupt_failure_reaps_instead_of_spinning():
     """R3-1 (infinite wedge): a black-holed stream whose interrupt() RAISES.
 
     Pre-fix the watchdog's except branch only cleared _stall_retrying and emitted
-    a summary. Nothing reaped: no ResultMessage ever arrives, so the _stall_fatal
+    a summary. Nothing reaped: no result_event ever arrives, so the _stall_fatal
     latch _consume_turn_stream would act on is never consumed, and the cleared
     _stall_retrying also disables the interrupt-deadline reap — the watchdog just
     re-interrupts on every idle bound, forever (in production: a full bound, up to
@@ -6347,9 +6098,6 @@ async def test_durable_workspace_sync_waits_for_consumer_ack():
 
 async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
     """Unsafe YAML is a repair finding, not a retry poison or trust leak."""
-    class ResultMessage:
-        pass
-
     with tempfile.TemporaryDirectory() as td:
         candidate = Path(td) / "candidate"
         candidate.mkdir()
@@ -6363,20 +6111,20 @@ async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
         run._begin_turn("batch")
         page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
 
-        # ResultMessage must finish normally instead of poisoning every batch
+        # result_event must finish normally instead of poisoning every batch
         # rebuild. The changed page is withheld from durability sync.
-        await compile_box._emit_message(run, ResultMessage())
+        await compile_box._emit_message(run, result_event())
         assert "topic.md" in run._provenance_stamp_failures
         assert await compile_box._sync_workspace(run, sent) == 0
         assert not _drain(run), "blocked page must emit neither stale bytes nor a tombstone"
 
-        # A later repair normalizes the YAML. The same ResultMessage seam stamps
+        # A later repair normalizes the YAML. The same result_event seam stamps
         # it, clears the blocker, and only then exposes the new bytes.
         run._begin_turn("repair")
         page.write_text(
             "---\ntype: Topic\nverified:\n  by: human:r\n"
             "  at: '2026-08-04T00:00:00Z'\n---\nNew\n", "utf-8")
-        await compile_box._emit_message(run, ResultMessage())
+        await compile_box._emit_message(run, result_event())
         assert run._provenance_stamp_failures == {}
         assert await compile_box._sync_workspace(run, sent) == 1
         sync = next(event for event in _drain(run) if event["type"] == "syncArtifacts")
@@ -6432,7 +6180,7 @@ async def test_resumed_batch_phase_is_watchdog_armed():
         compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
         compile_box._compile_session_client = factory
         compile_box._compile_system_prompt = lambda run_: "sys"
-        compile_box._engine_kind = lambda: "claude_agent_sdk"
+        compile_box._engine_kind = lambda: "pi_agent"
         compile_box._unaccounted_batch_sources = lambda run_, sources: []
         compile_box._post_turn_selfcheck = lambda run_: _async_none()
         compile_box._media_verify_enabled = lambda: False
@@ -6481,10 +6229,10 @@ async def _async_none():
 class _RateLimitedFakeClient:
     """Ends each turn with a rate-limit error result until the Nth query, which
     produces a normal completion. `is_error` + `api_error_status` mirror the CLI's
-    ResultMessage on a 429/503/529 (CLI >= 2.1.110)."""
+    result_event on a 429/503/529 (CLI >= 2.1.110)."""
 
-    def __init__(self, options=None, succeed_on_query=2, status=429):
-        self.options = options
+    def __init__(self, succeed_on_query=2, status=429, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
         self.queries = []
         self.interrupts = 0
         self._succeed_on = succeed_on_query
@@ -6507,13 +6255,12 @@ class _RateLimitedFakeClient:
             await self._gate.wait()
             self._gate.clear()
             if len(self.queries) >= self._succeed_on:
-                yield AssistantMessage("compiled ok")
-                yield ResultMessage()
+                yield assistant_event("compiled ok")
+                yield result_event()
                 self._closed = True
                 return
-            r = ResultMessage()
-            r.is_error = True
-            r.api_error_status = self._status
+            r = result_event(is_error=True)
+            r.data["api_error_status"] = self._status
             yield r
             # loop back and wait for the retry query
 
@@ -6879,7 +6626,7 @@ async def test_a_spend_cap_does_not_kill_a_live_session():
 
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
-    # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
+    # a real provider session in the background (test_selfcheck covers PK wiring).
     os.environ["KBC_PK_MODE"] = "off"
     test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
@@ -6960,7 +6707,6 @@ async def main():
     test_batch_checkpoint_digest_is_verified_before_resume()
     test_hierarchical_resume_state_contract()
     test_hierarchical_pdf_page_directive()
-    await test_codex_batch_scope_and_pdf_page_tool()
     await test_hierarchical_batch_plan_and_section_reduce()
     test_hierarchical_media_verify_round_limit()
     await test_hierarchical_media_rechecks_after_ledger_repair()
@@ -6972,7 +6718,7 @@ async def main():
     await test_stall_interrupt_deadline_closes_turn()
     await test_batch_lost_terminator_reaps_and_rebuilds()
     await test_batch_subprocess_death_rebuilds_and_continues()
-    await test_batch_plain_sdk_exception_rebuilds_and_continues()
+    await test_batch_transport_failure_rebuilds_and_continues()
     await test_batch_interrupt_failure_reaps_instead_of_spinning()
     await test_interrupt_failure_reap_is_bounded_and_resumable()
     await test_batch_rebuild_exhaustion_raises_resumable()
@@ -7749,10 +7495,10 @@ async def test_the_runtime_owns_the_dispatch_round_not_the_model():
             assert got == "round-A", f"{tid} stamped {got!r}, want the accepted round"
             assert rows[tid]["status"] == "applied", rows[tid]
 
-        # The round ends with its ResultMessage. The nonce must end with it: an
+        # The round ends with its result_event. The nonce must end with it: an
         # ordinary owner turn may still call resolve_ticket, but that receipt
         # must be visibly outside every apply round.
-        await compile_box._emit_message(run, ResultMessage())
+        await compile_box._emit_message(run, result_event())
         assert run.apply_dispatch_nonce == "", run.apply_dispatch_nonce
         run._turn_active = False
         r = await client.post("/message/nonce-run", json={"message": "继续检查剩余内容"})
@@ -7835,7 +7581,7 @@ async def test_incremental_rebinds_untouched_source_ids_without_widening_body_sc
             (wd / "authoring/RAW_CHANGES.json").write_text(json.dumps({
                 "modified": ["changed.md"], "added": [], "deleted": []}))
             run = compile_box.CompileRun("source-rekey", td, 1)
-            run.client = _FakeSDKClient()
+            run.client = _FakeAgentClient()
             await compile_box._start_incremental(run, "Update changed source", strict=True)
             assert run._incr_pending["changeset"]["affected_pages"] == ["a.md"]
             if needs_repair:

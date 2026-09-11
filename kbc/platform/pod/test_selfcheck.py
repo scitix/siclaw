@@ -1,7 +1,7 @@
 """Tests for the Layer-1 compile self-check (selfcheck.py + compile_box wiring).
 
 Pure-function tests need only stdlib; the wiring test imports compile_box
-(claude-agent-sdk required, same as test_compile_box.py). Run:
+(compiler host dependencies required, same as test_compile_box.py). Run:
     python test_selfcheck.py
 """
 
@@ -1997,8 +1997,10 @@ async def test_pk_wiring():
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)")
         _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx")
         run = _FakeRun(td)
-        os.environ["KBC_PK_MODE"] = "off"
+        os.environ.pop("KBC_PK_MODE", None)
         assert await compile_box._post_turn_selfcheck(run) is None  # ledger passes
+        assert compile_box._pk_due(run) is None                     # default off
+        os.environ["KBC_PK_MODE"] = "off"
         assert compile_box._pk_due(run) is None                     # mode off
         os.environ["KBC_PK_MODE"] = "auto"
         assert compile_box._pk_due(run) == "full"
@@ -2068,13 +2070,12 @@ async def test_seam_settles_when_nothing_pending():
             async def inject_user_message(self, t):
                 pass
 
-        class ResultMessage:  # type(msg).__name__ drives the seam
-            pass
+        from agent_protocol import AgentEvent
 
         os.environ["KBC_PK_MODE"] = "off"        # verify OFF (both layers)
         os.environ["KBC_MEDIA_VERIFY"] = "off"
         try:
-            await compile_box._emit_message(_R(), ResultMessage())
+            await compile_box._emit_message(_R(), AgentEvent("result", "fixture", data={"outcome": "completed"}))
             sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
             assert sc.get("converge_phase") == "settled", sc.get("converge_phase")
         finally:

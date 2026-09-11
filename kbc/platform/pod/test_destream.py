@@ -192,10 +192,6 @@ def test_default_on_session_scoped_activation():
         assert destream.session_env("authoring") == {}
         assert destream.model_idle_floor() == 0.0
         os.environ.pop("KBC_DESTREAM", None)
-        # codex engine out of scope
-        os.environ["KBC_ENGINE"] = "codex_sdk"
-        assert not destream.enabled()
-        os.environ.pop("KBC_ENGINE", None)
         # no shim listener -> off
         destream._PORT = None
         assert not destream.enabled()
@@ -210,54 +206,36 @@ def test_default_on_session_scoped_activation():
     print("OK  default-on session-scoped activation (test sessions stream, opt-out works)")
 
 
-def test_verify_caller_opts_carry_shim():
-    """Integration guard: the two non-interactive Claude reviewer sessions
-    (test recommendation + reference-answer assist) must thread the de-stream
-    shim into their SDK env, exactly like the authoring/verify entrypoints.
-    Without it they keep hitting the streaming gateway and re-expose the
-    cross-chunk charset corruption this PR fixes. Opt-out must clear it."""
-    import tempfile
-    import types
-
-    import compile_box
-
-    env_backup = {k: os.environ.get(k) for k in
-                  ("KBC_DESTREAM", "KBC_ENGINE", "ANTHROPIC_BASE_URL")}
+def test_verify_roles_use_their_own_scoped_shim():
+    """Noninteractive roles use the shim; interactive tests and opt-out stream."""
+    from copy import deepcopy
+    import pi_config
+    from test_compile_box import execution_fixture
+    original = deepcopy(pi_config._roles)
+    previous = os.environ.get("KBC_DESTREAM")
     destream._PORT = 45678
-    shim = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:45678"}
     try:
-        os.environ["ANTHROPIC_BASE_URL"] = "https://api.example/model-api"
         os.environ.pop("KBC_DESTREAM", None)
-        os.environ.pop("KBC_ENGINE", None)
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            parent = types.SimpleNamespace(locale="en")
-
-            rec_submit = compile_box._make_recommendation_submit_tool(root, parent, {})
-            rec_opts = compile_box._recommendation_session_opts(parent, root, rec_submit)
-            assert rec_opts.env == shim, rec_opts.env
-
-            ref_submit, allowed = compile_box._make_reference_assist_submit_tool(
-                root, parent, "polish", {})
-            ref_opts = compile_box._reference_assist_session_opts(
-                parent, root, ref_submit, allowed)
-            assert ref_opts.env == shim, ref_opts.env
-
-            # operator opt-out drops both back to true streaming (empty env)
-            os.environ["KBC_DESTREAM"] = "off"
-            assert compile_box._recommendation_session_opts(
-                parent, root, rec_submit).env == {}
-            assert compile_box._reference_assist_session_opts(
-                parent, root, ref_submit, allowed).env == {}
+        fixture = execution_fixture()["execution"]
+        for role in ("compile", "blue"):
+            fixture["roles"][role]["model"].update(api="anthropic-messages", baseUrl=f"https://{role}.example/v1")
+        pi_config.configure(fixture)
+        for role in ("compile", "blue"):
+            resolved = pi_config.for_role(role)
+            endpoint = resolved["model"]["baseUrl"]
+            assert endpoint.startswith("http://127.0.0.1:45678/_pi/")
+            assert destream._PI_UPSTREAMS[endpoint.rsplit("/", 1)[1]] == f"https://{role}.example/v1"
+            assert pi_config.for_role(role, session_kind="test")["model"]["baseUrl"] == f"https://{role}.example/v1"
+        os.environ["KBC_DESTREAM"] = "off"
+        assert pi_config.for_role("blue")["model"]["baseUrl"] == "https://blue.example/v1"
     finally:
+        pi_config._roles = original
         destream._PORT = None
         destream._UPSTREAM = None
-        for k, v in env_backup.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    print("OK  recommendation + reference-assist opts carry the shim env (opt-out clears it)")
+        if previous is None:
+            os.environ.pop("KBC_DESTREAM", None)
+        else:
+            os.environ["KBC_DESTREAM"] = previous
 
 
 def test_watchdog_floor_scoped_to_model_phase():
@@ -282,7 +260,7 @@ def test_watchdog_floor_scoped_to_model_phase():
 
 if __name__ == "__main__":
     test_default_on_session_scoped_activation()
-    test_verify_caller_opts_carry_shim()
+    test_verify_roles_use_their_own_scoped_shim()
     test_watchdog_floor_scoped_to_model_phase()
     for fn in (test_destream_synthesizes_valid_sse,
                test_destream_pings_while_upstream_is_slow,
