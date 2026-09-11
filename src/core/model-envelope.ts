@@ -85,7 +85,7 @@ export function inspectModelEnvelope(payload: unknown): ModelEnvelopeManifest {
       infrastructureGuidance: system.includes("# SRE Work Policy") || system.includes("# Infrastructure Access"),
       operationalSafety: system.includes("# Operational Safety"),
       memoryGuidance: system.includes("# Memory — Search On Demand"),
-      planningGuidance: system.includes("making a plan with `task_create` is your FIRST move"),
+      planningGuidance: system.includes("## Planning"),
       subagentGuidance: system.includes("make **one `spawn_subagent` call"),
     },
   };

@@ -58,7 +58,7 @@ describe("inspectModelEnvelope", () => {
         "# Infrastructure Access",
         "# Operational Safety",
         "# Memory — Search On Demand",
-        "Start by making a plan with `task_create` is your FIRST move.",
+        "## Planning",
         "For parallel work, make **one `spawn_subagent` call.",
       ].join("\n\n"),
     });

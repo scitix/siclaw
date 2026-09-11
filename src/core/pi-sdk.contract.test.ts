@@ -16,6 +16,7 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 import { LlmCallRecorder } from "./llm-call-recorder.js";
 import { summarizeWithFallback } from "./compaction.js";
+import { resolveSessionThinkingLevel } from "./session-thinking.js";
 
 // Exercise installed Pi packages through the real HTTP serializer and agent loop.
 // Only the network boundary is replaced; no SDK classes or events are mocked.
@@ -55,7 +56,10 @@ function mockNetwork(respond: (request: Request, body: any) => Response | Promis
   return requests;
 }
 
-async function createFixture(customTools: ToolDefinition[] = []) {
+async function createFixture(
+  customTools: ToolDefinition[] = [],
+  fixtureSettings: Parameters<typeof SettingsManager.inMemory>[0] = {},
+) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-pi-contract-"));
   cleanups.push(() => fs.rm(cwd, { recursive: true, force: true }));
   const modelsPath = path.join(cwd, "models.json");
@@ -80,6 +84,7 @@ async function createFixture(customTools: ToolDefinition[] = []) {
     settingsManager: SettingsManager.inMemory({
       retry: { enabled: false },
       compaction: { enabled: false, reserveTokens: 2048, keepRecentTokens: 1 },
+      ...fixtureSettings,
     }),
     resourceLoaderOptions: {
       noExtensions: true, noSkills: true, noPromptTemplates: true,
@@ -88,7 +93,8 @@ async function createFixture(customTools: ToolDefinition[] = []) {
   });
   const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
   const { session } = await createAgentSessionFromServices({
-    services, sessionManager, model, noTools: "builtin", customTools, thinkingLevel: "off",
+    services, sessionManager, model, noTools: "builtin", customTools,
+    thinkingLevel: resolveSessionThinkingLevel(services.settingsManager, model),
   });
   await session.bindExtensions({});
   cleanups.push(() => session.dispose());
@@ -96,7 +102,7 @@ async function createFixture(customTools: ToolDefinition[] = []) {
   session.agent.streamFunction = recorder.wrapStreamFn(session.agent.streamFunction);
   installGuardPipeline(createGuardRegistry(model.contextWindow), { agent: session.agent, sessionManager });
   const brain = new PiAgentBrain(session, new Map(), recorder);
-  return { brain, session, sessionManager, model };
+  return { brain, session, sessionManager, model, services, modelRuntime };
 }
 
 function resultTool(execute = vi.fn(async () => ({
@@ -110,6 +116,43 @@ function resultTool(execute = vi.fn(async () => ({
 }
 
 describe("installed Pi SDK contract", () => {
+  it("retains the requested default effort when a reasoning model is bound after bootstrap", async () => {
+    const requests = mockNetwork(() => completion({ content: "Completed." }));
+    const { brain, session, services, modelRuntime } = await createFixture();
+    // A bootstrap model without reasoning support clamps the initial high to off.
+    expect(session.thinkingLevel).toBe("off");
+    modelRuntime.registerProvider("late-provider", {
+      baseUrl: "https://pi-contract.invalid/v1", api: "openai-completions", apiKey: "contract-key",
+      models: [{ id: "late-reasoner", name: "Late reasoner", reasoning: true,
+        input: ["text"], contextWindow: 128_000, maxTokens: 2048,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    });
+    await modelRuntime.setRuntimeApiKey("late-provider", "contract-key");
+    const model = modelRuntime.getModel("late-provider", "late-reasoner")!;
+    await brain.setModel(model);
+    expect(session.thinkingLevel).toBe("high");
+    await brain.prompt("Confirm readiness.");
+    expect(requests.at(-1)?.body.reasoning_effort).toBe("high");
+    // Session defaults must not silently become a global user preference.
+    expect(services.settingsManager.getGlobalSettings().defaultThinkingLevel).toBeUndefined();
+    // An explicit routing override still wins after binding the model.
+    brain.applyModelParams({ reasoningEffort: "low" });
+    await brain.prompt("Confirm with the requested effort.");
+    expect(requests.at(-1)?.body.reasoning_effort).toBe("low");
+  });
+
+  it.each([
+    { defaultThinkingLevel: "off" as const, expected: "off" },
+    { defaultThinkingLevel: "low" as const, expected: "low" },
+    { defaultThinkingLevel: "high" as const,
+      modelThinkingLevels: { "contract-provider/contract-model": "medium" as const }, expected: "medium" },
+  ])("respects configured thinking defaults: $expected", async ({ expected, ...settings }) => {
+    const { session, services, model } = await createFixture([], settings);
+    expect(session.thinkingLevel).toBe("off"); // model capabilities remain authoritative
+    expect(resolveSessionThinkingLevel(services.settingsManager, model)).toBe(expected);
+    expect(services.settingsManager.getGlobalSettings().defaultThinkingLevel).toBe(settings.defaultThinkingLevel);
+  });
+
   it("preserves guards, payload hooks, tool events, timing and persisted checkpoints", async () => {
     const requests = mockNetwork(() => requests.length === 1
       ? resultCall(" submit_result ") : completion({ content: "Completed." }));
