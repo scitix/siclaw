@@ -184,7 +184,9 @@ filesystem guidance through the registered `run_script` tool description and
 parameter schema. This compact contract reuses the main Agent's existing MCP
 schemas without copying them into `run_script` or generating SDK functions.
 Detailed examples and architecture remain in this document, outside the model's
-tool description. The description adds only compact budget and bounded-worker guidance.
+tool description. With 10-lane guidance and deployed budgets, a representative
+complete tool definition is 1,003 `o200k_base` tokens (990 `cl100k_base`),
+18 more than the preceding 985-token contract.
 Other tool schemas, provider wrapping and conversation history also occupy
 context; prompt caching does not remove that occupancy.
 

@@ -1,5 +1,56 @@
 # Script sandbox validation — 2026-09-11
 
+## Ten-lane SDK and shared target admission
+
+Code revision `a51d006a` passed all six CI checks, including native amd64/arm64
+container smoke, the AgentBox build graph and Portal tests. Local verification
+passed 7,389 backend tests with two existing skips, 271 Portal tests, both
+TypeScript projects, backend build and 12 real Python runner tests. The final
+Pod/default-container admission regression also passed after the full suite.
+The companion shared admission implementation passed its race-enabled tests,
+resource authorization and Runtime WebSocket suites, plus vet.
+
+A fresh Linux Docker run held every response until **ten containers and all
+100 SDK calls** had entered. All ten scripts then completed with correct
+correlation; an eleventh run was refused. Cached container startup in that
+sample was 464–601 ms. CI now repeats this proof on both architectures, alongside
+one-run batches exceeding the former 64-call limit. The locally hosted E2B TLS
+relay also required ten simultaneous requests before returning any response.
+Cloud E2B provisioning remains deferred.
+
+Matching Runtime/AgentBox/runner images were deployed by digest after the
+companion API. Four fresh real-model Web cases produced one successful script
+each, with required network isolation and no warm pool:
+
+| Case | SDK calls | Startup | Total script time | Result |
+| --- | ---: | ---: | ---: | --- |
+| Python, ten concurrent built-in cluster queries to separate files | 10 | 2,057 ms | 3,055 ms | All five-node results identical |
+| Python, ten concurrent live MCP queries to separate files | 10 | 2,013 ms | 3,048 ms | Ten successes; shared target peak 10 |
+| Python, three concurrent node diagnostics | 3 | 1,705 ms | 8,155 ms | Three kernel versions; diagnostic cleanup confirmed |
+| Shell, ten concurrent SDK subprocesses to separate files | 10 | 1,794 ms | 4,160 ms | Ten successes; identical node lists |
+
+These script durations exclude model generation. All 33 SDK calls matched
+Runtime audit and complete persisted tool results. Python verified local
+`/work` and `/tmp` write/read/delete, socket denial, and absence of kubeconfig
+and service-account tokens. The MCP peak was sampled from shared admission
+storage, not inferred from the number of Python threads. The node case used
+three schedulable control-plane targets; workers were near Pod capacity. The
+full ten-container proof ran in Docker, rather than claiming ten concurrent
+Kubernetes runners on this capacity-constrained cluster.
+
+The dedicated runner namespace's old four-Pod quota was raised to 24 Pods and
+48 Jobs, allowing ten active runs plus cleanup/warm overlap; the diagnostic
+namespace retains its ten-Pod hard ceiling. Temporary test identity and local
+login material were removed, retained test Agent/MCP configuration was preserved,
+and runner/diagnostic Jobs and Pods were empty after acceptance.
+
+The fresh runner image is 124,391,568 bytes uncompressed and adds no dependency.
+The representative model-visible tool contract is 1,003 `o200k_base` tokens
+(990 `cl100k_base`), versus 985 before bounded concurrency guidance. Limits cover
+SDK traffic; ordinary direct tools keep their existing limits. Invocation-rate
+limits are not a bound on all HTTP requests or detached upstream processing.
+
+
 ## Live MCP result contract correction
 
 A real read-only HTTP MCP service returned successful native results with
