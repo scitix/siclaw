@@ -60,9 +60,10 @@ from mtls_auth import (
 )
 import redblue
 import selfcheck
-from engine import selected_readonly_engine
+from engine import selected_readonly_engine, engine_kind, create_agent_client
 from agent_protocol import AgentClient, AgentEvent, AgentTransportError, EngineTool, is_result as message_is_result, message_field
-from pi_engine import PiAgentClient, observe_sessions, sdk_version as pi_sdk_version
+from execution_observation import observe_sessions
+from pi_engine import sdk_version as pi_sdk_version
 from pi_file_tools import FileTools
 import pi_config
 import source_snapshot
@@ -2767,7 +2768,7 @@ async def _run_pk_flow(run, kind: str) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def _post_turn_selfcheck(run) -> str | None:
+async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
     """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
     design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
     lives in selfcheck.py (engine-neutral); this driver only decides WHEN
@@ -3016,7 +3017,7 @@ async def _post_turn_selfcheck(run) -> str | None:
         run._l1_repairs_used = 0
         run._l1_round_limit = 0
         report["state"] = "passed"
-    elif run._l1_repairs_used < run._l1_round_limit:
+    elif allow_repair and run._l1_repairs_used < run._l1_round_limit:
         report["state"] = "repairing"
         # The report carries the PREVIOUS converge_phase (possibly "settled");
         # the pre-turn_done sync would ship repairing+settled for one window
@@ -3303,10 +3304,7 @@ def _compile_model() -> str:
 
 
 def _engine_kind() -> str:
-    kind = os.environ.get("KBC_ENGINE", "pi_agent").strip().lower()
-    if kind not in {"pi", "pi_agent"}:
-        raise ValueError("Legacy compiler SDKs are retired in this image; configure Pi Agent before starting a new run")
-    return "pi_agent"
+    return engine_kind()
 
 
 def _reference_assist_model() -> str:
@@ -3330,7 +3328,7 @@ def _reference_assist_model() -> str:
 def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
                             pdf_page_ranges: dict | None = None,
                             raw_scope: dict | None = None):
-    """Create a Pi session with the compiler tool contract.
+    """Create the selected SDK session with the compiler tool contract.
 
     The mature turn/sync/watchdog orchestration consumes the same client shape
     with an engine-neutral event protocol and host-owned tools.
@@ -3343,7 +3341,7 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
     tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
                  for tool in _compile_engine_tools(run, raw_scope=raw_scope)
                  if f"mcp__compile__{tool.name}" in allowed)
-    return PiAgentClient(cwd=wd, system_prompt=system_prompt, session_id=session_id,
+    return create_agent_client(cwd=wd, system_prompt=system_prompt, session_id=session_id,
                          model_config=pi_config.for_role("compile", session_kind="authoring"), tools=tools,
                          max_model_calls=int(os.environ.get("KBC_MAX_TURNS", "150")))
 
@@ -4456,7 +4454,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
         wd = str(Path(run.workdir).resolve())
         planner_prompt = _planner_role(getattr(run, "locale", None))
         planner_session_id = str(uuid.uuid4())
-        client = PiAgentClient(
+        client = create_agent_client(
             cwd=wd, system_prompt=planner_prompt, session_id=planner_session_id,
             model_config=pi_config.for_role("compile", session_kind="authoring"), max_model_calls=8,
             tools=FileTools(wd, ["Read", "Write", "Glob"],
@@ -5210,7 +5208,7 @@ async def _consume_turn_stream(
                 run._turn_text = []
                 run._last_turn_reply = ""
                 if fail_on_error_result:
-                    raise ModelStallError("Pi turn interrupted after tool execution; reconstruct the pending domain operation")
+                    raise ModelStallError("Compiler turn interrupted after tool execution; reconstruct the pending domain operation")
                 # An owner conversation remains usable, but must not replay a
                 # directive whose tool effects may already be on disk.
                 run._stall_retrying = False
@@ -5279,6 +5277,22 @@ async def _consume_turn_stream(
                 subtype = str(message_field(msg, "subtype", "unknown") or "unknown")[:80]
                 if fail_on_error_result:
                     raise ModelResultError(f"model result failed (subtype={subtype}, api_status={status})")
+                # The failed turn can already have edited files. Reconcile its
+                # scope now, without scheduling another model call or committing
+                # full-generation provenance. An unrelated owner turn must never
+                # inherit this operation's restoration snapshot.
+                try:
+                    await _post_turn_selfcheck(run, allow_repair=False)
+                finally:
+                    run._incr_pending = None
+                    run._full_compile_pending = False
+                    run._l1_repair_pending = False
+                    run._turn_page_hashes = None
+                    run._turn_format_guard = None
+                    run._turn_selfcheck_key = None
+                    run.apply_dispatch_nonce = ""
+                if getattr(run, "_sync_sent", None) is not None:
+                    await _sync_workspace(run, run._sync_sent)
                 note = _loc(run, "The model request failed; this session remains available for retry.",
                             "模型请求失败，此会话仍可重试。")
                 await run.emit({"type": "error", "code": "model_request_failed", "error": note,
@@ -5630,6 +5644,9 @@ def _test_max_turns() -> int:
 
 
 def _test_sdk_version() -> str:
+    if _engine_kind() == "claude_agent_sdk":
+        from claude_engine import sdk_version
+        return sdk_version()
     return pi_sdk_version()
 
 
@@ -5665,7 +5682,7 @@ def _test_consumer_fingerprint(
         # configured value as local tool calls inside one user turn.
         "turn_budget": max_turns if max_turns is not None else _test_max_turns(),
     }
-    if _engine_kind() == "pi_agent":
+    if _engine_kind() in {"pi_agent", "claude_agent_sdk"}:
         execution = pi_config.for_role("blue", session_kind="test")
         contract["execution"] = {"model": execution["model"], "thinking_level": execution.get("thinking_level", "off")}
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -6196,7 +6213,7 @@ def _build_test_client(run: "TestRun", sid: str):
     out so both the first connect and a post-stall rebuild build an identical
     client (same snapshot, same profile) — only the SDK session id differs."""
     effective_tools = _effective_test_allowed_tools(run.allowed_tools)
-    return PiAgentClient(
+    return create_agent_client(
         cwd=run.cwd, system_prompt=_prompt("test_role", run.locale), session_id=sid,
         model_config=pi_config.for_role("blue", model=run.consumer_model or _test_model(), session_kind="test"),
         tools=FileTools(run.cwd, effective_tools, _make_test_path_guard(Path(run.cwd), run.locale)).tools(),
@@ -6426,7 +6443,7 @@ async def recommend_test_question(parent: "CompileRun") -> dict:
         "Inspect raw/ and candidate/, then call submit_recommended_test exactly once. Do not merely print JSON.",
         "检查 raw/ 与 candidate/，然后仅调用一次 submit_recommended_test；不要只输出 JSON。",
     )
-    client = PiAgentClient(
+    client = create_agent_client(
         cwd=str(root), system_prompt=_prompt("recommend_test_role", parent.locale), session_id=str(uuid.uuid4()),
         model_config=pi_config.for_role("compile"),
         tools=[*FileTools(str(root), RECOMMENDATION_BUILTIN_TOOLS,
@@ -6626,7 +6643,7 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
         "\n\nTimebox retrieval. Once the necessary evidence is found, stop reading and call the submit tool; always reserve a turn for submission.",
         "\n\n请限制检索范围。找到足以回答的证据后立即停止读取并调用提交工具，务必为提交保留一轮。",
     )
-    client = PiAgentClient(
+    client = create_agent_client(
         cwd=str(root), system_prompt=_prompt("reference_assist_role", parent.locale), session_id=str(uuid.uuid4()),
         model_config=pi_config.for_role("blue"),
         tools=[*FileTools(str(root), REFERENCE_ASSIST_BUILTIN_TOOLS,
@@ -6712,12 +6729,18 @@ def _apply_session_config(body: dict) -> None:
     credential/tiers. If multi-run pods ever become real, carry llm/settings
     per-run (SDK client env) instead of mutating the process environment."""
     llm = body.get("llm")
-    if not isinstance(llm, dict) or str(llm.get("engine", "")).strip().lower() not in {"pi", "pi_agent"}:
+    if not isinstance(llm, dict) or str(llm.get("engine", "")).strip().lower() not in {"pi", "pi_agent", "claude", "claude_agent_sdk"}:
         if os.environ.get("KBC_SMOKE") == "1" and llm is None:
             return
-        raise ValueError("This compiler image requires a complete Pi Agent model configuration; legacy SDKs are retired")
-    pi_config.configure(llm.get("execution"))
-    os.environ["KBC_ENGINE"] = "pi_agent"
+        raise ValueError("This compiler image requires complete Claude Agent SDK or Pi Agent model configuration")
+    kind = {"pi": "pi_agent", "claude": "claude_agent_sdk"}.get(llm["engine"].strip().lower(), llm["engine"].strip().lower())
+    execution = llm.get("execution")
+    if kind == "claude_agent_sdk" and isinstance(execution, dict):
+        for config in (execution.get("roles") or {}).values():
+            if not isinstance(config, dict) or config.get("model", {}).get("api") != "anthropic-messages":
+                raise ValueError("Claude Agent SDK requires Anthropic models for every role")
+    pi_config.configure(execution)
+    os.environ["KBC_ENGINE"] = kind
     for prefix in ("ANTHROPIC", "OPENAI"):
         for suffix in ("BASE_URL", "MODEL", "API_KEY", "AUTH_TOKEN"):
             os.environ.pop(f"{prefix}_{suffix}", None)
@@ -6739,7 +6762,7 @@ def _apply_session_config(body: dict) -> None:
             k = str(key)
             if not k.startswith("KBC_") or value is None or k == "KBC_ENGINE":
                 continue  # whitelist: only the box's own knob vocabulary
-            if _engine_kind() == "pi_agent" and k.endswith("_MODEL"):
+            if k.endswith("_MODEL"):
                 continue  # Resolved execution roles own model selection.
             if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
                 continue  # ops kill switch outranks consumer config
@@ -7224,7 +7247,7 @@ async def handle_events(request: web.Request):
 
 async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS),
-                              "engine": "pi_agent"})
+                              "engine": _engine_kind()})
 
 
 def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | None = None) -> tuple[str, int]:

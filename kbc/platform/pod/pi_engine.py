@@ -8,42 +8,15 @@ import os
 import shutil
 import tempfile
 import uuid
-from contextlib import contextmanager
-from contextvars import ContextVar
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
 
 from agent_protocol import AgentEvent, AgentTransportError, EngineTool
+from execution_observation import ExecutionObserver, observe_sessions
 
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 MAX_QUEUED_BYTES = 2 * MAX_FRAME_BYTES
 _CLOSED = object()
-_OBSERVER: ContextVar = ContextVar("pi_execution_observer", default=None)
-
-
-def _observation_metadata(value):
-    # Providers may echo the entire request in an error, including prompt/tool
-    # contents. Keep it in the private owner channel, never diagnostic records.
-    if isinstance(value, dict):
-        return {key: _observation_metadata(item) for key, item in value.items()
-                if key != "error_message"}
-    if isinstance(value, list):
-        return [_observation_metadata(item) for item in value]
-    return value
-
-
-@contextmanager
-def observe_sessions(observer):
-    """Scope all child sessions, including concurrent verification agents, to
-    the caller's observation sink without process-global run routing."""
-    token = _OBSERVER.set(observer)
-    try:
-        yield
-    finally:
-        _OBSERVER.reset(token)
-
-
 def worker_command() -> list[str]:
     pod = Path(__file__).resolve().parent
     packaged = pod / "pi-worker" / "dist" / "kbc" / "pi-worker.js"
@@ -101,39 +74,10 @@ class PiAgentClient:
         self._replies: dict[str, asyncio.Task] = {}
         self.sdk_version: str | None = None
         self._last_usage: dict = {}
-        self._observer = _OBSERVER.get()
+        self._observations = ExecutionObserver(session_id, model_config)
 
     async def _observe(self, kind: str, data: dict) -> None:
-        if self._observer is None:
-            return
-        fields = {
-            "ready": ("sdk_version",),
-            "model_request": ("call", "model", "provider"),
-            "model_envelope": ("manifest",),
-            "assistant": ("llm_call", "stop_reason"),
-            "tool_start": ("call_id", "name"),
-            "tool_end": ("call_id", "name", "is_error"),
-            "result": ("outcome", "api_error_status", "model_calls", "tool_calls", "usage"),
-            "transport_error": (),
-        }.get(kind)
-        if fields is None:
-            return
-        metadata = _observation_metadata({key: data[key] for key in fields if key in data})
-        if kind == "ready" and self.config.get("agent_type"):
-            metadata["agent_type"] = self.config["agent_type"]
-        if kind == "result" and data.get("outcome") != "completed":
-            metadata["failure_code"] = "interrupted" if data.get("outcome") == "aborted" else "model_request_failed"
-        elif kind == "transport_error":
-            metadata["failure_code"] = "worker_transport_failed"
-        await self._observer({
-            "version": 1, "id": str(uuid.uuid4()), "session_id": self.session_id,
-            "turn_id": self._turn_id, "kind": kind,
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-            "role": self.config.get("role", "compile"),
-            "model_id": self.config["model"]["id"],
-            "provider": self.config["model"]["provider"],
-            "data": metadata,
-        })
+        await self._observations.emit(kind, data, self._turn_id)
 
     @property
     def returncode(self) -> int | None:

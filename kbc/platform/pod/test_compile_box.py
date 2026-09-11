@@ -401,8 +401,8 @@ class _FakeAgentClient:
 async def test_session_driver_conversational():
     """run_session connects WITHOUT a prompt (conversational by construction) and
     relays assistant text + turn_done; the session id is minted and announced."""
-    orig = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _FakeAgentClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("ps1", td, 1, instruction="authoring/CLAUDE.md present")
@@ -417,15 +417,15 @@ async def test_session_driver_conversational():
             turn = next(e for e in evs if e["type"] == "turn_done")
             assert turn.get("text") == "seed reply", turn
     finally:
-        compile_box.PiAgentClient = orig
+        compile_box.create_agent_client = orig
     print("✓ session driver is conversational (no kickoff, log + turn_done)")
 
 
 async def test_conversational_session():
     """P2.2: a conversational session (no kickoff) connects WITHOUT a prompt and
     waits — a later /message (query) drives the turn that relays log + turn_done."""
-    orig = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _FakeAgentClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("cs1", td, 1)
@@ -446,7 +446,7 @@ async def test_conversational_session():
             turn = next(e for e in evs if e["type"] == "turn_done")
             assert turn.get("text") == "reply: what should this KB cover?", turn
     finally:
-        compile_box.PiAgentClient = orig
+        compile_box.create_agent_client = orig
     print("✓ conversational session (P2.2)")
 
 
@@ -738,9 +738,9 @@ async def test_test_path_escape_guard():
 
 
 async def test_batch_planner_uses_compile_path_guard():
-    original = compile_box.PiAgentClient
+    original = compile_box.create_agent_client
     previous = os.environ.get("KBC_BATCH_PLANNER")
-    compile_box.PiAgentClient = _FakeAgentClient
+    compile_box.create_agent_client = _FakeAgentClient
     os.environ["KBC_BATCH_PLANNER"] = "model"
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -756,7 +756,7 @@ async def test_batch_planner_uses_compile_path_guard():
             except PermissionError:
                 pass
     finally:
-        compile_box.PiAgentClient = original
+        compile_box.create_agent_client = original
         if previous is None:
             os.environ.pop("KBC_BATCH_PLANNER", None)
         else:
@@ -849,8 +849,8 @@ def test_pack_candidates_symlink_confinement():
 
 
 async def test_test_session_driver_readonly():
-    original = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _FakeAgentClient
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as snap:
             run = compile_box.TestRun("t-drv", snap, parent_run_id="p1", snapshot_hash="h")
@@ -870,13 +870,13 @@ async def test_test_session_driver_readonly():
             assert {"session", "log", "turn_done"}.issubset(types)
             assert run.session_id
     finally:
-        compile_box.PiAgentClient = original
+        compile_box.create_agent_client = original
 
 
 
 async def test_test_session_driver_uses_captured_contract():
-    original = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _FakeAgentClient
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as snap:
             run = compile_box.TestRun("t-contract", snap, parent_run_id="p1", snapshot_hash="h")
@@ -895,7 +895,7 @@ async def test_test_session_driver_uses_captured_contract():
             except ValueError:
                 pass
     finally:
-        compile_box.PiAgentClient = original
+        compile_box.create_agent_client = original
 
 
 async def test_open_close_test_session_http():
@@ -903,8 +903,8 @@ async def test_open_close_test_session_http():
     session (200 + snapshot/consumer hashes + pages); unknown parent → 404;
     missing index.md → 400; concurrency cap → 429; close tears down
     (snapshot dir + registry entry gone)."""
-    orig = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _FakeAgentClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     snap_root = tempfile.mkdtemp()
@@ -990,7 +990,7 @@ async def test_open_close_test_session_http():
         assert r.status == 400, await r.text()
     finally:
         await client.close()
-        compile_box.PiAgentClient = orig
+        compile_box.create_agent_client = orig
         compile_box.RUNS.clear()
         compile_box.TEST_SESSIONS.clear()
         os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
@@ -1030,8 +1030,8 @@ async def test_open_test_session_idempotency():
     same tid/snapshot_hash/pages, flagged idempotent_replay, no new session, no new
     concurrency slot. A different key opens a new session. Teardown drops the key
     so a later same-key open starts fresh (never replays a dead tid)."""
-    orig = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _AliveFakeClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _AliveFakeClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -1084,7 +1084,7 @@ async def test_open_test_session_idempotency():
             await client.post(f"/test-session/{t}/close")
     finally:
         await client.close()
-        compile_box.PiAgentClient = orig
+        compile_box.create_agent_client = orig
         compile_box.RUNS.clear()
         compile_box.TEST_SESSIONS.clear()
         compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -1599,13 +1599,13 @@ async def _drive_rebuild_scenario(scenario):
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.PiAgentClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
     _RebuildFake.instances = []
     _RebuildFake.scenario = scenario
-    compile_box.PiAgentClient = _RebuildFake
+    compile_box.create_agent_client = _RebuildFake
     buf = io.StringIO()
     snap = tempfile.mkdtemp()
     run = compile_box.TestRun("t-rb", snap, parent_run_id="p-rb", snapshot_hash="h")
@@ -1645,7 +1645,7 @@ async def _drive_rebuild_scenario(scenario):
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.PiAgentClient) = saved
+         compile_box.create_agent_client) = saved
 
 
 async def test_test_session_rebuild_after_failed_interrupt():
@@ -1713,12 +1713,12 @@ async def test_test_session_immediate_retry_within_terminator_window():
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.PiAgentClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0  # wide: the retry always lands inside it
     _ImmediateRetryFake.instances = []
-    compile_box.PiAgentClient = _ImmediateRetryFake
+    compile_box.create_agent_client = _ImmediateRetryFake
     compile_box.TEST_SESSIONS.clear()
     buf = io.StringIO()
     snap = tempfile.mkdtemp()
@@ -1764,7 +1764,7 @@ async def test_test_session_immediate_retry_within_terminator_window():
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.PiAgentClient) = saved
+         compile_box.create_agent_client) = saved
     print("✓ test-session immediate retry inside the terminator window rebuilds; one timeout, answer shown")
 
 
@@ -1783,14 +1783,14 @@ async def test_test_session_retry_during_interrupt_in_flight():
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.PiAgentClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0
     _BlockedInterruptFake.instances = []
     _BlockedInterruptFake.interrupt_entered = asyncio.Event()
     _BlockedInterruptFake.interrupt_release = asyncio.Event()
-    compile_box.PiAgentClient = _BlockedInterruptFake
+    compile_box.create_agent_client = _BlockedInterruptFake
     compile_box.TEST_SESSIONS.clear()
     buf = io.StringIO()
     snap = tempfile.mkdtemp()
@@ -1836,7 +1836,7 @@ async def test_test_session_retry_during_interrupt_in_flight():
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.PiAgentClient) = saved
+         compile_box.create_agent_client) = saved
     print("✓ test-session retry during an in-flight interrupt rebuilds; one stall, answer shown")
 
 
@@ -1851,12 +1851,12 @@ async def test_test_session_rebuild_retry_after_failed_reconnect():
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
-             compile_box.PiAgentClient)
+             compile_box.create_agent_client)
     compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
     _RetryRebuildFake.instances = []
-    compile_box.PiAgentClient = _RetryRebuildFake
+    compile_box.create_agent_client = _RetryRebuildFake
     # keep the pre-fix failure mode fast: the old ordering would eat this timeout
     # on every retry instead of ever reaching the rebuild
     os.environ["KBC_CONNECT_TIMEOUT_SECS"] = "1"
@@ -1909,7 +1909,7 @@ async def test_test_session_rebuild_retry_after_failed_reconnect():
         (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
          compile_box._MODEL_WATCHDOG_POLL_S,
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
-         compile_box.PiAgentClient) = saved
+         compile_box.create_agent_client) = saved
     print("✓ test-session rebuild retry: a failed reconnect 503s fast and the next retry rebuilds")
 
 
@@ -1918,8 +1918,8 @@ async def test_open_test_session_idempotency_is_run_scoped():
     box two runs that mint the SAME client_request_id must each open their OWN session
     (no cross-run aliasing of tid/snapshot/fingerprint); the same key on the SAME run
     still replays. Teardown drops only the run-scoped key."""
-    orig = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _AliveFakeClient
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _AliveFakeClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -1957,7 +1957,7 @@ async def test_open_test_session_idempotency_is_run_scoped():
         assert compile_box.TEST_SESSION_IDEMPOTENCY == {}, compile_box.TEST_SESSION_IDEMPOTENCY
     finally:
         await client.close()
-        compile_box.PiAgentClient = orig
+        compile_box.create_agent_client = orig
         compile_box.RUNS.clear()
         compile_box.TEST_SESSIONS.clear()
         compile_box.TEST_SESSION_IDEMPOTENCY.clear()
@@ -2211,7 +2211,7 @@ async def test_reference_assist_http_and_validation():
 
 
 async def test_reference_assist_driver_is_fast_isolated_and_structured():
-    original_client = compile_box.PiAgentClient
+    original_client = compile_box.create_agent_client
     previous_turns = os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS")
     previous_light_model = os.environ.get("KBC_PK_BLUE_MODEL")
     seen = {}
@@ -2243,7 +2243,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
         async def disconnect(self):
             pass
 
-    compile_box.PiAgentClient = SubmittingClient
+    compile_box.create_agent_client = SubmittingClient
     os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
     os.environ["KBC_PK_BLUE_MODEL"] = "claude-light-admin-config"
     try:
@@ -2267,7 +2267,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
             assert '"question": "What is the retry limit?"' in seen["directive"]
             assert "2-3 independently usable candidates" in seen["directive"]
     finally:
-        compile_box.PiAgentClient = original_client
+        compile_box.create_agent_client = original_client
         if previous_turns is None:
             os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
         else:
@@ -2286,7 +2286,7 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
     by invoking the exact SDK MCP tool registered in its options. This keeps the
     test sensitive to both option drift and callback wiring.
     """
-    original_client = compile_box.PiAgentClient
+    original_client = compile_box.create_agent_client
     previous_turns = os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS")
     seen = {}
 
@@ -2318,7 +2318,7 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
         async def disconnect(self):
             seen["disconnected"] = True
 
-    compile_box.PiAgentClient = SubmittingClient
+    compile_box.create_agent_client = SubmittingClient
     os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = "20"
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -2345,7 +2345,7 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
             assert opts.model_config["role"] == "compile"
             assert seen["connected"] and seen["disconnected"]
     finally:
-        compile_box.PiAgentClient = original_client
+        compile_box.create_agent_client = original_client
         if previous_turns is None:
             os.environ.pop("KBC_TEST_RECOMMEND_MAX_TURNS", None)
         else:
@@ -2356,7 +2356,7 @@ async def test_recommendation_driver_is_minimal_and_submits_through_registered_m
 async def test_recommendation_driver_reports_max_turn_exhaustion():
     """A reviewer that spends its bounded turn budget without submitting must
     surface a distinct diagnostic instead of the generic no-result error."""
-    original_client = compile_box.PiAgentClient
+    original_client = compile_box.create_agent_client
 
     class ExhaustedClient:
         def __init__(self, **kwargs):
@@ -2374,7 +2374,7 @@ async def test_recommendation_driver_reports_max_turn_exhaustion():
         async def disconnect(self):
             pass
 
-    compile_box.PiAgentClient = ExhaustedClient
+    compile_box.create_agent_client = ExhaustedClient
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2390,7 +2390,7 @@ async def test_recommendation_driver_reports_max_turn_exhaustion():
             except ValueError as exc:
                 assert "turn budget" in str(exc) and "submitting" in str(exc), exc
     finally:
-        compile_box.PiAgentClient = original_client
+        compile_box.create_agent_client = original_client
     print("✓ recommendation driver: max-turn exhaustion is explicit")
 
 
@@ -2723,8 +2723,8 @@ async def test_a_session_records_what_it_actually_spent():
 
 def test_compile_session_denies_subagents():
     """Only the parent compiler sees Raw and owns its accounting ledger."""
-    original = compile_box.PiAgentClient
-    compile_box.PiAgentClient = _FakeAgentClient
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("deny", td, 1)
@@ -2733,7 +2733,7 @@ def test_compile_session_denies_subagents():
             assert not names.intersection({"Agent", "Task", "WebFetch", "WebSearch", "Bash"})
             assert names == set(compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS)
     finally:
-        compile_box.PiAgentClient = original
+        compile_box.create_agent_client = original
 
 
 
@@ -5310,8 +5310,8 @@ async def test_batch_orchestrator_review_fixes():
             async def disconnect(self):
                 pass
 
-        real_client = compile_box.PiAgentClient
-        compile_box.PiAgentClient = _ErrorResultClient
+        real_client = compile_box.create_agent_client
+        compile_box.create_agent_client = _ErrorResultClient
         try:
             with tempfile.TemporaryDirectory() as td:
                 wd = Path(td)
@@ -5326,7 +5326,7 @@ async def test_batch_orchestrator_review_fixes():
                            for e in evs), evs
                 assert sum(e["type"] == "turn_done" for e in evs) == 1, evs
         finally:
-            compile_box.PiAgentClient = real_client
+            compile_box.create_agent_client = real_client
 
         # (f) is_error=False is necessary but not sufficient: a provider/SDK
         # regression may return an empty successful result. Every assigned
@@ -5335,7 +5335,7 @@ async def test_batch_orchestrator_review_fixes():
             async def receive_messages(self):
                 yield result_event()
 
-        compile_box.PiAgentClient = _NoopResultClient
+        compile_box.create_agent_client = _NoopResultClient
         try:
             with tempfile.TemporaryDirectory() as td:
                 wd = Path(td)
@@ -5349,7 +5349,7 @@ async def test_batch_orchestrator_review_fixes():
                 assert any(e["type"] == "error" and "BatchOutputError" in e.get("error", "")
                            for e in evs), evs
         finally:
-            compile_box.PiAgentClient = real_client
+            compile_box.create_agent_client = real_client
     finally:
         compile_box._drive_batch_session = real_drive
         compile_box._unaccounted_batch_sources = real_accounted

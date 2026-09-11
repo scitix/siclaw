@@ -12,21 +12,16 @@ slicing, plan and candidate artifacts, contradiction tickets, deterministic lint
 red-blue checks, media verification, artifact acknowledgements and recovery.
 The migration changes execution without changing these product contracts.
 
-The control plane can manage compilation as a system Agent Type named
-`knowledge_compiler`. It supplies a published release identity and the
-`kb-compile` harness contract version 1, together with the resolved execution
-configuration. Compiler role instructions are appended to the harness's own
-instructions for compile sessions; other model roles keep their dedicated
-instructions. This does not create an ordinary conversational Agent instance.
+The compiler has independent capability settings: Claude Agent SDK or Pi, primary
+and light models, and existing quality switches. Saving applies directly to new
+attempts. It does not create an Agent Type, published release, or approval flow.
+Both engines use the same host-owned tools, domain orchestration and metadata
+observations. Claude supports Anthropic roles; Pi also supports OpenAI Chat
+Completions and Responses. Each role can use its own endpoint and credential.
 
-The type's primary model serves compile/judge/compare, and its optional fast
-model serves blue/transcribe. Organization overrides are resolved by the control
-plane before execution. KBC receives complete roles and never queries a mutable
-type or model catalogue. Historical Pi attempts without a type identity remain
-supported; a supplied unknown harness version is rejected before a worker starts.
-Type-bearing setup payloads use execution configuration version 2, which older
-Pi images reject instead of silently ignoring managed instructions. Version 1
-remains the compatibility contract for previously frozen Pi attempts.
+Historical version 2 Pi snapshots may contain a frozen compiler type identity
+and instructions. Recovery continues to decode that payload without looking up
+mutable type/release state. New attempts use independent version 1 snapshots.
 
 ## Data flow
 
@@ -59,11 +54,11 @@ Source budgets are capped to the configured window using the planner's existing
 and reserving output capacity. Models without enough remaining source capacity
 are rejected. Planning estimates remain distinct from measured Pi usage.
 
-New configuration writes select Pi. Historical Claude/Codex rows are readable,
-and the settings UI requires an explicit Pi save before a new or rebuilt compiler
-uses them. A saved Pi attempt can recover after catalog edits or deletion; only
-its credential references are resolved again. The emergency boot-time PK stop
-remains an operational override.
+Configuration writes preserve the selected Claude or Pi engine. Continuation
+attempts atomically inherit the original snapshot, including engine, resolved
+roles and compiler settings. Catalog edits or deletion cannot change the old
+plan; only referenced credentials are resolved again for rotation. The emergency
+boot-time PK stop remains an operational override.
 
 ## Failure and recovery
 
@@ -85,7 +80,7 @@ requested nonempty result arrays within the existing one-retry budget.
 A running box with its original session is reused across Runtime replacement.
 A container restart can leave an old-image Pod alive with zero sessions. After
 validating the new execution configuration and pinned source revision, Runtime
-replaces that empty legacy box and restores the durable workspace. Unknown health
+replaces that empty incompatible box and restores the durable workspace. Unknown health
 or active test sessions prevent deletion. Local shared endpoints do not use the
 single-run Pod health shortcut.
 
@@ -127,8 +122,7 @@ paired control-plane API/Web change with execution/observation table migrations 
 Siclaw Runtime/AgentBox/KBC images from exact commits.
 
 Deploy the compatible control plane and Runtime before enabling new Pi compilation.
-Update Runtime and its configured KBC image together; the new image cannot consume
-legacy session payloads. Configure and save Pi model roles through knowledge
+Update Runtime and its configured KBC image together; new sessions require a complete resolved execution payload. Configure and save the selected engine and model roles through knowledge
 settings, then start an acceptance run. Preserve running old-image boxes so they
 can finish through the unchanged event/artifact protocol.
 
@@ -139,3 +133,10 @@ ordinary-agent upgrade test alone does not establish KBC acceptance.
 Before rollback, preserve or finish active Pi sessions. Restoring an old control
 plane/box combination cannot execute a stored Pi snapshot. Database migrations
 are additive; do not delete execution or observation records as a rollback step.
+
+Compiler context protection preserves mixed text/image tool results intact. It
+fails explicitly if the estimated input exceeds the reserved context budget;
+it never silently removes PDF images to satisfy the conversational tool-result
+share. A failed owner turn reconciles its scoped edits and clears pending scope
+before returning to idle, without starting automatic repair or marking a full
+compilation complete.

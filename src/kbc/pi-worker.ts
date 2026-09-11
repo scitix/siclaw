@@ -9,6 +9,8 @@ import {
 import { createPiExecutionSession } from "../core/pi-execution.js";
 import type { LlmCallEnvelope } from "../core/llm-call-recorder.js";
 import { withResolvedModelCompat } from "../core/model-compat.js";
+import { createGuardRegistry } from "../core/guard-pipeline.js";
+import { estimateMessageChars, PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE } from "../core/tool-result-context-guard.js";
 import {
   parseWorkerInput, PI_WORKER_MAX_FRAME_BYTES,
   type WorkerInit, type WorkerInput,
@@ -145,9 +147,20 @@ export class PiCompilerWorker {
         }
       },
     }));
+    const guards = createGuardRegistry(resolved.contextWindow);
+    // Host tools already paginate and bound their output. The conversational
+    // guard converts oversized mixed-media results into text, which silently
+    // removes scanned PDF evidence. Compilation must preserve its evidence or
+    // fail explicitly so the domain can rebuild with a smaller source batch.
+    guards.context = [{ name: "compiler-context-budget", handler: messages => {
+      const budget = (resolved.contextWindow - resolved.maxTokens) * 0.75 * 4;
+      const estimated = config.system_prompt.length + messages.reduce((sum, message) => sum + estimateMessageChars(message), 0);
+      if (estimated > budget) throw new Error(PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE);
+    } }];
     this.execution = await createPiExecutionSession({
       services, sessionManager: SessionManager.create(config.cwd, path.join(config.state_dir, "sessions")),
       model: resolved, thinkingLevel: config.thinking_level, customTools: tools,
+      guards,
       onModelEnvelope: manifest => this.emit("model_envelope", { manifest }),
     });
     const { session } = this.execution;

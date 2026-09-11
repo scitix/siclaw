@@ -116,7 +116,7 @@ def parse_json_lenient(text: str):
 
 
 
-class PiEngine:
+class CompilerReadonlyEngine:
     """Ephemeral Pi sessions with the same guarded host tools as compilation."""
 
     async def run_readonly_agent(
@@ -124,14 +124,13 @@ class PiEngine:
         model: str, effort: str | None = None, role: str | None = None,
         allowed_read_roots: list[str], timeout_secs: float,
     ) -> str:
-        from pi_engine import PiAgentClient
         from pi_file_tools import FileTools
         import pi_config
 
         roots = [Path(value).resolve() for value in allowed_read_roots] or [Path(cwd).resolve()]
         if Path(cwd).resolve() not in roots:
             raise ValueError("Read-only session cwd must be a declared read root")
-        client = PiAgentClient(
+        client = create_agent_client(
             cwd=cwd, system_prompt=system_prompt, session_id=str(uuid.uuid4()),
             model_config=(pi_config.for_role(role, model=model, effort=effort) if role
                           else pi_config.for_model(model, effort=effort)),
@@ -150,14 +149,28 @@ class PiEngine:
                         parts = [block["text"] for block in event.data.get("content", [])
                                  if block.get("type") == "text" and block.get("text", "").strip()]
                     elif event.kind == "result" and event.data["outcome"] != "completed":
-                        raise RuntimeError(event.data.get("error") or "Read-only Pi execution did not complete")
+                        raise RuntimeError(event.data.get("error") or "Read-only compiler execution did not complete")
         finally:
             await client.disconnect()
         return "\n\n".join(parts)
 
 
-def selected_readonly_engine() -> ReadonlyAgentEngine:
+def engine_kind() -> str:
     kind = os.environ.get("KBC_ENGINE", "pi_agent").strip().lower()
-    if kind not in {"pi", "pi_agent"}:
-        raise ValueError("Legacy compiler SDKs are retired; configure Pi Agent")
-    return PiEngine()
+    kind = {"pi": "pi_agent", "claude": "claude_agent_sdk"}.get(kind, kind)
+    if kind not in {"pi_agent", "claude_agent_sdk"}:
+        raise ValueError(f"Unsupported compiler engine {kind!r}; select Claude Agent SDK or Pi Agent")
+    return kind
+
+
+def create_agent_client(**kwargs):
+    if engine_kind() == "claude_agent_sdk":
+        from claude_engine import ClaudeAgentClient
+        return ClaudeAgentClient(**kwargs)
+    from pi_engine import PiAgentClient
+    return PiAgentClient(**kwargs)
+
+
+def selected_readonly_engine() -> ReadonlyAgentEngine:
+    engine_kind()
+    return CompilerReadonlyEngine()
