@@ -1,5 +1,55 @@
 # Script sandbox validation — 2026-09-11
 
+## Compact contract: deployed model acceptance
+
+Runtime and AgentBox were rebuilt from `120271d3` and deployed by immutable
+digest. The runner SDK and companion API were unchanged and retained their
+previously validated images. Six authenticated Web requests through the
+configured model each completed with one script, without supplying script code:
+
+- The model read the actual 60-second default, 120-second maximum, 64-call and
+  131,072-byte budgets from the tool contract. Python used `input_data()` and
+  verified CSV/scratch create, read, update and delete; the total changed from
+  36 to 40 as requested.
+- One ordinary `node_exec` validated a representative node. Its result was
+  passed into one Python script, which queried only the other four nodes.
+  All five values were 4096; the script took 16,367 ms with four SDK calls.
+  Managed diagnostic Jobs were created and reclaimed; node configuration was
+  not modified.
+- Cross-run files were absent, new image-root files failed with `EROFS`, and
+  IPv4/IPv6/Unix socket creation failed with `EPERM`. Requesting isolation off
+  could not override the administrator's requirement.
+- Python processed a 141,497-byte saved command envelope. Shell saved the same
+  SDK envelope and processed 134,405 bytes of decoded Kubernetes JSON. Both
+  returned compact five-node summaries, with no raw dataset in the answer.
+- Undeclared-cluster, API-server override and client-only `create` dry-run
+  attempts were denied; normal reading succeeded. Runtime audit independently
+  recorded the three denials and successful control.
+- Python SDK `pod_exec` read the dedicated test container's OS information.
+
+All six results matched their complete persisted history records. The six
+business cases used 11 SDK calls; cached-image startup with no prewarmed runner
+was 1,151–1,669 ms, median 1,255.5 ms. These are samples, not latency guarantees.
+A separate 20-second probe supplied a live Pod specification: non-root, read-only
+root, no privilege escalation, all capabilities dropped, no environment or SA
+token mounts, and only two memory-backed work volumes. The original sampler had
+exited on a kubectl timeout; it was fixed to retry, and this additional sample
+is not presented as a specification capture of every earlier run.
+
+The first image build inherited a private-file umask in its source checkout,
+making the command-policy configuration unreadable to the AgentBox user. The
+request failed before script execution. The deployment was rolled back, source
+checkout permissions corrected, and an offline non-root image check added before
+rebuilding/pushing. The six successful cases above use the corrected images;
+application command policy and container isolation were not loosened.
+
+Runner and diagnostic resources were reclaimed and temporary test identities
+cleaned up. Runtime's existing image reconciler also drained and replaced the
+ordinary AgentBox replicas; they are ready on the new image, with Agent
+configuration preserved. Other service Pods were preserved. All six CI checks
+passed for the code revision. Hosted E2B and live host/MCP integration remain
+outside this round; PR remains draft.
+
 ## Compact planning contract and complete MCP inventory
 
 The model contract now recommends reusing a successful sample or validating one
@@ -23,9 +73,9 @@ tokens. Counts exclude provider framing and other conversation/tool content;
 no MCP schemas are duplicated in this definition.
 
 Verification: 7,379 tests passed with two existing skips across 356 files; main
-and AgentBox TypeScript checks and backend build passed. This contract update
-has not been redeployed or rechecked with a live model; the fresh-image results
-below remain tied to `b01205a6`. No runner SDK or companion API code changed.
+and AgentBox TypeScript checks and backend build passed. Deployment acceptance
+for this update is recorded above. The earlier review-fix results below remain
+tied to `b01205a6`. No runner SDK or companion API code changed.
 
 ## Review fixes: fresh-image model acceptance
 
