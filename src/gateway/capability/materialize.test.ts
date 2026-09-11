@@ -65,10 +65,10 @@ describe("materializeCapabilityInputs", () => {
     expect(client.postJson).not.toHaveBeenCalled();
   });
 
-  it("a restarted container with no live session must rehydrate the pinned attempt", async () => {
+  it.each(["pi_agent", "claude_agent_sdk"])("a restarted %s container with no live session must rehydrate the pinned attempt", async engine => {
     const { client, backend, posts } = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned" } });
     const result = await materializeCapabilityInputs({
-      client: { ...client, getJson: vi.fn().mockResolvedValue({ runs: 0, engine: "pi_agent" }) }, backend,
+      client: { ...client, getJson: vi.fn().mockResolvedValue({ runs: 0, engine }) }, backend,
       runId: "r1", inputRevision: "pinned", reuseExisting: true,
     });
     expect(result.reattached).not.toBe(true);
@@ -76,9 +76,9 @@ describe("materializeCapabilityInputs", () => {
     expect(backend.request).toHaveBeenCalledWith(CAPABILITY_FETCH_INPUT, { run_id: "r1", input_revision: "pinned" });
   });
 
-  it("replaces an empty restarted legacy box only after configuration resolves", async () => {
+  it.each(["pi_agent", "claude_agent_sdk"])("replaces an empty restarted legacy box only after %s configuration resolves", async engine => {
     const old = { getJson: vi.fn().mockResolvedValue({ runs: 0, test_sessions: 0 }), postJson: vi.fn() };
-    const fresh = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned", llm: { engine: "pi_agent" } },
+    const fresh = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned", llm: { engine } },
       workspace: { bundle_base64: "V1M=" } });
     const replace = vi.fn(async () => {
       expect(fresh.backend.request).toHaveBeenCalledTimes(1);
@@ -90,10 +90,19 @@ describe("materializeCapabilityInputs", () => {
     expect(old.postJson).not.toHaveBeenCalled();
     expect(fresh.posts.map(p => p.path)).toEqual(["/sources", "/authoring"]);
 
-    fresh.backend.request.mockRejectedValue(new Error("configure Pi first"));
     replace.mockClear();
     await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
-      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("configure Pi first");
+      inputRevision: "different", reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("input revision mismatch");
+    expect(replace).not.toHaveBeenCalled();
+    old.getJson.mockResolvedValue({ runs: 0, test_sessions: 1 });
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("active test sessions");
+    expect(replace).not.toHaveBeenCalled();
+
+    old.getJson.mockResolvedValue({ runs: 0, test_sessions: 0 });
+    fresh.backend.request.mockRejectedValue(new Error("configure the engine first"));
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("configure the engine first");
     expect(replace).not.toHaveBeenCalled();
   });
 

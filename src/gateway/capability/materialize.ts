@@ -186,7 +186,7 @@ export async function materializeCapabilityInputs(opts: {
     const health = await client.getJson<{ runs?: number; test_sessions?: number; engine?: string }>("/health");
     if (health.runs === 1) return { reattached: true, inputRevision };
     if (health.runs !== 0) throw new CapabilityMaterializationError("source-fetch", new Error("Invalid single-run box health response"));
-    emptyLegacyBox = health.engine !== "pi_agent";
+    emptyLegacyBox = health.engine !== "pi_agent" && health.engine !== "claude_agent_sdk";
     if (emptyLegacyBox && health.test_sessions !== 0) {
       throw new CapabilityMaterializationError("source-fetch", new Error("Cannot replace a legacy box with unknown or active test sessions"));
     }
@@ -227,13 +227,13 @@ export async function materializeCapabilityInputs(opts: {
   if (src?.llm && typeof src.llm === "object") result.llm = src.llm;
   if (src?.settings && typeof src.settings === "object") result.settings = src.settings;
 
-  if (emptyLegacyBox && src?.llm?.engine === "pi_agent") {
+  if (emptyLegacyBox && (src?.llm?.engine === "pi_agent" || src?.llm?.engine === "claude_agent_sdk")) {
     if (!opts.replaceEmptyLegacyBox) {
-      throw new CapabilityMaterializationError("source-install", new Error("The empty legacy compiler must be rebuilt with the Pi image"));
+      throw new CapabilityMaterializationError("source-install", new Error("The empty legacy compiler must be rebuilt with the current compiler image"));
     }
     // No active session or unacknowledged producer remains. Configuration is
     // valid and the durable source revision has been checked before deletion.
-    // Rehydrate into the replacement, never send a Pi payload to an old SDK.
+    // Rehydrate into the replacement, never send resolved roles to an old SDK.
     client = await opts.replaceEmptyLegacyBox();
   }
 

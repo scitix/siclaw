@@ -47,7 +47,9 @@ for path in Path("/app").rglob("*"):
 assert not unreadable, "unreadable application files:\n" + "\n".join(unreadable)
 import compile_box  # noqa: F401
 from importlib.util import find_spec
-assert find_spec("claude_agent_sdk") is None
+import claude_agent_sdk  # noqa: F401
+from claude_engine import sdk_version as claude_sdk_version
+assert claude_sdk_version() == "0.2.110"
 assert find_spec("codex") is None
 import asyncio
 import tempfile
