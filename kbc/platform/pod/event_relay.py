@@ -85,6 +85,8 @@ class EventRelay:
                     await self._write(response, event)
                     while not self._ack.done():
                         try:
+                            # Takeover cancels this handler, not the persistence
+                            # receipt the next handler must continue waiting for.
                             await asyncio.wait_for(asyncio.shield(self._ack), 25)
                         except TimeoutError:
                             await response.write(b": heartbeat\n\n")

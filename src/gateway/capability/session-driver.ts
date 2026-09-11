@@ -21,12 +21,15 @@ import type {
   CapabilityEventType,
   CapabilityPersistArtifactsRequest,
   CapabilityPersistTurnRequest,
+  CapabilityLifecycleStatus,
+  CapabilityRunFailure,
 } from "./contract.js";
 import {
   CAPABILITY_EVENT,
   CAPABILITY_PERSIST_ARTIFACTS,
   CAPABILITY_PERSIST_TURN,
   isTerminalCapabilityStatus,
+  isRelayEventId,
 } from "./contract.js";
 import { structuredBoxFailure } from "./failure.js";
 import { capabilityRelayReconnectsTotal } from "./capability-metrics.js";
@@ -107,6 +110,10 @@ export const defaultStreamReconnectPolicy: StreamReconnectPolicy = {
   },
 };
 
+// Allow the control-plane WS reconnect (up to 30s backoff) to recover during
+// event persistence. This deadline never resets on retries or heartbeat traffic.
+const EVENT_PERSIST_RETRY_MS = 120_000;
+
 /**
  * Relay the box event stream over the capability protocol until the box closes
  * the stream (`end`). Returns when the stream ends. Errors propagate to the
@@ -153,23 +160,14 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           try {
             if ((replaySupported || replay) && !acknowledgedStream) throw new Error("box cannot safely replay lifecycle events");
             if (acknowledgedStream && ["syncArtifacts", "turn_done", "error", "done", "end"].includes(event.type)) {
-              if (typeof event.event_id !== "string" || !/^[a-f0-9]{32}:[1-9][0-9]{0,15}$/.test(event.event_id)) {
+              if (!isRelayEventId(event.event_id)) {
                 throw new Error("box omitted a valid durable event id");
               }
               if (event.event_id !== lastCommittedEvent && event.event_id !== manager.get(runId)?.persistedRelayEventId) {
-                // The consumer already supports adjacent persistTurn retries.
-                // No later frame is consumed until this event and its state commit.
-                for (let retry = 0; ; retry++) {
-                  try {
-                    if (manager.get(runId)?.persistedRelayEventId === event.event_id) break;
-                    await relayBoxEvent(event);
-                    await manager.commitRelayEvent(runId, event.event_id);
-                    break;
-                  } catch (err) {
-                    if (retry >= 3) throw err;
-                    await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** retry));
-                  }
-                }
+                // Each phase retries only its own write. Never repeat live
+                // notices or an already committed artifact transaction.
+                await relayBoxEvent(event);
+                await commitEvent(event);
               }
               lastCommittedEvent = event.event_id;
             } else {
@@ -231,6 +229,33 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     return !rec || isTerminalCapabilityStatus(rec.status);
   }
 
+  async function persistEventStep(operation: () => Promise<void>, allowTerminal = false): Promise<void> {
+    const deadline = Date.now() + EVENT_PERSIST_RETRY_MS;
+    let delayMs = 250;
+    for (;;) {
+      try {
+        await operation();
+        return;
+      } catch (error) {
+        const rec = manager.get(runId);
+        if (!rec || (!allowTerminal && isTerminalCapabilityStatus(rec.status)) || Date.now() + delayMs >= deadline) throw error;
+        console.warn(`[capability] run=${runId} event persistence failed; retrying in ${delayMs}ms`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        // Cancellation can land during backoff. Do not begin another write for
+        // a cancelled run; terminal event writes keep their original outcome.
+        if (Date.now() >= deadline || (!allowTerminal && runSettled())) throw error;
+        delayMs = Math.min(delayMs * 2, 5_000);
+      }
+    }
+  }
+
+  async function commitEvent(evt: BoxEvent, status?: CapabilityLifecycleStatus, failure?: CapabilityRunFailure): Promise<void> {
+    await persistEventStep(
+      () => manager.commitRelayEvent(runId, evt.event_id!, status, failure),
+      status === "done" || status === "failed",
+    );
+  }
+
   async function relayBoxEvent(evt: BoxEvent): Promise<void> {
     // ANY box event means the box is alive → bump activity so the watchdog never
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
@@ -266,15 +291,20 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // this is the generalization of compile.assistantTurn. The run is now idle
         // (awaiting the next turn) — NOT terminal.
         emit("turn", { text: evt.text ?? "" });
-        try {
+        {
           const turn: CapabilityPersistTurnRequest = { run_id: runId, text: evt.text ?? "" };
-          await frontendClient.request(CAPABILITY_PERSIST_TURN, turn);
-        } catch (err) {
-          if (evt.event_id) throw err;
-          console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
+          if (evt.event_id) {
+            await persistEventStep(() => frontendClient.request(CAPABILITY_PERSIST_TURN, turn));
+            await commitEvent(evt, "idle");
+          } else {
+            try {
+              await frontendClient.request(CAPABILITY_PERSIST_TURN, turn);
+            } catch (err) {
+              console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
+            }
+            await manager.setStatus(runId, "idle");
+          }
         }
-        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "idle");
-        else await manager.setStatus(runId, "idle");
         break;
       case "syncArtifacts":
         // One box sync event is one consumer transaction. Keep retrying the
@@ -365,7 +395,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
       case "done":
         emit("lifecycle", { status: "done" });
-        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "done");
+        if (evt.event_id) await commitEvent(evt, "done");
         else await manager.endRun(runId, "done");
         break;
       case "error":
@@ -379,7 +409,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // Always persist a structured failure. Bare box errors (error string
         // only, no code/stage) used to call endRun without a failure object, so
         // the consumer checkpoint and auto-resume detail were empty.
-        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "failed", structuredBoxFailure(evt));
+        if (evt.event_id) await commitEvent(evt, "failed", structuredBoxFailure(evt));
         else await manager.endRun(runId, "failed", structuredBoxFailure(evt));
         break;
       case "end": {
@@ -397,7 +427,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         if (rec && !isTerminalCapabilityStatus(rec.status)) {
           emit("lifecycle", { status: "done" });
         }
-        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "done");
+        if (evt.event_id) await commitEvent(evt, "done");
         else await manager.endRun(runId, "done");
         break;
       }

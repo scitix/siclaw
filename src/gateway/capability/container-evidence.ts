@@ -1,7 +1,16 @@
 import * as k8s from "@kubernetes/client-node";
 import { createHash } from "node:crypto";
 
-export const CAPABILITY_OBSERVE_CONTAINER = "capability.observeContainer";
+interface PendingObservation {
+  observation: ContainerObservation;
+  declined: boolean;
+  declinedRetries: number;
+  replay: boolean;
+}
+
+// A false receipt can mean either a foreign run or a legacy run awaiting claim.
+// Allow three reconnect/reconcile opportunities without retaining it forever.
+const MAX_DECLINED_REPLAYS = 3;
 
 export interface ContainerTermination {
   reason: string;
@@ -76,8 +85,8 @@ export function containerObservation(pod: k8s.V1Pod, source: ContainerObservatio
 
 /** A bounded queue keeps a watch burst from creating unbounded pending RPCs. */
 export class ContainerEvidenceQueue {
-  private pending = new Map<string, ContainerObservation>();
-  private failed = new Map<string, ContainerObservation>();
+  private pending = new Map<string, PendingObservation>();
+  private failed = new Map<string, PendingObservation>();
   private acknowledged = new Map<string, true>();
   private draining?: Promise<void>;
   private closed = false;
@@ -89,16 +98,28 @@ export class ContainerEvidenceQueue {
     if (this.closed) return;
     const key = createHash("sha256").update(JSON.stringify(observation)).digest("hex");
     if (this.acknowledged.has(key) || this.pending.has(key) || this.inFlight === key) return;
-    console.info("[capability-container]", JSON.stringify(observation));
+    const previous = this.failed.get(key);
+    if (!previous) console.info("[capability-container]", JSON.stringify(observation));
+    this.failed.delete(key);
+    this.enqueue(key, { observation, declined: previous?.declined ?? false,
+      declinedRetries: previous?.declinedRetries ?? 0, replay: false });
+  }
+
+  private enqueue(key: string, entry: PendingObservation) {
+    if (this.closed || this.acknowledged.has(key) || this.pending.has(key) || this.inFlight === key) return;
     if (this.pending.size >= 256) {
+      // Old replay traffic must not displace newly observed exit evidence.
+      if (entry.replay) {
+        this.retainForReconnect(key, entry);
+        return;
+      }
       // This is evidence loss, not a successful observation. Keep a log that
       // central logging can retain even while the consumer store is overloaded.
-      const oldest = this.pending.keys().next().value!;
-      console.error("[capability-container] queue full; evicting oldest snapshot", this.pending.get(oldest)!.run_id);
+      const oldest = [...this.pending].find(([, value]) => value.declined)?.[0] ?? this.pending.keys().next().value!;
+      console.error("[capability-container] queue full; evicting oldest snapshot", this.pending.get(oldest)!.observation.run_id);
       this.pending.delete(oldest);
     }
-    this.failed.delete(key);
-    this.pending.set(key, observation);
+    this.pending.set(key, entry);
     this.pump();
   }
 
@@ -113,20 +134,30 @@ export class ContainerEvidenceQueue {
 
   private async drain() {
     while (this.pending.size > 0) {
-      const [key, observation] = this.pending.entries().next().value!;
+      const [key, entry] = this.pending.entries().next().value!;
+      const { observation } = entry;
       this.pending.delete(key);
       this.inFlight = key;
       try {
         const result = await this.send(observation);
-        // Another Runtime may own this run, or its initial write may still be
-        // in flight. Only an explicit stored acknowledgement enables dedupe.
-        if ((result as { observed?: boolean } | null)?.observed === true) this.acknowledged.set(key, true);
-        else this.retainForReconnect(key, observation);
+        const observed = (result as { observed?: boolean } | null)?.observed;
+        if (observed === true) this.acknowledged.set(key, true);
+        else {
+          entry.declined = observed === false;
+          // A watch burst is not three recovery opportunities. Only explicit
+          // declines after reconnect/reconcile consume this snapshot's budget.
+          if (entry.declined && entry.replay) entry.declinedRetries++;
+          if (entry.declinedRetries >= MAX_DECLINED_REPLAYS) {
+            console.error("[capability-container] receiver declined replay budget; retained in logs", observation.run_id);
+          } else this.retainForReconnect(key, entry);
+        }
         if (this.acknowledged.size > 1024) this.acknowledged.delete(this.acknowledged.keys().next().value!);
       } catch (error) {
         // Diagnostic transport is a top-level boundary, independent of running
         // work. Failed observations are not deduplicated on a later relist.
-        this.retainForReconnect(key, observation);
+        // Transport errors do not consume the explicit-decline budget.
+        entry.declined = false;
+        this.retainForReconnect(key, entry);
         console.error("[capability-container] persistence failed", observation.run_id, error);
       } finally {
         this.inFlight = undefined;
@@ -134,19 +165,22 @@ export class ContainerEvidenceQueue {
     }
   }
 
-  private retainForReconnect(key: string, observation: ContainerObservation) {
+  private retainForReconnect(key: string, entry: PendingObservation) {
     if (this.closed) return;
-    if (this.failed.size >= 256) {
-      console.error("[capability-container] reconnect backlog full", observation.run_id);
-      this.failed.delete(this.failed.keys().next().value!);
+    if (!this.failed.has(key) && this.failed.size >= 256) {
+      const declined = [...this.failed].find(([, value]) => value.declined)?.[0];
+      console.error("[capability-container] reconnect backlog full", entry.observation.run_id);
+      // Namespace-wide foreign receipts must not evict transport-failed work.
+      if (entry.declined && !declined) return;
+      this.failed.delete(declined ?? this.failed.keys().next().value!);
     }
-    this.failed.set(key, observation);
+    this.failed.set(key, entry);
   }
 
   retry() {
-    const snapshots = [...this.failed.values()];
+    const snapshots = [...this.failed].sort((a, b) => Number(a[1].declined) - Number(b[1].declined));
     this.failed.clear();
-    for (const snapshot of snapshots) this.record(snapshot);
+    for (const [key, entry] of snapshots) this.enqueue(key, { ...entry, replay: true });
   }
 
   async close() {

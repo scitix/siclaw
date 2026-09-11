@@ -35,7 +35,7 @@ import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { recoverCapabilityUsage } from "./capability/model-usage.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
-import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/container-evidence.js";
+import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
