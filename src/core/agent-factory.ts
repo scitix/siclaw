@@ -44,6 +44,7 @@ import setupExtension from "./extensions/setup.js";
 import lsExtension from "./extensions/ls.js";
 import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
+import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
 import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
 import {
@@ -937,7 +938,7 @@ export async function createSiclawSession(
     services,
     sessionManager,
     model: configuredModel,
-    thinkingLevel: "high",
+    thinkingLevel: resolveSessionThinkingLevel(services.settingsManager, configuredModel),
     noTools: "builtin",
     customTools,
   });

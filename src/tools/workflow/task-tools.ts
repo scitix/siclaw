@@ -50,8 +50,8 @@ function title(theme: any, name: string) {
 const MAX_BATCH = 50;
 
 const TaskCreateItem = Type.Object({
-  subject: Type.String({ description: "Short imperative title" }),
-  description: Type.String({ description: "What needs to be done" }),
+  subject: Type.String({ description: "Short, concrete outcome or question to resolve" }),
+  description: Type.String({ description: "Approach and enough context to carry out the task; include relevant constraints and how to verify the outcome" }),
   activeForm: Type.Optional(Type.String({ description: "Present-continuous form for spinners" })),
   owner: Type.Optional(Type.String({ description: "Who works this (e.g. a sub-agent name)" })),
 });
@@ -65,7 +65,7 @@ const TaskUpdateItem = Type.Object({
   id: Type.String({ description: "The task id returned by task_create" }),
   status: Type.Optional(TaskStatusLiteral),
   subject: Type.Optional(Type.String({ description: "Non-empty new title; omitted or blank keeps the current title" })),
-  description: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String({ description: "Refined approach, completion criterion, or observed result; preserve the task's intent and relevant evidence" })),
   activeForm: Type.Optional(Type.String()),
   owner: Type.Optional(Type.String()),
   addBlockedBy: Type.Optional(Type.Array(Type.String())),
@@ -127,52 +127,54 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
     renderCall: (_a, theme) => title(theme, "task_create"),
     renderResult: renderTextResult,
     description:
-      "Create a task in the plan (the per-session task ledger) and return its id. A live plan tracks your " +
-      "progress, organizes a complex investigation, and shows the user where you are.\n\n" +
-      "## When to use (proactively)\n" +
-      "- The request needs 3+ distinct steps, or the same check across several targets (e.g. several nodes).\n" +
-      "- The user gives several things to do (a numbered or comma-separated list).\n" +
-      "- A single question turns out to need a real investigation — create the main steps up front, as " +
-      "soon as you see it is multi-step, BEFORE diving into tool calls. Don't wait until you're deep in.\n\n" +
-      "## When NOT to use\n" +
-      "- A single, straightforward, or purely informational request — just answer it, no ceremony.\n" +
-      "- Fewer than 3 trivial steps.\n" +
-      "- NEVER open a one-task plan whose single task just restates the request (e.g. a lone " +
-      "\"investigate why X is slow\"). A single-item plan tracks nothing and is pure ceremony — it is " +
-      "always wrong. Either you can name 3+ real steps up front (then create those), or you cannot yet — " +
-      "in which case skip the plan and start working, narrating as you go; create the plan later if it " +
-      "turns out to be genuinely multi-step.\n\n" +
-      "## What belongs in the ledger\n" +
-      "Create tasks ONLY for steps you will carry out yourself — read-only diagnosis and verification. Do " +
-      "NOT add remediation, physical hardware work, or anything that needs the user or another team (you " +
-      "can't execute them, so the plan would never complete); put those in your recommendation instead.\n\n" +
-      "## Fields\n" +
-      "`tasks` is an ARRAY — pass the whole plan in ONE call. Each entry: subject (short imperative " +
-      "title), description (what to do), activeForm (present-continuous form shown in the spinner), " +
-      "owner (optional, e.g. a sub-agent name).\n" +
-      "One call per task is the same plan for N times the model round-trips, and a plan is worth making " +
-      "precisely because you can already name its steps — so name them together. A single task may be " +
-      "passed as a one-element array.\n\n" +
-      "## Tips\n" +
-      "- Call task_list first to avoid creating duplicate tasks.\n" +
+      "Create milestones in the per-session task ledger and return their ids. This is a progress " +
+      "checklist, not a separate planning or approval mode. Use it when tracking " +
+      "outcomes, dependencies, or changing evidence helps carry substantial work to completion.\n\n" +
+      "## Ground the plan\n" +
+      "- If the relevant procedure, scope, or data source is unknown, read the applicable Skill or do " +
+      "a focused discovery check first. Plan once you can choose meaningful next actions; do not defer " +
+      "planning until the investigation is over. Already have enough context? Plan immediately.\n" +
+      "- Skip the ledger for simple work. There is no minimum task count: two useful milestones are " +
+      "better than five generic phases. Do not pad a plan with 'understand / investigate / summarize', " +
+      "one task per tool call, or a single task that merely repeats the request.\n\n" +
+      "## Write useful milestones\n" +
+      "- subject: a short, concrete outcome or question to resolve.\n" +
+      "- description: enough context to carry out the step, including the approach, relevant " +
+      "constraints, and how to verify the outcome. Keep it concise; put detailed analysis in the " +
+      "conversation or requested deliverable. Do not invent targets, findings, or ids.\n" +
+      "- State the actual completion criterion, not just which tool to call. If an empty or negative " +
+      "result can answer the question, say so: 'Determine whether the window has a usable sample' " +
+      "can finish with a documented empty result; 'Find a usable sample' cannot. Avoid a separate " +
+      "'summarize/report' step unless producing and checking that artifact is substantial work.\n" +
+      "- Plan the work supported by current context. Keep later milestones provisional; refine them " +
+      "when evidence arrives rather than guessing every downstream step.\n" +
+      "- Include only work you can carry out yourself or through available delegation within the " +
+      "authorized scope. Put external remediation recommendations in the answer, not the ledger.\n\n" +
+      "## Efficient use\n" +
+      "- Pass the currently useful milestones together in the `tasks` array. A single entry is valid " +
+      "when adding new work to an existing plan. activeForm and owner are optional.\n" +
+      "- Reuse the known plan. Call task_list only when its current state is unclear; do not list " +
+      "before every create or update.\n" +
+      "- The interface already displays the checklist. Do not repeat it or announce 'plan created'; " +
+      "use progress messages for findings, important context, or the next check.\n" +
       "- Dependencies are NOT set here: task_create returns each task's id; order dependent steps " +
       "afterward with task_update addBlockedBy, referencing those returned ids (never guess ids).\n" +
       "- Nothing is created if any entry is invalid, so a rejected call leaves no half-written plan.\n"
-      + "- At most 50 tasks per call, which is far more than a real plan needs.\n\n" +
-      "## Example\n" +
-      "User: \"why has GPU training been failing on the cluster lately?\" — one question, but answering it " +
-      "well needs several checks. Up front, ONE call creating all five: (1) check node/pod status & recent " +
-      "events, (2) check GPU health, (3) check RDMA/network, (4) check storage, (5) correlate evidence into " +
-      "a root cause. Then work them, sending each task_update along with the tool call that does the work " +
-      "rather than as a turn of its own. The fix goes in your final answer, not as a task.",
+      + "- At most 50 tasks per call (a safety limit, not a suggested plan size).\n\n" +
+      "## Example after discovering a request-log and trace source\n" +
+      "Weak: 'Confirm scope / Analyze trace / Summarize findings'.\n" +
+      "Useful: 'Select a slow request with a usable trace / Attribute elapsed time along the critical " +
+      "path / Build and verify the request timeline'. The first description can preserve a requested " +
+      "30-minute window and a user-authorized 2-hour fallback only when no usable sample exists. " +
+      "Refine the next step after reading the trace; do not claim a bottleneck in advance.",
     parameters: Type.Object({
       tasks: Type.Optional(Type.Array(TaskCreateItem, {
-        description: "The tasks to create, in order. Pass the WHOLE plan here in one call.",
+        description: "Currently useful milestones, in order, created together in one call.",
       })),
       // Single-task form, kept so a call in the older shape still lands instead of costing a
       // retry round-trip — which is the very thing the array form exists to save.
-      subject: Type.Optional(Type.String({ description: "Single-task form: short imperative title" })),
-      description: Type.Optional(Type.String({ description: "Single-task form: what needs to be done" })),
+      subject: Type.Optional(TaskCreateItem.properties.subject),
+      description: Type.Optional(TaskCreateItem.properties.description),
       activeForm: Type.Optional(Type.String({ description: "Single-task form: present-continuous form" })),
       owner: Type.Optional(Type.String({ description: "Single-task form: who works this" })),
     }),
@@ -226,25 +228,36 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       "Update a task in the plan: set status (pending/in_progress/completed), subject/description/" +
       "activeForm/owner, add a dependency (addBlockedBy), or delete it (status=deleted). " +
       "An unknown id returns an error.\n" +
-      "## Never spend a turn on bookkeeping alone\n" +
-      "A plan update carries no evidence, so a turn containing ONLY task_update costs a full model " +
-      "round-trip and returns nothing. Emit the update in the SAME message as the next real tool call — " +
-      "the one that actually looks at something — so the two share one round-trip. Marking a task " +
-      "completed and starting the next check is one message, not two.\n" +
-      "A bookkeeping-only turn is justified in exactly two places: the plan's first draft, and the final " +
-      "close-out when there is no next call to ride along with. If you are about to send task_update by " +
-      "itself anywhere else, attach it to the call you were going to make next instead.\n" +
-      "Status workflow pending -> in_progress -> completed: mark a task in_progress when work on it actually " +
-      "starts, and completed once it is FULLY done so dependents unblock. Do not sit on a finished task — " +
-      "report it with your next call rather than saving it up for a status-only turn later.\n" +
+      "## Update from observed evidence\n" +
+      "Mark in_progress when work starts. Mark completed only after the milestone's completion " +
+      "criterion has been met using results already observed; a tool call or sub-agent launch alone " +
+      "does not complete it. Record a concise result or evidence reference in description when useful. " +
+      "The current subject and description must both match the result.\n" +
+      "- 'Verify the timeline' stays in_progress if the verifier fails or required spans are missing, " +
+      "even though you finished running the check. Describe the gap; do not mark it completed with " +
+      "an error in the description, and do not rename it to 'attempt verification' to manufacture success.\n" +
+      "- A question such as 'Determine whether a sample exists' can complete with an observed empty " +
+      "result. A milestone promising to find a usable sample cannot complete without one.\n" +
+      "- If a permitted fallback changes the search window or approach, revise the unfinished title " +
+      "and description to reflect that scope before completing it. A result from a larger window " +
+      "does not fulfill a title promising a sample from the original window.\n" +
       "Keep your OWN inline work to one task in_progress at a time (you do one thing yourself at a time); but " +
       "when you fan out sub-agents in parallel, mark EACH of their tasks in_progress — several can be " +
-      "in_progress at once when sub-agents are running them. Only mark completed when truly finished; if you " +
-      "hit errors, blockers, partial work, or failing checks, keep it in_progress.\n" +
-      "Keep the plan a living mirror of the work: when the investigation reveals a new thread or root-cause " +
-      "lead (e.g. you set out to check RDMA but the evidence points at the GPU driver), task_create a NEW " +
-      "task for it — do NOT repurpose or re-label an existing task to cram in the new finding. The plan " +
-      "should grow to match what you are actually doing.\n" +
+      "in_progress at once when sub-agents are running them.\n" +
+      "## Revise the approach\n" +
+      "Refine an unfinished task's subject/description in place when new evidence changes how to " +
+      "reach the same outcome. Add a task only for distinct new work; delete obsolete pending tasks " +
+      "instead of letting the plan grow indefinitely. Preserve completed results. Briefly explain " +
+      "a material change of direction and its evidence in a progress update.\n" +
+      "For a blocker, record what is missing and the next viable check. If no viable check remains " +
+      "within scope, report the blocker or insufficient evidence to the user; do not keep looping " +
+      "or mark the original goal successful just to close the plan. It is valid to finish the " +
+      "response with a blocked milestone still in_progress and its blocker in description. " +
+      "All tasks do not need to be completed before answering.\n" +
+      "## Batch bookkeeping\n" +
+      "Send related updates in one `updates` array, alongside the next independent real tool call " +
+      "when possible. Do not mark completed alongside a verification whose result you still need. " +
+      "An initial plan or final close-out can stand alone; avoid intermediate status-only turns.\n" +
       "Set ordering with addBlockedBy using the real ids from task_create / task_list, " +
       "e.g. {\"id\":\"2\",\"addBlockedBy\":[\"1\"]}. If unsure of a task's current state, task_get it first.\n" +
       "Remove a task that is no longer relevant or was created in error with status=deleted. " +
@@ -257,7 +270,7 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       id: Type.Optional(Type.String()),
       status: Type.Optional(TaskStatusLiteral),
       subject: Type.Optional(Type.String({ description: "Non-empty new title; omitted or blank keeps the current title" })),
-      description: Type.Optional(Type.String()),
+      description: TaskUpdateItem.properties.description,
       activeForm: Type.Optional(Type.String()),
       owner: Type.Optional(Type.String()),
       addBlockedBy: Type.Optional(Type.Array(Type.String())),
