@@ -83,7 +83,7 @@ describe("container evidence", () => {
     const queue = new ContainerEvidenceQueue(send);
     for (let i = 0; i < 300; i++) queue.record({ ...containerObservation(pod(), "observed", "test")!, pod_uid: `pod-${i}` });
     expect(send).toHaveBeenCalledTimes(1);
-    expect(errors).toHaveBeenCalledWith("[capability-container] queue full", expect.any(String));
+    expect(errors).toHaveBeenCalledWith("[capability-container] queue full; evicting oldest snapshot", expect.any(String));
     expect(logs).toHaveBeenCalledTimes(300);
     const closed = queue.close(); complete({ observed: true }); await closed;
     expect(send).toHaveBeenCalledTimes(1);
@@ -101,6 +101,24 @@ describe("container evidence", () => {
     watch.handlers.get("delete")!(pod()); await flush();
     expect(send.mock.calls.map(([s]) => (s as unknown as { source: string }).source)).toEqual(["stopping", "deleted"]);
     await observer.stop();
+  });
+
+  it("evicts old pending snapshots so a terminal exit survives a watch burst", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let release!: (result: unknown) => void;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const send = vi.fn().mockImplementationOnce(() => blocked).mockResolvedValue({ observed: true });
+    const queue = new ContainerEvidenceQueue(send);
+    const snapshot = containerObservation(pod(), "observed", "test")!;
+    for (let i = 0; i < 257; i++) queue.record({ ...snapshot, pod_uid: `pod-${i}` });
+    const terminal = { ...snapshot, pod_uid: "pod-0", source: "deleted" as const };
+    queue.record(terminal);
+    release({ observed: true });
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(257));
+    expect(send).toHaveBeenLastCalledWith(terminal);
+    expect(send.mock.calls.some(([event]) => event.pod_uid === "pod-1")).toBe(false);
+    await queue.close();
   });
 
   it("handles rejected watch starts and cancels reconnect on shutdown", async () => {

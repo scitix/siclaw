@@ -35,7 +35,11 @@ vi.mock("./agentbox/client.js", () => ({
     postJson = postJsonMock;
     getJson = vi.fn(async () => ({}));
     streamEvents = async function* () {};
-    streamPath = async function* (path: string) { streamPathMock(path); };
+    streamPath = async function* (path: string) {
+      streamPathMock(path);
+      yield { type: "relay_ready", event_ack: 1 };
+      yield { type: "end", event_id: `${"a".repeat(32)}:1` };
+    };
   },
 }));
 
@@ -119,7 +123,13 @@ describe("startRuntime — capability session setup", () => {
     });
 
     await vi.waitFor(() => expect(streamPathMock).toHaveBeenCalled());
-    expect(streamPathMock).toHaveBeenCalledWith("/events/recovered-run?replay=1");
+    expect(streamPathMock).toHaveBeenCalledWith("/events/recovered-run?ack=1&replay=1");
+    await vi.waitFor(() => expect(postJsonMock).toHaveBeenCalledWith(
+      "/events/ack/recovered-run", { event_id: `${"a".repeat(32)}:1` }, 10_000,
+    ));
+    expect(frontend.request).not.toHaveBeenCalledWith(
+      "capability.persistRunState", expect.objectContaining({ status: "failed" }),
+    );
   });
 
   it("registers a connection observer that reconciles runs immediately after WS reconnect", async () => {

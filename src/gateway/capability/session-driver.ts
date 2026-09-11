@@ -34,6 +34,9 @@ import { ExecutionObservationRelay, type ExecutionObservation } from "./executio
 
 interface BoxEvent {
   type: string;
+  /** Negotiated ordered delivery; only these frames require a persistence ACK. */
+  event_id?: string;
+  event_ack?: number;
   summary?: string;
   /**
    * On error events: producer **safe** short reason for checkpoint (e.g.
@@ -85,8 +88,8 @@ export interface StreamReconnectPolicy {
   isBoxAlive: (client: AgentBoxClient) => Promise<boolean>;
 }
 
-// Six attempts with 2s→60s backoff is about three minutes of transport trouble
-// tolerated; the run-manager's data-stale watchdog still bounds a box that is
+// Six attempts per run with 2s→60s backoff allow 122 seconds of backoff
+// in total; the run-manager's data-stale watchdog still bounds a box that is
 // alive but silent. A box that answers /health is worth reconnecting to — the
 // alternative (relay_failed → stop the box) throws away the whole in-flight
 // batch for a broken TCP connection.
@@ -122,6 +125,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   const policy: StreamReconnectPolicy = { ...defaultStreamReconnectPolicy, ...opts.reconnect };
   let replay = opts.replayWorkspace === true;
   let attempts = 0;
+  let replaySupported = false;
+  let lastCommittedEvent = manager.get(runId)?.persistedRelayEventId;
   // Only TRANSPORT errors (the stream itself) are retried. An error thrown while
   // relaying an event — e.g. the artifact persist loop giving up because the run
   // was cancelled or reaped — is a relay decision and must fail the run as before.
@@ -133,16 +138,55 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
       // must count as liveness (touchHeartbeat, the separate clock) or the watchdog
       // reaps a healthy run and kills its box. It is deliberately NOT touch(): a box
       // that ONLY heartbeats (a wedged turn) must still be reaped at dataStaleMs.
-      const eventPath = `/events/${runId}${replay ? "?replay=1" : ""}`;
+      const eventPath = `/events/${runId}?ack=1${replay ? "&replay=1" : ""}`;
+      let acknowledgedStream = false;
+      let sawEnd = false;
       try {
         for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
+          const event = raw as BoxEvent;
+          if (event.type === "end") sawEnd = true;
+          if (event.type === "relay_ready" && event.event_ack === 1) {
+            acknowledgedStream = true;
+            replaySupported = true;
+            continue;
+          }
           try {
-            await relayBoxEvent(raw as BoxEvent);
+            if ((replaySupported || replay) && !acknowledgedStream) throw new Error("box cannot safely replay lifecycle events");
+            if (acknowledgedStream && ["syncArtifacts", "turn_done", "error", "done", "end"].includes(event.type)) {
+              if (typeof event.event_id !== "string" || !/^[a-f0-9]{32}:[1-9][0-9]{0,15}$/.test(event.event_id)) {
+                throw new Error("box omitted a valid durable event id");
+              }
+              if (event.event_id !== lastCommittedEvent && event.event_id !== manager.get(runId)?.persistedRelayEventId) {
+                // The consumer already supports adjacent persistTurn retries.
+                // No later frame is consumed until this event and its state commit.
+                for (let retry = 0; ; retry++) {
+                  try {
+                    if (manager.get(runId)?.persistedRelayEventId === event.event_id) break;
+                    await relayBoxEvent(event);
+                    await manager.commitRelayEvent(runId, event.event_id);
+                    break;
+                  } catch (err) {
+                    if (retry >= 3) throw err;
+                    await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** retry));
+                  }
+                }
+              }
+              lastCommittedEvent = event.event_id;
+            } else {
+              await relayBoxEvent(event);
+            }
           } catch (err) {
             relayError = err;
             throw err;
           }
+          if (acknowledgedStream && event.event_id) {
+            // Lost ACK responses are transport failures: reattach and ACK the
+            // same event without replaying its already-persisted side effects.
+            await client.postJson(`/events/ack/${runId}`, { event_id: event.event_id }, 10_000);
+          }
         }
+        if (replay && !acknowledgedStream) throw new Error("box cannot safely replay lifecycle events");
+        if (acknowledgedStream && !sawEnd && !runSettled()) throw new Error("box stream ended before its end event");
         return; // clean close: the box ended the stream
       } catch (err) {
         if (relayError !== undefined) throw err;
@@ -154,6 +198,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           console.warn(`[capability] run=${runId} box stream error after the run settled; ignoring`);
           return;
         }
+        if (!replaySupported) throw err; // Legacy boxes cannot replay lost lifecycle frames.
         attempts++;
         if (attempts > policy.maxAttempts || !(await policy.isBoxAlive(client))) {
           throw err;
@@ -161,7 +206,6 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // The probe awaited; the run may have been cancelled or finished meanwhile.
         if (runSettled()) return;
         const delay = Math.min(policy.baseDelayMs * 2 ** (attempts - 1), policy.maxDelayMs);
-        capabilityRelayReconnectsTotal.inc();
         console.warn(
           `[capability] run=${runId} box stream lost (${attempts}/${policy.maxAttempts}), box alive; ` +
             `reconnecting with replay in ${delay}ms: ${err instanceof Error ? err.message : String(err)}`,
@@ -172,6 +216,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // Re-attach semantics: ask for the workspace replay so a sync batch that
         // was in flight when the connection broke is delivered again (the
         // consumer accepts duplicate ACKs; persistArtifacts is idempotent).
+        capabilityRelayReconnectsTotal.inc();
         replay = true;
       }
     }
@@ -225,9 +270,11 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           const turn: CapabilityPersistTurnRequest = { run_id: runId, text: evt.text ?? "" };
           await frontendClient.request(CAPABILITY_PERSIST_TURN, turn);
         } catch (err) {
+          if (evt.event_id) throw err;
           console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
         }
-        await manager.setStatus(runId, "idle");
+        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "idle");
+        else await manager.setStatus(runId, "idle");
         break;
       case "syncArtifacts":
         // One box sync event is one consumer transaction. Keep retrying the
@@ -318,7 +365,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
       case "done":
         emit("lifecycle", { status: "done" });
-        await manager.endRun(runId, "done");
+        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "done");
+        else await manager.endRun(runId, "done");
         break;
       case "error":
         if (evt.recoverable === true) {
@@ -331,7 +379,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // Always persist a structured failure. Bare box errors (error string
         // only, no code/stage) used to call endRun without a failure object, so
         // the consumer checkpoint and auto-resume detail were empty.
-        await manager.endRun(runId, "failed", structuredBoxFailure(evt));
+        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "failed", structuredBoxFailure(evt));
+        else await manager.endRun(runId, "failed", structuredBoxFailure(evt));
         break;
       case "end": {
         // The box's session coroutine exited (clean stream close: max_turns
@@ -348,7 +397,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         if (rec && !isTerminalCapabilityStatus(rec.status)) {
           emit("lifecycle", { status: "done" });
         }
-        await manager.endRun(runId, "done");
+        if (evt.event_id) await manager.commitRelayEvent(runId, evt.event_id, "done");
+        else await manager.endRun(runId, "done");
         break;
       }
       default:
