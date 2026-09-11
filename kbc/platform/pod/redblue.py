@@ -240,14 +240,15 @@ async def _agent_json(engine: ReadonlyAgentEngine, *, stage: str, system: str, u
             allowed_read_roots=roots, timeout_secs=timeout, role=role)
         try:
             data = parse_json_lenient(text)
-            if stage == "questions":
-                questions = data.get("questions") if isinstance(data, dict) else None
-                if not isinstance(questions, list) or not any(
-                    isinstance(q, dict) and isinstance(q.get("question"), str) and q["question"].strip()
-                    for q in questions
+            if stage in {"survey", "questions"}:
+                key, field = ("topics", "knowledge_point") if stage == "survey" else ("questions", "question")
+                items = data.get(key) if isinstance(data, dict) else None
+                if not isinstance(items, list) or not any(
+                    isinstance(item, dict) and isinstance(item.get(field), str) and item[field].strip()
+                    for item in items
                 ):
                     shape = f"object keys={list(data)[:8]}" if isinstance(data, dict) else type(data).__name__
-                    raise ValueError(f'expected a nonempty "questions" array with question text; received {shape}')
+                    raise ValueError(f'expected a nonempty "{key}" array with {field} text; received {shape}')
             return data
         except ValueError as e:
             last_err = f"{e}; output head: {text[:200]!r}"
@@ -256,10 +257,11 @@ async def _agent_json(engine: ReadonlyAgentEngine, *, stage: str, system: str, u
                 "\n\n(Your previous output did not match the requested JSON result. Answer again and output "
                 "**valid JSON only**, with no other text.)",
                 "\n\n(你上一次的输出不符合要求的 JSON 结果。请重新作答,**只输出合法 JSON**,不带任何其他文字。)")
-            if stage == "questions":
+            if stage in {"survey", "questions"}:
+                key, field = ("topics", "knowledge_point") if stage == "survey" else ("questions", "question")
                 user += _t(locale,
-                    '\nReturn one object with a nonempty "questions" array; every item must contain "question" text.',
-                    '\n返回一个包含非空 "questions" 数组的对象，每项必须包含 "question" 问题文本。')
+                    f'\nReturn one object with a nonempty "{key}" array; every item must contain "{field}" text.',
+                    f'\n返回一个包含非空 "{key}" 数组的对象，每项必须包含 "{field}" 文本。')
     raise PKStageError(stage, f"invalid JSON result after retry: {last_err}")
 
 

@@ -72,6 +72,12 @@ compaction are disabled for compiler sessions. Cancellation waits for worker and
 host-tool completion before another turn can begin. EOF, abort, budget exhaustion
 and provider failure are distinct from completion.
 
+Text reads preserve bounded output while allowing a complete traversal of long
+single lines. Oversized lines switch to UTF-8 byte pages with an explicit next
+`offset_bytes`; the final page reports end of file. The same path guards apply
+to line and byte reads. Quality survey and question outputs must contain the
+requested nonempty result arrays within the existing one-retry budget.
+
 A running box with its original session is reused across Runtime replacement.
 A container restart can leave an old-image Pod alive with zero sessions. After
 validating the new execution configuration and pinned source revision, Runtime

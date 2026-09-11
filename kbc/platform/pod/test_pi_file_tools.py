@@ -1,6 +1,7 @@
 """File-tool parity at the existing KBC source and snapshot boundaries."""
 
 import base64
+import re
 from pathlib import Path
 
 import pytest
@@ -25,10 +26,46 @@ async def test_unicode_atomic_write_edit_and_bounded_read(tmp_path):
     assert page.read_text() == text
     await tools.edit({"file_path": str(page), "old_string": "故障", "new_string": "错误", "replace_all": True})
     assert page.read_text() == text.replace("故障", "错误")
-    result = (await tools.read({"file_path": str(page)}))["content"][0]["text"]
+    result = "\n".join(part["text"] for part in (await tools.read({"file_path": str(page)}))["content"])
     assert "truncated" in result and "\ufffd" not in result
     assert len(result.encode()) < MAX_OUTPUT_BYTES + 200
     assert sorted(path.name for path in page.parent.iterdir()) == ["page.md"]
+
+
+async def test_single_line_read_paginates_every_utf8_byte_to_the_tail(tmp_path):
+    text = "Header. " + "甲乙🙂" * 9000 + " Final policy: review required."
+    (tmp_path / "candidate").mkdir()
+    (tmp_path / "candidate/page.md").write_text(text, encoding="utf-8")
+    tools = files(tmp_path)
+    args = {"file_path": "candidate/page.md"}
+    chunks = []
+    while True:
+        result = await tools.read(args)
+        chunk, note = [part["text"] for part in result["content"]]
+        assert len(chunk.encode("utf-8")) <= MAX_OUTPUT_BYTES
+        chunks.append(chunk)
+        match = re.search(r"offset_bytes=(\d+)", note)
+        if not match:
+            assert "End of file" in note
+            break
+        next_offset = int(match[1])
+        assert next_offset > args.get("offset_bytes", 0)
+        args["offset_bytes"] = next_offset
+    assert "".join(chunks) == text
+    assert chunks[-1].endswith("Final policy: review required.")
+
+
+async def test_byte_read_keeps_source_guards_and_rejects_ambiguous_ranges(tmp_path):
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw/assigned.md").write_text("evidence")
+    (tmp_path / "raw/unassigned.md").write_text("private")
+    tools = files(tmp_path, scope={"account": ["assigned.md"], "deny_read": [], "consult": False})
+    with pytest.raises(PermissionError):
+        await tools.read({"file_path": "raw/unassigned.md", "offset_bytes": 0})
+    with pytest.raises(ValueError, match="either line"):
+        await tools.read({"file_path": "raw/assigned.md", "offset": 1, "offset_bytes": 0})
+    with pytest.raises(ValueError, match="offset_bytes"):
+        await tools.read({"file_path": "raw/assigned.md", "offset_bytes": 99})
 
 
 async def test_frozen_raw_scope_and_symlink_cannot_be_bypassed(tmp_path):

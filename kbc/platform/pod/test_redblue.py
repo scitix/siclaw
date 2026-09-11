@@ -437,6 +437,44 @@ async def test_question_shape_failure_retries_with_required_contract():
         assert '"questions"' in fake.users["questions"]
 
 
+async def test_survey_shape_failure_retries_with_required_contract():
+    class EmptySurveyOnce(FakeEngine):
+        async def run_readonly_agent(self, **kwargs):
+            result = await super().run_readonly_agent(**kwargs)
+            if "question-surface survey" in kwargs["user_message"] and self.calls["survey"] == 1:
+                return '{"topics": []}'
+            return result
+
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = EmptySurveyOnce()
+        summary, detail = await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw,
+                                             page_count=3, questions_budget=2)
+        assert fake.calls["survey"] == 2
+        assert len(detail["questions"]) == 2
+        assert summary["state"] != "failed", summary
+        assert '"topics"' in fake.users["survey"]
+
+
+async def test_empty_survey_failure_is_bounded_and_diagnosable():
+    class EmptySurvey(FakeEngine):
+        async def run_readonly_agent(self, **kwargs):
+            result = await super().run_readonly_agent(**kwargs)
+            if "question-surface survey" in kwargs["user_message"]:
+                return '{"topics": []}'
+            return result
+
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = EmptySurvey()
+        summary, detail = await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3)
+        assert fake.calls["survey"] == 2
+        assert fake.calls["questions"] == fake.calls["blue"] == 0
+        assert summary["state"] == "failed"
+        assert "survey" in summary["error"] and "topics" in summary["error"]
+        assert detail["questions"] == []
+
+
 async def test_question_shape_failure_is_bounded_and_diagnosable():
     class WrongShape(FakeEngine):
         async def run_readonly_agent(self, **kwargs):

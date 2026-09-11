@@ -119,10 +119,21 @@ class FileTools:
             if len(data) > MAX_MEDIA_BYTES:
                 raise ValueError("Image exceeds the media budget")
             return {"content": [{"type": "image", "mimeType": mime, "data": base64.b64encode(data).decode("ascii")}]}
+        data = target.read_bytes()
+        if "offset_bytes" in args or "limit_bytes" in args:
+            if "offset" in args or "limit" in args:
+                raise ValueError("Use either line offset/limit or byte offset_bytes/limit_bytes")
+            return self.read_text_bytes(data, args)
         offset = _integer(args, "offset", 1, minimum=1, maximum=100_000_000)
         limit = _integer(args, "limit", 2000, minimum=1)
-        lines = target.read_text(encoding="utf-8").splitlines()
+        decoded = data.decode("utf-8")
+        source_lines = decoded.splitlines(keepends=True)
+        lines = decoded.splitlines()
         selected = lines[offset - 1:offset - 1 + limit]
+        if any(len(line.encode("utf-8")) > MAX_OUTPUT_BYTES for line in selected):
+            # Line pagination cannot reach the tail of an oversized single line.
+            start = sum(len(line.encode("utf-8")) for line in source_lines[:offset - 1])
+            return self.read_text_bytes(data, {"offset_bytes": start})
         output = "\n".join(f"{index}\t{line}" for index, line in enumerate(selected, offset))
         encoded = output.encode("utf-8")
         truncated = len(encoded) > MAX_OUTPUT_BYTES or offset - 1 + limit < len(lines)
@@ -131,6 +142,23 @@ class FileTools:
         if truncated:
             output += "\n[Output truncated. Continue with offset/limit or the bounded source tools.]"
         return text_result(output)
+
+    @staticmethod
+    def read_text_bytes(data: bytes, args: dict) -> dict:
+        start = _integer(args, "offset_bytes", 0, maximum=len(data))
+        limit = _integer(args, "limit_bytes", MAX_OUTPUT_BYTES, minimum=4, maximum=MAX_OUTPUT_BYTES)
+        end = min(start + limit, len(data))
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        text = decoder.decode(data[start:end], final=end == len(data))
+        consumed = start + len(text.encode("utf-8"))
+        result = text_result(text)
+        note = f"Read bytes [{start},{consumed}) of {len(data)} (zero-based UTF-8 offsets)."
+        if consumed < len(data):
+            note += f" Output truncated. Continue Read with offset_bytes={consumed}."
+        else:
+            note += " End of file."
+        result["content"].append({"type": "text", "text": note})
+        return result
 
     async def read_pdf(self, target: Path, args: dict) -> dict:
         status, info, _ = await _command(["pdfinfo", str(target)])
@@ -320,8 +348,8 @@ class FileTools:
         integer = {"type": "integer"}
         boolean = {"type": "boolean"}
         definitions = [
-            ("Read", "Read UTF-8 text with one-based offset/limit, an image, or selected PDF pages (e.g. pages=1-5). Output is bounded and reports truncation.",
-             {"file_path": string, "offset": integer, "limit": integer, "pages": string}, ["file_path"], self.read),
+            ("Read", "Read UTF-8 text with one-based line offset/limit, an image, or selected PDF pages (e.g. pages=1-5). Oversized lines use byte pagination: follow the returned zero-based offset_bytes until End of file. Optional limit_bytes is 4-32768. Do not combine byte and line arguments.",
+             {"file_path": string, "offset": integer, "limit": integer, "offset_bytes": integer, "limit_bytes": integer, "pages": string}, ["file_path"], self.read),
             ("Write", "Atomically write UTF-8 text to an allowed workspace file.",
              {"file_path": string, "content": string}, ["file_path", "content"], self.write),
             ("Edit", "Replace an exact unique string, or every match with replace_all.",
