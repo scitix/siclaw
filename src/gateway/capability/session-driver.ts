@@ -115,6 +115,10 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   const policy: StreamReconnectPolicy = { ...defaultStreamReconnectPolicy, ...opts.reconnect };
   let replay = opts.replayWorkspace === true;
   let attempts = 0;
+  // Only TRANSPORT errors (the stream itself) are retried. An error thrown while
+  // relaying an event — e.g. the artifact persist loop giving up because the run
+  // was cancelled or reaped — is a relay decision and must fail the run as before.
+  let relayError: unknown;
   for (;;) {
     // onComment: the box emits `: heartbeat` SSE comments between data events. A
     // long read-only compile phase can be data-silent for >10min — the heartbeat
@@ -124,22 +128,30 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     const eventPath = `/events/${runId}${replay ? "?replay=1" : ""}`;
     try {
       for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
-        await relayBoxEvent(raw as BoxEvent);
+        try {
+          await relayBoxEvent(raw as BoxEvent);
+        } catch (err) {
+          relayError = err;
+          throw err;
+        }
       }
       return; // clean close: the box ended the stream
     } catch (err) {
-      // A stream error after the run already settled (done/error consumed, or the
-      // record dropped at a terminal) has nothing left to relay — do not turn it
-      // into a relay_failed that stops a box which is already finished.
-      const rec = manager.get(runId);
-      if (rec && isTerminalCapabilityStatus(rec.status)) {
-        console.warn(`[capability] run=${runId} box stream error after terminal status; ignoring`);
+      if (relayError !== undefined) throw err;
+      // A stream error after the run already settled has nothing left to relay
+      // — do not turn it into a relay_failed that stops a box which is already
+      // finished. endRun() DROPS the live record once the terminal state is
+      // persisted, so "no record" is the normal settled case, not an unknown.
+      if (runSettled()) {
+        console.warn(`[capability] run=${runId} box stream error after the run settled; ignoring`);
         return;
       }
       attempts++;
       if (attempts > policy.maxAttempts || !(await policy.isBoxAlive(client))) {
         throw err;
       }
+      // The probe awaited; the run may have been cancelled or finished meanwhile.
+      if (runSettled()) return;
       const delay = Math.min(policy.baseDelayMs * 2 ** (attempts - 1), policy.maxDelayMs);
       capabilityRelayReconnectsTotal.inc();
       console.warn(
@@ -147,11 +159,19 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           `reconnecting with replay in ${delay}ms: ${err instanceof Error ? err.message : String(err)}`,
       );
       await new Promise((resolve) => setTimeout(resolve, delay));
+      // Same check after the backoff: never reopen a stream for a settled run.
+      if (runSettled()) return;
       // Re-attach semantics: ask for the workspace replay so a sync batch that
       // was in flight when the connection broke is delivered again (the
       // consumer accepts duplicate ACKs; persistArtifacts is idempotent).
       replay = true;
     }
+  }
+
+  /** True once the run is terminal or its live record is gone (endRun drops it). */
+  function runSettled(): boolean {
+    const rec = manager.get(runId);
+    return !rec || isTerminalCapabilityStatus(rec.status);
   }
 
   async function relayBoxEvent(evt: BoxEvent): Promise<void> {

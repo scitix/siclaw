@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { driveCapabilitySession } from "./session-driver.js";
-import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS } from "./contract.js";
+import { CapabilityRunManager } from "./run-manager.js";
+import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS, CAPABILITY_PERSIST_RUN_STATE } from "./contract.js";
 
 // Fake box client that yields a fixed sequence of box events over streamPath.
 function fakeClient(events: any[]) {
@@ -521,10 +522,70 @@ describe("driveCapabilitySession — bounded stream reconnect", () => {
         throw new Error("connection closed by peer");
       },
     } as any;
-    // endRun("done") is sticky in the real manager; mirror it for the check.
-    mgr.endRun.mockImplementation(async () => { mgr.get.mockReturnValue({ status: "done" }); });
+    // The real manager DROPS the record after persisting the terminal state.
+    mgr.endRun.mockImplementation(async () => { mgr.get.mockReturnValue(undefined); });
     await driveCapabilitySession({ client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr, reconnect: alive });
     expect(mgr.endRun).toHaveBeenCalledTimes(1);
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+});
+
+describe("driveCapabilitySession — reconnect against the real run manager", () => {
+  const noDelay = { baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true };
+  const frontend = () => ({ emitEvent: vi.fn(), request: vi.fn().mockResolvedValue({ ok: true }) }) as any;
+
+  it.each(["done", "error"])("does not replay after %s was persisted and the live record dropped", async (eventType) => {
+    const fe = frontend();
+    const manager = new CapabilityRunManager(fe);
+    const id = `settled-${eventType}`;
+    await manager.startRun({ runId: id, profile: "kb-compile", orgId: "t" });
+    const paths: string[] = [];
+    const health = vi.fn().mockResolvedValue(true);
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (paths.length === 1) {
+          yield { type: eventType };
+          expect(manager.get(id)).toBeUndefined(); // endRun dropped the record
+          throw new Error("socket reset after terminal, before end");
+        }
+        yield { type: "end" };
+      },
+    } as any;
+    await driveCapabilitySession({ client, runId: id, frontendClient: fe, manager, reconnect: { ...noDelay, isBoxAlive: health } });
+    const persisted = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_RUN_STATE).map((c: any[]) => c[1].status);
+    expect(persisted).toEqual(["running", eventType === "done" ? "done" : "failed"]);
+    expect(paths).toEqual([`/events/${id}`]);
+    expect(health).not.toHaveBeenCalled();
+  });
+
+  it.each(["probe", "backoff"])("does not reopen after the run settles during the %s", async (stage) => {
+    const fe = frontend();
+    const manager = new CapabilityRunManager(fe);
+    const id = `settle-during-${stage}`;
+    await manager.startRun({ runId: id, profile: "kb-compile", orgId: "t" });
+    const paths: string[] = [];
+    let settling: Promise<void> | undefined;
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (paths.length === 1) throw new Error("temporary stream reset");
+        yield { type: "end" };
+      },
+    } as any;
+    await driveCapabilitySession({
+      client, runId: id, frontendClient: fe, manager,
+      reconnect: {
+        ...noDelay, baseDelayMs: 20, maxDelayMs: 20,
+        isBoxAlive: async () => {
+          if (stage === "probe") await manager.endRun(id, "done");
+          else setTimeout(() => { settling = manager.endRun(id, "done"); }, 0);
+          return true;
+        },
+      },
+    });
+    await settling;
+    expect(paths).toEqual([`/events/${id}`]);
+    expect(manager.get(id)).toBeUndefined();
   });
 });
