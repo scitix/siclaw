@@ -22,6 +22,8 @@ import {
   SENSITIVE_ENV_NAME_PATTERNS,
   SENSITIVE_VALUE_PATTERNS,
   type SensitiveResourceType,
+  appendSanitizationNotice,
+  type SanitizationNoticeSink,
 } from "./kubectl-sanitize.js";
 
 // The line-level redactor lives in kubectl-sanitize.ts — the structural
@@ -39,7 +41,7 @@ export { redactSensitiveContent, REDACTION_NOTICE };
  */
 export type OutputAction = {
   type: "sanitize";
-  sanitize: (output: string) => string;
+  sanitize: (output: string, report?: SanitizationNoticeSink) => string;
   lineSafe: boolean;
 };
 
@@ -76,9 +78,10 @@ export function analyzeOutput(
 export function applySanitizer(
   output: string,
   action: OutputAction | null,
+  report?: SanitizationNoticeSink,
 ): string {
   if (!action) return output;
-  return action.sanitize(output);
+  return report ? action.sanitize(output, report) : action.sanitize(output);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -86,8 +89,8 @@ export function applySanitizer(
 /** Build sanitize function for kubectl -o json output (structural sanitization) */
 function makeKubectlJsonSanitizer(
   resource: SensitiveResourceType,
-): (output: string) => string {
-  return (output: string) => sanitizeJSON(output, resource);
+): OutputAction["sanitize"] {
+  return (output, report) => sanitizeJSON(output, resource, report);
 }
 
 // ── kubectl rules ────────────────────────────────────────────────────
@@ -158,7 +161,7 @@ for (const cmd of [
  * Redact sensitive values from env/printenv output (KEY=VALUE per line).
  * Matches key names against SENSITIVE_ENV_NAME_PATTERNS.
  */
-function redactEnvOutput(output: string, opts?: { separator?: string }): string {
+function redactEnvOutput(output: string, opts?: { separator?: string }, report?: SanitizationNoticeSink): string {
   // `env -0` / `printenv -0` separate entries with NUL, not newline. Splitting on newlines left the whole
   // record as one "line" whose first KEY= decided everything, so `SAFE=x<NUL>API_KEY=secret` kept the
   // secret. The separator is passed in by the rule, the only place that can see the flag.
@@ -200,7 +203,7 @@ function redactEnvOutput(output: string, opts?: { separator?: string }): string 
   });
 
   const sanitized = result.join(sep);
-  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
+  return redacted ? appendSanitizationNotice(sanitized, REDACTION_NOTICE, report) : sanitized;
 }
 
 /**
@@ -208,11 +211,11 @@ function redactEnvOutput(output: string, opts?: { separator?: string }): string 
  * came back verbatim. The name is only in the argv, and the entire output is that one value: redact all
  * of it or none of it.
  */
-function redactBareEnvValue(names: string[]): (output: string) => string {
+function redactBareEnvValue(names: string[]): OutputAction["sanitize"] {
   const sensitive = names.some((n) => SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(n)));
-  return (output: string) => {
-    if (!sensitive) return redactEnvOutput(output);
-    return output.trim() ? REDACTED + REDACTION_NOTICE : output;
+  return (output, report) => {
+    if (!sensitive) return redactEnvOutput(output, undefined, report);
+    return output.trim() ? appendSanitizationNotice(REDACTED, REDACTION_NOTICE, report) : output;
   };
 }
 
@@ -227,7 +230,7 @@ OUTPUT_RULES["env"] = (args) => {
   const nul = envNulSeparated(args);
   return {
     type: "sanitize",
-    sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
+    sanitize: (out, report) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined, report),
     // NEVER line-safe, NUL or not. `redactEnvOutput` folds continuation lines: a value containing a
     // newline is one env RECORD spanning several lines, and the sanitizer joins them before matching —
     // which is the whole reason a multi-line `PASSWORD=…` is covered. A per-batch streaming call has no
@@ -246,7 +249,7 @@ OUTPUT_RULES["printenv"] = (args) => {
   }
   return {
     type: "sanitize",
-    sanitize: (out: string) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined),
+    sanitize: (out, report) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined, report),
     // Same reasoning as `env` above: this redactor folds continuation lines, so a record spanning lines
     // cannot be redacted a batch at a time. Fixing only `env` left this half of the same rule behind.
     lineSafe: false,
@@ -260,7 +263,7 @@ OUTPUT_RULES["printenv"] = (args) => {
  * Targets .info.config.envs (containerd) — an array of {key, value} objects.
  * On JSON parse failure, suppresses raw output (same behavior as sanitizeJSON).
  */
-function sanitizeCrictlInspect(output: string): string {
+function sanitizeCrictlInspect(output: string, report?: SanitizationNoticeSink): string {
   let obj: any;
   try {
     obj = JSON.parse(output);
@@ -300,7 +303,7 @@ function sanitizeCrictlInspect(output: string): string {
   }
 
   const sanitized = JSON.stringify(obj, null, 2);
-  return redacted ? sanitized + "\n\n⚠️ Sensitive values have been redacted for security." : sanitized;
+  return redacted ? appendSanitizationNotice(sanitized, REDACTION_NOTICE, report) : sanitized;
 }
 
 OUTPUT_RULES["crictl"] = (args) => {

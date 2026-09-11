@@ -13,3 +13,11 @@ it("keeps complete sanitized data without display truncation or host file refere
   expect(result.text).not.toMatch(/private-value|siclaw-output|output truncated/);
   expect(result.text).toContain("last-line");
 });
+it("preserves JSON syntax while retaining document redaction inside values and arrays", () => {
+  const payload = { password: 871234, message: "password: embedded-value\nhealthy", values: [
+    "-----BEGIN PRIVATE KEY-----\nprivate-pem\n-----END PRIVATE KEY-----", "ghp_testvalue", "healthy",
+  ] };
+  const result = sanitizeSandboxResult({ text: JSON.stringify(payload, null, 2) }) as { text: string };
+  expect(JSON.parse(result.text).values[2]).toBe("healthy");
+  expect(result.text).not.toMatch(/871234|embedded-value|private-pem|ghp_testvalue/);
+});

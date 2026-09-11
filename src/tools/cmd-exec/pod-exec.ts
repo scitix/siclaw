@@ -11,7 +11,7 @@ import { checkPodRunning } from "../infra/k8s-checks.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
@@ -36,7 +36,7 @@ interface PodExecParams {
 }
 
 
-export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring, trustedOptions?: { outputMode?: "data"; remoteTimeoutSeconds?: number }): ToolDefinition {
+export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring, trustedOptions?: TrustedToolOutputOptions & { remoteTimeoutSeconds?: number }): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "pod_exec",
@@ -262,6 +262,7 @@ Examples:
         return {
           content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
             outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: filterPodNoise(stderr.trim()) || undefined,
             project: jsonPathProjector(params.json_path),
           }) }],
@@ -290,6 +291,7 @@ Examples:
         return {
           content: [{ type: "text", text: postExecSecurity(stdout, pre.action, {
             outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: stderr || undefined,
             project: jsonPathProjector(params.json_path),
             ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),

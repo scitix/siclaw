@@ -10,6 +10,8 @@ import { debugPodCache } from "../tools/infra/debug-pod.js";
 import { executeSandboxBuiltin } from "./sandbox-tools.js";
 import { resolveSandboxBuiltin, type SandboxBuiltinTool } from "../script-sandbox/tool-dispatch.js";
 import type { SandboxBuiltinApproval } from "../shared/sandbox-tool-types.js";
+import { sanitizeSandboxResult } from "../script-sandbox/sanitize.js";
+import { ScriptResultTransfer } from "../script-sandbox/result-transfer.js";
 
 const kubeconfig = JSON.stringify({ "current-context": "c", contexts: [{ name: "c", context: { cluster: "c", user: "u" } }],
   clusters: [{ name: "c", cluster: { server: "https://example.test" } }], users: [{ name: "u", user: { token: "snapshot-token" } }] });
@@ -49,6 +51,72 @@ it.each([
   expect(pre.mock.calls[0][0]).toBe(command);
   expect(boundedExec).toHaveBeenCalledOnce();
   expect(fs.readdirSync(dir)).toEqual([]);
+});
+
+it.each([
+  ["nodes", { kind: "NodeList", items: [] }, false],
+  ["pods", { kind: "PodList", items: [{ kind: "Pod", metadata: { name: "api" }, spec: { containers: [{ name: "api", env: [{ name: "PASSWORD", value: "private-test-value" }] }] } }] }, true],
+  ["secrets", { kind: "Secret", data: { password: "private-test-value" } }, true],
+  ["configmaps", { kind: "ConfigMap", data: { password: "private-test-value" } }, true],
+] as const)("keeps %s JSON parseable with warnings and redaction, inline and in file delivery", async (resource, payload, redacted) => {
+  const pre = vi.spyOn(security, "preExecSecurity");
+  const warning = "Warning: Use tokens from the TokenRequest API.";
+  vi.mocked(boundedExec).mockResolvedValue({ stdout: JSON.stringify(payload), stderr: warning });
+  const result = sanitizeSandboxResult(await call("bash", `kubectl get ${resource} -o json`)) as any;
+  expect(JSON.parse(result.text).kind).toBe(payload.kind);
+  expect(result).toMatchObject({ stderr: warning, exit_code: 0, exit_class: "success" });
+  expect(result.notices.length > 0).toBe(redacted);
+  expect(JSON.stringify(result)).not.toContain("private-test-value");
+  expect(pre).toHaveBeenCalledOnce();
+  expect(boundedExec).toHaveBeenCalledOnce();
+
+  const transfer = new ScriptResultTransfer();
+  const authorize = vi.fn(async () => {});
+  const descriptor = transfer.open(result, authorize);
+  const chunk = await transfer.read({ transfer_id: descriptor.transfer_id, offset: 0 }, new AbortController().signal);
+  const saved = JSON.parse(Buffer.from(chunk.data, "base64").toString("utf8"));
+  expect(chunk.done).toBe(true);
+  expect(saved).toEqual(result);
+  expect(JSON.parse(saved.text).kind).toBe(payload.kind);
+  expect(authorize).toHaveBeenCalledOnce();
+  expect(boundedExec).toHaveBeenCalledOnce();
+});
+
+it("preserves a no-match exit status without appending it to stdout", async () => {
+  vi.mocked(boundedExec).mockRejectedValue({ code: 1, stdout: "\n__siclaw_pipe_status_9f3c__0 1\n", stderr: "" });
+  const result = await call("bash", "kubectl get pods -n app | grep absent") as any;
+  expect(result.text).toBe("");
+  expect(result.exit_code).toBe(1);
+  expect(result.exit_class).toBe("no_match");
+  expect(result.notices.length).toBeGreaterThan(0);
+});
+
+it("transfers a large sanitized JSON result across chunks without repeating the query", async () => {
+  const payload = { kind: "PodList", items: Array.from({ length: 1000 }, (_, i) => ({
+    metadata: { name: `pod-${i}` }, spec: { containers: [{ name: "api", image: "example/api:latest",
+      env: [{ name: "PASSWORD", value: "private-test-value" }] }] },
+  })) };
+  vi.mocked(boundedExec).mockResolvedValue({ stdout: JSON.stringify(payload), stderr: "query warning" });
+  const result = sanitizeSandboxResult(await call("bash", "kubectl get pods -n app -o json"));
+  const transfer = new ScriptResultTransfer();
+  const authorize = vi.fn(async () => {});
+  const descriptor = transfer.open(result, authorize);
+  expect(descriptor.bytes).toBeGreaterThan(128 * 1024);
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  while (offset < descriptor.bytes) {
+    const chunk = await transfer.read({ transfer_id: descriptor.transfer_id, offset }, new AbortController().signal);
+    chunks.push(Buffer.from(chunk.data, "base64"));
+    offset = chunk.next_offset;
+    expect(chunk.done).toBe(offset === descriptor.bytes);
+  }
+  const saved = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  expect(JSON.parse(saved.text).items).toHaveLength(1000);
+  expect(saved.stderr).toBe("query warning");
+  expect(saved.notices).toHaveLength(1);
+  expect(saved.text).not.toContain("private-test-value");
+  expect(authorize).toHaveBeenCalledTimes(chunks.length);
+  expect(boundedExec).toHaveBeenCalledOnce();
 });
 
 it.each([

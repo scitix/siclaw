@@ -7,7 +7,7 @@ import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
@@ -103,7 +103,7 @@ function noteSshFailure(host: string, stage: string): string {
 export function createHostExecTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
-  trustedOptions?: { outputMode?: "data"; hostKeyPins?: Record<string, string> },
+  trustedOptions?: TrustedToolOutputOptions & { hostKeyPins?: Record<string, string> },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -387,6 +387,7 @@ Examples (pass the id from host_list; names shown here for readability):
           type: "text",
           text: postExecSecurity(result.stdout.trim(), pre.action, {
             outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: result.stderr.trim() || undefined,
             project: jsonPathProjector(params.json_path),
             ...(notes ? { notes } : {}),

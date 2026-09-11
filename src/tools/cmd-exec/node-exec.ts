@@ -11,7 +11,7 @@ import { DebugPodStartupError } from "../infra/debug-pod.js";
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
@@ -93,7 +93,7 @@ export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
   userId?: string,
   bg?: BackgroundExecWiring,
-  trustedOptions?: { outputMode?: "data"; sandboxDiagnostics?: boolean },
+  trustedOptions?: TrustedToolOutputOptions & { sandboxDiagnostics?: boolean },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -497,6 +497,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       return {
         content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
           outputMode: trustedOptions?.outputMode,
+          onOutputData: trustedOptions?.onOutputData,
           stderr: filteredStderr || undefined,
           project: jsonPathProjector(params.json_path),
           // A `--tail=N` window that came back at exactly N lines reads like a complete answer; the

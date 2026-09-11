@@ -193,6 +193,15 @@ function redactOneLine(line: string): string | null {
  */
 export const REDACTION_NOTICE = "\n\n⚠️ Sensitive values have been redacted for security.";
 
+export type SanitizationNoticeSink = (notice: string) => void;
+
+/** Data consumers receive advisory text separately; display callers keep the footer. */
+export function appendSanitizationNotice(text: string, notice: string, report?: SanitizationNoticeSink): string {
+  if (!report) return text + notice;
+  report(notice.trim());
+  return text;
+}
+
 /**
  * Appended when `-o json` output did not parse as JSON.
  *
@@ -338,9 +347,14 @@ function ownedByBlock(line: string, keyIndent: number): boolean {
  * where a block split across batches is inherently beyond reach — no worse than
  * before, and the per-line layer still applies.
  */
-export function redactSensitiveContent(output: string): string {
-  const { text, redacted } = redactDocument(output);
-  return redacted ? text + REDACTION_NOTICE : text;
+export function redactSensitiveContent(output: string, report?: SanitizationNoticeSink): string {
+  const { text, redacted } = report ? redactDataDocument(output) : redactDocument(output);
+  return redacted ? appendSanitizationNotice(text, REDACTION_NOTICE, report) : text;
+}
+
+/** Preserve JSON syntax for data consumers using the existing JSON/document redactors. */
+export function redactDataDocument(text: string): { text: string; redacted: boolean } {
+  return redactJsonPayload(text) ?? redactDocument(text);
 }
 
 // ── Resource alias mapping ───────────────────────────────────────────
@@ -705,6 +719,7 @@ function extractFormatName(value: string): string {
 export function sanitizeJSON(
   output: string,
   resourceType: SensitiveResourceType,
+  report?: SanitizationNoticeSink,
 ): string {
   let obj: any;
   try {
@@ -719,8 +734,8 @@ export function sanitizeJSON(
     // So the text is kept, run through the line redactor first. That is strictly better than
     // suppression in both directions: an API error survives, and a recognisable secret is still masked
     // — the structural sanitizer never applied to this text anyway, since it does not parse.
-    const text = redactSensitiveContent(output);
-    return text + NON_JSON_NOTICE;
+    const text = redactSensitiveContent(output, report);
+    return appendSanitizationNotice(text, NON_JSON_NOTICE, report);
   }
 
   let redacted = false;
@@ -746,7 +761,7 @@ export function sanitizeJSON(
   if (redactRegistryAuth(obj)) redacted = true;
 
   const sanitized = JSON.stringify(obj, null, 2);
-  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
+  return redacted ? appendSanitizationNotice(sanitized, REDACTION_NOTICE, report) : sanitized;
 }
 
 /**
@@ -1091,8 +1106,11 @@ function redactJsonPayload(
 function redactJsonTree(node: unknown): boolean {
   if (Array.isArray(node)) {
     let redacted = false;
-    for (const item of node) {
-      if (redactJsonTree(item)) redacted = true;
+    for (let i = 0; i < node.length; i++) {
+      if (typeof node[i] === "string") {
+        const result = redactDocument(node[i]);
+        if (result.redacted) { node[i] = result.text; redacted = true; }
+      } else if (redactJsonTree(node[i])) redacted = true;
     }
     return redacted;
   }
@@ -1102,17 +1120,19 @@ function redactJsonTree(node: unknown): boolean {
   const obj = node as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
     const value = obj[key];
-    if (typeof value === "string") {
-      if (isSensitiveKeyName(key) || looksLikeSensitiveValue(value)) {
-        obj[key] = REDACTED;
-        redacted = true;
-      }
-      continue;
-    }
-    if (isSensitiveKeyName(key) && value !== null && typeof value === "object") {
-      // A sensitive key holding a structure (e.g. `"auth": {…}`) — drop it all.
+    // A sensitive key protects scalars as well as nested structures.
+    if (isSensitiveKeyName(key) && value !== null) {
       obj[key] = REDACTED;
       redacted = true;
+      continue;
+    }
+    if (typeof value === "string") {
+      // Reuse document rules for embedded configs and standalone value patterns.
+      const result = redactDocument(value);
+      if (result.redacted) {
+        obj[key] = result.text;
+        redacted = true;
+      }
       continue;
     }
     if (redactJsonTree(value)) redacted = true;

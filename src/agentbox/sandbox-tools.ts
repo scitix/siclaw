@@ -17,6 +17,7 @@ import { withSandboxKubeconfig } from "./sandbox-kubeconfig.js";
 import { SCRIPT_FILE_RESULT_BYTES } from "../script-sandbox/result-transfer.js";
 import { record } from "../script-sandbox/validation.js";
 import type { SandboxBuiltinRequest } from "../script-sandbox/tool-dispatch.js";
+import type { ToolOutputData, TrustedToolOutputOptions } from "../tools/infra/security-pipeline.js";
 
 /** Run the SAME tool factories used by the Agent, against an immutable,
  * freshly authorized credential snapshot. No fallback to its ambient broker.
@@ -25,15 +26,20 @@ export async function executeSandboxBuiltin(request: SandboxBuiltinRequest, appr
   credentialsDir: string | undefined, signal: AbortSignal): Promise<unknown> {
   if (!credentialsDir || approval.tool !== request.tool) throw new Error("Invalid sandbox approval");
   signal.throwIfAborted();
+  const captured: { data?: ToolOutputData } = {};
+  const trusted: TrustedToolOutputOptions = {
+    outputMode: "data", onOutputData: data => { captured.data = data; },
+  };
   const execute = async (tool: ToolDefinition) => {
     // The same schema advertised by the built-in, including which optional
     // execution features are available. Do not maintain a second SDK schema.
     const parameters = tool.parameters as unknown as TSchema;
     if (!Value.Check({ ...parameters, additionalProperties: false }, request.arguments)) throw new Error("Invalid built-in tool arguments");
     const output = await tool.execute(`sandbox-${randomUUID()}`, request.arguments, signal, undefined, {} as Parameters<typeof tool.execute>[4]);
-    const details = output.details as { blocked?: boolean; error?: unknown; truncated?: boolean } | undefined;
+    const details = output.details as { blocked?: boolean; error?: unknown; truncated?: boolean; exitCode?: number | string | null; exit_class?: string } | undefined;
     if (details?.blocked || details?.error || details?.truncated) throw new Error("Sandbox tool failed");
-    const value = { text: output.content.filter(c => c.type === "text").map(c => (c as { text: string }).text).join("\n") };
+    if (!captured.data) throw new Error("Sandbox tool data unavailable");
+    const value = { ...captured.data, exit_code: details?.exitCode ?? null, exit_class: details?.exit_class ?? "unknown" };
     if (Buffer.byteLength(JSON.stringify(value)) > SCRIPT_FILE_RESULT_BYTES) throw new Error("Sandbox tool output too large");
     return value;
   };
@@ -54,7 +60,7 @@ export async function executeSandboxBuiltin(request: SandboxBuiltinRequest, appr
     if (!file) throw new Error("Missing kubeconfig");
     kubeConnection(file.content);
     if (request.tool === "bash") return withSandboxKubeconfig(credentialsDir, file.content,
-      kubeconfigPath => execute(createRestrictedBashTool(undefined, undefined, { kubeconfigPath, validateKubeconfig: kubeConnection, outputMode: "data" })));
+      kubeconfigPath => execute(createRestrictedBashTool(undefined, undefined, { ...trusted, kubeconfigPath, validateKubeconfig: kubeConnection })));
     payload.files = [{ name: "approved.kubeconfig", content: file.content }];
   }
   const args = request.arguments as { host?: string; cluster?: string; node?: string };
@@ -88,7 +94,6 @@ export async function executeSandboxBuiltin(request: SandboxBuiltinRequest, appr
   // invocation's diagnostic Job before deleting its credential snapshot.
   const owner = `sandbox-${randomUUID()}`;
   try {
-    const trusted = { outputMode: "data" as const };
     if (request.tool === "host_exec") return await execute(createHostExecTool(ref, undefined,
       { ...trusted, hostKeyPins: approval.hostKeyPins }));
     if (request.tool === "pod_exec") return await execute(createPodExecTool(ref, undefined, { ...trusted, remoteTimeoutSeconds: request.arguments.timeout_seconds }));

@@ -34,3 +34,40 @@ it("refuses ambiguous users and delegated turns without confusing independent se
   context.enter("s", "a", "owner", "web", true);
   expect(context.user("s", "a")).toBe("");
 });
+
+it("replaces a same-user Web executor despite overlapping handoff terminal cleanup", () => {
+  const context = new SandboxTurnContext();
+  const source = context.enter("s", "a", "u", "web");
+  const target = context.enter("s", "b", "u", "web");
+  expect(context.user("s", "a")).toBe("");
+  expect(context.user("s", "b")).toBe("u");
+  source(); source();
+  expect(context.user("s", "b")).toBe("u");
+  target();
+  expect(context.user("s", "b")).toBe("");
+});
+
+it("never restores the replaced executor if the new turn finishes first", () => {
+  const context = new SandboxTurnContext();
+  const source = context.enter("s", "a", "u", "web");
+  const target = context.enter("s", "b", "u", "web");
+  target();
+  expect(context.user("s", "a")).toBe("");
+  expect(context.user("s", "b")).toBe("");
+  source();
+});
+
+it.each([["attacker", "web", false], ["u", "api", false], ["u", "web", true]] as const)(
+  "does not let an agent switch clear a rejected %s/%s/delegated=%s entry", (user, origin, delegated) => {
+    const context = new SandboxTurnContext();
+    const source = context.enter("s", "a", "u", "web");
+    const rejected = context.enter("s", "b", user, origin, delegated);
+    rejected();
+    const target = context.enter("s", "c", "u", "web");
+    source();
+    expect(context.user("s", "c")).toBe("");
+    target();
+    context.enter("s", "c", "u", "web");
+    expect(context.user("s", "c")).toBe("u");
+  },
+);

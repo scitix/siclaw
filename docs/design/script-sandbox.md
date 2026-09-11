@@ -55,6 +55,12 @@ the turn removes its authority; restart cannot reconstruct it from an old
 session row. This also prevents an API request from enabling a sandbox by
 reusing its owner's saved Web session ID.
 
+A same-user Web handoff replaces the active executor even when the source's
+terminal cleanup overlaps the destination's start. Source cleanup cannot remove
+destination authority, and destination completion cannot restore the old source.
+The control plane must independently authorize the session's current executor,
+its Runtime and bindings; a live local turn alone does not grant resource access.
+
 Initial access is limited to non-delegated, logged-in **Web sessions**. Channel,
 API, task, sub-agent and delegated sessions are excluded until the current
 requester's identity can be verified independently of session ownership.
@@ -145,6 +151,15 @@ have the same resource authorization, tool policies, limits and cancellation.
 Prefer direct Agent tools for simple diagnostics and scripts for aggregation.
 There is no package installation or direct production credential access.
 
+Built-in command results contain `text` (sanitized stdout), `stderr`, `notices`,
+`exit_code` and `exit_class`. Parse `result["text"]` for JSON commands; stderr
+warnings, redaction notices and execution annotations never get appended to it.
+The existing tools' shared sanitizers produce these separate channels, preserving
+JSON syntax through broker sanitization as well. Direct Agent calls retain their
+normal combined display. Check the exit classification and notices for no-match
+or bounded-window results; failed or truncated calls are rejected. MCP results
+retain the shared MCP tool's result shape.
+
 ## Tool budgets and diagnostic cleanup
 
 Tool commands have a 1–15 second budget. Background execution is unavailable
@@ -223,9 +238,10 @@ Portal and external control planes only relay small messages to the original
 live Runtime. No object store, public download endpoint or file credential is
 needed.
 
-The trusted Bash callback uses the shared sanitizer in data mode, without the
-chat renderer's truncation or host temporary files. Runtime caps the internal
-callback at 4 MiB; existing Bash execution capture limits still apply and
+The trusted built-in callbacks use the shared sanitizer in data mode, without the
+chat renderer's truncation or host temporary files. File delivery saves the same
+result envelope, so parse its `text` field for command JSON. Runtime caps the internal
+callback at 4 MiB; existing tool execution capture limits still apply and
 capture failures are rejected. Only script stdout/stderr reaches the Agent,
 with the existing combined 128 KiB limit and explicit `output_truncated` flag.
 Scripts should inspect all required pages and print a concise summary, not dump

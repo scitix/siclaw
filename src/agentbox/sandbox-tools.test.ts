@@ -36,23 +36,25 @@ it.each(["node_exec", "pod_exec"] as const)("executes the shared %s factory agai
     snapshotPath = broker.getClusterLocalInfo("prod").path;
     expect(fs.readFileSync(snapshotPath, "utf8")).toBe(kubeconfig);
     await expect(broker.ensureCluster("other", "test")).rejects.toThrow();
-    return { content: [{ type: "text", text: "rows" }], details: {} };
+    options.at(-1).onOutputData({ text: "rows", stderr: "", notices: [] });
+    return { content: [{ type: "text", text: "rows" }], details: { exitCode: 0, exit_class: "success" } };
   } }));
   state.evict.mockImplementation(async (owner, cluster, node) => {
     expect(owner).toMatch(/^sandbox-/); expect(cluster).toBe("prod"); expect(node).toBe("node-a");
     expect(fs.existsSync(snapshotPath)).toBe(true);
   });
   const args = { command: "uname", timeout_seconds: 10, cluster: "prod", ...(tool === "node_exec" ? { node: "node-a" } : { namespace: "app", pod: "pod-a" }) };
-  await expect(executeSandboxBuiltin({ tool, arguments: args }, approval(tool), dir, new AbortController().signal)).resolves.toEqual({ text: "rows" });
+  await expect(executeSandboxBuiltin({ tool, arguments: args }, approval(tool), dir, new AbortController().signal)).resolves.toEqual({ text: "rows", stderr: "", notices: [], exit_code: 0, exit_class: "success" });
   expect(fs.readdirSync(dir)).toEqual([]);
   expect(state.evict).toHaveBeenCalledTimes(tool === "node_exec" ? 1 : 0);
 });
-it.each(["blocked", "error", "truncated", "oversized", "cancelled"])("rejects %s output and still cleans the diagnostic resources before credentials", async kind => {
+it.each(["blocked", "error", "truncated", "oversized", "cancelled", "missing-data"])("rejects %s output and still cleans the diagnostic resources before credentials", async kind => {
   const controller = new AbortController();
-  state.create.mockReturnValue({ execute: async () => {
+  state.create.mockImplementation((_name, _ref, ...options) => ({ execute: async () => {
     if (kind === "cancelled") { controller.abort(); throw new Error("aborted"); }
-    return { content: [{ type: "text", text: kind === "oversized" ? "x".repeat(4 * 1024 * 1024) : "prefix" }], details: { [kind]: true } };
-  } });
+    if (kind !== "missing-data") options.at(-1).onOutputData({ text: kind === "oversized" ? "x".repeat(4 * 1024 * 1024) : "prefix", stderr: "", notices: [] });
+    return { content: [{ type: "text", text: "display" }], details: { [kind]: true } };
+  } }));
   state.evict.mockImplementation(async () => expect(fs.readdirSync(dir)).toHaveLength(1));
   await expect(executeSandboxBuiltin({ tool: "node_exec", arguments: { cluster: "prod", node: "node-a", command: "uname", timeout_seconds: 10 } }, approval("node_exec"), dir, controller.signal)).rejects.toThrow();
   expect(state.evict).toHaveBeenCalledOnce(); expect(fs.readdirSync(dir)).toEqual([]);
@@ -66,7 +68,10 @@ it("fails closed on missing or malformed SSH pins before constructing the actual
   expect(state.create).not.toHaveBeenCalled(); expect(fs.readdirSync(dir)).toEqual([]);
 });
 it("removes credential snapshots even if confirmed cleanup fails", async () => {
-  state.create.mockReturnValue({ execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }) });
+  state.create.mockImplementation((_name, _ref, options) => ({ execute: async () => {
+    options.onOutputData({ text: "ok", stderr: "", notices: [] });
+    return { content: [{ type: "text", text: "ok" }], details: {} };
+  } }));
   state.evict.mockRejectedValue(new Error("cleanup unconfirmed"));
   await expect(executeSandboxBuiltin({ tool: "node_exec", arguments: { cluster: "prod", node: "node-a", command: "uname", timeout_seconds: 10 } }, approval("node_exec"), dir, new AbortController().signal)).rejects.toThrow("cleanup");
   expect(fs.readdirSync(dir)).toEqual([]);

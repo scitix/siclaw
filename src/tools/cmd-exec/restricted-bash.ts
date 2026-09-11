@@ -23,7 +23,7 @@ import {
   extractCommands as _extractCommands,
   validateShellOperators as _validateShellOperators,
 } from "../infra/command-validator.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { hasPipeline, instrumentPipeline, extractPipelineStatus } from "../infra/pipeline-status.js";
@@ -161,7 +161,7 @@ interface RestrictedBashParams {
 export function createRestrictedBashTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
-  trustedOptions?: { validateKubeconfig?: (content: string) => unknown; kubeconfigPath?: string; outputMode?: "data" },
+  trustedOptions?: TrustedToolOutputOptions & { validateKubeconfig?: (content: string) => unknown; kubeconfigPath?: string },
 ): ToolDefinition {
   // run_in_background is exposed to the model only when the master switch is on AND a
   // runtime executor was injected — otherwise the param stays out of the schema.
@@ -435,6 +435,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         return {
           content: [{ type: "text", text: postExecSecurity(okStdout.trim(), pre.action, {
             outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: stderr.trim() || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
             ...(okNotes ? { notes: okNotes } : {}),
@@ -491,6 +492,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         return {
           content: [{ type: "text", text: postExecSecurity(errStdout, pre.action, {
             outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: errStderr || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
             ...(notes ? { notes } : {}),

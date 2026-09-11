@@ -60,9 +60,20 @@ export function preExecSecurity(
 
 // ── Post-exec ───────────────────────────────────────────────────────
 
-export interface PostExecOptions {
-  /** Trusted, separately bounded data consumers keep complete sanitized text. */
+export interface ToolOutputData {
+  /** Complete sanitized stdout; advisory text belongs in notices or stderr. */
+  text: string;
+  stderr: string;
+  notices: string[];
+}
+
+export interface TrustedToolOutputOptions {
+  /** Trusted, separately bounded data consumers keep complete sanitized channels. */
   outputMode?: "data";
+  onOutputData?: (data: ToolOutputData) => void;
+}
+
+export interface PostExecOptions extends TrustedToolOutputOptions {
   /** Stderr output — appended after sanitization with "\n\nSTDERR:\n" prefix */
   stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
@@ -117,15 +128,19 @@ export function postExecSecurity(
   action: OutputAction | null,
   opts?: PostExecOptions,
 ): string {
+  const notices: string[] = [];
+  const report = opts?.outputMode === "data"
+    ? (notice: string) => { if (!notices.includes(notice)) notices.push(notice); }
+    : undefined;
   // Sanitize the command's own stdout, and only when there IS one. An empty body
   // holds nothing to redact, whereas a structural sanitizer would fail to parse
   // it and suppress the result — dropping the exit code and stderr that are the
   // only evidence of what went wrong.
   let sanitized = stdout;
   if (stdout.trim()) {
-    sanitized = applySanitizer(sanitized, action);
+    sanitized = applySanitizer(sanitized, action, report);
     if (opts?.hasSensitiveKubectl) {
-      sanitized = redactSensitiveContent(sanitized);
+      sanitized = redactSensitiveContent(sanitized, report);
     }
   }
 
@@ -133,6 +148,21 @@ export function postExecSecurity(
   // and nothing we appended to it.
   if (opts?.project) {
     sanitized = opts.project(sanitized);
+  }
+
+  // SDK consumers parse stdout. Keep stderr, sanitizer notices and execution
+  // annotations separate while using the same sanitizers as direct tool calls.
+  if (opts?.outputMode === "data") {
+    const stderr = redactDocument(opts.stderr ?? "");
+    if (stderr.redacted) report!(REDACTION_NOTICE.trim());
+    if (opts.notes) report!(redactDocument(opts.notes).text.trim());
+    const data = {
+      text: sanitizeOutput(sanitized),
+      stderr: sanitizeOutput(stderr.text),
+      notices: notices.map(sanitizeOutput),
+    };
+    opts.onOutputData?.(data);
+    return data.text;
   }
 
   // Everything below is literal text we generate, so it is appended after
@@ -167,7 +197,7 @@ export function postExecSecurity(
       combined += REDACTION_NOTICE;
     }
   }
-  return opts?.outputMode === "data" ? sanitizeOutput(combined) : processToolOutput(combined);
+  return processToolOutput(combined);
 }
 
 // ── Internal: resolve output action by strategy ─────────────────────
