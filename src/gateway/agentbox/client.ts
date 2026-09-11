@@ -65,6 +65,8 @@ export interface PromptOptions {
   releaseId?: string;
   /** Fingerprint of the release model snapshot for runtime observation. */
   modelFingerprint?: string;
+  /** Monotonic Agent configuration selection, independent of release identity. */
+  modelSelectionVersion?: number;
   /** Agent ID (for logging/context) */
   agentId?: string;
   /** Agent-owned Addendum (legacy wire field name). */

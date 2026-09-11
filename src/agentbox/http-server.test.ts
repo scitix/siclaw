@@ -446,6 +446,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       modelId: "gpt-4",
       releaseId: "release-2",
       modelFingerprint: "fingerprint-2",
+      modelSelectionVersion: 3,
       systemPromptTemplate: "You are the personal preview.",
     });
     expect(prompt.status).toBe(200);
@@ -457,6 +458,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       modelFingerprint: "fingerprint-2",
     });
     expect(new Date(after.data.model.observedAt).toString()).not.toBe("Invalid Date");
+    expect(after.data.model.modelSelectionVersion).toBe(3);
     expect(after.data.harness).toMatchObject({
       agentType: "sre",
       systemPromptTemplate: "You are the personal preview.",

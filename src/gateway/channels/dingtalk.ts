@@ -362,6 +362,7 @@ export async function handleDingTalkMessage(
       modelId: modelBinding?.modelId,
       releaseId: modelBinding?.releaseId,
       modelFingerprint: modelBinding?.modelFingerprint,
+      modelSelectionVersion: modelBinding?.modelSelectionVersion,
       modelConfig: modelBinding?.modelConfig,
       modelRouting: modelBinding?.modelRouting,
       subagentTiers: modelBinding?.subagentTiers,

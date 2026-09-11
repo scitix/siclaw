@@ -584,3 +584,21 @@ describe("agent.syncStatus RPC — MCP connection outcomes", () => {
     expect(out.mcp.servers).toHaveLength(1);
   });
 });
+
+it("distinguishes model selections even when release and fingerprint repeat", async () => {
+  listReturns = [
+    { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+    { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+  ];
+  for (const [endpoint, version] of [["https://b1", 1], ["https://b2", 3]] as const) {
+    getJsonByEndpoint.set(endpoint, async () => ({ ...defaultSyncStatus,
+      model: { releaseId: "release", modelFingerprint: "same-model", modelSelectionVersion: version, observedAt: "2026-09-11T00:00:00Z" },
+    }));
+  }
+  server = await bootRuntime();
+  const result = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+  expect(result).toMatchObject({ consistent: false, model: null, observations: [
+    { status: { model: { modelSelectionVersion: 1 } } },
+    { status: { model: { modelSelectionVersion: 3 } } },
+  ] });
+});

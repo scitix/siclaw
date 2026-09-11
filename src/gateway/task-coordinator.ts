@@ -309,6 +309,7 @@ export class TaskCoordinator {
           modelId: binding.modelId,
           releaseId: binding.releaseId,
           modelFingerprint: binding.modelFingerprint,
+          modelSelectionVersion: binding.modelSelectionVersion,
           modelConfig: binding.modelConfig,
           modelRouting: binding.modelRouting,
           subagentTiers: binding.subagentTiers,

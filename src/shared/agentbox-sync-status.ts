@@ -90,6 +90,7 @@ export interface BoxSyncStatus {
   model?: {
     releaseId: string;
     modelFingerprint: string;
+    modelSelectionVersion?: number;
     observedAt: string;
   } | null;
   /**
@@ -250,6 +251,7 @@ export function normalizeBoxSyncStatus(value: unknown): BoxSyncStatus {
       ? { model: {
           releaseId: model.releaseId,
           modelFingerprint: model.modelFingerprint,
+          ...(typeof model.modelSelectionVersion === "number" ? { modelSelectionVersion: model.modelSelectionVersion } : {}),
           observedAt: typeof model.observedAt === "string" ? model.observedAt : "",
         } }
       : root.model === null ? { model: null } : {}),

@@ -13,6 +13,7 @@ const { startRuntime } = await import("./server.js");
 const binding = {
   releaseId: "release-2",
   modelFingerprint: "fingerprint-2",
+  modelSelectionVersion: 3,
   modelProvider: "openai",
   modelId: "gpt-4",
   modelConfig: { name: "openai", baseUrl: "", apiKey: "", api: "openai-responses", authHeader: true, models: [] },
@@ -85,5 +86,15 @@ describe("agent.reload release model identity", () => {
     }) as any;
     expect(result).toMatchObject({ boxes: 0, preparedReleaseId: "release-2" });
     expect(reloadCalls).toEqual([]);
+  });
+});
+
+describe("agent.reload model selection within one release", () => {
+  it("rejects an old A -> B -> A receipt even when the model fingerprint matches", async () => {
+    const reload = await boot();
+    await expect(reload({agentId: "agent-1", resources: ["model"], releaseId: "release-2", modelFingerprint: "fingerprint-2", modelSelectionVersion: 1})).rejects.toThrow(/model selection version/);
+    expect(reloadCalls).toEqual([]);
+    const prepared = await reload({agentId: "agent-1", resources: ["model"], releaseId: "release-2", modelFingerprint: "fingerprint-2", modelSelectionVersion: 3});
+    expect(prepared).toMatchObject({preparedModelSelectionVersion: 3, preparedModelFingerprint: "fingerprint-2"});
   });
 });
