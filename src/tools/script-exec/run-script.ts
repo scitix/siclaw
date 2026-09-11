@@ -24,7 +24,7 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
       "Declare bound clusters/hosts; these calls require run_commands. Use bash for kubectl queries. Command timeout: 1-15s; no background or image/credential overrides. node_exec creates a managed diagnostic Job; pod_exec requires timeout in the target container. " +
       "Command results: text (sanitized stdout), stderr, notices, exit_code, exit_class. Parse text for kubectl JSON; inspect exit_class/notices for completeness. Failed/truncated calls are rejected. " +
       "MCP: use the main Agent's existing tool schemas. mcp__metrics__query maps to call('mcp.call', {'server':'metrics','tool':'query','arguments':{...}}), with mcp:[{server:'metrics',tools:['query']}] declared. tool is the original MCP name. SDK entry points are fixed; no discovery or generated wrappers. " +
-      "MCP results have content, optional structuredContent, and isError, not command text. Check isError; prefer structuredContent, otherwise parse text content per that tool's format. " +
+      "MCP returns its native result directly, also at the saved file's JSON root: content, optional structuredContent and optional isError (absent means false). Check result.get('isError', False); prefer structuredContent, otherwise parse text content per tool schema. Do not search nested wrappers. " +
       "Every call/chunk reauthorizes the caller and declared resources; existing tool policies and credential RBAC apply. Use known bound names; ask if missing. Never embed secrets. " +
       `Network isolation: ${network}. When on, sockets (including subprocess SSH/HTTP) are denied; SDK tools work over pipes.`,
     parameters: Type.Object({

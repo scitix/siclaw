@@ -1,5 +1,21 @@
 # Script sandbox validation — 2026-09-11
 
+## Live MCP result contract correction
+
+A real read-only HTTP MCP service returned successful native results with
+`content` and `structuredContent`, omitting the optional `isError`. Native Agent
+querying and Shell SDK file delivery worked. Two model-written Python scripts
+incorrectly required an `isError` property to identify the envelope and rejected
+successful results after the authorized MCP calls had completed.
+
+The model-visible contract now explicitly states that the native MCP result is
+returned directly and occupies the saved file's JSON root; absent `isError`
+means false. It shows `result.get('isError', False)` and advises against searching
+nested wrappers. The SDK and MCP result wire format are unchanged. The complete
+representative tool definition is 4,483 characters / 985 `o200k_base` tokens,
+23 more than the previous contract and still below the pre-planning 1,008 tokens.
+The three targeted suites passed 32 tests; TypeScript and backend build passed.
+
 ## Live SSH host acceptance
 
 The deployed `120271d3` Runtime/AgentBox images were additionally exercised

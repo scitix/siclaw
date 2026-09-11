@@ -109,10 +109,13 @@ scripts at execution time. An Agent tool named `mcp__metrics__query` maps to SDK
 operation `mcp.call` with `server: "metrics"`, `tool: "query"`, and `arguments`
 matching that MCP tool's schema. The run must declare the same server/tool.
 
-MCP returns its standard `content`, optional `structuredContent`, and `isError`,
-not the Bash `text` envelope. Check `isError`, prefer `structuredContent` when
+MCP returns its standard `content`, optional `structuredContent`, and optional `isError`,
+not the Bash `text` envelope. Missing `isError` means false; in Python, check
+`result.get("isError", False)`. Prefer `structuredContent` when
 present, and otherwise interpret text content using the tool's documented format.
-SDK file delivery stores this same MCP result shape without a new wrapper.
+SDK file delivery stores this same MCP result at the file's JSON root, without
+a new wrapper. Do not require an `isError` property or search nested wrappers
+to recognize a successful MCP result.
 Knowing a tool's schema does not grant permission to execute it: the broker
 still checks the current binding and reviewed operation policy.
 
@@ -182,8 +185,10 @@ parameter schema. This compact contract reuses the main Agent's existing MCP
 schemas without copying them into `run_script` or generating SDK functions.
 Detailed examples and architecture remain in this document, outside the model's
 tool description. A representative serialization including the parameter schema
-is 962 tokens with `o200k_base` (949 with `cl100k_base`), down from 1,008 (1,000)
-before the planning/budget update. These counts exclude provider-specific tool
+is 985 tokens with `o200k_base` (973 with `cl100k_base`), down from 1,008 (1,000)
+before the planning/budget update. Clarifying the native MCP result root and
+optional error flag adds 23 `o200k_base` tokens to the earlier 962-token contract.
+These counts exclude provider-specific tool
 wrapping, other tools and conversation history; prompt caching does not remove
 context occupancy.
 
