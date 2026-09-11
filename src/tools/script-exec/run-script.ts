@@ -6,7 +6,9 @@ import { validateScriptRequest } from "../../script-sandbox/validation.js";
 export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
   return {
     name: "run_script", label: "Run Script",
-    description: "Prefer direct built-in tools for simple diagnostics. Use this for multi-step aggregation or batch processing. Run Python stdlib or Bash in a disposable container. No production credentials, local files or package installation. " +
+    description: "Prefer direct built-in tools for simple diagnostics. Use this for multi-step aggregation or batch processing. Run Python stdlib or Bash in a disposable container. No production credentials, AgentBox/host files or package installation. " +
+      "The working directory is /work. You may create, read, update and delete your own files in /work and use /tmp for scratch data, subject to storage, memory and execution limits. Files exist only for this run and cannot be shared with later runs. Treat image and SDK files as read-only. " +
+      "Local Python/Shell file processing needs no SDK call. To access a cluster, host, Pod or MCP service, use the SDK tools below; local file access does not grant access to remote files or production credentials. " +
       "Python: from siclaw import call, call_to_file, input_data. " +
       "input_data() is a zero-argument function that returns the input parameter as a decoded JSON value; omitted or null input returns None. " +
       "Example with input {\"numbers\": [1, 2, 3]}:\n```python\nfrom siclaw import input_data\npayload = input_data()\nprint(sum(payload[\"numbers\"]))\n```\n" +

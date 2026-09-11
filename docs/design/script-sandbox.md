@@ -151,6 +151,16 @@ have the same resource authorization, tool policies, limits and cancellation.
 Prefer direct Agent tools for simple diagnostics and scripts for aggregation.
 There is no package installation or direct production credential access.
 
+The model receives the SDK imports, operation arguments, result contract and
+filesystem guidance through the registered `run_script` tool description and
+parameter schema. Its working directory is `/work`; scripts can create, read,
+modify and delete their own work files and use `/tmp` for scratch space. These
+local operations need no SDK call. Files disappear after the run and are not
+shared with later runs. Native Kubernetes runners have a read-only image root,
+64 MiB `/work` and 32 MiB `/tmp` memory-backed volumes, plus process/container
+resource limits. This local write access never grants remote write authority;
+SDK calls retain the original tools' authorization and command policies.
+
 Built-in command results contain `text` (sanitized stdout), `stderr`, `notices`,
 `exit_code` and `exit_class`. Parse `result["text"]` for JSON commands; stderr
 warnings, redaction notices and execution annotations never get appended to it.
