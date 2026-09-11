@@ -1,6 +1,54 @@
 # Script sandbox validation — 2026-09-11
 
-## Latest default-branch rebase and deployment
+## Review fixes: fresh-image model acceptance
+
+Runtime, AgentBox and runner images built from `b01205a6`, including the review
+fixes in `06f70230`, were deployed with the updated companion authorization API.
+Six natural-language requests through authenticated Web Chat and the configured
+model produced seven successful `run_script` executions, without supplying SDK
+code or changing the Agent prompt:
+
+- Python correctly called `input_data()` and created, read, modified and deleted
+  JSON/CSV and scratch files. A marker left in one run was absent in the next.
+- Writes to new canary paths under `/etc` and `/opt/siclaw` returned `EROFS`.
+  IPv4, IPv6 and Unix socket creation returned `EPERM`, even when the request
+  set `network_isolation=false` under the administrator's required isolation.
+- Python and Shell both used the SDK Bash tool, saved the full 142,106-byte
+  result, parsed its `text` as JSON and summarized five nodes. The output had
+  separate empty stderr/notices and `exit_code=0`, `exit_class=success`.
+- A facade ran a local script before handing the same Web session to its
+  backend. The backend's script then queried its own cluster binding. Both
+  tool events and the persisted active-executor routing were verified.
+- `/work` reported 64 MiB and stopped at its available capacity with a short
+  write; `/tmp` reported 32 MiB and returned `ENOSPC` when full. Test files were
+  deleted and available capacity recovered. The first probe represented its
+  short write with a synthetic `EIO`; this was not an OS-reported error.
+- SDK attempts to use `create` with client-only dry-run, override the API server
+  address, or access an undeclared cluster were rejected. A normal read passed.
+  Runtime audit independently recorded the three denials and successful read.
+
+The deployed AgentBox tool definition includes local file rules, Python/Shell
+SDK entry points, operation arguments, `input_data()` and result-file semantics.
+Tool metadata teaches the model how to operate; container and shared-tool
+enforcement remains independent of model compliance. MCP has a generic invocation
+contract here; dynamic publication of each MCP tool's schema is not implemented.
+
+All seven results were recovered unchanged from the history API. Observed cold
+runner startup was 1,043–1,579 ms (median 1,375 ms), with no warm pool; these are
+individual samples, not a performance guarantee. Captured runner specs had no
+credential/environment mounts or service-account token, only the two memory
+volumes, a non-root identity, read-only root and dropped capabilities. Runner
+Jobs/Pods and temporary Agent fixtures were removed; temporary user privileges
+were revoked. The updated deployment remains available.
+
+Review-fix verification: 7,351 tests passed, two existing skips; both TypeScript
+checks, build and ten Python SDK tests passed. The later tool-description-only
+change passed seven targeted tests and TypeScript. This fresh-image acceptance
+covers the integrated Web path. Standalone Portal results below belong to their
+stated revisions. Hosted E2B and live host/MCP bindings remain deferred; PR stays
+draft pending review and current CI.
+
+## Previous default-branch rebase and deployment
 
 The feature branch was rebased without conflicts onto `main` revision
 `d78fd7bf`. Range-diff preserved all eleven feature commits. Runtime and AgentBox
