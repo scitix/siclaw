@@ -28,6 +28,7 @@ import {
   CAPABILITY_PERSIST_RUN_STATE,
   CAPABILITY_LIST_ACTIVE_RUNS,
   isTerminalCapabilityStatus,
+  isRelayEventId,
 } from "./contract.js";
 import { normalizeFailure } from "./failure.js";
 import { ErrorCodes, RpcResponseError } from "../../lib/error-envelope.js";
@@ -416,16 +417,20 @@ export class CapabilityRunManager {
     const rec = this.runs.get(runId);
     if (!rec || rec.persistedRelayEventId === eventId) return;
     // Cancellation/watchdog outcomes stay sticky while their final write retries.
-    if (status && !isTerminalCapabilityStatus(rec.status)) {
+    if (rec.relayEventId !== eventId && status && !isTerminalCapabilityStatus(rec.status)) {
       rec.status = status;
       if (status === "failed") rec.failure = normalizeFailure(failure) ?? {
         code: "runtime_failure", stage: "unknown", message: "unspecified failure",
       };
     }
     rec.relayEventId = eventId;
-    rec.lastActivityMs = this.now();
+    // Retrying persistence is not new box activity. Do not extend the watchdog
+    // or reapply idle over a newer command while this event's write retries.
+    const commitsTerminal = isTerminalCapabilityStatus(rec.status);
     await this.persist(rec, { failFast: true });
-    if (isTerminalCapabilityStatus(rec.status)) this.runs.delete(runId);
+    // A concurrent cancellation may have changed rec.status while this write
+    // was in flight. Only a persisted terminal write may release that record.
+    if (commitsTerminal) this.runs.delete(runId);
   }
 
   /**
@@ -678,8 +683,9 @@ export class CapabilityRunManager {
    * runtime's authority (option B — the store is a dumb mirror), so transitions
    * of an EXISTING run swallow a persist failure with a warning: a transient WS
    * blip must not fail a healthy run, and the reconcile loop re-converges the
-   * store. The one exception is `failFast` (startRun): a run must not come into
-   * existence without its store row, so start fails closed.
+   * store. Durability barriers use `failFast` to expose failures to their caller:
+   * start requires its store row, and event delivery must withhold its ACK while
+   * persistence retries. A thrown write does not itself decide the run outcome.
    */
   private async persist(rec: CapabilityRunRecord, opts?: { failFast?: boolean }): Promise<void> {
     // The contract type IS the wire shape (snake_case) — see contract.ts WIRE RULE.
@@ -810,5 +816,5 @@ function relayEventIdFromCheckpoint(checkpoint: unknown): string | undefined {
   }
   if (!value || typeof value !== "object") return undefined;
   const id = (value as { relay_event_id?: unknown }).relay_event_id;
-  return typeof id === "string" && /^[a-f0-9]{32}:[1-9][0-9]{0,15}$/.test(id) ? id : undefined;
+  return isRelayEventId(id) ? id : undefined;
 }

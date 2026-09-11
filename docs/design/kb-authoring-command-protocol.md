@@ -123,6 +123,11 @@ prioritizes concepts/relationships, procedures/checks, or symptoms/evidence/
 remediation. It changes content organization only; it never changes protocol
 routing or lifecycle state.
 
+`KBC_BATCH_MODE=off` disables automatic batching for new compile work. It does
+not discard a persisted batch plan or its reset marker: `compile.resume` still
+continues that existing batch train. Without a plan/reset marker, resume uses
+the recovery decision and available workspace described above.
+
 ## Layer responsibilities
 
 ### ControlPlane
@@ -183,7 +188,11 @@ stable for one release window.
 Runtime requests `GET /events/{run_id}?ack=1`; the box announces
 `{"type":"relay_ready","event_ack":1}` before sending events. Each
 `syncArtifacts`, `turn_done`, `error`, `done` and `end` frame then carries an
-`event_id` scoped to that live box run. The box retains one unacknowledged frame
+`event_id` scoped to that live box run. With `event_ack=1`, the ID is a lowercase
+32-character UUID hex epoch, a colon, and a nonzero decimal sequence of 1 to 16
+digits without leading zeros (`^[a-f0-9]{32}:[1-9][0-9]{0,15}$`). The epoch is
+generated once per live run; replay preserves the original ID. A rehydrated box
+starts a new epoch. The box retains one unacknowledged frame
 and waits for `POST /events/ack/{run_id}` with that id before consuming the next
 frame. A new attachment cancels and waits for the previous consumer to exit,
 then replays the pending frame before queued events. Socket-write success alone
@@ -197,6 +206,17 @@ assistant-turn sink must support adjacent retries after a lost persistence
 response; the existing authoring sink provides this deduplication. Artifact
 batch ACKs remain independent durability barriers and still precede event ACKs.
 
+Turn and run-checkpoint writes each have a fixed 120-second retry window, with
+backoff from 250 milliseconds up to 5 seconds. Only the failed persistence phase
+is retried: an already saved artifact batch and its batch ACK are not repeated
+after a checkpoint failure, and live turn, summary and lifecycle notifications
+are emitted once while those writes retry. An in-flight RPC keeps its existing
+transport timeout; no further retry starts after the window expires. Retries
+do not refresh run activity or overwrite a newer command's running transition.
+Cancellation stops nonterminal retries. If the write still cannot be committed,
+delivery fails without an event ACK; a terminal outcome already selected stays
+terminal while reconciliation retries its persistence.
+
 A legacy box that omits the handshake keeps its prior stream behavior; Runtime
 does not automatically reconnect that stream after a transport failure. Runtime
 adoption also requires the handshake before accepting replayed events. A live
@@ -205,3 +225,8 @@ history cannot be reconstructed. A new Runtime/box pair enables the protocol
 without a deployment setting. Reconnect attempts are bounded per run; they are
 not reset by replay traffic. Reliable streams ending without an end frame are
 transport failures, not evidence of successful completion.
+
+An upgrade or rollback across this protocol boundary cannot safely adopt an
+in-flight legacy Runtime/box pair. Drain active compiles before rollout, or plan
+for their interruption and recovery from the last persisted workspace in a new
+pair. There is no transparent in-place conversion of discarded legacy events.

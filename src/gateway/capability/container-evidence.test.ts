@@ -132,4 +132,78 @@ describe("container evidence", () => {
     await observer.stop(); await vi.advanceTimersByTimeAsync(5000);
     expect(watch.start).toHaveBeenCalledTimes(2);
   });
+
+  it("keeps transport-failed exit evidence when a shared namespace yields 256 declined observations", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const own = { ...containerObservation(pod(), "deleted", "test")!, run_id: "own" };
+    const send = vi.fn().mockRejectedValueOnce(new Error("offline"))
+      .mockImplementation(async event => ({ observed: event.run_id === "own" }));
+    const queue = new ContainerEvidenceQueue(send);
+    queue.record(own); await flush();
+    for (let i = 0; i < 256; i++) {
+      queue.record({ ...own, run_id: `foreign-${i}`, pod_uid: `foreign-${i}`, source: "observed" });
+      await flush();
+    }
+    queue.retry();
+    await vi.waitFor(() => expect(send.mock.calls.filter(([event]) => event.run_id === "own")).toHaveLength(2));
+    await queue.close();
+  });
+
+  it("bounds explicit declines across reconnects without acknowledging or permanently rejecting the snapshot", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const send = vi.fn().mockResolvedValue({ observed: false });
+    const queue = new ContainerEvidenceQueue(send);
+    const snapshot = containerObservation(pod(), "deleted", "test")!;
+    queue.record(snapshot); await flush();
+    for (let i = 0; i < 5; i++) { queue.retry(); await flush(); }
+    expect(send).toHaveBeenCalledTimes(4); // initial observation + three recovery cycles
+    expect(logs).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveBeenCalledWith("[capability-container] receiver declined replay budget; retained in logs", snapshot.run_id);
+    send.mockResolvedValue({ observed: true });
+    queue.record(snapshot); await flush(); // a later relist remains eligible
+    queue.record({ ...snapshot, pod_uid: "replacement" }); await flush();
+    expect(send).toHaveBeenCalledTimes(6);
+    await queue.close();
+  });
+
+  it("does not consume decline replay opportunities on a watch burst or transport failure", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const send = vi.fn().mockResolvedValue({ observed: false });
+    const queue = new ContainerEvidenceQueue(send);
+    const snapshot = containerObservation(pod(), "deleted", "test")!;
+    for (let i = 0; i < 5; i++) { queue.record(snapshot); await flush(); }
+    send.mockRejectedValue(new Error("offline"));
+    for (let i = 0; i < 5; i++) { queue.retry(); await flush(); }
+    expect(send).toHaveBeenCalledTimes(10);
+    send.mockResolvedValue({ observed: true }); // legacy ownership claim completed
+    queue.retry(); await flush();
+    expect(send).toHaveBeenCalledTimes(11);
+    queue.retry(); await flush();
+    expect(send).toHaveBeenCalledTimes(11);
+    await queue.close();
+  });
+
+  it("does not let reconnect replay evict fresh watch snapshots from a full pending queue", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let release!: (result: unknown) => void;
+    const send = vi.fn().mockRejectedValueOnce(new Error("offline"))
+      .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValue({ observed: true });
+    const queue = new ContainerEvidenceQueue(send);
+    const snapshot = containerObservation(pod(), "deleted", "test")!;
+    queue.record(snapshot); await flush();
+    for (let i = 0; i < 257; i++) queue.record({ ...snapshot, pod_uid: `fresh-${i}` });
+    queue.retry();
+    release({ observed: true });
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(258));
+    expect(send.mock.calls.filter(([event]) => event.pod_uid.startsWith("fresh-"))).toHaveLength(257);
+    queue.retry(); await flush();
+    expect(send).toHaveBeenCalledTimes(259);
+    expect(send).toHaveBeenLastCalledWith(snapshot);
+    await queue.close();
+  });
 });

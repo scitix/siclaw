@@ -17,11 +17,24 @@ A namespace informer records additions, updates and deletions. Before explicit
 cleanup, the last cached snapshot is also recorded without delaying deletion.
 One RPC is in flight at a time, with a 3 second transport deadline. Pending and
 reconnect backlogs each retain at most 256 observations; acknowledged dedupe
-retains at most 1024 keys. A full pending or replay backlog evicts the oldest
-snapshot, favoring the latest exit/deletion evidence. Connection recovery
-replays failed snapshots after run reconciliation. Shutdown waits only for the
+retains at most 1024 keys. A full backlog evicts a previously declined snapshot
+before a transport-failed one, then the oldest eligible snapshot. Fresh watch
+observations take priority over replay: a replay cannot evict a queued fresh
+snapshot. Connection recovery replays failed snapshots after run reconciliation,
+with transport failures ahead of explicit declines. Shutdown waits only for the
 active request and reports any dropped backlog; it does not drain minutes of
 queued diagnostics.
+
+In a shared namespace, an explicit `observed:false` may mean a foreign run or a
+legacy run whose ownership is not claimed yet. It is not proof of ownership and
+never counts as a stored acknowledgement. Each snapshot gets up to three
+explicitly declined reconnect/reconcile replays before its retained replay entry
+is dropped with a log. Initial observations, watch relists and transport errors
+do not consume that budget. Exhaustion does not blacklist the run: a later
+relist or changed snapshot may be sent again. Replays do not repeat the full
+snapshot log. This bounds foreign-run replay traffic while allowing temporarily
+unclaimed runs to recover; declined snapshots cannot displace transport-failed
+evidence in the retained backlog.
 
 These are observations, not a Kubernetes audit journal. A Runtime crash before
 acknowledgement can lose its in-memory backlog; retained Runtime logs remain the
