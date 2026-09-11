@@ -123,11 +123,12 @@ export function buildKnowledgeWikiCatalog(
     "# Knowledge Wiki",
     "",
     `Bound knowledge lives as markdown pages under \`${wikiRoot}\`; its top-level catalog is \`${modelIndexPath}\`. ` +
-    "The complete page catalog is below. Route from its titles and descriptions first. When multiple pages " +
-    "remain plausible or the question uses an alias, use `knowledge_search`; it resolves typed page labels only " +
-    "and never searches page bodies. Set `listLabels=true` to inspect the paginated label catalog. Catalog and " +
-    "label results are navigation metadata, not answer evidence. Read the complete relevant page(s) with the " +
-    "Read tool before answering, and " +
+    "The complete page catalog is below. For ordinary questions prefer `knowledge_lookup` when available: " +
+    "it searches bodies across the mounted libraries and returns initial complete pages in one call. Only " +
+    "`readStatus=full` counts as already read; use Read for other relevant candidates. For catalog exploration " +
+    "or aliases, `knowledge_search` resolves typed page labels only. Set `listLabels=true` to inspect the " +
+    "paginated label catalog. Catalog and label results are navigation metadata, not answer evidence. " +
+    "Read the complete relevant page(s) before answering, preserve their applicability and exceptions, and " +
     "follow standard markdown links " +
     "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
     `Also tolerate legacy \`[[other-page]]\` links, resolved from \`${wikiRoot}\`. Don't read unrelated ` +
