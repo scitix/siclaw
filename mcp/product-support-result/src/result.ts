@@ -269,9 +269,6 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
     return result;
   }
 
-  if (result.info.ticket_type === "unknown") {
-    throw new Error("label=true requires a resolved ticket_type");
-  }
   if (result.info.summary.length === 0) {
     throw new Error("label=true requires a non-empty info.summary");
   }
