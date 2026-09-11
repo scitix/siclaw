@@ -12,11 +12,12 @@ import {
   effectiveAgentPrompt,
   effectiveCapabilityKeys,
   resolveAgentPromptLayers,
+  resolveAgentAllowedTools,
 } from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the six designed types; built-ins lock capabilities and own their runtime contracts", () => {
-    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coding", "coordinator", "custom", "knowledge_qa", "product_support", "sre"]);
+  it("has the seven designed types; built-ins lock capabilities and own their runtime contracts", () => {
+    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coding", "coordinator", "custom", "evidence_review", "knowledge_qa", "product_support", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.coordinator.capabilities).toContain("delegate_agents");
@@ -152,5 +153,25 @@ describe("agent-types", () => {
     });
     expect(effectiveAgentPrompt("knowledge_qa", `${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`))
       .toBe(`${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`);
+  });
+});
+
+
+describe("type-aware concrete tool resolution", () => {
+  it.each([null, [], ["run_commands"]])("preserves the locked empty set with own selection %j", (selection) => {
+    expect(resolveAgentAllowedTools("evidence_review", selection)).toEqual([]);
+  });
+  it("retains Custom empty-selection unrestricted semantics", () => {
+    expect(resolveAgentAllowedTools("custom", null)).toBeNull();
+    expect(resolveAgentAllowedTools("custom", [])).toBeNull();
+    expect(resolveAgentAllowedTools("custom", ["read_files"])).toContain("read");
+    expect(resolveAgentAllowedTools("custom", ["read_files"])).not.toContain("bash");
+  });
+  it("keeps non-empty built-in policies locked", () => {
+    expect(resolveAgentAllowedTools("sre", [])).toContain("bash");
+    expect(resolveAgentAllowedTools("coordinator", ["run_commands"])).not.toContain("bash");
+    expect(resolveAgentAllowedTools("knowledge_qa", ["run_commands"])).toEqual([
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+    ]);
   });
 });

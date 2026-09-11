@@ -141,6 +141,12 @@ vi.mock("../core/config.js", () => ({
 
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
+import { handleToolCapabilities } from "../gateway/internal-api.js";
+import { createToolsHandler } from "./sync-handlers.js";
+import { syncResource } from "./resource-sync.js";
+import { compileAgentContext, evidenceReviewResourceOptions } from "../core/agent-context.js";
+import { EVIDENCE_REVIEW_DEFAULT_PROMPT } from "../core/agent-types.js";
+import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { createMemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
@@ -457,6 +463,17 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const mgr = new AgentBoxSessionManager();
     await mgr.getOrCreate("sess-1");
     expect(lastCreateSiclawSession.calls[0].mode).toBe("web");
+  });
+
+  it("does not initialize shared memory or knowledge for evidence review even when memory is configured", async () => {
+    _memoryEnabled = true;
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentTypeState = "evidence_review";
+    await mgr.getOrCreate("evidence-review");
+    expect(createMemoryIndexer).not.toHaveBeenCalled();
+    expect(lastCreateSiclawSession.calls[0].agentType).toBe("evidence_review");
+    expect(lastCreateSiclawSession.calls[0].knowledgeIndexer).toBeUndefined();
+    expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
   });
 
   it("does not initialize memory or create memory dir when memory is disabled", async () => {
@@ -2258,5 +2275,97 @@ describe("request-owned background command execution", () => {
     expect(mgr.backgroundWorkOwners.size).toBe(0);
     // Allow the launcher's eager output-file creation to settle before temp-dir cleanup.
     await new Promise(resolve => setTimeout(resolve, 20));
+  });
+});
+
+// Exercise the real Gateway JSON boundary and AgentBox cold/reload consumers.
+// Only the control-plane RPC transport and model session are fakes.
+describe("Gateway tool policy to AgentBox session wire", () => {
+  function wireClient(initialType: string) {
+    let agentType = initialType;
+    const client: GatewaySyncClientLike = {
+      async request(url, method) {
+        expect(url).toBe("/api/internal/tool-capabilities");
+        expect(method).toBe("GET");
+        let status = 0;
+        let body = "";
+        const response = {
+          writeHead(code: number) { status = code; },
+          end(value: string) { body = value; },
+        };
+        const frontend = { request: async (rpc: string, params: { agentId: string }) => {
+          expect(rpc).toBe("config.getAgent");
+          expect(params.agentId).toBe("review-agent");
+          return { agent_type: agentType, tool_capabilities: [] };
+        } };
+        await handleToolCapabilities(
+          {} as Parameters<typeof handleToolCapabilities>[0],
+          response as unknown as Parameters<typeof handleToolCapabilities>[1],
+          { agentId: "review-agent" } as Parameters<typeof handleToolCapabilities>[2],
+          frontend as unknown as Parameters<typeof handleToolCapabilities>[3],
+        );
+        expect(status).toBe(200);
+        return JSON.parse(body);
+      },
+    };
+    return { client, changeType: (type: string) => { agentType = type; } };
+  }
+
+  function assertEvidenceSession(mgr: AgentBoxSessionManager) {
+    expect(mgr.harnessResolvedState).toBe(true);
+    expect(mgr.agentTypeState).toBe("evidence_review");
+    expect(mgr.allowedToolsState).toEqual([]);
+    const opts = lastCreateSiclawSession.calls.at(-1);
+    const compiled = compileAgentContext({
+      agentType: opts.agentType,
+      allowedTools: opts.allowedTools,
+      harnessResolved: opts.harnessResolved,
+      agentPrompt: opts.systemPromptAppend,
+      systemPromptTemplate: opts.systemPromptTemplate,
+      memoryConfigured: true,
+      mode: opts.mode,
+    });
+    expect(compiled.harness.agentType).toBe("evidence_review");
+    expect(compiled.harness.resolution).toBe("resolved");
+    expect(compiled.harness.allowedTools).toEqual([]);
+    expect(compiled.harness.mcpExposure).toBe("none");
+    expect(compiled.harness.memoryEnabled).toBe(false);
+    expect(compiled.harness.includeBundledSkills).toBe(false);
+    expect(compiled.harness.includePlatformSkills).toBe(false);
+    expect(compiled.systemPrompt).toBe(EVIDENCE_REVIEW_DEFAULT_PROMPT);
+    expect(evidenceReviewResourceOptions.noContextFiles).toBe(true);
+    expect(evidenceReviewResourceOptions.noSkills).toBe(true);
+    expect(evidenceReviewResourceOptions.noExtensions).toBe(true);
+  }
+
+  it("cold-starts from the Gateway payload without remaining Custom/unresolved", async () => {
+    const mgr = new AgentBoxSessionManager();
+    mgr.harnessResolvedState = false;
+    mgr.allowedToolsState = [];
+    const { client } = wireClient("evidence_review");
+    const handler = createToolsHandler(mgr, client);
+    expect(await syncResource("tools", client, handler)).toBe(0);
+    await mgr.getOrCreate("review-cold", "web", "ambient prompt must not win");
+    assertEvidenceSession(mgr);
+    expect(createMemoryIndexer).not.toHaveBeenCalled();
+    expect(lastCreateSiclawSession.calls.at(-1).knowledgeIndexer).toBeUndefined();
+  });
+
+  it.each(["sre", "coordinator", "knowledge_qa", "custom"])("reloads %s to the isolated review profile and invalidates its previous session", async (initialType) => {
+    const mgr = new AgentBoxSessionManager();
+    const { client, changeType } = wireClient(initialType);
+    const handler = createToolsHandler(mgr, client);
+    await syncResource("tools", client, handler);
+    const old = await mgr.getOrCreate("review-hot", "web", "old operating instructions");
+    if (initialType === "custom") expect(mgr.allowedToolsState).toBeNull();
+    if (initialType === "sre") expect(mgr.allowedToolsState).toContain("bash");
+
+    changeType("evidence_review");
+    await handler.materialize(await handler.fetch(client));
+    await handler.postReload!({ sessions: [{ id: "review-hot", brain: old.brain, invalidate: () => mgr.invalidate("review-hot") }] });
+    expect(old._invalidated).toBe(true);
+    const rebuilt = await mgr.getOrCreate("review-hot", "web", "old operating instructions");
+    expect(rebuilt).not.toBe(old);
+    assertEvidenceSession(mgr);
   });
 });

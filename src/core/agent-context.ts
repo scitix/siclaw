@@ -1,17 +1,35 @@
 import { createHash } from "node:crypto";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { DefaultResourceLoader, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import {
-  effectiveCapabilityKeys,
+  EVIDENCE_REVIEW_DEFAULT_PROMPT,
+  resolveAgentAllowedTools,
   requireAgentType,
   resolveAgentPromptLayers,
   type AgentType,
 } from "./agent-types.js";
-import { buildSystemPromptAssembly, type PromptAssembly } from "./prompt.js";
-import { resolveCapabilities } from "./tool-capabilities.js";
+import { PROMPT_ASSEMBLY_VERSION, buildSystemPromptAssembly, type PromptAssembly } from "./prompt.js";
 import type { DelegationContext, SessionMode } from "./types.js";
 
 export const AGENT_CONTEXT_VERSION = "agent-context/v2" as const;
+
+// This is also exercised against Pi's real discovery implementation. Apply it last:
+// inline factories and explicit paths must not bypass the no-discovery switches.
+export const evidenceReviewResourceOptions = {
+  noContextFiles: true,
+  noSkills: true,
+  noExtensions: true,
+  noPromptTemplates: true,
+  additionalSkillPaths: [],
+  additionalExtensionPaths: [],
+  additionalPromptTemplatePaths: [],
+  extensionFactories: [],
+  systemPrompt: EVIDENCE_REVIEW_DEFAULT_PROMPT,
+  systemPromptOverride: () => EVIDENCE_REVIEW_DEFAULT_PROMPT,
+  appendSystemPrompt: [],
+  appendSystemPromptOverride: () => [],
+  skillsOverride: () => ({ skills: [], diagnostics: [] }),
+} satisfies Partial<ConstructorParameters<typeof DefaultResourceLoader>[0]>;
 
 export type HarnessResolution = "resolved" | "unresolved";
 export type McpExposure = "configured" | "none";
@@ -113,7 +131,7 @@ export function resolveAgentHarness(
   // expanded them still receive the type's concrete allow-list rather than all
   // tools. This keeps the compiler boundary aligned with Gateway/LocalSpawner.
   const resolvedTools = input.allowedTools === null && agentType !== "custom"
-    ? (resolveCapabilities(effectiveCapabilityKeys(agentType, null)) ?? [])
+    ? resolveAgentAllowedTools(agentType, null)
     : input.allowedTools;
   // task_report is part of the automated-task transport contract, not an
   // Agent's ordinary interactive capability set. Grant it only in task mode so
@@ -128,7 +146,7 @@ export function resolveAgentHarness(
     && Array.isArray(modeTools)
     ? [...new Set([...modeTools, "transfer_to_agent", "search_handoff_targets"])]
     : modeTools;
-  const allowedTools = resolution === "resolved" ? conversationTools : [];
+  const allowedTools = resolution === "resolved" && agentType !== "evidence_review" ? conversationTools : [];
   const legacyUnrestrictedCustom = resolution === "resolved" && agentType === "custom" && allowedTools === null;
 
   const canOperate = hasAnyTool(allowedTools, [
@@ -146,7 +164,7 @@ export function resolveAgentHarness(
     // in a static built-in capability group. Siclaw currently receives no
     // trustworthy read/write or binding-source metadata with which to narrow
     // this set further. An unresolved context fails closed.
-    mcpExposure: resolution === "resolved" ? "configured" : "none",
+    mcpExposure: resolution === "resolved" && agentType !== "evidence_review" ? "configured" : "none",
     memoryEnabled:
       resolution === "resolved" &&
       input.memoryConfigured &&
@@ -177,6 +195,21 @@ export function resolveAgentHarness(
 /** Compile the stable system prompt and enforceable policy for one session. */
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
+  if (harness.agentType === "evidence_review") {
+    const promptAssembly: PromptAssembly = {
+      version: PROMPT_ASSEMBLY_VERSION,
+      text: EVIDENCE_REVIEW_DEFAULT_PROMPT,
+      legacyTemplateOverride: false,
+      layers: [{
+        id: "agent_type.contract",
+        owner: "agent_type",
+        source: "src/core/agent-types.ts#EVIDENCE_REVIEW_DEFAULT_PROMPT",
+        mutable: false,
+        text: EVIDENCE_REVIEW_DEFAULT_PROMPT,
+      }],
+    };
+    return { systemPrompt: promptAssembly.text, promptAssembly, harness };
+  }
   const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
   const handoffContract = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
     && harness.resolution === "resolved"
