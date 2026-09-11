@@ -71,7 +71,7 @@ vi.mock("../core/agent-factory.js", async () => {
       abort: behavior.abort ?? (async () => {}),
       steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
-      getModel: () => null,
+      getModel: behavior.getModel ?? (() => null),
       // Overridable, unchanged defaults. Model SETUP is where a provider exception
       // is raised, and a factory that could only vary prompt/abort/steer could not
       // express that at all: every failure arrived as `findModel → null`, whose
@@ -80,7 +80,7 @@ vi.mock("../core/agent-factory.js", async () => {
       setModel: behavior.setModel ?? (async () => {}),
       findModel: behavior.findModel ?? (() => null),
       getContextUsage: () => null,
-      getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 }),
+      getSessionStats: behavior.getSessionStats ?? (() => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 })),
       registerProvider: behavior.registerProvider ?? (() => {}),
     };
   }
@@ -147,6 +147,7 @@ import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import * as subagentRegistry from "../core/subagent-registry.js";
 import { getSubagentConcurrency } from "../core/subagent-registry.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
+import { onDiagnostic, type DiagnosticEvent } from "../shared/diagnostic-events.js";
 
 // ── Test setup ────────────────────────────────────────────────────────
 
@@ -1071,6 +1072,34 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
     } finally {
       attachSpy.mockRestore(); startSpy.mockRestore(); endSpy.mockRestore(); detachSpy.mockRestore();
     }
+  });
+
+  it.each([false, true])("records child token usage once even when execution fails (%s)", async (fails) => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const before = { tokens: { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, total: 35 }, cost: 0.01 };
+    const after = { tokens: { input: 110, output: 35, cacheRead: 70, cacheWrite: 0, total: 215 }, cost: 0.03 };
+    let stats = before;
+    const events: DiagnosticEvent[] = [];
+    const unsubscribe = onDiagnostic((event) => events.push(event));
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      getSessionStats: () => stats,
+      getModel: () => ({ id: "fast-model", provider: "provider-b" }),
+      prompt: async () => {
+        stats = after;
+        if (fails) throw new Error("provider failed after usage");
+        emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+      },
+    }));
+    try {
+      await mgr.runSpawnedSubagent({ spawnId: "s1", parentSessionId: "parent", parentAgentId: "a1", description: "d", prompt: "do x", userId: "u1" }, { childSessionId: "child-usage" });
+      const usage = events.filter((event) => event.type === "prompt_complete");
+      expect(usage).toHaveLength(1);
+      expect(usage[0]).toMatchObject({
+        sessionId: "child-usage", prev: before, curr: after,
+        model: { id: "fast-model", provider: "provider-b" }, userId: "u1",
+        outcome: fails ? "error" : "completed",
+      });
+    } finally { unsubscribe(); }
   });
 
   it("#1 stopSessionJobs re-sweep catches a job registered after the first sweep", () => {

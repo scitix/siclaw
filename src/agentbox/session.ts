@@ -2777,6 +2777,7 @@ export class AgentBoxSessionManager {
     // startPrompt (else startPrompt takes the id-only branch). Both self-gate on tracing state.
     tracingRecorder.attach(childSessionId, child.brain, { userId: request.userId, agentId });
     tracingRecorder.startPrompt(childSessionId, request.prompt, request.userId, mainTraceId, spawnSpanContext);
+    const previousUsage = child.brain.getSessionStats();
 
     // Cancellation: stopRequested is set by either the parent's abort signal
     // (main "stop" button → the spawn_subagent tool's signal) or job_stop.
@@ -3060,6 +3061,19 @@ export class AgentBoxSessionManager {
     // so no child trace is left open. endPrompt stays outside the try so it runs before the
     // terminal persist, mirroring the main-prompt ordering.
     tracingRecorder.endPrompt(childSessionId, status === "done" ? "completed" : "error");
+    // Internal children bypass HTTP /prompt and own separate session histories.
+    // Their usage is absent from the parent's delta, so account for it here once,
+    // including consumed tokens on failed or cancelled work.
+    emitDiagnostic({
+      type: "prompt_complete",
+      sessionId: childSessionId,
+      prev: previousUsage,
+      curr: child.brain.getSessionStats(),
+      model: child.brain.getModel(),
+      durationMs: Date.now() - startedAt,
+      outcome: status === "done" ? "completed" : "error",
+      userId: request.userId,
+    });
     try {
       const bundle = buildDelegateSummaryBundle(redactText(finalText, redactionConfig));
       const durationMs = Date.now() - startedAt;
