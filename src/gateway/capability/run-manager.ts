@@ -50,6 +50,10 @@ export interface CapabilityRunRecord {
   messageIds: string[];
   /** Recent typed commands durably accepted by this run (id + payload digest). */
   commandReceipts: CapabilityCommandReceipt[];
+  /** Last ordered box event included in a run-state write. */
+  relayEventId?: string;
+  /** ACK eligibility: advanced only after that write succeeds. */
+  persistedRelayEventId?: string;
   /** Sanitized machine-readable terminal failure; never user/tool content. */
   failure?: CapabilityRunFailure;
   /**
@@ -248,6 +252,8 @@ export class CapabilityRunManager {
         inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
         messageIds: messageIdsFromCheckpoint(row.checkpoint),
         commandReceipts: commandReceiptsFromCheckpoint(row.checkpoint),
+        relayEventId: relayEventIdFromCheckpoint(row.checkpoint),
+        persistedRelayEventId: relayEventIdFromCheckpoint(row.checkpoint),
         failure: failureFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
@@ -397,6 +403,31 @@ export class CapabilityRunManager {
     await this.persist(rec);
   }
 
+  /** Commit a replayable event and its lifecycle transition in the same write.
+   * Unlike ordinary best-effort transitions, failure must withhold the box ACK.
+   * The box serializes delivery, so one durable event id deduplicates re-attach.
+   */
+  async commitRelayEvent(
+    runId: string,
+    eventId: string,
+    status?: CapabilityLifecycleStatus,
+    failure?: CapabilityRunFailure,
+  ): Promise<void> {
+    const rec = this.runs.get(runId);
+    if (!rec || rec.persistedRelayEventId === eventId) return;
+    // Cancellation/watchdog outcomes stay sticky while their final write retries.
+    if (status && !isTerminalCapabilityStatus(rec.status)) {
+      rec.status = status;
+      if (status === "failed") rec.failure = normalizeFailure(failure) ?? {
+        code: "runtime_failure", stage: "unknown", message: "unspecified failure",
+      };
+    }
+    rec.relayEventId = eventId;
+    rec.lastActivityMs = this.now();
+    await this.persist(rec, { failFast: true });
+    if (isTerminalCapabilityStatus(rec.status)) this.runs.delete(runId);
+  }
+
   /**
    * Terminate a run (done/failed): persist the terminal state, then drop it from
    * the live map so the watchdog + recovery ignore it. When the terminal persist
@@ -466,6 +497,8 @@ export class CapabilityRunManager {
           inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
           messageIds: messageIdsFromCheckpoint(r.checkpoint),
           commandReceipts: commandReceiptsFromCheckpoint(r.checkpoint),
+          relayEventId: relayEventIdFromCheckpoint(r.checkpoint),
+          persistedRelayEventId: relayEventIdFromCheckpoint(r.checkpoint),
           failure: failureFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
@@ -655,6 +688,7 @@ export class CapabilityRunManager {
       ...(rec.messageIds.length > 0 ? { message_ids: rec.messageIds } : {}),
       ...(rec.commandReceipts.length > 0 ? { command_receipts: rec.commandReceipts } : {}),
       ...(rec.failure ? { failure: rec.failure } : {}),
+      ...(rec.relayEventId ? { relay_event_id: rec.relayEventId } : {}),
       ...(rec.closeReason ? { close_reason: rec.closeReason } : {}),
     };
     const state: CapabilityRunState = {
@@ -674,6 +708,7 @@ export class CapabilityRunManager {
     const current = previous.catch(() => undefined).then(async () => {
       try {
         await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
+        rec.persistedRelayEventId = checkpoint.relay_event_id;
       } catch (err) {
         if (opts?.failFast) throw err;
         console.warn(
@@ -767,3 +802,13 @@ function failureFromCheckpoint(checkpoint: unknown): CapabilityRunFailure | unde
 
 // normalizeFailure lives in failure.ts so session-driver logs and checkpoint
 // persistence share one token/safe-message sanitizer.
+
+function relayEventIdFromCheckpoint(checkpoint: unknown): string | undefined {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const id = (value as { relay_event_id?: unknown }).relay_event_id;
+  return typeof id === "string" && /^[a-f0-9]{32}:[1-9][0-9]{0,15}$/.test(id) ? id : undefined;
+}

@@ -90,11 +90,12 @@ export class ContainerEvidenceQueue {
     const key = createHash("sha256").update(JSON.stringify(observation)).digest("hex");
     if (this.acknowledged.has(key) || this.pending.has(key) || this.inFlight === key) return;
     console.info("[capability-container]", JSON.stringify(observation));
-    if (!this.pending.has(key) && this.pending.size >= 256) {
+    if (this.pending.size >= 256) {
       // This is evidence loss, not a successful observation. Keep a log that
       // central logging can retain even while the consumer store is overloaded.
-      console.error("[capability-container] queue full", JSON.stringify(observation));
-      return;
+      const oldest = this.pending.keys().next().value!;
+      console.error("[capability-container] queue full; evicting oldest snapshot", this.pending.get(oldest)!.run_id);
+      this.pending.delete(oldest);
     }
     this.failed.delete(key);
     this.pending.set(key, observation);

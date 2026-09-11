@@ -67,6 +67,7 @@ from pi_engine import sdk_version as pi_sdk_version
 from pi_file_tools import FileTools
 import pi_config
 import source_snapshot
+from event_relay import EventRelay
 from source_inspector import SourceInspector
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
@@ -614,6 +615,7 @@ class CompileRun:
         # _resume_workspace_state. Cleared by every other typed command.
         self._recovery: dict | None = None
         self.events: asyncio.Queue = asyncio.Queue()
+        self.event_relay = EventRelay(self.events)
         self.task: asyncio.Task | None = None
         self.done = False
         # Persistent Pi session (set by run_session). The box is a
@@ -3610,7 +3612,15 @@ def _should_route_to_incremental(run: "CompileRun", text: str, action: str | Non
 
 def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = None) -> bool:
     full_compile = action in _FULL_COMPILE_ACTIONS if action is not None else _is_compile_trigger(text)
-    if not _batch_mode_enabled() or run._batch_active or not full_compile:
+    if run._batch_active or not full_compile:
+        return False
+    if action == "compile.resume":
+        state = _resume_workspace_state(run)
+        if state == "complete":
+            return False
+        if state == "plan":
+            return True
+    if not _batch_mode_enabled():
         return False
     raw_dir = Path(run.workdir) / "raw"
     # This gate runs for every normal compile trigger. Keep it metadata-light:
@@ -7328,49 +7338,36 @@ async def handle_artifacts_ack(request: web.Request):
     return web.json_response({"ok": True, "sync_id": sync_id, "accepted": future is not None})
 
 
+async def handle_event_ack(request: web.Request):
+    run = RUNS.get(request.match_info["run_id"])
+    if not run:
+        return web.json_response({"error": "unknown run"}, status=404)
+    payload = await request.json()
+    event_id = payload.get("event_id") if isinstance(payload, dict) else None
+    if not isinstance(event_id, str) or not event_id or len(event_id) > 128:
+        return web.json_response({"error": "event_id is required"}, status=400)
+    try:
+        accepted = run.event_relay.acknowledge(event_id)
+    except ValueError as error:
+        return web.json_response({"error": str(error)}, status=409)
+    return web.json_response({"ok": True, "accepted": accepted})
+
+
 async def handle_events(request: web.Request):
     run = RUNS.get(request.match_info["run_id"])
     if not run:
         return web.Response(status=404, text="unknown run")
-    resp = web.StreamResponse(headers={
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-    })
-    await resp.prepare(request)
-    run._relays = getattr(run, "_relays", 0) + 1
-    try:
-        # Replay BEFORE consuming the queue. This closes the crash window where
-        # a previous runtime dequeued a sync event but died before persisting it;
-        # it also works when the run already queued its terminal `end` frame.
-        wants_replay = request.query.get("replay") == "1"
-        pending_syncs = (list(getattr(run, "_pending_sync_events", {}).values())
-                         if wants_replay else [])
-        for ev in pending_syncs:
-            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
-        replay = (_workspace_replay_artifacts(run, getattr(run, "_sync_sent", {}))
-                  if wants_replay and not pending_syncs else [])
-        replay_commit = wants_replay and getattr(run, "_commit_input_replay", False)
-        if replay or replay_commit:
-            ev = {"type": "syncArtifacts", "artifacts": replay}
-            if replay_commit:
-                ev["commit_input"] = True
-            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
-        while True:
-            try:
-                ev = await asyncio.wait_for(run.events.get(), timeout=25)
-            except asyncio.TimeoutError:
-                await resp.write(b": heartbeat\n\n")  # keep-alive
-                continue
-            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
-            # Delivery mark AFTER the socket write: the shutdown drain gates on
-            # queue.join(), so "drained" means written out, not merely dequeued.
-            run.events.task_done()
-            if ev.get("type") == "end":
-                break
-    finally:
-        run._relays = getattr(run, "_relays", 1) - 1
-    return resp
+
+    def legacy_replay():
+        pending = list(run._pending_sync_events.values())
+        if pending:
+            return pending
+        artifacts = _workspace_replay_artifacts(run, getattr(run, "_sync_sent", {}))
+        commit = getattr(run, "_commit_input_replay", False)
+        return [{"type": "syncArtifacts", "artifacts": artifacts,
+                 **({"commit_input": True} if commit else {})}] if artifacts or commit else []
+
+    return await run.event_relay.stream(request, legacy_replay)
 
 
 async def handle_health(request: web.Request):
@@ -7768,7 +7765,7 @@ async def _flush_on_shutdown(_app) -> None:
     # no live relay would never drain and would burn the whole deadline,
     # starving the active runs' grace window.
     to_drain = [r for r in runs
-                if not getattr(r, "_ended", False) and getattr(r, "_relays", 0) > 0]
+                if not getattr(r, "_ended", False) and r.event_relay.active]
     if to_drain:
         try:
             await asyncio.wait_for(
@@ -7807,6 +7804,7 @@ def build_app() -> web.Application:
         web.post("/command/{run_id}", handle_command),
         web.post("/artifacts/ack/{run_id}", handle_artifacts_ack),
         web.get("/events/{run_id}", handle_events),
+        web.post("/events/ack/{run_id}", handle_event_ack),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),
         web.post("/test-recommendation/{run_id}", handle_test_recommendation),

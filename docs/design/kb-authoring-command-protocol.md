@@ -111,7 +111,7 @@ parameters. Unknown versions and unknown actions fail closed.
 | `compile.regenerate` | optional `brief` | Replace-generation into consumer-owned staging |
 | `compile.approve_plan` | `plan_id` | Execute the exact currently proposed plan |
 | `compile.incremental` | optional `brief` | Use the materialized structured changeset |
-| `compile.resume` | none from the caller; the control plane injects `recovery_mode` (`resume`/`complete`/`restart`), `produced_count`, `produced_pages_ref` (= `authoring/RECOVERY_PROVENANCE.json`, the complete produced-page set in the workspace) and an inline `produced_pages` preview only up to 200. In `complete` mode the box classifies pages from the file and refuses (409) when it is missing/mismatched and no whole inline list exists | Continue an interrupted compile from its workspace. The injected decision wins over local inference — a regeneration clones the stable draft, so file existence cannot tell inherited pages from this lineage's output: a pending compiler-owned batch plan (or a reset marker) resumes the batch train; landed candidate pages without a plan finish the coverage ledger; an empty candidate/ re-runs the full compile over the same raw/. A recovered incremental lineage (RAW_CHANGES.json with changes, no plan) takes the scoped incremental path. Never refused |
+| `compile.resume` | none from the caller; the control plane injects `recovery_mode` (`resume`/`complete`/`restart`), `produced_count`, `produced_pages_ref` (= `authoring/RECOVERY_PROVENANCE.json`, the complete produced-page set in the workspace, with POSIX paths relative to `candidate/`) and an inline `produced_pages` preview only up to 200. In `complete` mode the box classifies pages from the file and refuses (409) when it is missing/mismatched and no whole inline list exists | Continue an interrupted compile from its workspace. The injected decision wins over local inference — a regeneration clones the stable draft, so file existence cannot tell inherited pages from this lineage's output: a pending compiler-owned batch plan (or a reset marker) resumes the batch train; landed candidate pages without a plan finish the coverage ledger; an empty candidate/ re-runs the full compile over the same raw/. A recovered incremental lineage (RAW_CHANGES.json with changes, no plan) takes the scoped incremental path. Missing batch plans are accepted; incomplete provenance is refused |
 | `compile.submit_decisions` | `decisions[]` | Apply owner decisions and propose the resulting plan |
 | `compile.apply_rulings` | `dispatch_nonce`, `rulings[]` | Apply contradiction rulings and emit per-ticket receipts |
 | `compile.repair_test` | `question`, `reference_answer`, `verdict` | Repair the minimum draft scope for a failed test |
@@ -177,3 +177,31 @@ Existing message-prefix detection remains a temporary compatibility adapter for
 older ControlPlane deployments. New ControlPlane buttons use `capability.command`. Legacy
 hits must be observable and can be removed after the paired deployment has been
 stable for one release window.
+
+## Acknowledged run-event delivery
+
+Runtime requests `GET /events/{run_id}?ack=1`; the box announces
+`{"type":"relay_ready","event_ack":1}` before sending events. Each
+`syncArtifacts`, `turn_done`, `error`, `done` and `end` frame then carries an
+`event_id` scoped to that live box run. The box retains one unacknowledged frame
+and waits for `POST /events/ack/{run_id}` with that id before consuming the next
+frame. A new attachment cancels and waits for the previous consumer to exit,
+then replays the pending frame before queued events. Socket-write success alone
+never releases the frame. Heartbeat comments continue while awaiting the ACK.
+
+Runtime persists the reply/artifacts and the run-state transition before
+acknowledging delivery. The last committed event id is included in the opaque
+run checkpoint, so a Runtime restart can acknowledge an already committed turn
+without replaying its reply or resetting a newer turn to idle. The consumer's
+assistant-turn sink must support adjacent retries after a lost persistence
+response; the existing authoring sink provides this deduplication. Artifact
+batch ACKs remain independent durability barriers and still precede event ACKs.
+
+A legacy box that omits the handshake keeps its prior stream behavior; Runtime
+does not automatically reconnect that stream after a transport failure. Runtime
+adoption also requires the handshake before accepting replayed events. A live
+legacy stream cannot switch to acknowledged delivery, because its discarded
+history cannot be reconstructed. A new Runtime/box pair enables the protocol
+without a deployment setting. Reconnect attempts are bounded per run; they are
+not reset by replay traffic. Reliable streams ending without an end frame are
+transport failures, not evidence of successful completion.
