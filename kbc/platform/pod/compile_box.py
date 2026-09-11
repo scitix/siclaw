@@ -2544,7 +2544,7 @@ _PK_ANSWER_PERSIST_CAP = 4000  # chars per answer in the persisted detail
 
 
 def _pk_mode() -> str:
-    return os.environ.get("KBC_PK_MODE", "auto")
+    return os.environ.get("KBC_PK_MODE", "off")
 
 
 def _pk_repair_rounds() -> int:

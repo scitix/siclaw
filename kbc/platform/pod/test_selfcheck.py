@@ -1997,8 +1997,10 @@ async def test_pk_wiring():
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)")
         _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx")
         run = _FakeRun(td)
-        os.environ["KBC_PK_MODE"] = "off"
+        os.environ.pop("KBC_PK_MODE", None)
         assert await compile_box._post_turn_selfcheck(run) is None  # ledger passes
+        assert compile_box._pk_due(run) is None                     # default off
+        os.environ["KBC_PK_MODE"] = "off"
         assert compile_box._pk_due(run) is None                     # mode off
         os.environ["KBC_PK_MODE"] = "auto"
         assert compile_box._pk_due(run) == "full"

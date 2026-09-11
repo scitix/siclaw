@@ -85,7 +85,7 @@ An asymmetric "one writer, many examiners" design: the **judge** (strong tier, r
 - **Orchestration is all in code** (redblue.py): question budget = clamp(8, pages×1.5, 40); the question surface is cached by raw fingerprint (`authoring/PK_SURVEY_CACHE.json`); chunked answering/grading (`KBC_PK_CHUNK=5`, concurrency `KBC_PK_CONCURRENCY=2`); a targeted-retest primitive (`questions_override`); a global wall clock `KBC_PK_WALL_SECS=1800`; any stage's bad JSON is retried once, then fails open (state=failed, never raises).
 - **Engine-neutral** (engine.py): the `ReadonlyAgentEngine` Protocol is the only engine surface; structured output = text JSON + lenient parse (deliberately not SDK tool-forcing); both SDK implementations receive explicit role configuration and root-confined tools.
 - **S0 calibration runner = this module**: `python redblue.py --config /private/path/execution.json --raw <dir> (--workdir <dir>|--wiki <dir>) [--questions N] [--retest last-result.json] [--out pk-result.json]` — offline calibration runs the exact production pipeline. Results are written to the `pk` section of SELFCHECK.json (single write point `selfcheck.update_pk_section`; an L1 re-check never wipes it).
-- **Wiring pending S0 sign-off**: compile_box's automatic trigger (background run after L1 passes + repair injection + staleness detection) is wired in per design doc §9.4 once calibration passes.
+- **Opt-in**: PK is off by default. An explicit `KBC_PK_MODE=auto` enables the background check after L1 passes, including repair injection and targeted retesting. Existing attempts retain their frozen setting.
 
 ## Execution boundaries
 
