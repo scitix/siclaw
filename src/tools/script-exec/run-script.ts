@@ -7,7 +7,10 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
   return {
     name: "run_script", label: "Run Script",
     description: "Prefer direct built-in tools for simple diagnostics. Use this for multi-step aggregation or batch processing. Run Python stdlib or Bash in a disposable container. No production credentials, local files or package installation. " +
-      "Python: from siclaw import call, call_to_file, input_data; Shell: siclaw-tool TOOL JSON. " +
+      "Python: from siclaw import call, call_to_file, input_data. " +
+      "input_data() is a zero-argument function that returns the input parameter as a decoded JSON value; omitted or null input returns None. " +
+      "Example with input {\"numbers\": [1, 2, 3]}:\n```python\nfrom siclaw import input_data\npayload = input_data()\nprint(sum(payload[\"numbers\"]))\n```\n" +
+      "Shell: siclaw-tool TOOL JSON; read the input JSON from $SICLAW_INPUT_FILE. " +
       "Large results: call_to_file(TOOL, ARGS, '/work/result.json') or siclaw-tool --output /work/result.json TOOL JSON saves complete sanitized JSON and returns only path/bytes/checksum. " +
       "Inline results are capped at 128 KiB; file results at 4 MiB each and 16 MiB per run. Read/process files inside the same run and print only the final summary; files disappear afterward. " +
       "SDK operations call the Agent's existing tools with their normal command policies: bash {cluster,command,timeout_seconds?}, host_exec {host,command,timeout_seconds?}, node_exec {cluster,node,command,timeout_seconds?}, pod_exec {cluster,namespace?,pod,container?,command,timeout_seconds?}. " +
@@ -20,7 +23,9 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
       "when on, socket creation is denied, including SSH/HTTP from subprocesses. Controlled tools work over pipes in both modes.",
     parameters: Type.Object({
       language: Type.Union([Type.Literal("python"), Type.Literal("shell")]), code: Type.String({ maxLength: 131072 }),
-      input: Type.Optional(Type.Unknown()), network_isolation: Type.Optional(Type.Boolean()),
+      input: Type.Optional(Type.Unknown({
+        description: "JSON value supplied to this script. Python reads it by calling input_data() with no arguments; Shell reads $SICLAW_INPUT_FILE. Omitted or null input becomes Python None.",
+      })), network_isolation: Type.Optional(Type.Boolean()),
       timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
       clusters: Type.Optional(Type.Array(Type.Object({ name: Type.String() }, { additionalProperties: false }))),
       hosts: Type.Optional(Type.Array(Type.String())),

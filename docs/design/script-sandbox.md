@@ -386,6 +386,17 @@ Example tool request:
 
 Python uses `from siclaw import call, call_to_file, input_data`; Bash uses
 `siclaw-tool TOOL '{"argument":"value"}'` and reads `$SICLAW_INPUT_FILE`.
+Call the zero-argument function `input_data()` to read the `run_script.input`
+parameter as a decoded JSON value. Omitted or JSON `null` input returns Python
+`None`. For example, with `input: {"numbers": [1, 2, 3]}`:
+
+```python
+from siclaw import input_data
+
+payload = input_data()
+print(sum(payload["numbers"]))  # 6
+```
+
 The SDK serializes cross-process calls through a file lock and paired pipes.
 Bash/exec results have a `text` field. With `kubectl -o json`, parse that field
 as JSON. File delivery saves the same result envelope, not a different API.
