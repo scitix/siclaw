@@ -560,7 +560,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(status).toBe(200);
     expect(body.activeAgent.agentType).toBe("knowledge_qa");
     expect(new Set(body.activeAgent.allowedTools)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite"]),
     );
     expect(body.activeAgent.allowedTools).not.toContain("bash");
   });
@@ -677,7 +677,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     expect(status).toBe(200);
     expect(new Set(body.activeAgent.allowedTools)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "manage_schedule"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite", "manage_schedule"]),
     );
   });
 

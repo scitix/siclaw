@@ -17,6 +17,7 @@ import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
+import type { KnowledgeReadSupport } from "../tools/query/knowledge-lookup.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
 
 export type { SessionMode };
@@ -446,8 +447,9 @@ export interface ToolRefs {
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
   memoryIndexer?: MemoryIndexer;
-  /** Labels-only resolver over the knowledge pages mounted for this Agent. */
+  /** Label navigation and body lookup over this Agent's mounted pages. */
   knowledgeIndexer?: KnowledgeResolver;
+  knowledgeReadSupport?: KnowledgeReadSupport;
   /** Session-scoped Skill script lookup. Required for LocalSpawner isolation. */
   skillScriptResolver?: SkillScriptResolver;
   memoryDir?: string;

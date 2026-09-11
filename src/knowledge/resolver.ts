@@ -3,22 +3,26 @@ import {
   type KnowledgeLabelCatalogResult,
   type KnowledgeResolutionResult,
 } from "./labels.js";
+import { KnowledgeLookupIndex, type LookupOptions, type LookupResult } from "./lookup.js";
 
 /**
- * Resolves mounted knowledge pages exclusively from typed page labels.
- *
- * The complete root index is injected separately as the compatibility route
- * for unlabeled packages. This resolver never reads page bodies, opens an
- * embedding provider, or builds an FTS/vector database; callers must Read the
- * selected page before treating it as evidence.
+ * Keeps label navigation and optional body lookup scoped to one Agent mount.
  */
 export class KnowledgeResolver {
   private closed = false;
 
-  constructor(private readonly labels: KnowledgeLabelIndex) {}
+  constructor(private readonly labels: KnowledgeLabelIndex, private readonly content?: KnowledgeLookupIndex) {}
+
+  get supportsLookup(): boolean { return Boolean(this.content) && !this.closed; }
+
+  async lookup(options: LookupOptions, signal?: AbortSignal): Promise<LookupResult> {
+    if (this.closed || !this.content) throw new Error("Knowledge lookup is unavailable.");
+    return this.content.lookup(options, signal);
+  }
 
   async sync(): Promise<void> {
     if (this.closed) return;
+    this.content?.invalidate();
     await this.labels.sync();
   }
 
@@ -42,5 +46,6 @@ export class KnowledgeResolver {
 
   close(): void {
     this.closed = true;
+    this.content?.close();
   }
 }

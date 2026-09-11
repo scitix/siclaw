@@ -291,7 +291,7 @@ describe("LocalSpawner — tool-capabilities injection", () => {
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite", "memory_search", "memory_get"]),
     );
   });
 
@@ -333,7 +333,7 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite"]),
     );
     expect(box.sessionManager.agentTypeState).toBe("product_support");
     expect(box.sessionManager.harnessResolvedState).toBe(true);
@@ -366,7 +366,7 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_lookup", "knowledge_cite"]),
     );
     expect(box.sessionManager.agentTypeState).toBe("custom");
   });
