@@ -1205,7 +1205,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           warnTraceBindFailure("prompt", promptResult.sessionId, promptMessageId!, bindErr);
         });
 
-        const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
+        const redactionConfig = buildRedactionConfigForModelConfig(promptOpts.modelConfig);
         const abortCtrl = turnAbort;
         const promptDoneEvent = () => ({
           type: "prompt_done",

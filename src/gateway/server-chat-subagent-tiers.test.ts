@@ -19,6 +19,7 @@
  * and asserts on the PromptOptions the box actually receives.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
@@ -174,4 +175,6 @@ it("resolves the latest shared model at dispatch and keeps the independent fast 
   expect(promptCalls[0]).toMatchObject(binding);
   expect(promptCalls[0].modelRouting).toBeUndefined();
   expect(frontend.request).toHaveBeenCalledWith("config.getModelBinding", { agentId: "a" });
+  await waitFor(() => vi.mocked(buildRedactionConfigForModelConfig).mock.calls.length > 0);
+  expect(buildRedactionConfigForModelConfig).toHaveBeenLastCalledWith(binding.modelConfig);
 });
