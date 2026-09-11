@@ -916,6 +916,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // dispatched to two boxes and both would run — two writers on one transcript.
       // Released in the finally below so a throw cannot wedge the session.
       let releaseTurn: (() => void) | undefined;
+      let steeredIntoExistingTurn = false;
       try {
         // One turn at a time for this session, across every box (see session-turn-lock.ts).
         // If the session is already running, fall back to the SAME steer the AgentBox's own
@@ -936,6 +937,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             .catch((e) => { console.warn(`[runtime] steer into ${running.boxId} failed session=${sessionId}:`, e); return undefined; })
             : undefined;
           if (steered) {
+            steeredIntoExistingTurn = true;
             console.log(`[runtime] session=${sessionId} busy; steered into the turn on ${running!.boxId}`);
             // The input WAS delivered (it rides the in-flight turn), so this
             // dispatch happened: confirm it rather than leaving it pending.
@@ -1048,9 +1050,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (err instanceof Error && err.message.includes("Session is already running")) {
             if (requiredResultToolName) throw err;
             const steerResult = await client.steerSession(sessionId, text, { images, files });
+            steeredIntoExistingTurn = true;
             // Delivered as a steer onto the running turn — the dispatch did
             // take effect, so it stays recorded (see the busy-degrade path).
             confirmDispatch(dispatchKey);
+            // We hold the Runtime lock, so this box turn has no consumer here.
+            // Keep the row for an unconsumed steer that pi can replay on the next
+            // prompt, where onUserMessageStarted can sequence it. This depends
+            // on pi retaining its queue; the AgentBox abort path clears that queue.
             if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             // chat.send persisted this row before it knew the active session would
             // reject a fresh prompt. Once the fallback steer is accepted, label the
@@ -1209,9 +1216,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           context.sendEvent("chat.event", { sessionId, turnId, event: { type: "prompt_done" } });
         }
       } finally {
-        // Anything still queued was never consumed — a steer the user sent into a turn
-        // that finished first. It must not be claimed by the next turn's first echo.
-        pendingUserRows.clear(sessionId);
+        // Only the owning turn may discard its unconsumed inputs. A concurrent
+        // send that degraded to steer returns before the active stream consumes
+        // that input; clearing here would lose its sequence acknowledgement and
+        // cause cold restore to filter out a question the box actually answered.
+        if (releaseTurn && !steeredIntoExistingTurn) pendingUserRows.clear(sessionId);
         unregisterPendingStart(sessionId, turnAbort);
         dropLiveTurn(sessionId, turnId);
         releaseSandboxTurn();

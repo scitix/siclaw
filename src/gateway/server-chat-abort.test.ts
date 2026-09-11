@@ -12,8 +12,9 @@
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
 
-const bindMessageTraceIdMock = vi.hoisted(() => vi.fn(async () => {}));
+const bindMessageTraceIdMock = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => {}));
 const updateMessageMock = vi.hoisted(() => vi.fn(async () => {}));
+const sequenceMessageMock = vi.hoisted(() => vi.fn(async (_id: string, _sessionId: string) => {}));
 const steerSessionMock = vi.hoisted(() =>
   vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" })),
 );
@@ -23,6 +24,7 @@ vi.mock("./chat-repo.js", async (importOriginal) => ({
   appendMessage: vi.fn(async () => "msg-id"),
   bindMessageTraceId: bindMessageTraceIdMock,
   updateMessage: updateMessageMock,
+  sequenceMessage: sequenceMessageMock,
   incrementMessageCount: vi.fn(async () => {}),
   warnTraceBindFailure: vi.fn(),
   // The real validator: the delegated-turn ledger gates the box ack through it.
@@ -38,14 +40,16 @@ vi.mock("./output-redactor.js", () => ({
 // that is mid-tool when the user hits Stop. capturedSignal lets the test observe
 // whether chat.abort actually aborted it.
 let capturedSignal: AbortSignal | undefined;
+let consumeUserMessage: ((text: string) => Promise<void>) | undefined;
 // A real consumer notices its abort only when the NEXT event arrives, so a turn can
 // stay live across two supervisor passes. Set this to model that.
 let consumerIgnoresAbort = false;
 // Settles the mocked consumer on demand, to model a turn finishing NORMALLY mid-drain.
 let settleConsumer: (() => void) | undefined;
 vi.mock("./sse-consumer.js", () => ({
-  consumeAgentSse: vi.fn((opts: { signal?: AbortSignal }) => {
+  consumeAgentSse: vi.fn((opts: { signal?: AbortSignal; onUserMessageStarted?: (text: string) => Promise<void> }) => {
     capturedSignal = opts.signal;
+    consumeUserMessage = opts.onUserMessageStarted;
     return new Promise((resolve) => {
       const done = () =>
         resolve({ resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0 });
@@ -103,6 +107,8 @@ vi.mock("./agentbox/client.js", () => ({
 }));
 
 const { startRuntime } = await import("./server.js");
+const { pendingUserRows } = await import("./pending-user-rows.js");
+const { loadFullHistory } = await import("./session-history-api.js");
 
 function fakeFrontendClient() {
   return {
@@ -147,6 +153,8 @@ afterEach(async () => {
   if (server) await server.close();
   server = undefined;
   capturedSignal = undefined;
+  consumeUserMessage = undefined;
+  pendingUserRows.clear("S");
   consumerIgnoresAbort = false;
   settleConsumer = undefined;
   abortSessionCalls.length = 0;
@@ -995,5 +1003,54 @@ describe("startRuntime — turnId is derived from the dispatch", () => {
 
     expect(ack.turnId).toMatch(/^[0-9a-f-]{36}$/);
     settleConsumer?.();
+  });
+});
+
+
+describe("concurrent sends preserve consumption acknowledgements", () => {
+  it("retains a busy steer until the owning stream consumes it, then restores it as history", async () => {
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+    await send({ agentId: "a", userId: "u", sessionId: "S", text: "inspect", skipInitialPersistence: true, persistedInput: true, userMessageId: "q1" }, ctx);
+    await waitFor(() => consumeUserMessage !== undefined);
+    await consumeUserMessage!("inspect");
+    expect(sequenceMessageMock).toHaveBeenCalledWith("q1", "S");
+
+    // The first stream is waiting for a long tool. The second RPC returns after
+    // steering, but does not own either the stream or its pending input queue.
+    await send({ agentId: "a", userId: "u", sessionId: "S", text: "also inspect logs", skipInitialPersistence: true, persistedInput: true, userMessageId: "q2" }, { sendEvent: vi.fn() });
+    // After invoking trace binding, the handler returns through finally without
+    // another await, so observing this call also observes its cleanup.
+    await waitFor(() => bindMessageTraceIdMock.mock.calls.some(([id]) => id === "q2"), 8000);
+    expect(pendingUserRows.size("S")).toBe(1);
+    expect(sequenceMessageMock).not.toHaveBeenCalledWith("q2", "S");
+
+    await consumeUserMessage!("also inspect logs");
+    expect(sequenceMessageMock).toHaveBeenCalledWith("q2", "S");
+    expect(pendingUserRows.size("S")).toBe(0);
+    const sequenced = sequenceMessageMock.mock.calls.some(([id]) => id === "q2");
+    const history = await loadFullHistory("S", async () => [{
+      id: "q2", sessionId: "S", role: "user", content: "also inspect logs", seqSequenced: sequenced,
+      toolName: null, toolset: null, toolInput: null, metadata: { kind: "steer" }, outcome: null, durationMs: null,
+      fromAgentId: null, parentSessionId: null, delegationId: null, targetAgentId: null, createdAt: new Date(),
+    }]);
+    expect(history).toHaveLength(1);
+    expect(history[0].content).toBe("also inspect logs");
+
+    pendingUserRows.push("S", "not-consumed", "too late");
+    settleConsumer?.();
+    await waitFor(() => pendingUserRows.size("S") === 0);
+  }, 15000);
+
+  it("keeps the AgentBox 409 fallback queued after its RPC returns", async () => {
+    promptError = new Error("Session is already running");
+    server = await bootRuntime();
+    await server.rpcMethods.get("chat.send")!({ agentId: "a", userId: "u", text: "queued via 409", sessionId: "S", skipInitialPersistence: true, persistedInput: true, userMessageId: "q409" }, { sendEvent: vi.fn() });
+    // This branch also reaches finally synchronously after invoking trace binding.
+    await waitFor(() => bindMessageTraceIdMock.mock.calls.some(([id]) => id === "q409"));
+    expect(pendingUserRows.claim("S", "queued via 409")).toBe("q409");
   });
 });
