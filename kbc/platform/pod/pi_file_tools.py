@@ -120,10 +120,21 @@ class FileTools:
                 raise ValueError("Image exceeds the media budget")
             return {"content": [{"type": "image", "mimeType": mime, "data": base64.b64encode(data).decode("ascii")}]}
         data = target.read_bytes()
+        # Previously advertised byte fields remain readable by older callers.
+        # New schemas expose a single range so providers can populate every
+        # optional property without creating mutually exclusive arguments.
         if "offset_bytes" in args or "limit_bytes" in args:
-            if "offset" in args or "limit" in args:
+            if "offset" in args or "limit" in args or "unit" in args:
                 raise ValueError("Use either line offset/limit or byte offset_bytes/limit_bytes")
             return self.read_text_bytes(data, args)
+        unit = args.get("unit", "lines")
+        if unit not in {"lines", "bytes"}:
+            raise ValueError("unit must be lines or bytes")
+        if unit == "bytes":
+            return self.read_text_bytes(data, {
+                "offset_bytes": args.get("offset", 0),
+                "limit_bytes": args.get("limit", MAX_OUTPUT_BYTES),
+            })
         offset = _integer(args, "offset", 1, minimum=1, maximum=100_000_000)
         limit = _integer(args, "limit", 2000, minimum=1)
         decoded = data.decode("utf-8")
@@ -154,7 +165,7 @@ class FileTools:
         result = text_result(text)
         note = f"Read bytes [{start},{consumed}) of {len(data)} (zero-based UTF-8 offsets)."
         if consumed < len(data):
-            note += f" Output truncated. Continue Read with offset_bytes={consumed}."
+            note += f" Output truncated. Continue Read with unit=bytes, offset={consumed}, limit={MAX_OUTPUT_BYTES}."
         else:
             note += " End of file."
         result["content"].append({"type": "text", "text": note})
@@ -348,8 +359,8 @@ class FileTools:
         integer = {"type": "integer"}
         boolean = {"type": "boolean"}
         definitions = [
-            ("Read", "Read UTF-8 text with one-based line offset/limit, an image, or selected PDF pages (e.g. pages=1-5). Oversized lines use byte pagination: follow the returned zero-based offset_bytes until End of file. Optional limit_bytes is 4-32768. Do not combine byte and line arguments.",
-             {"file_path": string, "offset": integer, "limit": integer, "offset_bytes": integer, "limit_bytes": integer, "pages": string}, ["file_path"], self.read),
+            ("Read", "Read UTF-8 text, an image, or PDF pages. For text, unit=lines (default) uses one-based offset and a line count limit; unit=bytes uses zero-based UTF-8 offset and byte count limit (4-32768). Oversized lines return a byte continuation: follow its unit, offset and limit until End of file. For PDFs, pages selects a page or range (e.g. 1-5); pages is ignored for other files.",
+             {"file_path": string, "unit": {"type": "string", "enum": ["lines", "bytes"]}, "offset": integer, "limit": integer, "pages": string}, ["file_path"], self.read),
             ("Write", "Atomically write UTF-8 text to an allowed workspace file.",
              {"file_path": string, "content": string}, ["file_path", "content"], self.write),
             ("Edit", "Replace an exact unique string, or every match with replace_all.",

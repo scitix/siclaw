@@ -44,13 +44,13 @@ async def test_single_line_read_paginates_every_utf8_byte_to_the_tail(tmp_path):
         chunk, note = [part["text"] for part in result["content"]]
         assert len(chunk.encode("utf-8")) <= MAX_OUTPUT_BYTES
         chunks.append(chunk)
-        match = re.search(r"offset_bytes=(\d+)", note)
+        match = re.search(r"unit=bytes, offset=(\d+)", note)
         if not match:
             assert "End of file" in note
             break
         next_offset = int(match[1])
-        assert next_offset > args.get("offset_bytes", 0)
-        args["offset_bytes"] = next_offset
+        assert next_offset > args.get("offset", 0)
+        args.update(unit="bytes", offset=next_offset, limit=MAX_OUTPUT_BYTES)
     assert "".join(chunks) == text
     assert chunks[-1].endswith("Final policy: review required.")
 
@@ -66,6 +66,11 @@ async def test_byte_read_keeps_source_guards_and_rejects_ambiguous_ranges(tmp_pa
         await tools.read({"file_path": "raw/assigned.md", "offset": 1, "offset_bytes": 0})
     with pytest.raises(ValueError, match="offset_bytes"):
         await tools.read({"file_path": "raw/assigned.md", "offset_bytes": 99})
+    with pytest.raises(PermissionError):
+        await tools.read({"file_path": "raw/unassigned.md", "unit": "bytes", "offset": 0})
+    old = await tools.read({"file_path": "raw/assigned.md", "offset_bytes": 0, "limit_bytes": 4})
+    new = await tools.read({"file_path": "raw/assigned.md", "unit": "bytes", "offset": 0, "limit": 4})
+    assert old == new
 
 
 async def test_frozen_raw_scope_and_symlink_cannot_be_bypassed(tmp_path):

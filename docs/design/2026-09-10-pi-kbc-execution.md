@@ -73,8 +73,11 @@ host-tool completion before another turn can begin. EOF, abort, budget exhaustio
 and provider failure are distinct from completion.
 
 Text reads preserve bounded output while allowing a complete traversal of long
-single lines. Oversized lines switch to UTF-8 byte pages with an explicit next
-`offset_bytes`; the final page reports end of file. The same path guards apply
+single lines. One `offset`/`limit` range has an explicit `unit` of `lines` or
+`bytes`, so providers that populate every optional argument cannot create
+conflicting pagination modes. Oversized lines switch to UTF-8 byte pages with
+an explicit next offset; the final page reports end of file. Legacy byte
+arguments remain readable. The same path guards apply
 to line and byte reads. Quality survey and question outputs must contain the
 requested nonempty result arrays within the existing one-retry budget.
 

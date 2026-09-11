@@ -64,3 +64,32 @@ async def test_responses_read_failure_returns_to_model(tmp_path):
         result = next(item for item in requests[1]["input"] if item.get("type") == "function_call_output")
         assert "missing.md" in result["output"]
         assert events[-1].data["outcome"] == "completed"
+
+
+async def test_responses_read_with_every_advertised_parameter_can_write_result(tmp_path):
+    source = "Synthetic retention rule: keep records for 19 days."
+    (tmp_path / "source.md").write_text(source)
+
+    def respond(body, number):
+        if number == 1:
+            schema = next(tool["parameters"] for tool in body["tools"] if tool["name"] == "Read")
+            # Some providers populate every optional property in tool calls.
+            values = {"file_path": "source.md", "unit": "lines", "offset": 1, "limit": 200,
+                      "offset_bytes": 0, "limit_bytes": 4096, "pages": ""}
+            return response(tool=("Read", {key: values[key] for key in schema["properties"]}))
+        if number == 2:
+            output = next(item["output"] for item in body["input"] if item.get("type") == "function_call_output")
+            if source not in output:
+                return response(text="Source could not be read")
+            return response(tool=("Write", {"file_path": "page.md", "content": source}))
+        return response(text="Written")
+
+    async with provider(respond, api="openai-responses") as (config, requests):
+        config["model"]["compat"] = {"sessionAffinityFormat": "openai-nosession"}
+        async with client(tmp_path, config, FileTools(str(tmp_path), ["Read", "Write"], allow).tools()) as instance:
+            await instance.query("Read the source and write its exact rule to page.md")
+            events = await collect(instance)
+        assert (tmp_path / "page.md").is_file(), "Read must remain usable when all schema properties are populated"
+        assert (tmp_path / "page.md").read_text() == source
+        assert events[-1].data["outcome"] == "completed"
+        assert events[-1].data["model_calls"] == 3
