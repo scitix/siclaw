@@ -609,6 +609,10 @@ class CompileRun:
         self.workdir = workdir
         self.round = round_
         self.instruction = instruction
+        # Server-decided continuation for the current compile.resume, if any
+        # ({"recovery_mode", "produced_count", "produced_pages"}); see
+        # _resume_workspace_state. Cleared by every other typed command.
+        self._recovery: dict | None = None
         self.events: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
         self.done = False
@@ -911,6 +915,10 @@ SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
 MAX_SYNC_FILE_BYTES = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1024)))
 ARTIFACT_ACK_TIMEOUT_SECS = 10 * 60
 RECOVERY_RESET_PATH = "authoring/RECOVERY_RESET.json"
+# Control plane → box: the COMPLETE set of candidate pages the interrupted
+# lineage produced (changed against its base draft). The compile.resume
+# parameters only summarize it; page classification reads this file.
+RECOVERY_PROVENANCE_PATH = "authoring/RECOVERY_PROVENANCE.json"
 # SDK stdio JSON reader buffer. The SDK default is 1MB, and one oversized tool
 # result (a Read of a big source file) kills the whole session with a fatal
 # "exceeded maximum buffer size" — seen live on a 139-source compile (2026-07-06).
@@ -1704,6 +1712,45 @@ def _render_command(run: "CompileRun", command: dict) -> str:
             rationale=params.get("rationale") or "(none)",
             pages=", ".join(pages) if pages else "(the pages the brief names)",
         )
+    if action == "compile.resume":
+        state = _resume_workspace_state(run)
+        if state == "complete":
+            pages = selfcheck.candidate_pages(run.workdir)
+            exclusions, _ = selfcheck.load_exclusions(run.workdir)
+            unaccounted = selfcheck.coverage(run.workdir, pages, exclusions)["unaccounted"]
+            listing = "\n".join(f"- raw/{p}" for p in unaccounted[:40])
+            if len(unaccounted) > 40:
+                listing += f"\n- … {len(unaccounted) - 40} more (see the coverage ledger)"
+            all_pages = sorted(page for page in pages if Path(page).name != "index.md")
+            recovery = run._recovery or {}
+            if recovery.get("recovery_mode") == "complete":
+                # Control-plane provenance: only these pages are this lineage's
+                # output; everything else under candidate/ is inherited baseline.
+                produced = list(recovery.get("produced_pages") or [])
+                produced_count = int(recovery.get("produced_count") or len(produced))
+                produced_set = set(produced)
+                inherited = [page for page in all_pages if page not in produced_set]
+            else:
+                produced, produced_count, inherited = all_pages, len(all_pages), []
+            produced_listing = "\n".join(f"- candidate/{p}" for p in produced[:60])
+            if produced_count > len(produced[:60]):
+                produced_listing += f"\n- … {produced_count - len(produced[:60])} more"
+            if inherited:
+                inherited_text = strings["compile.resume_complete_inherited"].format(
+                    inherited=len(inherited),
+                    inherited_listing="\n".join(f"- candidate/{p}" for p in inherited[:60])
+                    + (f"\n- … {len(inherited) - 60} more" if len(inherited) > 60 else ""),
+                )
+            else:
+                inherited_text = strings["compile.resume_complete_no_inherited"]
+            return strings["compile.resume_complete"].format(
+                pages=produced_count, unaccounted=len(unaccounted),
+                produced_listing=produced_listing or "(none)",
+                inherited=inherited_text,
+                listing=listing or "(none — every source is already cited or excluded)",
+            )
+        if state == "restart":
+            return strings["compile.resume_restart"]
     rendered = strings[action]
     renew = params.get("renew")
     if renew is not None:
@@ -1723,11 +1770,36 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
             raise CommandRejected("the proposed plan changed; refresh before approving", 409)
     if action == "compile.incremental" and not incremental.has_changes(incremental.load_raw_changes(run.workdir)):
         raise CommandRejected("no structured source changes are available for incremental compile", 409)
+    # compile.resume is never refused here: the control plane sends it for every
+    # recovery lineage and _resume_workspace_state decides the route (pending
+    # batch plan → orchestrator; landed pages → finish the ledger; empty → full
+    # compile). A refusal used to suspend the recovery with "command rejected".
+    run._recovery = None
     if action == "compile.resume":
-        plan = _load_batch_plan(run)
-        reset_marker = (Path(run.workdir) / RECOVERY_RESET_PATH).is_file()
-        if not _batch_plan_resumable(plan) and not reset_marker:
-            raise CommandRejected("no interrupted batch plan is available to resume", 409)
+        mode = params.get("recovery_mode")
+        if mode is not None and mode not in ("resume", "complete", "restart"):
+            raise CommandRejected("parameters.recovery_mode must be resume, complete or restart", 400)
+        inline = params.get("produced_pages")
+        if inline is not None and (not isinstance(inline, list) or len(inline) > 500):
+            raise CommandRejected("parameters.produced_pages must be a list of at most 500 pages", 400)
+        count = params.get("produced_count", len(inline or []))
+        if not isinstance(count, int) or count < 0:
+            raise CommandRejected("parameters.produced_count must be a non-negative integer", 400)
+        produced: list[str] | None = None
+        if mode == "complete":
+            # The classification set must be COMPLETE: a page missing from it is
+            # told to be rewritten as inherited. Prefer the workspace artifact the
+            # control plane wrote (never truncated); accept the inline list only
+            # when it is whole; otherwise refuse rather than misclassify.
+            produced = _load_recovery_provenance(run.workdir, count)
+            if produced is None and inline is not None and len(inline) == count:
+                produced = [_bounded_string(p, f"parameters.produced_pages[{i}]", required=True, limit=512) for i, p in enumerate(inline)]
+            if produced is None:
+                raise CommandRejected(
+                    f"recovery provenance is incomplete: {RECOVERY_PROVENANCE_PATH} is missing or does not list all "
+                    f"{count} produced page(s) and the inline list is partial", 409)
+        run._recovery = {"recovery_mode": mode, "produced_count": count, "produced_pages": produced or []}
+
     if action == "compile.refresh_domain":
         index = Path(run.workdir) / "candidate" / "index.md"
         if not index.is_file():
@@ -1737,6 +1809,24 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         # Structured command data replaces the old localized-text parser. The
         # file remains model-facing intent, not a control-plane fact.
         _write_brief(run.workdir, brief)
+
+
+def _load_recovery_provenance(workdir: str, expected_count: int) -> list[str] | None:
+    """The complete produced-page set from RECOVERY_PROVENANCE.json, or None when
+    the file is absent, malformed, or disagrees with the command's count."""
+    path = Path(workdir) / RECOVERY_PROVENANCE_PATH
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    pages = data.get("produced_pages") if isinstance(data, dict) else None
+    if not isinstance(pages, list) or not all(isinstance(p, str) and p for p in pages):
+        return None
+    if data.get("produced_count", len(pages)) != expected_count or len(pages) != expected_count:
+        return None
+    return [str(p) for p in pages]
 
 
 def _compile_engine_tools(
@@ -3506,6 +3596,11 @@ def _should_route_to_incremental(run: "CompileRun", text: str, action: str | Non
     batch route (backward compatible: the consumer not yet wired = old behavior)."""
     if run._batch_active:
         return False
+    if action == "compile.resume":
+        # A recovered incremental lineage still carries its changeset; without a
+        # pending batch plan the scoped path is the right continuation, not a
+        # full recompile of the cloned base draft.
+        return _resume_workspace_state(run) != "plan" and incremental.has_changes(incremental.load_raw_changes(run.workdir))
     if action is not None and action != "compile.incremental":
         return False
     if action is None and not _is_compile_trigger(text):
@@ -3653,6 +3748,39 @@ def _batch_plan_resumable(plan: dict | None) -> bool:
         len(batching.pending_batches(plan)) > 0
         or plan.get("phase") in {"map", "reduce", "final", "commit"}
     )
+
+
+def _candidate_has_pages(workdir: str) -> bool:
+    """Any candidate/**/*.md besides the index — the durable evidence that a
+    single-session compile landed work before it was interrupted."""
+    cand = Path(workdir) / "candidate"
+    if not cand.is_dir():
+        return False
+    return any(p.name != "index.md" for p in cand.rglob("*.md"))
+
+
+def _resume_workspace_state(run: "CompileRun") -> str:
+    """What a ``compile.resume`` continues from. The control plane sends the
+    same command for every recovery lineage; the workspace decides:
+
+    plan     — a pending compiler-owned batch plan (or an explicit reset marker
+               revoking a corrupt one): run the batch orchestrator.
+    complete — no plan but candidate pages landed: a single-session compile died
+               mid-way. Finish the coverage ledger over what landed.
+    restart  — nothing landed: the compile failed before producing anything.
+               Treat it as a fresh full compile of the same frozen raw/.
+    """
+    if _batch_plan_resumable(_load_batch_plan(run)) or (Path(run.workdir) / RECOVERY_RESET_PATH).is_file():
+        return "plan"
+    decided = (run._recovery or {}).get("recovery_mode")
+    if decided in ("complete", "restart"):
+        # The control plane compared this lineage's candidate pages against the
+        # base draft it was cloned from. File existence alone cannot tell an
+        # inherited page (a regeneration clones the stable draft into staging
+        # before anything is compiled) from one this compile produced, so its
+        # decision wins over the local inference below.
+        return decided
+    return "complete" if _candidate_has_pages(run.workdir) else "restart"
 
 
 def _write_batch_file(run: "CompileRun", rel: str, value) -> None:

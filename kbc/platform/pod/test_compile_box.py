@@ -4857,14 +4857,128 @@ def test_hierarchical_resume_state_contract():
         plan["phase"] = "complete"
         (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
         assert not compile_box._batch_plan_resumable(plan)
+        # A completed plan is not resumable work; with nothing else in the
+        # workspace the command falls through to the restart route (it is no
+        # longer refused — the control plane sends compile.resume for every
+        # recovery lineage, see test_resume_without_plan_routes_by_workspace).
+        compile_box._prepare_command(run, command)
+        assert compile_box._resume_workspace_state(run) == "restart"
+        assert not compile_box._should_route_to_batch(run, "ignored localized text", "compile.resume")
+    print("\u2713 hierarchical resume: typed command covers map/reduce/final/commit only")
+
+
+def test_resume_without_plan_routes_by_workspace():
+    """compile.resume is the single continuation command. Without a pending
+    batch plan the WORKSPACE decides: landed pages → finish the coverage ledger
+    (complete); nothing landed → full compile of the same raw/ (restart); a
+    recovered incremental lineage → the scoped path. The command is never
+    refused. This is the box half of the control plane's plan-less recovery
+    (single-session compiles and planning-phase failures used to be lost)."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir()
+        run = compile_box.CompileRun("resume-state", str(wd), 1)
+        command = {"action": "compile.resume", "parameters": {}}
+        strings = compile_box._command_strings(run.locale)
+
+        (wd / "raw").mkdir()
+        (wd / "raw" / "a.md").write_text("# A\n\nfact a\n", "utf-8")
+        (wd / "raw" / "b.md").write_text("# B\n\nfact b\n", "utf-8")
+
+        # Empty candidate/: restart — a full compile over the same raw/.
+        compile_box._prepare_command(run, command)
+        assert compile_box._resume_workspace_state(run) == "restart"
+        assert compile_box._render_command(run, command) == strings["compile.resume_restart"]
+        assert not compile_box._should_route_to_incremental(run, "", "compile.resume")
+
+        # Landed pages: complete — the directive names exactly the unaccounted sources.
+        (wd / "candidate").mkdir()
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Concept\ntitle: A\nsources:\n  - resource: raw/a.md\n---\n\n# A\n\nfact a (source: a.md)\n", "utf-8")
+        (wd / "candidate" / "index.md").write_text(
+            '---\nokf_version: "0.2"\n---\n\n## Pages\n\n* [A](a.md) - a\n', "utf-8")
+        assert compile_box._resume_workspace_state(run) == "complete"
+        text = compile_box._render_command(run, command)
+        assert text.startswith(strings["compile.resume_complete"].split("{pages}")[0])
+        assert "produced 1 candidate page" in text and "1 source(s)" in text
+        assert "- raw/b.md" in text and "- raw/a.md" not in text
+        assert "was also written by this compile" in text  # no control-plane provenance → nothing inherited
+
+        # A recovered incremental lineage still carries its changeset → scoped path.
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(json.dumps({
+            "added": ["b.md"], "modified": [], "deleted": [], "diffs": {}, "summary": {},
+        }), "utf-8")
+        assert compile_box._should_route_to_incremental(run, "", "compile.resume")
+        (wd / "authoring" / "RAW_CHANGES.json").unlink()
+
+        # The control plane's decision wins over file existence. A regeneration
+        # clones the stable draft into staging, so an inherited a.md with a
+        # matching source is NOT this lineage's output: the control plane says restart.
+        restart_cmd = {"action": "compile.resume", "parameters": {"recovery_mode": "restart", "produced_count": 0, "produced_pages": []}}
+        compile_box._prepare_command(run, restart_cmd)
+        assert compile_box._resume_workspace_state(run) == "restart"
+        assert compile_box._render_command(run, restart_cmd) == strings["compile.resume_restart"]
+        # ...and when it says complete, only the named pages are kept; the rest
+        # are called out as inherited and to be regenerated.
+        (wd / "candidate" / "c.md").write_text(
+            "---\ntype: Concept\ntitle: C\nsources:\n  - resource: raw/b.md\n---\n\n# C\n\nfact b (source: b.md)\n", "utf-8")
+        complete_cmd = {"action": "compile.resume", "parameters": {"recovery_mode": "complete", "produced_count": 1, "produced_pages": ["c.md"]}}
+        compile_box._prepare_command(run, complete_cmd)
+        assert compile_box._resume_workspace_state(run) == "complete"
+        text = compile_box._render_command(run, complete_cmd)
+        assert "produced 1 candidate page" in text and "- candidate/c.md" in text
+        assert "inherited from the previous published draft" in text and "- candidate/a.md" in text
+        assert "regenerate" in text.lower()
+        # The classification set must be COMPLETE. A partial inline list (the
+        # control plane only previews up to 200 inline) is not accepted on its
+        # own; the workspace provenance artifact is the authority.
+        partial = {"action": "compile.resume", "parameters": {"recovery_mode": "complete", "produced_count": 2, "produced_pages": ["c.md"], "produced_pages_ref": compile_box.RECOVERY_PROVENANCE_PATH}}
         try:
-            compile_box._prepare_command(run, command)
+            compile_box._prepare_command(run, partial)
+        except compile_box.CommandRejected as error:
+            assert error.status == 409 and "incomplete" in str(error)
+        else:
+            raise AssertionError("a partial produced list must be refused, never used to classify pages")
+        (wd / compile_box.RECOVERY_PROVENANCE_PATH).write_text(json.dumps({
+            "version": 1, "recovery_mode": "complete", "produced_count": 2, "produced_pages": ["a.md", "c.md"],
+        }), "utf-8")
+        compile_box._prepare_command(run, partial)
+        assert run._recovery["produced_pages"] == ["a.md", "c.md"]
+        text = compile_box._render_command(run, partial)
+        assert "produced 2 candidate page" in text and "- candidate/a.md" in text and "- candidate/c.md" in text
+        assert "was also written by this compile" in text  # nothing falsely inherited
+        # A provenance file that disagrees with the command count is not trusted either.
+        (wd / compile_box.RECOVERY_PROVENANCE_PATH).write_text(json.dumps({"produced_count": 1, "produced_pages": ["a.md"]}), "utf-8")
+        try:
+            compile_box._prepare_command(run, partial)
         except compile_box.CommandRejected as error:
             assert error.status == 409
-            assert "no interrupted batch plan" in str(error)
         else:
-            raise AssertionError("complete batch plan must not be resumable")
-    print("\u2713 hierarchical resume: typed command covers map/reduce/final/commit only")
+            raise AssertionError("mismatched provenance must be refused")
+        (wd / compile_box.RECOVERY_PROVENANCE_PATH).unlink()
+        (wd / "candidate" / "c.md").unlink()
+        # Bad parameters are refused, and any other command clears the decision.
+        try:
+            compile_box._prepare_command(run, {"action": "compile.resume", "parameters": {"recovery_mode": "finish"}})
+        except compile_box.CommandRejected as error:
+            assert error.status == 400
+        else:
+            raise AssertionError("unknown recovery_mode must be refused")
+        compile_box._prepare_command(run, {"action": "compile.refresh_domain", "parameters": {}})
+        assert run._recovery is None
+
+        # A pending plan always wins and keeps the original resume directive.
+        plan = {"version": 3, "phase": "map", "batches": [{"id": "b1", "sources": ["b.md"], "status": "pending"}]}
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        assert compile_box._resume_workspace_state(run) == "plan"
+        assert compile_box._render_command(run, command) == strings["compile.resume"]
+        assert not compile_box._should_route_to_incremental(run, "", "compile.resume")
+        # Even a control-plane "complete" cannot override a pending batch plan.
+        compile_box._prepare_command(run, complete_cmd)
+        assert compile_box._resume_workspace_state(run) == "plan"
+    print("\u2713 plan-less compile.resume routes by workspace: restart / complete / incremental / plan")
 
 
 def test_hierarchical_pdf_page_directive():
@@ -6650,6 +6764,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_test_session_driver_uses_captured_contract()
     await test_open_close_test_session_http()
+    test_resume_without_plan_routes_by_workspace()
     await test_open_test_session_idempotency()
     await test_open_test_session_idempotency_is_run_scoped()
     await test_test_message_path()

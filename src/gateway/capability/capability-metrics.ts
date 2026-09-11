@@ -37,3 +37,9 @@ export const capabilityRelayFailuresTotal = new Counter({
   help: "Capability box event relays that ended with an error",
   registers: [federationSelfRegistry],
 });
+
+export const capabilityRelayReconnectsTotal = new Counter({
+  name: "siclaw_gateway_capability_relay_reconnects_total",
+  help: "Capability box event stream reconnects (stream lost while the box was still alive)",
+  registers: [federationSelfRegistry],
+});
