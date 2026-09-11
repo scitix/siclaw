@@ -18,6 +18,7 @@
     "quota-debug":              ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "service-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "statefulset-debug":        ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "ticket-review":            ["general", "sre", "developer"],
     "volcano-diagnose-pod":       ["volcano", "scheduling", "diagnostic", "sre", "developer"],
     "volcano-gang-scheduling":    ["volcano", "scheduling", "diagnostic", "sre", "developer"],
     "volcano-job-diagnose":       ["volcano", "scheduling", "diagnostic", "sre", "developer"],
