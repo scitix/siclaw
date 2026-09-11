@@ -130,8 +130,15 @@ class CompilerReadonlyEngine:
         roots = [Path(value).resolve() for value in allowed_read_roots] or [Path(cwd).resolve()]
         if Path(cwd).resolve() not in roots:
             raise ValueError("Read-only session cwd must be a declared read root")
+        # Every stage starts a fresh session. In particular, question generation
+        # does not inherit the survey's raw/wiki directory map.
+        filesystem_contract = (
+            f"\n\nRead-only filesystem: working directory is {Path(cwd).resolve()}. "
+            f"Allowed read roots: {json.dumps([str(root) for root in roots])}. "
+            "Use absolute paths to read files in a root outside the working directory."
+        )
         client = create_agent_client(
-            cwd=cwd, system_prompt=system_prompt, session_id=str(uuid.uuid4()),
+            cwd=cwd, system_prompt=system_prompt + filesystem_contract, session_id=str(uuid.uuid4()),
             model_config=(pi_config.for_role(role, model=model, effort=effort) if role
                           else pi_config.for_model(model, effort=effort)),
             tools=FileTools(cwd, ["Read", "Glob", "Grep"], _make_multiroot_guard(roots)).tools(),

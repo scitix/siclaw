@@ -153,3 +153,37 @@ async def test_claude_interrupt_settles_host_writes_before_next_turn(tmp_path):
             assert result[-1].data["outcome"] == "completed"
         finally:
             await client.disconnect()
+
+
+@pytest.mark.parametrize("engine", ["claude_agent_sdk", "pi_agent"])
+async def test_fresh_question_session_can_locate_raw_outside_wiki(tmp_path, monkeypatch, engine):
+    from redblue import _agent_json
+
+    raw, wiki = tmp_path / "raw", tmp_path / "wiki"
+    raw.mkdir()
+    wiki.mkdir()
+    (raw / "source.md").write_text("The staging watchdog is 45 seconds.")
+    expected = {"questions": [{"question": "What is the watchdog timeout?", "expected": "45 seconds"}]}
+    tool_name = "mcp__kbc__Read" if engine == "claude_agent_sdk" else "Read"
+
+    def respond(body, number):
+        # Question generation is a fresh session. The survey's directory map
+        # is not in its conversation, so the engine must disclose allowed roots.
+        context = json.dumps([body.get("system"), body["messages"]])
+        if str(raw) not in context:
+            return response(text='The raw source is not accessible. {"id":"q1","question":"Watchdog?"}')
+        if number == 1:
+            return response(tool=(tool_name, {"file_path": str(raw / "source.md")}))
+        assert "The staging watchdog is 45 seconds." in json.dumps(body["messages"])
+        return response(text=json.dumps(expected))
+
+    async with provider(respond) as (config, requests):
+        config["model"]["cost"] = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        configure(monkeypatch, config)
+        monkeypatch.setenv("KBC_ENGINE", engine)
+        result = await _agent_json(
+            selected_readonly_engine(), stage="questions", system="Check raw ground truth.",
+            user='Return one question as {"questions": [...]}.', model="claude-fixture", role="judge",
+            cwd=str(wiki), roots=[str(wiki), str(raw)], timeout=30)
+        assert result == expected
+        assert len(requests) == 2
