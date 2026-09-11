@@ -16,6 +16,38 @@ representative tool definition is 4,483 characters / 985 `o200k_base` tokens,
 23 more than the previous contract and still below the pre-planning 1,008 tokens.
 The three targeted suites passed 32 tests; TypeScript and backend build passed.
 
+Runtime and AgentBox were rebuilt from `f0d08d9e`, passed the offline non-root
+image contract check, and were deployed by digest. Four fresh Web sessions used
+the same natural-language prompts as the initial round, without supplied script
+code or changes to the Agent prompt:
+
+- The ordinary Agent discovered all 30 native tools and queried a five-node
+  sample. The broker approved only two reviewed query operations, with the
+  metric selector fixed to the test cluster; discovery does not grant sandbox
+  permission to every native tool.
+- One Python script saved a 429,274-byte native result with `call_to_file`, read
+  its JSON root and correctly handled absent `isError`. It summarized 7,205
+  points: 1,441 per node. All five min/mean/max rows matched an independent
+  calculation at the displayed precision. Only 494 bytes of summary reached
+  the Agent, rather than the raw series.
+- One Shell script used `siclaw-tool --output`, parsed the native result,
+  returned five node values, and confirmed local-file deletion.
+- A single negative-test script observed three denials: changing the fixed
+  query, calling an unapproved tool, and using an undeclared server. A valid
+  query in the same script still returned five nodes.
+
+Each of the three scripts completed on its first attempt in this corrected-image
+round, with empty stderr and no truncated output. Six SDK calls matched Runtime
+audit, and all complete script results matched persisted history. Network
+isolation was enabled; no prewarmed runner was used. Cached-image startup was
+1,702–2,215 ms, a small acceptance sample rather than a latency guarantee.
+The management API omitted the authorization value, storage encryption was
+checked, and the credential was absent from model events and saved history.
+The dedicated Agent and reviewed MCP binding remain available for further
+testing; temporary test-user access was revoked and execution resources were
+reclaimed. No runner SDK or companion API change was needed. Hosted E2B remains
+deferred and the PR remains draft.
+
 ## Live SSH host acceptance
 
 The deployed `120271d3` Runtime/AgentBox images were additionally exercised
