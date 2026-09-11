@@ -55,7 +55,9 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
     const endpoint = kubeConnection(file.content).url.origin;
     const keys = [key("cluster", endpoint)];
     if (call.tool === "node_exec") keys.push(key("node", [endpoint, call.arguments.node]));
-    if (call.tool === "pod_exec") keys.push(key("pod", [endpoint, call.arguments.namespace ?? "default", call.arguments.pod, call.arguments.container ?? ""]));
+    // Omitted container resolves remotely; group the whole Pod so an explicit
+    // container name cannot bypass a simultaneous default-container invocation.
+    if (call.tool === "pod_exec") keys.push(key("pod", [endpoint, call.arguments.namespace ?? "default", call.arguments.pod]));
     return keys;
   }
 

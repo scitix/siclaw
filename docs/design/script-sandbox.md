@@ -240,10 +240,11 @@ Runtime hashes the authorized endpoint, never a script-provided URL or quota:
 | --- | ---: | --- |
 | Cluster API origin | 10 across all Runtime instances | 10 calls/s, burst 20 |
 | MCP origin | 10 across all Runtime instances | 10 calls/s, burst 20 |
-| Same host address/port, node, or Pod container | 1 | Included in its cluster budget when applicable |
+| Same host address/port, node, or Pod | 1 | Included in its cluster budget when applicable |
 
 Bindings with different names but the same endpoint share capacity; unrelated
-endpoints can proceed independently. Endpoint aliases with different origins
+endpoints can proceed independently. Pod execution shares one slot across its
+containers, including an omitted/default container name. Endpoint aliases with different origins
 are distinct targets. The limit counts tool invocations, not every underlying
 HTTP request. MCP discovery/handshakes and upstream work can generate additional
 requests. Ordinary direct Agent calls retain their existing limits; this gate

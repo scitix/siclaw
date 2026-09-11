@@ -28,6 +28,9 @@ jobs:
       - run: npx tsx scripts/smoke/script-sandbox.ts
         env:
           SICLAW_SCRIPT_SANDBOX_IMAGE: siclaw-script:test
+      - run: npx tsx scripts/smoke/script-sandbox-concurrency.ts
+        env:
+          SICLAW_SCRIPT_SANDBOX_IMAGE: siclaw-script:test
       - uses: helm/kind-action@v1
         if: matrix.os == 'ubuntu-24.04'
         with:

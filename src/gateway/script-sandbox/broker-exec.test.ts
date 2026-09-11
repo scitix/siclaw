@@ -77,3 +77,17 @@ it.each(["revoked", "rebound"])("rechecks a queued target when it is %s", async 
   changed = true; finish(); await first; await denied;
   expect(builtin).toHaveBeenCalledOnce();
 });
+
+it("shares a Pod slot for explicit and default containers", async () => {
+  const finish: Array<() => void> = [];
+  const builtin = vi.fn<SandboxBuiltinExecutor>(() => new Promise(resolve => finish.push(() => resolve({ text: "ok" }))));
+  const broker = new ReadOnlyScriptBroker(rpc(), loadScriptSandboxConfig(), builtin);
+  const call = { id: "a", tool: "pod_exec", arguments: { cluster: "prod", pod: "api", command: "uname" } };
+  const first = broker.call(p(), scope, call, signal());
+  await vi.waitFor(() => expect(builtin).toHaveBeenCalledOnce());
+  const second = broker.call(p(), scope, { ...call, id: "b", arguments: { ...call.arguments, container: "main" } }, signal());
+  await new Promise(resolve => setTimeout(resolve, 10));
+  expect(builtin).toHaveBeenCalledOnce(); finish[0](); await first;
+  await vi.waitFor(() => expect(builtin).toHaveBeenCalledTimes(2));
+  finish[1](); await second;
+});
