@@ -8,7 +8,7 @@ from test_pi_engine import client, collect, provider, allow
 from pi_file_tools import FileTools
 
 
-def response(*, tool=None, text="done", status="completed"):
+def response(*, tool=None, text="done"):
     reasoning = {"id": "rs_fixture", "type": "reasoning", "summary": [],
                  "encrypted_content": "opaque-reasoning-fixture"}
     item = ({"type": "function_call", "id": "fc_fixture", "call_id": "call_fixture",
@@ -20,11 +20,10 @@ def response(*, tool=None, text="done", status="completed"):
     events = [{"type": "response.created", "response": {"id": "resp_fixture"}}]
     for index, value in enumerate(output):
         events.append({"type": "response.output_item.done", "output_index": index, "item": value})
-    events.append({"type": "response." + status, "response": {
-        "id": "resp_fixture", "status": status, "output": output,
+    events.append({"type": "response.completed", "response": {
+        "id": "resp_fixture", "status": "completed", "output": output,
         "usage": {"input_tokens": 42, "output_tokens": 8, "total_tokens": 50,
                   "input_tokens_details": {"cached_tokens": 12}},
-        **({"incomplete_details": {"reason": "max_output_tokens"}} if status == "incomplete" else {}),
     }})
     return web.Response(text="".join(f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n" for event in events),
                         content_type="text/event-stream")

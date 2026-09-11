@@ -104,6 +104,14 @@ The real-worker Responses fixture covers API-key requests, encrypted reasoning
 continuity and host-tool results, including a failed Read returned to the model.
 It does not establish compatibility or output quality for an untested gateway.
 
+`python kbc/tools/generate_compiler_corpus.py <output-directory>` creates a
+repeatable acceptance corpus: 14 fictional sources totaling 1,415,331 bytes,
+including a 1,059,531-byte manual and a 229,685-byte single-line supplement.
+At a 192,000-byte source budget it plans nine map batches below the total-corpus
+hierarchical threshold. Upload only `raw/`; keep the 22 reference questions in
+`expected.json` outside the compilation workspace. Real acceptance must check
+source coverage, those answers, unexpected exclusions and checkpoint recovery.
+
 The Pi SDK upgrade is a separate dependency PR. The KBC feature requires the
 paired control-plane API/Web change with execution/observation table migrations and the
 Siclaw Runtime/AgentBox/KBC images from exact commits.
