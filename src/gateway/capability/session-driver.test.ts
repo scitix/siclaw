@@ -451,3 +451,80 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     });
   });
 });
+
+describe("driveCapabilitySession — bounded stream reconnect", () => {
+  const alive = { baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true };
+
+  it("re-opens the stream with replay when it breaks while the box is alive", async () => {
+    const paths: string[] = [];
+    let call = 0;
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (call++ === 0) {
+          yield { type: "log", text: "before the drop" };
+          throw new Error("socket hang up");
+        }
+        yield { type: "log", text: "after reconnect" };
+        yield { type: "end" };
+      },
+    } as any;
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager: mgr, reconnect: alive });
+    expect(paths).toEqual(["/events/r1", "/events/r1?replay=1"]);
+    expect(emits(fe).filter((e: any) => e.type === "log").map((e: any) => e.payload.text)).toEqual(["before the drop", "after reconnect"]);
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+
+  it("gives up immediately when the box no longer answers", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        throw new Error("ECONNRESET");
+      },
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await expect(driveCapabilitySession({
+      client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
+      reconnect: { ...alive, isBoxAlive: async () => false },
+    })).rejects.toThrow("ECONNRESET");
+    expect(paths).toEqual(["/events/r1"]);
+    expect(mgr.endRun).not.toHaveBeenCalled(); // the caller fails the run (relay_failed)
+  });
+
+  it("fails the relay once the attempt budget is spent", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        throw new Error("still broken");
+      },
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await expect(driveCapabilitySession({
+      client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
+      reconnect: { ...alive, maxAttempts: 2 },
+    })).rejects.toThrow("still broken");
+    expect(paths).toEqual(["/events/r1", "/events/r1?replay=1", "/events/r1?replay=1"]);
+  });
+
+  it("ignores a stream error after the run already settled", async () => {
+    const mgr = fakeManager();
+    const client = {
+      async *streamPath(_path: string) {
+        yield { type: "done" };
+        throw new Error("connection closed by peer");
+      },
+    } as any;
+    // endRun("done") is sticky in the real manager; mirror it for the check.
+    mgr.endRun.mockImplementation(async () => { mgr.get.mockReturnValue({ status: "done" }); });
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr, reconnect: alive });
+    expect(mgr.endRun).toHaveBeenCalledTimes(1);
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+});

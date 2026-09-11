@@ -29,6 +29,7 @@ import {
   isTerminalCapabilityStatus,
 } from "./contract.js";
 import { structuredBoxFailure } from "./failure.js";
+import { capabilityRelayReconnectsTotal } from "./capability-metrics.js";
 
 interface BoxEvent {
   type: string;
@@ -67,7 +68,37 @@ export interface DriveCapabilitySessionOptions {
   manager: CapabilityRunManager;
   /** Re-attaching to a live box after relay/runtime loss: request full replay. */
   replayWorkspace?: boolean;
+  /** Bounded reconnect of the box event stream (see driveCapabilitySession). */
+  reconnect?: Partial<StreamReconnectPolicy>;
 }
+
+export interface StreamReconnectPolicy {
+  /** Reconnect attempts per run before the relay gives up and fails the run. */
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  /** Probe the box before reconnecting; a dead box is not worth waiting for. */
+  isBoxAlive: (client: AgentBoxClient) => Promise<boolean>;
+}
+
+// Six attempts with 2s→60s backoff is about three minutes of transport trouble
+// tolerated; the run-manager's data-stale watchdog still bounds a box that is
+// alive but silent. A box that answers /health is worth reconnecting to — the
+// alternative (relay_failed → stop the box) throws away the whole in-flight
+// batch for a broken TCP connection.
+export const defaultStreamReconnectPolicy: StreamReconnectPolicy = {
+  maxAttempts: 6,
+  baseDelayMs: 2_000,
+  maxDelayMs: 60_000,
+  isBoxAlive: async (client) => {
+    try {
+      await client.getJson("/health");
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
 
 /**
  * Relay the box event stream over the capability protocol until the box closes
@@ -81,14 +112,49 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     frontendClient.emitEvent(CAPABILITY_EVENT, frame);
   };
 
-  // onComment: the box emits `: heartbeat` SSE comments between data events. A
-  // long read-only compile phase can be data-silent for >10min — the heartbeat
-  // must count as liveness (touchHeartbeat, the separate clock) or the watchdog
-  // reaps a healthy run and kills its box. It is deliberately NOT touch(): a box
-  // that ONLY heartbeats (a wedged turn) must still be reaped at dataStaleMs.
-  const eventPath = `/events/${runId}${opts.replayWorkspace ? "?replay=1" : ""}`;
-  for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
-    const evt = raw as BoxEvent;
+  const policy: StreamReconnectPolicy = { ...defaultStreamReconnectPolicy, ...opts.reconnect };
+  let replay = opts.replayWorkspace === true;
+  let attempts = 0;
+  for (;;) {
+    // onComment: the box emits `: heartbeat` SSE comments between data events. A
+    // long read-only compile phase can be data-silent for >10min — the heartbeat
+    // must count as liveness (touchHeartbeat, the separate clock) or the watchdog
+    // reaps a healthy run and kills its box. It is deliberately NOT touch(): a box
+    // that ONLY heartbeats (a wedged turn) must still be reaped at dataStaleMs.
+    const eventPath = `/events/${runId}${replay ? "?replay=1" : ""}`;
+    try {
+      for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
+        await relayBoxEvent(raw as BoxEvent);
+      }
+      return; // clean close: the box ended the stream
+    } catch (err) {
+      // A stream error after the run already settled (done/error consumed, or the
+      // record dropped at a terminal) has nothing left to relay — do not turn it
+      // into a relay_failed that stops a box which is already finished.
+      const rec = manager.get(runId);
+      if (rec && isTerminalCapabilityStatus(rec.status)) {
+        console.warn(`[capability] run=${runId} box stream error after terminal status; ignoring`);
+        return;
+      }
+      attempts++;
+      if (attempts > policy.maxAttempts || !(await policy.isBoxAlive(client))) {
+        throw err;
+      }
+      const delay = Math.min(policy.baseDelayMs * 2 ** (attempts - 1), policy.maxDelayMs);
+      capabilityRelayReconnectsTotal.inc();
+      console.warn(
+        `[capability] run=${runId} box stream lost (${attempts}/${policy.maxAttempts}), box alive; ` +
+          `reconnecting with replay in ${delay}ms: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      // Re-attach semantics: ask for the workspace replay so a sync batch that
+      // was in flight when the connection broke is delivered again (the
+      // consumer accepts duplicate ACKs; persistArtifacts is idempotent).
+      replay = true;
+    }
+  }
+
+  async function relayBoxEvent(evt: BoxEvent): Promise<void> {
     // ANY box event means the box is alive → bump activity so the watchdog never
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
     // touch() is in-memory only (no persist), so it is cheap to call every event.
