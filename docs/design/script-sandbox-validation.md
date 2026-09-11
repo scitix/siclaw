@@ -1,5 +1,47 @@
 # Script sandbox validation — 2026-09-11
 
+## Live SSH host acceptance
+
+The deployed `120271d3` Runtime/AgentBox images were additionally exercised
+against a real test-cluster host using a temporary platform binding and an
+operator-supplied root credential. The password was supplied only to the
+control plane's credential store. The host's public key was read through the
+authenticated Kubernetes API and pinned in Runtime; scripts received only the
+registered host handle.
+
+- An ordinary `host_exec` first read the host name and `somaxconn=4096`.
+  The initial `host_list` request incorrectly searched for an ID using its
+  documented name/IP/description filter and made no SSH call. Supplying the
+  registered host name corrected this test input.
+- One model-written Python script used two successful SDK `host_exec` calls
+  to read the kernel and somaxconn, then created, read, modified and deleted
+  `/work/host.json`. Remote `rm -f` against a unique nonexistent canary and an
+  undeclared host call were denied; socket creation raised `PermissionError`.
+- Direct `host_exec` rejected the same `rm` with `command_blocked`. A single
+  model-written Shell script used `siclaw-tool --output` to save the 94-byte
+  command envelope, parse the host name/somaxconn and delete its local file.
+- Removing the temporary pins and reloading Runtime made another single-call
+  script reject the otherwise valid, declared host query.
+
+The three scripts each completed on the first attempt. Six SDK calls produced
+three permitted reads and three denials, independently confirmed in Runtime
+audit. All three complete results matched persisted Web history. Cached-image
+startup without prewarming was 1,152–2,212 ms; this small sample is not an SLA.
+
+Cleanup exposed a companion-service credential reference lookup that assumed
+every binding table had a name column. The companion fix retains deletion
+protection: its deployed API returned 409 while a test host referenced the
+credential, then deleted it after that reference was removed. Temporary Agents,
+hosts, credentials, groups and user privileges were removed. The original host
+pin policy was restored, execution Jobs/Pods were absent, and the test services
+were ready.
+
+Root remains a privileged SSH identity. These checks validate the shared
+diagnostic-tool policy and credential isolation, not a read-only operating-system
+account or proof that every diagnostic binary has no side effects. No sandbox
+command policy, SDK, or image change was needed for this host acceptance.
+Hosted E2B and live third-party MCP integration remain outside this round.
+
 ## Compact contract: deployed model acceptance
 
 Runtime and AgentBox were rebuilt from `120271d3` and deployed by immutable
