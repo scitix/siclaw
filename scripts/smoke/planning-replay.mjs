@@ -84,11 +84,14 @@ replays: for (let run = 1; run <= repeat; run++) {
       }
       buffer += decoder.decode();
       if (buffer.trim()) accept(buffer);
-      const assistantMessages = events.filter((e) => e.data?.type === "message_end"
-        && e.data.message?.role === "assistant").map((e) => e.data.message);
-      const lastAssistant = assistantMessages.at(-1);
+      const lastAssistantIndex = events.findLastIndex((e) => e.data?.type === "message_end"
+        && e.data.message?.role === "assistant");
+      const lastAssistant = events[lastAssistantIndex]?.data.message;
+      const lastStreamErrorIndex = events.findLastIndex((e) => e.event === "error");
+      // Only a later completed response can recover an earlier SSE error.
       const streamError = lastAssistant?.stopReason === "error"
-        || (events.some((e) => e.event === "error") && lastAssistant?.stopReason !== "stop");
+        || (lastStreamErrorIndex >= 0
+          && (lastStreamErrorIndex > lastAssistantIndex || lastAssistant?.stopReason !== "stop"));
       if (streamError) failure = "The chat stream ended with an execution/model error; inspect the trace";
       else if (!events.some((e) => e.event === "done")) failure = "Chat stream ended without its terminal event";
       else if (lastAssistant?.stopReason !== "stop"
