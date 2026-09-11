@@ -111,7 +111,7 @@ parameters. Unknown versions and unknown actions fail closed.
 | `compile.regenerate` | optional `brief` | Replace-generation into consumer-owned staging |
 | `compile.approve_plan` | `plan_id` | Execute the exact currently proposed plan |
 | `compile.incremental` | optional `brief` | Use the materialized structured changeset |
-| `compile.resume` | none | Resume an interrupted compiler-owned batch plan |
+| `compile.resume` | none from the caller; the control plane injects `recovery_mode` (`resume`/`complete`/`restart`), `produced_count`, `produced_pages_ref` (= `authoring/RECOVERY_PROVENANCE.json`, the complete produced-page set in the workspace) and an inline `produced_pages` preview only up to 200. In `complete` mode the box classifies pages from the file and refuses (409) when it is missing/mismatched and no whole inline list exists | Continue an interrupted compile from its workspace. The injected decision wins over local inference — a regeneration clones the stable draft, so file existence cannot tell inherited pages from this lineage's output: a pending compiler-owned batch plan (or a reset marker) resumes the batch train; landed candidate pages without a plan finish the coverage ledger; an empty candidate/ re-runs the full compile over the same raw/. A recovered incremental lineage (RAW_CHANGES.json with changes, no plan) takes the scoped incremental path. Never refused |
 | `compile.submit_decisions` | `decisions[]` | Apply owner decisions and propose the resulting plan |
 | `compile.apply_rulings` | `dispatch_nonce`, `rulings[]` | Apply contradiction rulings and emit per-ticket receipts |
 | `compile.repair_test` | `question`, `reference_answer`, `verdict` | Repair the minimum draft scope for a failed test |

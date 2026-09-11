@@ -35,6 +35,7 @@ import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { recoverCapabilityUsage } from "./capability/model-usage.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
+import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/container-evidence.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
@@ -1431,7 +1432,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
-  const unsubscribeCapabilityReconnect = frontendClient.onConnected?.(() => capabilityRunManager.reconcile());
+  let retryContainerEvidence: (() => void) | undefined;
+  const unsubscribeCapabilityReconnect = frontendClient.onConnected?.(async () => {
+    await capabilityRunManager.reconcile();
+    retryContainerEvidence?.();
+  });
   recoverCapabilityUsage(frontendClient);
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
@@ -2842,6 +2847,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     console.error("[runtime] Failed to start HTTPS server:", err);
   }
 
+  const containerObservation = spawner?.observeContainers?.((observation) =>
+    frontendClient.request(CAPABILITY_OBSERVE_CONTAINER, observation, 3_000));
+  retryContainerEvidence = () => containerObservation?.retry();
+
   // ── Server handle ────────────────────────────────────────
   const runtimeServer: RuntimeServer = {
     httpServer,
@@ -2851,6 +2860,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
+      await containerObservation?.stop();
       metricsAggregator?.destroy();
       unsubscribeCapabilityReconnect?.();
       await Promise.all([endInFlightTurns(), scriptSandbox.shutdown()]);

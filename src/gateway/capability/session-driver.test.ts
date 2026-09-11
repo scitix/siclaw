@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { driveCapabilitySession } from "./session-driver.js";
 import { CapabilityRunManager } from "./run-manager.js";
-import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS } from "./contract.js";
+import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS, CAPABILITY_PERSIST_EXECUTION_OBSERVATION, CAPABILITY_PERSIST_RUN_STATE } from "./contract.js";
 
 // Fake box client that yields a fixed sequence of box events over streamPath.
 function fakeClient(events: any[]) {
@@ -466,5 +466,194 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       input_revision: undefined,
       artifacts: [{ path: "candidate/dup.md", deleted: true }],
     });
+  });
+});
+
+describe("driveCapabilitySession — bounded stream reconnect", () => {
+  it("replays artifact ACKs without waiting for execution observations across reconnect", async () => {
+    const order: string[] = [];
+    let releaseObservation!: () => void;
+    const pendingObservation = new Promise<void>((resolve) => { releaseObservation = resolve; });
+    const fe = fakeFrontend();
+    fe.request.mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_EXECUTION_OBSERVATION) await pendingObservation;
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) order.push("persist");
+      return { ok: true };
+    });
+    const manager = new CapabilityRunManager(fe);
+    const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        yield {
+          type: "execution_observation",
+          observation: {
+            version: 1, id: `observation-${paths.length}`, session_id: "session", turn_id: "turn",
+            kind: "model_request", observed_at: "2026-09-11T00:00:00Z", role: "compiler",
+            model_id: "model", provider: "provider", data: {},
+          },
+        };
+        yield {
+          type: "syncArtifacts", sync_id: "sync-1",
+          artifacts: [{ path: "candidate/a.md", content: "# A" }],
+        };
+        if (paths.length === 1) throw new Error("socket reset");
+        yield { type: "done" };
+        yield { type: "end" };
+      },
+      postJson: vi.fn().mockImplementation(async () => { order.push("ack"); return { ok: true }; }),
+    } as any;
+    try {
+      await driveCapabilitySession({
+        client, runId, frontendClient: fe, manager,
+        reconnect: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true },
+      });
+      expect(paths).toEqual([`/events/${runId}`, `/events/${runId}?replay=1`]);
+      expect(order).toEqual(["persist", "ack", "persist", "ack"]);
+      expect(client.postJson).toHaveBeenCalledTimes(2);
+      expect(manager.get(runId)).toBeUndefined();
+      expect(fe.request.mock.calls.filter(([method]: any[]) => method === CAPABILITY_PERSIST_EXECUTION_OBSERVATION)).toHaveLength(1);
+    } finally {
+      releaseObservation();
+    }
+    await vi.waitFor(() => {
+      expect(fe.request.mock.calls.filter(([method]: any[]) => method === CAPABILITY_PERSIST_EXECUTION_OBSERVATION)).toHaveLength(2);
+    });
+  });
+
+  const alive = { baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true };
+
+  it("re-opens the stream with replay when it breaks while the box is alive", async () => {
+    const paths: string[] = [];
+    let call = 0;
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (call++ === 0) {
+          yield { type: "log", text: "before the drop" };
+          throw new Error("socket hang up");
+        }
+        yield { type: "log", text: "after reconnect" };
+        yield { type: "end" };
+      },
+    } as any;
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager: mgr, reconnect: alive });
+    expect(paths).toEqual(["/events/r1", "/events/r1?replay=1"]);
+    expect(emits(fe).filter((e: any) => e.type === "log").map((e: any) => e.payload.text)).toEqual(["before the drop", "after reconnect"]);
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+
+  it("gives up immediately when the box no longer answers", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        throw new Error("ECONNRESET");
+      },
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await expect(driveCapabilitySession({
+      client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
+      reconnect: { ...alive, isBoxAlive: async () => false },
+    })).rejects.toThrow("ECONNRESET");
+    expect(paths).toEqual(["/events/r1"]);
+    expect(mgr.endRun).not.toHaveBeenCalled(); // the caller fails the run (relay_failed)
+  });
+
+  it("fails the relay once the attempt budget is spent", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        throw new Error("still broken");
+      },
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await expect(driveCapabilitySession({
+      client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
+      reconnect: { ...alive, maxAttempts: 2 },
+    })).rejects.toThrow("still broken");
+    expect(paths).toEqual(["/events/r1", "/events/r1?replay=1", "/events/r1?replay=1"]);
+  });
+
+  it("ignores a stream error after the run already settled", async () => {
+    const mgr = fakeManager();
+    const client = {
+      async *streamPath(_path: string) {
+        yield { type: "done" };
+        throw new Error("connection closed by peer");
+      },
+    } as any;
+    // The real manager DROPS the record after persisting the terminal state.
+    mgr.endRun.mockImplementation(async () => { mgr.get.mockReturnValue(undefined); });
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fakeFrontend(), manager: mgr, reconnect: alive });
+    expect(mgr.endRun).toHaveBeenCalledTimes(1);
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+});
+
+describe("driveCapabilitySession — reconnect against the real run manager", () => {
+  const noDelay = { baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true };
+  const frontend = () => ({ emitEvent: vi.fn(), request: vi.fn().mockResolvedValue({ ok: true }) }) as any;
+
+  it.each(["done", "error"])("does not replay after %s was persisted and the live record dropped", async (eventType) => {
+    const fe = frontend();
+    const manager = new CapabilityRunManager(fe);
+    const id = `settled-${eventType}`;
+    await manager.startRun({ runId: id, profile: "kb-compile", orgId: "t" });
+    const paths: string[] = [];
+    const health = vi.fn().mockResolvedValue(true);
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (paths.length === 1) {
+          yield { type: eventType };
+          expect(manager.get(id)).toBeUndefined(); // endRun dropped the record
+          throw new Error("socket reset after terminal, before end");
+        }
+        yield { type: "end" };
+      },
+    } as any;
+    await driveCapabilitySession({ client, runId: id, frontendClient: fe, manager, reconnect: { ...noDelay, isBoxAlive: health } });
+    const persisted = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_RUN_STATE).map((c: any[]) => c[1].status);
+    expect(persisted).toEqual(["running", eventType === "done" ? "done" : "failed"]);
+    expect(paths).toEqual([`/events/${id}`]);
+    expect(health).not.toHaveBeenCalled();
+  });
+
+  it.each(["probe", "backoff"])("does not reopen after the run settles during the %s", async (stage) => {
+    const fe = frontend();
+    const manager = new CapabilityRunManager(fe);
+    const id = `settle-during-${stage}`;
+    await manager.startRun({ runId: id, profile: "kb-compile", orgId: "t" });
+    const paths: string[] = [];
+    let settling: Promise<void> | undefined;
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (paths.length === 1) throw new Error("temporary stream reset");
+        yield { type: "end" };
+      },
+    } as any;
+    await driveCapabilitySession({
+      client, runId: id, frontendClient: fe, manager,
+      reconnect: {
+        ...noDelay, baseDelayMs: 20, maxDelayMs: 20,
+        isBoxAlive: async () => {
+          if (stage === "probe") await manager.endRun(id, "done");
+          else setTimeout(() => { settling = manager.endRun(id, "done"); }, 0);
+          return true;
+        },
+      },
+    });
+    await settling;
+    expect(paths).toEqual([`/events/${id}`]);
+    expect(manager.get(id)).toBeUndefined();
   });
 });
