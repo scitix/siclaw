@@ -187,3 +187,41 @@ async def test_fresh_question_session_can_locate_raw_outside_wiki(tmp_path, monk
             cwd=str(wiki), roots=[str(wiki), str(raw)], timeout=30)
         assert result == expected
         assert len(requests) == 2
+
+
+async def test_claude_assembles_text_blocks_before_returning_json(tmp_path, monkeypatch):
+    expected = {"questions": [{"question": "What is the timeout?", "expected": "45 seconds"}]}
+    encoded = json.dumps(expected)
+    parts = [encoded[:len(encoded) // 2], encoded[len(encoded) // 2:]]
+    observed = []
+
+    async def observe(event):
+        observed.append(event)
+
+    def respond(_, number):
+        if number == 1:
+            return response(tool=("mcp__kbc__Read", {"file_path": "source.md"}))
+        template = [json.loads(line[6:]) for line in response().text.splitlines() if line.startswith("data: ")]
+        events = [template[0]]
+        for index, part in enumerate(parts):
+            events.append({"type": "content_block_start", "index": index,
+                           "content_block": {"type": "text", "text": ""}})
+            for offset in range(0, len(part), 13):
+                events.append({"type": "content_block_delta", "index": index,
+                               "delta": {"type": "text_delta", "text": part[offset:offset + 13]}})
+            events.append({"type": "content_block_stop", "index": index})
+        events.extend(template[-2:])
+        return web.Response(text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events),
+                            content_type="text/event-stream")
+
+    (tmp_path / "source.md").write_text("The timeout is 45 seconds.")
+    async with provider(respond) as (config, requests):
+        configure(monkeypatch, config)
+        with observe_sessions(observe):
+            answer = await selected_readonly_engine().run_readonly_agent(
+                cwd=str(tmp_path), system_prompt="Read the source and return JSON.", user_message="Write a question.",
+                model="claude-fixture", role="judge", allowed_read_roots=[str(tmp_path)], timeout_secs=30)
+        assert json.loads(answer) == expected
+        assert len(requests) == 2
+        assert [e["data"]["stop_reason"] for e in observed if e["kind"] == "assistant"] == ["tool_use", "end_turn"]
+        assert [e["data"]["model_calls"] for e in observed if e["kind"] == "result"] == [2]

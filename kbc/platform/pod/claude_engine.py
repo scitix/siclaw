@@ -49,6 +49,9 @@ class ClaudeAgentClient:
         self._model_calls = 0
         self._usage = {}
         self._status = None
+        self._assistant = None
+        self._message_usage = {}
+        self._message_stop_reason = None
         self._names = {"mcp__kbc__" + name: name for name in self.tools}
 
     @property
@@ -138,29 +141,61 @@ class ClaudeAgentClient:
         await self._observations.emit("ready", {"sdk_version": self.sdk_version})
         self._reader = asyncio.create_task(self._read_messages())
 
+    async def _flush_assistant(self):
+        if self._assistant is None:
+            return
+        message, self._assistant = self._assistant, None
+        self._model_calls += 1
+        self._usage = dict(self._message_usage)
+        await self._emit("assistant", {
+            "content": message["content"], "stop_reason": self._message_stop_reason,
+            "llm_call": {"model": {"id": self.config["model"]["id"]}, "usage": self._usage},
+        })
+
     async def _read_messages(self):
         try:
             async for message in self._client.receive_messages():
                 kind = type(message).__name__
                 if kind == "StreamEvent":
+                    event = message.event
+                    if event.get("type") == "message_start":
+                        await self._flush_assistant()
+                        self._message_usage = dict((event.get("message") or {}).get("usage") or {})
+                        self._message_stop_reason = None
+                    elif event.get("type") == "message_delta":
+                        self._message_usage.update(event.get("usage") or {})
+                        self._message_stop_reason = (event.get("delta") or {}).get("stop_reason")
+                    elif event.get("type") == "message_stop":
+                        await self._flush_assistant()
                     await self._emit("activity", {})
                 elif kind == "AssistantMessage":
-                    self._model_calls += 1
-                    self._usage = message.usage or {}
+                    # The SDK emits one AssistantMessage per completed content
+                    # block, sharing a message ID. Normalize them to the single
+                    # completed-message contract used by both compiler engines.
+                    if self._assistant is not None and self._assistant["id"] != message.message_id:
+                        await self._flush_assistant()
+                    if self._assistant is None:
+                        self._assistant = {"id": message.message_id, "content": []}
+                    if not self._message_usage:
+                        self._message_usage = dict(message.usage or {})
+                    if message.stop_reason:
+                        self._message_stop_reason = message.stop_reason
                     if message.error:
                         self._status = {"billing_error": 402, "rate_limit": 429, "authentication_failed": 401,
                                         "invalid_request": 400, "server_error": 500}.get(message.error)
-                    blocks = []
+                    blocks = self._assistant["content"]
                     for block in message.content:
                         value = asdict(block)
                         if type(block).__name__ == "TextBlock":
-                            blocks.append({"type": "text", "text": value["text"]})
+                            if blocks and blocks[-1]["type"] == "text":
+                                blocks[-1]["text"] += value["text"]
+                            else:
+                                blocks.append({"type": "text", "text": value["text"]})
                         elif type(block).__name__ == "ToolUseBlock":
                             blocks.append({"type": "toolCall", "id": value["id"],
                                            "name": self._names.get(value["name"], value["name"]), "arguments": value["input"]})
-                    await self._emit("assistant", {"content": blocks, "stop_reason": message.stop_reason,
-                                                   "llm_call": {"model": {"id": self.config["model"]["id"]}, "usage": self._usage}})
                 elif kind == "ResultMessage":
+                    await self._flush_assistant()
                     await self._stop_tools()
                     data = {"outcome": "aborted" if self._aborted else "failed" if message.is_error else "completed",
                             "model_calls": self._model_calls, "tool_calls": self._tool_calls,
