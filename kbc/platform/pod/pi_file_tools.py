@@ -49,10 +49,11 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-async def _command(command: list[str], *, limit: int = MAX_OUTPUT_BYTES) -> tuple[int, str, bool]:
+async def _command(command: list[str], *, limit: int = MAX_OUTPUT_BYTES,
+                   cwd: Path | None = None) -> tuple[int, str, bool]:
     """Bounded subprocess output and cancellation; never starts a shell."""
     process = await asyncio.create_subprocess_exec(
-        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=cwd,
     )
     output = bytearray()
     truncated = False
@@ -255,16 +256,21 @@ class FileTools:
     async def glob(self, args: dict) -> dict:
         await self.check("Glob", args)
         root = self.target(args.get("path") or str(self.root))
+        if not root.is_dir():
+            raise ValueError("Glob path must be a directory")
         pattern = args.get("pattern")
         if not isinstance(pattern, str) or not pattern:
             raise ValueError("pattern must be non-empty text")
         if Path(pattern).is_absolute():
             pattern = str(Path(pattern).relative_to(root))
-        status, output, truncated = await _command(["rg", "--files", "--null", "--hidden", "--no-ignore", "-g", pattern, "--", str(root)])
+        status, output, truncated = await _command(
+            ["rg", "--files", "--null", "--hidden", "--no-ignore", "-g", pattern, "--", "."], cwd=root,
+        )
         if status not in (0, 1) and not truncated:
             raise ValueError(f"Glob failed: {output[:1000]}")
         paths = []
         for value in output.split("\0")[:-1]:
+            value = str((root / value).resolve())
             try:
                 await self.check("Glob", {**args, "path": value})
             except PermissionError:
@@ -291,13 +297,15 @@ class FileTools:
             # rg bypasses glob/type filters for an explicitly named file. Walk
             # its immediate parent and keep only that file after filtering.
             enumerate_command.extend(["--max-depth", "1"])
+        search_root = root.parent if single_file else root
         status, listing, listing_truncated = await _command(
-            [*enumerate_command, "--", str(root.parent if single_file else root)], limit=MAX_PATH_LIST_BYTES,
+            [*enumerate_command, "--", "."], limit=MAX_PATH_LIST_BYTES, cwd=search_root,
         )
         if status not in (0, 1) and not listing_truncated:
             raise ValueError("Could not enumerate search paths")
         paths = []
         for value in listing.split("\0")[:-1]:
+            value = str((search_root / value).resolve())
             if single_file and Path(value) != root:
                 continue
             try:

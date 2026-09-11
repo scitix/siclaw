@@ -131,6 +131,22 @@ async def test_grep_filters_files_before_consuming_output_budget(tmp_path, filte
     assert (await tools.grep({**args, "path": "notes.txt"}))["content"][0]["text"] == "No matches."
 
 
+@pytest.mark.parametrize("tool", ["glob", "grep"])
+async def test_search_globs_are_relative_to_the_selected_directory(tmp_path, tool):
+    selected = tmp_path / "candidate"
+    (selected / "nested").mkdir(parents=True)
+    page = selected / "nested/page.md"
+    page.write_text("selected-marker")
+    (selected / "ignored.txt").write_text("selected-marker")
+    tools = files(tmp_path)
+    args = {"path": str(selected), "pattern": "nested/*.md"}
+    if tool == "grep":
+        args.update(pattern="selected-marker", glob="nested/*.md", output_mode="content")
+    result = (await getattr(tools, tool)(args))["content"][0]["text"]
+    assert str(page) in result
+    assert "ignored.txt" not in result
+
+
 def pdf_fixture(path: Path):
     """Three actual PDF pages, without adding a PDF library to production."""
     objects = [b"<< /Type /Catalog /Pages 2 0 R >>",

@@ -78,7 +78,8 @@ single lines. One `offset`/`limit` range has an explicit `unit` of `lines` or
 conflicting pagination modes. Oversized lines switch to UTF-8 byte pages with
 an explicit next offset; the final page reports end of file. Legacy byte
 arguments remain readable. The same path guards apply
-to line and byte reads. Quality survey and question outputs must contain the
+to line and byte reads. Glob and Grep resolve relative path filters against the
+selected search directory rather than the host process directory. Quality survey and question outputs must contain the
 requested nonempty result arrays within the existing one-retry budget.
 
 A running box with its original session is reused across Runtime replacement.
