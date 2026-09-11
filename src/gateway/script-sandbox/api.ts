@@ -10,6 +10,7 @@ import { ReadOnlyScriptBroker, type SandboxControlPlane, type SandboxBuiltinExec
 import { K8sScriptSandboxProvider } from "./k8s-provider.js";
 import { E2bScriptSandboxProvider } from "./e2b-provider.js";
 import { ExternalScriptTools } from "./external-tools.js";
+import { RemoteScriptTraffic } from "../../script-sandbox/traffic.js";
 
 export function createScriptSandboxApi(deploymentMode: string, controlPlane: SandboxControlPlane, builtin?: SandboxBuiltinExecutor,
   currentUser?: (sessionId: string, agentId: string) => string) {
@@ -23,7 +24,7 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
     ? new E2bScriptSandboxProvider(config, external) : new K8sScriptSandboxProvider(config)), config) : undefined;
   const service = provider ? new ScriptSandboxService(config, provider, new ReadOnlyScriptBroker(controlPlane, config, builtin, p => {
     if (!p.userId || currentUser?.(p.sessionId, p.agentId) !== p.userId) throw new ScriptSandboxError("Active Web caller required", 403);
-  })) : undefined;
+  }, new RemoteScriptTraffic(controlPlane))) : undefined;
   provider?.prewarm();
   return {
     externalTool: async (params: unknown) => {
@@ -37,7 +38,8 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
         send(200, { enabled: !!service, network_isolation: config.requireNetworkIsolation || config.networkIsolation,
           require_network_isolation: config.requireNetworkIsolation,
           ...(service ? { limits: { default_timeout_seconds: Math.min(60, config.maxTimeoutSeconds),
-            max_timeout_seconds: config.maxTimeoutSeconds, max_tool_calls: config.maxToolCalls, max_output_bytes: config.maxOutputBytes } } : {}) });
+            max_timeout_seconds: config.maxTimeoutSeconds, max_tool_calls: config.maxToolCalls, max_output_bytes: config.maxOutputBytes,
+            max_concurrent_tools: 10 } } : {}) });
         return;
       }
       if (!service) { send(503, { error: "Script sandbox is disabled" }); return; }

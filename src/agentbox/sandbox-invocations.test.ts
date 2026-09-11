@@ -35,3 +35,20 @@ it("propagates cancellation to a running tool and prevents concurrent/replayed w
   await expect(box.execute(grant.token, "session", args, signal(), vi.fn())).rejects.toThrow();
   grant.close();
 });
+
+it("accepts ten distinct concurrent callbacks and cancels every slot on close", async () => {
+  const box = new SandboxInvocations(); const grant = box.open("session", scope);
+  const entered: string[] = [];
+  const executor = vi.fn(async (_: unknown, s: AbortSignal) => {
+    entered.push("entered");
+    await new Promise<void>(resolve => s.addEventListener("abort", () => resolve(), { once: true }));
+    return "cancelled";
+  });
+  const run = (id: string) => box.execute(grant.token, "session", { ...args, id }, signal(), executor);
+  const pending = Array.from({ length: 10 }, (_, i) => run(String(i)));
+  expect(entered).toHaveLength(10);
+  await expect(run("11")).rejects.toThrow();
+  await expect(run("0")).rejects.toThrow();
+  grant.close(); expect(await Promise.all(pending)).toHaveLength(10);
+  expect(executor).toHaveBeenCalledTimes(10);
+});

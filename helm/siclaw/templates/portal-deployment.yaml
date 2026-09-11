@@ -29,6 +29,12 @@ spec:
             - name: SICLAW_SANDBOX_PUBLIC_URL
               value: {{ .Values.scriptSandbox.publicUrl | quote }}
             {{- end }}
+            - name: SICLAW_SANDBOX_TARGET_CONCURRENCY
+              value: {{ .Values.scriptSandbox.traffic.targetConcurrency | quote }}
+            - name: SICLAW_SANDBOX_TARGET_RPS
+              value: {{ .Values.scriptSandbox.traffic.targetRps | quote }}
+            - name: SICLAW_SANDBOX_TARGET_BURST
+              value: {{ .Values.scriptSandbox.traffic.targetBurst | quote }}
             - name: NODE_ENV
               value: "production"
             - name: PORTAL_PORT

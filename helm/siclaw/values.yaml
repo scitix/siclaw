@@ -333,10 +333,15 @@ scriptSandbox:
   requireNetworkIsolation: false
   warmPoolSize: 1 # One-use idle instances for the most recently requested profile, per Runtime.
   warmIdleSeconds: 300
-  maxConcurrentRuns: 4
-  maxTimeoutSeconds: 120
+  maxConcurrentRuns: 10
+  maxTimeoutSeconds: 300
   maxOutputBytes: 131072
-  maxToolCalls: 64
+  maxToolCalls: 512
+  # Shared admission owned by standalone Portal (external control planes configure their own limits).
+  traffic:
+    targetConcurrency: 10
+    targetRps: 10
+    targetBurst: 20
   # Operator-reviewed HTTP MCP tools. No automatic readOnlyHint trust.
   mcpPolicy: {}
   # Registered host name -> SHA256 host key fingerprint.

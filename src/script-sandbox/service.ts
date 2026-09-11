@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { ScriptFrameParser, encodeScriptFrame } from "./protocol.js";
 import { record, resolveScriptLimits, validateScriptRequest } from "./validation.js";
+import { ScriptTrafficBusyError } from "./traffic.js";
 import { ScriptResultTransfer, ScriptResultLimitError, SCRIPT_INLINE_RESULT_BYTES, SCRIPT_RUN_FILE_BYTES, SCRIPT_RESULT_CHUNK_BYTES } from "./result-transfer.js";
 import { ScriptSandboxError, type ScriptChannel, type ScriptPrincipal, type ScriptRequest, type ScriptResult, type ScriptSandboxConfig, type ScriptSandboxProvider, type ScriptToolCall } from "./types.js";
 
@@ -80,7 +81,7 @@ export class ScriptSandboxService {
       const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
       let bytes = 0;
       let received = 0;
-      let pending = false;
+      let pending = 0;
       let settled = false;
       const ids = new Set<string>();
       const transfers = new ScriptResultTransfer();
@@ -112,15 +113,15 @@ export class ScriptSandboxService {
       const discard = () => {}; // Raw stderr belongs to the supervisor, not script output.
       const tool = async (raw: unknown) => {
         if (settled || signal.aborted) throw new Error("Inactive script run");
-        if (pending || ++requests > maxRequests) throw new Error("Protocol budget exceeded");
+        if (pending >= 10 || ++requests > maxRequests) throw new Error("Protocol budget exceeded");
         if (!record(raw) || Object.keys(raw).some(k => !["id", "tool", "arguments", "delivery"].includes(k)) || typeof raw.id !== "string" || raw.id.length > 64 || ids.has(raw.id) || typeof raw.tool !== "string" || !/^[a-z][a-z0-9_.]{0,63}$/.test(raw.tool) || !record(raw.arguments) ||
           (raw.delivery !== undefined && raw.delivery !== "file")) throw new Error("Invalid tool request");
         const isTransfer = raw.tool === "result.read" || raw.tool === "result.discard";
         if (!isTransfer && ++result.tool_calls > this.config.maxToolCalls) throw new Error("Tool budget exceeded");
-        ids.add(raw.id); pending = true;
+        ids.add(raw.id); pending++;
         let response: unknown;
         try {
-          const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(raw.tool === "node_exec" ? 90_000 : 25_000)]);
+          const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(raw.tool === "node_exec" ? 125_000 : 55_000)]);
           let value: unknown;
           if (isTransfer) {
             if (raw.delivery !== undefined) throw new Error("Invalid transfer delivery");
@@ -132,12 +133,14 @@ export class ScriptSandboxService {
             value = await this.broker.call(principal, scope, call, boundedSignal);
             if (call.delivery === "file") value = transfers.open(value, s => this.broker.authorizeResult!(principal, scope, call, s));
           }
+          boundedSignal.throwIfAborted();
           response = { id: raw.id, result: value };
           if (Buffer.byteLength(JSON.stringify(response)) > SCRIPT_INLINE_RESULT_BYTES) throw new ScriptResultLimitError();
         } catch (error) {
-          response = { id: raw.id, error: error instanceof ScriptResultLimitError ? "Result exceeds delivery budget; use file delivery or pagination" : "Tool request denied or unavailable" };
+          response = { id: raw.id, error: error instanceof ScriptTrafficBusyError ? error.message : error instanceof ScriptResultLimitError ? "Result exceeds delivery budget; use file delivery or pagination" : "Tool request denied or unavailable",
+            ...(error instanceof ScriptTrafficBusyError ? { code: "TARGET_BUSY", retry_after_ms: 1000 } : {}) };
         }
-        pending = false;
+        pending--;
         if (settled || signal.aborted) throw new Error("Inactive script run");
         return response;
       };

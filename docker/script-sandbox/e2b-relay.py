@@ -11,6 +11,8 @@ import resource
 import signal
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -59,11 +61,11 @@ def main():
     )
     try:
         hello = read_frame(sys.stdin.buffer)
-        if hello != {"type": "hello", "version": 2}:
+        if hello != {"type": "hello", "version": 3}:
             raise RuntimeError("Expected hello")
         send(child.stdin, hello)
         ready = read_frame(child.stdout)
-        if ready != {"type": "ready", "version": 2}:
+        if ready != {"type": "ready", "version": 3}:
             raise RuntimeError("Runner unavailable")
         send(sys.stdout.buffer, ready)
         config = read_frame(sys.stdin.buffer, 4096)
@@ -76,29 +78,52 @@ def main():
                 not isinstance(token, str) or len(token) != 64 or
                 any(c not in "0123456789abcdef" for c in token)):
             raise RuntimeError("Invalid relay grant")
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         send(child.stdin, config["start"])
         del config
-        while True:
-            frame = read_frame(child.stdout)
-            if frame.get("type") == "tool":
-                body = json.dumps({"call": frame.get("call")}, ensure_ascii=False).encode()
+        writers = threading.Lock()
+        slots = threading.BoundedSemaphore(10)
+        pool = ThreadPoolExecutor(max_workers=10)
+        pending = 0
+        def invoke(call):
+            nonlocal pending
+            try:
+                body = json.dumps({"call": call}, ensure_ascii=False).encode()
                 if len(body) > MAX_FRAME:
                     raise RuntimeError("Tool request too large")
                 request = urllib.request.Request(endpoint, data=body, method="POST", headers={
                     "Authorization": "Bearer " + token, "Content-Type": "application/json",
                 })
-                # No retries: a dropped response must never execute a call twice.
-                with opener.open(request, timeout=100 if isinstance(frame.get("call"), dict) and frame["call"].get("tool") == "node_exec" else 35) as response:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+                # Never retry an uncertain remote execution.
+                with opener.open(request, timeout=140 if isinstance(call, dict) and call.get("tool") == "node_exec" else 70) as response:
                     data = response.read(MAX_FRAME + 1)
                     if response.status != 200 or len(data) > MAX_FRAME:
                         raise RuntimeError("Tool response unavailable")
                     result = json.loads(data)
-                send(child.stdin, {"type": "tool_result", "response": result})
+                with writers:
+                    slots.release()
+                    send(child.stdin, {"type": "tool_result", "response": result})
+                    pending -= 1
+            except Exception:
+                # Wakes the reader; the outer failure closes this one-use VM.
+                child.kill()
+        while True:
+            frame = read_frame(child.stdout)
+            if frame.get("type") == "tool":
+                if not slots.acquire(blocking=False):
+                    raise RuntimeError("Too many concurrent callbacks")
+                with writers:
+                    pending += 1
+                pool.submit(invoke, frame.get("call"))
             elif frame.get("type") in ("stdout", "stderr", "exit"):
-                send(sys.stdout.buffer, frame)
                 if frame["type"] == "exit":
+                    with writers:
+                        if pending:
+                            raise RuntimeError("Runner exited with active callbacks")
+                    pool.shutdown(wait=True)
+                    send(sys.stdout.buffer, frame)
                     return
+                send(sys.stdout.buffer, frame)
             else:
                 raise RuntimeError("Invalid runner output")
     finally:

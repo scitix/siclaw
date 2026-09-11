@@ -1,4 +1,6 @@
-import { SANDBOX_NODE_CONCURRENCY } from "../../tools/infra/sandbox-debug.js";
+import { createHash } from "node:crypto";
+import { LocalScriptTraffic, type ScriptTrafficAdmission } from "../../script-sandbox/traffic.js";
+import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
 import { createMcpToolDefinition } from "../../core/mcp-client.js";
 import { normalizeAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
 import { resolveCapabilities } from "../../core/tool-capabilities.js";
@@ -33,9 +35,41 @@ function only(args: Record<string, unknown>, fields: string[]): void {
 export type SandboxBuiltinExecutor = (principal: ScriptPrincipal, args: Record<string, unknown>, signal: AbortSignal, approval: SandboxBuiltinApproval) => Promise<unknown>;
 
 export class ReadOnlyScriptBroker implements ScriptBroker {
-  private activeNodeExecutions = 0;
   constructor(private readonly controlPlane: SandboxControlPlane, private readonly config: ScriptSandboxConfig, private readonly builtin?: SandboxBuiltinExecutor,
-    private readonly verifyCaller?: (principal: ScriptPrincipal) => void) {}
+    private readonly verifyCaller?: (principal: ScriptPrincipal) => void,
+    private readonly traffic: ScriptTrafficAdmission = new LocalScriptTraffic()) {}
+
+  private trafficKeys(grant: SandboxGrant, call: ScriptToolCall): string[] {
+    const key = (kind: string, value: unknown) => `${kind}:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+    if (call.tool === "mcp.call") {
+      if (!grant.mcp) throw new Error("Missing MCP endpoint");
+      return [key("mcp", new URL(grant.mcp.url).origin)];
+    }
+    if (call.tool === "host_exec") {
+      const host = grant.credential?.metadata;
+      if (typeof host?.ip !== "string") throw new Error("Missing host endpoint");
+      return [key("host", [host.ip, host.port ?? 22])];
+    }
+    const file = grant.credential?.files.find(f => f.name.endsWith(".kubeconfig"));
+    if (!file) throw new Error("Missing cluster endpoint");
+    const endpoint = kubeConnection(file.content).url.origin;
+    const keys = [key("cluster", endpoint)];
+    if (call.tool === "node_exec") keys.push(key("node", [endpoint, call.arguments.node]));
+    if (call.tool === "pod_exec") keys.push(key("pod", [endpoint, call.arguments.namespace ?? "default", call.arguments.pod, call.arguments.container ?? ""]));
+    return keys;
+  }
+
+  private async admit(p: ScriptPrincipal, source: string, name: string, call: ScriptToolCall, signal: AbortSignal, requiredTool?: string) {
+    const initial = await this.resolve(p, source, name, signal, requiredTool);
+    const keys = this.trafficKeys(initial, call);
+    const release = await this.traffic.acquire(keys, p.userId, signal);
+    try {
+      // Never execute a credential snapshot that waited in the admission queue.
+      const grant = await this.resolve(p, source, name, signal, requiredTool);
+      if (JSON.stringify(keys) !== JSON.stringify(this.trafficKeys(grant, call))) throw new Error("Target changed while queued");
+      return { grant, release };
+    } catch (error) { await release(); throw error; }
+  }
 
   private async resolve(p: ScriptPrincipal, source = "", name = "", signal: AbortSignal, requiredTool?: string): Promise<SandboxGrant> {
     signal.throwIfAborted();
@@ -74,24 +108,28 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
   async call(p: ScriptPrincipal, scope: ScriptRequest, call: ScriptToolCall, signal: AbortSignal): Promise<unknown> {
     const a = call.arguments;
     let allowed = false;
+    let release: (() => Promise<void>) | undefined;
+    let uncertain = false;
     try {
       if (call.tool === "bash") {
         const request = resolveSandboxBuiltin(call, scope).arguments;
         if (!this.builtin || !p.callbackToken) throw new Error("Builtin tool unavailable");
-        const grant = await this.resolve(p, "cluster", request.cluster!, signal, "bash");
+        const admitted = await this.admit(p, "cluster", request.cluster!, call, signal, "bash");
+        const grant = admitted.grant; release = admitted.release;
         const file = grant.credential?.files.find(f => f.name.endsWith(".kubeconfig"));
         if (!file || grant.credential?.type !== "kubeconfig") throw new Error("No Kubernetes credential");
         kubeConnection(file.content);
-        const result = await this.builtin(p, a, signal, { tool: "bash", credential: grant.credential });
+        const result = await this.builtin(p, a, signal, { tool: "bash", credential: grant.credential, callId: call.id });
         allowed = true; return sanitizeSandboxResult(result);
       }
       if (call.tool === "host_exec" || call.tool === "node_exec" || call.tool === "pod_exec") {
         const request = resolveSandboxBuiltin(call, scope).arguments;
         if (!this.builtin || !p.callbackToken) throw new Error("Builtin tool unavailable");
         const source = call.tool === "host_exec" ? "host" : "cluster";
-        const grant = await this.resolve(p, source, request.host ?? request.cluster!, signal, call.tool);
+        const admitted = await this.admit(p, source, request.host ?? request.cluster!, call, signal, call.tool);
+        const grant = admitted.grant; release = admitted.release;
         if (!grant.credential) throw new Error("No approved credential");
-        const approval: SandboxBuiltinApproval = { tool: call.tool, credential: grant.credential };
+        const approval: SandboxBuiltinApproval = { tool: call.tool, credential: grant.credential, callId: call.id };
         if (source === "host") {
           approval.hostKeyPins = {};
           const hops = [{ name: request.host, metadata: grant.credential.metadata }, ...(grant.credential.jump_chain ?? [])];
@@ -105,14 +143,9 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
           if (grant.credential.type !== "kubeconfig" || !file) throw new Error("No Kubernetes credential");
           kubeConnection(file.content);
         }
-        const node = call.tool === "node_exec";
-        if (node && this.activeNodeExecutions >= SANDBOX_NODE_CONCURRENCY) throw new Error("Sandbox node diagnostics busy");
-        if (node) this.activeNodeExecutions++;
-        try {
-          signal.throwIfAborted();
-          const result = await this.builtin(p, a, signal, approval);
-          allowed = true; return sanitizeSandboxResult(result);
-        } finally { if (node) this.activeNodeExecutions--; }
+        signal.throwIfAborted();
+        const result = await this.builtin(p, a, signal, approval);
+        allowed = true; return sanitizeSandboxResult(result);
       }
       if (call.tool === "mcp.call") {
         only(a, ["server", "tool", "arguments"]);
@@ -122,7 +155,8 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
         for (const [key, value] of Object.entries(policy.fixedArguments ?? {})) {
           if (Object.hasOwn(a.arguments, key) && JSON.stringify(a.arguments[key]) !== JSON.stringify(value)) throw new Error("Fixed MCP scope cannot be overridden");
         }
-        const grant = await this.resolve(p, "mcp", a.server, signal);
+        const admitted = await this.admit(p, "mcp", a.server, call, signal);
+        const grant = admitted.grant; release = admitted.release;
         if (grant.mcp?.transport !== "streamable-http") throw new Error("Only reviewed HTTP MCP is supported");
         const url = new URL(grant.mcp.url);
         if (url.protocol !== "https:" || url.username || url.password) throw new Error("MCP requires HTTPS");
@@ -145,12 +179,18 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
           const tool = createMcpToolDefinition(a.server, undefined, { name: a.tool }, client, 15_000, { includeRawResult: true });
           const result = await tool.execute(call.id, { ...a.arguments, ...policy.fixedArguments }, boundedSignal, undefined, {} as any);
           const details = result.details as { rawResult?: unknown };
-          if (!details?.rawResult) throw new Error("MCP tool failed");
+          if (!details?.rawResult) { uncertain = true; throw new Error("MCP tool failed"); }
           allowed = true; return sanitizeSandboxResult(details.rawResult);
-        } finally { await client.close().catch(() => {}); }
+        } finally { uncertain ||= boundedSignal.aborted; await client.close().catch(() => {}); }
       }
       throw new Error("Unknown script tool");
+    } catch (error) {
+      uncertain ||= error instanceof SandboxCallbackUncertainError;
+      throw error;
     } finally {
+      // Transport loss cannot prove remote completion. Retain the shared lease
+      // until its bounded expiry instead of admitting replacement work early.
+      if (!uncertain) await release?.();
       const { callbackToken: _token, ...audit } = p;
       console.info(JSON.stringify({ event: "script_tool", ...audit, tool: call.tool, allowed }));
     }

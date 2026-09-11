@@ -19,10 +19,9 @@ describe("live-run result transfer", () => {
     await expect(transfer.read({ transfer_id: info.transfer_id, offset: 0 }, new AbortController().signal)).rejects.toThrow();
   });
 
-  it("denies other runs, arbitrary paths, skipped/replayed offsets and concurrent files", async () => {
+  it("denies other runs, arbitrary paths and skipped/replayed offsets", async () => {
     const t = new ScriptResultTransfer(); const a = vi.fn(async () => {});
     const info = t.open({ text: "x".repeat(100_000) }, a); const signal = new AbortController().signal;
-    expect(() => t.open({}, a)).toThrow();
     await expect(new ScriptResultTransfer().read({ transfer_id: info.transfer_id, offset: 0 }, signal)).rejects.toThrow();
     for (const args of [{ transfer_id: "other", offset: 0 }, { transfer_id: info.transfer_id, offset: 1 }, { transfer_id: info.transfer_id, offset: 0, path: "/etc/shadow" }]) {
       await expect(t.read(args, signal)).rejects.toThrow();
@@ -32,6 +31,20 @@ describe("live-run result transfer", () => {
     await expect(t.read({ transfer_id: info.transfer_id, offset: 0 }, signal)).rejects.toThrow();
     t.discard({ transfer_id: info.transfer_id });
     await expect(t.read({ transfer_id: info.transfer_id, offset: 49152 }, signal)).rejects.toThrow();
+  });
+
+  it("separates ten concurrent files and rejects concurrent reads of the same offset", async () => {
+    const t = new ScriptResultTransfer();
+    let finish!: () => void;
+    const blocked = t.open({ file: "blocked" }, () => new Promise<void>(r => { finish = r; }));
+    const files = Array.from({ length: 9 }, (_, i) => t.open({ file: i }, async () => {}));
+    expect(() => t.open({}, async () => {})).toThrow();
+    const signal = new AbortController().signal;
+    const pending = t.read({ transfer_id: blocked.transfer_id, offset: 0 }, signal);
+    await expect(t.read({ transfer_id: blocked.transfer_id, offset: 0 }, signal)).rejects.toThrow();
+    const results = await Promise.all(files.map(f => t.read({ transfer_id: f.transfer_id, offset: 0 }, signal)));
+    expect(results.map(r => JSON.parse(Buffer.from(r.data, "base64").toString()).file)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    finish(); expect((await pending).done).toBe(true);
   });
 
   it("refuses to release a chunk after revocation or a close during authorization", async () => {

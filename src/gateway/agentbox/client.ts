@@ -1,3 +1,4 @@
+import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
 /**
  * AgentBox HTTP Client
  *
@@ -227,7 +228,7 @@ export class AgentBoxClient {
           if (size > SCRIPT_FILE_RESULT_BYTES) req.destroy(new Error("Sandbox callback response too large"));
           else chunks.push(chunk);
         });
-        res.on("error", reject);
+        res.on("error", () => reject(new SandboxCallbackUncertainError()));
         res.on("end", () => {
           try {
             if (res.statusCode !== 200) throw new Error();
@@ -235,7 +236,7 @@ export class AgentBoxClient {
           } catch { reject(new Error("Sandbox callback denied or unavailable")); }
         });
       });
-      req.on("error", () => reject(new Error("Sandbox callback interrupted or unavailable")));
+      req.on("error", () => reject(new SandboxCallbackUncertainError()));
       req.end(JSON.stringify(body));
     });
   }

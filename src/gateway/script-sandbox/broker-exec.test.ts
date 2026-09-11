@@ -13,16 +13,17 @@ const rpc = () => ({ request: vi.fn(async (method: string) => method === "config
   ? { status: "active", tool_capabilities: ["run_sandbox", "run_commands"] } : { user_id: "u", credential }) });
 const signal = () => new AbortController().signal;
 
-it("caps concurrent node callbacks at ten and holds each slot until the callback settles", async () => {
+it("queues node callbacks beyond ten for one cluster until a callback settles", async () => {
   const finish: Array<() => void> = [];
   const builtin = vi.fn<SandboxBuiltinExecutor>(() => new Promise(resolve => finish.push(() => resolve({ text: "ok" }))));
   const broker = new ReadOnlyScriptBroker(rpc(), loadScriptSandboxConfig(), builtin);
-  const pending = Array.from({ length: 10 }, () => broker.call(p(), scope, nodeCall, signal()));
+  const call = (i: number) => ({ ...nodeCall, id: String(i), arguments: { ...nodeCall.arguments, node: `node-${i}` } });
+  const pending = Array.from({ length: 10 }, (_, i) => broker.call(p(), scope, call(i), signal()));
   await vi.waitFor(() => expect(builtin).toHaveBeenCalledTimes(10));
-  await expect(broker.call(p(), scope, nodeCall, signal())).rejects.toThrow("busy");
+  const next = broker.call(p(), scope, call(10), signal());
+  await new Promise(r => setTimeout(r, 10));
   expect(builtin).toHaveBeenCalledTimes(10);
   finish[0](); await pending[0];
-  const next = broker.call(p(), scope, nodeCall, signal());
   await vi.waitFor(() => expect(builtin).toHaveBeenCalledTimes(11));
   finish.slice(1).forEach(f => f()); await Promise.all([...pending, next]);
 });
@@ -56,4 +57,23 @@ it("requires an operator pin for every SSH hop and keeps credentials in the trus
   await expect(broker.call(p(), scope, call, signal())).resolves.toEqual({ text: "Linux" });
   expect(builtin.mock.calls[0][3]).toMatchObject({ tool: "host_exec", credential, hostKeyPins: { "192.0.2.1:2222": config.hostKeyPins.bastion, "192.0.2.2:22": config.hostKeyPins["host-a"] } });
   expect(JSON.stringify(builtin.mock.calls[0][1])).not.toContain("private-password");
+});
+
+it.each(["revoked", "rebound"])("rechecks a queued target when it is %s", async change => {
+  const control = rpc(); let changed = false;
+  control.request.mockImplementation(async method => {
+    if (method === "config.getAgent") return { status: "active" } as any;
+    if (changed && change === "revoked") throw new Error("revoked");
+    return { user_id: "u", credential: changed ? { ...credential, files: [{ name: "cluster.kubeconfig", content: kubeconfig.replace("example.test", "different.test") }] } : credential } as any;
+  });
+  let finish!: () => void;
+  const builtin = vi.fn<SandboxBuiltinExecutor>(() => new Promise(resolve => { finish = () => resolve({ text: "ok" }); }));
+  const broker = new ReadOnlyScriptBroker(control, loadScriptSandboxConfig(), builtin);
+  const first = broker.call(p(), scope, nodeCall, signal());
+  await vi.waitFor(() => expect(builtin).toHaveBeenCalledOnce());
+  const second = broker.call(p(), scope, { ...nodeCall, id: "2" }, signal());
+  const denied = expect(second).rejects.toThrow();
+  await vi.waitFor(() => expect(control.request.mock.calls.filter(c => c[0] === "sandbox.resolve")).toHaveLength(3));
+  changed = true; finish(); await first; await denied;
+  expect(builtin).toHaveBeenCalledOnce();
 });

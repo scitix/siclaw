@@ -42,7 +42,7 @@ describe("E2B service integration", () => {
         const body = JSON.parse(init!.body as string);
         expect(body.process).toEqual({ pid: 123 });
         const frame = JSON.parse(Buffer.from(body.input.stdin, "base64").toString()); frames.push(frame);
-        if (frame.type === "hello") emit({ type: "ready", version: 2 });
+        if (frame.type === "hello") emit({ type: "ready", version: 3 });
         else {
           token = frame.token;
           const call = { id: "tool-1", tool: "bash", arguments: { cluster: "test", command: "kubectl get nodes -o json" } };
@@ -102,7 +102,7 @@ describe("E2B service integration", () => {
         signal.addEventListener("abort", stop, { once: true });
         yield { start: { pid: 123 } };
         await helloReceived;
-        yield { data: { stdout: Buffer.from('{"type":"ready","version":2}\n').toString("base64") } };
+        yield { data: { stdout: Buffer.from('{"type":"ready","version":3}\n').toString("base64") } };
         await stopped;
       },
     };

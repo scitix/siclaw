@@ -44,9 +44,9 @@ def main():
     signal.alarm(min(max(lifetime, 1), 3600))
     # Respond only after attach; startup stdout can otherwise be lost in K8s.
     hello = read_frame(sys.stdin.buffer)
-    if hello != {"type": "hello", "version": 2}:
+    if hello != {"type": "hello", "version": 3}:
         raise RuntimeError("Expected hello")
-    emit({"type": "ready", "version": 2})
+    emit({"type": "ready", "version": 3})
     frame = read_frame(sys.stdin.buffer)
     if frame.get("type") != "start" or frame.get("language") not in ("python", "shell"):
         raise RuntimeError("Expected a start frame")
@@ -58,17 +58,21 @@ def main():
     script.write_text(code, encoding="utf-8")
     input_file = work / "input.json"
     input_file.write_text(json.dumps(frame.get("input")), encoding="utf-8")
-    request_read, request_write = os.pipe()
-    response_read, response_write = os.pipe()
+    lanes = []
+    pipes = []
+    for index in range(10):
+        request_read, request_write = os.pipe()
+        response_read, response_write = os.pipe()
+        lanes.append({"request": request_write, "response": response_read,
+                      "lock": str(work / (".rpc-" + str(index) + ".lock"))})
+        pipes.append((request_read, request_write, response_read, response_write))
     # No inherited environment, including cloud identity, loader settings or keys.
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": str(work), "TMPDIR": "/tmp", "LANG": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
         "SICLAW_INPUT_FILE": str(input_file),
-        "SICLAW_RPC_LOCK_FILE": str(work / ".rpc.lock"),
-        "SICLAW_RPC_REQUEST_FD": str(request_write),
-        "SICLAW_RPC_RESPONSE_FD": str(response_read),
+        "SICLAW_RPC_LANES": json.dumps(lanes),
     }
     if frame["language"] == "python":
         # The SDK is in the immutable image, not resolved from task input.
@@ -78,10 +82,14 @@ def main():
         command = ["/bin/bash", "--noprofile", "--norc", str(script)]
     child = subprocess.Popen(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             pass_fds=(request_write, response_read), start_new_session=True)
-    os.close(request_write)
-    os.close(response_read)
+                             pass_fds=tuple(fd for pipe in pipes for fd in (pipe[1], pipe[2])), start_new_session=True)
+    for pipe in pipes:
+        os.close(pipe[1])
+        os.close(pipe[2])
     failed = threading.Event()
+    pending = {}
+    occupied = set()
+    pending_lock = threading.Lock()
 
     def stop():
         try:
@@ -102,11 +110,19 @@ def main():
             failed.set()
             stop()
 
-    def requests():
+    def requests(index, request_read):
         try:
             with os.fdopen(request_read, "rb") as stream:
                 while True:
                     call = read_frame(stream)
+                    call_id = call.get("id")
+                    if not isinstance(call_id, str) or not 1 <= len(call_id) <= 64:
+                        raise RuntimeError("Invalid request id")
+                    with pending_lock:
+                        if index in occupied or call_id in pending:
+                            raise RuntimeError("SDK channel already occupied")
+                        occupied.add(index)
+                        pending[call_id] = index
                     emit({"type": "tool", "call": call})
         except EOFError:
             return
@@ -121,10 +137,18 @@ def main():
                 response = read_frame(sys.stdin.buffer)
                 if response.get("type") != "tool_result":
                     raise RuntimeError("Unexpected response frame")
-                data = (json.dumps(response["response"], ensure_ascii=False) + "\n").encode()
+                value = response["response"]
+                with pending_lock:
+                    index = pending.pop(value.get("id"), None)
+                    if index is None:
+                        raise RuntimeError("Unknown response id")
+                    # The client cannot issue its next transaction until the
+                    # response below has been read from this lane's pipe.
+                    occupied.remove(index)
+                data = (json.dumps(value, ensure_ascii=False) + "\n").encode()
                 remaining = memoryview(data)
                 while remaining:
-                    remaining = remaining[os.write(response_write, remaining):]
+                    remaining = remaining[os.write(pipes[index][3], remaining):]
         except Exception:
             if child.poll() is None:
                 failed.set()
@@ -132,8 +156,9 @@ def main():
 
     threads = [threading.Thread(target=output, args=(child.stdout, "stdout"), daemon=True),
                threading.Thread(target=output, args=(child.stderr, "stderr"), daemon=True),
-               threading.Thread(target=requests, daemon=True),
                threading.Thread(target=responses, daemon=True)]
+    threads.extend(threading.Thread(target=requests, args=(index, pipe[0]), daemon=True)
+                   for index, pipe in enumerate(pipes))
     for thread in threads:
         thread.start()
     exit_code = child.wait()

@@ -33,6 +33,10 @@ const principal = { agentId: "smoke", userId: "fixture", boxId: "fixture", sessi
 const code = `import os, socket, subprocess, ctypes, platform
 from siclaw import call, call_to_file
 import json
+from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=10) as pool:
+    results = list(pool.map(lambda i: call("test.echo", {"index": i}), range(30)))
+assert results == [{"index": i} for i in range(30)]
 info = call_to_file("test.large", {}, "data.json")
 assert json.load(open(info["path"]))["rows"] == ["节点🐍"] * 40_000
 assert call("test.echo", {"unicode": "🐍" * 30_000}) == {"unicode": "🐍" * 30_000}

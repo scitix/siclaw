@@ -10,9 +10,36 @@ import uuid
 import base64
 import hashlib
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 MAX_FRAME = 256 * 1024
+
+
+@contextmanager
+def _lane():
+    # Each lane has its own response pipe. File locks coordinate threads AND
+    # independently started Shell/Python children without sockets or a daemon.
+    lanes = json.loads(os.environ["SICLAW_RPC_LANES"])
+    if not isinstance(lanes, list) or not 1 <= len(lanes) <= 10:
+        raise RuntimeError("Invalid SDK channels")
+    start = int(uuid.uuid4().hex, 16) % len(lanes)
+    while True:
+        for index in range(len(lanes)):
+            lane = lanes[(start + index) % len(lanes)]
+            lock = open(lane["lock"], "a")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                continue
+            try:
+                yield lane
+            finally:
+                lock.close()
+            return
+        time.sleep(0.01)
 
 
 def input_data():
@@ -31,12 +58,9 @@ def _call(tool, arguments=None, delivery=None):
     data = (json.dumps(request, ensure_ascii=False) + "\n").encode()
     if len(data) > MAX_FRAME:
         raise ValueError("Tool request exceeds the frame limit")
-    # One response pipe is shared by descendants. Serialize whole transactions,
-    # including Shell CLI calls; no per-call process or HTTP connection in Python.
-    with open(os.environ["SICLAW_RPC_LOCK_FILE"], "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        request_fd = int(os.environ["SICLAW_RPC_REQUEST_FD"])
-        response_fd = int(os.environ["SICLAW_RPC_RESPONSE_FD"])
+    with _lane() as lane:
+        request_fd = lane["request"]
+        response_fd = lane["response"]
         remaining = memoryview(data)
         while remaining:
             written = os.write(request_fd, remaining)

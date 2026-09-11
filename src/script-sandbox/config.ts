@@ -63,12 +63,12 @@ export function loadScriptSandboxConfig(env: NodeJS.ProcessEnv = process.env): S
     runtimeClass: env.SICLAW_SCRIPT_SANDBOX_RUNTIME_CLASS || undefined,
     networkIsolation: bool(env.SICLAW_SCRIPT_SANDBOX_NETWORK_ISOLATION),
     requireNetworkIsolation: bool(env.SICLAW_SCRIPT_SANDBOX_REQUIRE_NETWORK_ISOLATION),
-    maxTimeoutSeconds: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_TIMEOUT_SECONDS, 120, 600),
-    maxConcurrentRuns: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_CONCURRENT_RUNS, 4, 100),
+    maxTimeoutSeconds: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_TIMEOUT_SECONDS, 300, 600),
+    maxConcurrentRuns: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_CONCURRENT_RUNS, 10, 100),
     warmPoolSize: env.SICLAW_SCRIPT_SANDBOX_WARM_POOL_SIZE === "0" ? 0 : integer(env.SICLAW_SCRIPT_SANDBOX_WARM_POOL_SIZE, 1, 8),
     warmIdleSeconds: integer(env.SICLAW_SCRIPT_SANDBOX_WARM_IDLE_SECONDS, 300, 1800),
     maxOutputBytes: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_OUTPUT_BYTES, 128 * 1024, 1024 * 1024),
-    maxToolCalls: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_TOOL_CALLS, 64, 1000),
+    maxToolCalls: integer(env.SICLAW_SCRIPT_SANDBOX_MAX_TOOL_CALLS, 512, 1000),
     mcpPolicy,
   };
 }

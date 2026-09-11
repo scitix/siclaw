@@ -20,6 +20,7 @@ token = secrets.token_hex(32)
 calls = []
 redirected = []
 redirect = False
+barrier = threading.Barrier(10, timeout=5)
 large_data = json.dumps({"rows": ["节点🐍"] * 40_000}, ensure_ascii=False).encode()
 transfer_id = "b" * 64
 
@@ -46,6 +47,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if call["tool"] == "bash" and call["arguments"] == {"cluster": "test", "command": "kubectl get nodes -o json"}:
             value = {"id": call["id"], "result": {"text": json.dumps({"items": [{"metadata": {"name": "node-1"}}]})}}
+        elif call["tool"] == "test.concurrent":
+            barrier.wait()  # All ten must reach HTTPS before any response returns.
+            value = {"id": call["id"], "result": call["arguments"]}
         elif call["tool"] == "test.echo":
             value = {"id": call["id"], "result": call["arguments"]}
         elif call["tool"] == "test.large" and call.get("delivery") == "file":
@@ -70,9 +74,9 @@ def run(code, language="python", isolated=True, fail=False):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env={"SSL_CERT_FILE": "/test-certs/cert.pem"},
     )
-    relay.stdin.write(b'{"type":"hello","version":2}\n')
+    relay.stdin.write(b'{"type":"hello","version":3}\n')
     relay.stdin.flush()
-    assert json.loads(relay.stdout.readline()) == {"type": "ready", "version": 2}
+    assert json.loads(relay.stdout.readline()) == {"type": "ready", "version": 3}
     startup_ms = int((time.monotonic() - started) * 1000)
     # Leave only the UID 10001 work files from this run; template state is one-use.
     # Test process reuses the container to avoid cloud/build overhead.
@@ -150,6 +154,7 @@ print("PASS")
 siclaw-tool --output data.json test.large '{}' > receipt.json
 python3 -c 'import json; assert len(json.load(open("data.json"))["rows"]) == 40000; print("PASS")'
 ''', language="shell")
+    run('from concurrent.futures import ThreadPoolExecutor\nfrom siclaw import call\nwith ThreadPoolExecutor(max_workers=10) as pool:\n    rows = list(pool.map(lambda i: call("test.concurrent", {"i":i}), range(10)))\nassert rows == [{"i":i} for i in range(10)]\nprint("PASS")')
     redirect = True
     run('from siclaw import call\ncall("bash", {"cluster":"test", "command":"kubectl get nodes -o json"})\n', fail=True)
     assert not redirected

@@ -35,7 +35,7 @@ describe("public sandbox tool ingress", () => {
     const response = await s.post({ call });
     expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.json()).toEqual({ id: "1", result: { nodes: [] } });
-    expect(s.sendCommandToRuntime).toHaveBeenCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call }, 30_000);
+    expect(s.sendCommandToRuntime).toHaveBeenCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call }, 65_000);
     expect(s.sendCommand).not.toHaveBeenCalled();
     await expect(s.handlers.get(SANDBOX_LEASE_CLOSE)!({ token_hash: hash, run_id: "run-1" }, "wrong-runtime")).rejects.toThrow();
     await s.handlers.get(SANDBOX_LEASE_CLOSE)!({ token_hash: hash, run_id: "run-1" }, "runtime-1");
@@ -75,10 +75,10 @@ it("forwards file metadata and bounded chunks without widening the public respon
     s.sendCommandToRuntime.mockResolvedValueOnce({ ok: true, payload } as any);
     const response = await s.post({ call: request });
     expect(response.status).toBe(200); expect(await response.json()).toEqual(payload);
-    expect(s.sendCommandToRuntime).toHaveBeenLastCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call: request }, 30_000);
+    expect(s.sendCommandToRuntime).toHaveBeenLastCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call: request }, 65_000);
   }
   s.sendCommandToRuntime.mockResolvedValueOnce({ ok: true, payload: { result: "x".repeat(256 * 1024) } } as any);
-  expect((await s.post({ call })).status).toBe(403);
+  expect((await s.post({ call: { ...call, id: "oversize" } })).status).toBe(403);
   await s.handlers.get(SANDBOX_LEASE_CLOSE)!({ token_hash: hash, run_id: "run-1" }, "runtime-1");
   expect((await s.post({ call: { id: "4", tool: "result.read", arguments: { transfer_id: transfer, offset: 49152 } } })).status).toBe(403);
   expect(s.sendCommandToRuntime).toHaveBeenCalledTimes(4);
@@ -88,5 +88,22 @@ it("allows diagnostic startup without broadening other callback deadlines", asyn
   const s = await setup(); await s.handlers.get(SANDBOX_LEASE_OPEN)!(s.grant(), "runtime-1");
   const request = { id: "node", tool: "node_exec", arguments: { cluster: "test", node: "node-a", command: "uname" } };
   expect((await s.post({ call: request })).status).toBe(200);
-  expect(s.sendCommandToRuntime).toHaveBeenLastCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call: request }, 95_000);
+  expect(s.sendCommandToRuntime).toHaveBeenLastCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call: request }, 135_000);
+});
+
+it("relays ten independent callbacks, rejects the eleventh and never releases an uncertain slot", async () => {
+  const s = await setup(); await s.handlers.get(SANDBOX_LEASE_OPEN)!(s.grant(), "runtime-1");
+  const finish: Array<() => void> = [];
+  s.sendCommandToRuntime.mockImplementation(() => new Promise(resolve => finish.push(() => resolve({ ok: true, payload: {} } as any))));
+  const pending = Array.from({ length: 10 }, (_, i) => s.post({ call: { ...call, id: String(i) } }));
+  await vi.waitFor(() => expect(finish).toHaveLength(10));
+  expect((await s.post({ call: { ...call, id: "extra" } })).status).toBe(403);
+  finish[0](); expect((await pending[0]).status).toBe(200);
+  s.sendCommandToRuntime.mockRejectedValueOnce(new Error("transport lost"));
+  expect((await s.post({ call: { ...call, id: "uncertain" } })).status).toBe(403);
+  expect((await s.post({ call: { ...call, id: "next" } })).status).toBe(403);
+  expect(s.sendCommandToRuntime).toHaveBeenCalledTimes(11);
+  finish.slice(1).reverse().forEach(f => f());
+  expect((await Promise.all(pending)).every(r => r.status === 200)).toBe(true);
+  expect((await s.post({ call: { ...call, id: "0" } })).status).toBe(403);
 });

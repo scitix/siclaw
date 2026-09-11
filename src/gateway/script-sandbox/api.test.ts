@@ -69,7 +69,7 @@ describe("Runtime sandbox deployment gate", () => {
       expect(await request(api, "GET")).toEqual({ status: 200, body: {
         enabled: true, network_isolation: true, require_network_isolation: true,
         limits: { default_timeout_seconds: Math.min(60, maximum), max_timeout_seconds: maximum,
-          max_tool_calls: 12, max_output_bytes: 8192 },
+          max_tool_calls: 12, max_concurrent_tools: 10, max_output_bytes: 8192 },
       } });
       expect((await request(api, "GET", false)).status).toBe(401);
     } finally { await api.shutdown(); }

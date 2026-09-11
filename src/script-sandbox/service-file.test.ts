@@ -26,16 +26,17 @@ describe("file delivery over native and external channels", () => {
       if (frame.type === "tool_result") { pending(frame.response); return; }
       void (async () => {
         const info = (await invoke("mcp.call", { server: "test", tool: "query", arguments: {} }, "file")).result;
-        // Reject another file before executing its upstream operation.
-        expect((await invoke("mcp.call", { server: "test", tool: "query", arguments: {} }, "file")).error).toBeTruthy();
-        expect(broker.call).toHaveBeenCalledOnce();
+        // Independent results may remain open while another is consumed.
+        const second = (await invoke("mcp.call", { server: "test", tool: "query", arguments: {} }, "file")).result;
+        expect(second.transfer_id).not.toBe(info.transfer_id);
+        expect(broker.call).toHaveBeenCalledTimes(2);
         let offset = 0; const chunks: Buffer[] = [];
         while (offset < info.bytes) {
           const chunk = (await invoke("result.read", { transfer_id: info.transfer_id, offset })).result;
           chunks.push(Buffer.from(chunk.data, "base64")); offset = chunk.next_offset;
         }
         expect(JSON.parse(Buffer.concat(chunks).toString())).toEqual(value);
-        expect(broker.call).toHaveBeenCalledOnce(); expect(broker.authorizeResult).toHaveBeenCalledTimes(chunks.length);
+        expect(broker.call).toHaveBeenCalledTimes(2); expect(broker.authorizeResult).toHaveBeenCalledTimes(chunks.length);
         // Reusing a transfer cannot re-run the upstream tool or retrieve old data.
         expect((await invoke("result.read", { transfer_id: info.transfer_id, offset: 0 })).error).toBeTruthy();
         emit({ type: "stdout", data: Buffer.from("summary only").toString("base64") });

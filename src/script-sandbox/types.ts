@@ -56,6 +56,7 @@ export interface ScriptSandboxInfo {
     max_timeout_seconds: number;
     max_tool_calls: number;
     max_output_bytes: number;
+    max_concurrent_tools?: number;
   };
 }
 

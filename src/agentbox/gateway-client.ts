@@ -328,7 +328,9 @@ export class GatewayClient {
       const limits = raw && [raw.default_timeout_seconds, raw.max_timeout_seconds, raw.max_tool_calls, raw.max_output_bytes]
         .every(value => Number.isSafeInteger(value) && value > 0) && raw.default_timeout_seconds <= raw.max_timeout_seconds
         ? { default_timeout_seconds: raw.default_timeout_seconds, max_timeout_seconds: raw.max_timeout_seconds,
-          max_tool_calls: raw.max_tool_calls, max_output_bytes: raw.max_output_bytes } : undefined;
+          max_tool_calls: raw.max_tool_calls, max_output_bytes: raw.max_output_bytes,
+          ...(Number.isSafeInteger(raw.max_concurrent_tools) && raw.max_concurrent_tools > 0 && raw.max_concurrent_tools <= 10
+            ? { max_concurrent_tools: raw.max_concurrent_tools } : {}) } : undefined;
       return { enabled: true, network_isolation: info.network_isolation === true,
         require_network_isolation: info.require_network_isolation === true, ...(limits ? { limits } : {}) };
     } catch { return disabled; }

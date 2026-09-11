@@ -106,11 +106,10 @@ describe("runner lifecycle", () => {
   it("rejects concurrent RPC floods and closes the instance", async () => {
     const c = channel(); const b = broker(); vi.mocked(b.call).mockImplementation(() => new Promise(() => {}));
     c.stdin.on("data", () => {
-      emit(c, { type: "tool", call: { id: "a", tool: "test", arguments: {} } });
-      emit(c, { type: "tool", call: { id: "b", tool: "test", arguments: {} } });
+      for (let i = 0; i < 11; i++) emit(c, { type: "tool", call: { id: String(i), tool: "test", arguments: {} } });
     });
     const result = await new ScriptSandboxService(config(), { start: async () => c }, b).run(request, principal());
-    expect(result.status).toBe("failed"); expect(b.call).toHaveBeenCalledOnce(); expect(c.close).toHaveBeenCalledOnce();
+    expect(result.status).toBe("failed"); expect(b.call).toHaveBeenCalledTimes(10); expect(c.close).toHaveBeenCalledOnce();
   });
   it("cancels a running script and releases quota", async () => {
     const c = channel(); const controller = new AbortController();
@@ -131,7 +130,7 @@ describe("runner lifecycle", () => {
   });
   it("requires a ready handshake before putting an instance in the warm pool", async () => {
     const c = channel(); let ready = false;
-    c.stdin.on("data", raw => { expect(JSON.parse(String(raw))).toEqual({ type: "hello", version: 2 }); ready = true; emit(c, { type: "ready", version: 2 }); });
+    c.stdin.on("data", raw => { expect(JSON.parse(String(raw))).toEqual({ type: "hello", version: 3 }); ready = true; emit(c, { type: "ready", version: 3 }); });
     await new ReadyScriptSandboxProvider({ start: async () => c }).start("r", true, 30, new AbortController().signal);
     expect(ready).toBe(true); await c.close();
   });
@@ -139,7 +138,7 @@ describe("runner lifecycle", () => {
     const c = channel(); const received: unknown[] = [];
     c.stdin.on("data", raw => { received.push(JSON.parse(String(raw))); emit(c, { type: "ready", version: 1 }); });
     await expect(new ReadyScriptSandboxProvider({ start: async () => c }).start("r", true, 30, new AbortController().signal)).rejects.toThrow("handshake");
-    expect(received).toEqual([{ type: "hello", version: 2 }]); expect(c.close).toHaveBeenCalledOnce();
+    expect(received).toEqual([{ type: "hello", version: 3 }]); expect(c.close).toHaveBeenCalledOnce();
   });
   it("uses fresh warm instances once, with separate isolation profiles", async () => {
     let id = 0; const channels: ScriptChannel[] = [];
@@ -198,4 +197,40 @@ describe("runner lifecycle", () => {
     await expect(running).rejects.toThrow("cancelled"); expect(start).toHaveBeenCalledOnce();
     ready(channel("warming")); await pool.shutdown();
   });
+});
+
+it("admits ten runs, each with ten tools, routes out-of-order replies and cleans up on cancel", async () => {
+  const channels = Array.from({ length: 10 }, (_, i) => channel(String(i)));
+  const completions: Array<() => void> = [];
+  const b = broker();
+  vi.mocked(b.call).mockImplementation(async (_, __, call, signal) => new Promise(resolve => {
+    const finish = () => resolve({ identity: call.id });
+    completions.push(finish); signal.addEventListener("abort", finish, { once: true });
+  }));
+  const replies: string[][] = channels.map(() => []);
+  channels.forEach((c, i) => c.stdin.on("data", raw => {
+    const f = JSON.parse(String(raw));
+    if (f.type === "start") {
+      for (let j = 0; j < 10; j++) emit(c, { type: "tool", call: { id: `${i}-${j}`, tool: "bash", arguments: {} } });
+    } else {
+      expect(f.response.result.identity).toBe(f.response.id);
+      replies[i].push(f.response.id);
+      if (replies[i].length === 10) emit(c, { type: "exit", code: 0 });
+    }
+  }));
+  let next = 0;
+  const service = new ScriptSandboxService(config(), { start: async () => channels[next++] }, b);
+  const controllers = channels.map(() => new AbortController());
+  const runs = channels.map((_, i) => service.run(request, principal(), controllers[i].signal));
+  await vi.waitFor(() => expect(b.call).toHaveBeenCalledTimes(100));
+  await expect(service.run(request, principal())).rejects.toThrow("busy");
+  controllers[0].abort();
+  expect((await runs[0]).status).toBe("cancelled");
+  completions.slice(10).reverse().forEach(f => f());
+  const results = await Promise.all(runs.slice(1));
+  expect(results.every(r => r.status === "completed" && r.tool_calls === 10)).toBe(true);
+  expect(replies[0]).toEqual([]);
+  expect(replies[9][0]).toBe("9-9");
+  channels.forEach(c => expect(c.close).toHaveBeenCalledOnce());
+  await service.shutdown();
 });

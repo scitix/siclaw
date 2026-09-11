@@ -940,8 +940,9 @@ export function createHttpServer(
       if (!managed || managed.mode !== "web" || managed.delegation || !invocations) throw new Error();
       const { executeSandboxBuiltin } = await import("./sandbox-tools.js");
       const approval = body.approval as unknown as import("../shared/sandbox-tool-types.js").SandboxBuiltinApproval;
+      if (typeof approval.callId !== "string" || !approval.callId || approval.callId.length > 64) throw new Error();
       const result = await invocations.execute(body.callback_token, body.session_id,
-        { id: "callback", tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
+        { id: approval.callId, tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
         (request, signal) => executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal));
       sendJson(res, 200, result);
     } catch { sendJson(res, 403, { error: "Sandbox tool denied or unavailable" }); }

@@ -25,7 +25,7 @@ export class ReadyScriptSandboxProvider implements ScriptSandboxProvider {
           try {
             const frames = parser.push(chunk);
             if (!frames.length) return;
-            if (frames.length !== 1 || frames[0].type !== "ready" || frames[0].version !== 2) throw new Error("Invalid runner handshake");
+            if (frames.length !== 1 || frames[0].type !== "ready" || frames[0].version !== 3) throw new Error("Invalid runner handshake");
             parser.finish();
             finish();
           } catch { finish(new Error("Runner handshake failed")); }
@@ -36,7 +36,7 @@ export class ReadyScriptSandboxProvider implements ScriptSandboxProvider {
         signal.addEventListener("abort", abort, { once: true });
         void channel.done.then(() => finish(new Error("Runner exited during startup")));
         if (signal.aborted) abort();
-        else channel.stdin.write(encodeScriptFrame({ type: "hello", version: 2 }));
+        else channel.stdin.write(encodeScriptFrame({ type: "hello", version: 3 }));
       });
       return channel;
     } catch (error) { await channel.close(); throw error; }

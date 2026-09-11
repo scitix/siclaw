@@ -15,7 +15,7 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
     description: "Run Python stdlib or Bash in a disposable container for batch orchestration and aggregation. Prefer direct tools for simple tasks. " +
       "Before batching, reuse a successful sample or validate one representative direct tool call for arguments, authorization and output shape. If direct tools are unavailable, validate the first SDK result before continuing the batch. " +
       "Write the complete script from known tool schemas; avoid sandbox probes. Reuse existing input or one bulk query for local processing. Validate fields, catch per-resource errors, report successes and failures; do not retry denials or blindly repeat batches. " +
-      budget + "SDK calls are sequential; include diagnostic startup/cleanup in the budget and split batches beforehand. " +
+      budget + `Up to ${limits?.max_concurrent_tools ?? 10} concurrent SDK calls per run: use Python ThreadPoolExecutor(max_workers=${limits?.max_concurrent_tools ?? 10}) or bounded Shell workers. Target limits queue calls automatically; include waiting and diagnostic cleanup in the budget. ` +
       "No production credentials, AgentBox/host files or package installation. /work and /tmp are writable scratch space within storage/memory limits; files vanish after this run. Image/SDK files are read-only. Local file processing needs no SDK. " +
       "Python: from siclaw import call, call_to_file, input_data. input_data() takes no arguments and returns decoded input JSON (None if omitted/null). Example for input {\"numbers\":[1,2,3]}: payload = input_data(); print(sum(payload[\"numbers\"])). " +
       "call(TOOL, ARGS) returns a result; call_to_file(TOOL, ARGS, '/work/result.json') saves the same sanitized JSON envelope and returns path/bytes/checksum. Shell: siclaw-tool TOOL JSON; siclaw-tool --output /work/result.json TOOL JSON; input is $SICLAW_INPUT_FILE. " +
@@ -33,7 +33,7 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
         description: "JSON value supplied to this script. Python reads it by calling input_data() with no arguments; Shell reads $SICLAW_INPUT_FILE. Omitted or null input becomes Python None.",
       })), network_isolation: Type.Optional(Type.Boolean()),
       timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: limits?.max_timeout_seconds ?? 600,
-        ...(limits ? { default: limits.default_timeout_seconds } : {}), description: "Execution budget after runner startup. Include sequential SDK calls and diagnostic cleanup; choose a batch that fits this limit." })),
+        ...(limits ? { default: limits.default_timeout_seconds } : {}), description: "Execution budget after runner startup. Include target queue waits, concurrent SDK batches and diagnostic cleanup." })),
       clusters: Type.Optional(Type.Array(Type.Object({ name: Type.String() }, { additionalProperties: false }))),
       hosts: Type.Optional(Type.Array(Type.String())),
       mcp: Type.Optional(Type.Array(Type.Object({ server: Type.String(), tools: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false }))),

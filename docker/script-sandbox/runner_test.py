@@ -22,8 +22,8 @@ class RunnerTest(unittest.TestCase):
                 process.stdin.write((json.dumps(value, ensure_ascii=False) + "\n").encode())
                 process.stdin.flush()
             try:
-                send({"type": "hello", "version": 2})
-                self.assertEqual(json.loads(process.stdout.readline()), {"type": "ready", "version": 2})
+                send({"type": "hello", "version": 3})
+                self.assertEqual(json.loads(process.stdout.readline()), {"type": "ready", "version": 3})
                 send({"type": "start", "language": language, "code": code, "input": input_data})
                 output = {"stdout": bytearray(), "stderr": bytearray()}
                 calls = []
@@ -37,7 +37,9 @@ class RunnerTest(unittest.TestCase):
                     if frame["type"] == "tool":
                         calls.append(frame["call"])
                         response = responder(frame["call"]) if responder else {"id": frame["call"]["id"], "result": {"pods": ["one"]}}
-                        send({"type": "tool_result", "response": response})
+                        responses = response if isinstance(response, list) else [response] if response is not None else []
+                        for item in responses:
+                            send({"type": "tool_result", "response": item})
                     else:
                         output[frame["type"]].extend(base64.b64decode(frame["data"]))
                 self.assertEqual(process.wait(timeout=5), 0)
@@ -59,6 +61,38 @@ for _ in range(2):
 ''', input_data={"count": 2})
         self.assertEqual(len(calls), 2)
         self.assertIn("one", out)
+
+    def ten_reversed_responses(self):
+        pending = []
+        def respond(call):
+            pending.append(call)
+            if len(pending) == 10:
+                return [{"id": c["id"], "result": c["arguments"]} for c in reversed(pending)]
+        return respond
+
+    def test_ten_python_calls_are_in_flight_and_large_responses_cannot_cross(self):
+        out, calls = self.run_script('''from concurrent.futures import ThreadPoolExecutor
+from siclaw import call
+def query(i):
+    args = {"index": i, "text": str(i) * 100000}
+    assert call("test.echo", args) == args
+    return i
+with ThreadPoolExecutor(max_workers=10) as workers:
+    assert list(workers.map(query, range(10))) == list(range(10))
+print("parallel-python-ok")
+''', responder=self.ten_reversed_responses())
+        self.assertEqual(len(calls), 10)
+        self.assertEqual(out, "parallel-python-ok\n")
+
+    def test_ten_shell_processes_share_bounded_lanes_with_out_of_order_results(self):
+        import shlex
+        sdk = shlex.quote(str(Path(RUNNER).with_name("siclaw.py")))
+        python = shlex.quote(sys.executable)
+        commands = [f'{python} {sdk} test.echo \'{{"index":{i}}}\' > result-{i}.json &' for i in range(10)]
+        commands += ['wait', f'''{python} -c 'import json; assert [json.load(open("result-%d.json" % i))["index"] for i in range(10)] == list(range(10)); print("parallel-shell-ok")' ''']
+        out, calls = self.run_script('\n'.join(commands), language="shell", responder=self.ten_reversed_responses())
+        self.assertEqual(len(calls), 10)
+        self.assertEqual(out, "parallel-shell-ok\n")
 
     def test_shell_and_subprocess(self):
         out, _ = self.run_script('test -z "$FAKE_PRODUCTION_SECRET" && printf "shell works\\n"', "shell")

@@ -73,7 +73,7 @@ describe("script connectors", () => {
         expect(builtin).toHaveBeenLastCalledWith(expect.anything(), { cluster: "prod", command }, expect.anything(), expect.objectContaining({ tool: "bash" }));
       }
       expect(request).not.toHaveBeenCalled();
-      expect(rpc.request.mock.calls.filter(c => c[0] === "sandbox.resolve")).toHaveLength(2);
+      expect(rpc.request.mock.calls.filter(c => c[0] === "sandbox.resolve")).toHaveLength(4);
     } finally { request.mockRestore(); }
   });
   it.each([{ exec: { command: "sh" } }, { "auth-provider": { name: "gcp" } }, { tokenFile: "/etc/secret" }, { "client-key": "/etc/key" }, { "as": "admin" }])("refuses active/file kubeconfig authentication %j", user => {

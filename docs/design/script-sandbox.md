@@ -184,13 +184,9 @@ filesystem guidance through the registered `run_script` tool description and
 parameter schema. This compact contract reuses the main Agent's existing MCP
 schemas without copying them into `run_script` or generating SDK functions.
 Detailed examples and architecture remain in this document, outside the model's
-tool description. A representative serialization including the parameter schema
-is 985 tokens with `o200k_base` (973 with `cl100k_base`), down from 1,008 (1,000)
-before the planning/budget update. Clarifying the native MCP result root and
-optional error flag adds 23 `o200k_base` tokens to the earlier 962-token contract.
-These counts exclude provider-specific tool
-wrapping, other tools and conversation history; prompt caching does not remove
-context occupancy.
+tool description. The description adds only compact budget and bounded-worker guidance.
+Other tool schemas, provider wrapping and conversation history also occupy
+context; prompt caching does not remove that occupancy.
 
 For a remote batch, reuse an already successful representative sample or make
 one ordinary direct tool call to check arguments, authorization and result
@@ -205,8 +201,8 @@ timeout, SDK call and stdout/stderr budgets plus network-isolation defaults.
 AgentBox projects these fields into the tool description and timeout schema;
 provider configuration and credentials are never forwarded. Missing budgets
 from an older Runtime use conservative guidance, and Runtime still enforces its
-limits independently. Batch planning must account for sequential SDK operations
-and node diagnostic startup/cleanup; a command's own timeout is not the whole
+limits independently. Batch planning must account for bounded parallel SDK operations,
+shared-target queue time and node diagnostic startup/cleanup; a command's own timeout is not the whole
 callback duration.
 
 Its working directory is `/work`; scripts can create, read,
@@ -231,10 +227,47 @@ retain the shared MCP tool's result shape.
 Tool commands have a 1–15 second budget. Background execution is unavailable
 without background wiring, and node diagnostic images come from service
 configuration; these choices are represented in the existing tools' schemas.
-Each run permits one in-flight SDK operation, even with multiple child threads
-or processes. Runtime permits at most **10** in-flight sandbox `node_exec`
-callbacks across runs; excess calls fail promptly. Runner concurrency is
-configured independently.
+Each Runtime defaults to **10 active scripts**, with **10 concurrent SDK calls**
+per script. Python can use `ThreadPoolExecutor(max_workers=10)`; Shell can use
+at most ten background workers followed by `wait`. Ten independent pipe pairs
+and process-shared lane locks correlate out-of-order results. Runtime and
+AgentBox independently reject extra in-flight frames and replayed call IDs.
+
+All sandbox tools acquire shared target capacity before execution. The trusted
+Runtime hashes the authorized endpoint, never a script-provided URL or quota:
+
+| Target | Default active tools | Rate budget |
+| --- | ---: | --- |
+| Cluster API origin | 10 across all Runtime instances | 10 calls/s, burst 20 |
+| MCP origin | 10 across all Runtime instances | 10 calls/s, burst 20 |
+| Same host address/port, node, or Pod container | 1 | Included in its cluster budget when applicable |
+
+Bindings with different names but the same endpoint share capacity; unrelated
+endpoints can proceed independently. Endpoint aliases with different origins
+are distinct targets. The limit counts tool invocations, not every underlying
+HTTP request. MCP discovery/handshakes and upstream work can generate additional
+requests. Ordinary direct Agent calls retain their existing limits; this gate
+covers SDK traffic, not all traffic to the upstream service.
+
+Standalone Portal owns the shared admission gate in its single process. A
+multi-replica control plane implements `sandbox.traffic.acquire` and
+`sandbox.traffic.release` atomically in shared storage. Neither RPC is exposed
+to scripts or public callbacks. An unavailable coordinator fails closed, without
+falling back to a per-Runtime counter. The target ceiling, rate and burst are
+operator settings (`SICLAW_SANDBOX_TARGET_CONCURRENCY`, `_RPS`, `_BURST`, each
+with the full `SICLAW_SANDBOX_TARGET` prefix); standalone Helm settings are under
+`scriptSandbox.traffic`. Leaf-target concurrency stays one.
+
+Admission waits at most 30 seconds, with at most 100 queued calls per target and
+1,000 overall. Contending users receive scheduling preference over repeated
+calls from the current user. Waiting consumes the script deadline. After
+admission, Runtime resolves current authorization and credentials again and
+refuses a changed target. A full/expired queue returns `TARGET_BUSY`; the SDK
+raises a clear busy error, with no automatic retry or script rewriting.
+Confirmed tool completion releases the slot. Uncertain transport loss retains
+its 150-second lease, rather than allowing another request while the previous
+execution may still be active. Expiry bounds owner-loss recovery; upstream
+services with work that outlives a disconnected request need their own limits.
 
 Node diagnostics use `siclaw-script-diagnostics` in the target cluster. The
 trusted node tool creates only this labeled namespace and its quota when absent.
@@ -285,14 +318,15 @@ python3 -c 'import json; data=json.load(open("data.json")); print(type(data).__n
 
 The SDK requests `delivery: "file"`; no file path or download URL is sent to
 Runtime. Runtime executes the authorized tool once, sanitizes its response and
-holds at most one 4 MiB result buffer for that run. This is bounded buffering,
+holds at most ten independent result buffers, each capped at 4 MiB and
+collectively subject to the 16 MiB cumulative budget. This is bounded buffering,
 not unlimited upstream streaming. A random run-local transfer ID identifies the
 buffer. `result.read` returns sequential chunks of at most 48 KiB, reauthorizing
 the **original** user/resource on each chunk without repeating the operation.
 Skipped/replayed offsets, other runs, cancelled runs and revoked resources are
 rejected. Data is discarded at EOF, explicit `result.discard`, or run completion.
 Chunk requests have a separate bounded protocol budget and do not consume the
-64 upstream tool-call slots. Failed/discarded files still consume the cumulative
+512 default upstream tool-call slots. Failed/discarded files still consume the cumulative
 admitted-byte budget.
 
 Python and Shell share the same SDK. It checks byte count and SHA-256 before an
@@ -315,7 +349,7 @@ raw files to stdout. Data too large for these budgets requires narrower queries
 or pagination; partial data is never presented as a successful file.
 
 Deploy matching Runtime, AgentBox and runner images. Runner readiness protocol
-version **2** requires the UTF-8 and file SDK; old native images or E2B templates
+version **3** requires the ten-lane SDK; old native images or E2B templates
 fail the handshake before receiving task data. Rebuild the E2B template when
 upgrading the SDK. No model call, package installation or extra service is added
 to sandbox startup.
@@ -381,8 +415,8 @@ keeping unused warm Pods from blocking real work on a full cluster. Waiting for
 provisioning is reported as a cold start. Pools replenish asynchronously. Warm instances expire
 after 300 seconds by default and are terminated on Runtime shutdown.
 
-Defaults: four active runs per Runtime, 120-second maximum execution, 90-second
-startup ceiling, 128 KiB combined output, 64 tool calls, 1 CPU / 256 MiB limits,
+Defaults: ten active runs per Runtime, 300-second maximum execution, 90-second
+startup ceiling, 128 KiB combined output, 512 tool calls, 1 CPU / 256 MiB limits,
 64 MiB `/work` and 32 MiB `/tmp`. Requested CPU/memory are 20m/64Mi. The launcher
 caps descriptors, processes and core dumps; Docker additionally sets a PID limit.
 Linux RLIMIT_NPROC is per host UID. Runtime-generated instance IDs derive UIDs
@@ -479,7 +513,7 @@ payload = input_data()
 print(sum(payload["numbers"]))  # 6
 ```
 
-The SDK serializes cross-process calls through a file lock and paired pipes.
+The SDK supports ten cross-process lanes, each with its own file lock and paired pipes.
 Bash/exec results have a `text` field. With `kubectl -o json`, parse that field
 as JSON. File delivery saves the same result envelope, not a different API.
 
@@ -543,7 +577,7 @@ The registration binds the Runtime, run, Agent and Web session and expires
 within the script timeout plus 10 seconds (maximum 610 seconds). It returns
 the configured callback URL. Each callback is checked at ingress and again
 against Runtime's live run before entering the **same** scope checks, replay
-detection, serial execution, call budget, output limits and 25-second tool
+detection, ten concurrent callbacks, call budget, output limits and bounded tool
 deadline as a Pod pipe request. Current resource authorization is still checked
 on every operation. No token refresh or automatic request retries occur.
 
