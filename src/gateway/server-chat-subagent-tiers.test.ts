@@ -178,3 +178,58 @@ it("resolves the latest shared model at dispatch and keeps the independent fast 
   await waitFor(() => vi.mocked(buildRedactionConfigForModelConfig).mock.calls.length > 0);
   expect(buildRedactionConfigForModelConfig).toHaveBeenLastCalledWith(binding.modelConfig);
 });
+
+it.each(["CURRENT ADDENDUM", "", null, undefined])("refreshes the caller-stamped prompt with the dispatched binding (%s)", async (systemPrompt) => {
+  const frontend = fakeFrontendClient();
+  const binding = {
+    modelProvider: "provider-b", modelId: "model-b", modelConfig: {},
+    modelSelectionVersion: 2, systemPrompt,
+  };
+  frontend.request.mockImplementation(async (method: string) => method === "config.getModelBinding"
+    ? { binding } : { system_prompt: "CURRENT SEPARATE ADDENDUM" });
+  server = await bootRuntime(frontend);
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "prompt-refresh",
+    modelSelectionVersion: 1, systemPrompt: "STALE CALLER ADDENDUM",
+  }, { sendEvent: vi.fn() });
+  await waitFor(() => promptCalls.length > 0);
+  expect(promptCalls[0]).toMatchObject({
+    modelId: "model-b",
+    systemPromptTemplate: systemPrompt ?? "CURRENT SEPARATE ADDENDUM",
+  });
+});
+
+it("preserves explicit prompts for callers without selection metadata", async () => {
+  server = await bootRuntime();
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "legacy-prompt",
+    systemPrompt: "CALLER ADDENDUM",
+  }, { sendEvent: vi.fn() });
+  await waitFor(() => promptCalls.length > 0);
+  expect(promptCalls[0].systemPromptTemplate).toBe("CALLER ADDENDUM");
+});
+
+it("fails a versioned turn explicitly when current binding resolution fails", async () => {
+  const frontend = fakeFrontendClient();
+  const context = { sendEvent: vi.fn() };
+  frontend.request.mockImplementation(async (method: string) => {
+    if (method === "config.getModelBinding") throw new Error("control plane unavailable");
+    return { found: false };
+  });
+  server = await bootRuntime(frontend);
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "binding-failure",
+    modelSelectionVersion: 0, modelProvider: "old-provider", modelId: "old-model", modelConfig: {},
+  }, context);
+  await waitFor(() => context.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "stream_error"));
+  expect(promptCalls).toHaveLength(0);
+  expect(context.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "prompt_done")).toBe(true);
+});
+
+it.each(["3", null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])("rejects malformed chat selection version %s before dispatch", async (modelSelectionVersion) => {
+  server = await bootRuntime();
+  await expect(server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", modelSelectionVersion,
+  }, { sendEvent: vi.fn() })).rejects.toThrow("modelSelectionVersion must be a non-negative safe integer");
+  expect(promptCalls).toHaveLength(0);
+});

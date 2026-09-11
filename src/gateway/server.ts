@@ -809,6 +809,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
     }
+    if (params.modelSelectionVersion !== undefined
+      && (typeof params.modelSelectionVersion !== "number"
+        || !Number.isSafeInteger(params.modelSelectionVersion) || params.modelSelectionVersion < 0)) {
+      throw new Error("modelSelectionVersion must be a non-negative safe integer");
+    }
     // Refuse rather than accept a turn this process will not be around to finish. The
     // caller can place it on a Runtime that will.
     if (shuttingDown) {
@@ -1056,6 +1061,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           promptOpts.modelFingerprint = binding.modelFingerprint;
           promptOpts.modelSelectionVersion = binding.modelSelectionVersion;
           promptOpts.subagentTiers = binding.subagentTiers;
+          // A caller-stamped Addendum belongs to its old binding too. An absent
+          // Addendum is resolved below for control planes with a separate RPC.
+          promptOpts.systemPromptTemplate = binding.systemPrompt ?? undefined;
         }
 
         // Agent-Addendum precedence for the box session. An explicit
@@ -2263,6 +2271,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const wantsModel = resourceTypes.includes("model");
     const expectedReleaseId = params.releaseId as string | undefined;
     const expectedModelFingerprint = params.modelFingerprint as string | undefined;
+    const expectedModelSelectionVersion = params.modelSelectionVersion;
+    if (expectedModelSelectionVersion !== undefined
+      && (typeof expectedModelSelectionVersion !== "number"
+        || !Number.isSafeInteger(expectedModelSelectionVersion) || expectedModelSelectionVersion < 0)) {
+      throw new Error("modelSelectionVersion must be a non-negative safe integer");
+    }
     let preparedReleaseId = "";
     let preparedModelFingerprint = "";
     let preparedModelSelectionVersion = 0;
@@ -2272,14 +2286,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       preparedReleaseId = binding.releaseId ?? "";
       preparedModelFingerprint = binding.modelFingerprint ?? "";
       preparedModelSelectionVersion = binding.modelSelectionVersion ?? 0;
-      if (params.modelSelectionVersion !== undefined && params.modelSelectionVersion !== preparedModelSelectionVersion) {
-        throw new Error("model selection version does not match expected Agent configuration");
-      }
       if (expectedReleaseId && preparedReleaseId !== expectedReleaseId) {
         throw new Error(`model binding release ${preparedReleaseId || "<empty>"} does not match expected ${expectedReleaseId}`);
       }
       if (expectedModelFingerprint && preparedModelFingerprint !== expectedModelFingerprint) {
         throw new Error(`model binding fingerprint ${preparedModelFingerprint || "<empty>"} does not match expected ${expectedModelFingerprint}`);
+      }
+      if (expectedModelSelectionVersion !== undefined && expectedModelSelectionVersion !== preparedModelSelectionVersion) {
+        throw new Error("model selection version does not match expected Agent configuration");
       }
     }
 

@@ -1498,6 +1498,8 @@ export function createHttpServer(
         const ranIntendedModel = intendedCandidate !== undefined
           && result?.activeCandidateKey === intendedCandidate;
         if (ranIntendedModel && body.releaseId && body.modelFingerprint
+          // Versionless callers are legacy version zero. They cannot certify a
+          // newer selection, even if they happen to use the same model again.
           && (body.modelSelectionVersion ?? 0) >= (observedModel?.modelSelectionVersion ?? 0)) {
           observedModel = {
             releaseId: body.releaseId,
