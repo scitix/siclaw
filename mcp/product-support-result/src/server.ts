@@ -14,7 +14,7 @@ const inputSchema = {
   properties: {
     label: {
       type: "boolean",
-      description: "True only when the downstream robot may create a support ticket now.",
+      description: "True when intake is complete and this is the Agent's final conversation turn. The channel may offer its human-handoff button; the user must trigger that workflow. This result does not initiate a handoff or create a ticket.",
     },
     info: {
       type: "object",
@@ -32,7 +32,7 @@ const inputSchema = {
           type: "string",
           enum: ["consultation", "incident", "llm_incident", "requirement", "unknown"],
           description:
-            "llm_incident covers failures while calling an LLM / model API or inference endpoint (gateway errors, auth, rate limits, quotas, a named model misbehaving). incident is every other fault.",
+            "llm_incident covers failures while calling an LLM / model API or inference endpoint (gateway errors, auth, rate limits, quotas, a named model misbehaving). incident is every other fault. Preserve unknown when the conversation does not establish a type, including a final handoff result after the user cannot or declines to clarify; never guess a type to submit.",
         },
         product: {
           type: "string",
@@ -52,7 +52,7 @@ const inputSchema = {
         missing_fields: {
           type: "array",
           description:
-            "Blocking machine field identifiers only; never user-facing questions or diagnostic instructions. Items are trimmed and post-trim duplicates are removed.",
+            "Fields that still justify a user clarification, as machine identifiers only; never user-facing questions or diagnostic instructions. Must be empty for label=true; preserve unavailable facts in description instead of continuing questions after intake ends. Items are trimmed and post-trim duplicates are removed.",
           maxItems: LIMITS.missingFieldsMaxItems,
           items: {
             type: "string",

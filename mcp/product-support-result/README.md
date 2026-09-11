@@ -24,8 +24,18 @@ both MCP text content and `structuredContent`.
 ```
 
 `ticket_type` is one of `consultation`, `incident`, `llm_incident`,
-`requirement`, or `unknown`. A `label=true` result must resolve the type,
-provide a non-empty summary and description, and have no missing fields.
+`requirement`, or `unknown`. A `label=true` result marks the Agent's final
+conversation turn: intake is complete and the channel can offer its human
+handoff button. The user triggers that workflow; the result itself does not
+initiate a handoff or create a ticket. End with an acknowledgment that the
+information is prepared, without further questions or claims of completed actions.
+
+A `label=true` result must provide a non-empty summary and description and
+have no blocking clarification fields. The type may remain `unknown` when
+the user cannot or declines to clarify; preserve that uncertainty and the
+handoff request in the description instead of inventing a classification.
+An empty `missing_fields` means no further Agent clarification is needed,
+not that every fact is known.
 Requirements must also name a concrete product grounded in product knowledge.
 For incidents and consultations, a concrete `product` must be established by
 the conversation or authoritative product knowledge; otherwise leave it empty,

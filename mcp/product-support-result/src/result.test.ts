@@ -86,21 +86,23 @@ describe("parseProductSupportResult", () => {
         )).toThrow(/requires info\.product/);
   });
 
-  it("rejects unresolved ticket-ready results", () => {
-    expect(() =>
-        parseProductSupportResult(
-          validResult({
-            info: {
-              ticket_type: "unknown",
-              product: "",
-              summary: "Needs support",
-              description: "The request cannot be resolved automatically.",
-              evidence: [],
-              missing_fields: [],
-              llm: emptyLlm(),
-            },
-          }),
-        )).toThrow(/resolved ticket_type/);
+  it("preserves an unknown type when the user declines clarification and requests handoff", () => {
+    const result = parseProductSupportResult({
+      label: true,
+      info: {
+        ticket_type: "unknown",
+        product: "",
+        summary: "User requests human support",
+        description: "After one clarification, the user cannot describe the issue and declines further questions. Type and product remain unknown.",
+        evidence: ["User explicitly requested human support."],
+        missing_fields: [],
+      },
+    });
+
+    expect(result.label).toBe(true);
+    expect(result.info.ticket_type).toBe("unknown");
+    expect(result.info.product).toBe("");
+    expect(result.info.llm).toEqual(emptyLlm());
   });
 
   it("requires a boolean label", () => {
