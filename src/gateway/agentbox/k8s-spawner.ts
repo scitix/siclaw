@@ -11,6 +11,7 @@ import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
 import { CertificateManager } from "../security/cert-manager.js";
+import { observeContainerLifecycle, type ContainerObservation } from "../capability/container-evidence.js";
 import {
   certExpiryLabel,
   certificateNeedsRenewal,
@@ -203,6 +204,19 @@ export class K8sSpawner implements BoxSpawner {
   private coreApi: k8s.CoreV1Api;
   private config: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelector">> & Pick<K8sSpawnerConfig, "persistence" | "nodeSelector">;
   private certManager: CertificateManager | null = null;
+  private containerObserver?: ReturnType<typeof observeContainerLifecycle>;
+
+  observeContainers(send: (observation: ContainerObservation) => Promise<unknown>): { retry(): void; stop(): Promise<void> } {
+    if (this.containerObserver) throw new Error("container observation already started");
+    this.containerObserver = observeContainerLifecycle(this.kc, this.coreApi, this.config.namespace, this.config.labelPrefix, send);
+    return {
+      retry: () => this.containerObserver?.retry(),
+      stop: async () => {
+        await this.containerObserver?.stop();
+        this.containerObserver = undefined;
+      },
+    };
+  }
 
   constructor(config?: K8sSpawnerConfig) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -1083,6 +1097,8 @@ export class K8sSpawner implements BoxSpawner {
     const { namespace, labelPrefix } = this.config;
 
     console.log(`[k8s-spawner] Stopping pod: ${boxId}`);
+
+    this.containerObserver?.beforeStop(boxId);
 
     try {
       await this.coreApi.deleteNamespacedPod({ name: boxId, namespace });
