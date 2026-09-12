@@ -93,6 +93,11 @@ describe("strict API result consumer", () => {
     await expect(runTicketReview(options(), contextFor())).rejects.toMatchObject({ code: "RUN_FRAME_TOO_LARGE" });
   });
 
+  it("refuses a ready draft when the caller declares unavailable material", async () => {
+    serve(encode("session", session) + encode("result", drafts[0]) + encode("done", {}));
+    await expect(runTicketReview(options(), { ...contextFor(), coverage: { complete: false, missing: ["unread handling page"] } })).rejects.toMatchObject({ code: "REVIEW_INCOMPLETE_COVERAGE", retriable: false });
+  });
+
   it("rejects non-SSE success, classifies HTTP retry, and refuses plaintext remote keys", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 })));
     await expect(runTicketReview(options(), contextFor())).rejects.toMatchObject({ code: "RUN_HTTP_200", retriable: false });
