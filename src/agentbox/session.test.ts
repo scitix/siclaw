@@ -996,6 +996,14 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
       description: "batch", spawnId: "grp1", parentSessionId: "p1", parentAgentId: null, userId: "u",
       taskListId: "tl1", subagentType: "general-purpose", runInBackground: true,
       renderedTasks: [{ item: "a", prompt: "do a" }, { item: "b", prompt: "do b" }],
+      targetCoverage: {
+        artifact_id: "inventory",
+        total: 3,
+        offset: 0,
+        selected: 2,
+        next_offset: 2,
+        target_ids: ["a", "b"],
+      },
     });
     expect(res.status).toBe("launched");
     expect(mgr.jobs.get("grp1").status).toBe("stopped");
@@ -1010,6 +1018,16 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
       { index: 0, status: "skipped" },
       { index: 1, status: "skipped" },
     ]);
+    expect(terminal.event.targetCoverage).toEqual({
+      artifact_id: "inventory",
+      total: 3,
+      offset: 0,
+      selected: 2,
+      next_offset: 2,
+      target_ids: ["a", "b"],
+      outcomes: { a: "skipped", b: "skipped" },
+      snapshot_complete: false,
+    });
   });
 
   it("#9 background sub-agent bails when parent _aborted during setup (no child prompt)", async () => {
@@ -2270,7 +2288,7 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
   }
   it("seeds inherited context before the child runs and excludes later parent changes", async () => {
     const mgr = new AgentBoxSessionManager() as any;
-    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "user");
+    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", "user");
     parent.session.messages = [{ role: "user", content: "first question" }, { role: "user", content: "latest question" }];
     (globalThis as any).__inheritedContextMessages = [];
     (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({ prompt: async () => {
@@ -2290,12 +2308,12 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
   it("rejects inheritance from an unavailable parent or another user", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     await expect(mgr.createSpawnSubagentExecutor()(request({ forkTurns: "all" }))).rejects.toThrow(/unavailable/);
-    await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "someone-else");
+    await mgr.getOrCreate("parent", "web", undefined, "normal", "someone-else");
     await expect(mgr.createSpawnSubagentExecutor()(request({ forkTurns: "all" }))).rejects.toThrow(/unavailable/);
   });
   it("shares one captured context across map children and synthesis", async () => {
     const mgr = new AgentBoxSessionManager() as any;
-    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "user");
+    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", "user");
     parent.session.messages = [{ role: "user", content: "inventory at dispatch" }];
     const snapshots: unknown[] = [];
     mgr.runSpawnedSubagent = async (req: any, options: any) => {
@@ -2314,7 +2332,7 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
   });
   it("fails before inference when inherited context does not fit the child model", async () => {
     const mgr = new AgentBoxSessionManager() as any;
-    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", undefined, "user");
+    const parent = await mgr.getOrCreate("parent", "web", undefined, "normal", "user");
     parent.session.messages = [{ role: "user", content: "large context" }];
     let prompted = false;
     (globalThis as any).__fakeBrainFactories.push(() => ({
@@ -2329,7 +2347,7 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
   });
   it("retains the parent's business prompt independently of the child role", async () => {
     const mgr = new AgentBoxSessionManager() as any;
-    const parent = await mgr.getOrCreate("parent", "web", "Only inspect region X", "normal", undefined, "user");
+    const parent = await mgr.getOrCreate("parent", "web", "Only inspect region X", "normal", "user");
     expect(parent.agentPrompt).toBe("Only inspect region X");
     success();
     await mgr.createSpawnSubagentExecutor()(request());

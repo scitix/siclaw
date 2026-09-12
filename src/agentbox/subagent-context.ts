@@ -8,6 +8,12 @@ export interface SubagentContextSnapshot {
   images: ImageContent[];
 }
 
+export const MAX_SUBAGENT_INHERITED_ARTIFACT_BYTES = 64 * 1024 * 1024;
+
+interface SubagentContextMaterializationOptions {
+  maxInheritedArtifactBytes?: number;
+}
+
 export function validateSubagentContextSelection(value: unknown): asserts value is SubagentContextSelection | undefined {
   if (value === undefined || value === "none" || value === "all") return;
   if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return;
@@ -75,9 +81,12 @@ export async function materializeSubagentContext(
   destination: Pick<ToolResultArtifactStore, "capture">,
   sanitize: (text: string) => string,
   stopped: () => boolean = () => false,
+  options: SubagentContextMaterializationOptions = {},
 ): Promise<Array<TextContent | ImageContent>> {
   const replacements = new Map<string, string>();
   const visiting = new Set<string>();
+  const maxInheritedArtifactBytes = options.maxInheritedArtifactBytes ?? MAX_SUBAGENT_INHERITED_ARTIFACT_BYTES;
+  let inheritedArtifactBytes = 0;
   const rebind = async (text: string): Promise<string> => {
     if (stopped()) throw new Error("Stopped while preparing inherited context");
     // Resume tickets are capabilities, not evidence references.
@@ -94,6 +103,11 @@ export async function materializeSubagentContext(
         let evidence;
         try { evidence = await source.readFull(id); }
         catch { throw new Error("An inherited tool result is unavailable or expired; refresh the evidence or use fork_turns:'none'."); }
+        const evidenceBytes = Buffer.byteLength(evidence.text, "utf8");
+        if (inheritedArtifactBytes + evidenceBytes > maxInheritedArtifactBytes) {
+          throw new Error("Inherited artifact graph exceeds the 64 MiB byte budget; use a narrower fork_turns selection.");
+        }
+        inheritedArtifactBytes += evidenceBytes;
         if (evidence.toolName.startsWith("internal:")) {
           replacement = "[parent runtime capability omitted]";
         } else {

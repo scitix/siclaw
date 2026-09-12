@@ -10,7 +10,8 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
-import type { GroupItemStatus } from "../core/tool-registry.js";
+import type { GroupItemStatus, SubagentTargetCoverage } from "../core/tool-registry.js";
+import { sanitizeWireTargetCoverage } from "../shared/delegation-persistence.js";
 import {
   sanitizeWireItemStatuses,
   sanitizeWireTierOutcome,
@@ -124,6 +125,8 @@ export interface AppendDelegationEventInput {
   interruptedTool?: string;
   /** Group terminal event per-item status snapshot (mirrors DelegationEventPayload.itemStatuses). */
   itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
+  /** Final inventory coverage for a group terminal event. */
+  targetCoverage?: SubagentTargetCoverage;
   /**
    * Single-child terminal event: which model ran it and why (identifiers only).
    * Mirrors `DelegationEventPayload.tier`.
@@ -358,6 +361,10 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
     ...(() => {
       const items = sanitizeWireItemStatuses(evt.itemStatuses);
       return items ? { item_statuses: items } : {};
+    })(),
+    ...(() => {
+      const coverage = sanitizeWireTargetCoverage(evt.targetCoverage);
+      return coverage ? { target_coverage: coverage } : {};
     })(),
     ...(() => {
       const tier = sanitizeWireTierOutcome(evt.tier);

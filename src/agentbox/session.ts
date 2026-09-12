@@ -32,6 +32,7 @@ import type {
   SubagentGroupReport,
   SubagentGroupResult,
   SubagentGroupItemResult,
+  SubagentTargetCoverage,
   JobStopExecutor,
   BackgroundExecExecutor,
   TaskOutputReader,
@@ -1563,6 +1564,7 @@ export class AgentBoxSessionManager {
     // Persisted terminal event content: reduce summary, else the group explanation, else a status
     // digest — always non-empty.
     const capsule = reduceSummary ?? groupSummary ?? summarizeItemStatuses(itemResults);
+    const targetCoverage = finishTargetCoverage(request.targetCoverage, itemResults.map(item => item.status));
 
     // Group terminal delegation_event (design §"Persistence & lineage"): delegationId == groupId ties the
     // per-child events (`{groupId}#{i}`) together so the UI rebuilds the card on reload. The per-item
@@ -1583,6 +1585,7 @@ export class AgentBoxSessionManager {
         status: r.status,
         ...(r.tierOutcome ? { tier: persistableTierOutcome(r.tierOutcome) } : {}),
       })),
+      targetCoverage,
       durationMs,
       traceId: traceCtx?.mainTraceId,
     });
@@ -1590,7 +1593,7 @@ export class AgentBoxSessionManager {
     return {
       status,
       itemResults,
-      coverage: finishTargetCoverage(request.targetCoverage, itemResults.map(item => item.status)),
+      coverage: targetCoverage,
       ...(reduceSummary !== undefined ? { reduceSummary } : {}),
       ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
       ...(circuitBroken ? { circuitBroken } : {}),
@@ -1608,6 +1611,7 @@ export class AgentBoxSessionManager {
       summaryTruncated: boolean;
       reduceChildSessionId?: string;
       itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
+      targetCoverage?: SubagentTargetCoverage;
       durationMs: number;
       traceId?: string;
     },
@@ -1628,6 +1632,7 @@ export class AgentBoxSessionManager {
         fullSummary: outcome.capsule,
         summaryTruncated: outcome.summaryTruncated,
         ...(outcome.itemStatuses ? { itemStatuses: outcome.itemStatuses } : {}),
+        ...(outcome.targetCoverage ? { targetCoverage: outcome.targetCoverage } : {}),
         scope: request.description,
         toolCalls: 0,
         durationMs: outcome.durationMs,
@@ -1674,6 +1679,7 @@ export class AgentBoxSessionManager {
         capsule: `Sub-agent group "${request.description}" was stopped before it started.`,
         summaryTruncated: false,
         itemStatuses: request.renderedTasks.map((_, i) => ({ index: i, status: "skipped" as GroupItemStatus })),
+        targetCoverage: finishTargetCoverage(request.targetCoverage, request.renderedTasks.map(() => "skipped")),
         durationMs: 0,
         traceId: traceCtx?.mainTraceId,
       });

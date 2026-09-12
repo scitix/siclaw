@@ -99,6 +99,22 @@ describe("child-scoped inherited evidence", () => {
     const snapshot = captureSubagentContext([text("user", id)], "all", "spawn");
     await expect(materializeSubagentContext(snapshot, source, child, identity)).rejects.toThrow(/cyclic/);
   });
+  it("bounds total inherited artifact bytes before copying the overflowing artifact", async () => {
+    const first = "tra_" + "a".repeat(32);
+    const second = "tra_" + "b".repeat(32);
+    const snapshot = captureSubagentContext([text("user", `${first} ${second}`)], "all", "spawn");
+    const source = { readFull: async (id: string) => ({ text: id === first ? "123456" : "abcdef", toolName: "query" }) };
+    const captured: string[] = [];
+    const destination = { capture: async ({ text: value }: { text: string }) => {
+      captured.push(value);
+      return { reference: { id: "tra_" + "c".repeat(32) } };
+    } };
+
+    await expect(materializeSubagentContext(snapshot, source, destination, identity, undefined, {
+      maxInheritedArtifactBytes: 10,
+    })).rejects.toThrow(/byte budget/);
+    expect(captured).toEqual(["123456"]);
+  });
   it("persists inherited context as reference data in the native transcript for follow-ups", async () => {
     const { parent, child } = await stores();
     const content = await materializeSubagentContext(captureSubagentContext([text("user", "prior evidence")], "all", "spawn"), parent, child, identity);

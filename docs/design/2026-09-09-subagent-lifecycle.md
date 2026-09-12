@@ -40,6 +40,15 @@ A continuation uses a new tool/delegation ID, trace span and result, while keepi
 the child session ID. Completed child transcripts can be reopened after a manager
 restart on the same persistent storage. An in-flight run/mailbox is not a durable
 job scheduler: a process crash does not promise delivery of pending guidance.
+Resume parses and validates every row with bounded memory before native recovery,
+and rejects files larger than 64 MiB before either pass. Corrupt or unbounded
+retained history therefore cannot mutate or monopolize an AgentBox. Oversized
+histories require a new task.
+
+Inventory-backed background groups persist their sanitized final coverage receipt
+on the bare group terminal event. This keeps `snapshot_complete`, selected/total,
+and the next offset available to a reloaded UI instead of leaving only the launch-
+time selection range. The persistence boundary allow-lists the coverage shape.
 
 A manager reserves child IDs before queueing work. Running/queued continuations
 cannot instantiate a second brain for the same child. Queued work keeps its mailbox
@@ -84,9 +93,9 @@ or template alone proves exhaustive coverage.
 
 ## Compatibility and verification
 
-No HTTP endpoint, database schema or Helm value change is required. SiCore on
-`develop` at `bf9361509` recognizes snapshot batches and terminal guidance
-acknowledgements, and preserves runtime-resolved target labels. Tool
+No HTTP endpoint, database schema or Helm value change is required. A companion
+control-plane UI recognizes snapshot batches and terminal guidance acknowledgements,
+and preserves runtime-resolved target labels. Tool
 parameters/results are additive; existing single/batch prompts still work. Existing
 live/terminal events and child transcript views remain in use. Channels that force
 foreground execution still do so. Native `read` behavior is untouched; the internal

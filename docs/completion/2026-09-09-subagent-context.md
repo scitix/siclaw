@@ -17,8 +17,8 @@ Implemented in the existing `codex/subagent-lifecycle` worktree based on Siclaw
   references are remapped and deduplicated; internal tickets are not copied.
 - Reject unavailable evidence, graph cycles, quota failures and oversized model
   input explicitly. Do not clip context, replay tools or grant parent-directory access.
-- Added design/runtime documentation and bilingual SiCore product documentation.
-  This increment changes no SiCore runtime code, HTTP API, DB schema or Helm value.
+- Added design/runtime documentation and bilingual companion product documentation.
+  This increment changes no control-plane runtime code, HTTP API, DB schema or Helm value.
 
 ## Validation
 

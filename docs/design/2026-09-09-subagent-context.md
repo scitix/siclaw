@@ -35,9 +35,10 @@ Remap only artifact IDs referenced by selected history. Each read uses the paren
 original Agent/session scope and the existing integrity/TTL/private-path checks.
 Copy sanitized full contents to each child's existing artifact store; recursively
 remap nested references with deduplication. Do not copy internal capability artifacts
-or resume tickets. Cycles and graphs larger than 256 IDs fail explicitly. The child
-gets fresh IDs; historical reference checksums/expiry metadata are not authoritative
-for the copies. Existing child quotas and cleanup remain in force.
+or resume tickets. Cycles, graphs larger than 256 IDs, and graphs exceeding 64 MiB
+of referenced artifact content fail explicitly. The child gets fresh IDs; historical
+reference checksums/expiry metadata are not authoritative for the copies. Existing
+child quotas and cleanup remain in force.
 
 Missing evidence or exhausted quotas fail the child visibly instead of silently
 clipping it. Copies made before failure remain bounded by the existing TTL cleanup.
@@ -48,6 +49,6 @@ optimizer or forced reasoning steps are introduced.
 
 ## Compatibility
 
-No SiCore rendering change, HTTP endpoint, database migration, production dependency
+No control-plane rendering change, HTTP endpoint, database migration, production dependency
 or Helm value change is needed for context selection. Product docs are bilingual.
 Native read and artifact access controls remain unchanged.

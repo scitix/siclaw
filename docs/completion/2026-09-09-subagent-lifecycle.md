@@ -2,8 +2,8 @@
 
 Implemented on `codex/subagent-lifecycle`, based on `origin/main` at `403395ad`.
 The isolated checkout is `/private/tmp/siclaw-subagent-lifecycle`; existing checkouts
-and their uncommitted changes were preserved. SiCore's small UI companion uses its
-own `codex/subagent-lifecycle` branch based on `origin/develop` at `bf9361509`.
+and their uncommitted changes were preserved. The small control-plane UI companion
+uses its own feature branch.
 
 ## Delivered
 
@@ -26,7 +26,7 @@ own `codex/subagent-lifecycle` branch based on `origin/develop` at `bf9361509`.
 - Keep existing channel foreground behavior, concurrency limits, model tier
   resolution, long-output recovery, child acceptance and background delivery.
   Native pi `read` was not changed.
-- Document usage in `docs/features/subagents.mdx`, and update bilingual SiCore
+- Document usage in `docs/features/subagents.mdx`, and update bilingual companion
   product documentation in the companion worktree.
 
 ## Validation
@@ -38,7 +38,7 @@ own `codex/subagent-lifecycle` branch based on `origin/develop` at `bf9361509`.
 - First full-suite attempt was interrupted after the restricted sandbox rejected
   localhost listeners with `EPERM`. The complete suite passed with local listening
   permitted. No production model, cluster, channel or deployment was exercised.
-- SiCore companion: 176 focused rendering/state tests passed. Expanded chat/hooks
+- Companion UI: 176 focused rendering/state tests passed. Expanded chat/hooks
   regression: 661 passed, one existing analysis-run test failed. An untouched
   `bf9361509` archive reproduces that failure. Its 11 TypeScript diagnostics are
   byte-for-byte identical with and without these changes using the same local
@@ -49,7 +49,7 @@ own `codex/subagent-lifecycle` branch based on `origin/develop` at `bf9361509`.
 Follow-up review confirmed that template-free string items already support different
 complete prompts in one batch. Tool descriptions now distinguish independent
 assignments from repeated-target templates, state the shared role/model-tier scope,
-and explain that synthesis is optional. Runtime and bilingual SiCore documentation
+and explain that synthesis is optional. Runtime and bilingual companion documentation
 include this distinction. A regression verifies distinct prompts reach the executor
 unchanged without forcing a reducer: all 23 spawn-subagent tool tests passed.
 Both worktrees passed `git diff --check` after this clarification.
@@ -63,7 +63,7 @@ integrate revisions. Exhaustive work across several bounded waves still requires
 the parent to consume every `next_offset` and reconcile the union of reports. Source
 count/identity checks cannot prove the source query used the correct scope.
 
-No HTTP API, database schema or Helm value changed. Deploy the SiCore companion
+No HTTP API, database schema or Helm value changed. Deploy the companion UI
 with the runtime change so snapshot batches and guidance acknowledgements render
 correctly. Prepared for the user-requested local commit; no push, PR/MR creation
 or deployment was performed. Unimplemented session synchronization proposals

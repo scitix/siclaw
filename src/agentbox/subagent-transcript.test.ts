@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { openSubagentTranscript } from "./subagent-transcript.js";
+import { MAX_SUBAGENT_TRANSCRIPT_BYTES, openSubagentTranscript } from "./subagent-transcript.js";
 
 let directory: string;
 beforeEach(() => { directory = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-resume-")); });
@@ -52,4 +52,12 @@ it("rejects missing paths and symlinked transcripts", () => {
   fs.writeFileSync(path.join(directory, "outside"), "{}");
   fs.symlinkSync(path.join(directory, "outside"), path.join(directory, "linked.jsonl"));
   expect(() => openSubagentTranscript(directory)).toThrow(/recoverable transcript/);
+});
+
+it("rejects oversized transcripts before parsing them", () => {
+  const file = path.join(directory, "oversized.jsonl");
+  fs.writeFileSync(file, '{"type":"session","id":"oversized"}\n');
+  fs.truncateSync(file, MAX_SUBAGENT_TRANSCRIPT_BYTES + 1);
+
+  expect(() => openSubagentTranscript(directory)).toThrow(/64 MiB resume limit/);
 });
