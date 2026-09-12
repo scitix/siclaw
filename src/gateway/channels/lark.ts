@@ -1861,7 +1861,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const persistedText = redactImageUrlsInText(effectiveText);
   let promptMessageId: string;
   try {
-    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel", undefined, { senderExternalId, channelId });
+    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel", undefined, { senderExternalId, channelId, senderType });
     promptMessageId = await appendMessage({
       sessionId,
       role: "user",
