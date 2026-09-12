@@ -18,6 +18,7 @@ trap cleanup EXIT HUP INT TERM
 
 cp "$KBC_TEST_ROOT/package.json" "$KBC_TEST_ROOT/package-lock.json" "$KBC_TEST_ROOT/tsconfig.json" "$KBC_TEST_ROOT/.dockerignore" "$KBC_TEST_CONTEXT/"
 cp -R "$KBC_TEST_ROOT/src" "$KBC_TEST_ROOT/kbc" "$KBC_TEST_CONTEXT/"
+cp -R "$KBC_TEST_ROOT/patches" "$KBC_TEST_ROOT/scripts" "$KBC_TEST_CONTEXT/"
 
 # Reproduce a checkout/build context created under a restrictive umask. Docker
 # can read these files as the builder user, but USER kbc must not depend on the

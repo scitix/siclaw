@@ -235,6 +235,7 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
   return {
     sessions,
     getOrCreateCalls,
+    setUsageRole: vi.fn(),
     ledgerDir,
     userId: "u",
     agentId: "a",

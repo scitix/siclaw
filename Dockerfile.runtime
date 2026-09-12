@@ -8,6 +8,8 @@ WORKDIR /app
 
 # Dependencies layer (cached unless package*.json changes)
 COPY package*.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci
 
 # Copy source and compile
@@ -26,6 +28,8 @@ WORKDIR /app
 
 # Production deps
 COPY package*.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci --omit=dev
 
 # Copy compiled JS

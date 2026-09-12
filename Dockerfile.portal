@@ -18,6 +18,8 @@ FROM node:22.19-slim AS backend-builder
 WORKDIR /app
 
 COPY package*.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci
 
 COPY tsconfig.json ./
@@ -34,6 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY package*.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci --omit=dev
 
 # Backend JS

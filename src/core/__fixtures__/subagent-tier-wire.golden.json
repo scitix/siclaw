@@ -54,17 +54,21 @@
     "never appears on spawn_subagent, and both suites stay green. That is exactly",
     "how the first integration attempt failed."
   ],
-
   "config_getAgent": {
     "subagent_model_tiers": {
       "revision": "0000000000000000000000000000000000000000000000000000000000000000",
       "items": [
-        { "tier": "fast", "whenToUse": "查日志、读代码、翻配置这类只需要检索和摘要的活" },
-        { "tier": "deep", "whenToUse": "需要跨多个证据源做因果推断、或结论要直接给人看的活" }
+        {
+          "tier": "fast",
+          "whenToUse": "查日志、读代码、翻配置这类只需要检索和摘要的活"
+        },
+        {
+          "tier": "deep",
+          "whenToUse": "需要跨多个证据源做因果推断、或结论要直接给人看的活"
+        }
       ]
     }
   },
-
   "config_getModelBinding": {
     "binding": {
       "subagentTiers": {
@@ -85,22 +89,35 @@
                   "id": "gpt-4o-mini",
                   "name": "gpt-4o-mini",
                   "reasoning": false,
-                  "input": ["text"],
-                  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                  "input": [
+                    "text"
+                  ],
+                  "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0
+                  },
                   "compat": {
                     "maxTokensField": "max_tokens",
                     "supportsDeveloperRole": false,
                     "supportsUsageInStreaming": true
                   }
                 }
-              ]
+              ],
+              "usageIdentity": {
+                "configId": "model-example",
+                "name": "Example model",
+                "sourceKind": "api",
+                "sourceId": "model-example",
+                "sourceName": "Example model"
+              }
             }
           }
         ]
       }
     }
   },
-
   "_rules": [
     "revision is 64 lowercase hex characters (SHA-256), computed over the RAW tier",
     "mapping sorted by tier — NOT over the hydrated candidates. Hashing the",

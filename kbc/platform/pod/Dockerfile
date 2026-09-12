@@ -3,6 +3,8 @@
 FROM node:22.19-slim AS pi-builder
 WORKDIR /pi-worker
 COPY package.json package-lock.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci
 COPY tsconfig.json ./
 COPY src/ ./src/
