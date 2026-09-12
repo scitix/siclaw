@@ -25,6 +25,36 @@ describe("knowledge_search", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it.each(["Library A", "Library-A"])("prefers the exact display name %s over normalized aliases", async (selectedName) => {
+    const otherName = selectedName === "Library A" ? "Library-A" : "Library A";
+    for (const library of ["a", "b"]) {
+      fs.mkdirSync(path.join(knowledgeDir, "repos", library), { recursive: true });
+      fs.writeFileSync(path.join(knowledgeDir, "repos", library, "index.md"), "# Index\n\n- [Entry](entry.md)\n");
+      fs.writeFileSync(path.join(knowledgeDir, "repos", library, "entry.md"),
+        "---\ntype: Topic\ntitle: Entry\nlabels:\n  - facet: topic\n    value: Widget\n---\n# Entry\n");
+    }
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"),
+      `# Knowledge Index\n\n- [[repos/a/index]] - ${otherName} v1\n- [[repos/b/index]] - ${selectedName} v1\n`);
+    await resolver.sync();
+
+    const tool = createKnowledgeSearchTool(resolver);
+    const result = await tool.execute("exact-name", { query: "Widget", library: selectedName });
+    const payload = JSON.parse(result.content[0].text as string);
+
+    expect(payload.error).toBeUndefined();
+    expect(payload.routing.selected).toEqual(["repos/b"]);
+    expect(payload.results.map((row: { file: string }) => row.file)).toEqual(["repos/b/entry.md"]);
+
+    const ambiguous = await tool.execute("ambiguous-name", { query: "Widget", library: "library_a" });
+    const ambiguousPayload = JSON.parse(ambiguous.content[0].text as string);
+    expect(ambiguousPayload.error).toContain("ambiguous");
+    expect(ambiguousPayload).not.toHaveProperty("results");
+    expect(ambiguousPayload.libraries.map((library: { library: string }) => library.library)).toEqual(["repos/a", "repos/b"]);
+
+    const byRoot = await tool.execute("explicit-root", { query: "Widget", library: "repos/a" });
+    expect(JSON.parse(byRoot.content[0].text as string).routing.selected).toEqual(["repos/a"]);
+  });
+
   it("does not search unlabeled page bodies", async () => {
     fs.writeFileSync(
       path.join(knowledgeDir, "nvshmem-install.md"),

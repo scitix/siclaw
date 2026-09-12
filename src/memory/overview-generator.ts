@@ -132,7 +132,8 @@ export function buildKnowledgeWikiCatalog(
     "follow standard markdown links " +
     "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
     (multiLibrary
-      ? "Several libraries are mounted: the catalog below lists libraries, not pages. Pick the library whose domain " +
+      ? "Several libraries are mounted: the catalog below lists libraries, not pages. For catalog exploration or " +
+        "label-only search, pick the library whose domain " +
         "covers the task, then Read that library's own index; `knowledge_search` groups results per library and " +
         "`listLibraries=true` compares their domains in one call. Do not grep or list the whole tree before choosing a library. "
       : "") +

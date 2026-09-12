@@ -434,8 +434,10 @@ export class KnowledgeLabelIndex {
     if (!wanted) return undefined;
     const byRoot = this.libraries.find((library) => library.root === wanted);
     if (byRoot) return byRoot.root;
-    const byName = this.libraries.find((library) => normalize(library.name) === normalize(wanted));
-    if (byName) return byName.root;
+    const byExactName = this.libraries.filter((library) => library.name === selector.trim());
+    if (byExactName.length > 0) return byExactName.length === 1 ? byExactName[0].root : null;
+    const byName = this.libraries.filter((library) => normalize(library.name) === normalize(selector));
+    if (byName.length > 0) return byName.length === 1 ? byName[0].root : null;
     const byBase = this.libraries.filter((library) => path.posix.basename(library.root) === wanted);
     return byBase.length === 1 ? byBase[0].root : null;
   }
@@ -451,7 +453,7 @@ export class KnowledgeLabelIndex {
       unreachableLabeledPages: 0,
     });
     if (libraryFilter === null) {
-      // Unknown library selector: fail loud with an empty result rather than
+      // Unknown or ambiguous library selector: fail loud with an empty result rather than
       // silently searching everything the caller tried to exclude. The flag is
       // the single source of truth for callers; they must not re-match names.
       return { ...empty(), unknownLibrary: true, unreachableLabeledPages: this.pages.size - this.reachableLabeledPageCount() };

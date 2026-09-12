@@ -231,7 +231,7 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
         if (result.unknownLibrary) {
           return {
             content: [{ type: "text", text: JSON.stringify({
-              error: `Unknown library: ${library}`,
+              error: `Unknown library or ambiguous selector: ${library}. Choose an explicit library root.`,
               libraries: resolver.libraries().map((entry) => ({ library: entry.root, name: entry.name })),
             }) }],
             details: { error: true },
