@@ -31,7 +31,7 @@ import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
-import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import { parseToolCapabilitiesAtBoundary } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
   CliSnapshotClusterCredential,
@@ -45,7 +45,7 @@ import { safeParseSkillFiles } from "../shared/skill-package.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
 import { resolveSnapshotModelRouting } from "./model-routing-config.js";
 import {
-  effectiveCapabilityKeys,
+  resolveAgentAllowedTools,
   requireAgentType,
 } from "../core/agent-types.js";
 
@@ -538,15 +538,15 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     }));
 
     // Resolve the agent's capability groups → concrete allowedTools at this
-    // boundary (the AgentBox/TUI stays oblivious to group keys). null/empty =
-    // unrestricted; we only emit the field when non-null to keep the payload
-    // compact (TUI treats absent as null).
+    // boundary (the AgentBox/TUI stays oblivious to group keys). Only Custom
+    // with no selection is unrestricted; emit locked empty arrays and omit null
+    // to keep the payload compact (TUI treats absent as null).
     const activeAgentType = activeAgent ? requireAgentType(activeAgent.agent_type) : null;
     const allowedToolsOut = activeAgent && activeAgentType
-      ? resolveCapabilities(effectiveCapabilityKeys(
+      ? resolveAgentAllowedTools(
           activeAgentType,
           parseToolCapabilitiesAtBoundary(activeAgent.tool_capabilities),
-        ))
+        )
       : null;
 
     const activeAgentOut: CliSnapshotActiveAgent | null = activeAgent

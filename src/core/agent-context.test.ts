@@ -249,3 +249,32 @@ it("asks for concrete missing information when the managed owner has no eligible
   expect(compiled.systemPrompt).toContain("No eligible authorized transfer destination");
   expect(compiled.systemPrompt).toContain("specific missing information or access");
 });
+
+describe("evidence review isolation", () => {
+  it.each(["web", "task"] as const)("keeps %s transport tools out of evidence sessions", (mode) => {
+    const context = compileAgentContext({
+      agentType: "evidence_review", allowedTools: [], memoryConfigured: true,
+      mode, handoffAvailable: true,
+    });
+    expect(context.harness.allowedTools).toEqual([]);
+    expect(context.harness.mcpExposure).toBe("none");
+    expect(context.promptAssembly.text).toBe(context.systemPrompt);
+    expect(context.promptAssembly.layers).toHaveLength(1);
+    expect(context.promptAssembly.layers[0]).toMatchObject({
+      id: "agent_type.contract", owner: "agent_type", mutable: false,
+    });
+  });
+  it.each([null, [], ["bash", "read", "spawn_subagent", "memory_search"]])("never exposes tools from %j", (allowedTools) => {
+    const context = compileAgentContext({
+      agentType: "evidence_review", allowedTools, memoryConfigured: true, mode: "web",
+      agentPrompt: "ADMIN_SECRET", systemPromptTemplate: "WORKSPACE_SECRET",
+    });
+    expect(context.harness.allowedTools).toEqual([]);
+    expect(context.harness.mcpExposure).toBe("none");
+    expect(context.harness.memoryEnabled).toBe(false);
+    expect(context.harness.includeBundledSkills).toBe(false);
+    expect(context.harness.includePlatformSkills).toBe(false);
+    expect(context.systemPrompt).not.toContain("SECRET");
+    expect(context.systemPrompt).toContain("untrusted data");
+  });
+});

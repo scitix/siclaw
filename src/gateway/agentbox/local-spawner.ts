@@ -22,8 +22,8 @@ import {
 } from "../../agentbox/sync-handlers.js";
 import type { CertificateManager } from "../security/cert-manager.js";
 import { getDb } from "../db.js";
-import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../../core/tool-capabilities.js";
-import { requireAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
+import { parseToolCapabilitiesAtBoundary } from "../../core/tool-capabilities.js";
+import { requireAgentType, resolveAgentAllowedTools } from "../../core/agent-types.js";
 import { resolveAgentSubagentTiers } from "../../portal/model-routing-config.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveUnderDir } from "../../shared/path-utils.js";
@@ -133,7 +133,7 @@ export class LocalSpawner implements BoxSpawner {
     // restricted agent is restricted from its very first turn. This mirrors
     // the K8s path
     // (internal-api.ts handleToolCapabilities): a built-in type
-    // LOCKS its capability set via effectiveCapabilityKeys and drives the locked
+    // LOCKS its capability set via resolveAgentAllowedTools and drives the locked
     // persona via agentTypeState — without this, a Coordinator with an empty raw
     // tool_capabilities would resolve to null (unrestricted) and keep the default
     // custom persona in Local mode. Custom with null/empty selection keeps that
@@ -149,7 +149,7 @@ export class LocalSpawner implements BoxSpawner {
       }
       const groupKeys = parseToolCapabilitiesAtBoundary(rows[0].tool_capabilities);
       const agentType = requireAgentType(rows[0].agent_type);
-      sessionManager.allowedToolsState = resolveCapabilities(effectiveCapabilityKeys(agentType, groupKeys));
+      sessionManager.allowedToolsState = resolveAgentAllowedTools(agentType, groupKeys);
       sessionManager.agentTypeState = agentType;
       sessionManager.harnessResolvedState = true;
 

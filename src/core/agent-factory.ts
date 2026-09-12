@@ -34,6 +34,7 @@ import { allToolEntries } from "../tools/all-entries.js";
 import {
   compileAgentContext,
   createAgentContextManifest,
+  evidenceReviewResourceOptions,
   type AgentContextManifest,
 } from "./agent-context.js";
 import type { AgentType } from "./agent-types.js";
@@ -443,6 +444,7 @@ export async function createSiclawSession(
     handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
     interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
   });
+  const evidenceOnly = compiledContext.harness.agentType === "evidence_review";
   const allowedTools = compiledContext.harness.allowedTools;
   const memoryEnabled = compiledContext.harness.memoryEnabled;
   // Mutable ref — populated after memoryIndexer is created (below) so memory-
@@ -474,7 +476,7 @@ export async function createSiclawSession(
     ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
       ? opts.portalKnowledgeDir
       : path.resolve(cwd, config.paths.knowledgeDir));
-  const citationSupport = opts?.sessionEventEmitter
+  const citationSupport = !evidenceOnly && opts?.sessionEventEmitter
     ? createKnowledgeCitationSupport({
         knowledgeDir,
         turnRef,
@@ -528,8 +530,8 @@ export async function createSiclawSession(
   // configuration. Typed page labels become available after one local
   // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
   // shared resolver, while standalone TUI owns this fallback instance.
-  let knowledgeIndexer = opts?.knowledgeIndexer;
-  if (!knowledgeIndexer) {
+  let knowledgeIndexer = evidenceOnly ? undefined : opts?.knowledgeIndexer;
+  if (!evidenceOnly && !knowledgeIndexer) {
     let candidate: KnowledgeResolver | undefined;
     try {
       const created = createKnowledgeResolver(knowledgeDir);
@@ -783,7 +785,7 @@ export async function createSiclawSession(
   // session intentionally sees no bound skills instead of falling back to a
   // process-shared tree.
   const resolvedSkillsDir = path.join(skillsBase, "resolved");
-  const skillsDirs = resolveSkillDirectories({
+  const skillsDirs = evidenceOnly ? [] : resolveSkillDirectories({
     cwd,
     skillsBase,
     scopedSkillsDir: opts?.portalSkillsDir,
@@ -896,6 +898,7 @@ export async function createSiclawSession(
         };
       },
       additionalSkillPaths: skillsDirs,
+      ...(evidenceOnly ? evidenceReviewResourceOptions : {}),
     },
   });
   loader = services.resourceLoader as DefaultResourceLoader;
@@ -917,7 +920,7 @@ export async function createSiclawSession(
     tools: customTools,
     skillNames: loadedSkills.map((skill) => skill.name),
     mcpServerNames: Object.keys(mcpServers),
-    knowledgeMounted: fs.existsSync(knowledgeDir),
+    knowledgeMounted: !evidenceOnly && fs.existsSync(knowledgeDir),
   });
   console.log(`[agent-context] ${JSON.stringify(contextManifest)}`);
   const modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest } = {};

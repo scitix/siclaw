@@ -26,14 +26,14 @@ import {
   hasBackgroundChannelDelivery,
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
-import { parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import { parseToolCapabilitiesAtBoundary } from "../core/tool-capabilities.js";
 import {
   projectTierMenuFromConfig,
   sanitizeWireItemStatuses,
   sanitizeWireTierOutcome,
 } from "../core/subagent-models.js";
 import { sha256Hex } from "../portal/model-routing-config.js";
-import { requireAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
+import { requireAgentType, resolveAgentAllowedTools } from "../core/agent-types.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -455,15 +455,13 @@ export async function handleToolCapabilities(
     const agent = await frontendClient.request("config.getAgent", {
       agentId: identity.agentId,
     });
-    // Built-in types LOCK the capability set; custom uses the
-    // agent's own tool_capabilities. resolveCapabilities(null/[]) === null keeps
-    // the backward-compatible "unrestricted" default for custom with no selection.
+    // Locked types always emit an array, including [] for a zero-tool type.
+    // Only Custom with no selection retains the unrestricted null wire value.
     const agentType = requireAgentType(agent?.agent_type);
-    const capsKeys = effectiveCapabilityKeys(
+    const allowedTools = resolveAgentAllowedTools(
       agentType,
       parseToolCapabilitiesAtBoundary(agent?.tool_capabilities),
     );
-    const allowedTools = resolveCapabilities(capsKeys);
     // The sub-agent tier MENU rides this channel rather than the prompt binding,
     // because a session's tool description is built at creation and a per-prompt
     // field would arrive too late to appear in it. Credential-free by contract:

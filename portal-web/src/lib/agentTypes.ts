@@ -2,7 +2,7 @@
 // capability set and provide an immutable type contract. The Portal edits only
 // an optional Agent Addendum; it never replaces that contract.
 
-export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "coding" | "custom"
+export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "coding" | "evidence_review" | "custom"
 
 export interface AgentTypeOption {
   key: AgentTypeKey
@@ -49,6 +49,13 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     description: "Managed project coding agent: inspects the project's clusters with a read-only snapshot of its source at hand.",
     capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
     defaultNoSkills: false,
+  },
+  {
+    key: "evidence_review",
+    label: "Evidence Review Agent",
+    description: "Analyzes supplied evidence snapshots without tools or ambient context.",
+    capabilities: [],
+    defaultNoSkills: true,
   },
   {
     key: "custom",

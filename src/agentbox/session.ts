@@ -828,6 +828,7 @@ export class AgentBoxSessionManager {
   private async ensureSharedComponents(): Promise<void> {
     if (this._sharedInitialized) return;
     this._sharedInitialized = true;
+    if (this.agentTypeState === "evidence_review") return;
 
     try {
       this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
