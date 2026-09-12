@@ -5,6 +5,8 @@
  * Auth required for every route.
  */
 
+import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
+
 import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
 import { insertIgnorePrefix, isUniqueViolation } from "../gateway/dialect-helpers.js";
@@ -88,7 +90,7 @@ function normalizedPrompt(value: unknown): string {
 
 function normalizedToolCapabilities(value: unknown): string {
   const parsed = safeParseJson<string[] | null>(value, null);
-  if (!Array.isArray(parsed) || parsed.length === 0) return "";
+  if (!Array.isArray(parsed)) return "";
   return JSON.stringify([...new Set(parsed)].sort());
 }
 
@@ -173,7 +175,7 @@ export function registerAgentRoutes(
     }
 
     if (body.agent_type === "coordinator") {
-      sendJson(res, 410, { error: "Agent type has been retired; use a supported Agent with handoff" });
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
       return;
     }
     const agentType = normalizeAgentType(body.agent_type);
@@ -281,6 +283,22 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    // Every mutation checks retirement, including a rename or an empty update.
+    // Reuse this snapshot for change-driven reloads of the full settings form.
+    const [currentRows] = await db.query(
+      "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities, subagent_models FROM agents WHERE id = ?",
+      [params.id],
+    ) as any;
+    const current = currentRows[0];
+    if (!current) {
+      sendJson(res, 404, { error: "Agent not found" });
+      return;
+    }
+    if (body.agent_type === "coordinator" || current.agent_type === "coordinator") {
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
+      return;
+    }
+
     let encodedToolCapabilities: string | null | undefined;
     if ("tool_capabilities" in body) {
       try {
@@ -306,31 +324,6 @@ export function registerAgentRoutes(
       }
     }
 
-    // The Web settings form sends a complete snapshot on every Save. Read the
-    // fields whose side effects must be change-driven so an unrelated rename,
-    // model edit, or binding save does not invalidate warm sessions.
-    const needsCurrentState = ["status", "idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities", "subagent_models"]
-      .some((field) => field in body);
-    let current: {
-      idle_timeout_sec?: unknown;
-      system_prompt?: unknown;
-      agent_type?: unknown;
-      is_production?: unknown;
-      tool_capabilities?: unknown;
-      subagent_models?: unknown;
-    } | undefined;
-    if (needsCurrentState) {
-      const [rows] = await db.query(
-        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities, subagent_models FROM agents WHERE id = ?",
-        [params.id],
-      ) as any;
-      current = rows[0];
-    }
-
-    if (body.agent_type === "coordinator" || current?.agent_type === "coordinator") {
-      sendJson(res, 410, { error: "Agent type has been retired; create a supported Agent with handoff" });
-      return;
-    }
     const currentAgentType = normalizeAgentType(current?.agent_type);
     const nextAgentType = "agent_type" in body
       ? normalizeAgentType(body.agent_type)
@@ -715,7 +708,7 @@ export function registerAgentRoutes(
     }
     const source = sourceRows[0];
     if (source.agent_type === "coordinator") {
-      sendJson(res, 410, { error: "Retired Agent types cannot be forked" });
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
       return;
     }
 

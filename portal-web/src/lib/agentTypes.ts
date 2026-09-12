@@ -45,6 +45,14 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   },
 ]
 
-export function agentTypeOption(key: string | null | undefined): AgentTypeOption {
+export function isRetiredAgentType(key: unknown): boolean {
+  return key === "coordinator"
+}
+
+export function agentTypeOption(key: string | null | undefined): Omit<AgentTypeOption, "key"> & { key: string } {
+  if (isRetiredAgentType(key)) return {
+    key: "coordinator", label: "Retired Agent", description: "Create a supported Agent and use conversation handoff.",
+    capabilities: [], defaultNoSkills: true,
+  }
   return AGENT_TYPES.find((t) => t.key === key) ?? AGENT_TYPES[AGENT_TYPES.length - 1] // default: custom
 }

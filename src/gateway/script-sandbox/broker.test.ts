@@ -40,6 +40,12 @@ describe("script connectors", () => {
     rpc.request.mockResolvedValue({ status: "active", agent_type: "coordinator" });
     await expect(new ReadOnlyScriptBroker(rpc, config()).authorize(p(), new AbortController().signal)).rejects.toThrow();
   });
+  it.each(["active", "disabled"])("rejects retired types independently of %s status", async (status) => {
+    const rpc = { request: vi.fn().mockResolvedValue({ status, agent_type: "coordinator" }) };
+    await expect(new ReadOnlyScriptBroker(rpc, config()).authorize(p(), new AbortController().signal))
+      .rejects.toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
+    expect(rpc.request).toHaveBeenCalledTimes(1);
+  });
   it("rejects inherited properties and fixed MCP scope overrides", async () => {
     const c = { ...config() }; c.mcpPolicy = { metrics: { query: { fixedArguments: { tenant: "mine" } } } };
     const rpc = { request: vi.fn() };

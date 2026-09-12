@@ -168,3 +168,9 @@ describe("frontend ↔ backend CAPABILITY_GROUPS parity", () => {
     );
   });
 });
+
+// Removing the final retired key must not use the explicit-clear null sentinel.
+it("keeps a retired-only capability write restricted", () => {
+  expect(encodeToolCapabilitiesForDb(["delegate_agents"])).toBe("[]");
+  expect(encodeToolCapabilitiesForDb(["read_files", "delegate_agents"])).toBe('["read_files"]');
+});

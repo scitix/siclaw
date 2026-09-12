@@ -5,7 +5,8 @@ import { CAPABILITY_GROUPS, countToolsForSelection } from "../lib/toolCapabiliti
  * Reusable capability-group multi-select. Used in both the agent create dialog
  * and the agent edit page (Tools tab).
  *
- * Backend semantics: an EMPTY selection means "unrestricted — all tools". The
+ * Editing an empty selection clears it to unrestricted; an existing explicit
+ * empty whitelist stays restricted until the user changes the selection. The
  * banner makes that explicit so an empty checkbox list is not mistaken for
  * "no tools". A non-empty selection restricts the agent to the union of the
  * selected groups' tools.
@@ -13,11 +14,13 @@ import { CAPABILITY_GROUPS, countToolsForSelection } from "../lib/toolCapabiliti
 export function CapabilityGroupSelector({
   selected,
   onChange,
+  emptyRestricted = false,
 }: {
+  emptyRestricted?: boolean
   selected: Set<string>
   onChange: (next: Set<string>) => void
 }) {
-  const restricted = selected.size > 0
+  const restricted = emptyRestricted || selected.size > 0
   const toolCount = countToolsForSelection(selected)
   const allSelected = selected.size === CAPABILITY_GROUPS.length
 
@@ -31,7 +34,7 @@ export function CapabilityGroupSelector({
 
   return (
     <div className="space-y-3">
-      {/* Effective-state banner — teaches the empty = unrestricted rule */}
+      {/* Effective-state banner preserves stored empty whitelist semantics. */}
       {restricted ? (
         <div className="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
           <ShieldCheck className="h-4 w-4 text-primary mt-0.5 shrink-0" />

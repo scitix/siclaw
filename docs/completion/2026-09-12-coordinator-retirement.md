@@ -34,3 +34,15 @@ Rebuilt and deployed Linux amd64 Runtime and AgentBox images after the fix. With
 ## Deployment boundary
 
 Staging was deployed from the worktree source snapshot. Production was not deployed. Live handoff used one active Runtime; multi-Runtime behavior remains covered by automated tests rather than this live check. The standalone Portal was validated by its tests and build, not a separate live deployment. Restoring the retired workflow requires restoring its old configuration and data separately.
+
+## Pre-merge review fixes
+
+- Replace obsolete harness references to deleted peer tools/transports and acknowledge the complete-registry regression. Preserve the explanation for historical orphan traces.
+- Use a shared `AGENT_RETIRED` error detail (410, non-retriable) in normalization, Portal REST and peer-request rejection. HTTP/JSON/RPC round-trip tests and the Web error client preserve the same fields and message.
+- Read the stored type on every Agent PUT, including name/description-only and empty bodies; keep 404 and change-driven reload behavior. Script authorization rejects retired types independently of active/disabled status.
+- Show retired instances explicitly in the list and a read-only settings view. Remove targetAgentId from the ownership cache while retaining durable historical lineage and provenance/invalidation behavior.
+- Clean retired capability keys on repeatable Portal migration and new writes. Preserve explicit empty whitelists; display their restricted state, omit untouched capability selections on save, and reload tools on an intentional empty-to-null change.
+
+Validation after these fixes: full root suite **361 files, 7354 passed, 2 skipped**; Portal **33 files, 274 passed**; root/AgentBox TypeScript, root build and Portal TypeScript/Vite build passed. Tests include a real settings Save interaction and repeated SQLite upgrades after the original migration, with only-retired/mixed/null/empty/future/malformed capability configurations.
+
+The staging and Linux image acceptance above applies to the earlier removal snapshot. These review fixes have not been redeployed or rebuilt as container images; their AgentBox import stays within the shared image boundary and the full boundary tests/typecheck pass.

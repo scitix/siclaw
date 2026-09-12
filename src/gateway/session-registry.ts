@@ -15,8 +15,7 @@
  * `chat_sessions` row is the source of truth, and the registry merely
  * accelerates lookup.
  *
- * Historical peer sessions may retain a targetAgentId for lineage. That field
- * does not authorize new peer execution or persistence callbacks.
+ * Historical lineage stays in persisted session rows, outside this ownership cache.
  */
 
 const DEFAULT_CAPACITY = 10_000;
@@ -24,8 +23,6 @@ const DEFAULT_CAPACITY = 10_000;
 export interface SessionRecord {
   userId: string;
   agentId: string;
-  /** Historical peer execution target, retained as lineage only. */
-  targetAgentId?: string;
   /** Owner/user provenance comes from the persisted session row. */
   authoritative?: boolean;
   lastSeen: number;
@@ -33,7 +30,7 @@ export interface SessionRecord {
 
 export type SessionResolver = (
   sessionId: string,
-) => Promise<{ userId: string; agentId: string; targetAgentId?: string } | null>;
+) => Promise<{ userId: string; agentId: string } | null>;
 
 export class SessionRegistry {
   private map = new Map<string, SessionRecord>();
@@ -55,38 +52,31 @@ export class SessionRegistry {
 
   /**
    * Record that `sessionId` belongs to `userId` on `agentId`. Updates recency.
-   * `targetAgentId` is the delegation target when the session is a delegated leg;
-   * omitting it PRESERVES an already-cached target rather than clearing it.
    */
-  remember(sessionId: string, userId: string, agentId: string, targetAgentId?: string): void {
+  remember(sessionId: string, userId: string, agentId: string): void {
     if (!sessionId) return;
     const cached = this.map.get(sessionId);
-    // Preserve historical lineage when callers supply only the current identity.
-    const target = targetAgentId || cached?.targetAgentId;
     // A cached execution identity is not authoritative ownership. Preserve row
     // provenance only while the fields it certifies remain identical.
     const identityIntact = cached?.agentId === agentId && cached?.userId === userId;
     this.write(sessionId, {
       userId,
       agentId,
-      ...(target ? { targetAgentId: target } : {}),
       ...(cached?.authoritative && identityIntact ? { authoritative: true } : {}),
     });
   }
 
   /**
-   * Cache a record read from the `chat_sessions` row, marked as such so an
-   * absent target is answerable from cache instead of triggering another read.
+   * Cache ownership read from the persisted row with authoritative provenance.
    */
   private rememberFromSource(
     sessionId: string,
-    fetched: { userId: string; agentId: string; targetAgentId?: string },
+    fetched: { userId: string; agentId: string },
   ): void {
     if (!sessionId) return;
     this.write(sessionId, {
       userId: fetched.userId,
       agentId: fetched.agentId,
-      ...(fetched.targetAgentId ? { targetAgentId: fetched.targetAgentId } : {}),
       authoritative: true,
     });
   }
@@ -194,7 +184,7 @@ export class SessionRegistry {
         // Awaiters of THIS call still get the fetched record so the in-flight
         // callback can still attribute, but the next miss goes to Portal afresh.
         if (this.tombstones.has(sessionId)) {
-          return { ...fetched, authoritative: true, lastSeen: Date.now() };
+          return { userId: fetched.userId, agentId: fetched.agentId, authoritative: true, lastSeen: Date.now() };
         }
         this.rememberFromSource(sessionId, fetched);
         return this.map.get(sessionId);

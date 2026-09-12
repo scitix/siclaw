@@ -868,7 +868,7 @@ describe("handleDelegationEvents", () => {
     // the exposure only appears once they are composed:
     //   1. the row is read — the coordinator owns the leg, the peer executes it;
     //   2. this Runtime handles chat.send for the relayed leg and re-remembers it
-    //      under the PEER, correctly dropping provenance but keeping the target;
+    //      under the PEER, correctly dropping provenance;
     //   3. Portal goes away, so the gate cannot ask the row;
     //   4. the peer asks to rewrite a row in the coordinator's conversation.
     // Trusting the cache at step 4 hands over the permission, and hands it over
@@ -879,7 +879,7 @@ describe("handleDelegationEvents", () => {
     try {
       expect(await sessionRegistry.get("parent-1")).toMatchObject({ agentId: "agent-2", authoritative: true });
       sessionRegistry.remember("parent-1", "user-1", "agent-1");
-      expect(sessionRegistry.peek("parent-1")).toMatchObject({ agentId: "agent-1", targetAgentId: "agent-1" });
+      expect(sessionRegistry.peek("parent-1")).toMatchObject({ agentId: "agent-1" });
       expect(sessionRegistry.peek("parent-1")?.authoritative).toBeUndefined();
 
       sessionRegistry.setResolver(async () => { throw new Error("portal unavailable") });

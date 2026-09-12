@@ -5,8 +5,8 @@
 // backend (capability groups are stable code constants — update both together).
 //
 // Semantics (backend): an agent stores the selected group KEYS in its
-// `tool_capabilities` field. null / empty = unrestricted (all tools, the
-// backward-compatible default). A non-null, non-empty selection restricts the
+// `tool_capabilities` field. null = unrestricted; a stored [] allows no tools.
+// Explicitly clearing the editor writes null. A non-empty selection restricts the
 // agent to the union of those groups' tools. MCP tools are exempt (governed by
 // the agent_mcp_servers binding).
 

@@ -110,7 +110,8 @@ export function resolveCapabilities(
  *   - an array of strings   → deduped JSON array of group keys.
  *   - anything else         → throw (rejected as HTTP 400 by the caller).
  *
- * Unknown group keys are NOT rejected here: `resolveCapabilities` already
+ * The retired delegate_agents key is removed; removing the final key stores []
+ * (zero tools), never null. Other unknown group keys are NOT rejected here: `resolveCapabilities` already
  * tolerates them (warn + ignore), and a key absent today may become valid in a
  * later release — storing it forward-compatibly beats a hard 400.
  */
@@ -125,5 +126,7 @@ export function encodeToolCapabilitiesForDb(value: unknown): string | null | und
   }
   const deduped = [...new Set(value as string[])];
   if (deduped.length === 0) return null; // empty selection = unrestricted
-  return JSON.stringify(deduped);
+  // A removed key cannot become a future capability. Keep [] restricted when
+  // retirement removes the last key; only an explicitly empty input clears it.
+  return JSON.stringify(deduped.filter((key) => key !== "delegate_agents"));
 }

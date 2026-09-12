@@ -1279,6 +1279,7 @@ describe("http-server — prompt + session lifecycle", () => {
     for (const legacy of [{ delegation: { delegationId: "d1" } }, { origin: "delegation" }]) {
       const result = await getJson(port, "/api/prompt", "POST", { text: "old request", sessionId: "old", ...legacy });
       expect(result.status).toBe(410);
+      expect(result.data.error).toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
     }
     expect(sm.getOrCreateCalls).toHaveLength(0);
   });

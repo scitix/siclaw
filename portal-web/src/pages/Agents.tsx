@@ -1,3 +1,4 @@
+import { isRetiredAgentType } from "../lib/agentTypes"
 import { useState, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
 import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, Eraser, Zap, Plug, Server, Clock, BoltIcon, BookOpen, Copy } from "lucide-react"
@@ -10,7 +11,7 @@ import { CapabilityGroupSelector } from "../components/CapabilityGroupSelector"
 import { AGENT_TYPES } from "../lib/agentTypes"
 
 interface Agent {
-  id: string; name: string; description: string; status: string
+  id: string; name: string; description: string; status: string; agent_type?: string
   model_provider: string; model_id: string; is_production: boolean; created_at: string
   skills_count?: number; mcp_count?: number; clusters_count?: number; hosts_count?: number; tasks_count?: number; tasks_active_count?: number; knowledge_count?: number
 }
@@ -231,6 +232,7 @@ export function Agents() {
                     <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${a.is_production ? "bg-red-500/20 text-red-400" : "bg-blue-500/20 text-blue-400"}`}>
                       {a.is_production ? "PROD" : "DEV"}
                     </span>
+                    {isRetiredAgentType(a.agent_type) && <span className="text-xs text-amber-500">Retired</span>}
                     <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${a.status === "active" ? "bg-green-500" : "bg-gray-500"}`} />
                   </div>
                   <p className="text-[11px] text-muted-foreground mt-0.5 truncate">

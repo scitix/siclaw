@@ -29,6 +29,27 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(roster).toEqual([]);
   });
 
+  it("cleans retired capability keys after an earlier upgrade without broadening access", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const cases: [string, string | null, string | null][] = [
+      ["only", '["delegate_agents"]', '[]'],
+      ["mixed", '["read_files","delegate_agents","delegate_agents"]', '["read_files"]'],
+      ["empty", '[]', '[]'], ["unrestricted", null, null],
+      ["future", '["future_capability"]', '["future_capability"]'],
+      ["malformed", 'delegate_agents invalid JSON', 'delegate_agents invalid JSON'],
+    ];
+    for (const [id, value] of cases) {
+      await db.query("INSERT INTO agents (id, name, tool_capabilities) VALUES (?, ?, ?)", [id, id, value]);
+    }
+    await runPortalMigrations();
+    await runPortalMigrations();
+    for (const [id, , expected] of cases) {
+      const [rows] = await db.query<any[]>("SELECT tool_capabilities FROM agents WHERE id = ?", [id]);
+      expect(rows[0].tool_capabilities).toBe(expected);
+    }
+  });
+
   it("creates all 34 tables without error", async () => {
     await runPortalMigrations();
     const db = getDb();

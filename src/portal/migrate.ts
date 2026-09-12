@@ -769,6 +769,21 @@ export async function runPortalMigrations(): Promise<void> {
   await db.query("UPDATE agents SET status = 'disabled' WHERE agent_type = ? AND status <> 'disabled'", ["coordinator"]);
   await db.query("DROP TABLE IF EXISTS agent_delegates");
 
+  // Repeatable data cleanup also repairs installs that already ran retirement.
+  // Parse in JS so malformed legacy TEXT and both SQL dialects remain safe.
+  const [capabilityRows] = await db.query<Array<{ id: string; tool_capabilities: string }>>(
+    "SELECT id, tool_capabilities FROM agents WHERE tool_capabilities LIKE ?", ["%delegate_agents%"],
+  );
+  for (const row of capabilityRows) {
+    let keys: unknown;
+    try { keys = JSON.parse(row.tool_capabilities); } catch { continue; }
+    if (!Array.isArray(keys) || !keys.includes("delegate_agents")) continue;
+    // [] is a restrictive whitelist; null would silently grant every tool.
+    const cleaned = JSON.stringify(keys.filter((key) => key !== "delegate_agents"));
+    await db.query("UPDATE agents SET tool_capabilities = ? WHERE id = ? AND tool_capabilities = ?",
+      [cleaned, row.id, row.tool_capabilities]);
+  }
+
   console.log("[portal-migrate] All tables ready");
 }
 

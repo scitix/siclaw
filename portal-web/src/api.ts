@@ -16,6 +16,16 @@ interface ApiOptions extends Omit<RequestInit, "body"> {
   body?: unknown
 }
 
+function responseError(body: Record<string, any>, status: number): Error {
+  const detail = body.error
+  const message = typeof detail === "string" ? detail : detail?.message
+  return Object.assign(new Error(message || `HTTP ${status}`), {
+    status, body,
+    ...(typeof detail?.code === "string" ? { code: detail.code } : {}),
+    ...(typeof detail?.retriable === "boolean" ? { retriable: detail.retriable } : {}),
+  })
+}
+
 export async function api<T>(path: string, options?: ApiOptions): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" }
   const token = getToken()
@@ -35,16 +45,7 @@ export async function api<T>(path: string, options?: ApiOptions): Promise<T> {
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }))
-    // Attach the full response body + status so callers can act on extra
-    // fields (e.g. retry_after_sec on 429). Message keeps the flat behavior
-    // existing callers expect.
-    const err = new Error(body.error || `HTTP ${res.status}`) as Error & {
-      status?: number
-      body?: Record<string, unknown>
-    }
-    err.status = res.status
-    err.body = body
-    throw err
+    throw responseError(body, res.status)
   }
 
   if (res.status === 204) return undefined as T
@@ -68,7 +69,7 @@ export async function apiRaw<T>(path: string, options: RequestInit): Promise<T> 
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(body.error || `HTTP ${res.status}`)
+    throw responseError(body, res.status)
   }
   return res.json()
 }

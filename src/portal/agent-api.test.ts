@@ -109,15 +109,18 @@ describe("registerAgentRoutes", () => {
       url: "/api/v1/agents", method: "POST", body: { name: "Old", agent_type: "coordinator" },
     }));
     expect(created.status).toBe(410);
+    expect(created.body.error).toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
     expect(query).not.toHaveBeenCalled();
 
     query.mockResolvedValue([[{ id: "old", agent_type: "coordinator", status: "disabled" }], []]);
-    const updated = await runRoute(router, fakeReq({
-      url: "/api/v1/agents/old", method: "PUT", body: { status: "active" },
-    }));
-    expect(updated.status).toBe(410);
+    for (const body of [{ status: "active" }, { name: "Renamed" }, { description: "Edited" }, {}]) {
+      const updated = await runRoute(router, fakeReq({ url: "/api/v1/agents/old", method: "PUT", body }));
+      expect(updated.status).toBe(410);
+      expect(updated.body.error).toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
+    }
     const forked = await runRoute(router, fakeReq({ url: "/api/v1/agents/old/fork", method: "POST" }));
     expect(forked.status).toBe(410);
+    expect(forked.body.error).toEqual(created.body.error);
     expect(query.mock.calls.every(([sql]) => String(sql).startsWith("SELECT"))).toBe(true);
     expect(conn.beginTransaction).not.toHaveBeenCalled();
   });
@@ -441,7 +444,15 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(403);
     });
 
+    it("returns 404 before writing a missing Agent", async () => {
+      query.mockResolvedValueOnce([[], []]);
+      const result = await runRoute(router, fakeReq({ url: "/api/v1/agents/missing", method: "PUT", body: { name: "New" } }));
+      expect(result.status).toBe(404);
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
     it("returns 400 when no fields to update", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1", agent_type: "custom" }], []]);
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1",
         method: "PUT",
@@ -670,15 +681,9 @@ describe("registerAgentRoutes", () => {
     });
 
     it("does not reload tools when the tier list is not supplied at all", async () => {
-      // The other half: an unrelated edit must not kick warm sessions.
-      //
-      // `description` is not in the needs-current-state set, so this request reads
-      // NO current row — only UPDATE + select-back. An earlier version of this
-      // test mocked a current-state read that never happens, which desynchronised
-      // every later mock and made the request throw; with no status assertion it
-      // passed anyway. Asserting 200 is what makes "no reload" mean "the request
-      // succeeded and chose not to reload" instead of "the request died early".
+      // Retirement is always checked, but a rename must not reload tools.
       query
+        .mockResolvedValueOnce([[{ id: "a1", agent_type: "custom" }], []])
         .mockResolvedValueOnce([undefined, []])                       // UPDATE
         .mockResolvedValueOnce([[{ id: "a1", name: "a" }], []]);      // select-back
 
@@ -885,6 +890,7 @@ describe("registerAgentRoutes", () => {
 
     it("updates model_routing as a standalone field", async () => {
       query
+        .mockResolvedValueOnce([[{ id: "a1", agent_type: "custom" }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1" }], []]);
 
@@ -901,8 +907,8 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(200);
-      expect(query.mock.calls[0][0]).toContain("model_routing = ?");
-      expect(JSON.parse(query.mock.calls[0][1][0])).toEqual({
+      expect(query.mock.calls[1][0]).toContain("model_routing = ?");
+      expect(JSON.parse(query.mock.calls[1][1][0])).toEqual({
         enabled: true,
         strategy: "ordered_fallback",
         cooldownMsByKind: { rate_limit: 0 },
@@ -953,8 +959,17 @@ describe("registerAgentRoutes", () => {
       });
     });
 
+    it("reloads when explicitly clearing an existing empty whitelist", async () => {
+      query.mockResolvedValueOnce([[{ tool_capabilities: "[]" }], []])
+        .mockResolvedValueOnce([undefined, []]).mockResolvedValueOnce([[{ id: "a1" }], []]);
+      const result = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "PUT", body: { tool_capabilities: null } }));
+      expect(result.status).toBe(200);
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1", resources: ["tools"] });
+    });
+
     it("does not push a tools reload when tool_capabilities is absent", async () => {
       query
+        .mockResolvedValueOnce([[{ id: "a1", agent_type: "custom" }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1" }], []]);
 
@@ -968,6 +983,7 @@ describe("registerAgentRoutes", () => {
     });
 
     it("rejects a non-array tool_capabilities with 400", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1", agent_type: "custom" }], []]);
       const { status, body } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1",
         method: "PUT",

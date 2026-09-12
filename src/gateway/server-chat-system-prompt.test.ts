@@ -137,7 +137,7 @@ describe("startRuntime — chat.send custom system prompt", () => {
     const send = server.rpcMethods.get("chat.send")!;
     for (const legacy of [{ delegation: { delegationId: "d1" } }, { origin: "delegation" }]) {
       await expect(send({ agentId: "peer", userId: "u", text: "old request", sessionId: "retired", ...legacy },
-        { sendEvent: vi.fn() })).rejects.toThrow("retired");
+        { sendEvent: vi.fn() })).rejects.toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
     }
     expect(promptCalls).toHaveLength(0);
     expect(chatRepo.ensureChatSession).not.toHaveBeenCalled();

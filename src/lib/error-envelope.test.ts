@@ -1,3 +1,4 @@
+import { AgentRetiredError, agentRetiredDetail } from "../shared/agent-retirement.js";
 import { describe, it, expect } from "vitest";
 import {
   ErrorCodes,
@@ -11,6 +12,14 @@ import {
 } from "./error-envelope.js";
 
 describe("error-envelope", () => {
+  it("serializes retirement consistently across HTTP and RPC", () => {
+    const wire = JSON.parse(JSON.stringify(wrapRpcError(new AgentRetiredError())));
+    expect(wire).toEqual(agentRetiredDetail());
+    const received = new RpcResponseError(wire);
+    expect(received).toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
+    expect(JSON.parse(JSON.stringify(wrapError(new AgentRetiredError())))).toEqual(wire);
+  });
+
   describe("isErrorDetail", () => {
     it("accepts well-formed envelope", () => {
       expect(

@@ -23,3 +23,11 @@ Historical peer cards, transcript links and trace metadata remain readable. Shar
 Keep authorization, session ownership, subagent capability limits and handoff controls. The type removal does not grant another Agent additional tools or resource access. Deploy with a compatible control plane. Coordinate any destructive schema migration with the retirement of older control-plane processes; restoring an old image alone does not restore deleted configuration.
 
 Staging acceptance must resolve tools through the complete production registry and exercise a real ownership transfer. Tests of individual tool factories cannot detect an accidentally removed registry entry. See the [implementation and staging validation](../completion/2026-09-12-coordinator-retirement.md).
+
+## Review hardening
+
+All retired type and peer-request refusals share `AGENT_RETIRED`, HTTP status 410 and `retriable: false`. The detail is shared across Portal, Runtime and the isolated AgentBox image; Web clients preserve both the readable message and machine fields. Portal PUT reads the current type for every mutation, including name-only and empty requests. Script authorization rejects retirement independently of the stored status. Historical instances have a read-only settings view and a retirement badge, outside the selectable type catalog.
+
+The repeatable standalone migration removes `delegate_agents` from instance capability selections, including installations that already ran the first retirement migration. It preserves null, malformed data, future keys and historical transcripts. Removing the final key writes `[]`, not null: the empty whitelist grants no tools. New capability writes also discard the retired key. The editor displays an existing empty whitelist and omits unchanged capability fields on save; explicitly choosing “Clear (unrestricted)” still writes null. Empty-to-null changes trigger a tool reload.
+
+The session registry now caches only ownership and provenance. Historical target metadata stays in durable records, without carry-forward in the runtime authorization cache. LRU, singleflight, invalidation and provenance checks remain covered by tests. The harness reference drops deleted files and relay acknowledgements and records the complete-tool-registry regression learned during staging acceptance.

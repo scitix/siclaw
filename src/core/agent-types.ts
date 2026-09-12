@@ -22,6 +22,8 @@
  * is the built-in type contract; Custom has no built-in contract.
  */
 
+import { AgentRetiredError } from "../shared/agent-retirement.js";
+
 export type AgentType = "sre" | "knowledge_qa" | "product_support" | "custom";
 
 export interface AgentTypeDef {
@@ -205,9 +207,14 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   },
 };
 
-/** Normalize an unknown stored value to a valid AgentType (default custom). */
+/**
+ * Normalize stored values, defaulting missing/unknown values to Custom for legacy
+ * display compatibility. Retired types throw AgentRetiredError (410); callers
+ * must not depend on the instance status or migration to exclude them.
+ * Use requireAgentType at authorization boundaries.
+ */
 export function normalizeAgentType(v: unknown): AgentType {
-  if (v === "coordinator") throw new Error("Agent type has been retired; use a supported Agent with handoff");
+  if (v === "coordinator") throw new AgentRetiredError();
   return v === "sre" || v === "knowledge_qa" || v === "product_support" ? v : "custom";
 }
 
@@ -219,6 +226,7 @@ export function normalizeAgentType(v: unknown): AgentType {
  * tools enter a model session must fail closed when provenance is absent.
  */
 export function requireAgentType(v: unknown): AgentType {
+  if (v === "coordinator") throw new AgentRetiredError();
   if (v === "sre" || v === "knowledge_qa" || v === "product_support" || v === "custom") {
     return v;
   }

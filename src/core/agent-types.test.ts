@@ -53,7 +53,7 @@ describe("agent-types", () => {
   it("normalizeAgentType defaults unknown/absent to custom", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
     expect(() => normalizeAgentType("coordinator")).toThrow("retired");
-    expect(() => requireAgentType("coordinator")).toThrow("Invalid or missing agent_type");
+    expect(() => requireAgentType("coordinator")).toThrow("retired");
     expect(normalizeAgentType("knowledge_qa")).toBe("knowledge_qa");
     expect(normalizeAgentType("product_support")).toBe("product_support");
     expect(normalizeAgentType("custom")).toBe("custom");

@@ -1,3 +1,4 @@
+import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
@@ -217,7 +218,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       return {
         userId: data.user_id,
         agentId: data.agent_id,
-        ...(data.target_agent_id ? { targetAgentId: data.target_agent_id } : {}),
       };
     } catch (err) {
       console.error("[session-registry] resolveSession RPC failed:", err);
@@ -707,7 +707,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // when THIS handler creates the session row.
     const origin = params.origin as string | undefined;
     if (params.delegation || origin === "delegation") {
-      throw new Error("Peer delegation has been retired; use conversation handoff");
+      throw new AgentRetiredError();
     }
     const allowInputRequest = params.allowInputRequest === true;
     const requireExistingSession = params.requireExistingSession === true || Boolean(params.handoff);

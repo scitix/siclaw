@@ -1,3 +1,4 @@
+import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
 import { SandboxToolError } from "../script-sandbox/errors.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
@@ -960,7 +961,7 @@ export function createHttpServer(
 
     const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
     if ((body as Record<string, unknown>).delegation || String(body.origin) === "delegation") {
-      sendJson(res, 410, { error: "Peer delegation has been retired; use conversation handoff" });
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
       return;
     }
     // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried

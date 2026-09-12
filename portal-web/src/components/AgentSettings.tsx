@@ -6,7 +6,7 @@ import { AgentTasks } from "./AgentTasks"
 import { AgentApiKeys } from "./AgentApiKeys"
 import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
 import { toCapabilitySet } from "../lib/toolCapabilities"
-import { AGENT_TYPES, agentTypeOption, type AgentTypeKey } from "../lib/agentTypes"
+import { AGENT_TYPES, agentTypeOption, isRetiredAgentType } from "../lib/agentTypes"
 import {
   diffAgentResourceBindings,
   requiresLoadedResourceBindings,
@@ -185,7 +185,26 @@ interface AgentSettingsProps {
   initialTab?: string
 }
 
-export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProps) {
+export function AgentSettings(props: AgentSettingsProps) {
+  if (isRetiredAgentType(props.agent.agent_type)) {
+    return (
+      <div className="px-6 py-6 space-y-4">
+        <div role="status" className="rounded-md border border-amber-500/30 bg-amber-500/10 p-4">
+          <h3 className="text-sm font-medium">Retired Agent</h3>
+          <p className="mt-1 text-sm">This Coordinator is read-only and cannot be edited, reactivated or forked. Create a supported Agent and use conversation handoff. Historical conversations remain available; you can delete the instance from the Agents list.</p>
+        </div>
+        <dl className="text-sm space-y-2">
+          <dt>Name</dt><dd>{props.agent.name}</dd>
+          <dt>Description</dt><dd>{props.agent.description || "—"}</dd>
+          <dt>Historical prompt</dt><dd className="whitespace-pre-wrap">{props.agent.system_prompt || "—"}</dd>
+        </dl>
+      </div>
+    )
+  }
+  return <EditableAgentSettings {...props} />
+}
+
+function EditableAgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProps) {
   const toast = useToast()
   const [activeTab, setActiveTab] = useState<TabKey>((initialTab as TabKey) || "basic")
 
@@ -203,7 +222,9 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [idleTimeoutSec, setIdleTimeoutSec] = useState<number>(agent.idle_timeout_sec ?? 300)
   const [replicas, setReplicas] = useState<number>(agent.replicas ?? 1)
   const [selectedCapabilities, setSelectedCapabilities] = useState<Set<string>>(toCapabilitySet(agent.tool_capabilities))
-  const [agentType, setAgentType] = useState<AgentTypeKey>(agentTypeOption(agent.agent_type).key)
+  const [capabilitiesEdited, setCapabilitiesEdited] = useState(false)
+  const emptyRestricted = !capabilitiesEdited && agent.tool_capabilities != null && selectedCapabilities.size === 0
+  const [agentType, setAgentType] = useState<string>(agentTypeOption(agent.agent_type).key)
   const typeDef = agentTypeOption(agentType)
 
   // ── Data ──
@@ -247,6 +268,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     setIdleTimeoutSec(agent.idle_timeout_sec ?? 300)
     setReplicas(agent.replicas ?? 1)
     setSelectedCapabilities(toCapabilitySet(agent.tool_capabilities))
+    setCapabilitiesEdited(false)
   }, [agent])
 
   // Load data
@@ -367,7 +389,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     try {
       const updated = await api<Agent>(`/agents/${agent.id}`, {
         method: "PUT",
-        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, replicas: Number.isFinite(replicas) ? replicas : 1, tool_capabilities: Array.from(selectedCapabilities), agent_type: agentType },
+        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, replicas: Number.isFinite(replicas) ? replicas : 1, ...(capabilitiesEdited ? { tool_capabilities: Array.from(selectedCapabilities) } : {}), agent_type: agentType },
       })
       const nextResourceBindings: AgentResourceBindingIds = {
         cluster_ids: Array.from(selectedClusterIds),
@@ -476,7 +498,10 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
                 )}
               </div>
             ) : (
-              <CapabilityGroupSelector selected={selectedCapabilities} onChange={setSelectedCapabilities} />
+              <>
+                {emptyRestricted && <p role="status" className="text-sm text-amber-500">No supported tools are selected. This Agent retains an empty tool whitelist. Select supported capabilities to restore tool access.</p>}
+                <CapabilityGroupSelector selected={selectedCapabilities} emptyRestricted={emptyRestricted} onChange={value => { setSelectedCapabilities(value); setCapabilitiesEdited(true) }} />
+              </>
             )}
           </div>
         )}
