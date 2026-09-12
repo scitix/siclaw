@@ -357,3 +357,8 @@ services were not redeployed by this follow-up.
 Upgrade the Web assets before the history API and Runtime. New Web understands
 old full responses; already-open old clients must reload to understand the new
 availability markers.
+
+Final compatibility check: single-message detail preserves legacy JSON text up
+to the same byte budget, so malformed structured metadata can still fall back.
+Oversized detail text is suppressed. The 259 affected Portal checks and backend
+build passed after this adjustment.

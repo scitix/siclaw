@@ -47,6 +47,12 @@ export function historyContentSql(): string {
   return "CASE WHEN JSON_VALID(metadata) THEN CASE WHEN tool_name = 'skill_preview' AND JSON_EXTRACT(metadata, '$.skillPreview') IS NOT NULL THEN 'Skill preview: open to load files.' ELSE content END ELSE content END";
 }
 
-export function historyColumns(): string {
-  return CHAT_HISTORY_COLUMNS.replace("role, content,", `role, ${historyContentSql()} AS content,`);
+export function historyColumns(contentSql = historyContentSql()): string {
+  return CHAT_HISTORY_COLUMNS.replace("role, content,", `role, ${contentSql} AS content,`);
+}
+
+/** Keep the legacy JSON fallback in detail responses without returning unbounded text. */
+export function previewDetailContentSql(db: Pick<Db, "driver">): string {
+  const bytes = db.driver === "mysql" ? "OCTET_LENGTH(content)" : "LENGTH(CAST(content AS BLOB))";
+  return `CASE WHEN tool_name = 'skill_preview' AND ${bytes} > ${MAX_PREVIEW_METADATA_BYTES} THEN 'Skill preview text exceeds the storage limit.' ELSE content END`;
 }

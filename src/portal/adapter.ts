@@ -5,7 +5,7 @@
  * Auth: X-Auth-Token header (shared secret).
  */
 
-import { historyMetadataSql, historyContentSql, preparePreviewMessage } from "./skill-preview-storage.js";
+import { historyMetadataSql, historyContentSql, previewDetailContentSql, preparePreviewMessage } from "./skill-preview-storage.js";
 import { sandboxResolveHandler } from "./script-sandbox.js";
 import crypto from "node:crypto";
 import http from "node:http";
@@ -1903,7 +1903,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     params.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, ${historyContentSql()} AS content, tool_name, tool_input, ${historyMetadataSql(db, Boolean(body.message_id))} AS metadata, outcome, duration_ms,
+      `SELECT id, session_id, role, ${body.message_id ? previewDetailContentSql(db) : historyContentSql()} AS content, tool_name, tool_input, ${historyMetadataSql(db, Boolean(body.message_id))} AS metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, seq DESC, id DESC LIMIT ?`,
       params,
@@ -2913,7 +2913,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     sqlParams.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, ${historyContentSql()} AS content, tool_name, toolset, tool_input, ${historyMetadataSql(db, Boolean(params.message_id))} AS metadata, outcome, duration_ms,
+      `SELECT id, session_id, role, ${params.message_id ? previewDetailContentSql(db) : historyContentSql()} AS content, tool_name, toolset, tool_input, ${historyMetadataSql(db, Boolean(params.message_id))} AS metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, seq DESC, id DESC LIMIT ?`,
       sqlParams,

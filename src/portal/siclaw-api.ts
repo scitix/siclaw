@@ -6,7 +6,7 @@
  * a pure execution engine that never touches these tables.
  */
 
-import { historyColumns, historyContentSql, historyMetadataSql } from "./skill-preview-storage.js";
+import { historyColumns, historyContentSql, historyMetadataSql, previewDetailContentSql } from "./skill-preview-storage.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -2278,7 +2278,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Single-message detail uses exactly the same session ownership gate as history.
     if (query.message_id) {
       const [rows] = await db.query(
-        `SELECT ${historyColumns()}, ${historyMetadataSql(db, true)} AS metadata FROM chat_messages WHERE session_id = ? AND id = ? AND ${transcriptVisiblePredicate(db)} LIMIT 1`,
+        `SELECT ${historyColumns(previewDetailContentSql(db))}, ${historyMetadataSql(db, true)} AS metadata FROM chat_messages WHERE session_id = ? AND id = ? AND ${transcriptVisiblePredicate(db)} LIMIT 1`,
         [params.sid, query.message_id],
       ) as any;
       for (const row of rows) row.metadata = safeParseJson(row.metadata, null);

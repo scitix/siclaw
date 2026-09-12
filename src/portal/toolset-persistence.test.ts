@@ -81,4 +81,15 @@ describe("standalone Portal tool result persistence", () => {
     expect(JSON.stringify(legacy).length).toBeLessThan(2000);
   });
 
+  it("preserves bounded legacy text for detail fallback without returning oversized text", async () => {
+    const handlers = buildAdapterRpcHandlers();
+    const metadata = { skillPreview: { skill: { name: "invalid", files: "bad" } } };
+    const content = JSON.stringify({ skill: { name: "legacy", specs: "LEGACY_END" } });
+    const { id } = await handlers.get("chat.appendMessage")!({ session_id: "s1", role: "tool", content, tool_name: "skill_preview", metadata }, "a1");
+    const read = () => handlers.get("chat.getMessages")!({ session_id: "s1", message_id: id }, "a1");
+    expect((await read()).messages[0].content).toBe(content);
+    await getDb().query("UPDATE chat_messages SET content = ? WHERE id = ?", ["界".repeat(400_000), id]);
+    expect(JSON.stringify(await read()).length).toBeLessThan(2000);
+  });
+
 });
