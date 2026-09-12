@@ -41,8 +41,18 @@ Staging was deployed from the worktree source snapshot. Production was not deplo
 - Use a shared `AGENT_RETIRED` error detail (410, non-retriable) in normalization, Portal REST and peer-request rejection. HTTP/JSON/RPC round-trip tests and the Web error client preserve the same fields and message.
 - Read the stored type on every Agent PUT, including name/description-only and empty bodies; keep 404 and change-driven reload behavior. Script authorization rejects retired types independently of active/disabled status.
 - Show retired instances explicitly in the list and a read-only settings view. Remove targetAgentId from the ownership cache while retaining durable historical lineage and provenance/invalidation behavior.
-- Clean retired capability keys on repeatable Portal migration and new writes. Preserve explicit empty whitelists; display their restricted state, omit untouched capability selections on save, and reload tools on an intentional empty-to-null change.
+- Clean retired capability keys on repeatable Portal migration and new writes. Use the explicit no_tools group when filtering removes the final key; null/[] group selections keep their unrestricted meaning. Display that distinction and omit untouched selections on save. Null/[] changes do not reload tools; explicitly clearing no_tools does.
 
 Validation after these fixes: full root suite **361 files, 7354 passed, 2 skipped**; Portal **33 files, 274 passed**; root/AgentBox TypeScript, root build and Portal TypeScript/Vite build passed. Tests include a real settings Save interaction and repeated SQLite upgrades after the original migration, with only-retired/mixed/null/empty/future/malformed capability configurations.
 
 The staging and Linux image acceptance above applies to the earlier removal snapshot. These review fixes have not been redeployed or rebuilt as container images; their AgentBox import stays within the shared image boundary and the full boundary tests/typecheck pass.
+
+## Capability cleanup correction
+
+The first review fix confused a capability-group array with a concrete tool whitelist. Reproducing its actual encode → parse → resolve path yields stored `[]` and `allowedTools: null`, which is unrestricted. The corrected path yields stored `["no_tools"]` and `allowedTools: []`. The resolver's null/empty compatibility behavior and tool-append's null semantics are unchanged. Mixed selections keep their surviving keys; no_tools adds no tools and does not veto other selected groups.
+
+Coverage now follows encoded and migrated values through parsing, Custom type resolution and capability resolution. Runtime internal API tests verify the concrete JSON whitelist, and the production-registry test verifies command/file tools remain absent while separately authorized handoff tools survive. Portal tests check no_tools versus null/[] rendering and an unrelated Save; null/[] transitions no longer reload warm sessions. The redundant current-state optional access was removed.
+
+The faulty cleanup snapshot was not deployed by this task. If it was applied independently, an already-written [] row no longer identifies its former selection; recover affected selections from a backup instead of converting every legitimate unrestricted [] row.
+
+Validation: `npm test -- --maxWorkers=4` passed all 361 files (7367 passed, 2 skipped); Portal passed 33 files / 276 tests. Root and AgentBox typechecks, root build and Portal build passed. The first unconstrained full run hit timeouts in unchanged output/security and shell-script tests plus asynchronous teardown errors; the complete four-worker rerun passed with no assertion or timeout changes. These corrections have not been deployed.

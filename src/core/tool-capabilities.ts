@@ -26,6 +26,9 @@
  * added/renamed without changing stored selections.
  */
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
+  // A non-empty selection of this group resolves to an empty concrete whitelist.
+  // Unlike []/null group selections, it never opts into unrestricted tools.
+  no_tools:        [],
   read_files:      ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
@@ -110,8 +113,9 @@ export function resolveCapabilities(
  *   - an array of strings   → deduped JSON array of group keys.
  *   - anything else         → throw (rejected as HTTP 400 by the caller).
  *
- * The retired delegate_agents key is removed; removing the final key stores []
- * (zero tools), never null. Other unknown group keys are NOT rejected here: `resolveCapabilities` already
+ * The retired delegate_agents key is removed; removing the final key stores
+ * ["no_tools"]. Empty group selections still mean unrestricted. Other unknown
+ * group keys are NOT rejected here: `resolveCapabilities` already
  * tolerates them (warn + ignore), and a key absent today may become valid in a
  * later release — storing it forward-compatibly beats a hard 400.
  */
@@ -126,7 +130,13 @@ export function encodeToolCapabilitiesForDb(value: unknown): string | null | und
   }
   const deduped = [...new Set(value as string[])];
   if (deduped.length === 0) return null; // empty selection = unrestricted
-  // A removed key cannot become a future capability. Keep [] restricted when
-  // retirement removes the last key; only an explicitly empty input clears it.
-  return JSON.stringify(deduped.filter((key) => key !== "delegate_agents"));
+  return JSON.stringify(removeRetiredCapabilityKeys(deduped));
+}
+
+/** Preserve the effective grant when retirement removes the last selected key. */
+export function removeRetiredCapabilityKeys(keys: string[]): string[] {
+  const remaining = keys.filter((key) => key !== "delegate_agents");
+  // An empty group array turns the whitelist OFF. Use the explicit zero-tool
+  // group instead; the resolver then returns [] as concrete allowedTools.
+  return keys.length > 0 && remaining.length === 0 ? ["no_tools"] : remaining;
 }

@@ -30,16 +30,24 @@ describe("Agent retirement settings", () => {
     expect(AGENT_TYPES.some(t => String(t.key) === "coordinator")).toBe(false)
   })
 
-  it("does not clear a stored empty whitelist when saving unrelated settings", async () => {
-    const custom = { ...agent, agent_type: "custom", status: "active" }
+  it.each([
+    { capabilities: ["no_tools"], restricted: true },
+    { capabilities: [], restricted: false },
+    { capabilities: null, restricted: false },
+  ])("renders the actual grant and preserves $capabilities on an unrelated save", async ({ capabilities, restricted }) => {
+    const custom = { ...agent, agent_type: "custom", status: "active", tool_capabilities: capabilities }
     vi.mocked(api).mockImplementation(async (_path, options) => options?.method === "PUT" ? custom as any : {} as any)
     const container = document.createElement("div")
     const root = createRoot(container)
     ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
     try {
       await act(async () => root.render(<AgentSettings agent={custom} onUpdate={vi.fn()} initialTab="tools" />))
-      expect(container.textContent).toContain("empty tool whitelist")
-      expect(container.textContent).not.toContain("agent can use ALL tools")
+      if (restricted) {
+        expect(container.textContent).toContain("1 group · 0 tools")
+        expect(container.textContent).not.toContain("agent can use ALL tools")
+      } else {
+        expect(container.textContent).toContain("agent can use ALL tools")
+      }
       const save = Array.from(container.querySelectorAll("button")).find(b => b.textContent?.trim() === "Save")!
       expect(save.disabled).toBe(false)
       await act(async () => save.click())

@@ -1,3 +1,5 @@
+import { resolveCapabilities, parseToolCapabilitiesAtBoundary } from "../core/tool-capabilities.js";
+import { effectiveCapabilityKeys } from "../core/agent-types.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initDb, closeDb, getDb } from "../gateway/db.js";
 import { runPortalMigrations } from "./migrate.js";
@@ -33,7 +35,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     await runPortalMigrations();
     const db = getDb();
     const cases: [string, string | null, string | null][] = [
-      ["only", '["delegate_agents"]', '[]'],
+      ["only", '["delegate_agents"]', '["no_tools"]'],
       ["mixed", '["read_files","delegate_agents","delegate_agents"]', '["read_files"]'],
       ["empty", '[]', '[]'], ["unrestricted", null, null],
       ["future", '["future_capability"]', '["future_capability"]'],
@@ -47,6 +49,12 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     for (const [id, , expected] of cases) {
       const [rows] = await db.query<any[]>("SELECT tool_capabilities FROM agents WHERE id = ?", [id]);
       expect(rows[0].tool_capabilities).toBe(expected);
+      if (id === "only" || id === "mixed" || id === "empty" || id === "unrestricted") {
+        const allowed = resolveCapabilities(effectiveCapabilityKeys("custom", parseToolCapabilitiesAtBoundary(rows[0].tool_capabilities)));
+        if (id === "only") expect(allowed).toEqual([]);
+        else if (id === "mixed") expect(allowed).toEqual(resolveCapabilities(["read_files"]));
+        else expect(allowed).toBeNull();
+      }
     }
   });
 

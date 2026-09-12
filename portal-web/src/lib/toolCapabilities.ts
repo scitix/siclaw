@@ -5,8 +5,8 @@
 // backend (capability groups are stable code constants — update both together).
 //
 // Semantics (backend): an agent stores the selected group KEYS in its
-// `tool_capabilities` field. null = unrestricted; a stored [] allows no tools.
-// Explicitly clearing the editor writes null. A non-empty selection restricts the
+// `tool_capabilities` field. null / [] = unrestricted. ["no_tools"] explicitly
+// grants no built-in capabilities. Clearing the editor writes null. A non-empty selection restricts the
 // agent to the union of those groups' tools. MCP tools are exempt (governed by
 // the agent_mcp_servers binding).
 
@@ -18,6 +18,7 @@ export interface CapabilityGroup {
 }
 
 export const CAPABILITY_GROUPS: CapabilityGroup[] = [
+  { key: "no_tools", name: "No built-in tools", description: "Select only this group to grant no built-in tool capabilities. Other selected groups still grant their tools; MCP bindings are separate.", tools: [] },
   { key: "read_files", name: "Read files", description: "Read & search files and knowledge pages", tools: ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"] },
   { key: "write_sandbox", name: "Write & author skills", description: "Write/edit scratch files and author skills (sandboxed to user-data)", tools: ["write", "edit", "skill_preview"] },
   { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only discovery of bound clusters and hosts", tools: ["cluster_list", "host_list"] },

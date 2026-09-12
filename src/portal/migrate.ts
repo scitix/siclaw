@@ -18,6 +18,7 @@ import { getDb } from "../gateway/db.js";
 import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull, setColumnDefault } from "./migrate-compat.js";
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 import type { Db } from "../gateway/db.js";
+import { removeRetiredCapabilityKeys } from "../core/tool-capabilities.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
   // Users (simple auth, no org/RBAC)
@@ -777,9 +778,10 @@ export async function runPortalMigrations(): Promise<void> {
   for (const row of capabilityRows) {
     let keys: unknown;
     try { keys = JSON.parse(row.tool_capabilities); } catch { continue; }
-    if (!Array.isArray(keys) || !keys.includes("delegate_agents")) continue;
-    // [] is a restrictive whitelist; null would silently grant every tool.
-    const cleaned = JSON.stringify(keys.filter((key) => key !== "delegate_agents"));
+    if (!Array.isArray(keys) || !keys.every((key) => typeof key === "string") || !keys.includes("delegate_agents")) continue;
+    // Both [] and null group selections are unrestricted. If nothing remains,
+    // use ["no_tools"] so resolution still grants no built-in capabilities.
+    const cleaned = JSON.stringify(removeRetiredCapabilityKeys(keys));
     await db.query("UPDATE agents SET tool_capabilities = ? WHERE id = ? AND tool_capabilities = ?",
       [cleaned, row.id, row.tool_capabilities]);
   }

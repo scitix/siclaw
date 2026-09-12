@@ -255,6 +255,14 @@ describe("handleToolCapabilities", () => {
     });
   });
 
+  it.each([{ capabilities: ["no_tools"] }, { capabilities: '["no_tools"]' }])("returns a concrete empty whitelist for $capabilities", async ({ capabilities }) => {
+    frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: capabilities });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ agentType: "custom", allowedTools: [] });
+  });
+
   it("500 when the agent lookup fails", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     frontend.nextError = new Error("agent lookup down");

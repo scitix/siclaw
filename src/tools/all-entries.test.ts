@@ -1,3 +1,7 @@
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { encodeToolCapabilitiesForDb, parseToolCapabilitiesAtBoundary, resolveCapabilities } from "../core/tool-capabilities.js";
+import { effectiveCapabilityKeys } from "../core/agent-types.js";
+import { appendAllowedTools } from "../core/tool-append.js";
 import { describe, expect, it, vi } from "vitest";
 import { ToolRegistry, type ToolRefs } from "../core/tool-registry.js";
 import { resolveAgentHarness } from "../core/agent-context.js";
@@ -16,6 +20,19 @@ function refs(): ToolRefs {
 }
 
 describe("production tool registry", () => {
+  it.each([false, true])("keeps the retired-only selection out of execution tools (handoff=%s)", (handoffAvailable) => {
+    const registry = new ToolRegistry();
+    registry.register(...allToolEntries);
+    const stored = encodeToolCapabilitiesForDb(["delegate_agents"]);
+    const allowedTools = resolveCapabilities(effectiveCapabilityKeys("custom", parseToolCapabilitiesAtBoundary(stored)));
+    expect(allowedTools).toEqual([]);
+    const harness = resolveAgentHarness({ agentType: "custom", allowedTools, memoryConfigured: false, handoffAvailable });
+    expect(harness.legacyUnrestrictedCustom).toBe(false);
+    const tools = registry.resolve({ mode: "web", refs: refs(), allowedTools: harness.allowedTools });
+    appendAllowedTools(tools, ["read", "write", "edit"].map(name => ({ name }) as ToolDefinition), harness.allowedTools);
+    expect(tools.map(t => t.name).sort()).toEqual(handoffAvailable ? ["search_handoff_targets", "transfer_to_agent"] : []);
+  });
+
   it("executes an authorized handoff through the complete SRE registry", async () => {
     const registry = new ToolRegistry();
     registry.register(...allToolEntries);

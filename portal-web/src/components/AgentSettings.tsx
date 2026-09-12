@@ -223,7 +223,7 @@ function EditableAgentSettings({ agent, onUpdate, initialTab }: AgentSettingsPro
   const [replicas, setReplicas] = useState<number>(agent.replicas ?? 1)
   const [selectedCapabilities, setSelectedCapabilities] = useState<Set<string>>(toCapabilitySet(agent.tool_capabilities))
   const [capabilitiesEdited, setCapabilitiesEdited] = useState(false)
-  const emptyRestricted = !capabilitiesEdited && agent.tool_capabilities != null && selectedCapabilities.size === 0
+  const noToolCapabilities = selectedCapabilities.size === 1 && selectedCapabilities.has("no_tools")
   const [agentType, setAgentType] = useState<string>(agentTypeOption(agent.agent_type).key)
   const typeDef = agentTypeOption(agentType)
 
@@ -499,8 +499,8 @@ function EditableAgentSettings({ agent, onUpdate, initialTab }: AgentSettingsPro
               </div>
             ) : (
               <>
-                {emptyRestricted && <p role="status" className="text-sm text-amber-500">No supported tools are selected. This Agent retains an empty tool whitelist. Select supported capabilities to restore tool access.</p>}
-                <CapabilityGroupSelector selected={selectedCapabilities} emptyRestricted={emptyRestricted} onChange={value => { setSelectedCapabilities(value); setCapabilitiesEdited(true) }} />
+                {noToolCapabilities && <p role="status" className="text-sm text-amber-500">The No built-in tools group grants no built-in tool capabilities. Select other groups to grant tools, or keep this restriction.</p>}
+                <CapabilityGroupSelector selected={selectedCapabilities} onChange={value => { setSelectedCapabilities(value); setCapabilitiesEdited(true) }} />
               </>
             )}
           </div>

@@ -959,8 +959,16 @@ describe("registerAgentRoutes", () => {
       });
     });
 
-    it("reloads when explicitly clearing an existing empty whitelist", async () => {
-      query.mockResolvedValueOnce([[{ tool_capabilities: "[]" }], []])
+    it.each(["[]", null])("does not reload for an unrestricted null/[] transition from %s", async (currentCapabilities) => {
+      query.mockResolvedValueOnce([[{ tool_capabilities: currentCapabilities }], []])
+        .mockResolvedValueOnce([undefined, []]).mockResolvedValueOnce([[{ id: "a1" }], []]);
+      const result = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "PUT", body: { tool_capabilities: currentCapabilities === null ? [] : null } }));
+      expect(result.status).toBe(200);
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("reloads when explicitly clearing the no_tools restriction", async () => {
+      query.mockResolvedValueOnce([[{ tool_capabilities: '["no_tools"]' }], []])
         .mockResolvedValueOnce([undefined, []]).mockResolvedValueOnce([[{ id: "a1" }], []]);
       const result = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "PUT", body: { tool_capabilities: null } }));
       expect(result.status).toBe(200);

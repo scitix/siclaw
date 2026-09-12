@@ -90,7 +90,7 @@ function normalizedPrompt(value: unknown): string {
 
 function normalizedToolCapabilities(value: unknown): string {
   const parsed = safeParseJson<string[] | null>(value, null);
-  if (!Array.isArray(parsed)) return "";
+  if (!Array.isArray(parsed) || parsed.length === 0) return "";
   return JSON.stringify([...new Set(parsed)].sort());
 }
 
@@ -324,7 +324,7 @@ export function registerAgentRoutes(
       }
     }
 
-    const currentAgentType = normalizeAgentType(current?.agent_type);
+    const currentAgentType = normalizeAgentType(current.agent_type);
     const nextAgentType = "agent_type" in body
       ? normalizeAgentType(body.agent_type)
       : currentAgentType;

@@ -11,6 +11,7 @@ describe("CAPABILITY_GROUPS shape", () => {
   it("declares the designed capability groups, including conversation handoff", () => {
     expect([...KNOWN_KEYS].sort()).toEqual([
       "inspect_infra",
+      "no_tools",
       "plan_tasks",
       "read_files",
       "run_commands",
@@ -29,9 +30,10 @@ describe("CAPABILITY_GROUPS shape", () => {
     expect(new Set(KNOWN_KEYS).size).toBe(KNOWN_KEYS.length)
   })
 
-  it("gives every group a non-empty, internally-unique tool list, a name and a description", () => {
+  it("gives each group a unique tool list, including the explicit zero-tool group", () => {
     for (const g of CAPABILITY_GROUPS) {
-      expect(g.tools.length).toBeGreaterThan(0)
+      if (g.key === "no_tools") expect(g.tools).toEqual([])
+      else expect(g.tools.length).toBeGreaterThan(0)
       expect(new Set(g.tools).size).toBe(g.tools.length)
       expect(g.name.trim()).not.toBe("")
       expect(g.description.trim()).not.toBe("")
