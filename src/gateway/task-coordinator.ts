@@ -287,14 +287,14 @@ export class TaskCoordinator {
           resultText = consumed.resultText;
         } finally { clearTimeout(timer); client.close(); }
       } else {
-        const binding = await resolveAgentModelBinding(agentId, this.frontendClient);
-        if (!binding) throw new Error(`Agent ${agentId} has no valid model binding`);
-
         // One pod per agent — shared across users who call the agent.
         // Caller/task-owner attribution flows to Upstream via the session registry.
         sessionRegistry.remember(sessionId, userId, agentId);
         // One turn at a time for this task's session — see session-turn-lock.ts.
         releaseTurn = await sessionTurnLocks.acquire(sessionId);
+        const binding = await resolveAgentModelBinding(agentId, this.frontendClient);
+        if (!binding) throw new Error(`Agent ${agentId} has no valid model binding`);
+
         const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence }, sessionId);
         sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
         const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
@@ -309,6 +309,7 @@ export class TaskCoordinator {
           modelId: binding.modelId,
           releaseId: binding.releaseId,
           modelFingerprint: binding.modelFingerprint,
+          modelSelectionVersion: binding.modelSelectionVersion,
           modelConfig: binding.modelConfig,
           modelRouting: binding.modelRouting,
           subagentTiers: binding.subagentTiers,

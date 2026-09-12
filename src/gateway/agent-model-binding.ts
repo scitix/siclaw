@@ -13,6 +13,8 @@ export interface ResolvedModelBinding {
   releaseId?: string;
   /** Digest of the immutable model snapshot in that Release. */
   modelFingerprint?: string;
+  /** Monotonic Agent configuration selection, independent of release identity. */
+  modelSelectionVersion?: number;
   modelProvider: string;
   modelId: string;
   modelConfig: {

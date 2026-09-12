@@ -112,6 +112,8 @@ interface PromptRequestBody {
   modelId?: string;
   releaseId?: string;
   modelFingerprint?: string;
+  /** Monotonic Agent configuration selection, independent of release identity. */
+  modelSelectionVersion?: number;
   systemPromptTemplate?: string;
   modelConfig?: Record<string, unknown>;
   modelRouting?: ModelRoutePolicy;
@@ -661,7 +663,7 @@ export function createHttpServer(
   // Updated only after a turn completes successfully. A reload ACK means the
   // next turn is prepared; this state is the stronger evidence that a box has
   // actually run with the published model binding.
-  let observedModel: { releaseId: string; modelFingerprint: string; observedAt: string } | null = null;
+  let observedModel: { releaseId: string; modelFingerprint: string; modelSelectionVersion: number; observedAt: string } | null = null;
   let observedHarness: {
     agentType: string;
     /** Request-scoped Agent prompt; the resource loader adds platform instructions. */
@@ -1495,10 +1497,14 @@ export function createHttpServer(
           : undefined;
         const ranIntendedModel = intendedCandidate !== undefined
           && result?.activeCandidateKey === intendedCandidate;
-        if (ranIntendedModel && body.releaseId && body.modelFingerprint) {
+        if (ranIntendedModel && body.releaseId && body.modelFingerprint
+          // Versionless callers are legacy version zero. They cannot certify a
+          // newer selection, even if they happen to use the same model again.
+          && (body.modelSelectionVersion ?? 0) >= (observedModel?.modelSelectionVersion ?? 0)) {
           observedModel = {
             releaseId: body.releaseId,
             modelFingerprint: body.modelFingerprint,
+            modelSelectionVersion: body.modelSelectionVersion ?? 0,
             observedAt: new Date().toISOString(),
           };
         }

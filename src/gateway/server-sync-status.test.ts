@@ -584,3 +584,21 @@ describe("agent.syncStatus RPC — MCP connection outcomes", () => {
     expect(out.mcp.servers).toHaveLength(1);
   });
 });
+
+it.each([1, undefined])("does not certify an older or unversioned box (%s) as the current selection", async (oldVersion) => {
+  listReturns = [
+    { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+    { boxId: "b2", agentId: "preview", status: "running", endpoint: "https://b2" },
+  ];
+  for (const [endpoint, version] of [["https://b1", oldVersion], ["https://b2", 3]] as const) {
+    getJsonByEndpoint.set(endpoint, async () => ({ ...defaultSyncStatus,
+      model: { releaseId: "release", modelFingerprint: "same-model", modelSelectionVersion: version, observedAt: "2026-09-11T00:00:00Z" },
+    }));
+  }
+  server = await bootRuntime();
+  const result = await server.rpcMethods.get("agent.syncStatus")!({ agentId: "preview" }, { sendEvent: vi.fn() } as any);
+  expect(result).toMatchObject({ consistent: false, model: null, observations: [
+    { status: { model: { releaseId: "release", modelFingerprint: "same-model" } } },
+    { status: { model: { modelSelectionVersion: 3 } } },
+  ] });
+});

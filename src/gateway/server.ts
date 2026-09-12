@@ -809,6 +809,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
     }
+    if (params.modelSelectionVersion !== undefined
+      && (typeof params.modelSelectionVersion !== "number"
+        || !Number.isSafeInteger(params.modelSelectionVersion) || params.modelSelectionVersion < 0)) {
+      throw new Error("modelSelectionVersion must be a non-negative safe integer");
+    }
     // Refuse rather than accept a turn this process will not be around to finish. The
     // caller can place it on a Runtime that will.
     if (shuttingDown) {
@@ -913,6 +918,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelId: params.modelId as string | undefined,
       releaseId: params.releaseId as string | undefined,
       modelFingerprint: params.modelFingerprint as string | undefined,
+      modelSelectionVersion: params.modelSelectionVersion as number | undefined,
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
       origin: origin as PromptOptions["origin"],
@@ -1041,6 +1047,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           releaseTurn = await sessionTurnLocks.acquire(sessionId);
         }
         throwIfStoppedBeforePrompt();
+
+        // Resolve selection-aware bindings at dispatch, after acquiring the turn
+        // lock. A save while this request waited must affect this new turn.
+        if (promptOpts.modelSelectionVersion !== undefined) {
+          const binding = await resolveAgentModelBinding(agentId, frontendClient);
+          if (!binding) throw new Error(`model binding unavailable for agent ${agentId}`);
+          promptOpts.modelProvider = binding.modelProvider;
+          promptOpts.modelId = binding.modelId;
+          promptOpts.modelConfig = binding.modelConfig;
+          promptOpts.modelRouting = binding.modelRouting;
+          promptOpts.releaseId = binding.releaseId;
+          promptOpts.modelFingerprint = binding.modelFingerprint;
+          promptOpts.modelSelectionVersion = binding.modelSelectionVersion;
+          promptOpts.subagentTiers = binding.subagentTiers;
+          // A caller-stamped Addendum belongs to its old binding too. An absent
+          // Addendum is resolved below for control planes with a separate RPC.
+          promptOpts.systemPromptTemplate = binding.systemPrompt ?? undefined;
+        }
 
         // Agent-Addendum precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
@@ -1189,7 +1213,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           warnTraceBindFailure("prompt", promptResult.sessionId, promptMessageId!, bindErr);
         });
 
-        const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
+        const redactionConfig = buildRedactionConfigForModelConfig(promptOpts.modelConfig);
         const abortCtrl = turnAbort;
         const promptDoneEvent = () => ({
           type: "prompt_done",
@@ -2247,18 +2271,29 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const wantsModel = resourceTypes.includes("model");
     const expectedReleaseId = params.releaseId as string | undefined;
     const expectedModelFingerprint = params.modelFingerprint as string | undefined;
+    const expectedModelSelectionVersion = params.modelSelectionVersion;
+    if (expectedModelSelectionVersion !== undefined
+      && (typeof expectedModelSelectionVersion !== "number"
+        || !Number.isSafeInteger(expectedModelSelectionVersion) || expectedModelSelectionVersion < 0)) {
+      throw new Error("modelSelectionVersion must be a non-negative safe integer");
+    }
     let preparedReleaseId = "";
     let preparedModelFingerprint = "";
+    let preparedModelSelectionVersion = 0;
     if (wantsModel) {
       const binding = await resolveAgentModelBinding(agentId, frontendClient);
       if (!binding) throw new Error(`model binding unavailable for agent ${agentId}`);
       preparedReleaseId = binding.releaseId ?? "";
       preparedModelFingerprint = binding.modelFingerprint ?? "";
+      preparedModelSelectionVersion = binding.modelSelectionVersion ?? 0;
       if (expectedReleaseId && preparedReleaseId !== expectedReleaseId) {
         throw new Error(`model binding release ${preparedReleaseId || "<empty>"} does not match expected ${expectedReleaseId}`);
       }
       if (expectedModelFingerprint && preparedModelFingerprint !== expectedModelFingerprint) {
         throw new Error(`model binding fingerprint ${preparedModelFingerprint || "<empty>"} does not match expected ${expectedModelFingerprint}`);
+      }
+      if (expectedModelSelectionVersion !== undefined && expectedModelSelectionVersion !== preparedModelSelectionVersion) {
+        throw new Error("model selection version does not match expected Agent configuration");
       }
     }
 
@@ -2273,7 +2308,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       console.log(`[rpc] agent.reload: no active boxes for agent=${agentId}, skipping`);
       return {
         ok: true, reloaded: [], skipped: resourceTypes, boxes: 0,
-        preparedReleaseId, preparedModelFingerprint,
+        preparedReleaseId, preparedModelFingerprint, preparedModelSelectionVersion,
       };
     }
 
@@ -2304,7 +2339,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
     return {
       ok: true, reloaded, failed, boxes: targets.length,
-      preparedReleaseId, preparedModelFingerprint,
+      preparedReleaseId, preparedModelFingerprint, preparedModelSelectionVersion,
     };
   });
 
@@ -2396,6 +2431,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       model: status.model ? {
         releaseId: status.model.releaseId,
         modelFingerprint: status.model.modelFingerprint,
+        modelSelectionVersion: status.model.modelSelectionVersion ?? 0,
       } : null,
       // Sub-agent tiering is part of what a replica IS, so it belongs here for the
       // same reason `model` does. Without it two boxes serving different tier state

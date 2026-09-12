@@ -19,11 +19,13 @@
  * and asserts on the PromptOptions the box actually receives.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
   bindMessageTraceId: vi.fn(async () => {}),
+  validTraceId: (value: unknown) => typeof value === "string" ? value : undefined,
   updateMessage: vi.fn(async () => {}),
   incrementMessageCount: vi.fn(async () => {}),
 }));
@@ -82,11 +84,11 @@ function fakeAgentBoxManager() {
   } as any;
 }
 
-async function bootRuntime() {
+async function bootRuntime(frontendClient = fakeFrontendClient()) {
   return startRuntime({
     config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
     agentBoxManager: fakeAgentBoxManager(),
-    frontendClient: fakeFrontendClient(),
+    frontendClient,
     credentialService: {} as any,
   });
 }
@@ -152,4 +154,82 @@ describe("startRuntime — chat.send forwards sub-agent tier candidates", () => 
     // key the caller never set would misreport a clear as a decision.
     expect("subagentTiers" in promptCalls[0]).toBe(true);
   });
+});
+
+
+it("resolves the latest shared model at dispatch and keeps the independent fast tier", async () => {
+  const frontend = fakeFrontendClient();
+  const binding = {
+    modelProvider: "provider-b", modelId: "model-b", modelConfig: { apiKey: "test-key" },
+    releaseId: "release-1", modelFingerprint: "fingerprint-b", modelSelectionVersion: 2,
+    subagentTiers: TIERS,
+  };
+  frontend.request.mockImplementation(async (method: string) => method === "config.getModelBinding" ? { binding } : { found: false });
+  server = await bootRuntime(frontend);
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "S3",
+    modelProvider: "provider-a", modelId: "model-a", modelSelectionVersion: 1,
+    modelRouting: { enabled: true },
+  }, { sendEvent: vi.fn() });
+  await waitFor(() => promptCalls.length > 0);
+  expect(promptCalls[0]).toMatchObject(binding);
+  expect(promptCalls[0].modelRouting).toBeUndefined();
+  expect(frontend.request).toHaveBeenCalledWith("config.getModelBinding", { agentId: "a" });
+  await waitFor(() => vi.mocked(buildRedactionConfigForModelConfig).mock.calls.length > 0);
+  expect(buildRedactionConfigForModelConfig).toHaveBeenLastCalledWith(binding.modelConfig);
+});
+
+it.each(["CURRENT ADDENDUM", "", null, undefined])("refreshes the caller-stamped prompt with the dispatched binding (%s)", async (systemPrompt) => {
+  const frontend = fakeFrontendClient();
+  const binding = {
+    modelProvider: "provider-b", modelId: "model-b", modelConfig: {},
+    modelSelectionVersion: 2, systemPrompt,
+  };
+  frontend.request.mockImplementation(async (method: string) => method === "config.getModelBinding"
+    ? { binding } : { system_prompt: "CURRENT SEPARATE ADDENDUM" });
+  server = await bootRuntime(frontend);
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "prompt-refresh",
+    modelSelectionVersion: 1, systemPrompt: "STALE CALLER ADDENDUM",
+  }, { sendEvent: vi.fn() });
+  await waitFor(() => promptCalls.length > 0);
+  expect(promptCalls[0]).toMatchObject({
+    modelId: "model-b",
+    systemPromptTemplate: systemPrompt ?? "CURRENT SEPARATE ADDENDUM",
+  });
+});
+
+it("preserves explicit prompts for callers without selection metadata", async () => {
+  server = await bootRuntime();
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "legacy-prompt",
+    systemPrompt: "CALLER ADDENDUM",
+  }, { sendEvent: vi.fn() });
+  await waitFor(() => promptCalls.length > 0);
+  expect(promptCalls[0].systemPromptTemplate).toBe("CALLER ADDENDUM");
+});
+
+it("fails a versioned turn explicitly when current binding resolution fails", async () => {
+  const frontend = fakeFrontendClient();
+  const context = { sendEvent: vi.fn() };
+  frontend.request.mockImplementation(async (method: string) => {
+    if (method === "config.getModelBinding") throw new Error("control plane unavailable");
+    return { found: false };
+  });
+  server = await bootRuntime(frontend);
+  await server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", sessionId: "binding-failure",
+    modelSelectionVersion: 0, modelProvider: "old-provider", modelId: "old-model", modelConfig: {},
+  }, context);
+  await waitFor(() => context.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "stream_error"));
+  expect(promptCalls).toHaveLength(0);
+  expect(context.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "prompt_done")).toBe(true);
+});
+
+it.each(["3", null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])("rejects malformed chat selection version %s before dispatch", async (modelSelectionVersion) => {
+  server = await bootRuntime();
+  await expect(server.rpcMethods.get("chat.send")!({
+    agentId: "a", userId: "u", text: "hi", modelSelectionVersion,
+  }, { sendEvent: vi.fn() })).rejects.toThrow("modelSelectionVersion must be a non-negative safe integer");
+  expect(promptCalls).toHaveLength(0);
 });
