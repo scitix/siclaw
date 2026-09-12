@@ -1,0 +1,9 @@
+{
+  "tool_capabilities": ["read_files"],
+  "result_contract": {
+    "kind": "mcp_tool",
+    "mcp_server_id": "<BOUND_SUPPORT_RESULT_MCP_ID>",
+    "tool_name": "submit_product_support_result",
+    "required": true
+  }
+}
