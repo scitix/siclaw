@@ -268,6 +268,39 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     await mgr.release("running-b");
   });
 
+  it.each([false, true])("only supplies the sandbox executor when Runtime advertises enabled=%s", async enabled => {
+    const mgr = new AgentBoxSessionManager();
+    const runScript = vi.fn(async () => ({ status: "completed" }));
+    const info = { enabled, network_isolation: true, require_network_isolation: true,
+      ...(enabled ? { limits: { default_timeout_seconds: 45, max_timeout_seconds: 90, max_tool_calls: 12, max_output_bytes: 8192 } } : {}) };
+    mgr.gatewayClient = { scriptSandboxInfo: vi.fn(async () => info), runScript } as any;
+    await mgr.getOrCreate("sandbox-session", "web");
+    const executor = lastCreateSiclawSession.calls[0].scriptExecutor;
+    expect(lastCreateSiclawSession.calls[0].scriptSandboxInfo).toEqual(info);
+    if (enabled) {
+      const signal = new AbortController().signal;
+      const request = { language: "python", code: "print(1)" };
+      await executor(request, "untrusted-session-override", signal);
+      expect(runScript).toHaveBeenCalledWith(request, "sandbox-session", signal);
+    } else {
+      expect(executor).toBeUndefined();
+      expect(runScript).not.toHaveBeenCalled();
+    }
+    await mgr.closeAll();
+  });
+
+  it.each(["cli", "channel", "api", "task", "web"] as const)("does not request sandbox metadata for excluded %s sessions", async mode => {
+    const mgr = new AgentBoxSessionManager();
+    const metadata = vi.fn(async () => ({ enabled: true }));
+    mgr.gatewayClient = { scriptSandboxInfo: metadata, runScript: vi.fn() } as any;
+    await mgr.getOrCreate("excluded-sandbox", mode, undefined, "normal",
+      mode === "web" ? { delegationId: "delegated", readOnly: false } : undefined);
+    expect(metadata).not.toHaveBeenCalled();
+    expect(lastCreateSiclawSession.calls[0].scriptExecutor).toBeUndefined();
+    expect(lastCreateSiclawSession.calls[0].scriptSandboxInfo).toBeUndefined();
+    await mgr.closeAll();
+  });
+
   it("creates a new session on first call and caches it", async () => {
     const mgr = new AgentBoxSessionManager();
     const s1 = await mgr.getOrCreate("sess-1");

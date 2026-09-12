@@ -2480,21 +2480,17 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 61 handlers", () => {
-    const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(61);
-  });
-
-  it("all expected handler names are registered", () => {
+  it("registers exactly the declared handler names", () => {
     const handlers = buildAdapterRpcHandlers();
     const expected = [
-      "config.getAgent", "config.getResources", "config.getSettings",
+      "sandbox.resolve", "config.getAgent", "config.getResources", "config.getSettings",
       "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel", "config.getTracingConfig",
       "config.getDelegates",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
       "chat.getVisualLink", "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
+      "chat.recentDelegationSessions", "chat.sequenceMessage",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
@@ -2505,9 +2501,7 @@ describe("buildAdapterRpcHandlers", () => {
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
     ];
-    for (const name of expected) {
-      expect(handlers.has(name), `Missing handler: ${name}`).toBe(true);
-    }
+    expect([...handlers.keys()].sort()).toEqual(expected.sort());
   });
 
   // These exist purely so the runtime can call them unconditionally against ANY frontend

@@ -10,6 +10,8 @@
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type ResolvedToolDefinition } from "./tool-registry.js";
+import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,6 +59,10 @@ const MCP_STDIO_FORWARDED_ENV = [
 ] as const;
 const DEFAULT_VISUAL_EXPORT_TIMEOUT_MS = 60_000;
 const VISUAL_EXPORT_MCP_GRACE_MS = 5_000;
+const MCP_DISCOVERY_MAX_PAGES = 32;
+const MCP_DISCOVERY_MAX_TOOLS = 1000;
+const MCP_DISCOVERY_MAX_BYTES = 4 * 1024 * 1024;
+const MCP_DISCOVERY_TIMEOUT_MS = 30_000;
 
 /**
  * Optionally forward the platform-owned renderer contract into a bundled stdio MCP.
@@ -430,6 +436,7 @@ export class McpClientManager {
       // whose listTools() failed: the SSE stream is open by then, and a client
       // that never reached this.clients is otherwise closed by nobody.
       let connected: any = null;
+      const discoverySignal = AbortSignal.timeout(MCP_DISCOVERY_TIMEOUT_MS);
       const recordFailure = (error: McpConnectError) => {
         this.connections.push({
           name: serverName, transport: detectedTransport, state: "failed",
@@ -457,17 +464,13 @@ export class McpClientManager {
           case "sse":
             transport = new SSEClientTransport(
               new URL(cfg.url),
-              cfg.headers
-                ? { requestInit: { headers: cfg.headers } }
-                : undefined,
+              cfg.headers ? { requestInit: { headers: cfg.headers } } : undefined,
             );
             break;
           case "streamable-http":
             transport = new StreamableHTTPClientTransport(
               new URL(cfg.url),
-              cfg.headers
-                ? { requestInit: { headers: cfg.headers } }
-                : undefined,
+              cfg.headers ? { requestInit: { headers: cfg.headers } } : undefined,
             );
             break;
           default:
@@ -479,8 +482,15 @@ export class McpClientManager {
             continue;
         }
 
-        await client.connect(transport);
         connected = client;
+        let expire!: () => void;
+        const expired = new Promise<never>((_, reject) => {
+          expire = () => reject(discoverySignal.reason);
+          discoverySignal.addEventListener("abort", expire, { once: true });
+          if (discoverySignal.aborted) expire();
+        });
+        try { await Promise.race([client.connect(transport, { signal: discoverySignal }), expired]); }
+        finally { discoverySignal.removeEventListener("abort", expire); }
         if (this.disposed) {
           await this.closeLate(serverName, client, startedAt, detectedTransport);
           continue;
@@ -488,8 +498,34 @@ export class McpClientManager {
         console.log(`[mcp-client] Connected to "${serverName}" (${detectedTransport})`);
         const serverImplementationName = client.getServerVersion()?.name;
 
-        // Discover tools
-        const { tools: mcpTools } = await client.listTools();
+        // Publish a complete per-server inventory. A failed later page must not
+        // leave a partial tool set that silently hides capabilities from the model.
+        const mcpTools: McpTool[] = [];
+        const names = new Set<string>();
+        const cursors = new Set<string>();
+        let cursor: string | undefined;
+        let schemaBytes = 0;
+        for (let page = 0; page < MCP_DISCOVERY_MAX_PAGES; page++) {
+          const result = await client.listTools(cursor ? { cursor } : undefined, { signal: discoverySignal });
+          if (this.disposed) break;
+          schemaBytes += Buffer.byteLength(JSON.stringify(result.tools));
+          if (schemaBytes > MCP_DISCOVERY_MAX_BYTES || mcpTools.length + result.tools.length > MCP_DISCOVERY_MAX_TOOLS) {
+            throw Object.assign(new Error("MCP tool inventory exceeds discovery budget"), { name: "ProtocolError" });
+          }
+          for (const tool of result.tools) {
+            if (!tool.name || names.has(tool.name)) {
+              throw Object.assign(new Error("MCP tool inventory contains missing or duplicate names"), { name: "ProtocolError" });
+            }
+            names.add(tool.name);
+            mcpTools.push(tool);
+          }
+          if (!result.nextCursor) break;
+          cursor = result.nextCursor;
+          if (cursor.length > 4096 || cursors.has(cursor) || page + 1 === MCP_DISCOVERY_MAX_PAGES) {
+            throw Object.assign(new Error("MCP tool pagination is invalid or exceeds discovery budget"), { name: "ProtocolError" });
+          }
+          cursors.add(cursor);
+        }
         if (this.disposed) {
           await this.closeLate(serverName, client, startedAt, detectedTransport);
           continue;
@@ -497,7 +533,7 @@ export class McpClientManager {
         console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
 
         for (const mcpTool of mcpTools) {
-          const toolDef = this.createToolDefinition(
+          const toolDef = createMcpToolDefinition(
             serverName,
             cfg.description,
             mcpTool,
@@ -600,84 +636,89 @@ export class McpClientManager {
     this.tools = [];
   }
 
-  /**
-   * Create a pi-agent ToolDefinition from an MCP tool descriptor.
-   */
-  private createToolDefinition(
-    serverName: string,
-    serverDescription: string | undefined,
-    mcpTool: {
-      name: string;
-      description?: string;
-      inputSchema?: any;
-      /**
-       * MCP 规范的工具注解。这里只用 `readOnlyHint` —— authority guard 靠它决定
-       * 这个工具算不算"读"。见 tool-registry 的 MCP_TOOL_EFFECTS。
-       */
-      annotations?: { readOnlyHint?: boolean };
+}
+
+/** Shared Agent/SDK MCP tool factory. Transport authorization belongs to its caller. */
+export function createMcpToolDefinition(
+  serverName: string,
+  serverDescription: string | undefined,
+  mcpTool: {
+    name: string;
+    description?: string;
+    inputSchema?: any;
+    /**
+     * MCP 规范的工具注解。这里只用 `readOnlyHint` —— authority guard 靠它决定
+     * 这个工具算不算"读"。见 tool-registry 的 MCP_TOOL_EFFECTS。
+     */
+    annotations?: { readOnlyHint?: boolean };
+  },
+  client: any,
+  requestTimeoutMs?: number,
+  trustedOptions?: { includeRawResult?: boolean },
+): ResolvedToolDefinition {
+  const fullName = buildMcpToolName(serverName, mcpTool.name);
+  const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
+  // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
+  // into a @sinclair/typebox TSchema. The pi runtime validates and coerces tool
+  // arguments with a *different* TypeBox package (`typebox` 1.x, bundled under
+  // @earendil-works/pi-ai) whose schema-kind detection (`~kind` string prop) is
+  // incompatible with @sinclair/typebox 0.34's metadata (`Symbol.for('TypeBox.Kind')`).
+  // Converting here silently disables string→number/boolean coercion (e.g. "10" → 10):
+  // `Value.Convert` no-ops and pi-ai's JSON-Schema coercion fallback is skipped because
+  // `hasTypeBoxMetadata` detects the 0.34 symbol — so integer/object params such as
+  // get_panel_image's `panelId` fail validation with "must be integer". Raw JSON Schema
+  // leaves the kind metadata absent, letting pi-ai's coercion path run, and providers
+  // advertise tools straight from `.properties`/`.required`. See scitix/siclaw#355.
+  const parameters = normalizeMcpInputSchema(inputSchema);
+
+  // Prepend the admin-provided server description so the model sees server-level
+  // context (e.g. monitoring tenant IDs) on every tool from that server.
+  const serverContext = serverDescription?.trim()
+    ? `[Server "${serverName}" context: ${serverDescription.trim()}]\n`
+    : "";
+  const toolDescription = mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`;
+
+  return {
+    name: fullName,
+    toolset: `mcp:${serverName}`,
+    label: `${serverName}/${mcpTool.name}`,
+    description: serverContext + toolDescription,
+    parameters,
+    execute: async (_toolCallId, args, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const result = await client.callTool(
+          {
+            name: mcpTool.name,
+            arguments: args ?? {},
+          },
+          undefined,
+          requestTimeoutMs === undefined && !signal ? undefined : { ...(requestTimeoutMs === undefined ? {} : { timeout: requestTimeoutMs }), ...(signal ? { signal } : {}) },
+        );
+
+        const isError = !!result.isError;
+        const { content, text } = mcpContentToAgentContent(result.content);
+
+        return {
+          content,
+          details: {
+            ...(trustedOptions?.includeRawResult ? { rawResult: result } : {}),
+            ...(isError ? { error: text } : {}),
+            ...(result.structuredContent !== undefined
+              ? { structuredContent: result.structuredContent }
+              : {}),
+          },
+        };
+      } catch (err: any) {
+        const errorMsg = err?.message ?? String(err);
+        const execution = err instanceof McpError && ![ErrorCode.ConnectionClosed, ErrorCode.RequestTimeout].includes(err.code)
+          ? [ErrorCode.InvalidRequest, ErrorCode.InvalidParams, ErrorCode.MethodNotFound].includes(err.code) ? "NOT_DISPATCHED" : "FINISHED"
+          : "UNKNOWN";
+        return {
+          content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
+          details: { error: errorMsg, ...(trustedOptions?.includeRawResult ? { execution } : {}) },
+        };
+      }
     },
-    client: any,
-    requestTimeoutMs?: number,
-  ): ResolvedToolDefinition {
-    const fullName = buildMcpToolName(serverName, mcpTool.name);
-    const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
-    // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
-    // into a @sinclair/typebox TSchema. The pi runtime validates and coerces tool
-    // arguments with a *different* TypeBox package (`typebox` 1.x, bundled under
-    // @earendil-works/pi-ai) whose schema-kind detection (`~kind` string prop) is
-    // incompatible with @sinclair/typebox 0.34's metadata (`Symbol.for('TypeBox.Kind')`).
-    // Converting here silently disables string→number/boolean coercion (e.g. "10" → 10):
-    // `Value.Convert` no-ops and pi-ai's JSON-Schema coercion fallback is skipped because
-    // `hasTypeBoxMetadata` detects the 0.34 symbol — so integer/object params such as
-    // get_panel_image's `panelId` fail validation with "must be integer". Raw JSON Schema
-    // leaves the kind metadata absent, letting pi-ai's coercion path run, and providers
-    // advertise tools straight from `.properties`/`.required`. See scitix/siclaw#355.
-    const parameters = normalizeMcpInputSchema(inputSchema);
-
-    // Prepend the admin-provided server description so the model sees server-level
-    // context (e.g. monitoring tenant IDs) on every tool from that server.
-    const serverContext = serverDescription?.trim()
-      ? `[Server "${serverName}" context: ${serverDescription.trim()}]\n`
-      : "";
-    const toolDescription = mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`;
-
-    return {
-      name: fullName,
-      toolset: `mcp:${serverName}`,
-      label: `${serverName}/${mcpTool.name}`,
-      description: serverContext + toolDescription,
-      parameters,
-      execute: async (_toolCallId, args) => {
-        try {
-          const result = await client.callTool(
-            {
-              name: mcpTool.name,
-              arguments: args ?? {},
-            },
-            undefined,
-            requestTimeoutMs === undefined ? undefined : { timeout: requestTimeoutMs },
-          );
-
-          const isError = !!result.isError;
-          const { content, text } = mcpContentToAgentContent(result.content);
-
-          return {
-            content,
-            details: {
-              ...(isError ? { error: text } : {}),
-              ...(result.structuredContent !== undefined
-                ? { structuredContent: result.structuredContent }
-                : {}),
-            },
-          };
-        } catch (err: any) {
-          const errorMsg = err?.message ?? String(err);
-          return {
-            content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
-            details: { error: errorMsg },
-          };
-        }
-      },
-    };
-  }
+  };
 }

@@ -50,7 +50,8 @@ import {
   type ModelEnvelopeManifest,
 } from "./model-envelope.js";
 import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
-import { McpClientManager } from "./mcp-client.js";
+import type { McpClientManager } from "./mcp-client.js";
+import { resolveSessionMcpTools } from "./session-mcp-tools.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
@@ -72,6 +73,8 @@ import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
+  scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
+  scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
@@ -550,6 +553,8 @@ export async function createSiclawSession(
     mode,
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
+      scriptExecutor: opts?.scriptExecutor,
+      scriptSandboxInfo: opts?.scriptSandboxInfo,
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
@@ -595,6 +600,8 @@ export async function createSiclawSession(
 
   // -- MCP external tools (dynamic discovery, not in registry) --
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
+  const sandboxOnly = allowedTools?.length && allowedTools.every(name => name === "run_script");
+  const mcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
   const toolResultArtifactStore = new ToolResultArtifactStore({
     rootDir: toolResultArtifactsDir,
     getScope: () => ({
@@ -610,36 +617,14 @@ export async function createSiclawSession(
       error instanceof Error ? error.message : String(error),
     );
   }
-  let mcpManager: McpClientManager | undefined = exposeConfiguredMcp
-    ? opts?.mcpManager
-    : undefined;
-  const mcpServers = exposeConfiguredMcp ? (opts?.mcpServers ?? config.mcpServers) : {};
-  let mcpTools: ToolDefinition[] = [];
-  if (mcpManager) {
-    const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
-    if (sharedTools.length > 0) {
-      mcpTools = sharedTools.map((tool) => withToolResultArtifactCapture(tool, toolResultArtifactStore));
-      console.log(`[agent-factory] Reusing ${sharedTools.length} shared MCP tools`);
-    }
-  } else if (mcpServers && Object.keys(mcpServers).length > 0) {
-    mcpManager = new McpClientManager({ mcpServers } as any);
-    try {
-      await mcpManager.initialize();
-      const discovered = mcpManager.getTools();
-      console.log(`[agent-factory] MCP initialization complete: ${discovered.length} tools discovered`);
-      if (discovered.length > 0) {
-        mcpTools = discovered.map((tool) => withToolResultArtifactCapture(tool, toolResultArtifactStore));
-        console.log(`[agent-factory] Added ${discovered.length} MCP tools: ${discovered.map(t => t.name).join(", ")}`);
-      }
-    } catch (err) {
-      console.warn(`[agent-factory] MCP initialization failed:`, err);
-      mcpManager = undefined;
-    }
-  } else if (exposeConfiguredMcp) {
-    console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
-  } else {
-    console.log(`[agent-factory] Configured MCP tools disabled by ${compiledContext.harness.resolution} harness`);
-  }
+  const { mcpManager, mcpTools: discoveredMcpTools } = await resolveSessionMcpTools({
+    enabled: exposeConfiguredMcp, allowedTools,
+    mcpServers,
+    mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
+  });
+  const mcpTools = discoveredMcpTools.map(tool => withToolResultArtifactCapture(tool, toolResultArtifactStore));
+  // Sandbox-only agents use the reviewed broker; the harness gate and artifact
+  // recovery remain in effect for every other MCP selection.
   // Configured MCP tools are orthogonal to the built-in `allowedTools`
   // whitelist, but they are NOT exempt from the Agent harness: unresolved and
   // delegated-read-only contexts never initialize or append them. In a scoped
@@ -735,8 +720,8 @@ export async function createSiclawSession(
     }),
   ].map((tool) => Object.assign(tool, { toolset: "filesystem" }) as ResolvedToolDefinition);
   // Push into customTools so they override framework defaults via extension mechanism.
-  // Subject to allowedTools (same chokepoint as MCP append above): file tools are
-  // created outside the registry, so the shared name-based whitelist is applied here.
+  // File tools are created outside the registry, so apply the same name-based
+  // capability whitelist here before exposing them to the model.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
 
   for (let i = 0; i < customTools.length; i++) {

@@ -19,7 +19,7 @@ export type SessionMode = "web" | "channel" | "cli" | "task";
  * cron). Used for audit categorization and to carry the entry context into a
  * delegated turn. `undefined` ⇒ web.
  */
-export type OriginKind = "web" | "api" | "a2a" | "channel" | "task";
+export type OriginKind = "web" | "webchat" | "api" | "a2a" | "channel" | "task";
 
 /**
  * Present when this turn was delegated by a coordinator agent to a peer,

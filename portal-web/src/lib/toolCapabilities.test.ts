@@ -15,6 +15,7 @@ describe("CAPABILITY_GROUPS shape", () => {
       "plan_tasks",
       "read_files",
       "run_commands",
+      "run_sandbox",
       "run_scripts",
       "scheduling",
       "search_memory",

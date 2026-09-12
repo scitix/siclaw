@@ -715,7 +715,7 @@ export class CredentialBroker {
  */
 const groupGidCache = new Map<string, number | null>();
 
-function resolveGroupGid(groupName: string): number | null {
+export function resolveGroupGid(groupName: string): number | null {
   const overrideEnv = `SICLAW_${groupName.toUpperCase()}_GROUP`;
   const effective = process.env[overrideEnv] ?? groupName;
   if (groupGidCache.has(effective)) return groupGidCache.get(effective) ?? null;

@@ -19,7 +19,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "sre",
     label: "SRE Agent",
     description: "Hands-on specialist: inspects, diagnoses and remediates within its authorized clusters/hosts.",
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "run_sandbox", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
     defaultNoSkills: false,
   },
   {

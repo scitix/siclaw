@@ -29,6 +29,11 @@ describe("resolveCapabilities", () => {
     ]);
   });
 
+  it("sandbox capability does not grant legacy script or command tools", () => {
+    expect(resolveCapabilities(["run_sandbox"])).toEqual(["run_script"]);
+    expect(resolveCapabilities(["run_scripts"])).not.toContain("run_script");
+  });
+
   it("multiple groups resolve to the union of their tools", () => {
     const result = resolveCapabilities(["read_files", "search_memory"]);
     expect(new Set(result)).toEqual(
@@ -71,6 +76,7 @@ describe("resolveCapabilities", () => {
       "plan_tasks",
       "read_files",
       "run_commands",
+      "run_sandbox",
       "run_scripts",
       "scheduling",
       "search_memory",

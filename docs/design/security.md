@@ -4,6 +4,9 @@ sidebarTitle: "Security"
 description: "Defense-in-depth security model for LLM agent command execution in AgentBox containers."
 ---
 
+The opt-in `run_script` container, broker authorization, network profiles and
+one-use warm pool are specified in [Disposable script sandbox](script-sandbox.md).
+
 # AgentBox Security Architecture
 
 > **Purpose**: Document the multi-layer security model that constrains what an LLM agent

@@ -312,3 +312,39 @@ metrics:
     namespace: ""
     additionalLabels: {}
     costThresholdPerHour: 10
+
+# Optional, disposable Python/Bash execution. No AgentBox or production secrets.
+scriptSandbox:
+  enabled: false
+  provider: k8s # k8s or e2b; both use the same controlled tools.
+  publicUrl: "" # Canonical HTTPS origin of the standalone Portal callback ingress.
+  e2b:
+    template: "" # Operator-built Dockerfile.script-sandbox-e2b template.
+    apiUrl: https://api.e2b.app
+    domain: e2b.app
+    apiKeySecret: "" # Existing Secret in Runtime namespace; never mounted in a runner.
+    apiKeySecretKey: api-key
+  image: "" # Set to the built Dockerfile.script-sandbox image, preferably a digest.
+  namespace: "" # Default: <release-fullname>-execution; dedicated to runners.
+  createNamespace: true
+  serviceAccount: siclaw-script-runner
+  runtimeClass: "" # Optional gVisor/Kata class already installed on the cluster.
+  networkIsolation: false
+  requireNetworkIsolation: false
+  warmPoolSize: 1 # One-use idle instances for the deployment default profile, per Runtime.
+  warmIdleSeconds: 300
+  maxConcurrentRuns: 10
+  maxTimeoutSeconds: 300
+  maxOutputBytes: 131072
+  maxToolCalls: 512
+  # Shared admission owned by standalone Portal (external control planes configure their own limits).
+  traffic:
+    targetConcurrency: 10
+    targetRps: 10
+    targetBurst: 20
+  # Operator-reviewed HTTP MCP tools. No automatic readOnlyHint trust.
+  mcpPolicy: {}
+  # Registered host name -> SHA256 host key fingerprint.
+  hostKeyPins: {}
+  # Global execution namespace quota (include all Runtime replicas and both warm profiles).
+  podQuota: 24

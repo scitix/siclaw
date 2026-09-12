@@ -20,6 +20,8 @@ import { parseHandoffPolicy } from "../shared/agent-handoff.js";
  */
 
 import { normalizeHandoffTrace } from "../shared/handoff-trace.js";
+import { createScriptSandboxApi } from "./script-sandbox/api.js";
+import { SandboxTurnContext } from "./script-sandbox/turn-context.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
@@ -267,8 +269,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     ca: certManager.getCACertificate(),
   };
 
+  const sandboxTurns = new SandboxTurnContext();
+  const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
+    const handle = await agentBoxManager.getForSession(principal.agentId, principal.sessionId);
+    // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
+    // Route by the live session binding; only its originating box holds the active
+    // callback grant. A moved/replaced box rejects the grant instead of executing.
+    if (!handle || handle.agentId !== principal.agentId || !principal.callbackToken) {
+      throw new Error("Sandbox callback placement changed");
+    }
+    signal.throwIfAborted();
+    return new AgentBoxClient(handle.endpoint, 95_000, agentBoxTlsOptions).sandboxTool({
+      session_id: principal.sessionId, callback_token: principal.callbackToken, arguments: args,
+      approval,
+    }, signal);
+  }, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId));
+
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
+  rpcMethods.set("sandbox.tool", async params => scriptSandbox.externalTool(params));
 
   // Resolve the per-agent spawn env. Two sources fold together in buildSpawnEnv:
   // the idle self-destruct window (agents.idle_timeout_sec →
@@ -966,6 +985,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const turnAbort = new AbortController();
     registerPendingStart(sessionId, turnAbort);
     addLiveTurn(sessionId, turnId, turnAbort);
+    const releaseSandboxTurn = sandboxTurns.enter(sessionId, agentId, userId, origin, Boolean(delegation));
     if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
 
     let promptMessageId: string | undefined = params.persistedInput === true && typeof params.userMessageId === "string"
@@ -977,6 +997,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await incrementMessageCount(sessionId);
       } catch (persistErr) {
         if (requireSessionPersistence) {
+          releaseSandboxTurn();
           unregisterPendingStart(sessionId, turnAbort);
           dropLiveTurn(sessionId, turnId);
           delegatedTurns.delete(turnId);
@@ -1309,6 +1330,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         pendingUserRows.clear(sessionId);
         unregisterPendingStart(sessionId, turnAbort);
         dropLiveTurn(sessionId, turnId);
+        releaseSandboxTurn();
         delegatedTurns.delete(turnId);
         supervisorEndedTurns.delete(turnId);
         boxAbortAsked.delete(turnId);
@@ -2863,6 +2885,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
+          if (url === "/api/internal/script-runs" && (method === "POST" || method === "GET")) {
+            void scriptSandbox.handle(req, res, identity);
+            return;
+          }
+
           // Agent tasks — CRUD scoped by mTLS identity.agentId (via RPC)
           if (url.startsWith("/api/internal/agent-tasks")) {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
@@ -2971,7 +2998,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       unsubscribeCapabilityReconnect?.();
       // Before frontendClient.close(): the acknowledged terminal for a delegated turn
       // travels over that same connection.
-      await endInFlightTurns();
+      await Promise.all([endInFlightTurns(), scriptSandbox.shutdown()]);
       frontendClient.close();
       // Older embedded test/adapter managers may only implement cleanup(); the
       // concrete manager's shutdown() preserves K8s boxes across Runtime rolls.

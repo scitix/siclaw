@@ -811,3 +811,29 @@ them**. `turnStartMs` is accepted on the wire and ignored.
 `src/gateway/sse-consumer.ts`, `src/gateway/llm-call-rows.ts`,
 `src/gateway/channels/lark.ts`, `src/portal/metrics-timing.ts`,
 `src/shared/message-kinds.ts`
+
+## ADR-019: Coordinate Sandbox Tool Traffic Outside the Runner
+
+**Status**: Accepted (2026-09-11).
+
+**Context**: Serial SDK calls make fleet diagnostics slow. Increasing both script
+and tool concurrency without a shared target budget multiplies load across
+Runtime replicas and resource aliases.
+
+**Decision**: Permit ten scripts per Runtime and ten SDK lanes per script. The
+trusted Runtime derives target digests from freshly authorized credentials and
+requests atomic admission from the control plane. Cluster/MCP origins share ten
+active invocations and a 10/s, burst-20 token bucket. Host/node/Pod targets admit
+one at a time; all Pod containers share the leaf slot, including default selection.
+Queueing is bounded and credentials are resolved again after waiting. Confirmed
+completion releases a lease; uncertain completion retains its bounded expiry.
+Standalone Portal coordinates its Runtime instances in its single process;
+distributed control planes must use shared storage without a local fallback.
+
+**Consequences**: Python threads and Shell processes gain parallel orchestration
+without credentials or new command policies in the runner. Readiness protocol v3
+requires matching Runtime/AgentBox/runner images and a control plane supporting
+the private traffic RPCs. The gate counts SDK tool invocations, not all upstream
+HTTP traffic; ordinary Agent tools retain their existing limits. Endpoint aliases
+with different origins and upstream work surviving disconnection require
+operator/service-level controls. See `script-sandbox.md` for budgets and rollout.

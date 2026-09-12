@@ -317,7 +317,9 @@ postReload(context)  Notify active sessions to pick up changes
 
 - `fetch` is network I/O with retry (3 attempts, exponential backoff: 1s, 2s, 4s)
 - `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `global/` + `skillset/` + `user/` subdirs then rebuilds)
-- `postReload` calls `brain.reload()` on active sessions
+- `postReload` invalidates sessions for a rebuild after in-flight work and pending
+  completion notifications drain. It must not call `brain.reload()` during tool
+  execution, because that replaces the extension contexts used to deliver results.
 
 ### 6.2 When to Use Each Handler
 

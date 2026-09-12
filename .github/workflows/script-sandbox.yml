@@ -1,0 +1,52 @@
+name: Script Sandbox
+on:
+  pull_request:
+    paths: ["Dockerfile.script-sandbox*", "docker/script-sandbox/**", "src/script-sandbox/**", "src/gateway/script-sandbox/**", "src/portal/sandbox-ingress*", "scripts/smoke/*sandbox*", "scripts/smoke/e2b-relay*", "helm/siclaw/**", ".github/workflows/script-sandbox.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  container:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - uses: azure/setup-helm@v4
+      - run: npx tsx scripts/smoke/script-sandbox-helm.ts
+      - run: python3 -m unittest discover -s docker/script-sandbox -p '*_test.py'
+      - run: docker build -f Dockerfile.script-sandbox -t siclaw-script:test .
+      - run: docker image inspect siclaw-script:test --format '{{.Size}}'
+      - run: docker build -f Dockerfile.script-sandbox-e2b --build-arg SANDBOX_IMAGE=siclaw-script:test -t siclaw-script-e2b:test .
+      - run: bash scripts/smoke/e2b-relay.sh
+        env:
+          SICLAW_E2B_SMOKE_IMAGE: siclaw-script-e2b:test
+      - run: npx tsx scripts/smoke/script-sandbox.ts
+        env:
+          SICLAW_SCRIPT_SANDBOX_IMAGE: siclaw-script:test
+      - run: npx tsx scripts/smoke/script-sandbox-concurrency.ts
+        env:
+          SICLAW_SCRIPT_SANDBOX_IMAGE: siclaw-script:test
+      - uses: helm/kind-action@v1
+        if: matrix.os == 'ubuntu-24.04'
+        with:
+          cluster_name: script-sandbox
+      - name: Prepare disposable K8s execution namespace
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          kind load docker-image siclaw-script:test --name script-sandbox
+          kubectl --context kind-script-sandbox create namespace siclaw-script-smoke
+          kubectl --context kind-script-sandbox label namespace siclaw-script-smoke pod-security.kubernetes.io/enforce=restricted
+          kubectl --context kind-script-sandbox -n siclaw-script-smoke create serviceaccount siclaw-script-runner
+      - run: npx tsx scripts/smoke/script-sandbox.ts
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          SICLAW_SCRIPT_SANDBOX_PROVIDER: k8s
+          SICLAW_SCRIPT_SANDBOX_IMAGE: siclaw-script:test
+          SICLAW_SCRIPT_SMOKE_KUBE_CONTEXT: kind-script-sandbox

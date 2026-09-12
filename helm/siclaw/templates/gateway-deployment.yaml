@@ -26,6 +26,10 @@ spec:
       {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 6 }}
   template:
     metadata:
+      {{- if .Values.scriptSandbox.enabled }}
+      annotations:
+        checksum/script-policy: {{ include (print $.Template.BasePath "/script-sandbox.yaml") . | sha256sum }}
+      {{- end }}
       labels:
         {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 8 }}
     spec:
@@ -42,6 +46,53 @@ spec:
               containerPort: 3002
               protocol: TCP
           env:
+            {{- if .Values.scriptSandbox.enabled }}
+            - name: SICLAW_SCRIPT_SANDBOX_ENABLED
+              value: "true"
+            - name: SICLAW_SCRIPT_SANDBOX_PROVIDER
+              value: {{ .Values.scriptSandbox.provider | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_IMAGE
+              value: {{ if eq .Values.scriptSandbox.provider "e2b" }}""{{ else }}{{ required "scriptSandbox.image is required when enabled" .Values.scriptSandbox.image | quote }}{{ end }}
+            {{- if eq .Values.scriptSandbox.provider "e2b" }}
+            - name: SICLAW_SCRIPT_SANDBOX_E2B_TEMPLATE
+              value: {{ required "scriptSandbox.e2b.template is required" .Values.scriptSandbox.e2b.template | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_E2B_API_URL
+              value: {{ .Values.scriptSandbox.e2b.apiUrl | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_E2B_DOMAIN
+              value: {{ .Values.scriptSandbox.e2b.domain | quote }}
+            - name: E2B_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "scriptSandbox.e2b.apiKeySecret is required" .Values.scriptSandbox.e2b.apiKeySecret | quote }}
+                  key: {{ .Values.scriptSandbox.e2b.apiKeySecretKey | quote }}
+            {{- end }}
+            - name: SICLAW_SCRIPT_SANDBOX_NAMESPACE
+              value: {{ .Values.scriptSandbox.namespace | default (printf "%s-execution" (include "siclaw.fullname" .)) | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_SERVICE_ACCOUNT
+              value: {{ .Values.scriptSandbox.serviceAccount | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_RUNTIME_CLASS
+              value: {{ .Values.scriptSandbox.runtimeClass | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_NETWORK_ISOLATION
+              value: {{ .Values.scriptSandbox.networkIsolation | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_REQUIRE_NETWORK_ISOLATION
+              value: {{ .Values.scriptSandbox.requireNetworkIsolation | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_WARM_POOL_SIZE
+              value: {{ .Values.scriptSandbox.warmPoolSize | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_WARM_IDLE_SECONDS
+              value: {{ .Values.scriptSandbox.warmIdleSeconds | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_CONCURRENT_RUNS
+              value: {{ .Values.scriptSandbox.maxConcurrentRuns | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_TIMEOUT_SECONDS
+              value: {{ .Values.scriptSandbox.maxTimeoutSeconds | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_OUTPUT_BYTES
+              value: {{ .Values.scriptSandbox.maxOutputBytes | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_TOOL_CALLS
+              value: {{ .Values.scriptSandbox.maxToolCalls | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MCP_POLICY_FILE
+              value: /etc/siclaw-script-policy/mcp.json
+            - name: SICLAW_SCRIPT_SANDBOX_HOST_KEYS_FILE
+              value: /etc/siclaw-script-policy/hosts.json
+            {{- end }}
             - name: NODE_ENV
               value: "production"
             - name: SICLAW_PORT
@@ -217,6 +268,11 @@ spec:
           resources:
             {{- toYaml .Values.runtime.resources | nindent 12 }}
           volumeMounts:
+            {{- if .Values.scriptSandbox.enabled }}
+            - name: script-policy
+              mountPath: /etc/siclaw-script-policy
+              readOnly: true
+            {{- end }}
             - name: skills
               mountPath: /app/.siclaw/skills
             {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
@@ -236,6 +292,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
+        {{- if .Values.scriptSandbox.enabled }}
+        - name: script-policy
+          configMap:
+            name: {{ include "siclaw.fullname" . }}-script-policy
+        {{- end }}
         - name: skills
           emptyDir: {}
         {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}

@@ -34,6 +34,7 @@ COPY src/cron/ ./src/cron/
 COPY src/knowledge/ ./src/knowledge/
 COPY src/memory/ ./src/memory/
 COPY src/shared/ ./src/shared/
+COPY src/script-sandbox/ ./src/script-sandbox/
 COPY src/tools/ ./src/tools/
 # Type-only file consumed by core/agent-factory.ts and core/extensions/* —
 # keeps Portal runtime code (db, rest-router) out of the agentbox tsc graph.

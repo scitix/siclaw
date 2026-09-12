@@ -44,6 +44,7 @@ const { MockClient, mockState } = vi.hoisted(() => {
   }
 
   class MockClient extends TinyEmitter {
+    config: any;
     label = "";
     sock: any = undefined;
     privateKey: any = undefined;
@@ -64,6 +65,7 @@ const { MockClient, mockState } = vi.hoisted(() => {
       }
     }
     connect(config: any): void {
+      this.config = config;
       this.label = `${config.host}:${config.port}`;
       this.sock = config.sock;
       this.privateKey = config.privateKey;
@@ -298,4 +300,16 @@ describe("makeHostVerifier (TOFU)", () => {
     verify2(Buffer.from("key-B"), (ok) => { second = ok; });
     expect(second).toBe(false);
   });
+});
+
+it("uses strict host key pins on every hop without consulting or populating TOFU", async () => {
+  const { createHash } = await import("node:crypto");
+  const key = Buffer.from("approved-host-key");
+  const pin = "SHA256:" + createHash("sha256").update(key).digest("base64").replace(/=+$/, "");
+  const result = await dialSshChain([{ ...hop("192.0.2.1"), expectedHostKey: pin }, { ...hop("192.0.2.2"), expectedHostKey: pin }], { timeoutMs: 5000 });
+  for (const client of mockState.instances) {
+    expect(client.config.hostVerifier(key)).toBe(true);
+    expect(client.config.hostVerifier(Buffer.from("unapproved-key"))).toBe(false);
+  }
+  result.teardown();
 });

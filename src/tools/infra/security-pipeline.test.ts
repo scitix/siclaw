@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   preExecSecurity,
   postExecSecurity,
+  type ToolOutputData,
 } from "./security-pipeline.js";
 import { analyzeOutput } from "./output-sanitizer.js";
 
@@ -329,5 +330,48 @@ describe("stderr is redacted too", () => {
   it("leaves ordinary stderr untouched", () => {
     const out = postExecSecurity("body", null, { stderr: "Warning: v1beta1 is deprecated" });
     expect(out).toContain("Warning: v1beta1 is deprecated");
+  });
+});
+
+
+describe("trusted sandbox data output", () => {
+  it.each([
+    ["kubectl", ["get", "secret", "-o", "json"], { kind: "Secret", data: { password: "private-test-value" } }],
+    ["crictl", ["inspect", "id"], { info: { config: { envs: ["PASSWORD=private-test-value"] } } }],
+    ["cat", ["/tmp/config.json"], { password: "private-test-value", healthy: true }],
+  ] as const)("separates %s sanitizer notices from JSON and stderr", (binary, args, payload) => {
+    let captured: ToolOutputData | undefined;
+    const text = postExecSecurity(JSON.stringify(payload), analyzeOutput(binary, [...args]), {
+      outputMode: "data", onOutputData: data => { captured = data; },
+      stderr: "Warning: old API\npassword: private-stderr", notes: "\n[diagnostic note]", exitCode: 1,
+    });
+    expect(() => JSON.parse(text)).not.toThrow();
+    expect(captured?.text).toBe(text);
+    expect(captured?.stderr).toContain("Warning: old API");
+    expect(captured?.notices).toContain("[diagnostic note]");
+    expect(captured?.notices.filter(n => n.includes("redacted"))).toHaveLength(1);
+    expect(JSON.stringify(captured)).not.toMatch(/private-test-value|private-stderr|\[exit code/);
+  });
+
+  it("keeps JSON valid through the shared pipeline fallback sanitizer", () => {
+    const text = postExecSecurity('{"password":"private-value","healthy":true}', null, {
+      outputMode: "data", hasSensitiveKubectl: true,
+    });
+    expect(JSON.parse(text)).toEqual({ password: "**REDACTED**", healthy: true });
+  });
+
+  it("does not strip user data that contains the same words as a sanitizer notice", () => {
+    const payload = { message: "⚠️ Sensitive values have been redacted for security." };
+    const text = postExecSecurity(JSON.stringify(payload), null, { outputMode: "data", stderr: "warning" });
+    expect(JSON.parse(text)).toEqual(payload);
+  });
+
+  it("preserves complete data while sanitizing both channels and terminal controls", () => {
+    const rows = "healthy-node\n".repeat(30_000);
+    const result = postExecSecurity(rows + "TOKEN\x1b[31mlast-node\x1b[0m", {
+      type: "sanitize", sanitize: s => s.replace("TOKEN", "[REDACTED]"),
+    }, { outputMode: "data", stderr: "password: private-value" });
+    expect(result.startsWith(rows)).toBe(true); expect(result).toContain("last-node");
+    expect(result).not.toMatch(/TOKEN|private-value|siclaw-output|truncated|\x1b/);
   });
 });

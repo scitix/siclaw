@@ -12,6 +12,7 @@ import { registration as nodeExec } from "./cmd-exec/node-exec.js";
 import { registration as podExec } from "./cmd-exec/pod-exec.js";
 import { registration as restrictedBash } from "./cmd-exec/restricted-bash.js";
 import { registration as hostExec } from "./cmd-exec/host-exec.js";
+import { registration as runScript } from "./script-exec/run-script.js";
 // script-exec
 import { registration as nodeScript } from "./script-exec/node-script.js";
 import { registration as podScript } from "./script-exec/pod-script.js";
@@ -53,7 +54,7 @@ export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
   nodeExec, podExec, restrictedBash, hostExec,
   // ── script-exec ──
-  nodeScript, podScript, localScript, hostScript,
+  nodeScript, podScript, localScript, hostScript, runScript,
   // ── query ──
   clusterList, hostList, k8sInspect,
   memorySearch, memoryGet, knowledgeSearch, knowledgeCite,

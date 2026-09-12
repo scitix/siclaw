@@ -23,6 +23,17 @@ function fakeWs() {
 // ── Tests ────────────────────────────────────────────────────
 
 describe("RuntimeConnectionMap", () => {
+  it("does not fall back or accept a different socket's callback response", async () => {
+    const map = createConnectionMap(), first = fakeWs(), second = fakeWs();
+    map.register("runtime-1", first); map.register("runtime-2", second);
+    expect((await map.sendCommandToRuntime!("missing", "sandbox.tool", {})).ok).toBe(false);
+    expect(first._sent).toHaveLength(0); expect(second._sent).toHaveLength(0);
+    const pending = map.sendCommandToRuntime!("runtime-1", "sandbox.tool", {});
+    const id = JSON.parse(first._sent[0]).id;
+    second.emit("message", JSON.stringify({ type: "res", id, ok: true, payload: "forged" }));
+    first.emit("message", JSON.stringify({ type: "res", id, ok: true, payload: "correct" }));
+    expect((await pending).payload).toBe("correct");
+  });
   let map: RuntimeConnectionMap;
 
   function freshMap() {

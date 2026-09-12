@@ -1,3 +1,4 @@
+import { normalizeExecTarget } from "../infra/exec-utils.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -11,7 +12,7 @@ import { checkPodRunning } from "../infra/k8s-checks.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
@@ -36,7 +37,7 @@ interface PodExecParams {
 }
 
 
-export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring): ToolDefinition {
+export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring, trustedOptions?: TrustedToolOutputOptions & { remoteTimeoutSeconds?: number }): ToolDefinition {
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "pod_exec",
@@ -133,7 +134,7 @@ Examples:
     },
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
-      const params = rawParams as PodExecParams;
+      const params = normalizeExecTarget(rawParams as PodExecParams);
 
       // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
       // would answer with a kubeconfig error and hide the actual mistake.
@@ -202,7 +203,10 @@ Examples:
 
       // Build kubectl exec args
       const cmdArgs = parseArgs(params.command);
-      const execArgs = cmdArgs;
+      // SDK calls require a remote bound too: closing kubectl does not kill a
+      // process in an existing Pod. Missing timeout in the target fails closed.
+      const execArgs = trustedOptions?.remoteTimeoutSeconds === undefined ? cmdArgs
+        : ["timeout", "-s", "KILL", String(trustedOptions.remoteTimeoutSeconds), ...cmdArgs];
       const kubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
@@ -258,6 +262,8 @@ Examples:
 
         return {
           content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
+            outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: filterPodNoise(stderr.trim()) || undefined,
             project: jsonPathProjector(params.json_path),
           }) }],
@@ -285,6 +291,8 @@ Examples:
         });
         return {
           content: [{ type: "text", text: postExecSecurity(stdout, pre.action, {
+            outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: stderr || undefined,
             project: jsonPathProjector(params.json_path),
             ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),

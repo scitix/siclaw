@@ -1,3 +1,4 @@
+import { SandboxToolError } from "../script-sandbox/errors.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * AgentBox HTTP Server
@@ -9,9 +10,12 @@ import { assistantTextBlocks } from "../shared/assistant-items.js";
 import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
 import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
+import { isAuthenticatedRuntime } from "./runtime-auth.js";
+import { record } from "../script-sandbox/validation.js";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager, ManagedSession } from "./session.js";
 import type { SessionMode, OriginKind, DelegationContext } from "../core/types.js";
@@ -918,6 +922,40 @@ export function createHttpServer(
    *
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
+  // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
+  // The unguessable per-invocation grant is required in BOTH local and mTLS modes.
+  addRoute("POST", "/api/internal/sandbox-tool", async (req, res) => {
+    if (!useTls && !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")) {
+      sendJson(res, 403, { error: "Sandbox callback denied" }); return;
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    res.once("close", abort);
+    let dispatched = false;
+    try {
+      const body = await parseJsonBody(req);
+      if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approval"].includes(k)) ||
+          !record(body.approval) || Buffer.byteLength(JSON.stringify(body.approval)) > 256 * 1024 ||
+          typeof body.session_id !== "string" || typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token)) throw new Error();
+      const managed = sessionManager.get(body.session_id);
+      const invocations = sessionManager.gatewayClient?.sandboxInvocations;
+      if (!managed || managed.mode !== "web" || managed.delegation || !invocations) throw new Error();
+      const { executeSandboxBuiltin } = await import("./sandbox-tools.js");
+      const approval = body.approval as unknown as import("../shared/sandbox-tool-types.js").SandboxBuiltinApproval;
+      if (!Number.isSafeInteger(approval.deadlineMs) || Number(approval.deadlineMs) <= Date.now()) throw new Error();
+      if (typeof approval.callId !== "string" || !approval.callId || approval.callId.length > 64) throw new Error();
+      const result = await invocations.execute(body.callback_token, body.session_id,
+        { id: approval.callId, tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
+        (request, signal) => { dispatched = true; return executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal); });
+      sendJson(res, 200, { protocol: 1, ok: true, result });
+    } catch (error) {
+      const failure = error instanceof SandboxToolError ? error : new SandboxToolError(
+        dispatched ? "EXECUTION_UNKNOWN" : "UNAUTHORIZED", dispatched ? "UNKNOWN" : "NOT_DISPATCHED");
+      sendJson(res, 200, { protocol: 1, ok: false, ...failure.wire() });
+    }
+    finally { res.off("close", abort); }
+  });
+
   addRoute("POST", "/api/prompt", async (req, res) => {
     const promptStartedAt = Date.now();
     const body = (await parseJsonBody(req)) as PromptRequestBody;
@@ -1904,11 +1942,10 @@ export function createHttpServer(
         const payload = await handler.fetch(client ? client.toClientLike() : null);
         const count = await handler.materialize(payload);
 
-        // Build session list for postReload. Handlers choose whether to call
-        // brain.reload() (skills/knowledge — in-session hot-reload is safe) or
-        // invalidate() (mcp — session must be rebuilt to pick up the new
-        // toolset). invalidate() defers the release until any in-flight prompt
-        // completes so tool execution is not torn down mid-turn.
+        // Materialization above takes effect immediately. Session refresh uses
+        // invalidate(), including skills/knowledge: brain.reload() replaces Pi's
+        // extension contexts and would break in-flight tool result delivery.
+        // Invalidation defers teardown until the session's work has drained.
         const sessions = sessionManager.list().map((s) => ({
           id: s.id,
           brain: s.brain,
@@ -2127,15 +2164,8 @@ export function createHttpServer(
 
     // mTLS Gateway identity check (HTTPS only, skip /health for K8s probes)
     if (useTls && pathname !== "/health") {
-      const tlsSocket = req.socket as TLSSocket;
-      const peerCert = tlsSocket.getPeerCertificate?.();
-      if (!peerCert || !peerCert.subject) {
-        sendJson(res, 403, { error: "Client certificate required" });
-        return;
-      }
-      if (peerCert.subject.OU !== "Gateway" && peerCert.subject.OU !== "Runtime") {
-        console.warn(`[agentbox-http] Rejected request from OU=${peerCert.subject.OU} (expected Gateway or Runtime)`);
-        sendJson(res, 403, { error: "Forbidden: only Gateway/Runtime can access this API" });
+      if (!isAuthenticatedRuntime(req.socket as TLSSocket)) {
+        sendJson(res, 403, { error: "Trusted Gateway/Runtime certificate required" });
         return;
       }
     }
@@ -2191,7 +2221,7 @@ export function createHttpServer(
         key: fs.readFileSync(keyFile),
         ca: fs.readFileSync(caFile),
         requestCert: true,
-        rejectUnauthorized: false, // Allow K8s probes without client cert; app-layer checks OU for non-health routes
+        rejectUnauthorized: false, // Health probes are public; other routes verify CA authorization AND OU
       },
       requestHandler,
     );

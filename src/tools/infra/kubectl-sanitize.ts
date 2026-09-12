@@ -193,6 +193,15 @@ function redactOneLine(line: string): string | null {
  */
 export const REDACTION_NOTICE = "\n\n⚠️ Sensitive values have been redacted for security.";
 
+export type SanitizationNoticeSink = (notice: string) => void;
+
+/** Data consumers receive advisory text separately; display callers keep the footer. */
+export function appendSanitizationNotice(text: string, notice: string, report?: SanitizationNoticeSink): string {
+  if (!report) return text + notice;
+  report(notice.trim());
+  return text;
+}
+
 /**
  * Appended when `-o json` output did not parse as JSON.
  *
@@ -338,9 +347,14 @@ function ownedByBlock(line: string, keyIndent: number): boolean {
  * where a block split across batches is inherently beyond reach — no worse than
  * before, and the per-line layer still applies.
  */
-export function redactSensitiveContent(output: string): string {
-  const { text, redacted } = redactDocument(output);
-  return redacted ? text + REDACTION_NOTICE : text;
+export function redactSensitiveContent(output: string, report?: SanitizationNoticeSink): string {
+  const { text, redacted } = report ? redactDataDocument(output) : redactDocument(output);
+  return redacted ? appendSanitizationNotice(text, REDACTION_NOTICE, report) : text;
+}
+
+/** Preserve JSON syntax for data consumers using the existing JSON/document redactors. */
+export function redactDataDocument(text: string): { text: string; redacted: boolean } {
+  return redactJsonPayload(text) ?? redactDocument(text);
 }
 
 // ── Resource alias mapping ───────────────────────────────────────────
@@ -523,6 +537,36 @@ export function detectSensitiveResource(
  */
 const SHORT_FLAGS_WITH_VALUE = new Set(["o", "n", "l", "c", "s", "v", "L", "k", "f"]);
 
+const CONNECTION_OVERRIDE_FLAGS = new Set([
+  "--kubeconfig", "--server", "--context", "--cluster", "--user", "--username", "--password", "--token",
+  "--client-certificate", "--client-key", "--certificate-authority", "--insecure-skip-tls-verify",
+  "--tls-server-name", "--proxy-url", "--as", "--as-group", "--as-uid",
+]);
+
+/** Connection and identity are selected by the tool's credential binding.
+ * Reuse the same flag arities as the output/resource readers, including -AsURL.
+ */
+export function kubectlConnectionOverride(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const key = arg.split("=", 1)[0];
+      if (CONNECTION_OVERRIDE_FLAGS.has(key)) return key;
+      if (!arg.includes("=") && FLAGS_WITH_VALUE.has(key)) i++;
+    } else if (arg.startsWith("-")) {
+      for (let k = 1; k < arg.length; k++) {
+        if (arg[k] === "s") return "-s";
+        if (SHORT_FLAGS_WITH_VALUE.has(arg[k])) {
+          if (k === arg.length - 1) i++;
+          break;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
  * Every output-format declaration in an argv, in the order kubectl sees them.
  *
@@ -675,6 +719,7 @@ function extractFormatName(value: string): string {
 export function sanitizeJSON(
   output: string,
   resourceType: SensitiveResourceType,
+  report?: SanitizationNoticeSink,
 ): string {
   let obj: any;
   try {
@@ -689,8 +734,8 @@ export function sanitizeJSON(
     // So the text is kept, run through the line redactor first. That is strictly better than
     // suppression in both directions: an API error survives, and a recognisable secret is still masked
     // — the structural sanitizer never applied to this text anyway, since it does not parse.
-    const text = redactSensitiveContent(output);
-    return text + NON_JSON_NOTICE;
+    const text = redactSensitiveContent(output, report);
+    return appendSanitizationNotice(text, NON_JSON_NOTICE, report);
   }
 
   let redacted = false;
@@ -716,7 +761,7 @@ export function sanitizeJSON(
   if (redactRegistryAuth(obj)) redacted = true;
 
   const sanitized = JSON.stringify(obj, null, 2);
-  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
+  return redacted ? appendSanitizationNotice(sanitized, REDACTION_NOTICE, report) : sanitized;
 }
 
 /**
@@ -1043,6 +1088,23 @@ function redactJsonPayload(
   try {
     parsed = JSON.parse(trimmed);
   } catch {
+    // A stream of complete JSON records is data too. Validate every line before
+    // rewriting any of them; malformed/truncated documents retain fail-closed handling.
+    const lines = value.split("\n");
+    if (lines.filter(line => line.trim()).length > 1) {
+      try {
+        const records = lines.map(line => line.trim() ? JSON.parse(line) : undefined);
+        if (records.every(row => row === undefined || row !== null && typeof row === "object")) {
+          let redacted = false;
+          const text = records.map((row, index) => {
+            if (row === undefined || !redactJsonTree(row)) return lines[index];
+            redacted = true;
+            return JSON.stringify(row);
+          }).join("\n");
+          return { text, redacted };
+        }
+      } catch { /* Continue with the malformed document policy below. */ }
+    }
     return mentionsSensitiveKey(trimmed)
       ? { text: REDACTED, redacted: true }
       : null;
@@ -1058,11 +1120,20 @@ function redactJsonPayload(
 }
 
 /** Redact values under sensitive keys anywhere in a parsed JSON tree, in place. */
+export function isSensitiveDataKey(key: string, value: unknown): boolean {
+  // This Kubernetes setting describes token mounting; it is not token material.
+  if (key === "automountServiceAccountToken" && typeof value === "boolean") return false;
+  return value !== null && isSensitiveKeyName(key);
+}
+
 function redactJsonTree(node: unknown): boolean {
   if (Array.isArray(node)) {
     let redacted = false;
-    for (const item of node) {
-      if (redactJsonTree(item)) redacted = true;
+    for (let i = 0; i < node.length; i++) {
+      if (typeof node[i] === "string") {
+        const result = redactDocument(node[i]);
+        if (result.redacted) { node[i] = result.text; redacted = true; }
+      } else if (redactJsonTree(node[i])) redacted = true;
     }
     return redacted;
   }
@@ -1072,17 +1143,19 @@ function redactJsonTree(node: unknown): boolean {
   const obj = node as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
     const value = obj[key];
-    if (typeof value === "string") {
-      if (isSensitiveKeyName(key) || looksLikeSensitiveValue(value)) {
-        obj[key] = REDACTED;
-        redacted = true;
-      }
-      continue;
-    }
-    if (isSensitiveKeyName(key) && value !== null && typeof value === "object") {
-      // A sensitive key holding a structure (e.g. `"auth": {…}`) — drop it all.
+    // A sensitive key protects scalars as well as nested structures.
+    if (isSensitiveDataKey(key, value)) {
       obj[key] = REDACTED;
       redacted = true;
+      continue;
+    }
+    if (typeof value === "string") {
+      // Reuse document rules for embedded configs and standalone value patterns.
+      const result = redactDocument(value);
+      if (result.redacted) {
+        obj[key] = result.text;
+        redacted = true;
+      }
       continue;
     }
     if (redactJsonTree(value)) redacted = true;
