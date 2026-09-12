@@ -6,6 +6,7 @@ import {
   resetConversationSessionsForTest,
 } from "./dingtalk.js";
 import { sessionRegistry } from "../session-registry.js";
+import { sessionTurnLocks } from "../session-turn-lock.js";
 import { buildMarkdownMessage, DINGTALK_TITLE, sanitizeMarkdownForDingTalk } from "./dingtalk-card.js";
 
 const supportsConversationsMock = vi.hoisted(() => vi.fn());
@@ -473,6 +474,49 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     expect(promptArg.modelConfig).toEqual(modelConfig);
     expect(promptArg.modelRouting).toEqual(modelRouting);
     sessionRegistry.forget(promptArg.sessionId);
+  });
+
+  it.each(["binding", "separate", "cleared"])("refreshes the model and %s Addendum after a queued turn acquires its lock", async (promptSource) => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-selection", bindingId: "b1" });
+    promptMock.mockResolvedValue({ sessionId: "channel-selection" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    let selectionVersion = 1;
+    const frontend = { request: vi.fn(async (method: string) => {
+      if (method === "config.getModelBinding") {
+        return { binding: {
+          modelProvider: "provider", modelId: `model-${selectionVersion}`,
+          modelSelectionVersion: selectionVersion,
+          ...(promptSource === "binding" ? { systemPrompt: `BOUND ADDENDUM ${selectionVersion}` } : {}),
+          ...(promptSource === "cleared" && selectionVersion === 2 ? { systemPrompt: "" } : {}),
+        } };
+      }
+      return { system_prompt: `SEPARATE ADDENDUM ${selectionVersion}` };
+    }) };
+    const mgr = makeAgentBoxManager("agent-selection");
+    const message = makeDownstream("hi", { conversationType: "1", conversationId: "selection-chat" });
+    await handleDingTalkMessage(message, "ch", mgr as any, undefined, frontend as any);
+    const sessionId = promptMock.mock.calls[0][0].sessionId as string;
+    const release = await sessionTurnLocks.acquire(sessionId);
+    const acquire = vi.spyOn(sessionTurnLocks, "acquire");
+    promptMock.mockClear();
+    const queued = handleDingTalkMessage(message, "ch", mgr as any, undefined, frontend as any);
+    try {
+      await vi.waitFor(() => expect(acquire).toHaveBeenCalledWith(sessionId));
+      expect(promptMock).not.toHaveBeenCalled();
+      selectionVersion = 2;
+      release();
+      await queued;
+      expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
+        modelId: "model-2", modelSelectionVersion: 2,
+        systemPromptTemplate: promptSource === "binding" ? "BOUND ADDENDUM 2"
+          : promptSource === "cleared" ? "" : "SEPARATE ADDENDUM 2",
+      }));
+    } finally {
+      release();
+      await queued;
+      acquire.mockRestore();
+      sessionRegistry.forget(sessionId);
+    }
   });
 
   it("does not pass userId into the AgentBox prompt payload", async () => {

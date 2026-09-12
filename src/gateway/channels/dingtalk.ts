@@ -316,7 +316,6 @@ export async function handleDingTalkMessage(
   let releaseTurn: (() => void) | undefined;
   try {
     const remoteConversation = frontendClient ? await supportsConversations(frontendClient) : false;
-    const systemPromptTemplate = !remoteConversation ? await resolveAgentSystemPrompt(agentId, frontendClient) : undefined;
     // Audit: persist the session + inbound user message so DingTalk sessions are
     // visible in the audit (they were previously invisible — no chat_messages at
     // all). origin="channel" unifies IM channels alongside Web/API/A2A. user_id =
@@ -353,6 +352,10 @@ export async function handleDingTalkMessage(
       client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
     }
     const modelBinding = !remoteConversation && frontendClient ? await resolveAgentModelBinding(agentId, frontendClient) : null;
+    // Resolve the Addendum with the model after the turn lock. The binding owns
+    // an explicit value, including an empty string that clears the old prompt.
+    const systemPromptTemplate = remoteConversation ? undefined
+      : modelBinding?.systemPrompt ?? await resolveAgentSystemPrompt(agentId, frontendClient);
     const promptOpts: PromptOptions = {
       text,
       agentId,
