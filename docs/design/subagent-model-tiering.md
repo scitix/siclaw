@@ -1,5 +1,7 @@
 # Sub-agent Model Tiering
 
+> Historical design: Coordinator and peer delegation have been retired. See [the retirement design](../design/2026-09-12-coordinator-retirement-assessment.md). Same-Agent subagents remain supported.
+
 > Status: design (no implementation yet)
 > Baseline: `main` @ `30e2b4f9`
 > Complements `coordinator-routing.md` (delegation vs sub-agent boundary) and

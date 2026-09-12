@@ -47,10 +47,8 @@ import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
-import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "../core/types.js";
-import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
+import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import { normalizeAgentType } from "../core/agent-types.js";
-import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
@@ -221,7 +219,7 @@ export interface ManagedSession {
   /**
    * Caller-supplied identity of the turn currently running, when it supplied one.
    *
-   * A session id names a CONVERSATION, which a delegated peer session deliberately
+   * A session id names a CONVERSATION, which a multi-turn session deliberately
    * reuses across turns, so an abort addressed by session alone cannot distinguish
    * "stop what is running" from "stop the turn I dispatched" — a late abort for a
    * finished turn lands on its successor. Callers that know which turn they mean
@@ -234,9 +232,6 @@ export interface ManagedSession {
   mode: SessionMode;
   /** Active operating mode (normal/dp/…) this agent was built for — drives rebuild on change. */
   activeMode: AgentMode;
-  /** Delegation context this agent was built for (undefined = non-delegated). Drives
-   *  rebuild when the delegation tier changes on a reused session id. */
-  delegation?: DelegationContext;
   /** Whether this session was built with top-level `request_input` available. */
   allowInputRequest: boolean;
   handoffSupported?: boolean;
@@ -366,13 +361,6 @@ const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Rebuild key for the delegation tier: "none" (non-delegated) | "ro" | "rw".
- *  The ids do not affect the resolved toolset, so a re-delegation of the same
- *  session reuses the built agent. */
-function delegationSignature(d: DelegationContext | undefined): "none" | "delegated" {
-  return d ? "delegated" : "none";
 }
 
 async function abortBrainBestEffort(
@@ -940,7 +928,7 @@ export class AgentBoxSessionManager {
     // history dir, and a Stop on it would otherwise arm a latch the user's next
     // prompt consumes. A turn-scoped latch cannot do that — only that turn's own
     // prompt consumes it — so skipping the check is what lets a Stop on a REUSED
-    // session (a delegated peer thread always has a dir) arm anything at all.
+    // session (a restored thread already has a dir) arm anything at all.
     if (turnId === undefined) {
       try {
         if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
@@ -3255,7 +3243,6 @@ export class AgentBoxSessionManager {
     mode?: SessionMode,
     systemPromptTemplate?: string,
     activeMode: AgentMode = "normal",
-    delegation?: DelegationContext,
     requestUserId?: string,
     allowInputRequest = false,
     handoffSupported = false,
@@ -3299,44 +3286,20 @@ export class AgentBoxSessionManager {
           existing._releaseTimer = null;
           console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
         }
-        // Reuse unless the operating mode, delegation tier, or explicit input
-        // capability changed mid-session
-        // (e.g. user toggled Deep Investigation, or a reused session id flips between a
-        // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
-        // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
-        const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
+        // Rebuild an idle session when its execution context changes.
         const sameInputCapability = existing.allowInputRequest === allowInputRequest
           && Boolean(existing.handoffSupported) === handoffSupported
           && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
           && existing.mode === (mode ?? "web");
-        // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
-        // change falls through to a rebuild below), but every delegation turn gets a NEW
-        // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
-        // it is the SAME object we store here (agent-factory passes it by reference), so an
-        // in-place update makes report_findings / request_input stamp the CURRENT call's id
-        // instead of the previous one — no rebuild needed, conversation preserved.
-        //
-        // ONLY when the session is idle: a concurrent continuation targeting the SAME busy
-        // peer session is rejected with 409 by the HTTP layer AFTER this getOrCreate returns
-        // — mutating the shared context first would stamp the running turn's later
-        // report_findings/request_input with the REJECTED request's id. The gate MUST match
-        // the 409 condition exactly (`!_promptDone || _promptInflight`): `_promptInflight`
-        // can be set while `_promptDone` is momentarily true during synthetic-parent-prompt
-        // setup (background-job completion turn), so check both.
-        if (sameDelegation && existing._promptDone && !existing._promptInflight && existing.delegation && delegation) {
-          existing.delegation.delegationId = delegation.delegationId;
-          existing.delegation.parentSessionId = delegation.parentSessionId;
-          existing.delegation.parentAgentId = delegation.parentAgentId;
-        }
         if (
-          (existing.activeMode === activeMode && sameDelegation && sameInputCapability && !needsUserIdentityRebuild) ||
+          (existing.activeMode === activeMode && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
           existing._promptInflight
         ) {
           return existing;
         }
         console.log(
-          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
         );
         await this.releaseForRebuild(id, existing);
       }
@@ -3429,35 +3392,10 @@ export class AgentBoxSessionManager {
     // full pod/process restart from the PV snapshot. taskListId == session id.
     this.rehydrateLedger(id);
 
-    // Delegation roster (coordinator side): the peer agents this agent may
-    // delegate to, delivered from the gateway (K8s boxes have no DB). Skipped on
-    // a delegated turn (a peer can't re-delegate — one-level). Best-effort: a
-    // fetch failure just means the delegate_to_agent tool stays hidden.
-    let delegationRoster: DelegateRosterMember[] | undefined;
     const gc = this.gatewayClient;
-    if (gc && !delegation) {
-      // Retry once on a transient failure: a single fetch miss would otherwise hide
-      // the whole delegate_to_agent tool for this session's lifetime. (The reverse
-      // coordinator-invalidation path refreshes on member changes, but that can't help
-      // a coordinator whose FIRST fetch failed — hence the immediate retry here.)
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const r = await gc.fetchDelegates();
-          delegationRoster = r.members?.length ? r.members : undefined;
-          break;
-        } catch (err) {
-          console.warn(`[agentbox-session] fetchDelegates failed for ${id} (attempt ${attempt + 1}):`, err);
-        }
-      }
-    }
-    // Handoff destinations: the agents this one may transfer the conversation
-    // to. Same delivery as the delegation roster (K8s boxes have no DB) and the
-    // same degradation — a fetch miss just means transfer_to_agent stays hidden
-    // and this agent answers the turn itself, which is a worse answer but not a
-    // broken one. Skipped on a delegated turn: a peer has no standing to dispose
-    // of the coordinator's session.
+    // Load the authorized handoff index from the control plane.
     let handoffTargets: HandoffTarget[] | undefined;
-    if (gc && !delegation) {
+    if (gc) {
       try {
         const r = await gc.fetchHandoffTargets();
         handoffTargets = r.targets?.length ? r.targets : undefined;
@@ -3465,65 +3403,7 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
       }
     }
-    const delegateToAgentExecutor: DelegateToAgentExecutor | undefined = (gc && delegationRoster)
-      ? async (req, onProgress, signal) => {
-          // Translate the peer's live event stream into coordinator-card steps
-          // (same shape spawn_subagent uses), pushing progress as they arrive.
-          const steps: DelegateStep[] = [];
-          let toolCalls = 0;
-          // Match the main window: the command + args arrive on tool_execution_start
-          // (kept by call id), the result on tool_execution_end; assistant reasoning
-          // on message_end. Build the same {assistant|tool} step shape the card renders.
-          const pending = new Map<string, { toolName?: string; args?: unknown }>();
-          let childSessionId: string | undefined;
-          return gc.delegateStream(
-            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId, evidenceRefs: req.evidenceRefs },
-            (evt) => {
-              const e = evt as any;
-              const t = String(e?.type ?? "");
-              if (t === "delegate_session") {
-                // Peer session id known at start → surface it live so the card can
-                // offer "open full session" immediately.
-                childSessionId = e.peerSessionId ? String(e.peerSessionId) : undefined;
-                onProgress?.({ toolCalls, steps: [...steps], childSessionId });
-                return;
-              }
-              if (t === "tool_execution_start") {
-                if (e.toolCallId) pending.set(String(e.toolCallId), { toolName: e.toolName, args: e.args });
-                return;
-              }
-              if (t === "tool_execution_end") {
-                const meta = e.toolCallId ? pending.get(String(e.toolCallId)) : undefined;
-                const toolName = meta?.toolName ?? e.toolName;
-                const args = meta?.args;
-                const resultText = (e.result?.content ?? [])
-                  .filter((c: { type?: string }) => c.type === "text")
-                  .map((c: { text?: string }) => c.text ?? "").join("").slice(0, 2000);
-                toolCalls++;
-                steps.push({
-                  kind: "tool",
-                  toolName,
-                  toolInput: args !== undefined ? (typeof args === "string" ? args : JSON.stringify(args)) : undefined,
-                  content: resultText,
-                  outcome: e.isError ? "error" : "success",
-                  durationMs: typeof e.durationMs === "number" ? e.durationMs : null,
-                });
-                onProgress?.({ toolCalls, steps: [...steps], activity: toolName ? `Ran ${toolName}` : undefined, childSessionId });
-                return;
-              }
-              if (t === "message_end" && e.message?.role === "assistant") {
-                const content: Array<{ type?: string; text?: string; thinking?: string }> = e.message.content ?? [];
-                const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim()
-                  || content.filter((c) => c.type === "thinking").map((c) => c.thinking ?? "").join("").trim();
-                if (text) { steps.push({ kind: "assistant", text }); onProgress?.({ toolCalls, steps: [...steps], activity: text.slice(0, 80), childSessionId }); }
-              }
-            },
-            signal,
-          );
-        }
-      : undefined;
-
-    const scriptInfo = effectiveMode === "web" && !delegation && gc ? await gc.scriptSandboxInfo() : undefined;
+    const scriptInfo = effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
     const result = await createSiclawSession({
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
@@ -3548,17 +3428,8 @@ export class AgentBoxSessionManager {
       // platform template so safety/mode rules and dynamic context continue to
       // be assembled by agent-factory.
       systemPromptTemplate: undefined,
-      // Delegated read-only turn: gate the toolset (agent-factory filters to
-      // readOnlyDelegable + read file tools) and prepend the worker persona so
-      // the model knows to end with report_findings.
-      delegation,
-      // Built-in types compile their immutable contract plus this persisted
-      // Agent addendum. A delegated peer keeps its OWN contract — being called
-      // by a coordinator does not change who it is.
+      // Use the Agent-owned prompt addendum.
       systemPromptAppend: systemPromptTemplate,
-      // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
-      delegationRoster,
-      delegateToAgentExecutor,
       // Keep an internal target index; discover matching coverage on demand.
       handoffTargets,
       searchHandoffTargets: gc ? query => gc.searchHandoffTargets(query) : undefined,
@@ -3627,7 +3498,6 @@ export class AgentBoxSessionManager {
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
       activeMode,
-      delegation,
       allowInputRequest,
       handoffSupported,
       handoffPolicy,

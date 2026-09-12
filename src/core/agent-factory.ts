@@ -70,7 +70,7 @@ import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 
 import { allowsBackgroundExec } from "./background-execution-policy.js";
-import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
+import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
@@ -82,18 +82,6 @@ export interface CreateSiclawSessionOpts {
   activeMode?: AgentMode;
   /** True when building a spawned sub-agent (child) — hides the plan/task tools. */
   isSubagent?: boolean;
-  /**
-   * Present when this turn was delegated by a coordinator agent over the mesh.
-   * When `readOnly`, the resolved toolset is filtered to read-only-delegable tools
-   * (registry `readOnlyDelegable` + read file tools), so a delegated worker cannot
-   * write/remediate. See docs/design/agent-delegation.md §8.
-   */
-  delegation?: DelegationContext;
-  /** Coordinator side: peer agents this agent may delegate to (manifest for the
-   *  delegate_to_agent tool). Non-empty + executor → the tool is exposed. */
-  delegationRoster?: import("./tool-registry.js").ToolRefs["delegationRoster"];
-  /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
-  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /** Facade / backend side: agents this one may HAND the conversation to
    *  (internal index only). Non-empty plus a search executor exposes discovery and transfer. */
   handoffTargets?: import("./tool-registry.js").ToolRefs["handoffTargets"];
@@ -437,10 +425,9 @@ export async function createSiclawSession(
     mode,
     agentPrompt: opts?.systemPromptAppend,
     systemPromptTemplate: opts?.systemPromptTemplate,
-    delegation: opts?.delegation,
     handoffPolicy: opts?.handoffPolicy,
-    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
-    interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
+    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent),
+    interactiveProgress: mode === "web" && !opts?.isSubagent,
   });
   const allowedTools = compiledContext.harness.allowedTools;
   const memoryEnabled = compiledContext.harness.memoryEnabled;
@@ -569,8 +556,7 @@ export async function createSiclawSession(
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       // Channels currently deliver one foreground response. Do not advertise
       // background launches until they support an owned, resumable delivery lifecycle.
-      // Delegated peers retain foreground subagents for their synchronous result contract.
-      foregroundSubagentOnly: mode === "channel" || opts?.delegation != null,
+      foregroundSubagentOnly: mode === "channel",
       // The tier menu this session will advertise. Passed in rather than read from
       // box state because the tool schema is built HERE, once: the menu the lead is
       // shown has to be the one its choice is later resolved against.
@@ -580,9 +566,6 @@ export async function createSiclawSession(
         ? opts.backgroundExecExecutor : undefined,
       taskOutputReader: opts?.taskOutputReader,
       channelMessageExecutor: opts?.channelMessageExecutor,
-      delegation: opts?.delegation,
-      delegationRoster: opts?.delegationRoster,
-      delegateToAgentExecutor: opts?.delegateToAgentExecutor,
       handoffTargets: opts?.handoffTargets,
       searchHandoffTargets: opts?.searchHandoffTargets,
       handoffSearchMatches: new Map(),
@@ -626,8 +609,8 @@ export async function createSiclawSession(
   // Sandbox-only agents use the reviewed broker; the harness gate and artifact
   // recovery remain in effect for every other MCP selection.
   // Configured MCP tools are orthogonal to the built-in `allowedTools`
-  // whitelist, but they are NOT exempt from the Agent harness: unresolved and
-  // delegated-read-only contexts never initialize or append them. In a scoped
+  // whitelist, but they are NOT exempt from the Agent harness: unresolved
+  // contexts never initialize or append them. In a scoped
   // AgentBox/Portal session the config already contains that Agent's resource
   // bindings; standalone config is the user's explicit settings.json selection.
   // Dynamic MCP tool names cannot be enumerated in static capability groups.

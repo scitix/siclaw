@@ -132,23 +132,16 @@ afterEach(async () => {
 });
 
 describe("startRuntime — chat.send custom system prompt", () => {
-  it("does not duplicate a pre-created cross-Runtime delegation session or user row", async () => {
+  it("rejects retired delegation before creating or prompting a session", async () => {
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;
-
-    await send({
-      agentId: "peer",
-      userId: "u",
-      text: "delegated task",
-      sessionId: "delegated-session",
-      skipInitialPersistence: true,
-      delegation: { delegationId: "d1", parentAgentId: "coord", readOnly: false },
-    }, { sendEvent: vi.fn() });
-    await waitFor(() => promptCalls.length > 0);
-
+    for (const legacy of [{ delegation: { delegationId: "d1" } }, { origin: "delegation" }]) {
+      await expect(send({ agentId: "peer", userId: "u", text: "old request", sessionId: "retired", ...legacy },
+        { sendEvent: vi.fn() })).rejects.toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
+    }
+    expect(promptCalls).toHaveLength(0);
     expect(chatRepo.ensureChatSession).not.toHaveBeenCalled();
     expect(chatRepo.appendMessage).not.toHaveBeenCalled();
-    expect(chatRepo.incrementMessageCount).not.toHaveBeenCalled();
   });
 
   it("uses an explicitly forwarded systemPrompt as-is (portal-standalone) and skips the lookup", async () => {

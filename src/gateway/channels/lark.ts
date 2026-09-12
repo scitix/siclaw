@@ -3331,7 +3331,7 @@ export async function collectChannelResponse(
       // groups instead report via group_progress, not this SSE.)
       const progressToolName = ev.toolName || ev.name || progressToolNames.get(ev.toolCallId);
       if (ev.type === "tool_execution_update" && (options.onMilestone || options.onActivity)
-          && (!progressToolName || progressToolName === "spawn_subagent" || progressToolName === "delegate_to_agent")) {
+          && (!progressToolName || progressToolName === "spawn_subagent")) {
         const items = Array.isArray(ev.partialResult?.details?.items) ? ev.partialResult.details.items : null;
         let milestone = "";
         if (items) {

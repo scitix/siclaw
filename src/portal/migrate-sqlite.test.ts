@@ -1,3 +1,5 @@
+import { resolveCapabilities, parseToolCapabilitiesAtBoundary } from "../core/tool-capabilities.js";
+import { effectiveCapabilityKeys } from "../core/agent-types.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initDb, closeDb, getDb } from "../gateway/db.js";
 import { runPortalMigrations } from "./migrate.js";
@@ -10,6 +12,50 @@ describe("runPortalMigrations on SQLite :memory:", () => {
 
   afterEach(async () => {
     await closeDb();
+  });
+
+  it("retires peer rosters idempotently and preserves historical transcripts", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    await db.query("CREATE TABLE agent_delegates (coordinator_agent_id TEXT, member_agent_id TEXT)");
+    await db.query("INSERT INTO agents (id, name, agent_type) VALUES ('old', 'Old', 'coordinator'), ('current', 'Current', 'sre')");
+    await db.query("INSERT INTO agent_delegates VALUES ('old', 'current')");
+    await db.query("INSERT INTO chat_sessions (id, user_id, agent_id, origin, delegation_id) VALUES ('history', 'u', 'old', 'delegation', 'leg')");
+    await runPortalMigrations();
+    await runPortalMigrations();
+    const [agents] = await db.query("SELECT id, agent_type, status FROM agents ORDER BY id");
+    expect(agents).toEqual([{ id: "current", agent_type: "sre", status: "active" }, { id: "old", agent_type: "coordinator", status: "disabled" }]);
+    const [sessions] = await db.query("SELECT id, delegation_id FROM chat_sessions WHERE id = 'history'");
+    expect(sessions).toEqual([{ id: "history", delegation_id: "leg" }]);
+    const [roster] = await db.query("SELECT name FROM sqlite_master WHERE name = 'agent_delegates'");
+    expect(roster).toEqual([]);
+  });
+
+  it("cleans retired capability keys after an earlier upgrade without broadening access", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const cases: [string, string | null, string | null][] = [
+      ["only", '["delegate_agents"]', '["no_tools"]'],
+      ["mixed", '["read_files","delegate_agents","delegate_agents"]', '["read_files"]'],
+      ["empty", '[]', '[]'], ["unrestricted", null, null],
+      ["future", '["future_capability"]', '["future_capability"]'],
+      ["malformed", 'delegate_agents invalid JSON', 'delegate_agents invalid JSON'],
+    ];
+    for (const [id, value] of cases) {
+      await db.query("INSERT INTO agents (id, name, tool_capabilities) VALUES (?, ?, ?)", [id, id, value]);
+    }
+    await runPortalMigrations();
+    await runPortalMigrations();
+    for (const [id, , expected] of cases) {
+      const [rows] = await db.query<any[]>("SELECT tool_capabilities FROM agents WHERE id = ?", [id]);
+      expect(rows[0].tool_capabilities).toBe(expected);
+      if (id === "only" || id === "mixed" || id === "empty" || id === "unrestricted") {
+        const allowed = resolveCapabilities(effectiveCapabilityKeys("custom", parseToolCapabilitiesAtBoundary(rows[0].tool_capabilities)));
+        if (id === "only") expect(allowed).toEqual([]);
+        else if (id === "mixed") expect(allowed).toEqual(resolveCapabilities(["read_files"]));
+        else expect(allowed).toBeNull();
+      }
+    }
   });
 
   it("creates all 34 tables without error", async () => {
@@ -96,7 +142,6 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_skills_overlay",
       "idx_skills_org_name",
       "idx_hosts_jump",
-      "idx_agent_delegates_member",
     ];
 
     await runPortalMigrations();

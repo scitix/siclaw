@@ -18,6 +18,7 @@ import { getDb } from "../gateway/db.js";
 import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull, setColumnDefault } from "./migrate-compat.js";
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 import type { Db } from "../gateway/db.js";
+import { removeRetiredCapabilityKeys } from "../core/tool-capabilities.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
   // Users (simple auth, no org/RBAC)
@@ -100,17 +101,6 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_ah_host FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
   )`,
 
-  // Delegation roster: which peer agents a coordinator agent is authorized to
-  // delegate to (agent-to-agent delegation). Membership IS the authorization
-  // (config-time, not derived). Both columns reference agents(id); a delete of
-  // either side cascades the roster row. Mirrors agent_clusters/agent_hosts.
-  `CREATE TABLE IF NOT EXISTS agent_delegates (
-    coordinator_agent_id CHAR(36) NOT NULL,
-    member_agent_id CHAR(36) NOT NULL,
-    PRIMARY KEY (coordinator_agent_id, member_agent_id),
-    CONSTRAINT fk_ad_coordinator FOREIGN KEY (coordinator_agent_id) REFERENCES agents(id) ON DELETE CASCADE,
-    CONSTRAINT fk_ad_member FOREIGN KEY (member_agent_id) REFERENCES agents(id) ON DELETE CASCADE
-  )`,
 
   // Skills + MCP servers must be created BEFORE their junction tables below,
   // otherwise CREATE TABLE agent_skills / agent_mcp_servers fails on MySQL with
@@ -617,9 +607,6 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_repo", "repo_id, created_at");
   // hosts jump chain reverse lookup
   await ensureIndex(db, "hosts", "idx_hosts_jump", "jump_host_id");
-  // agent_delegates reverse lookup (who may delegate to this member) — the PK
-  // already covers the forward (coordinator → members) direction.
-  await ensureIndex(db, "agent_delegates", "idx_agent_delegates_member", "member_agent_id");
 }
 
 export async function runPortalMigrations(): Promise<void> {
@@ -779,6 +766,25 @@ export async function runPortalMigrations(): Promise<void> {
   // Data backfill (safe to run repeatedly).
   await db.query("UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'");
   await db.query("UPDATE skills SET is_builtin = 1 WHERE created_by = 'system' AND is_builtin = 0");
+
+  await db.query("UPDATE agents SET status = 'disabled' WHERE agent_type = ? AND status <> 'disabled'", ["coordinator"]);
+  await db.query("DROP TABLE IF EXISTS agent_delegates");
+
+  // Repeatable data cleanup also repairs installs that already ran retirement.
+  // Parse in JS so malformed legacy TEXT and both SQL dialects remain safe.
+  const [capabilityRows] = await db.query<Array<{ id: string; tool_capabilities: string }>>(
+    "SELECT id, tool_capabilities FROM agents WHERE tool_capabilities LIKE ?", ["%delegate_agents%"],
+  );
+  for (const row of capabilityRows) {
+    let keys: unknown;
+    try { keys = JSON.parse(row.tool_capabilities); } catch { continue; }
+    if (!Array.isArray(keys) || !keys.every((key) => typeof key === "string") || !keys.includes("delegate_agents")) continue;
+    // Both [] and null group selections are unrestricted. If nothing remains,
+    // use ["no_tools"] so resolution still grants no built-in capabilities.
+    const cleaned = JSON.stringify(removeRetiredCapabilityKeys(keys));
+    await db.query("UPDATE agents SET tool_capabilities = ? WHERE id = ? AND tool_capabilities = ?",
+      [cleaned, row.id, row.tool_capabilities]);
+  }
 
   console.log("[portal-migrate] All tables ready");
 }

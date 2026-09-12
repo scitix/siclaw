@@ -787,7 +787,7 @@ interface ToolsPayload {
   subagentTierMenu?: unknown;
 }
 
-const VALID_AGENT_TYPES = new Set(["sre", "coordinator", "knowledge_qa", "product_support", "custom"]);
+const VALID_AGENT_TYPES = new Set(["sre", "knowledge_qa", "product_support", "custom"]);
 
 /**
  * Minimal structural target the tools handler writes to. Deliberately NOT the

@@ -10,9 +10,8 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { MCP_TOOL_PREFIX } from "./mcp-client.js";
 import type {
-  SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
+  SessionMode, KubeconfigRef, MemoryRef, DpStateRef,
 } from "./types.js";
-import type { DelegateResponse, DelegateRosterMember, DelegateStep } from "../shared/agent-delegate.js";
 import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
@@ -391,35 +390,6 @@ export interface BackgroundExecWiring {
  */
 export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
-/** Live progress of a delegated turn, emitted as the peer streams. Mirrors the
- *  spawn_subagent progress shape so the coordinator card updates identically. */
-export type { DelegateStep };
-
-/** Live progress of a delegated turn. */
-export interface DelegateProgress {
-  toolCalls: number;
-  steps: DelegateStep[];
-  activity?: string;
-  /** The peer session id, known from delegation start — lets the card show the
-   *  "open full session" affordance live (before the final result arrives). */
-  childSessionId?: string;
-}
-
-/**
- * Delegates a bounded read-only task to a PEER agent (its own box, reached via
- * the gateway) and resolves with the peer's final result. `onProgress` fires as
- * the peer streams (live steps), so the caller can render the peer's work in
- * real time. Injected per-session from agentbox (which holds the gatewayClient).
- * Absent → the `delegate_to_agent` tool stays out of the resolved tool list.
- */
-export type DelegateToAgentExecutor = (
-  req: { peerAgentId: string; text: string; peerSessionId?: string; evidenceRefs?: string[] },
-  onProgress?: (p: DelegateProgress) => void,
-  /** Aborts the delegation when the coordinator's turn is stopped: closes the
-   *  relay stream and cancels the peer's turn. */
-  signal?: AbortSignal,
-) => Promise<DelegateResponse>;
-
 /** All dependencies shared by tool factory functions. */
 export interface ToolRefs {
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
@@ -457,7 +427,7 @@ export interface ToolRefs {
   sessionEventEmitter?: SessionEventEmitter;
   /**
    * Explicitly exposes `request_input` for a top-level machine-driven turn
-   * (currently A2A). Delegated peer turns use `delegation` instead.
+   * (currently A2A).
    */
   allowInputRequest?: boolean;
   /** Control plane owns this logical turn and will dispatch authorized handoffs. */
@@ -505,33 +475,11 @@ export interface ToolRefs {
   /** Sends an agent-selected visible update to the active IM channel; Gateway owns delivery policy. */
   channelMessageExecutor?: ChannelMessageExecutor;
   /**
-   * Present when this turn was delegated by a coordinator agent to a peer,
-   * siclaw-native via the gateway's internal delegate API. Its presence marks a
-   * delegated turn; `readOnly` drives the read-only
-   * tool filter in `resolve()`. Tools use it to gate visibility (report_findings
-   * appears only when delegated; channel_update is suppressed) and to stamp the
-   * result artifact with `delegationId`. See docs/design/agent-delegation.md.
-   */
-  delegation?: DelegationContext;
-  /**
-   * Delegation roster for a COORDINATOR agent: the peer agents it may delegate
-   * to, with derived manifest (name/description/bindings). Non-empty + an
-   * executor present → the `delegate_to_agent` tool is exposed and its
-   * description lists these peers. Delivered from the gateway (K8s boxes have no
-   * DB). See docs/design/agent-delegation.md §5.
-   */
-  delegationRoster?: DelegateRosterMember[];
-  /** Runs a delegation to a peer agent. See DelegateToAgentExecutor. */
-  delegateToAgentExecutor?: DelegateToAgentExecutor;
-  /**
    * The agents this one may HAND THE CONVERSATION OVER to — its backends if it
    * is a facade, its facade plus siblings if it is a backend. Non-empty exposes
    * `search_handoff_targets` and `transfer_to_agent`; the index stays outside model context. Empty (an ordinary
    * agent, or a fetch that failed) means the tool never appears, which is the
    * right degradation: this agent then answers the turn itself.
-   *
-   * Distinct from `delegationRoster` on purpose — a handoff moves ownership of
-   * the session, a delegation calls out and comes back. See agent-handoff.ts.
    */
   handoffTargets?: HandoffTarget[];
   searchHandoffTargets?: (query: import("../shared/agent-handoff.js").HandoffSearchQuery) => Promise<import("../shared/agent-handoff.js").HandoffSearchResponse>;
@@ -571,8 +519,8 @@ export interface ToolEntry {
   /**
    * Runtime permission metadata.
    *
-   * Use for tools that can branch work, spend meaningful resources, or delegate
-   * to another agent. The registry only annotates the ToolDefinition; execution
+   * Use for tools that can branch work, spend meaningful resources, or create
+   * subagents. The registry only annotates the ToolDefinition; execution
    * gating is owned by the session/runtime layer so existing tools keep their
    * behavior until such a wrapper is installed.
    */
@@ -632,7 +580,7 @@ export class ToolRegistry {
   }): ResolvedToolDefinition[] {
     const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // 1. session-mode + operating-mode + delegation + available check (create not called yet)
+    // 1. session-mode + operating-mode + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&

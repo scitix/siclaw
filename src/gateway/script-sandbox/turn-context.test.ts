@@ -21,7 +21,7 @@ it.each([undefined, "", "api", "a2a", "task", "channel"])("never borrows a saved
   other();
 });
 
-it("refuses ambiguous users and delegated turns without confusing independent sessions", () => {
+it("refuses ambiguous users without confusing independent sessions", () => {
   const context = new SandboxTurnContext();
   const owner = context.enter("s", "a", "owner", "web");
   const attacker = context.enter("s", "a", "attacker", "web");
@@ -31,8 +31,6 @@ it("refuses ambiguous users and delegated turns without confusing independent se
   owner();
   expect(context.user("s", "a")).toBe("");
   attacker();
-  context.enter("s", "a", "owner", "web", true);
-  expect(context.user("s", "a")).toBe("");
 });
 
 it("replaces a same-user Web executor despite overlapping handoff terminal cleanup", () => {
@@ -57,11 +55,11 @@ it("never restores the replaced executor if the new turn finishes first", () => 
   source();
 });
 
-it.each([["attacker", "web", false], ["u", "api", false], ["u", "web", true]] as const)(
-  "does not let an agent switch clear a rejected %s/%s/delegated=%s entry", (user, origin, delegated) => {
+it.each([["attacker", "web"], ["u", "api"]] as const)(
+  "does not let an agent switch clear a rejected %s/%s entry", (user, origin) => {
     const context = new SandboxTurnContext();
     const source = context.enter("s", "a", "u", "web");
-    const rejected = context.enter("s", "b", user, origin, delegated);
+    const rejected = context.enter("s", "b", user, origin);
     rejected();
     const target = context.enter("s", "c", "u", "web");
     source();

@@ -1,3 +1,4 @@
+import { AgentRetiredError } from "../../shared/agent-retirement.js";
 import { DISPATCH_WINDOW_MS } from "../../script-sandbox/budgets.js";
 import { createHash } from "node:crypto";
 import { LocalScriptTraffic, type ScriptTrafficAdmission } from "../../script-sandbox/traffic.js";
@@ -91,6 +92,7 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
       return remaining;
     };
     const agent = await this.controlPlane.request("config.getAgent", { agentId: p.agentId }, budget(5000)) as any;
+    if (agent?.agent_type === "coordinator") throw new AgentRetiredError();
     if (!agent || agent.status !== "active") throw new ScriptSandboxError("Sandbox authorization denied", 403);
     const tools = resolveCapabilities(effectiveCapabilityKeys(normalizeAgentType(agent.agent_type), agent.tool_capabilities ?? null));
     if (tools !== null && (!tools.includes("run_script") || (requiredTool !== undefined && !tools.includes(requiredTool)))) throw new ScriptSandboxError("Sandbox capability denied", 403);

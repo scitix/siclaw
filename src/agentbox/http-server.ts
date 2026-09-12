@@ -1,3 +1,4 @@
+import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
 import { SandboxToolError } from "../script-sandbox/errors.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
@@ -18,7 +19,7 @@ import { isAuthenticatedRuntime } from "./runtime-auth.js";
 import { record } from "../script-sandbox/validation.js";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager, ManagedSession } from "./session.js";
-import type { SessionMode, OriginKind, DelegationContext } from "../core/types.js";
+import type { SessionMode, OriginKind } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
 import { loadConfig, resolveTracingEnvironment } from "../core/config.js";
 import type { SiclawConfig } from "../core/config.js";
@@ -95,10 +96,8 @@ interface PromptRequestBody {
   userId?: string;
   text?: string;
   mode?: SessionMode;
-  /** Entry-form of this prompt (audit + delegation read-only hardening). */
+  /** Entry-form of this prompt (audit categorization). */
   origin?: OriginKind;
-  /** Present when a coordinator agent delegated this turn over the mesh. */
-  delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
   /** Control plane owns this logical turn and will dispatch authorized handoffs. */
@@ -483,33 +482,6 @@ function resolveActiveMode(
   if (!sessionId) return "normal";
   if (sessionManager.get(sessionId)?.dpStateRef?.active === true) return "dp";
   return sessionManager.getPersistedDpState(sessionId)?.active === true ? "dp" : "normal";
-}
-
-/**
- * Normalize the incoming delegation marker. Returns undefined for a
- * non-delegated turn (no behavioural change).
- *
- * A delegated agent runs under ITS OWN configuration — the coordinator and the
- * worker manage their own permissions independently, so delegation does NOT
- * downgrade the worker's toolset or persona, and there is no dial here that
- * could. The marker's jobs are the result-artifact contract, one-level
- * anti-recursion, and audit.
- */
-export function resolveDelegation(
-  delegation: DelegationContext | undefined,
-  _origin: OriginKind | undefined,
-): DelegationContext | undefined {
-  if (!delegation || !delegation.delegationId) return undefined;
-  // Built field by field, NOT spread: this marker arrives in the request body,
-  // so a spread would let a caller smuggle through any property the type gains
-  // later — including one meant to modulate the peer. There is no such property
-  // today and there should not be one; constructing explicitly is what keeps
-  // that true without anyone having to remember it.
-  return {
-    delegationId: delegation.delegationId,
-    ...(delegation.parentSessionId ? { parentSessionId: delegation.parentSessionId } : {}),
-    ...(delegation.parentAgentId ? { parentAgentId: delegation.parentAgentId } : {}),
-  };
 }
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -939,7 +911,7 @@ export function createHttpServer(
           typeof body.session_id !== "string" || typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token)) throw new Error();
       const managed = sessionManager.get(body.session_id);
       const invocations = sessionManager.gatewayClient?.sandboxInvocations;
-      if (!managed || managed.mode !== "web" || managed.delegation || !invocations) throw new Error();
+      if (!managed || managed.mode !== "web" || !invocations) throw new Error();
       const { executeSandboxBuiltin } = await import("./sandbox-tools.js");
       const approval = body.approval as unknown as import("../shared/sandbox-tool-types.js").SandboxBuiltinApproval;
       if (!Number.isSafeInteger(approval.deadlineMs) || Number(approval.deadlineMs) <= Date.now()) throw new Error();
@@ -988,9 +960,10 @@ export function createHttpServer(
     }
 
     const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
-    // A delegated agent runs under its own configuration; delegation does not
-    // downgrade it.
-    const delegation = resolveDelegation(body.delegation, body.origin);
+    if ((body as Record<string, unknown>).delegation || String(body.origin) === "delegation") {
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
+      return;
+    }
     // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
     // dispatch in process memory only, so after a Runtime restart the same turn
     // would execute twice. This box ran it and outlived that Runtime, so it is
@@ -1022,7 +995,6 @@ export function createHttpServer(
       body.mode,
       body.systemPromptTemplate,
       activeMode,
-      delegation,
       body.userId,
       body.allowInputRequest === true,
       body.handoffSupported === true,

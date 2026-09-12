@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -137,7 +137,7 @@ describe("credential isolation: only one code path drops to sandbox", () => {
   // matters. The number of IMPLEMENTATIONS is, and it is one.
   it("has exactly one implementation of the drop, in infra/sandbox-exec.ts", () => {
     const files = execSync("git ls-files 'src/**/*.ts'", { cwd: repoRoot, encoding: "utf8" })
-      .split("\n").map((f) => f.trim()).filter((f) => f && !f.endsWith(".test.ts"));
+      .split("\n").map((f) => f.trim()).filter((f) => existsSync(resolve(repoRoot, f))).filter((f) => f && !f.endsWith(".test.ts"));
 
     // Both spellings. The argv form was a blind spot in the previous version of this test: its regex
     // only matched the shell string, so `spawn("sudo", ["-n", "-E", "-u", "sandbox", …])` — which is

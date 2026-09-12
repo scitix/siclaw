@@ -289,12 +289,11 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     await mgr.closeAll();
   });
 
-  it.each(["cli", "channel", "api", "task", "web"] as const)("does not request sandbox metadata for excluded %s sessions", async mode => {
+  it.each(["cli", "channel", "api", "task"] as const)("does not request sandbox metadata for excluded %s sessions", async mode => {
     const mgr = new AgentBoxSessionManager();
     const metadata = vi.fn(async () => ({ enabled: true }));
     mgr.gatewayClient = { scriptSandboxInfo: metadata, runScript: vi.fn() } as any;
-    await mgr.getOrCreate("excluded-sandbox", mode, undefined, "normal",
-      mode === "web" ? { delegationId: "delegated", readOnly: false } : undefined);
+    await mgr.getOrCreate("excluded-sandbox", mode, undefined, "normal");
     expect(metadata).not.toHaveBeenCalled();
     expect(lastCreateSiclawSession.calls[0].scriptExecutor).toBeUndefined();
     expect(lastCreateSiclawSession.calls[0].scriptSandboxInfo).toBeUndefined();
@@ -345,11 +344,11 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
 
   it("rebuilds when top-level request_input availability changes", async () => {
     const mgr = new AgentBoxSessionManager();
-    const first = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, undefined, false);
+    const first = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, false);
     expect(first.allowInputRequest).toBe(false);
     expect(lastCreateSiclawSession.calls[0].allowInputRequest).toBe(false);
 
-    const rebuilt = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, undefined, true);
+    const rebuilt = await mgr.getOrCreate("sess-input", undefined, undefined, "normal", undefined, true);
     expect(rebuilt).not.toBe(first);
     expect(rebuilt.allowInputRequest).toBe(true);
     expect(lastCreateSiclawSession.calls[1].allowInputRequest).toBe(true);
@@ -359,16 +358,16 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const mgr = new AgentBoxSessionManager();
     const fresh = { remaining: 2, visitedAgentIds: ["a"], history: [] };
     const final = { remaining: 0, visitedAgentIds: ["a", "b", "a"], history: [] };
-    const first = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, fresh);
-    const peer = await mgr.getOrCreate("policy-b", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    const first = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, false, true, fresh);
+    const peer = await mgr.getOrCreate("policy-b", "web", undefined, "normal", undefined, false, true, fresh);
     peer._promptInflight = true;
-    const rebuilt = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, final);
+    const rebuilt = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, false, true, final);
     expect(rebuilt).not.toBe(first);
     expect(rebuilt.handoffPolicy?.remaining).toBe(0);
     expect(lastCreateSiclawSession.calls.at(-1).handoffPolicy).toEqual(final);
     expect(peer.handoffPolicy?.remaining).toBe(2);
     expect(peer._promptInflight).toBe(true);
-    const next = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, undefined, false, true, fresh);
+    const next = await mgr.getOrCreate("policy-a", "web", undefined, "normal", undefined, false, true, fresh);
     expect(next).not.toBe(rebuilt);
     expect(next.handoffPolicy?.remaining).toBe(2);
     peer._promptInflight = false;
@@ -394,28 +393,6 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
       { type: "message", message: { role: "user", content: "first turn" } },
     ];
     expect(mgr.hasRestorableSessionContext("persisted")).toBe(true);
-  });
-
-  it("refreshes the delegation correlation id on reuse of an IDLE peer session", async () => {
-    const mgr = new AgentBoxSessionManager();
-    const s1 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d1", readOnly: false });
-    expect(s1.delegation?.delegationId).toBe("d1");
-    expect(s1._promptDone).toBe(true); // idle after build
-    // Same tier (rw), new delegationId → reused in place with the id refreshed, so
-    // report_findings/request_input on the continuation stamp the CURRENT id.
-    const s2 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d2", readOnly: false });
-    expect(s2).toBe(s1);
-    expect(s1.delegation?.delegationId).toBe("d2");
-  });
-
-  it("does NOT mutate the delegation of a BUSY session (concurrent continuation is rejected elsewhere)", async () => {
-    const mgr = new AgentBoxSessionManager();
-    const s1 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d1", readOnly: false });
-    s1._promptDone = false; // a turn is in flight; the HTTP layer will 409 the concurrent continuation
-    const s2 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d2", readOnly: false });
-    expect(s2).toBe(s1); // returned via the !_promptDone reuse branch
-    // The running turn's id must survive — the rejected continuation must not overwrite it.
-    expect(s1.delegation?.delegationId).toBe("d1");
   });
 
   it("cancels a pending release timer when the session is re-requested", async () => {
@@ -451,7 +428,6 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
       "web",
       undefined,
       "normal",
-      undefined,
       "user-from-prompt",
     );
 
@@ -461,29 +437,11 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
 
   it("rejects reusing one resident session for a different user", async () => {
     const mgr = new AgentBoxSessionManager();
-    await mgr.getOrCreate("sess-owned", "web", undefined, "normal", undefined, "alice");
+    await mgr.getOrCreate("sess-owned", "web", undefined, "normal", "alice");
 
     await expect(
-      mgr.getOrCreate("sess-owned", "web", undefined, "normal", undefined, "bob"),
+      mgr.getOrCreate("sess-owned", "web", undefined, "normal", "bob"),
     ).rejects.toThrow(/different user/);
-  });
-
-  // 被委托的 peer 保留它自己的 persona。这里曾经断言相反的事:委托会把 peer 的
-  // prompt 整个换成一段通用的只读替身。那段替身之所以存在,是因为"砍掉写工具但
-  // 留着'去修好它'的 prompt"根本不自洽 —— 而正确的解法是不砍,不是换掉它是谁。
-  it("keeps the peer's OWN persona on a delegated turn", async () => {
-    const mgr = new AgentBoxSessionManager();
-    mgr.agentTypeState = "sre";
-    await mgr.getOrCreate(
-      "sess-delegated",
-      "web",
-      "custom prompt that says to remediate",
-      "normal",
-      { delegationId: "d1" },
-    );
-
-    const opts = lastCreateSiclawSession.calls.at(-1);
-    expect(opts.systemPromptAppend).toContain("custom prompt that says to remediate");
   });
 
   it("defaults mode to 'web' when none supplied", async () => {

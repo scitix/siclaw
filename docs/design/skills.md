@@ -520,7 +520,7 @@ available and can invoke them via `local_script`.
 For scoped Portal/Gateway Agents, the factory passes a `skillsOverride` that
 restricts the visible skill set to the roots selected above. This removes
 user-global skills that the loader would otherwise auto-discover from
-`~/.pi/agent/skills/` or similar. QA, Coordinator, delegated read-only, and
+`~/.pi/agent/skills/` or similar. QA and
 unresolved sessions also disable the repo-bundled operational fallback.
 
 Without the override, the prompt could advertise skills the Agent owner never

@@ -14,14 +14,10 @@ import {
 } from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the five designed types; built-ins lock capabilities and own their runtime contracts", () => {
-    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "knowledge_qa", "product_support", "sre"]);
+  it("has the four designed types; built-ins lock capabilities and own their runtime contracts", () => {
+    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["custom", "knowledge_qa", "product_support", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
-    expect(AGENT_TYPES.coordinator.capabilities).toContain("delegate_agents");
-    expect(AGENT_TYPES.coordinator.capabilities).not.toContain("inspect_infra");
-    expect(AGENT_TYPES.coordinator.capabilities).not.toContain("run_commands");
-    expect(AGENT_TYPES.coordinator.defaultNoSkills).toBe(true);
     expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual(["read_files"]);
     expect(AGENT_TYPES.knowledge_qa.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(true);
@@ -54,18 +50,10 @@ describe("agent-types", () => {
     }
   });
 
-  it("coordinator does not reach for memory (disabled fleet-wide)", () => {
-    // Asserted as structure and as an ABSENCE, so it survives any rewording of
-    // the prompt. The answer/route contract itself lives in
-    // docs/design/coordinator-routing.md — pinning its prose here would only
-    // restate the diff and would break on every future improvement.
-    expect(AGENT_TYPES.coordinator.capabilities).not.toContain("search_memory");
-    expect(AGENT_TYPES.coordinator.defaultPrompt).not.toContain("search_memory");
-  });
-
   it("normalizeAgentType defaults unknown/absent to custom", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
-    expect(normalizeAgentType("coordinator")).toBe("coordinator");
+    expect(() => normalizeAgentType("coordinator")).toThrow("retired");
+    expect(() => requireAgentType("coordinator")).toThrow("retired");
     expect(normalizeAgentType("knowledge_qa")).toBe("knowledge_qa");
     expect(normalizeAgentType("product_support")).toBe("product_support");
     expect(normalizeAgentType("custom")).toBe("custom");
@@ -79,7 +67,6 @@ describe("agent-types", () => {
   });
 
   it("effectiveCapabilityKeys: built-in types override, custom uses own selection", () => {
-    expect(effectiveCapabilityKeys("coordinator", ["run_commands"])).toEqual(AGENT_TYPES.coordinator.capabilities);
     expect(effectiveCapabilityKeys("sre", null)).toEqual(AGENT_TYPES.sre.capabilities);
     expect(effectiveCapabilityKeys("knowledge_qa", ["run_commands"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("product_support", ["run_commands"])).toEqual(["read_files"]);
@@ -88,15 +75,15 @@ describe("agent-types", () => {
   });
 
   it("keeps the compatibility text helper while layering authored specialization", () => {
-    expect(effectiveAgentPrompt("coordinator", "maintainer truth")).toBe("maintainer truth");
-    expect(effectiveAgentPrompt("coordinator", null)).toBe(AGENT_TYPES.coordinator.defaultPrompt);
+    expect(effectiveAgentPrompt("knowledge_qa", "maintainer truth")).toBe("maintainer truth");
+    expect(effectiveAgentPrompt("knowledge_qa", null)).toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("knowledge_qa", "Prefer concise Chinese answers.")).toBe("Prefer concise Chinese answers.");
     expect(effectiveAgentPrompt("knowledge_qa", null)).toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("custom", "custom truth")).toBe("custom truth");
     expect(effectiveAgentPrompt("custom", "")).toBeUndefined();
 
-    expect(resolveAgentPromptLayers("coordinator", "maintainer truth")).toEqual({
-      typeContract: AGENT_TYPES.coordinator.defaultPrompt,
+    expect(resolveAgentPromptLayers("knowledge_qa", "maintainer truth")).toEqual({
+      typeContract: AGENT_TYPES.knowledge_qa.defaultPrompt,
       addendum: "maintainer truth",
     });
     expect(resolveAgentPromptLayers("product_support", "Managed business contract")).toEqual({

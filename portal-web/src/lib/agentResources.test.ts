@@ -13,7 +13,6 @@ function bindings(overrides: Partial<AgentResourceBindingIds> = {}): AgentResour
     mcp_server_ids: [],
     channel_ids: [],
     knowledge_repo_ids: [],
-    delegate_agent_ids: [],
     ...overrides,
   }
 }
@@ -29,17 +28,16 @@ describe("diffAgentResourceBindings", () => {
   it("returns only the resource types that actually changed", () => {
     expect(diffAgentResourceBindings(
       bindings({ cluster_ids: ["c1"], mcp_server_ids: ["m1"] }),
-      bindings({ cluster_ids: ["c1", "c2"], mcp_server_ids: ["m1"], delegate_agent_ids: ["a2"] }),
+      bindings({ cluster_ids: ["c1", "c2"], mcp_server_ids: ["m1"] }),
     )).toEqual({
       cluster_ids: ["c1", "c2"],
-      delegate_agent_ids: ["a2"],
     })
   })
 })
 
 describe("requiresLoadedResourceBindings", () => {
   it("fails closed only on tabs that edit resource bindings", () => {
-    for (const tab of ["skills", "mcp", "knowledge", "resources", "delegates", "channels"]) {
+    for (const tab of ["skills", "mcp", "knowledge", "resources", "channels"]) {
       expect(requiresLoadedResourceBindings(tab)).toBe(true)
     }
     for (const tab of ["basic", "model", "tools", "tasks", "api-keys"]) {
