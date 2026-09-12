@@ -173,7 +173,7 @@ describe("the fixture PAYLOAD is pinned, so cross-repo drift is detectable", () 
    * same way lands on the same string; in Go, unmarshalling into a map and
    * re-marshalling sorts the keys for you.
    */
-  const EXPECTED_PAYLOAD_SHA256 = "de8aa805a00228e637f47d7480940f89361ba35de255ae9e8f76d6c2c31b7e4e";
+  const EXPECTED_PAYLOAD_SHA256 = "3c237cbf0702ed0bd3d7012af1126595329d181d2e8ac101c7db25b844995d13";
 
   it("has not drifted without the digest being updated", () => {
     const actual = crypto.createHash("sha256")

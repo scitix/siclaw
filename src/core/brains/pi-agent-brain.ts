@@ -567,7 +567,9 @@ export class PiAgentBrain implements BrainSession {
   }
 
   registerProvider(name: string, config: Record<string, unknown>): void {
-    this.session.modelRuntime.registerProvider(name, config as any);
+    const { usageIdentity, ...providerConfig } = config;
+    this.session.modelRuntime.registerProvider(name, providerConfig as any);
+    this.llmCalls?.registerUsageIdentity(name, usageIdentity);
   }
 
   /**

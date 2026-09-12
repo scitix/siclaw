@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { UsageEvidence, UsageIdentity, UsageObservation, UsageSink } from "../shared/model-usage.js";
 /**
  * LLM call recorder — measures every provider request at the `streamFn`
  * boundary and stamps the result onto the assistant message as `llmCall`.
@@ -48,6 +50,7 @@ export interface LlmCallUsage {
 
 export interface LlmCallEnvelope {
   v: typeof LLM_CALL_ENVELOPE_VERSION;
+  call_id?: string;
   /** 1-based index of this model call within the prompt. Only `agent` calls consume rounds. */
   round: number;
   /** Model-routing attempt number the call belongs to (1 when routing never switched). */
@@ -105,6 +108,8 @@ interface InFlightCall {
   modelProvider?: string;
   modelId?: string;
   sealedEnvelope?: LlmCallEnvelope;
+  observation?: UsageObservation;
+  evidence?: UsageEvidence;
 }
 
 export interface LlmCallRecorderOptions {
@@ -118,6 +123,7 @@ export interface LlmCallRecorderOptions {
  * boundaries without reaching into the recorder's internals.
  */
 export interface LlmCallPromptBoundary {
+  setUsageSink?(sink: UsageSink): void;
   /** A new prompt was accepted at `receivedAt` (ms epoch). Resets rounds. */
   beginPrompt(receivedAt?: number, opts?: { explicit?: boolean }): void;
   /** The prompt finished (every terminal path). */
@@ -131,6 +137,23 @@ export interface LlmCallPromptBoundary {
 export class LlmCallRecorder implements LlmCallPromptBoundary {
   private readonly now: () => number;
   private readonly warn: (message: string) => void;
+
+  private usageSink?: UsageSink;
+  private usageIdentities = new Map<string, UsageIdentity>();
+  setUsageSink(sink: UsageSink): void { this.usageSink = sink; }
+  registerUsageIdentity(provider: string, value: unknown): void {
+    if (!value || typeof value !== "object") return;
+    const v = value as UsageIdentity;
+    if (!["api", "subscription", "unknown"].includes(v.sourceKind)) return;
+    // Copy only non-secret fields; provider configs also carry credentials.
+    const text = (v: unknown, max: number) => typeof v === "string" ? v.slice(0, max) : "";
+    this.usageIdentities.set(provider, { configId: text(v.configId, 128), name: text(v.name, 200),
+      sourceKind: v.sourceKind, sourceId: text(v.sourceId, 128), sourceName: text(v.sourceName, 200) });
+  }
+  private emitUsage(observation: UsageObservation): void {
+    try { this.usageSink?.record(observation); }
+    catch { this.warn("[model-usage] observation could not be queued"); }
+  }
 
   private promptOpen = false;
   private promptExplicit = false;
@@ -265,7 +288,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
       // layer (child sub-agent, synthetic notify). Rounds still start at 1.
       this.beginPrompt(this.now());
     }
-    return {
+    const call: InFlightCall = {
       kind: Array.isArray(context?.tools) ? "agent" : "aux",
       requestAt: this.now(),
       blocks: [],
@@ -274,6 +297,16 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
       modelProvider: typeof model?.provider === "string" ? model.provider : undefined,
       modelId: typeof model?.id === "string" ? model.id : undefined,
     };
+    if (this.usageSink) {
+      const provider = call.modelProvider ?? "";
+      const identity = this.usageIdentities.get(provider) ?? { configId: "", name: call.modelId ?? "",
+        sourceKind: "unknown" as const, sourceId: "", sourceName: "" };
+      call.observation = { schemaVersion: 1, callId: randomUUID(), phase: "started", ...this.usageSink.context(),
+        requestAt: iso(call.requestAt), kind: call.kind, routingAttempt: this.attempt,
+        model: { ...identity, requestedId: call.modelId ?? "", runtimeProvider: provider } };
+      this.emitUsage(call.observation);
+    }
+    return call;
   }
 
   private wrapStream(stream: any, call: InFlightCall): any {
@@ -327,6 +360,10 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
   }
 
   private observeEvent(call: InFlightCall, event: any): void {
+    const partial = event?.partial ?? event?.message ?? event?.error;
+    if (partial?.providerUsageEvidence) call.evidence = structuredClone(partial.providerUsageEvidence);
+    if (event?.type === "done") this.sealCall(call, event.message);
+    if (event?.type === "error") this.sealCall(call, event.error);
     const type = event?.type;
     if (typeof type !== "string") return;
     const at = this.now();
@@ -472,6 +509,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
 
     const envelope: LlmCallEnvelope = {
       v: LLM_CALL_ENVELOPE_VERSION,
+      ...(call.observation ? { call_id: call.observation.callId } : {}),
       round: 0,
       attempt: this.attempt,
       kind: call.kind,
@@ -494,6 +532,15 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
       tool_call_ids: call.toolCallIds,
     };
     call.sealedEnvelope = envelope;
+    if (call.observation) {
+      const reason = message?.stopReason;
+      this.emitUsage({ ...call.observation, phase: "finished", finishedAt: iso(responseEndAt),
+        outcome: reason === "aborted" ? "cancelled" : reason === "error" ? "error" : reason === "length" ? "incomplete" : "success",
+        finishReason: typeof message?.rawStopReason === "string" ? message.rawStopReason.slice(0, 64) : typeof reason === "string" ? reason.slice(0, 64) : undefined,
+        responseId: typeof message?.responseId === "string" ? message.responseId.slice(0, 256) : undefined,
+        responseModel: typeof message?.responseModel === "string" ? message.responseModel.slice(0, 200) : undefined,
+        usageEvidence: message?.providerUsageEvidence ?? call.evidence });
+    }
 
     if (call.kind === "aux") {
       this.pendingAux.push(envelope);

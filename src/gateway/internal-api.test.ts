@@ -1462,3 +1462,24 @@ describe("handleMetricsFlush", () => {
     expect(errors).toBe(1);
   });
 });
+
+
+describe("model usage persistence ownership", () => {
+  it("forwards owned sessions and acknowledges foreign or unresolved sessions separately", async () => {
+    sessionRegistry.remember("parent-1", "user-1", "agent-1");
+    sessionRegistry.remember("parent-other", "user-2", "agent-2");
+    sessionRegistry.setResolver(async id => id === "parent-other" ? { userId: "user-2", agentId: "agent-2" } : null);
+    frontend.responses.set("usage.recordCalls", { results: [{ callId: "call-own", phase: "started", status: "accepted" }] });
+    const res = new FakeRes();
+    const observations = [{ callId: "call-own", sessionId: "parent-1", phase: "started" },
+      { callId: "call-foreign", sessionId: "parent-other", phase: "started" },
+      { callId: "call-missing", sessionId: "usage-unknown", phase: "started" }];
+    try {
+      await handleDelegationEvents(asReq(new FakeReq(JSON.stringify({ type: "usage.record_calls", batch: { observations } }))), asRes(res), identity, frontend as unknown as FrontendWsClient);
+      expect(res.statusCode).toBe(200);
+      expect(frontend.calls).toHaveLength(1);
+      expect(frontend.calls[0].params.observations).toEqual([observations[0]]);
+      expect(JSON.parse(res.body).usage.results.map((r: any) => r.status)).toEqual(["accepted", "rejected", "retryable"]);
+    } finally { sessionRegistry.setResolver(undefined); }
+  });
+});

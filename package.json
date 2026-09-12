@@ -11,7 +11,9 @@
     "portal-web/dist/",
     "siclaw.mjs",
     "skills/",
-    "settings.example.json"
+    "settings.example.json",
+    "patches/",
+    "scripts/install/"
   ],
   "license": "Apache-2.0",
   "publishConfig": {
@@ -121,6 +123,7 @@
     "docker:push:ocr": "docker push siclaw/siclaw-ocr:latest",
     "docker:push:agentbox": "docker push siclaw/siclaw-agentbox:latest",
     "dev:cli": "tsx src/cli-main.ts",
-    "prebuild": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\""
+    "prebuild": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
+    "postinstall": "node scripts/install/pi-usage-patch.mjs"
   }
 }

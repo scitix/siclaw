@@ -1,3 +1,4 @@
+import type { UsageBatch, UsageBatchResponse } from "./model-usage.js";
 // Type-only import (erased at runtime; src/shared already type-imports from src/core elsewhere,
 // and tool-registry does not import shared → no cycle). Keeps the group item-status snapshot
 // precisely typed on the wire.
@@ -157,6 +158,7 @@ export interface ChannelDeliverMessagePayload {
 }
 
 export type DelegationPersistenceEvent =
+  | { type: "usage.record_calls"; batch: UsageBatch }
   | {
       type: "delegation.ensure_session";
       sessionId: string;
@@ -175,6 +177,7 @@ export type DelegationPersistenceEvent =
   | { type: "channel.deliver_message"; message: ChannelDeliverMessagePayload };
 
 export interface DelegationPersistenceResponse {
+  usage?: UsageBatchResponse;
   ok: boolean;
   id?: string;
 }
