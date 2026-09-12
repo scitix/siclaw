@@ -19,7 +19,7 @@ async function client(handler: http.RequestListener) {
 it("permits authenticated invocation transport on local loopback without mTLS", async () => {
   const c = await client((req, res) => {
     expect(req.url).toBe("/api/internal/sandbox-tool");
-    expect(req.method).toBe("POST"); req.resume(); res.end(JSON.stringify({ text: "ok" }));
+    expect(req.method).toBe("POST"); req.resume(); res.end(JSON.stringify({ protocol: 1, ok: true, result: { text: "ok" } }));
   });
   await expect(c.sandboxTool({ callback_token: "fixture" }, new AbortController().signal)).resolves.toEqual({ text: "ok" });
 });
@@ -32,9 +32,19 @@ it("bounds tool response memory", async () => {
   const c = await client((_req, res) => res.end(JSON.stringify({ text: "a".repeat(4 * 1024 * 1024) })));
   await expect(c.sandboxTool({}, new AbortController().signal)).rejects.toThrow();
 });
+it("treats unstructured HTTP errors as unknown execution, not proof of rejection", async () => {
+  const c = await client((_req, res) => { res.writeHead(403); res.end("upstream proxy failure"); });
+  await expect(c.sandboxTool({}, new AbortController().signal)).rejects.toMatchObject({ execution: "UNKNOWN", retainsCapacity: true });
+});
+it("preserves confirmed failure and cleanup state from the trusted callback", async () => {
+  const c = await client((_req, res) => res.end(JSON.stringify({ protocol: 1, ok: false,
+    code: "CLEANUP_PENDING", execution: "FINISHED", cleanup: "pending", result: { text: "completed output" } })));
+  await expect(c.sandboxTool({}, new AbortController().signal)).rejects.toMatchObject({ execution: "FINISHED", cleanup: "pending",
+    retainsCapacity: true, result: { text: "completed output" } });
+});
 it("transports complete data above the inline preview limit", async () => {
   const text = "node row\n".repeat(30_000);
-  const c = await client((_req, res) => res.end(JSON.stringify({ text })));
+  const c = await client((_req, res) => res.end(JSON.stringify({ protocol: 1, ok: true, result: { text } })));
   await expect(c.sandboxTool({}, new AbortController().signal)).resolves.toEqual({ text });
 });
 it("cancels the HTTP connection while waiting for a tool", async () => {

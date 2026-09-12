@@ -28,7 +28,7 @@ describe("script connectors", () => {
     await expect(new ReadOnlyScriptBroker(rpc, config()).authorize(p(), new AbortController().signal)).rejects.toThrow();
   });
   it("rejects inherited properties and fixed MCP scope overrides", async () => {
-    const c = config(); c.mcpPolicy = { metrics: { query: { fixedArguments: { tenant: "mine" } } } };
+    const c = { ...config() }; c.mcpPolicy = { metrics: { query: { fixedArguments: { tenant: "mine" } } } };
     const rpc = { request: vi.fn() };
     await expect(new ReadOnlyScriptBroker(rpc, c).call(p(), scope, { id: "i", tool: "mcp.call", arguments: { server: "metrics", tool: "query", arguments: { tenant: "other" } } }, new AbortController().signal)).rejects.toThrow();
     expect(rpc.request).not.toHaveBeenCalled();
@@ -70,7 +70,7 @@ describe("script connectors", () => {
       for (const command of ["kubectl get deployments -n allowed -o json", "kubectl logs api -n allowed --tail=100 | grep ERROR"]) {
         const result = await b.call(p(), scope, { id: command, tool: "bash", arguments: { cluster: "prod", command } }, new AbortController().signal);
         expect(result).toEqual({ text: "rows" });
-        expect(builtin).toHaveBeenLastCalledWith(expect.anything(), { cluster: "prod", command }, expect.anything(), expect.objectContaining({ tool: "bash" }));
+        expect(builtin).toHaveBeenLastCalledWith(expect.anything(), { cluster: "prod", command, timeout_seconds: 10 }, expect.anything(), expect.objectContaining({ tool: "bash" }));
       }
       expect(request).not.toHaveBeenCalled();
       expect(rpc.request.mock.calls.filter(c => c[0] === "sandbox.resolve")).toHaveLength(4);

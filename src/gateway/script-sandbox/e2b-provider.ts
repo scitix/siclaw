@@ -27,12 +27,23 @@ export class E2bScriptSandboxProvider implements ScriptSandboxProvider {
     let started!: () => void, failed!: (error: Error) => void;
     const ready = new Promise<void>((resolve, reject) => { started = resolve; failed = reject; });
     let closed: Promise<void> | undefined;
+    let killed = false;
     const close = () => closed ??= (async () => {
       controller.abort();
       signal.removeEventListener("abort", abort);
-      await lease?.close();
-      try { await this.client.kill(instance.id); } finally { complete(null); stdout.destroy(); stderr.destroy(); }
-    })();
+      try {
+        await lease?.close();
+      } finally {
+        try {
+          if (!killed) {
+            for (let attempt = 0; ; attempt++) {
+              try { await this.client.kill(instance.id); killed = true; break; }
+              catch (error) { if (attempt === 2) throw error; }
+            }
+          }
+        } finally { complete(null); stdout.destroy(); stderr.destroy(); }
+      }
+    })().catch(error => { closed = undefined; throw error; });
     const parser = new ScriptFrameParser();
     const stdin = new Writable({ write: (chunk, _encoding, callback) => {
       void (async () => {

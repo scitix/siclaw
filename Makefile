@@ -74,7 +74,9 @@ build-portal-web: ## Compile Portal frontend (Vite)
 # ==================== Docker ====================
 ##@ Docker
 
-docker: docker-runtime docker-agentbox docker-portal docker-ocr docker-kbc ## Build all Docker images
+WITH_SCRIPT_SANDBOX ?= false
+
+docker: docker-runtime docker-agentbox docker-portal docker-ocr docker-kbc $(if $(filter true,$(WITH_SCRIPT_SANDBOX)),docker-script-sandbox) ## Build images (WITH_SCRIPT_SANDBOX=true includes runner)
 
 docker-runtime: ## Build runtime image
 	docker build -f Dockerfile.runtime $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
@@ -94,7 +96,7 @@ docker-ocr: ## Build OCR backend image
 docker-kbc: ## Build KB compile-box image siclaw-kbc-box (spawned per compile run; helm agentbox.compileBoxEnabled derives this tag)
 	docker build -f kbc/platform/pod/Dockerfile $(DOCKER_LABELS) -t $(KBC_IMAGE) .
 
-push: push-runtime push-agentbox push-portal push-ocr push-kbc ## Push all images to registry
+push: push-runtime push-agentbox push-portal push-ocr push-kbc $(if $(filter true,$(WITH_SCRIPT_SANDBOX)),push-script-sandbox) ## Push images (WITH_SCRIPT_SANDBOX=true includes runner)
 
 push-runtime: ## Push runtime image
 	docker push $(RUNTIME_IMAGE)

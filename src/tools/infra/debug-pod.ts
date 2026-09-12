@@ -77,6 +77,7 @@ export function buildDebugJobManifest(
   image: string,
   activeDeadlineSeconds: number,
   nodeName: string,
+  expiresAtMs?: number,
 ): Record<string, unknown> {
   return {
     apiVersion: "batch/v1",
@@ -97,7 +98,11 @@ export function buildDebugJobManifest(
             name: "debug",
             image,
             securityContext: { privileged: true },
-            command: ["sleep", "infinity"],
+            // An absolute stop time also fences Jobs whose controller or scheduler
+            // resumes after the admission lease. Never start a fresh full TTL then.
+            command: expiresAtMs === undefined ? ["sleep", "infinity"] : ["sh", "-c",
+              'remaining=$(( $1 - $(date +%s) )); [ "$remaining" -gt 0 ] && exec sleep "$remaining"',
+              "deadline", String(Math.floor(expiresAtMs / 1000))],
             resources: { limits: DEBUG_POD_RESOURCE_LIMITS },
           }],
         },
@@ -308,10 +313,19 @@ export interface CachedPod {
  */
 export class DebugPodCache {
   private readonly pods = new Map<string, CachedPod>();
+  private readonly owned = new Map<string, Map<string, { env: ExecEnv; namespace: string; nodeName: string }>>();
   private readonly creating = new Map<string, Promise<void>>();
 
   private key(userId: string, clusterKey: string, nodeName: string): string {
     return `${userId}:${clusterKey}:${nodeName}`;
+  }
+
+  /** Cleanup ownership survives cache removal and failed creation replies. */
+  own(userId: string, clusterKey: string, nodeName: string, jobName: string, namespace: string, env: ExecEnv): void {
+    const key = this.key(userId, clusterKey, nodeName);
+    const jobs = this.owned.get(key) ?? new Map();
+    jobs.set(jobName, { env, namespace, nodeName });
+    this.owned.set(key, jobs);
   }
 
   /**
@@ -495,6 +509,7 @@ export class DebugPodCache {
     // do not delete; re-arm so we retry after the next idle window.
     if (entry.refCount > 0) {
       this.armIdle(entry, key);
+      if (confirmCleanup) throw new Error("Diagnostic still has an active owner");
       return;
     }
     clearTimeout(entry.idleTimer);
@@ -528,7 +543,21 @@ export class DebugPodCache {
 
   /** Dispose only the caller-owned diagnostic Job while its credentials still exist. */
   async evictFor(userId: string, clusterKey: string, nodeName: string): Promise<void> {
-    await this.evict(this.key(userId, clusterKey, nodeName), true);
+    const key = this.key(userId, clusterKey, nodeName);
+    const jobs = this.owned.get(key);
+    if (!jobs) { await this.evict(key, true); return; }
+    const cached = this.pods.get(key);
+    if (cached?.refCount) throw new Error("Diagnostic still has an active owner");
+    this.remove(userId, clusterKey, nodeName);
+    try {
+      const results = await Promise.allSettled([...jobs].map(([jobName, handle]) =>
+        deleteDebugJob(jobName, handle.env, { namespace: handle.namespace, nodeName, confirmCleanup: true })));
+      if (results.some(result => result.status !== "fulfilled" || !result.value)) throw new Error("Sandbox diagnostic cleanup unconfirmed");
+    } finally {
+      // The caller disposes its credential snapshot after this bounded attempt.
+      // On failure the Job deadline/quota and retained admission lease remain.
+      this.owned.delete(key);
+    }
   }
 
   /** Evict all cached pods immediately. Used for graceful shutdown. */
@@ -547,6 +576,7 @@ export interface DebugPodSpec {
   /** Trusted infrastructure overrides; never exposed in tool arguments. */
   namespace?: string;
   activeDeadlineSeconds?: number;
+  expiresAtMs?: number;
   confirmCleanup?: boolean;
   userId: string;
   nodeName: string;
@@ -609,17 +639,20 @@ export async function ensureDebugPodReady(
       const debugId = randomBytes(4).toString("hex");
       const jobName = `node-debug-${debugId}`;
       const labels = { ...buildDebugPodLabels(spec.userId, spec.nodeName), [LABEL_DEBUG_ID]: debugId };
+      if (spec.confirmCleanup) debugPodCache.own(spec.userId, clusterKey, spec.nodeName, jobName, debugNamespace, env);
 
       // A Job (not a bare Pod) so the cluster self-cleans it: when the pod hits
       // activeDeadlineSeconds (or its owner is deleted), the Job finishes and
       // ttlSecondsAfterFinished deletes it — no external GC, on every cluster.
       const manifest = JSON.stringify(
-        buildDebugJobManifest(jobName, labels, image, spec.activeDeadlineSeconds ?? config.debugPodTTL, spec.nodeName),
+        buildDebugJobManifest(jobName, labels, image, spec.activeDeadlineSeconds ?? config.debugPodTTL, spec.nodeName, spec.expiresAtMs),
       );
 
       try {
         await ensureDebugNamespace(debugNamespace, env);
 
+        opts.signal?.throwIfAborted();
+        if (spec.expiresAtMs !== undefined && spec.expiresAtMs <= Date.now()) throw new Error("Diagnostic deadline expired");
         await spawnAsync(
           "kubectl",
           [...env.kubeconfigArgs, "-n", debugNamespace, "create", "-f", "-"],

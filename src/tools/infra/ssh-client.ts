@@ -1,3 +1,4 @@
+import { sshEndpoint } from "./ssh-endpoint.js";
 /**
  * SSH client for host_exec / host_script.
  *
@@ -148,7 +149,8 @@ async function acquireSshTargetInner(
     }
   }
 
-  const target: SshTarget = { host: meta.ip, port: meta.port, username: meta.username, auth, name: meta.name };
+  const endpoint = sshEndpoint(meta.ip, meta.port);
+  const target: SshTarget = { host: endpoint.host, port: endpoint.port, username: meta.username, auth, name: meta.name };
 
   if (chain && chain.length > 0) {
     // Server pre-resolved the chain [outermost … nearest]. Nest it onto the
@@ -197,7 +199,8 @@ function chainHopToTarget(
     }
     auth = { type: "password", passwordPath };
   }
-  return { host: hop.meta.ip, port: hop.meta.port, username: hop.meta.username, auth };
+  const endpoint = sshEndpoint(hop.meta.ip, hop.meta.port);
+  return { host: endpoint.host, port: endpoint.port, username: hop.meta.username, auth };
 }
 
 // ── sshExec ─────────────────────────────────────────────────────────

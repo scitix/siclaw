@@ -1,5 +1,6 @@
 import type { ScriptRequest, ScriptToolCall } from "./types.js";
 import { identifier, record } from "./validation.js";
+import { normalizeExecTarget } from "../tools/infra/exec-utils.js";
 
 export type SandboxBuiltinTool = "bash" | "host_exec" | "node_exec" | "pod_exec";
 
@@ -19,7 +20,7 @@ export interface SandboxBuiltinRequest {
 export function resolveSandboxBuiltin(call: ScriptToolCall, scope: ScriptRequest): SandboxBuiltinRequest {
   if (!record(call) || !record(call.arguments)) throw new Error("Invalid sandbox tool request");
   if (!["bash", "host_exec", "node_exec", "pod_exec"].includes(call.tool)) throw new Error("Sandbox tool unavailable");
-  const a = call.arguments;
+  const a = normalizeExecTarget(call.arguments);
   if (call.tool === "host_exec") {
     if (!identifier(a.host) || !scope.hosts?.includes(a.host)) throw new Error("Outside host scope");
   } else {

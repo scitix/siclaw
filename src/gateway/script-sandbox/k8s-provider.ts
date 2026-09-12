@@ -4,6 +4,7 @@ import * as k8s from "@kubernetes/client-node";
 import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { scriptRunnerUid } from "../../script-sandbox/identity.js";
+import { SandboxToolError } from "../../script-sandbox/errors.js";
 import type { ScriptChannel, ScriptSandboxConfig, ScriptSandboxProvider } from "../../script-sandbox/types.js";
 
 export function scriptJob(runId: string, isolated: boolean, seconds: number, config: ScriptSandboxConfig): k8s.V1Job {
@@ -121,6 +122,8 @@ export class K8sScriptSandboxProvider implements ScriptSandboxProvider {
         signal.throwIfAborted();
         const list = await this.core.listNamespacedPod({ namespace, labelSelector: `job-name=${name}` }, apiOptions(signal));
         pod = list.items.find(p => p.metadata?.ownerReferences?.some(o => o.uid === jobUid));
+        if (pod?.status?.containerStatuses?.some(s => ["ErrImagePull", "ImagePullBackOff", "InvalidImageName"].includes(s.state?.waiting?.reason ?? ""))) throw new SandboxToolError("IMAGE_UNAVAILABLE");
+        if (pod?.status?.conditions?.some(c => c.type === "PodScheduled" && c.status === "False" && c.reason === "Unschedulable")) throw new SandboxToolError("RUNNER_CAPACITY");
         if (pod?.status?.containerStatuses?.some(s => s.state?.terminated)) throw new Error("Runner failed before accepting code (check image/isolation support)");
         if (pod?.status?.containerStatuses?.some(s => s.name === "runner" && s.state?.running)) break;
         await delay(100, undefined, { signal });

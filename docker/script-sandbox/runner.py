@@ -10,7 +10,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from siclaw import _atomic_write, _read_message
 
 MAX_FRAME = 256 * 1024
 write_lock = threading.Lock()
@@ -59,13 +63,10 @@ def main():
     input_file = work / "input.json"
     input_file.write_text(json.dumps(frame.get("input")), encoding="utf-8")
     lanes = []
-    pipes = []
     for index in range(10):
-        request_read, request_write = os.pipe()
-        response_read, response_write = os.pipe()
-        lanes.append({"request": request_write, "response": response_read,
-                      "lock": str(work / (".rpc-" + str(index) + ".lock"))})
-        pipes.append((request_read, request_write, response_read, response_write))
+        prefix = work / (".rpc-" + str(index))
+        lanes.append({"request": str(prefix) + ".request", "response": str(prefix) + ".response",
+                      "lock": str(prefix) + ".lock"})
     # No inherited environment, including cloud identity, loader settings or keys.
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -82,14 +83,11 @@ def main():
         command = ["/bin/bash", "--noprofile", "--norc", str(script)]
     child = subprocess.Popen(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             pass_fds=tuple(fd for pipe in pipes for fd in (pipe[1], pipe[2])), start_new_session=True)
-    for pipe in pipes:
-        os.close(pipe[1])
-        os.close(pipe[2])
+                             start_new_session=True)
     failed = threading.Event()
     pending = {}
     occupied = set()
-    pending_lock = threading.Lock()
+    pending_lock = threading.Condition()
 
     def stop():
         try:
@@ -110,22 +108,27 @@ def main():
             failed.set()
             stop()
 
-    def requests(index, request_read):
+    def requests(index):
         try:
-            with os.fdopen(request_read, "rb") as stream:
-                while True:
-                    call = read_frame(stream)
-                    call_id = call.get("id")
-                    if not isinstance(call_id, str) or not 1 <= len(call_id) <= 64:
-                        raise RuntimeError("Invalid request id")
-                    with pending_lock:
-                        if index in occupied or call_id in pending:
-                            raise RuntimeError("SDK channel already occupied")
-                        occupied.add(index)
-                        pending[call_id] = index
-                    emit({"type": "tool", "call": call})
-        except EOFError:
-            return
+            while child.poll() is None:
+                with pending_lock:
+                    if index in occupied:
+                        pending_lock.wait(timeout=0.01)
+                        continue
+                try:
+                    call = _read_message(lanes[index]["request"])
+                except FileNotFoundError:
+                    time.sleep(0.005)
+                    continue
+                call_id = call.get("id")
+                if not isinstance(call_id, str) or not 1 <= len(call_id) <= 64:
+                    raise RuntimeError("Invalid request id")
+                with pending_lock:
+                    if call_id in pending:
+                        raise RuntimeError("Duplicate SDK request")
+                    occupied.add(index)
+                    pending[call_id] = index
+                emit({"type": "tool", "call": call})
         except Exception:
             if child.poll() is None:
                 failed.set()
@@ -133,7 +136,7 @@ def main():
 
     def responses():
         try:
-            while child.poll() is None:
+            while True:
                 response = read_frame(sys.stdin.buffer)
                 if response.get("type") != "tool_result":
                     raise RuntimeError("Unexpected response frame")
@@ -142,13 +145,16 @@ def main():
                     index = pending.pop(value.get("id"), None)
                     if index is None:
                         raise RuntimeError("Unknown response id")
-                    # The client cannot issue its next transaction until the
-                    # response below has been read from this lane's pipe.
-                    occupied.remove(index)
                 data = (json.dumps(value, ensure_ascii=False) + "\n").encode()
-                remaining = memoryview(data)
-                while remaining:
-                    remaining = remaining[os.write(pipes[index][3], remaining):]
+                if len(data) > MAX_FRAME:
+                    raise RuntimeError("Response exceeds limit")
+                # Atomic regular-file delivery cannot block behind a dead reader.
+                # Keep the request occupied until the entire response is visible.
+                _atomic_write(lanes[index]["response"], data)
+                Path(lanes[index]["request"]).unlink(missing_ok=True)
+                with pending_lock:
+                    occupied.remove(index)
+                    pending_lock.notify_all()
         except Exception:
             if child.poll() is None:
                 failed.set()
@@ -157,12 +163,19 @@ def main():
     threads = [threading.Thread(target=output, args=(child.stdout, "stdout"), daemon=True),
                threading.Thread(target=output, args=(child.stderr, "stderr"), daemon=True),
                threading.Thread(target=responses, daemon=True)]
-    threads.extend(threading.Thread(target=requests, args=(index, pipe[0]), daemon=True)
-                   for index, pipe in enumerate(pipes))
+    threads.extend(threading.Thread(target=requests, args=(index,), daemon=True)
+                   for index in range(len(lanes)))
     for thread in threads:
         thread.start()
     exit_code = child.wait()
     stop()  # Descendants must not outlive the foreground script.
+    for thread in threads[3:]:
+        thread.join(timeout=1)
+    # A killed SDK child may have left an accepted operation. Wait for its
+    # terminal reply; the outer run deadline still bounds this drain.
+    with pending_lock:
+        while occupied and not failed.is_set():
+            pending_lock.wait(timeout=0.05)
     for thread in threads[:2]:
         thread.join(timeout=2)
     emit({"type": "exit", "code": exit_code if not failed.is_set() else 125})

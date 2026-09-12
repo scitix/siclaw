@@ -1,4 +1,5 @@
 import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
+import { readSandboxToolError } from "../../script-sandbox/errors.js";
 /**
  * AgentBox HTTP Client
  *
@@ -231,9 +232,13 @@ export class AgentBoxClient {
         res.on("error", () => reject(new SandboxCallbackUncertainError()));
         res.on("end", () => {
           try {
-            if (res.statusCode !== 200) throw new Error();
-            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-          } catch { reject(new Error("Sandbox callback denied or unavailable")); }
+            const envelope = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (envelope?.protocol !== 1) throw new Error();
+            const failure = readSandboxToolError(envelope);
+            if (failure) { reject(failure); return; }
+            if (res.statusCode !== 200 || envelope.ok !== true) throw new Error();
+            resolve(envelope.result);
+          } catch { reject(new SandboxCallbackUncertainError()); }
         });
       });
       req.on("error", () => reject(new SandboxCallbackUncertainError()));

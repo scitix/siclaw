@@ -15,12 +15,12 @@ it.each([
   ["bash", { cluster: "prod", command: "kubectl get nodes" }, "cluster", "prod"],
   ["host_exec", { host: "node", command: "uname" }, "host", "node"],
   ["mcp.call", { server: "metrics", tool: "query", arguments: {} }, "mcp", "metrics"],
-])("reauthorizes %s's original resource and rejects revocation or identity changes", async (tool, args, source, name) => {
+])("rejects undelivered %s results and still checks revocation and identity changes", async (tool, args, source, name) => {
   const rpc = { request: vi.fn(async (method: string) => method === "config.getAgent" ? { status: "active" } : { user_id: "u" }) };
   const broker = new ReadOnlyScriptBroker(rpc, config());
   const call = { id: "1", tool, arguments: args, delivery: "file" } as ScriptToolCall;
   const execute = vi.spyOn(broker, "call");
-  await broker.authorizeResult(principal(), scope, call, signal());
+  await expect(broker.authorizeResult(principal(), scope, call, signal())).rejects.toThrow("Result authorization changed");
   expect(rpc.request).toHaveBeenLastCalledWith("sandbox.resolve", { agent_id: "a", session_id: "s", source, name }, 10_000);
   rpc.request.mockImplementation(async method => { if (method === "config.getAgent") return { status: "active" }; throw new Error("resource revoked"); });
   await expect(broker.authorizeResult(principal(), scope, call, signal())).rejects.toThrow("revoked");

@@ -15,7 +15,7 @@ export function sandboxResolveHandler(handlers: Map<string, Handler>): Handler {
        JOIN siclaw_users u ON u.id = s.user_id
        JOIN agents a ON a.id = s.agent_id
        WHERE s.id = ? AND s.agent_id = ? AND s.deleted_at IS NULL
-         AND (s.origin IS NULL OR s.origin = 'web') AND s.parent_session_id IS NULL
+         AND s.origin = 'web' AND s.parent_session_id IS NULL
          AND a.status = 'active' AND u.role = 'admin'`, [params.session_id, params.agent_id],
     ) as any;
     if (!rows?.[0]?.user_id) throw new Error("Sandbox requires an administrator-owned web session");

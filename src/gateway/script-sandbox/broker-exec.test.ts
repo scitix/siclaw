@@ -43,7 +43,7 @@ it.each(["node_exec", "pod_exec", "host_exec"])("checks current %s capabilities,
 });
 
 it("requires an operator pin for every SSH hop and keeps credentials in the trusted callback", async () => {
-  const config = loadScriptSandboxConfig();
+  const config = { ...loadScriptSandboxConfig() };
   config.hostKeyPins = { "host-a": "SHA256:" + "a".repeat(43) };
   const credential = { name: "host-a", type: "ssh", files: [{ name: "host.password", content: "private-password" }],
     metadata: { ip: "192.0.2.2", port: 22 }, jump_chain: [{ name: "bastion", metadata: { ip: "192.0.2.1", port: 2222 }, files: [] }] };

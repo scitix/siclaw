@@ -1,3 +1,4 @@
+import { normalizeExecTarget } from "../infra/exec-utils.js";
 import { ensureSandboxDebugQuota, SANDBOX_DEBUG_NAMESPACE } from "../infra/sandbox-debug.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
@@ -93,7 +94,7 @@ export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
   userId?: string,
   bg?: BackgroundExecWiring,
-  trustedOptions?: TrustedToolOutputOptions & { sandboxDiagnostics?: boolean },
+  trustedOptions?: TrustedToolOutputOptions & { sandboxDiagnostics?: boolean; expiresAtMs?: number },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -247,7 +248,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
     },
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
-      const params = rawParams as NodeExecParams;
+      const params = normalizeExecTarget(rawParams as NodeExecParams);
       if (trustedOptions?.sandboxDiagnostics && [params.image, params.pod, params.namespace, params.container, params.netns].some(v => v !== undefined)) {
         // Pod/netns discovery owns a separate debug-pod lifecycle. This managed
         // invocation must stay on its explicit node and quota-controlled Job.
@@ -423,9 +424,15 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       const fgUserShellEsc = (netnsPrefix + params.command).replace(/'/g, "'\\''");
       const fgPgidFile = backgroundPgidFile(toolCallId);
       const fgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${cap} sh -c '${fgUserShellEsc}'`, fgPgidFile)];
-      if (trustedOptions?.sandboxDiagnostics) await ensureSandboxDebugQuota(env, signal);
+      if (trustedOptions?.sandboxDiagnostics) {
+        try { await ensureSandboxDebugQuota(env, signal); }
+        catch {
+          return { content: [{ type: "text", text: "Node diagnostic namespace or quota is unavailable. Ask the operator to provision the target cluster." }],
+            details: { blocked: true, reason: "sandbox_facilities_unavailable" } };
+        }
+      }
       const fgSpec = {
-        ...(trustedOptions?.sandboxDiagnostics ? { namespace: SANDBOX_DEBUG_NAMESPACE, activeDeadlineSeconds: 120, confirmCleanup: true } : {}),
+        ...(trustedOptions?.sandboxDiagnostics ? { namespace: SANDBOX_DEBUG_NAMESPACE, activeDeadlineSeconds: 120, expiresAtMs: trustedOptions.expiresAtMs, confirmCleanup: true } : {}),
         userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey,
       };
 

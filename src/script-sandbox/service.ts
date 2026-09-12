@@ -1,8 +1,13 @@
+import { SCRIPT_STARTUP_MS, TOOL_CALLBACK_MS, NODE_CALLBACK_MS } from "./budgets.js";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { ScriptFrameParser, encodeScriptFrame } from "./protocol.js";
 import { record, resolveScriptLimits, validateScriptRequest } from "./validation.js";
 import { ScriptTrafficBusyError } from "./traffic.js";
+import { SandboxToolError } from "./errors.js";
+import { sanitizeSandboxResult } from "./sanitize.js";
+import { postExecSecurity } from "../tools/infra/security-pipeline.js";
+import { redactSensitiveContent } from "../tools/infra/kubectl-sanitize.js";
 import { ScriptResultTransfer, ScriptResultLimitError, SCRIPT_INLINE_RESULT_BYTES, SCRIPT_RUN_FILE_BYTES, SCRIPT_RESULT_CHUNK_BYTES } from "./result-transfer.js";
 import { ScriptSandboxError, type ScriptChannel, type ScriptPrincipal, type ScriptRequest, type ScriptResult, type ScriptSandboxConfig, type ScriptSandboxProvider, type ScriptToolCall } from "./types.js";
 
@@ -40,7 +45,7 @@ export class ScriptSandboxService {
     principal = { ...principal, runId: result.run_id };
     let channel: ScriptChannel | undefined;
     let timedOut = false;
-    let timer = setTimeout(() => { timedOut = true; controller.abort(new Error("startup timeout")); }, 90_000);
+    let timer = setTimeout(() => { timedOut = true; controller.abort(new Error("startup timeout")); }, SCRIPT_STARTUP_MS);
     try {
       await this.broker.authorize(principal, controller.signal);
       controller.signal.throwIfAborted();
@@ -50,18 +55,23 @@ export class ScriptSandboxService {
       result.warm = channel.warm === true;
       controller.signal.throwIfAborted();
       clearTimeout(timer);
+      principal.deadlineMs = Date.now() + limits.timeout * 1000;
       timer = setTimeout(() => { timedOut = true; controller.abort(); }, limits.timeout * 1000);
       await this.execute(channel, startFrame, principal, request, result, limits.timeout, controller.signal);
       result.status = result.exit_code === 0 ? "completed" : "failed";
     } catch (error) {
       result.status = timedOut ? "timed_out" : controller.signal.aborted ? "cancelled" : "failed";
       // Connector and Kubernetes exceptions can contain credentials; do not relay them.
-      result.error = "Script execution denied, interrupted or unavailable";
+      result.error = error instanceof SandboxToolError ? error.message : "Script execution denied, interrupted or unavailable";
       if (!channel && !controller.signal.aborted && error instanceof ScriptSandboxError) throw error;
     } finally {
       clearTimeout(timer);
       controller.abort();
-      await channel?.close().catch(() => console.warn("[script-sandbox] Instance cleanup failed"));
+      result.cleanup = channel ? "pending" : "not_required";
+      if (channel) {
+        try { await channel.close(); result.cleanup = "confirmed"; }
+        catch { console.warn("[script-sandbox] Instance cleanup failed"); }
+      }
       this.completions.delete(completion);
       complete();
       this.active.delete(controller);
@@ -71,6 +81,24 @@ export class ScriptSandboxService {
       console.info(JSON.stringify({ event: "script_run", ...audit, runId: result.run_id, instanceId: channel?.instanceId,
         codeHash: createHash("sha256").update(request.code).digest("hex"), status: result.status, isolated: limits.isolated,
         toolCalls: result.tool_calls, durationMs: result.duration_ms, startupMs: result.startup_ms, warm: result.warm }));
+    }
+    // Code can print supplied input, transformed tool results or literal secrets.
+    // Apply the shared document security pipeline before history/model exposure.
+    postExecSecurity(result.stdout, { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false }, {
+      outputMode: "data", stderr: result.stderr, onOutputData: safe => {
+        result.stdout = safe.text; result.stderr = safe.stderr;
+        result.notices = safe.notices;
+      },
+    });
+    if (result.cleanup === "pending") (result.notices ??= []).push("Instance cleanup is unconfirmed; do not automatically retry this run.");
+    let remaining = this.config.maxOutputBytes;
+    for (const name of ["stdout", "stderr"] as const) {
+      const bytes = Buffer.from(result[name]);
+      let end = Math.min(bytes.length, remaining);
+      while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+      result[name] = bytes.subarray(0, end).toString("utf8");
+      result.output_truncated ||= end < bytes.length;
+      remaining -= end;
     }
     return result;
   }
@@ -121,7 +149,7 @@ export class ScriptSandboxService {
         ids.add(raw.id); pending++;
         let response: unknown;
         try {
-          const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(raw.tool === "node_exec" ? 125_000 : 55_000)]);
+          const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(raw.tool === "node_exec" ? NODE_CALLBACK_MS : TOOL_CALLBACK_MS)]);
           let value: unknown;
           if (isTransfer) {
             if (raw.delivery !== undefined) throw new Error("Invalid transfer delivery");
@@ -131,14 +159,17 @@ export class ScriptSandboxService {
             if (call.delivery && !this.broker.authorizeResult) throw new Error("File delivery unavailable");
             if (call.delivery) transfers.assertAvailable();
             value = await this.broker.call(principal, scope, call, boundedSignal);
+            await this.broker.authorizeResult?.(principal, scope, call, boundedSignal);
             if (call.delivery === "file") value = transfers.open(value, s => this.broker.authorizeResult!(principal, scope, call, s));
           }
           boundedSignal.throwIfAborted();
           response = { id: raw.id, result: value };
           if (Buffer.byteLength(JSON.stringify(response)) > SCRIPT_INLINE_RESULT_BYTES) throw new ScriptResultLimitError();
         } catch (error) {
-          response = { id: raw.id, error: error instanceof ScriptTrafficBusyError ? error.message : error instanceof ScriptResultLimitError ? "Result exceeds delivery budget; use file delivery or pagination" : "Tool request denied or unavailable",
-            ...(error instanceof ScriptTrafficBusyError ? { code: "TARGET_BUSY", retry_after_ms: 1000 } : {}) };
+          const failure = error instanceof SandboxToolError ? error : new SandboxToolError(
+            error instanceof ScriptResultLimitError ? "RESULT_TOO_LARGE" : "UNAUTHORIZED",
+            error instanceof ScriptResultLimitError ? "FINISHED" : "NOT_DISPATCHED");
+          response = { id: raw.id, ...sanitizeSandboxResult(failure.wire()) as object };
         }
         pending--;
         if (settled || signal.aborted) throw new Error("Inactive script run");

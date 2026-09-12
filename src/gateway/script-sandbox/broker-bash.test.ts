@@ -18,7 +18,7 @@ it("binds each trusted Bash callback to freshly authorized credentials and omits
     const broker = new ReadOnlyScriptBroker(rpc, loadScriptSandboxConfig(), builtin);
     await expect(broker.call(p(), scope, call, new AbortController().signal)).resolves.toEqual({ text: "nodes" });
     expect(builtin).toHaveBeenCalledOnce();
-    expect(builtin.mock.calls[0][1]).toEqual(call.arguments);
+    expect(builtin.mock.calls[0][1]).toEqual({ ...call.arguments, timeout_seconds: 10 });
     expect(builtin.mock.calls[0][3]).toMatchObject({ tool: "bash", credential: { type: "kubeconfig", files: [{ name: "cluster.kubeconfig", content: kubeconfig }] } });
     expect(JSON.stringify(builtin.mock.calls[0][1])).not.toContain("private-token");
     expect(JSON.stringify(log.mock.calls)).not.toContain("private-token");

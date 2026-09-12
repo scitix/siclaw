@@ -63,7 +63,7 @@ it("fails closed on missing or malformed SSH pins before constructing the actual
   const request = { tool: "host_exec" as const, arguments: { host: "host-a", command: "uname", timeout_seconds: 10 } };
   const grant: SandboxBuiltinApproval = { tool: "host_exec", credential: { name: "host-a", type: "ssh", files: [] } };
   for (const pins of [undefined, {}, { "192.0.2.1:22": "" }]) {
-    await expect(executeSandboxBuiltin(request, { ...grant, hostKeyPins: pins }, dir, new AbortController().signal)).rejects.toThrow("pins");
+    await expect(executeSandboxBuiltin(request, { ...grant, hostKeyPins: pins }, dir, new AbortController().signal)).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE", execution: "NOT_DISPATCHED" });
   }
   expect(state.create).not.toHaveBeenCalled(); expect(fs.readdirSync(dir)).toEqual([]);
 });
@@ -75,4 +75,10 @@ it("removes credential snapshots even if confirmed cleanup fails", async () => {
   state.evict.mockRejectedValue(new Error("cleanup unconfirmed"));
   await expect(executeSandboxBuiltin({ tool: "node_exec", arguments: { cluster: "prod", node: "node-a", command: "uname", timeout_seconds: 10 } }, approval("node_exec"), dir, new AbortController().signal)).rejects.toThrow("cleanup");
   expect(fs.readdirSync(dir)).toEqual([]);
+});
+
+it("rejects an expired trusted dispatch deadline before constructing or executing a tool", async () => {
+  await expect(executeSandboxBuiltin({ tool: "node_exec", arguments: { cluster: "prod", node: "node-a", command: "uname", timeout_seconds: 10 } },
+    { ...approval("node_exec"), deadlineMs: Date.now() - 1 }, dir, new AbortController().signal)).rejects.toMatchObject({ code: "UNAUTHORIZED", execution: "NOT_DISPATCHED" });
+  expect(state.create).not.toHaveBeenCalled(); expect(fs.readdirSync(dir)).toEqual([]);
 });

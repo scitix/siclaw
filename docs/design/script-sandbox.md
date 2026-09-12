@@ -231,8 +231,10 @@ without background wiring, and node diagnostic images come from service
 configuration; these choices are represented in the existing tools' schemas.
 Each Runtime defaults to **10 active scripts**, with **10 concurrent SDK calls**
 per script. Python can use `ThreadPoolExecutor(max_workers=10)`; Shell can use
-at most ten background workers followed by `wait`. Ten independent pipe pairs
-and process-shared lane locks correlate out-of-order results. Runtime and
+at most ten background workers followed by `wait`. Ten atomic file mailboxes
+and process-shared lane locks correlate out-of-order results. An accepted request
+keeps its lane occupied until the supervisor receives a reply, even if that SDK
+client is killed. Large replies cannot block the supervisor on a dead reader. Runtime and
 AgentBox independently reject extra in-flight frames and replayed call IDs.
 
 All sandbox tools acquire shared target capacity before execution. The trusted
@@ -261,7 +263,7 @@ operator settings (`SICLAW_SANDBOX_TARGET_CONCURRENCY`, `_RPS`, `_BURST`, each
 with the full `SICLAW_SANDBOX_TARGET` prefix); standalone Helm settings are under
 `scriptSandbox.traffic`. Leaf-target concurrency stays one.
 
-Admission waits at most 30 seconds, with at most 100 queued calls per target and
+Admission waits at most 25 seconds, with at most 100 queued calls per target and
 1,000 overall. Contending users receive scheduling preference over repeated
 calls from the current user. Waiting consumes the script deadline. After
 admission, Runtime resolves current authorization and credentials again and
@@ -280,12 +282,31 @@ or quota above the ceiling causes refusal. `count/pods: 10` and
 Runtime/AgentBox replicas and restarts. Operators may provision a stricter quota.
 Ordinary direct node tools keep their existing namespace/lifecycle.
 
-Every callback owns its diagnostic cache entry, with foreground Job cleanup
-before credential disposal. Normal success requires confirmed cleanup; startup
-failure and cancellation also clean up. Jobs have no retries, an active deadline
-of 120 seconds and finished TTL of 60 seconds. Admission quota prevents unbounded
-accumulation if control-plane cleanup is unavailable. The node callback budget
-includes startup/cleanup (90 seconds); outer script deadlines may cancel earlier.
+For restricted installers, an operator can apply
+`examples/script-sandbox-diagnostics.yaml` to each authorized **target** cluster
+before enabling `node_exec`. It explicitly selects the privileged PSA level
+needed by the existing trusted diagnostic tool. This is separate from the
+runner namespace, which remains restricted and has no production credentials.
+The bound cluster identity still needs the tool's Job/Pod create, inspect, exec
+and delete permissions. Existing conflicting namespace policy is never loosened
+automatically; missing facilities return `DIAGNOSTICS_UNAVAILABLE`.
+
+Every callback retains diagnostic Job ownership independently of cache entries,
+with foreground deletion before credential disposal. A removed cache entry or
+lost create reply cannot discard cleanup responsibility. Jobs have no retries,
+a 120-second active deadline and a 60-second finished TTL. Their container also
+stops at an absolute deadline chosen **before admission**: the earlier of the
+script deadline and 100 seconds after admission was requested. A delayed Job
+cannot restart a fresh relative lifetime. This assumes host clocks are within
+five seconds; 34 seconds of cleanup headroom still fits inside the 150-second
+admission lease. The namespace object quotas remain the hard accumulation bound
+under control-plane failure, even for terminated or delayed objects.
+
+The shared budget constants live in `src/script-sandbox/budgets.ts`. Runtime
+callbacks use 55 seconds (125 for nodes), clamped by the script's AbortSignal;
+AgentBox applies the trusted absolute deadline. Cleanup has its own bounded
+attempts and may continue after the caller stops waiting. No timeout proves
+that a third-party MCP service stopped detached work.
 External ingress adds transport grace without extending the run's grant.
 
 Read-only means the existing tools' diagnostic command policies. Node diagnostics
@@ -357,6 +378,43 @@ fail the handshake before receiving task data. Rebuild the E2B template when
 upgrading the SDK. No model call, package installation or extra service is added
 to sandbox startup.
 
+## Failures, policy updates and rolling upgrades
+
+Python raises `siclaw.ToolError` with `code`, `execution`, `cleanup`, optional
+`retry_after_ms` and a sanitized `result`. `NOT_DISPATCHED` means rejected before
+execution; `FINISHED` means a trusted executor replied; `UNKNOWN` means transport
+or cancellation prevented confirmation. A command error can still be a finished
+execution. `cleanup=pending` retains target capacity and is not safe to retry
+just because the command ended. The SDK never automatically retries. Shell
+reports the same structured failure as JSON and exits nonzero.
+
+`run_script` separately reports runner `cleanup` and includes a notice if it is
+unconfirmed. It keeps the script's exit/result information. Final stdout/stderr
+use the shared output sanitizer and the combined byte limit before reaching the
+model. Redaction notices stay separate from JSON/NDJSON data. Redaction does not
+establish confidentiality for arbitrary encodings or transformed secrets.
+
+Policy and host-pin files are re-read at each authorization boundary. Kubernetes
+projected ConfigMap updates take effect when the kubelet updates that projection;
+Helm also rolls Runtime on policy changes. Environment-only policy changes require
+a restart. Bad replacement files fail closed. Result delivery and every file chunk
+must match both current grants and the originally authorized credential/endpoint
+snapshot; policy changes cannot expose an old result under a new binding.
+
+Upgrade the control-plane `sandbox.traffic.info` v1/acquire/release API first,
+then matching Runtime and AgentBox images, and the runner image or E2B template.
+Native readiness remains v3; SDK and supervisor mailbox changes ship together in
+that image. An unavailable or older coordinator is rejected before a runner is
+started. Unsupported runner handshakes trigger a short cooldown. Rollback should
+disable sandbox first, drain runs, and restore matching image digests together.
+No database migration is required. Disabled/local/TUI environments do not parse
+unused provider credentials, policies or traffic settings.
+
+Standalone Portal's shared Runtime secret defines one trusted service domain;
+it is not authentication for mutually untrusted Runtime tenants. Use separate
+Portal deployments and secrets for separate trust domains. The external control
+plane additionally binds an executor to its authenticated Runtime identity.
+
 ## Optional network isolation
 
 `network_isolation` defaults to the Runtime setting (off). Administrators may
@@ -374,7 +432,7 @@ also uses a distinct non-root UID per instance, read-only rootfs, dropped capabi
 namespaces, no token mount and bounded tmpfs volumes.
 
 There is no CNI dependency or node-local seccomp profile to distribute. The
-tool pipe remains available while direct HTTP, SSH, DNS and package downloads
+tool channel remains available while direct HTTP, SSH, DNS and package downloads
 are unavailable. Docker adds `--network=none`. A configured gVisor/Kata
 RuntimeClass can strengthen the kernel boundary, but is not required. Ordinary
 containers still share a kernel and do not claim microVM-level isolation.
@@ -412,9 +470,10 @@ instances contain no user data or authority. Claiming one transfers it to one
 run; it is destroyed after success, failure, timeout or cancellation and is
 never scrubbed/reused. Cold runs provision before speculative replacements, and
 requests join existing warmup instead of competing with it for the last Pod slot.
-Switching profiles retires incompatible idle instances before provisioning the
-requested profile. Only the most recently requested profile is replenished,
-keeping unused warm Pods from blocking real work on a full cluster. Waiting for
+Only the deployment
+default profile is prewarmed. Other profiles cold-start without replacing the
+default pool, avoiding churn when requests alternate profiles. Finished or failed
+idle channels are retired; failed deletion retains ownership and stops refill. Waiting for
 provisioning is reported as a cold start. Pools replenish asynchronously. Warm instances expire
 after 300 seconds by default and are terminated on Runtime shutdown.
 
@@ -516,7 +575,7 @@ payload = input_data()
 print(sum(payload["numbers"]))  # 6
 ```
 
-The SDK supports ten cross-process lanes, each with its own file lock and paired pipes.
+The SDK supports ten cross-process lanes, each with a file lock and atomic request/reply mailbox.
 Bash/exec results have a `text` field. With `kubectl -o json`, parse that field
 as JSON. File delivery saves the same result envelope, not a different API.
 
@@ -560,7 +619,7 @@ isolation remain disabled by default.
 
 ```mermaid
 flowchart LR
-  Code[Python / Bash, UID 10001] -->|local pipes| Relay[Trusted E2B relay, root]
+  Code[Python / Bash, UID 10001] -->|local messages| Relay[Trusted E2B relay, root]
   Relay -->|HTTPS + task grant| Portal[Portal dedicated callback API]
   Portal -->|authenticated Runtime WS| Broker[Active run + existing broker]
   Broker --> Tools[Restricted Bash / Kubernetes / host / reviewed MCP]

@@ -11,6 +11,7 @@ import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type ResolvedToolDefinition } from "./tool-registry.js";
 import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -435,6 +436,7 @@ export class McpClientManager {
       // whose listTools() failed: the SSE stream is open by then, and a client
       // that never reached this.clients is otherwise closed by nobody.
       let connected: any = null;
+      const discoverySignal = AbortSignal.timeout(MCP_DISCOVERY_TIMEOUT_MS);
       const recordFailure = (error: McpConnectError) => {
         this.connections.push({
           name: serverName, transport: detectedTransport, state: "failed",
@@ -462,17 +464,13 @@ export class McpClientManager {
           case "sse":
             transport = new SSEClientTransport(
               new URL(cfg.url),
-              cfg.headers
-                ? { requestInit: { headers: cfg.headers } }
-                : undefined,
+              cfg.headers ? { requestInit: { headers: cfg.headers } } : undefined,
             );
             break;
           case "streamable-http":
             transport = new StreamableHTTPClientTransport(
               new URL(cfg.url),
-              cfg.headers
-                ? { requestInit: { headers: cfg.headers } }
-                : undefined,
+              cfg.headers ? { requestInit: { headers: cfg.headers } } : undefined,
             );
             break;
           default:
@@ -484,8 +482,15 @@ export class McpClientManager {
             continue;
         }
 
-        await client.connect(transport);
         connected = client;
+        let expire!: () => void;
+        const expired = new Promise<never>((_, reject) => {
+          expire = () => reject(discoverySignal.reason);
+          discoverySignal.addEventListener("abort", expire, { once: true });
+          if (discoverySignal.aborted) expire();
+        });
+        try { await Promise.race([client.connect(transport, { signal: discoverySignal }), expired]); }
+        finally { discoverySignal.removeEventListener("abort", expire); }
         if (this.disposed) {
           await this.closeLate(serverName, client, startedAt, detectedTransport);
           continue;
@@ -498,7 +503,6 @@ export class McpClientManager {
         const mcpTools: McpTool[] = [];
         const names = new Set<string>();
         const cursors = new Set<string>();
-        const discoverySignal = AbortSignal.timeout(MCP_DISCOVERY_TIMEOUT_MS);
         let cursor: string | undefined;
         let schemaBytes = 0;
         for (let page = 0; page < MCP_DISCOVERY_MAX_PAGES; page++) {
@@ -707,9 +711,12 @@ export function createMcpToolDefinition(
         };
       } catch (err: any) {
         const errorMsg = err?.message ?? String(err);
+        const execution = err instanceof McpError && ![ErrorCode.ConnectionClosed, ErrorCode.RequestTimeout].includes(err.code)
+          ? [ErrorCode.InvalidRequest, ErrorCode.InvalidParams, ErrorCode.MethodNotFound].includes(err.code) ? "NOT_DISPATCHED" : "FINISHED"
+          : "UNKNOWN";
         return {
           content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
-          details: { error: errorMsg },
+          details: { error: errorMsg, ...(trustedOptions?.includeRawResult ? { execution } : {}) },
         };
       }
     },

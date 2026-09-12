@@ -11,16 +11,62 @@ import base64
 import hashlib
 import tempfile
 import time
+import stat
 from contextlib import contextmanager
 from pathlib import Path
 
 MAX_FRAME = 256 * 1024
 
 
+class ToolError(RuntimeError):
+    """A single tool failure; never automatically retry an uncertain execution."""
+    def __init__(self, response):
+        super().__init__(response["error"])
+        self.code = response.get("code", "TOOL_UNAVAILABLE")
+        self.execution = response.get("execution", "UNKNOWN")
+        self.cleanup = response.get("cleanup", "not_required")
+        self.retry_after_ms = response.get("retry_after_ms")
+        self.result = response.get("result")
+
+
+def _atomic_write(path, data):
+    destination = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".rpc-write-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(data)
+        directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.replace(temporary.name, destination.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_message(path):
+    # Never block on a task-created FIFO or follow a task-created symlink.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise RuntimeError("Invalid SDK message file")
+        data = stream.read(MAX_FRAME + 1)
+    if len(data) > MAX_FRAME:
+        raise RuntimeError("Tool message exceeds the frame limit")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise RuntimeError("Invalid SDK message")
+    return value
+
+
 @contextmanager
 def _lane():
-    # Each lane has its own response pipe. File locks coordinate threads AND
-    # independently started Shell/Python children without sockets or a daemon.
+    # Each lane has one atomic request/response mailbox. A published request
+    # remains occupied until Runtime replies, even if its client is killed.
+    # Locks coordinate both Python threads and independent Shell children.
     lanes = json.loads(os.environ["SICLAW_RPC_LANES"])
     if not isinstance(lanes, list) or not 1 <= len(lanes) <= 10:
         raise RuntimeError("Invalid SDK channels")
@@ -35,6 +81,11 @@ def _lane():
                 lock.close()
                 continue
             try:
+                if Path(lane["request"]).exists():
+                    continue
+                # The previous owner may have died. Its completed response must
+                # never be read by the next transaction.
+                Path(lane["response"]).unlink(missing_ok=True)
                 yield lane
             finally:
                 lock.close()
@@ -59,33 +110,18 @@ def _call(tool, arguments=None, delivery=None):
     if len(data) > MAX_FRAME:
         raise ValueError("Tool request exceeds the frame limit")
     with _lane() as lane:
-        request_fd = lane["request"]
-        response_fd = lane["response"]
-        remaining = memoryview(data)
-        while remaining:
-            written = os.write(request_fd, remaining)
-            remaining = remaining[written:]
-        response = bytearray()
-        while len(response) <= MAX_FRAME:
-            chunk = os.read(response_fd, min(16384, MAX_FRAME + 1 - len(response)))
-            if not chunk:
-                raise RuntimeError("Tool channel closed")
-            response.extend(chunk)
-            newline = response.find(b"\n")
-            if newline != -1:
-                # The lock permits exactly one in-flight request. Extra frames
-                # cannot be a future SDK call and must not be silently consumed.
-                if newline != len(response) - 1:
-                    raise RuntimeError("Unexpected tool response data")
-                response = response[:newline]
+        _atomic_write(lane["request"], data)
+        while True:
+            try:
+                result = _read_message(lane["response"])
                 break
-        else:
-            raise RuntimeError("Tool response exceeds the frame limit")
-        result = json.loads(response)
+            except FileNotFoundError:
+                time.sleep(0.005)
+        Path(lane["response"]).unlink(missing_ok=True)
         if result.get("id") != request["id"]:
             raise RuntimeError("Tool response id mismatch")
         if "error" in result:
-            raise RuntimeError(result["error"])
+            raise ToolError(result)
         return result.get("result")
 
 

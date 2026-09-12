@@ -95,11 +95,22 @@ def main():
                 })
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
                 # Never retry an uncertain remote execution.
-                with opener.open(request, timeout=140 if isinstance(call, dict) and call.get("tool") == "node_exec" else 70) as response:
-                    data = response.read(MAX_FRAME + 1)
-                    if response.status != 200 or len(data) > MAX_FRAME:
-                        raise RuntimeError("Tool response unavailable")
-                    result = json.loads(data)
+                try:
+                    with opener.open(request, timeout=140 if isinstance(call, dict) and call.get("tool") == "node_exec" else 70) as response:
+                        data = response.read(MAX_FRAME + 1)
+                        if response.status != 200 or len(data) > MAX_FRAME:
+                            raise RuntimeError("Tool response unavailable")
+                        result = json.loads(data)
+                except urllib.error.HTTPError as error:
+                    if error.code in (401, 403) or 300 <= error.code < 400:
+                        raise  # Revoked grant or redirect: terminate this run.
+                    result = {"id": call["id"], "error": "Tool execution is unconfirmed; do not automatically retry",
+                              "code": "EXECUTION_UNKNOWN", "execution": "UNKNOWN", "cleanup": "not_required"}
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
+                    result = {"id": call["id"], "error": "Tool execution is unconfirmed; do not automatically retry",
+                              "code": "EXECUTION_UNKNOWN", "execution": "UNKNOWN", "cleanup": "not_required"}
+                if not isinstance(result, dict) or result.get("id") != call.get("id"):
+                    raise RuntimeError("Mismatched tool response")
                 with writers:
                     slots.release()
                     send(child.stdin, {"type": "tool_result", "response": result})

@@ -1,10 +1,11 @@
+import { SandboxToolError } from "../script-sandbox/errors.js";
 import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { SANDBOX_HTTP_LIMIT, SANDBOX_LEASE_CLOSE, SANDBOX_LEASE_OPEN, SANDBOX_TOOL_PATH, SANDBOX_TOOL_RPC, sandboxToolEndpoint } from "../script-sandbox/external-protocol.js";
 import { identifier, record } from "../script-sandbox/validation.js";
 import type { RestRouter } from "../gateway/rest-router.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
-import { SandboxTrafficGate, TRAFFIC_ACQUIRE, TRAFFIC_RELEASE } from "../script-sandbox/traffic.js";
+import { SandboxTrafficGate, TRAFFIC_ACQUIRE, TRAFFIC_RELEASE, TRAFFIC_INFO, ScriptTrafficBusyError } from "../script-sandbox/traffic.js";
 
 type Handler = (params: any, runtimeId: string) => Promise<any>;
 interface Lease { runtimeId: string; runId: string; expires: number; busy: number; calls: number; ids: Set<string> }
@@ -16,12 +17,17 @@ export function registerSandboxIngress(router: RestRouter, handlers: Map<string,
     if (!Number.isInteger(value) || value < 1 || value > 100) throw new Error("Invalid sandbox traffic limit");
     return value;
   };
-  const traffic = new SandboxTrafficGate(limit("SICLAW_SANDBOX_TARGET_CONCURRENCY", 10),
+  let traffic: SandboxTrafficGate | undefined;
+  const gate = () => traffic ??= new SandboxTrafficGate(limit("SICLAW_SANDBOX_TARGET_CONCURRENCY", 10),
     limit("SICLAW_SANDBOX_TARGET_RPS", 10), limit("SICLAW_SANDBOX_TARGET_BURST", 20));
-  handlers.set(TRAFFIC_ACQUIRE, (p, runtimeId) => traffic.acquire(p, runtimeId));
+  handlers.set(TRAFFIC_INFO, async () => { gate(); return { version: 1 }; });
+  handlers.set(TRAFFIC_ACQUIRE, async (p, runtimeId) => {
+    try { return await gate().acquire(p, runtimeId); }
+    catch (error) { if (error instanceof ScriptTrafficBusyError) return error.wire(); throw error; }
+  });
   handlers.set(TRAFFIC_RELEASE, async (p, runtimeId) => {
     if (!record(p) || Object.keys(p).length !== 1 || typeof p.id !== "string" || !/^[a-f0-9-]{36}$/.test(p.id)) throw new Error("Invalid traffic lease");
-    traffic.release(p.id, runtimeId); return { ok: true };
+    gate().release(p.id, runtimeId); return { ok: true };
   });
   const endpoint = publicUrl ? sandboxToolEndpoint(publicUrl) : undefined;
   const leases = new Map<string, Lease>();
@@ -61,18 +67,29 @@ export function registerSandboxIngress(router: RestRouter, handlers: Map<string,
     if (!lease || lease.busy >= 10 || ++lease.calls > 4096) { send(403, { error: "Sandbox grant denied" }); return; }
     lease.busy++;
     let confirmed = true;
+    let callId: string | undefined;
     try {
       const body = await boundedBody(req, res);
       if (!record(body) || Object.keys(body).length !== 1 || !record(body.call) || lease.expires <= Date.now() || leases.get(hash) !== lease) throw denied();
       const id = body.call.id;
       if (typeof id !== "string" || !id || id.length > 64 || lease.ids.has(id)) throw denied();
       lease.ids.add(id);
+      callId = id;
+      if (!connections.sendCommandToRuntime) throw new SandboxToolError("SERVICE_UNAVAILABLE");
       confirmed = false;
-      const result = await connections.sendCommandToRuntime?.(lease.runtimeId, SANDBOX_TOOL_RPC, { run_id: lease.runId, token, call: body.call }, body.call.tool === "node_exec" ? 135_000 : 65_000);
-      if (result) confirmed = true;
+      const result = await connections.sendCommandToRuntime(lease.runtimeId, SANDBOX_TOOL_RPC, { run_id: lease.runId, token, call: body.call }, body.call.tool === "node_exec" ? 135_000 : 65_000);
+      confirmed = result.transport === "NOT_DISPATCHED" || result.ok;
+      if (!result.ok) throw new SandboxToolError(confirmed ? "SERVICE_UNAVAILABLE" : "EXECUTION_UNKNOWN", confirmed ? "NOT_DISPATCHED" : "UNKNOWN");
+      if (record(result.payload) && (result.payload.execution === "UNKNOWN" || result.payload.cleanup === "pending")) confirmed = false;
       if (!result?.ok || lease.expires <= Date.now() || leases.get(hash) !== lease || Buffer.byteLength(JSON.stringify(result.payload) ?? "") > SANDBOX_HTTP_LIMIT) throw denied();
       send(200, result.payload);
-    } catch { send(403, { error: "Sandbox tool denied or unavailable" }); }
+    } catch (error) {
+      if (callId) {
+        const failure = error instanceof SandboxToolError ? error : new SandboxToolError(
+          confirmed ? "UNAUTHORIZED" : "EXECUTION_UNKNOWN", confirmed ? "NOT_DISPATCHED" : "UNKNOWN");
+        send(200, { id: callId, ...failure.wire() });
+      } else send(403, { error: "Sandbox tool denied or unavailable" });
+    }
     finally { if (confirmed) lease.busy--; }
   });
 }

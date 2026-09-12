@@ -1,5 +1,14 @@
 import { expect, it } from "vitest";
 import { sanitizeSandboxResult } from "./sanitize.js";
+it("preserves JSON booleans and NDJSON records while redacting real credentials and reporting edits", () => {
+  const rows = [false, true].map(automountServiceAccountToken => ({ spec: { automountServiceAccountToken }, password: 123456 }));
+  const value = sanitizeSandboxResult({ text: rows.map(row => JSON.stringify(row)).join("\n") }) as any;
+  const decoded = value.text.split("\n").map(JSON.parse);
+  expect(decoded.map((row: any) => row.spec.automountServiceAccountToken)).toEqual([false, true]);
+  expect(JSON.stringify(value)).not.toContain("123456");
+  expect(value.notices).toHaveLength(1);
+  expect((sanitizeSandboxResult(rows) as any[])[0].spec.automountServiceAccountToken).toBe(false);
+});
 it("sanitizes structured and text outputs from every connector", () => {
   const result = sanitizeSandboxResult({ password: "bad-pass", content: [{ type: "text", text: "token: bad-token\nhealthy" }],
     nested: { client_secret: "bad-secret", os: "Linux" }, key: "-----BEGIN PRIVATE KEY-----\nbad-pem\n-----END PRIVATE KEY-----" });

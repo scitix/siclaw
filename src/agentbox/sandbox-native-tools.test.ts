@@ -129,7 +129,7 @@ it.each([
   ["host_exec", "curl -X POST https://example.test"],
 ])("rejects %s / %s in the real shared tool, not a sandbox command filter", async (tool, command) => {
   const pre = vi.spyOn(security, "preExecSecurity");
-  await expect(call(tool as SandboxBuiltinTool, command)).rejects.toThrow("Sandbox tool failed");
+  await expect(call(tool as SandboxBuiltinTool, command)).rejects.toMatchObject({ code: "UNAUTHORIZED", execution: "NOT_DISPATCHED" });
   expect(pre).toHaveBeenCalledOnce();
   expect(pre.mock.results[0].value.error).toBeTruthy();
   expect(boundedExec).not.toHaveBeenCalled();

@@ -59,7 +59,7 @@ describe("public sandbox tool ingress", () => {
     }
     expect(s.sendCommandToRuntime).not.toHaveBeenCalled();
     s.sendCommandToRuntime.mockRejectedValue(new Error("fake-upstream-secret"));
-    const response = await s.post({ call }); expect(response.status).toBe(403);
+    const response = await s.post({ call }); expect(response.status).toBe(200);
     expect(await response.text()).not.toContain("fake-upstream-secret");
   });
 });
@@ -78,7 +78,7 @@ it("forwards file metadata and bounded chunks without widening the public respon
     expect(s.sendCommandToRuntime).toHaveBeenLastCalledWith("runtime-1", "sandbox.tool", { run_id: "run-1", token, call: request }, 65_000);
   }
   s.sendCommandToRuntime.mockResolvedValueOnce({ ok: true, payload: { result: "x".repeat(256 * 1024) } } as any);
-  expect((await s.post({ call: { ...call, id: "oversize" } })).status).toBe(403);
+  expect(await (await s.post({ call: { ...call, id: "oversize" } })).json()).toMatchObject({ code: "UNAUTHORIZED" });
   await s.handlers.get(SANDBOX_LEASE_CLOSE)!({ token_hash: hash, run_id: "run-1" }, "runtime-1");
   expect((await s.post({ call: { id: "4", tool: "result.read", arguments: { transfer_id: transfer, offset: 49152 } } })).status).toBe(403);
   expect(s.sendCommandToRuntime).toHaveBeenCalledTimes(4);
@@ -100,7 +100,7 @@ it("relays ten independent callbacks, rejects the eleventh and never releases an
   expect((await s.post({ call: { ...call, id: "extra" } })).status).toBe(403);
   finish[0](); expect((await pending[0]).status).toBe(200);
   s.sendCommandToRuntime.mockRejectedValueOnce(new Error("transport lost"));
-  expect((await s.post({ call: { ...call, id: "uncertain" } })).status).toBe(403);
+  expect(await (await s.post({ call: { ...call, id: "uncertain" } })).json()).toMatchObject({ code: "EXECUTION_UNKNOWN", execution: "UNKNOWN" });
   expect((await s.post({ call: { ...call, id: "next" } })).status).toBe(403);
   expect(s.sendCommandToRuntime).toHaveBeenCalledTimes(11);
   finish.slice(1).reverse().forEach(f => f());

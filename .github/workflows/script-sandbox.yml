@@ -18,6 +18,8 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      - uses: azure/setup-helm@v4
+      - run: npx tsx scripts/smoke/script-sandbox-helm.ts
       - run: python3 -m unittest discover -s docker/script-sandbox -p '*_test.py'
       - run: docker build -f Dockerfile.script-sandbox -t siclaw-script:test .
       - run: docker image inspect siclaw-script:test --format '{{.Size}}'

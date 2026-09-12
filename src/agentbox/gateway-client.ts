@@ -318,22 +318,30 @@ export class GatewayClient {
     };
   }
 
+  private scriptInfoCache?: { expires: number; value: import("../script-sandbox/types.js").ScriptSandboxInfo };
+  private scriptInfoPending?: Promise<import("../script-sandbox/types.js").ScriptSandboxInfo>;
   async scriptSandboxInfo(): Promise<import("../script-sandbox/types.js").ScriptSandboxInfo> {
+    if (this.scriptInfoCache && this.scriptInfoCache.expires > Date.now()) return this.scriptInfoCache.value;
+    return this.scriptInfoPending ??= this.fetchScriptSandboxInfo().then(value => {
+      this.scriptInfoCache = { value, expires: Date.now() + 30_000 }; return value;
+    }).catch(() => ({ enabled: false, network_isolation: false, require_network_isolation: false }))
+      .finally(() => { this.scriptInfoPending = undefined; });
+  }
+
+  private async fetchScriptSandboxInfo(): Promise<import("../script-sandbox/types.js").ScriptSandboxInfo> {
     const disabled = { enabled: false, network_isolation: false, require_network_isolation: false };
-    try {
-      const info = await this.request("/api/internal/script-runs", "GET");
-      if (info?.enabled !== true) return disabled;
-      const raw = info.limits;
-      // Explicitly project the public fields; never pass arbitrary service config to model tools.
-      const limits = raw && [raw.default_timeout_seconds, raw.max_timeout_seconds, raw.max_tool_calls, raw.max_output_bytes]
-        .every(value => Number.isSafeInteger(value) && value > 0) && raw.default_timeout_seconds <= raw.max_timeout_seconds
-        ? { default_timeout_seconds: raw.default_timeout_seconds, max_timeout_seconds: raw.max_timeout_seconds,
-          max_tool_calls: raw.max_tool_calls, max_output_bytes: raw.max_output_bytes,
-          ...(Number.isSafeInteger(raw.max_concurrent_tools) && raw.max_concurrent_tools > 0 && raw.max_concurrent_tools <= 10
-            ? { max_concurrent_tools: raw.max_concurrent_tools } : {}) } : undefined;
-      return { enabled: true, network_isolation: info.network_isolation === true,
-        require_network_isolation: info.require_network_isolation === true, ...(limits ? { limits } : {}) };
-    } catch { return disabled; }
+    const info = await this.request("/api/internal/script-runs", "GET");
+    if (info?.enabled !== true) return disabled;
+    const raw = info.limits;
+    // Explicitly project the public fields; never pass arbitrary service config to model tools.
+    const limits = raw && [raw.default_timeout_seconds, raw.max_timeout_seconds, raw.max_tool_calls, raw.max_output_bytes]
+      .every(value => Number.isSafeInteger(value) && value > 0) && raw.default_timeout_seconds <= raw.max_timeout_seconds
+      ? { default_timeout_seconds: raw.default_timeout_seconds, max_timeout_seconds: raw.max_timeout_seconds,
+        max_tool_calls: raw.max_tool_calls, max_output_bytes: raw.max_output_bytes,
+        ...(Number.isSafeInteger(raw.max_concurrent_tools) && raw.max_concurrent_tools > 0 && raw.max_concurrent_tools <= 10
+          ? { max_concurrent_tools: raw.max_concurrent_tools } : {}) } : undefined;
+    return { enabled: true, network_isolation: info.network_isolation === true,
+      require_network_isolation: info.require_network_isolation === true, ...(limits ? { limits } : {}) };
   }
 
   async runScript(request: import("../script-sandbox/types.js").ScriptRequest, sessionId: string, signal?: AbortSignal): Promise<import("../script-sandbox/types.js").ScriptResult> {

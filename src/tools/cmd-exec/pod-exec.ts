@@ -1,3 +1,4 @@
+import { normalizeExecTarget } from "../infra/exec-utils.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -133,7 +134,7 @@ Examples:
     },
     renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
-      const params = rawParams as PodExecParams;
+      const params = normalizeExecTarget(rawParams as PodExecParams);
 
       // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
       // would answer with a kubeconfig error and hide the actual mistake.

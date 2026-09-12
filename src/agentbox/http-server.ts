@@ -1,3 +1,4 @@
+import { SandboxToolError } from "../script-sandbox/errors.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * AgentBox HTTP Server
@@ -930,6 +931,7 @@ export function createHttpServer(
     const controller = new AbortController();
     const abort = () => controller.abort();
     res.once("close", abort);
+    let dispatched = false;
     try {
       const body = await parseJsonBody(req);
       if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approval"].includes(k)) ||
@@ -940,12 +942,17 @@ export function createHttpServer(
       if (!managed || managed.mode !== "web" || managed.delegation || !invocations) throw new Error();
       const { executeSandboxBuiltin } = await import("./sandbox-tools.js");
       const approval = body.approval as unknown as import("../shared/sandbox-tool-types.js").SandboxBuiltinApproval;
+      if (!Number.isSafeInteger(approval.deadlineMs) || Number(approval.deadlineMs) <= Date.now()) throw new Error();
       if (typeof approval.callId !== "string" || !approval.callId || approval.callId.length > 64) throw new Error();
       const result = await invocations.execute(body.callback_token, body.session_id,
         { id: approval.callId, tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
-        (request, signal) => executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal));
-      sendJson(res, 200, result);
-    } catch { sendJson(res, 403, { error: "Sandbox tool denied or unavailable" }); }
+        (request, signal) => { dispatched = true; return executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal); });
+      sendJson(res, 200, { protocol: 1, ok: true, result });
+    } catch (error) {
+      const failure = error instanceof SandboxToolError ? error : new SandboxToolError(
+        dispatched ? "EXECUTION_UNKNOWN" : "UNAUTHORIZED", dispatched ? "UNKNOWN" : "NOT_DISPATCHED");
+      sendJson(res, 200, { protocol: 1, ok: false, ...failure.wire() });
+    }
     finally { res.off("close", abort); }
   });
 

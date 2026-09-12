@@ -331,7 +331,7 @@ scriptSandbox:
   runtimeClass: "" # Optional gVisor/Kata class already installed on the cluster.
   networkIsolation: false
   requireNetworkIsolation: false
-  warmPoolSize: 1 # One-use idle instances for the most recently requested profile, per Runtime.
+  warmPoolSize: 1 # One-use idle instances for the deployment default profile, per Runtime.
   warmIdleSeconds: 300
   maxConcurrentRuns: 10
   maxTimeoutSeconds: 300

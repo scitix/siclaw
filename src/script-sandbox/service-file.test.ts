@@ -36,7 +36,7 @@ describe("file delivery over native and external channels", () => {
           chunks.push(Buffer.from(chunk.data, "base64")); offset = chunk.next_offset;
         }
         expect(JSON.parse(Buffer.concat(chunks).toString())).toEqual(value);
-        expect(broker.call).toHaveBeenCalledTimes(2); expect(broker.authorizeResult).toHaveBeenCalledTimes(chunks.length);
+        expect(broker.call).toHaveBeenCalledTimes(2); expect(broker.authorizeResult).toHaveBeenCalledTimes(chunks.length + 2);
         // Reusing a transfer cannot re-run the upstream tool or retrieve old data.
         expect((await invoke("result.read", { transfer_id: info.transfer_id, offset: 0 })).error).toBeTruthy();
         emit({ type: "stdout", data: Buffer.from("summary only").toString("base64") });
@@ -49,4 +49,14 @@ describe("file delivery over native and external channels", () => {
     expect(result.stdout).toBe("summary only"); expect(JSON.stringify(result)).not.toContain("node-data");
     expect(c.close).toHaveBeenCalledOnce();
   });
+});
+
+it("reports unconfirmed runner cleanup without losing a completed script result", async () => {
+  const c: ScriptChannel = { instanceId: "fixture", stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    done: new Promise(() => {}), close: async () => { throw new Error("private-cleanup-error"); } };
+  c.stdin.on("data", () => { (c.stdout as PassThrough).write(JSON.stringify({ type: "stdout", data: Buffer.from("summary").toString("base64") }) + "\n" + JSON.stringify({ type: "exit", code: 0 }) + "\n"); });
+  const service = new ScriptSandboxService(loadScriptSandboxConfig({ SICLAW_SCRIPT_SANDBOX_ENABLED: "true", SICLAW_SCRIPT_SANDBOX_IMAGE: "fixture" }), { start: async () => c }, { authorize: async () => {}, call: async () => {} });
+  const result = await service.run({ language: "python", code: "pass" }, { agentId: "a", userId: "u", sessionId: "s", boxId: "b" });
+  expect(result).toMatchObject({ status: "completed", stdout: "summary", cleanup: "pending" });
+  expect(result.notices?.join(" ")).toContain("do not automatically retry"); expect(JSON.stringify(result)).not.toContain("private-cleanup-error");
 });

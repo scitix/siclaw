@@ -1088,6 +1088,23 @@ function redactJsonPayload(
   try {
     parsed = JSON.parse(trimmed);
   } catch {
+    // A stream of complete JSON records is data too. Validate every line before
+    // rewriting any of them; malformed/truncated documents retain fail-closed handling.
+    const lines = value.split("\n");
+    if (lines.filter(line => line.trim()).length > 1) {
+      try {
+        const records = lines.map(line => line.trim() ? JSON.parse(line) : undefined);
+        if (records.every(row => row === undefined || row !== null && typeof row === "object")) {
+          let redacted = false;
+          const text = records.map((row, index) => {
+            if (row === undefined || !redactJsonTree(row)) return lines[index];
+            redacted = true;
+            return JSON.stringify(row);
+          }).join("\n");
+          return { text, redacted };
+        }
+      } catch { /* Continue with the malformed document policy below. */ }
+    }
     return mentionsSensitiveKey(trimmed)
       ? { text: REDACTED, redacted: true }
       : null;
@@ -1103,6 +1120,12 @@ function redactJsonPayload(
 }
 
 /** Redact values under sensitive keys anywhere in a parsed JSON tree, in place. */
+export function isSensitiveDataKey(key: string, value: unknown): boolean {
+  // This Kubernetes setting describes token mounting; it is not token material.
+  if (key === "automountServiceAccountToken" && typeof value === "boolean") return false;
+  return value !== null && isSensitiveKeyName(key);
+}
+
 function redactJsonTree(node: unknown): boolean {
   if (Array.isArray(node)) {
     let redacted = false;
@@ -1121,7 +1144,7 @@ function redactJsonTree(node: unknown): boolean {
   for (const key of Object.keys(obj)) {
     const value = obj[key];
     // A sensitive key protects scalars as well as nested structures.
-    if (isSensitiveKeyName(key) && value !== null) {
+    if (isSensitiveDataKey(key, value)) {
       obj[key] = REDACTED;
       redacted = true;
       continue;

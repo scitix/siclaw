@@ -98,6 +98,47 @@ print("parallel-python-ok")
         out, _ = self.run_script('test -z "$FAKE_PRODUCTION_SECRET" && printf "shell works\\n"', "shell")
         self.assertEqual(out, "shell works\n")
 
+    def test_killed_client_large_reply_does_not_block_nine_peers_or_reuse_stale_reply(self):
+        import signal
+        pending = []
+        def respond(call):
+            if call["arguments"]["index"] == 10:
+                return {"id": call["id"], "result": 10}
+            pending.append(call)
+            if len(pending) != 10:
+                return None
+            abandoned = next(c for c in pending if c["arguments"]["index"] == 0)
+            os.kill(abandoned["arguments"]["pid"], signal.SIGKILL)
+            return [{"id": abandoned["id"], "result": "x" * 90000}] + [
+                {"id": c["id"], "result": c["arguments"]["index"]} for c in pending if c is not abandoned]
+        out, calls = self.run_script('''import multiprocessing, os
+from siclaw import call
+def query(index):
+    result = call("test.echo", {"index": index, "pid": os.getpid()})
+    assert result == index
+workers = [multiprocessing.get_context("fork").Process(target=query, args=(i,)) for i in range(10)]
+for worker in workers: worker.start()
+for worker in workers: worker.join(4)
+assert workers[0].exitcode == -9
+assert all(worker.exitcode == 0 for worker in workers[1:])
+assert call("test.echo", {"index": 10}) == 10
+print("nine-peers-and-reuse-ok")
+''', responder=respond)
+        self.assertEqual(len(calls), 11)
+        self.assertEqual(out, "nine-peers-and-reuse-ok\n")
+
+    def test_sdk_exposes_execution_state_without_automatic_retry(self):
+        out, calls = self.run_script('''from siclaw import call, ToolError
+try:
+    call("test.echo", {})
+except ToolError as error:
+    assert error.code == "TARGET_BUSY" and error.execution == "NOT_DISPATCHED"
+    assert error.retry_after_ms == 1000
+    print("typed-error-ok")
+''', responder=lambda c: {"id": c["id"], "error": "busy", "code": "TARGET_BUSY", "execution": "NOT_DISPATCHED", "retry_after_ms": 1000})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out, "typed-error-ok\n")
+
     def test_normal_eof_is_not_a_protocol_failure(self):
         for _ in range(10):
             out, _ = self.run_script('print("ok")')

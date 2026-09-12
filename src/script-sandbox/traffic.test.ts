@@ -1,10 +1,51 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { SandboxTrafficGate, TRAFFIC_LEASE_MS } from "./traffic.js";
+import { SandboxTrafficGate, TRAFFIC_LEASE_MS, RemoteScriptTraffic, TRAFFIC_ACQUIRE, TRAFFIC_RELEASE, TRAFFIC_INFO } from "./traffic.js";
 
 afterEach(() => vi.useRealTimers());
 const cluster = "cluster:" + "a".repeat(64);
 const request = (keys = [cluster], user = "user") => ({ id: randomUUID(), keys, user });
+
+it("cancellation fences late admission and cannot cancel another Runtime's request", async () => {
+  const gate = new SandboxTrafficGate();
+  const pending = request();
+  gate.release(pending.id, "owner");
+  await expect(gate.acquire(pending, "owner")).rejects.toThrow();
+  expect(() => gate.release(pending.id, "foreign")).toThrow();
+});
+
+it.each(["lost-reply", "abort-before-acquire"])("remote admission recovers %s without consuming a target slot", async mode => {
+  const gate = new SandboxTrafficGate(1);
+  let entered!: () => void, proceed!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  const delayed = new Promise<void>(r => { proceed = r; });
+  const rpc = { request: vi.fn(async (method: string, params: Record<string, unknown>) => {
+    if (method === TRAFFIC_INFO) return { version: 1 };
+    if (method === TRAFFIC_RELEASE) { gate.release(String(params.id), "runtime"); return { ok: true }; }
+    if (method === TRAFFIC_ACQUIRE) {
+      if (mode === "abort-before-acquire") { entered(); await delayed; }
+      await gate.acquire(params, "runtime");
+      throw new Error("lost reply");
+    }
+    throw new Error("unexpected method");
+  }) };
+  const controller = new AbortController();
+  const attempt = new RemoteScriptTraffic(rpc).acquire([cluster], "user", controller.signal);
+  const check = expect(attempt).rejects.toThrow();
+  if (mode === "abort-before-acquire") { await started; controller.abort(); }
+  await check;
+  proceed();
+  await new Promise(r => setTimeout(r, 0));
+  await expect(gate.acquire(request(), "other")).resolves.toHaveProperty("lease_id");
+  expect(rpc.request).toHaveBeenCalledWith(TRAFFIC_RELEASE, expect.anything(), 3000);
+});
+
+it("an unsupported coordinator fails before acquiring rather than reporting target congestion", async () => {
+  const rpc = { request: vi.fn().mockRejectedValue(new Error("unknown method")) };
+  await expect(new RemoteScriptTraffic(rpc).acquire([cluster], "u", new AbortController().signal))
+    .rejects.toMatchObject({ code: "UNSUPPORTED_PROTOCOL", execution: "NOT_DISPATCHED" });
+  expect(rpc.request).toHaveBeenCalledTimes(1);
+});
 
 it("shares backend capacity across Runtime owners, queues fairly and retains uncertain leases", async () => {
   vi.useFakeTimers();

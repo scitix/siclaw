@@ -18,6 +18,8 @@ export interface ScriptResult {
   exit_code: number | null;
   stdout: string;
   stderr: string;
+  notices?: string[];
+  cleanup?: "not_required" | "confirmed" | "pending";
   output_truncated: boolean;
   network_isolation: boolean;
   tool_calls: number;
@@ -30,6 +32,8 @@ export interface ScriptPrincipal {
   /** Trusted callback grant: never log or forward to runner. */
   callbackToken?: string;
   runId?: string;
+  /** Trusted absolute script deadline, established only after runner readiness. */
+  deadlineMs?: number;
   agentId: string;
   userId: string;
   sessionId: string;

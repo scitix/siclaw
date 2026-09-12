@@ -21,6 +21,16 @@ async function request(api: ReturnType<typeof createScriptSandboxApi>, method: s
 
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); });
 describe("Runtime sandbox deployment gate", () => {
+  it("disabled K8s ignores malformed provider, limits and inaccessible policy files", async () => {
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_ENABLED", "false");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVIDER", "invalid");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_MAX_TIMEOUT_SECONDS", "900");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_MCP_POLICY_FILE", "/nonexistent/private-policy");
+    const api = createScriptSandboxApi("k8s", { request: vi.fn() });
+    expect((await request(api, "GET")).body.enabled).toBe(false);
+    expect(constructed.k8s).not.toHaveBeenCalled();
+    await api.shutdown();
+  });
   it.each(["k8s", "e2b", "docker", "invalid"])("local ignores enabled %s configuration before loading credentials or creating providers", async provider => {
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_ENABLED", "true");
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVIDER", provider);

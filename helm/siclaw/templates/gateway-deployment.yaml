@@ -26,6 +26,10 @@ spec:
       {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 6 }}
   template:
     metadata:
+      {{- if .Values.scriptSandbox.enabled }}
+      annotations:
+        checksum/script-policy: {{ include (print $.Template.BasePath "/script-sandbox.yaml") . | sha256sum }}
+      {{- end }}
       labels:
         {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 8 }}
     spec:

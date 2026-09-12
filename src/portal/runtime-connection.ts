@@ -20,6 +20,7 @@ import { isErrorDetail, type ErrorDetail } from "../lib/error-envelope.js";
 
 export interface RpcResult {
   ok: boolean;
+  transport?: "NOT_DISPATCHED" | "REPLIED" | "UNKNOWN";
   payload?: unknown;
   /** Backward-compatible human message for existing Portal callers. */
   error?: string;
@@ -31,6 +32,7 @@ interface PendingRpc {
   ws: WebSocket;
   resolve: (result: RpcResult) => void;
   timer: ReturnType<typeof setTimeout>;
+  trackTransport?: boolean;
 }
 
 type EventHandler = (data: unknown) => void;
@@ -107,6 +109,7 @@ export function createConnectionMap(): RuntimeConnectionMap {
         const errorDetail = isErrorDetail(msg.error) ? msg.error : undefined;
         entry.resolve({
           ok: !!msg.ok,
+          ...(entry.trackTransport ? { transport: "REPLIED" as const } : {}),
           payload: msg.payload,
           error: typeof msg.error === "string" ? msg.error : errorDetail?.message,
           ...(errorDetail ? { errorDetail } : {}),
@@ -181,19 +184,20 @@ export function createConnectionMap(): RuntimeConnectionMap {
 
   async function dispatch(agentId: string, method: string, params: unknown, timeoutMs: number, exact: boolean): Promise<RpcResult> {
     const ws = getWs(agentId, exact);
-    if (!ws) return { ok: false, error: `Agent ${agentId} is not connected` };
+    const trackTransport = method === "sandbox.tool";
+    if (!ws) return { ok: false, error: `Agent ${agentId} is not connected`, ...(trackTransport ? { transport: "NOT_DISPATCHED" as const } : {}) };
     const id = crypto.randomUUID();
     const frame = JSON.stringify({ type: "req", id, method, params });
     return new Promise<RpcResult>((resolve) => {
       const timer = setTimeout(() => {
         pending.delete(id);
-        resolve({ ok: false, error: `RPC ${method} timed out after ${timeoutMs}ms` });
+        resolve({ ok: false, error: `RPC ${method} timed out after ${timeoutMs}ms`, ...(trackTransport ? { transport: "UNKNOWN" as const } : {}) });
       }, timeoutMs);
       timer.unref?.();
-      pending.set(id, { ws, resolve, timer });
+      pending.set(id, { ws, resolve, timer, trackTransport });
       try { ws.send(frame); } catch {
         clearTimeout(timer); pending.delete(id);
-        resolve({ ok: false, error: "Runtime connection unavailable" });
+        resolve({ ok: false, error: "Runtime connection unavailable", ...(trackTransport ? { transport: "UNKNOWN" as const } : {}) });
       }
     });
   }

@@ -54,6 +54,30 @@ describe("script contract", () => {
 });
 
 describe("runner lifecycle", () => {
+  it("sanitizes final script stdout and stderr with the shared document pipeline", async () => {
+    const c = channel();
+    c.stdin.on("data", () => {
+      emit(c, { type: "stdout", data: Buffer.from('{"password":"private-input","count":3}').toString("base64") });
+      emit(c, { type: "stderr", data: Buffer.from("-----BEGIN PRIVATE KEY-----\nprivate-body\n-----END PRIVATE KEY-----").toString("base64") });
+      emit(c, { type: "exit", code: 0 });
+    });
+    const result = await new ScriptSandboxService(config(), { start: async () => c }, broker()).run(request, principal());
+    expect(result.status).toBe("completed");
+    expect(JSON.parse(result.stdout).count).toBe(3);
+    expect(JSON.stringify(result)).not.toMatch(/private-input|private-body/);
+    expect(result.notices?.length).toBeGreaterThan(0);
+  });
+  it.each([false, true])("a terminated idle instance is closed even if its channel rejects=%s", async rejects => {
+    let done!: () => void;
+    const c = channel();
+    c.done = new Promise((resolve, reject) => { done = () => rejects ? reject(new Error("disconnected")) : resolve(null); });
+    const pool = new ScriptSandboxPool({ start: async () => c }, config());
+    await pool.waitForWarmup();
+    done();
+    await vi.waitFor(() => expect(c.close).toHaveBeenCalledOnce());
+    await pool.shutdown();
+    expect(c.close).toHaveBeenCalledOnce();
+  });
   it("authorizes before starting and bounds stdout without corrupting UTF-8", async () => {
     const c = channel(); const b = broker();
     const start = vi.fn(async () => { expect(b.authorize).toHaveBeenCalledOnce(); return c; });
@@ -165,15 +189,17 @@ describe("runner lifecycle", () => {
     expect(await running).toBe(c);
     await c.close(); await pool.shutdown();
   });
-  it("retires an incompatible idle profile before a cold request needs its Pod slot", async () => {
+  it("keeps the configured warm profile across occasional requests for another profile", async () => {
     const standard = channel("standard");
     const start = vi.fn(async (_id: string, isolated: boolean) => {
-      if (isolated) expect(standard.close).toHaveBeenCalledOnce();
+      if (isolated) expect(standard.close).not.toHaveBeenCalled();
       return isolated ? channel("isolated") : standard;
     });
     const pool = new ScriptSandboxPool({ start }, config()); await pool.waitForWarmup();
     const isolated = await pool.start("foreground", true, 30, new AbortController().signal);
     expect(isolated.instanceId).toBe("isolated");
+    expect((await pool.start("standard", false, 30, new AbortController().signal)).instanceId).toBe("standard");
+    await standard.close();
     await isolated.close(); await pool.shutdown();
   });
   it("joins in-flight prewarming without a competing Pod or misleading warm timing", async () => {

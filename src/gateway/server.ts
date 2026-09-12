@@ -997,6 +997,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await incrementMessageCount(sessionId);
       } catch (persistErr) {
         if (requireSessionPersistence) {
+          releaseSandboxTurn();
           unregisterPendingStart(sessionId, turnAbort);
           dropLiveTurn(sessionId, turnId);
           delegatedTurns.delete(turnId);

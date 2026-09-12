@@ -2432,7 +2432,8 @@ describe("sandbox callback authentication", () => {
       session_id: "sandbox-session", callback_token: "a".repeat(64),
       arguments: { cluster: "prod", command: "kubectl get nodes" },
     });
-    expect(r.status).toBe(403);
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ protocol: 1, ok: false, code: "UNAUTHORIZED", execution: "NOT_DISPATCHED" });
   });
 
   it("requires a trusted CA as well as Runtime OU, while preserving certificate-free health probes", async () => {
