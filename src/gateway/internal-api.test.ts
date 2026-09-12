@@ -1162,6 +1162,17 @@ describe("handleDelegationEvents", () => {
             },
             { index: 1, status: "skipped" },
           ],
+          targetCoverage: {
+            artifact_id: "inventory",
+            total: 2,
+            offset: 0,
+            selected: 2,
+            next_offset: null,
+            target_ids: ["node-a", "node-b"],
+            outcomes: { "node-a": "done", "node-b": "done", injected: "secret" },
+            snapshot_complete: true,
+            apiKey: "sk-coverage-leak",
+          },
         },
       }))),
       asRes(res),
@@ -1176,7 +1187,19 @@ describe("handleDelegationEvents", () => {
 
     expect(metadata.item_statuses[0].tier).toEqual({ source: "request", resolvedTier: "fast" });
     expect(metadata.item_statuses[1]).toEqual({ index: 1, status: "skipped" });
+    expect(metadata.target_coverage).toEqual({
+      artifact_id: "inventory",
+      total: 2,
+      offset: 0,
+      selected: 2,
+      next_offset: null,
+      target_ids: ["node-a", "node-b"],
+      outcomes: { "node-a": "done", "node-b": "done" },
+      snapshot_complete: true,
+    });
     expect(raw).not.toContain("sk-group-leak");
+    expect(raw).not.toContain("sk-coverage-leak");
+    expect(raw).not.toContain("injected");
   });
 
   it("delivers background assistant messages to a registered channel even when Portal has no chat session", async () => {

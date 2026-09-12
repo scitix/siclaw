@@ -42,6 +42,7 @@ import type {
   DelegationToolUpdatePayload,
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
+import { sanitizeWireTargetCoverage } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload, PromSampleGroup } from "../shared/metrics-types.js";
 
 /** Read + JSON-parse an HTTP request body. */
@@ -705,6 +706,10 @@ async function appendDelegationEvent(
     ...(() => {
       const items = sanitizeWireItemStatuses(evt.itemStatuses);
       return items ? { item_statuses: items } : {};
+    })(),
+    ...(() => {
+      const coverage = sanitizeWireTargetCoverage(evt.targetCoverage);
+      return coverage ? { target_coverage: coverage } : {};
     })(),
     ...(() => {
       const tier = sanitizeWireTierOutcome(evt.tier);

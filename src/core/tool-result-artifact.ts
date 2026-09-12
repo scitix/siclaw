@@ -318,6 +318,12 @@ export class ToolResultArtifactStore {
     }
   }
 
+  /** Runtime-only full read; preserves the same scope, integrity, TTL and quota checks as read(). */
+  async readFull(id: string): Promise<{ text: string; toolName: string }> {
+    const { metadata, text } = await this.load(id);
+    return { text, toolName: metadata.toolName };
+  }
+
   async read(id: string, offset = 0, limit = DEFAULT_READ_CHARS): Promise<ToolResultArtifactReadResult> {
     const { metadata, text } = await this.load(id);
     const safeOffset = safeInteger(offset, 0, 0, text.length);

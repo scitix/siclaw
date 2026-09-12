@@ -94,6 +94,7 @@ export interface CreateSiclawSessionOpts {
   harnessResolved?: boolean;
   /** Persisted Agent-owned addendum; built-in type contracts are compiled separately. */
   systemPromptAppend?: string;
+  subagentPrompt?: string;
   /** Legacy platform-template override for standalone callers; not an Agent setting. */
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
@@ -403,6 +404,8 @@ export async function createSiclawSession(
     memoryConfigured: isMemoryEnabled(),
     mode,
     agentPrompt: opts?.systemPromptAppend,
+    subagentPrompt: opts?.subagentPrompt,
+    isSubagent: opts?.isSubagent,
     systemPromptTemplate: opts?.systemPromptTemplate,
     handoffPolicy: opts?.handoffPolicy,
     handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent),
@@ -533,6 +536,7 @@ export async function createSiclawSession(
       handoffPolicy: opts?.handoffPolicy,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
+      readToolResult: async (id) => (await toolResultArtifactStore.readFull(id)).text,
       // Channels currently deliver one foreground response. Do not advertise
       // background launches until they support an owned, resumable delivery lifecycle.
       foregroundSubagentOnly: mode === "channel",

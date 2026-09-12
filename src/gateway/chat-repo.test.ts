@@ -245,6 +245,17 @@ describe("appendDelegationEvent", () => {
         { index: -1, status: "done" },
         { index: 1, status: "running" },
       ],
+      targetCoverage: {
+        artifact_id: "inventory",
+        total: 2,
+        offset: 0,
+        selected: 2,
+        next_offset: null,
+        target_ids: ["node-a", "node-b"],
+        outcomes: { "node-a": "done", "node-b": "done", injected: "secret" },
+        snapshot_complete: true,
+        apiKey: "sk-coverage-leak",
+      },
     } as never);
 
     const raw = fake.calls[0].params.metadata as string;
@@ -260,10 +271,22 @@ describe("appendDelegationEvent", () => {
     // A negative index and a non-terminal status are both refused: this record is
     // read back to render a UI.
     expect(metadata.item_statuses).toEqual([{ index: 0, status: "done", tier: { source: "env" } }]);
+    expect(metadata.target_coverage).toEqual({
+      artifact_id: "inventory",
+      total: 2,
+      offset: 0,
+      selected: 2,
+      next_offset: null,
+      target_ids: ["node-a", "node-b"],
+      outcomes: { "node-a": "done", "node-b": "done" },
+      snapshot_complete: true,
+    });
     expect(raw).not.toContain("apiKey");
     expect(raw).not.toContain("sk-must-not-persist");
     expect(raw).not.toContain("sk-group-leak");
     expect(raw).not.toContain("internal diagnostic");
+    expect(raw).not.toContain("sk-coverage-leak");
+    expect(raw).not.toContain("injected");
   });
 
   it("persists a model-compatible synthetic event with UI-distinguishing metadata", async () => {
