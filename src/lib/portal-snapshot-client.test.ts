@@ -1,5 +1,5 @@
 /**
- * Unit tests for the TUI-side Portal snapshot client.
+ * Unit tests for the CLI-side Portal snapshot client.
  *
  * Uses a temporary cwd + a short-lived http.Server as the fake Portal so we
  * exercise the real secrets-read -> header-auth -> fetch -> parse path
@@ -144,7 +144,7 @@ describe("tryLoadPortalSnapshot", () => {
 
   it("returns null when the secrets file is from an older version with no cliSnapshotSecret", async () => {
     // Old `.siclaw/local-secrets.json` (pre cli-snapshot-secret split) should
-    // degrade gracefully — TUI falls back to settings.json rather than sending
+    // degrade gracefully — CLI falls back to settings.json rather than sending
     // a bogus empty header that Portal would 401 on.
     writeSecrets(cwd, { cliSnapshotSecret: null });
     const portal = await startFakePortal({ validateSnapshotSecret: true });

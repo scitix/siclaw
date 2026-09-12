@@ -49,6 +49,36 @@ describe("chat result text capacity", () => {
   });
 });
 
+describe("widenColumn for structured preview metadata", () => {
+  it.each(["tinytext", "text", "mediumtext", "longtext", "json"])("handles existing MySQL %s without narrowing legacy JSON", async initialType => {
+    let columnType = initialType;
+    const queries: Array<{ sql: string }> = [];
+    const db = {
+      driver: "mysql",
+      query: async (sql: string) => {
+        queries.push({ sql });
+        if (sql.includes("SELECT COLUMN_NAME")) return [[{ COLUMN_NAME: "metadata" }], undefined];
+        if (sql.includes("SELECT COLUMN_TYPE")) return [[{ COLUMN_TYPE: columnType }], undefined];
+        if (sql.startsWith("ALTER TABLE")) columnType = "longtext";
+        return [[], undefined];
+      },
+    } as unknown as Db;
+    for (let i = 0; i < 2; i++) {
+      await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
+    }
+    expect(alters(queries).map(q => q.sql)).toEqual(["longtext", "json"].includes(initialType) ? [] : [
+      "ALTER TABLE `chat_messages` MODIFY COLUMN `metadata` LONGTEXT DEFAULT NULL",
+    ]);
+  });
+
+  it("leaves SQLite storage unchanged", async () => {
+    const queries: string[] = [];
+    const db = { driver: "sqlite", query: async (sql: string) => { queries.push(sql); } } as unknown as Db;
+    await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
+    expect(queries).toEqual([]);
+  });
+});
+
 describe("setColumnDefault", () => {
   it("corrects a legacy default on an existing MySQL table", async () => {
     const { db, queries } = fakeMysql("65536");

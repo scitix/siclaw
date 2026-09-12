@@ -12,7 +12,7 @@ Siclaw is an AI-powered SRE copilot for Kubernetes diagnostics.
 One agent core supports three runtime shapes:
 
 ```text
-TUI: single-user terminal, optionally paired with local Portal
+Headless CLI: non-interactive diagnostic invocation, optionally paired with local Portal
 Gateway + LocalSpawner: local multi-user dev, one process/shared filesystem
 Gateway + K8sSpawner: production, one isolated pod per user
 ```
@@ -47,8 +47,10 @@ snapshot, K8s/Docker/Helm, or user-facing workflows.
   skill directories such as global/skillset/user trees.
 - Core skills are baked into the Docker image. Workspace skill bundles should
   include only selected global/dev/personal skills.
-- TUI plus local Portal uses Portal as a read-only snapshot source. TUI startup
-  must tolerate missing or unauthorized Portal snapshot access.
+- Headless CLI uses local Portal as a read-only snapshot source. Unscoped
+  invocations tolerate unavailable snapshot access; a selected agent must load
+  successfully. Snapshot caches are private to each invocation, including empty
+  resource sets, and cleanup must never touch another invocation.
 - Shell execution security is layered: OS-level isolation first, whitelist-only
   command validation second, plus pre/post execution sanitization.
 - Portal/Gateway DB and Memory DB are separate persistence domains. Do not mix

@@ -43,8 +43,8 @@ help: ## Show this help
 # ==================== Development ====================
 ##@ Development
 
-tui: ## Run TUI agent (interactive terminal)
-	npx tsx src/cli-main.ts
+local: ## Run the local Web UI (Portal + Runtime + SQLite)
+	npx tsx src/cli-local.ts
 
 runtime: ## Run Agent Runtime (multi-user, local spawner)
 	npx tsx src/gateway-main.ts
@@ -55,7 +55,7 @@ portal: ## Run Portal server (standalone web UI + management)
 portal-web: ## Run Portal frontend dev server
 	cd portal-web && npm run dev
 
-dev: tui ## Alias for tui
+dev: local ## Alias for local
 
 dev-all: ## Run Runtime + Portal together (use in two terminals)
 	@echo "Terminal 1: make runtime"
@@ -66,7 +66,7 @@ dev-all: ## Run Runtime + Portal together (use in two terminals)
 ##@ Build
 
 build: ## Compile TypeScript
-	npx tsc --project tsconfig.json
+	npm run build
 
 build-portal-web: ## Compile Portal frontend (Vite)
 	cd portal-web && npm install && npm run build
@@ -122,7 +122,7 @@ push-kbc: ## Push KB compile-box image siclaw-kbc-box
 test: typecheck unit ## Type check + unit tests
 
 typecheck: ## Type check (no emit)
-	npx tsc --project tsconfig.json --noEmit
+	npm run build --noEmit
 
 unit: ## Run unit tests
 	npx vitest run
@@ -175,7 +175,7 @@ clean: ## Remove build artifacts
 	rm -rf dist *.tsbuildinfo portal-web/dist
 
 # ── All targets are phony (no file outputs) ──
-.PHONY: help tui runtime portal portal-web dev dev-all \
+.PHONY: help local runtime portal portal-web dev dev-all \
 	build build-portal-web \
 	docker docker-runtime docker-agentbox docker-portal docker-script-sandbox \
 	push push-runtime push-agentbox push-portal push-script-sandbox \

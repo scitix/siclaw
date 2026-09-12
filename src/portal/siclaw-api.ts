@@ -6,6 +6,7 @@
  * a pure execution engine that never touches these tables.
  */
 
+import { historyColumns, historyContentSql, historyMetadataSql, previewDetailContentSql } from "./skill-preview-storage.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -2274,6 +2275,17 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       return;
     }
 
+    // Single-message detail uses exactly the same session ownership gate as history.
+    if (query.message_id) {
+      const [rows] = await db.query(
+        `SELECT ${historyColumns(previewDetailContentSql(db))}, ${historyMetadataSql(db, true)} AS metadata FROM chat_messages WHERE session_id = ? AND id = ? AND ${transcriptVisiblePredicate(db)} LIMIT 1`,
+        [params.sid, query.message_id],
+      ) as any;
+      for (const row of rows) row.metadata = safeParseJson(row.metadata, null);
+      sendJson(res, 200, { data: rows, total: rows.length, page: 1, page_size: 1 });
+      return;
+    }
+
     // Rows the transcript never renders are excluded IN THE QUERY, not filtered
     // client-side, and the count uses the same predicate so pagination stays
     // consistent with what comes back.
@@ -2298,7 +2310,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       db.query(
         // Fetch newest N messages (DESC + LIMIT), then reverse in app to get chronological order.
         // This ensures page=1 returns the most recent messages (for initial load at bottom of chat).
-        `SELECT * FROM chat_messages WHERE session_id = ? AND ${visibleRows}` +
+        `SELECT ${historyColumns()}, ${historyMetadataSql(db)} AS metadata FROM chat_messages WHERE session_id = ? AND ${visibleRows}` +
           " ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
         [params.sid, pageSize, offset],
       ),
@@ -4216,7 +4228,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // buildPilotMessages pipeline and render identically to the live chat. Order
     // chronological (oldest first) — buildPilotMessages expects that.
     const [mRows] = await db.query(
-      `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, metadata,
+      `SELECT id, role, ${historyContentSql()} AS content, tool_name, tool_input, outcome, duration_ms, ${historyMetadataSql(db)} AS metadata,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE session_id = ?
        ORDER BY created_at ASC, id ASC LIMIT ?`,

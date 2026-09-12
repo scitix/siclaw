@@ -13,7 +13,7 @@ export interface LocalSecrets {
   portalSecret: string;
   /**
    * Dedicated secret for the `/api/v1/cli-snapshot` endpoint. Kept separate
-   * from `jwtSecret` so the TUI doesn't have to self-sign an admin JWT
+   * from `jwtSecret` so the CLI doesn't have to self-sign an admin JWT
    * (which would authenticate against every other admin route) just to
    * read the snapshot.
    */

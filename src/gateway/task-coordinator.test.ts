@@ -189,23 +189,47 @@ describe("TaskCoordinator.start + stop", () => {
     coord.stop();
   });
 
-  it("syncFromAdapter cancels jobs that are no longer active", async () => {
-    const { coord, frontend } = makeCoord();
-    frontend.responses.set("task.listActive", {
-      data: [
-        { id: "t1", agent_id: "a", name: "X", description: null,
-          schedule: "*/5 * * * *", prompt: "p", status: "active",
-          created_by: "u1", last_run_at: null, last_result: null },
-      ],
-    });
-    await coord.start();
-    // Second sync drops t1
-    frontend.responses.set("task.listActive", { data: [] });
-    // Trigger a manual sync via private call — use fireNow to return not_found
-    frontend.responses.set("task.fireNow", { outcome: "not_found" });
-    const outcome = await coord.fireNow("t1-removed");
-    expect(outcome.kind).toBe("not_found");
-    coord.stop();
+  it("reconciliation forgets a removed task even while its fire has no timer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 8, 10));
+    const { coord, frontend } = makeCoord({ syncIntervalMs: 90_000, executionTimeoutMs: 300_000 });
+    let finish!: (value: any) => void;
+    const pending = new Promise<any>(resolve => { finish = resolve; });
+    vi.mocked(consumeAgentSse).mockImplementationOnce(() => pending);
+    bindingResponder.result = { modelProvider: "p", modelId: "m" };
+    frontend.responses.set("task.listActive", { data: [{
+      id: "t1", agent_id: "a", name: "X", schedule: "* * * * *",
+      prompt: "p", status: "active", created_by: "u1",
+    }] });
+    frontend.responses.set("task.getStatus", { status: "active" });
+    try {
+      await coord.start();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(frontend.calls.filter(c => c.method === "task.runStart")).toHaveLength(1);
+      frontend.responses.set("task.listActive", { data: [] });
+      await vi.advanceTimersByTimeAsync(30_000); // reconcile while the run is pending
+      finish({ resultText: "done", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 30_000 });
+      await vi.advanceTimersByTimeAsync(150_000);
+      expect(frontend.calls.filter(c => c.method === "task.getStatus")).toHaveLength(1);
+      expect(frontend.calls.filter(c => c.method === "task.runFinalize")).toHaveLength(1);
+    } finally { finish({}); coord.stop(); vi.useRealTimers(); }
+  });
+
+  it.each([null, "paused"])("cancels a task immediately when the status precheck returns %s", async (status) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 8, 10));
+    const { coord, frontend, mgr } = makeCoord({ syncIntervalMs: 60 * 60_000 });
+    frontend.responses.set("task.listActive", { data: [{
+      id: "t1", agent_id: "a", name: "X", schedule: "* * * * *",
+      prompt: "p", status: "active", created_by: "u1",
+    }] });
+    frontend.responses.set("task.getStatus", { status });
+    try {
+      await coord.start();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(frontend.calls.filter(c => c.method === "task.getStatus")).toHaveLength(1);
+      expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    } finally { coord.stop(); vi.useRealTimers(); }
   });
 });
 

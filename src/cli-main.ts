@@ -2,92 +2,82 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   AgentSessionRuntime,
-  InteractiveMode,
   runPrintMode,
   SessionManager,
   type CreateAgentSessionRuntimeFactory,
 } from "@earendil-works/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
-import { TuiBackgroundHost } from "./core/tui-background-host.js";
-import { isMemoryEnabled, loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
-import { needsSetup } from "./cli-setup.js";
-import { runFirstRunSetup } from "./cli-first-run.js";
+import { CliBackgroundHost } from "./core/cli-background-host.js";
+import { isMemoryEnabled, loadConfig, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
+import { parseCliOptions, type CliOptions } from "./cli-options.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
-// topic-consolidator import removed — consolidation disabled
 import { debugPodCache } from "./tools/infra/debug-pod.js";
-import { tryLoadPortalSnapshot, loadPortalSnapshotDetailed } from "./lib/portal-snapshot-client.js";
-import { materializePortalSkills, cleanupPortalSkills } from "./lib/portal-skill-materializer.js";
-import { materializePortalKnowledge, cleanupPortalKnowledge } from "./lib/portal-knowledge-materializer.js";
-import { materializePortalCredentials, cleanupPortalCredentials } from "./lib/portal-credential-materializer.js";
-import { select, isCancel } from "@clack/prompts";
+import { type PortalSnapshot, loadPortalSnapshotDetailed } from "./lib/portal-snapshot-client.js";
+import { materializePortalSkills } from "./lib/portal-skill-materializer.js";
+import { materializePortalKnowledge } from "./lib/portal-knowledge-materializer.js";
+import { materializePortalCredentials } from "./lib/portal-credential-materializer.js";
+import { createPortalSnapshotCache } from "./lib/portal-snapshot-cache.js";
 
+// Reject missing input before probing Portal or starting any execution services.
+let options: CliOptions;
+try {
+  options = parseCliOptions(process.argv.slice(2));
+} catch (error) {
+  console.error(`[siclaw] ${error instanceof Error ? error.message : String(error)}`);
+  console.error("Run 'siclaw --help' for usage.");
+  process.exit(2);
+}
+const { prompt: initialMessage, continueSession, agent: explicitAgent } = options;
 
-// Parse arguments
-const args = process.argv.slice(2);
-const promptIndex = args.indexOf("--prompt");
-const initialMessage = promptIndex >= 0 ? args[promptIndex + 1] : undefined;
-const isPrintMode = args.includes("--print") || !!initialMessage;
-const continueSession = args.includes("--continue");
-const agentFlagIndex = args.indexOf("--agent");
-const explicitAgent: string | undefined = agentFlagIndex >= 0 ? args[agentFlagIndex + 1] : undefined;
+// There is no terminal UI to own cancellation. Dispose the active session
+// before exiting so its AbortSignal also kills foreground tool process groups.
+// Exit handlers below sweep snapshot credentials and background commands.
+let disposeActiveSession: (() => void) | undefined;
+const exitOnSignal = (code: number): void => {
+  try { disposeActiveSession?.(); } finally { process.exit(code); }
+};
+process.once("SIGINT", () => exitOnSignal(130));
+process.once("SIGTERM", () => exitOnSignal(143));
 
-// Portal snapshot: when a local Portal is running and has multiple agents
-// configured, resolve which agent to use BEFORE fetching the scoped snapshot.
-//   * --agent <name> flag             → use that (error if not found)
-//   * Portal has 0 agents             → unscoped snapshot (legacy behaviour)
-//   * Portal has 1 agent              → use it silently
-//   * Portal has 2+ agents + no flag  → interactive picker (print mode: err)
-let portalSnapshot: Awaited<ReturnType<typeof tryLoadPortalSnapshot>> = null;
+// A local Portal is an optional read-only configuration source. Selection is
+// deterministic: use --agent, auto-select a single agent, or report ambiguity.
+let portalSnapshot: PortalSnapshot | null = null;
 {
-  // First fetch unscoped to discover available agents + whether Portal is up.
-  const probe = await loadPortalSnapshotDetailed();
-  if (probe.snapshot) {
-    const agentCount = probe.snapshot.availableAgents.length;
-
-    let chosenAgent: string | undefined = explicitAgent;
-    if (!chosenAgent && agentCount >= 2) {
-      // `isTTY` is `true` when attached, `undefined` when piped/redirected —
-      // compare against `true` explicitly so the non-interactive branch is
-      // taken in both the undefined and false cases without relying on the
-      // coincidental truthiness of `!undefined`.
-      if (isPrintMode || process.stdin.isTTY !== true) {
-        console.error("[siclaw] Portal has multiple agents configured; pass --agent <name> in non-interactive mode.");
+  // An explicit agent must never silently fall back to another configuration.
+  // Only an unscoped invocation may continue without a local Portal.
+  let chosenAgent = explicitAgent;
+  if (!chosenAgent) {
+    const probe = await loadPortalSnapshotDetailed();
+    portalSnapshot = probe.snapshot;
+    if (probe.snapshot) {
+      const agentCount = probe.snapshot.availableAgents.length;
+      if (agentCount >= 2) {
+        console.error("[siclaw] Portal has multiple agents configured; pass --agent <name>.");
         console.error("Available agents:");
-        for (const a of probe.snapshot.availableAgents) {
-          console.error(`  ${a.name}${a.description ? ` — ${a.description}` : ""}`);
-        }
+        for (const agent of probe.snapshot.availableAgents) console.error(`  ${agent.name}`);
         process.exit(1);
       }
-      const picked = await select({
-        message: "Portal has multiple agents configured — which one?",
-        options: probe.snapshot.availableAgents.map((a) => ({
-          value: a.name,
-          label: a.name,
-          hint: a.description ?? undefined,
-        })),
-      });
-      if (isCancel(picked)) process.exit(0);
-      chosenAgent = picked as string;
-    }
-    if (!chosenAgent && agentCount === 1) {
-      chosenAgent = probe.snapshot.availableAgents[0].name;
-      console.log(`[siclaw] Using Portal agent: ${chosenAgent}`);
-    }
-
-    // Now fetch the (possibly scoped) snapshot we'll actually use.
-    if (chosenAgent) {
-      const scoped = await loadPortalSnapshotDetailed({ agent: chosenAgent });
-      if (scoped.error?.kind === "agent-not-found") {
-        console.error(`[siclaw] Agent "${scoped.error.requested}" not found in Portal.`);
-        console.error("Available agents:");
-        for (const name of scoped.error.available) console.error(`  ${name}`);
-        console.error("\nRun `siclaw agents` for more details.");
-        process.exit(1);
+      if (agentCount === 1) {
+        chosenAgent = probe.snapshot.availableAgents[0].name;
+        console.log(`[siclaw] Using Portal agent: ${chosenAgent}`);
       }
-      portalSnapshot = scoped.snapshot;
-    } else {
-      portalSnapshot = probe.snapshot;
     }
+  }
+  if (chosenAgent) {
+    const scoped = await loadPortalSnapshotDetailed({ agent: chosenAgent });
+    if (scoped.error?.kind === "agent-not-found") {
+      console.error(`[siclaw] Agent "${scoped.error.requested}" not found in Portal.`);
+      console.error("Available agents:");
+      for (const name of scoped.error.available) console.error(`  ${name}`);
+      console.error("\nRun `siclaw agents` for more details.");
+      process.exit(1);
+    }
+    if (!scoped.snapshot) {
+      console.error(`[siclaw] Cannot load Portal agent "${chosenAgent}" (${scoped.error?.kind ?? "snapshot-unavailable"}).`);
+      console.error("Start 'siclaw local' in this directory and verify Portal access, then retry.");
+      process.exit(1);
+    }
+    portalSnapshot = scoped.snapshot;
   }
 }
 let portalSkillsDir: string | undefined;
@@ -100,56 +90,36 @@ if (portalSnapshot) {
     modelRouting: portalSnapshot.modelRouting,
     mcpServers: portalSnapshot.mcpServers,
   });
-  // Materialize Portal skills into an ephemeral cache so pi-coding-agent's
-  // filesystem-based skill loader reads them unchanged. Only when the
-  // snapshot actually carries skills — empty array shouldn't clobber the
-  // regular filesystem fallback.
-  // Collect cleanup thunks so a single shutdown handler sweeps all three
-  // dirs. Registered on SIGINT + SIGTERM + exit — the `exit` listener is
-  // what covers the happy-path `process.exit(0)` case, so `.portal-snapshot/
-  // credentials/` (plaintext SSH keys + kubeconfigs) cannot outlive the
-  // session and end up in a stray `git add -A`.
-  const snapshotCleanups: Array<() => void> = [];
-  if (Array.isArray(portalSnapshot.skills) && portalSnapshot.skills.length > 0) {
-    const skillCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/skills");
+  // Each invocation owns its cache. Empty snapshots are authoritative too:
+  // never substitute ambient skills, knowledge or credentials for an agent.
+  // Register before materialization so partial snapshots are swept on startup
+  // failures or cancellation as well as normal exit.
+  const snapshotCache = createPortalSnapshotCache(process.cwd());
+  process.on("exit", snapshotCache.cleanup);
+  {
+    const skillCacheDir = path.join(snapshotCache.rootDir, "skills");
     const result = materializePortalSkills(portalSnapshot.skills, skillCacheDir);
     portalSkillsDir = result.rootDir;
-    snapshotCleanups.push(() => cleanupPortalSkills(skillCacheDir));
     console.log(`[siclaw] Materialized ${result.count} Portal skills into ${result.rootDir}${result.skipped.length ? ` (skipped ${result.skipped.length} with unsafe names: ${result.skipped.join(", ")})` : ""}`);
   }
-  if (Array.isArray(portalSnapshot.knowledge) && portalSnapshot.knowledge.length > 0) {
-    const knowledgeCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/knowledge");
+  {
+    const knowledgeCacheDir = path.join(snapshotCache.rootDir, "knowledge");
     const kres = materializePortalKnowledge(portalSnapshot.knowledge, knowledgeCacheDir);
     portalKnowledgeDir = kres.rootDir;
-    snapshotCleanups.push(() => cleanupPortalKnowledge(knowledgeCacheDir));
     const failureNote = kres.failures.length > 0
       ? ` (failures: ${kres.failures.map(f => `${f.repo}: ${f.error}`).join("; ")})`
       : "";
     console.log(`[siclaw] Materialized ${kres.reposUnpacked} Portal knowledge repo(s), ${kres.fileCount} page(s) into ${kres.rootDir}${failureNote}`);
   }
   const credsCount = (portalSnapshot.credentials?.clusters?.length ?? 0) + (portalSnapshot.credentials?.hosts?.length ?? 0);
-  if (credsCount > 0) {
-    const credsCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/credentials");
+  {
+    const credsCacheDir = path.join(snapshotCache.rootDir, "credentials");
     const cres = await materializePortalCredentials(portalSnapshot.credentials, credsCacheDir);
     portalCredentialsDir = cres.rootDir;
-    snapshotCleanups.push(() => cleanupPortalCredentials(credsCacheDir));
     const failureNote = cres.failures.length > 0
       ? ` (failures: ${cres.failures.map(f => `${f.kind}/${f.name}: ${f.error}`).join("; ")})`
       : "";
     console.log(`[siclaw] Materialized ${cres.clusters} cluster(s) + ${cres.hosts} host(s) into ${cres.rootDir}${failureNote}`);
-  }
-  if (snapshotCleanups.length > 0) {
-    let alreadySwept = false;
-    const sweepSnapshots = (): void => {
-      if (alreadySwept) return;
-      alreadySwept = true;
-      for (const fn of snapshotCleanups) {
-        try { fn(); } catch { /* best-effort; one dir failing shouldn't block the others */ }
-      }
-    };
-    process.on("exit", sweepSnapshots);
-    process.on("SIGINT", sweepSnapshots);
-    process.on("SIGTERM", sweepSnapshots);
   }
   const agentNote = portalSnapshot.activeAgent
     ? ` agent=${portalSnapshot.activeAgent.name}`
@@ -158,12 +128,13 @@ if (portalSnapshot) {
   console.log(`[siclaw] Portal snapshot providers=${Object.keys(portalSnapshot.providers).length} mcp=${Object.keys(portalSnapshot.mcpServers).length} skills=${portalSnapshot.skills.length} knowledge=${portalSnapshot.knowledge.length} creds=${credsCount} default=${portalSnapshot.default ? `${portalSnapshot.default.provider}/${portalSnapshot.default.modelId}` : "(none)"}`);
 }
 
-// P0: First-run setup — if no LLM config, run interactive wizard
-if (needsSetup()) {
-  const ok = await runFirstRunSetup();
-  if (!ok || needsSetup()) {
-    process.exit(1);
-  }
+// Headless runs must never wait for a provider picker or a credential prompt.
+if (!Object.values(loadConfig().providers).some((provider) => provider.apiKey)) {
+  console.error("[siclaw] No usable LLM provider configured.");
+  console.error(portalSnapshot
+    ? `[siclaw] Configure a model in ${portalSnapshot.portalUrl}/settings/models, then retry.`
+    : "[siclaw] Run 'siclaw local' and configure a model in the Web UI, or configure .siclaw/config/settings.json.");
+  process.exit(1);
 }
 
 // LLM config validation — warn early about issues
@@ -172,36 +143,27 @@ for (const w of llmWarnings) {
   console.warn(`[siclaw] ⚠ ${w}`);
 }
 
-const debugMode = args.includes("--debug") || loadConfig().debug;
+const debugMode = options.debug || loadConfig().debug;
 
 // Session
 const sessionManager = continueSession
   ? SessionManager.continueRecent(process.cwd())
   : SessionManager.create(process.cwd());
 
-// Resolve credentialsDir for kubectl + /setup + banner display. When a Portal
-// snapshot materialized credentials into an ephemeral dir, use THAT so the
-// banner count and tools all agree on the same source of truth.
+// Use the selected Portal credential snapshot consistently for this invocation.
 const config = loadConfig();
 const credentialsDir = portalCredentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir);
 
 // Orphaned debug pods self-clean via their Job's ttlSecondsAfterFinished — no GC needed.
 
-// Create session via shared factory. Opts are factored out so the runtime's
-// session-replacement factory (/new, /resume, /fork) can recreate an
-// equivalent siclaw session against a different SessionManager.
-// Background-job host for the TUI: owns the job registry and delivers completion
-// notifications back into the current session. Constructed before the session so its
-// executors can be injected; sessionRef is filled in once the session exists (and on
-// every session swap via createRuntime).
-const tuiBackgroundHost = new TuiBackgroundHost();
+// The headless invocation shares its agent factory and background execution
+// policy with the server modes. Shutdown must sweep detached child processes.
+const cliBackgroundHost = new CliBackgroundHost();
 // Background bash children are detached process-group leaders, so terminal SIGINT does
-// not reach them — sweep them on shutdown so they don't orphan in the host.
+// not reach them — sweep them on exit so they do not orphan in the host.
 {
-  const sweepJobs = () => tuiBackgroundHost.shutdown();
+  const sweepJobs = () => cliBackgroundHost.shutdown();
   process.on("exit", sweepJobs);
-  process.on("SIGINT", sweepJobs);
-  process.on("SIGTERM", sweepJobs);
 }
 
 const buildSiclawOpts = (sm: SessionManager) => ({
@@ -210,10 +172,9 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   kubeconfigRef: { credentialsDir },
   portalSkillsDir,
   portalKnowledgeDir,
-  portalCredentialsDir,
   // The Portal row owns agent identity/behaviour, while Siclaw keeps assembling
   // its platform prompt (safety, mode, skills/knowledge context) in every entry
-  // point. Match AgentBox semantics instead of replacing the full TUI template.
+  // point. Match AgentBox semantics without replacing the platform template.
   systemPromptAppend: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
   agentType: portalSnapshot?.activeAgent?.agentType ?? "sre",
   harnessResolved: true,
@@ -221,25 +182,24 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   // Standalone SRE null expands to the locked SRE capability set; only explicit
   // Custom null remains unrestricted.
   allowedTools: portalSnapshot?.activeAgent?.allowedTools ?? null,
-  portalActiveAgent: portalSnapshot?.activeAgent ?? null,
-  portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
-  portalUrl: portalSnapshot?.portalUrl,
-  // TUI background bash + job_stop. (No spawnSubagentExecutor → background sub-agents
-  // stay TUI-unavailable; that needs the agentbox child-session machinery.)
-  backgroundExecExecutor: tuiBackgroundHost.createBackgroundExecExecutor(),
-  jobStopExecutor: tuiBackgroundHost.createJobStopExecutor(),
-  taskOutputReader: tuiBackgroundHost.createTaskOutputReader(),
+  // CLI background commands and job_stop. Background sub-agents require the
+  // AgentBox child-session machinery and are not enabled in standalone runs.
+  backgroundExecExecutor: cliBackgroundHost.createBackgroundExecExecutor(),
+  jobStopExecutor: cliBackgroundHost.createJobStopExecutor(),
+  taskOutputReader: cliBackgroundHost.createTaskOutputReader(),
 });
 
-const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, knowledgeIndexer, mcpManager } =
+const { session, services, modelFallbackMessage, memoryIndexer, knowledgeIndexer, mcpManager } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
-tuiBackgroundHost.setSession(session);
+cliBackgroundHost.setSession(session);
+disposeActiveSession = () => session.dispose();
 
-// pi 0.73 drives the TUI through an AgentSessionRuntime rather than a bare
-// AgentSession. The factory recreates a full siclaw session on session switch.
+// The upstream print runner uses AgentSessionRuntime. Preserve the same
+// configuration if an extension recreates its session.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ sessionManager: sm }) => {
   const recreated = await createSiclawSession(buildSiclawOpts(sm));
-  tuiBackgroundHost.setSession(recreated.session);
+  cliBackgroundHost.setSession(recreated.session);
+  disposeActiveSession = () => recreated.session.dispose();
   return {
     session: recreated.session,
     services: recreated.services,
@@ -256,51 +216,7 @@ const runtime = new AgentSessionRuntime(
   modelFallbackMessage,
 );
 
-// P1-1: Startup status summary
-{
-  const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "package.json"), "utf-8"));
-  const llm = getDefaultLlm();
-  const providerEntries = Object.entries(loadConfig().providers);
-  const providerName = providerEntries.length > 0 ? providerEntries[0][0] : "none";
-  const modelName = llm ? (llm.model.name || llm.model.id) : "none";
-  // Count skills across all skill dirs
-  let skillCount = 0;
-  for (const dir of skillsDirs) {
-    try {
-      skillCount += fs.readdirSync(dir, { withFileTypes: true })
-        .filter((e) => (e.isDirectory() || e.isSymbolicLink()) && !e.name.startsWith("_")).length;
-    } catch { /* skip */ }
-  }
-  const memoryActive = isMemoryEnabled() && fs.existsSync(path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory"));
-
-  // Count credentials
-  let credCount = 0;
-  try {
-    const manifestPath = path.join(credentialsDir, "manifest.json");
-    if (fs.existsSync(manifestPath)) {
-      credCount = JSON.parse(fs.readFileSync(manifestPath, "utf-8")).length;
-    }
-  } catch { /* ignore */ }
-
-  const parts = [
-    `Siclaw v${pkg.version}`,
-    `Model: ${modelName} (${providerName})`,
-    `Skills: ${skillCount}`,
-    memoryActive ? "Memory: active" : "Memory: off",
-    `Credentials: ${credCount}`,
-  ];
-  console.log(parts.join(" | "));
-
-  if (credCount === 0) {
-    console.log("\n┌─────────────────────────────────────────────────┐");
-    console.log("│  No credentials configured.                     │");
-    console.log("│  Use /setup → Credentials to add kubeconfig,    │");
-    console.log("│  SSH keys, or API tokens for diagnostics.       │");
-    console.log("└─────────────────────────────────────────────────┘");
-  }
-}
-
-// Startup maintenance: purge stale investigations
+// Startup maintenance: preserve the standalone investigation retention policy.
 if (memoryIndexer) {
   const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   memoryIndexer.purgeStaleInvestigations(cliMemoryDir)
@@ -382,56 +298,38 @@ if (debugMode) {
   console.log(`[siclaw] Debug logging to ${logFile}`);
 }
 
-// Select run mode
-if (isPrintMode && initialMessage) {
-  await runPrintMode(runtime, {
-    mode: "text",
-    initialMessage,
-  });
-} else {
-  const mode = new InteractiveMode(runtime, { modelFallbackMessage });
+// The print runner owns stream completion and returns a nonzero status on failure.
+try {
+  process.exitCode = await runPrintMode(runtime, { mode: "text", initialMessage });
+} finally {
+  cliBackgroundHost.shutdown();
 
-  // Workaround: framework's getRegisteredToolDefinition only checks extension-registered
-  // tools via extensionRunner.getAllRegisteredTools(), missing SDK custom tools passed
-  // through createAgentSessionFromServices({ customTools }). Without this patch, custom
-  // tool output is captured by the LLM but never rendered in the interactive UI because
-  // the ToolExecutionComponent receives toolDefinition=undefined and skips all rendering.
-  const origGetDef = (mode as any).getRegisteredToolDefinition;
-  if (typeof origGetDef === "function") {
-    const customToolMap = new Map(customTools.map((t) => [t.name, t]));
-    const boundGetDef = origGetDef.bind(mode);
-    (mode as any).getRegisteredToolDefinition = (toolName: string) =>
-      boundGetDef(toolName) ?? customToolMap.get(toolName);
-  }
-
-  await mode.run();
-}
-
-// -- Cleanup on exit --
-// Auto-save session memory (mirrors AgentBox release flow)
-if (isMemoryEnabled() && session.sessionFile) {
-  const sessionDir = path.dirname(session.sessionFile);
-  const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
-  try {
-    const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
-    if (saved) {
-      console.log(`[siclaw] Session knowledge saved: ${saved.map(f => path.basename(f)).join(", ")}`);
+  // -- Cleanup on exit --
+  // Auto-save session memory (mirrors AgentBox release flow)
+  if (isMemoryEnabled() && session.sessionFile) {
+    const sessionDir = path.dirname(session.sessionFile);
+    const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
+    try {
+      const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
+      if (saved) {
+        console.log(`[siclaw] Session knowledge saved: ${saved.map(f => path.basename(f)).join(", ")}`);
+      }
+    } catch (err) {
+      console.warn(`[siclaw] Memory auto-save failed:`, err);
     }
-  } catch (err) {
-    console.warn(`[siclaw] Memory auto-save failed:`, err);
   }
-}
 
-// Clean up cached debug pods
-try { await debugPodCache.evictAll(); } catch { /* ignore */ }
-// Shutdown MCP connections
-if (mcpManager) {
-  try { await mcpManager.shutdown(); } catch { /* ignore */ }
-}
-// Close memory indexer
-if (memoryIndexer) {
-  try { memoryIndexer.close(); } catch { /* ignore */ }
-}
-if (knowledgeIndexer) {
-  try { knowledgeIndexer.close(); } catch { /* ignore */ }
+  // Clean up cached debug pods
+  try { await debugPodCache.evictAll(); } catch { /* ignore */ }
+  // Shutdown MCP connections
+  if (mcpManager) {
+    try { await mcpManager.shutdown(); } catch { /* ignore */ }
+  }
+  // Close memory indexer
+  if (memoryIndexer) {
+    try { memoryIndexer.close(); } catch { /* ignore */ }
+  }
+  if (knowledgeIndexer) {
+    try { knowledgeIndexer.close(); } catch { /* ignore */ }
+  }
 }

@@ -6,8 +6,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
 
 interface RequestInputParams {
@@ -26,8 +25,6 @@ export function createRequestInputTool(refs: ToolRefs): ToolDefinition {
   return {
     name: "request_input",
     label: "Request Input",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("request_input")), 0, 0),
-    renderResult: renderTextResult,
     description:
       `Ask ${recipient} for a human clarification you genuinely cannot proceed without. State ONE ` +
       "specific question. After calling this, STOP and end your turn — the answer will arrive as the next " +

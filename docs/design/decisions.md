@@ -1,10 +1,13 @@
 ---
+
 title: "Architecture Decision Records"
 sidebarTitle: "ADRs"
 description: "Key architectural decisions with context, rationale, and consequences."
 ---
 
 # Architecture Decision Records (ADR)
+
+> Runtime update (2026-09-10): Siclaw has removed its interactive terminal interface. References to TUI in earlier decisions describe the historical implementation. The retained non-interactive CLI and the migration contract are documented in ADR-020 below.
 
 > **Format**: Context → Decision → Consequences
 >
@@ -837,3 +840,39 @@ the private traffic RPCs. The gate counts SDK tool invocations, not all upstream
 HTTP traffic; ordinary Agent tools retain their existing limits. Endpoint aliases
 with different origins and upstream work surviving disconnection require
 operator/service-level controls. See `script-sandbox.md` for budgets and rollout.
+
+
+## ADR-020: Use Web UI for Interactive Work; Retain Headless CLI Execution
+
+**Date**: 2026-09-10
+
+**Decision**: Remove the interactive terminal runtime, setup wizard, terminal
+extensions, and custom terminal tool rendering. Use the Web UI for interactive
+investigations and configuration. Keep the shared agent engine available through
+`siclaw --prompt "..."` for a single diagnostic invocation.
+
+**Reason**: Maintaining a second interactive surface duplicates configuration,
+resource discovery, session controls, and tool presentation. Concentrating those
+workflows in Portal reduces maintenance while preserving scriptable diagnostics.
+
+**Consequences**:
+
+- Bare `siclaw` prints help. `siclaw local` starts the local Web UI.
+- `--continue` requires a new `--prompt`. `--print` remains accepted for scripts.
+- Missing providers or ambiguous agent selection produce a nonzero exit instead
+  of asking for input. Select Portal agents with `--agent <name>`.
+- Portal snapshots, standalone file configuration, credential materialization,
+  output sanitization, and background-command cleanup remain available to CLI runs.
+- A selected Portal agent must load successfully. Each invocation owns a private
+  snapshot root, including empty resource sets; cleanup never removes another
+  invocation's files. Background completions may join the active turn but cannot
+  wake an idle print session.
+- Prompt assembly discards obsolete terminal-only blocks in persisted templates.
+  Built-in skill preview guidance applies to Web/IM; CLI/task prompts omit
+  unavailable preview and sub-agent workflows.
+- DP activation and restoration remain available through Web/IM message markers;
+  terminal commands, shortcuts, and renderers are gone.
+- Direct terminal UI dependencies are removed. The upstream agent SDK may still
+  carry its own terminal packages transitively; Siclaw does not expose that UI.
+- Builds clear `dist/` before compiling, so removed terminal modules cannot leak
+  into packages built in an existing checkout.

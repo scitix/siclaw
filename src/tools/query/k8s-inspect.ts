@@ -26,9 +26,8 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolEntry } from "../../core/tool-registry.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { postExecSecurity, preExecSecurity } from "../infra/security-pipeline.js";
 import { applySanitizer } from "../infra/output-sanitizer.js";
 import { redactDocument } from "../infra/kubectl-sanitize.js";
@@ -612,12 +611,6 @@ export function createK8sInspectTool(kubeconfigRef?: KubeconfigRef): ToolDefinit
   return {
     name: "k8s_inspect",
     label: "K8s Object",
-    renderCall(args: any, theme: any) {
-      const target = [args?.kind, args?.namespace ? `${args.namespace}/${args?.name}` : args?.name]
-        .filter(Boolean).join(" ");
-      return new Text(theme.fg("toolTitle", theme.bold("k8s_inspect")) + " " + theme.fg("accent", target), 0, 0);
-    },
-    renderResult: renderTextResult,
     description: `Read one Kubernetes object together with the things you would ask about next, in a
 single call: its own key status, its recent events, and its immediate neighbours (for a pod, the node
 it runs on and its controller; for a node, what is scheduled on it).

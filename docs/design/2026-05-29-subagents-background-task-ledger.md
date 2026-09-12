@@ -1,5 +1,7 @@
 # Sub-agents, Background Jobs & Task Ledger (v2) — Design Spec
 
+> Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
+
 > Status: approved design (pending spec review)
 > Date: 2026-05-29
 > Reference only (not extended/merged): the `delegate_to_agent(s)` tools on `main` and the

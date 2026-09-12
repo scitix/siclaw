@@ -1,8 +1,7 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { KubeconfigRef } from "../../core/types.js";
 
 /**
@@ -18,10 +17,6 @@ export function createHostListTool(kubeconfigRef: KubeconfigRef): ToolDefinition
   return {
     name: "host_list",
     label: "Host List",
-    renderCall(_args: any, theme: any) {
-      return new Text(theme.fg("toolTitle", theme.bold("host_list")), 0, 0);
-    },
-    renderResult: renderTextResult,
     description: `List SSH-reachable hosts bound to the current agent (server-side search; results are capped).
 Returns id, name, IP, port, username, auth_type ("password"/"key"/"managed"), is_production, and jump_host (the bastion name when the host is reached via ProxyJump — host_exec/host_script tunnel through it automatically).
 Does NOT return password or private_key — those are materialized to disk only when an SSH-using tool actually runs.

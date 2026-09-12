@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { TuiBackgroundHost } from "./tui-background-host.js";
+import { CliBackgroundHost } from "./cli-background-host.js";
+import { JobRegistry } from "./job-registry.js";
 
 /** Minimal AgentSession stub exposing only what the host touches. */
 function fakeSession(isStreaming: boolean) {
@@ -9,27 +10,21 @@ function fakeSession(isStreaming: boolean) {
   };
 }
 
-describe("TuiBackgroundHost.notify", () => {
-  it("idle agent → sendCustomMessage with triggerTurn to wake a fresh turn", () => {
-    const host = new TuiBackgroundHost();
+describe("CliBackgroundHost.notify", () => {
+  it("does not wake an idle print session after its final answer", () => {
+    const host = new CliBackgroundHost();
     const session = fakeSession(false);
     host.setSession(session as any);
-    // Drive notify through the executor's notify path by registering + completing a job.
-    // Easiest: access the private notify via the bash executor with an instant command is
-    // overkill — instead exercise notify directly via a tiny spawned job is async; so we
-    // assert on the queued message shape using the public executor's notify wiring.
     (host as any).jobs.register({
       jobId: "j1", type: "bash", parentSessionId: "s", description: "d",
       status: "running", startedAt: 0, notified: false,
     });
     (host as any).notify("j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" });
-    expect(session.sendCustomMessage).toHaveBeenCalledTimes(1);
-    const [, opts] = session.sendCustomMessage.mock.calls[0];
-    expect(opts).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    expect(session.sendCustomMessage).not.toHaveBeenCalled();
   });
 
   it("streaming agent → followUp only (no triggerTurn)", () => {
-    const host = new TuiBackgroundHost();
+    const host = new CliBackgroundHost();
     const session = fakeSession(true);
     host.setSession(session as any);
     (host as any).jobs.register({
@@ -43,8 +38,8 @@ describe("TuiBackgroundHost.notify", () => {
   });
 
   it("dedups: second notify for the same job is a no-op", () => {
-    const host = new TuiBackgroundHost();
-    const session = fakeSession(false);
+    const host = new CliBackgroundHost();
+    const session = fakeSession(true);
     host.setSession(session as any);
     (host as any).jobs.register({
       jobId: "j3", type: "bash", parentSessionId: "s", description: "d",
@@ -56,9 +51,47 @@ describe("TuiBackgroundHost.notify", () => {
   });
 });
 
-describe("TuiBackgroundHost.createBackgroundExecExecutor — concurrency cap", () => {
+describe("CliBackgroundHost.shutdown", () => {
+  it("marks every active job stopped before aborting, including jobs without a handle", () => {
+    const host = new CliBackgroundHost();
+    const jobs: JobRegistry = (host as any).jobs;
+    const abort = vi.fn(() => {
+      expect(jobs.get("active")?.status).toBe("stopped");
+      throw new Error("connection already closed");
+    });
+    for (const jobId of ["active", "dialing", "finished"]) {
+      jobs.register({ jobId, type: "host", parentSessionId: "s", description: "d",
+        status: jobId === "finished" ? "completed" : "running", startedAt: 0, notified: false,
+        ...(jobId === "active" ? { abort } : {}),
+      });
+    }
+    host.shutdown();
+    host.shutdown();
+    expect(abort).toHaveBeenCalledOnce();
+    expect(host.createTaskOutputReader()("dialing")).toMatchObject({ status: "stopped" });
+    expect(host.createTaskOutputReader()("finished")).toMatchObject({ status: "completed" });
+  });
+
+  it("cannot revive a closed host with a late notification or session rebind", () => {
+    const host = new CliBackgroundHost();
+    const session = fakeSession(true);
+    host.setSession(session as any);
+    (host as any).jobs.register({ jobId: "late", type: "bash", parentSessionId: "s", description: "d",
+      status: "running", startedAt: 0, notified: false });
+    host.shutdown();
+    host.setSession(session as any);
+    (host as any).notify("late", { taskId: "late", status: "completed", summary: "done" });
+    expect(session.sendCustomMessage).not.toHaveBeenCalled();
+    expect(() => host.createBackgroundExecExecutor()({
+      command: "sleep 1", env: {}, action: null, hasSensitiveKubectl: false,
+      description: "d", parentSessionId: "s", jobId: "new", isProd: false,
+    })).toThrow(/closed/);
+  });
+});
+
+describe("CliBackgroundHost.createBackgroundExecExecutor — concurrency cap", () => {
   it("throws when too many background exec jobs are already running (no unbounded launches)", () => {
-    const host = new TuiBackgroundHost();
+    const host = new CliBackgroundHost();
     // Saturate well past any reasonable cap with running non-subagent jobs.
     for (let i = 0; i < 50; i++) {
       (host as any).jobs.register({

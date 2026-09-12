@@ -22,7 +22,7 @@
  *     filePaths if they need the credential file path.
  *
  * The broker is a per-AgentBox singleton (per (userId, agentId) in K8s mode;
- * per-process in TUI). LocalSpawner already gives each user/agent its own
+ * per-process in CLI). LocalSpawner already gives each user/agent its own
  * credentialsDir, so cross-user leakage is impossible.
  */
 
@@ -709,7 +709,7 @@ export class CredentialBroker {
  * setgid `kubecred` so it — and only it — can read a kubeconfig from the sandbox side. There is no setgid
  * ssh and no plan for one; granting `sandbox` these groups for a "future ssh wrapper" is precisely the
  * change that disabled the isolation for four months. Returns null when the group doesn't exist (Local
- * mode, TUI).
+ * mode, CLI).
  *
  * Result is cached across calls — /etc/group is read at most once per group.
  */

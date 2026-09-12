@@ -3,7 +3,7 @@
 Status: opt-in implementation. `run_script` supports Bash and Python's standard
 library in a separate container. Both the feature and optional network isolation
 default to **off**. Kubernetes deployments support native Jobs or optional E2B.
-LocalSpawner and TUI deployments always disable this feature, regardless of
+LocalSpawner and headless CLI invocations always disable this feature, regardless of
 environment settings. Docker is only used by the standalone smoke harness.
 
 ## Security contract
@@ -65,7 +65,7 @@ Initial access is limited to non-delegated, logged-in **Web sessions**. Channel,
 API, task, sub-agent and delegated sessions are excluded until the current
 requester's identity can be verified independently of session ownership.
 Standalone Portal has no resource RBAC, so it requires an administrator-owned
-Web session and still enforces Agent resource bindings. TUI-only execution is
+Web session and still enforces Agent resource bindings. Headless CLI execution is
 not exposed. LocalSpawner ignores sandbox configuration before loading secrets
 or initializing providers, advertises the feature as disabled, and rejects
 execution and external tool callbacks. Agents receive no `run_script` tool.
@@ -407,7 +407,7 @@ Native readiness remains v3; SDK and supervisor mailbox changes ship together in
 that image. An unavailable or older coordinator is rejected before a runner is
 started. Unsupported runner handshakes trigger a short cooldown. Rollback should
 disable sandbox first, drain runs, and restore matching image digests together.
-No database migration is required. Disabled/local/TUI environments do not parse
+No database migration is required. Disabled/local/CLI environments do not parse
 unused provider credentials, policies or traffic settings.
 
 Standalone Portal's shared Runtime secret defines one trusted service domain;

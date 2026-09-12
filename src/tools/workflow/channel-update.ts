@@ -7,8 +7,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
 
 interface ChannelUpdateParams {
@@ -27,8 +26,6 @@ export function createChannelUpdateTool(refs: ToolRefs): ToolDefinition {
   return {
     name: "channel_update",
     label: "Channel Update",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("channel_update")), 0, 0),
-    renderResult: renderTextResult,
     description:
       "Send a concise user-visible update to the current IM channel when a long-running investigation has " +
       "a meaningful milestone, final conclusion, blocker, or artifact note. Do NOT use this for raw tool " +

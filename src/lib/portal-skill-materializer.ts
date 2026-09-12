@@ -14,7 +14,7 @@
  *
  * The destination is wiped on each call so stale content from a previous
  * session doesn't leak into this one; caller is expected to nest it under
- * `.siclaw/.portal-snapshot/skills/` so it's obviously ephemeral.
+ * `.siclaw/.portal-snapshot/run-<random>/skills/` so it's obviously ephemeral.
  */
 
 import fs from "node:fs";
@@ -121,7 +121,7 @@ export function materializePortalSkills(
 }
 
 /**
- * Remove a previously-materialized directory. Called on TUI shutdown so we
+ * Remove a previously-materialized directory. Called on CLI shutdown so we
  * don't leave stale trees around. Safe to call if the dir doesn't exist.
  */
 export function cleanupPortalSkills(outDir: string): void {

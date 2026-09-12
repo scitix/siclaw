@@ -21,8 +21,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type {
   ToolEntry,
   ToolRefs,
@@ -161,8 +160,6 @@ export function createSpawnSubagentTool(
   return {
     name: "spawn_subagent",
     label: "Spawn Sub-agent",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("spawn_subagent")), 0, 0),
-    renderResult: renderTextResult,
     description:
       buildDescription(isSubagentGroupEnabled(), backgroundAllowed) +
       renderTierMenuForDescription(tierMenu),
@@ -453,7 +450,7 @@ function toToolOutput(
 export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createSpawnSubagentTool(refs),
-  modes: ["web", "channel", "cli"],
+  modes: ["web", "channel"],
   // Hidden unless the runtime injected an executor (same "never show a non-working tool" contract;
   // children get no executor → spawn_subagent is hidden from them → no recursion). The batch
   // capability is gated by isSubagentGroupEnabled() at the CALL layer (item cap), not here — the tool

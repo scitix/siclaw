@@ -6,6 +6,8 @@ description: "Replace the DP state machine + specialized cards with checkpoint a
 
 # Deep Investigation Mode — Refactor Design
 
+> Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
+
 > **Status**: Phase 1 implementation active (2026-04-24). Current target is the single-agent DP + same-agent sub-agent loop, including async notify-style same-agent delegation; cross-agent expert teams are deliberately deferred.
 > **Supersedes**: The current `src/core/extensions/deep-investigation.ts` state-machine + `propose_hypotheses` / `deep_search` / `end_investigation` tool family + `HypothesesCard` / `InvestigationCard` / `DpChecklistCard` React components.
 

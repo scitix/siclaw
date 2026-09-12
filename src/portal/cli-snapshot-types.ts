@@ -76,7 +76,7 @@ export interface CliSnapshotActiveAgent {
    * Per-agent tool whitelist, already resolved from capability groups to
    * concrete tool names. `null` = no restriction (the agent selected no
    * capability groups). Omitted when null so the wire payload stays compact;
-   * the TUI treats an absent field as null = unrestricted.
+   * the CLI treats an absent field as null = unrestricted.
    */
   allowedTools?: string[] | null;
 }

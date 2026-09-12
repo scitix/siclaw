@@ -458,3 +458,16 @@ describe("getVisualLink", () => {
     }
   });
 });
+
+it("retries an explicit packet rejection with a visible marker, but never retries uncertain appends", async () => {
+  const metadata = { skillPreview: { skill: { name: "packet", specs: "full" } }, llm_round: 3 };
+  fake.nextError = new Error("ER_NET_PACKET_TOO_LARGE: exceeds max_allowed_packet");
+  await updateMessage({ sessionId: "s", messageId: "m", content: "full", metadata });
+  expect(fake.calls).toHaveLength(2);
+  expect(JSON.parse(fake.calls[1].params.metadata)).toMatchObject({ skillPreview: { status: "omitted", reason: "storage_error" }, llm_round: 3 });
+  expect(fake.calls[1].params.content).toContain("could not be saved");
+  fake.calls = [];
+  fake.nextError = new Error("RPC timeout");
+  await expect(appendMessage({ sessionId: "s", role: "tool", content: "full", metadata })).rejects.toThrow("RPC timeout");
+  expect(fake.calls).toHaveLength(1);
+});

@@ -3,10 +3,9 @@ import { ensureSandboxDebugQuota, SANDBOX_DEBUG_NAMESPACE } from "../infra/sandb
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { DebugPodStartupError } from "../infra/debug-pod.js";
 import { loadConfig } from "../../core/config.js";
@@ -88,7 +87,6 @@ interface NodeExecParams {
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
-
 
 export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
@@ -235,18 +233,6 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
           }
         : {}),
     }),
-    renderCall(args: any, theme: any) {
-      const node = args?.node || "...";
-      const cmd = args?.command || "...";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("node_exec")) +
-          " " + theme.fg("accent", node) +
-          " " + theme.fg("toolTitle", theme.bold("$")) +
-          " " + cmd,
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
       const params = normalizeExecTarget(rawParams as NodeExecParams);
       if (trustedOptions?.sandboxDiagnostics && [params.image, params.pod, params.namespace, params.container, params.netns].some(v => v !== undefined)) {

@@ -8,8 +8,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
 import { handoffRefusal } from "../../shared/agent-handoff.js";
 
@@ -33,8 +32,6 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
     name: "transfer_to_agent",
     label: "Transfer Conversation",
     executionMode: "sequential",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("transfer_to_agent")), 0, 0),
-    renderResult: renderTextResult,
     description:
       "Hand this conversation over when an authorized destination is better suited to continue the user's " +
       "request. First call search_handoff_targets with the cluster, host or capability to obtain matching " +

@@ -44,12 +44,12 @@ const CAPABILITY_CHECK = /modelOptionsSupportImageInput\(/;
 /**
  * Paths that carry `modelRouting` but must NOT carry tier state, with the reason.
  *
- * `cli-main.ts` — the TUI registers no `spawnSubagentExecutor` (see the comment at
+ * `cli-main.ts` — the CLI registers no `spawnSubagentExecutor` (see the comment at
  * its job-registry wiring), so it builds no sub-agents. Forwarding candidates there
  * would ship provider credentials to a surface with no consumer for them.
  */
 const DELIBERATE_EXCLUSIONS = new Map<string, string>([
-  ["cli-main.ts", "TUI has no spawnSubagentExecutor — no sub-agents, so no tiers"],
+  ["cli-main.ts", "CLI has no spawnSubagentExecutor — no sub-agents, so no tiers"],
 ]);
 
 function listSourceFiles(dir: string): string[] {
@@ -104,7 +104,7 @@ describe("subagentTiers reaches every binding forwarding site", () => {
     // the assertion above starts passing vacuously.
     //
     // 10 lines in the tree match `modelRouting` as a property. Two are the
-    // vision-capability check (lark, chat-gateway), one is the excluded TUI, and
+    // vision-capability check (lark, chat-gateway), one is the excluded CLI, and
     // the remaining 7 are forwarding sites: chat-gateway ×2, a2a-gateway,
     // task-coordinator (cron), lark, dingtalk, and server.ts (chat.send). Bump
     // DELIBERATELY when adding an entry path, and add the field there in the

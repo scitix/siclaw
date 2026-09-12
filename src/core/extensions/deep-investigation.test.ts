@@ -7,7 +7,6 @@ import type { MutableDpStateRef } from "../types.js";
 //     the prompt preamble; later ones just strip the marker)
 //   - Deactivation via [DP_EXIT] marker
 //   - Session restoration from persisted entries (new + legacy shapes)
-//   - /dp command toggle behaviour
 //   - Context-filter strips UI-only dp-mode messages
 //
 // The old 25-test suite exercised the state machine (awaiting_confirmation
@@ -68,13 +67,13 @@ async function callAll(handlers: Map<string, Handler[]>, event: string, ...args:
 }
 
 describe("deepInvestigationExtension — registration surface", () => {
-  it("registers /dp command, Ctrl+I shortcut, --dp flag, dp-mode renderer, and no tools", () => {
+  it("registers server mode hooks without terminal commands or UI", () => {
     const { api, commands, shortcuts, flags, renderers, handlers } = makeApi();
     deepInvestigationExtension(api);
-    expect(commands.has("dp")).toBe(true);
-    expect(shortcuts.size).toBe(1);
-    expect(flags.has("dp")).toBe(true);
-    expect(renderers.has("dp-mode-toggle")).toBe(true);
+    expect(commands.size).toBe(0);
+    expect(shortcuts.size).toBe(0);
+    expect(flags.size).toBe(0);
+    expect(renderers.size).toBe(0);
     expect(handlers.has("input")).toBe(true);
     expect(handlers.has("session_start")).toBe(true);
     expect(handlers.has("context")).toBe(true);
@@ -269,31 +268,6 @@ describe("deepInvestigationExtension — session restoration", () => {
       sessionEntries: [{ type: "custom", customType: "dp-mode", data: { dpStatus: "idle" } }],
     });
     await callAll(handlers, "session_start", {}, ctx);
-    expect(stateRef.active).toBe(false);
-  });
-});
-
-describe("deepInvestigationExtension — /dp command toggle", () => {
-  it("/dp toggles the mode on when idle", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, commands } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    const ctx = makeCtx({ hasUI: true });
-    await commands.get("dp")!.handler("", ctx);
-    expect(stateRef.active).toBe(true);
-    expect(ctx.ui.notify).toHaveBeenCalled();
-  });
-
-  it("/dp toggles the mode off when active", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, commands } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    const ctx = makeCtx({ hasUI: true });
-    await commands.get("dp")!.handler("", ctx);
-    expect(stateRef.active).toBe(true);
-    await commands.get("dp")!.handler("", ctx);
     expect(stateRef.active).toBe(false);
   });
 });

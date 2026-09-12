@@ -1,18 +1,18 @@
 /**
  * Materialize Portal credentials (cluster kubeconfigs + SSH hosts) into a
  * directory laid out exactly the way the existing `credential-manager.ts`
- * helpers produce. pi-agent tools (kubectl, ssh) + `/setup` list view see
+ * helpers produce. pi-agent tools (kubectl, ssh) see
  * a Portal-sourced credential set with zero format drift.
  *
  * Strategy: delegate to the same `registerKubeconfig` / `registerSshPassword`
- * / `registerSshKey` functions TUI already uses — avoids reimplementing
+ * / `registerSshKey` functions CLI already uses — avoids reimplementing
  * manifest + SSH-config generation. For SSH keys whose content comes from
  * Portal (not a keyfile path), we stage the content in a short-lived tmp
  * file so `registerSshKey` (which reads from disk by design) works
  * unchanged, then delete the tmp.
  *
  * All written files land under `outDir`, which the caller typically sets
- * to `.siclaw/.portal-snapshot/credentials/`. The dir is wiped before
+ * to `.siclaw/.portal-snapshot/run-<random>/credentials/`. The dir is wiped before
  * materialize so stale entries from a previous session don't linger.
  * SIGINT / SIGTERM cleanup is installed by cli-main, not here.
  */

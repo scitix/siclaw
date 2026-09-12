@@ -818,6 +818,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const toolInput = pendingCall?.input || "";
         const existingMessageId = pendingCall?.messageId;
         const detailsMeta = persistableToolDetails(toolResult?.details, value => redactText(value, redactionConfig));
+        // Forward the same bounded, redacted preview to the UI. A downgrade is
+        // visible during this turn and cannot fall back to unredacted JSON text.
+        if (toolResult?.details?.skillPreview && detailsMeta?.skillPreview) {
+          toolResult.details.skillPreview = detailsMeta.skillPreview;
+          if ((detailsMeta.skillPreview as { status?: string }).status === "omitted") {
+            toolResult.content = [{ type: "text", text: "Skill preview omitted from history: size or redaction limit." }];
+          }
+        }
         // Re-stamp the round markers — persistableToolDetails only looks at
         // the tool *result*, and updateMessage REPLACES metadata wholesale.
         const roundMeta = pendingCall?.roundMeta ?? timeline.toolMetadata(evt);
@@ -832,7 +840,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         if (persist) {
           const payload = {
             sessionId,
-            content: redactText(text, redactionConfig),
+            content: redactText((detailsMeta?.skillPreview as { status?: string } | undefined)?.status === "omitted" ? "Skill preview omitted from history: size or redaction limit." : text, redactionConfig),
             toolName,
             toolset: toolset ?? null,
             toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,

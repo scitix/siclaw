@@ -1,7 +1,7 @@
 /**
  * CLI snapshot endpoint — `GET /api/v1/cli-snapshot`.
  *
- * Returns the minimum config needed for a local TUI (`siclaw`) to run against
+ * Returns the minimum config needed for a local CLI (`siclaw`) to run against
  * a local Portal (`siclaw local`) without its own settings.json:
  *   - providers + models assembled from `model_providers` × `model_entries`
  *   - mcpServers from `mcp_servers`
@@ -240,13 +240,13 @@ export interface CliSnapshot {
   /** Cluster kubeconfigs + SSH host credentials. */
   credentials: CliSnapshotCredentials;
   /**
-   * ALWAYS populated (even when request is agent-scoped) — lets the TUI
+   * ALWAYS populated (even when request is agent-scoped) — lets the CLI
    * render a picker / `siclaw agents` list without a second round-trip.
    */
   availableAgents: CliSnapshotAgentMeta[];
   /** Agent the rest of this snapshot is scoped to, null = global/unscoped view. */
   activeAgent: CliSnapshotActiveAgent | null;
-  /** Server-side ISO timestamp so the TUI can display when this was fetched. */
+  /** Server-side ISO timestamp so the CLI can display when this was fetched. */
   generatedAt: string;
 }
 
@@ -275,7 +275,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     const agentName = query.agent || null;
 
     // Always fetch the agent list — populates `availableAgents` even when
-    // the request is scoped, so the TUI can render its picker without a
+    // the request is scoped, so the CLI can list available agents without a
     // second round-trip.
     const [allAgents] = await db.query<AgentRow[]>(
       "SELECT id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
@@ -514,7 +514,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     };
 
     // When an agent is active and carries a model preference, override the
-    // default so the TUI picks that model instead of whatever is_default
+    // default so the CLI picks that model instead of whatever is_default
     // was set at the global model_entries level.
     if (activeAgent && activeAgent.model_provider && activeAgent.model_id) {
       defaultOut = { provider: activeAgent.model_provider, modelId: activeAgent.model_id };
@@ -538,9 +538,9 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     }));
 
     // Resolve the agent's capability groups → concrete allowedTools at this
-    // boundary (the AgentBox/TUI stays oblivious to group keys). null/empty =
+    // boundary (the AgentBox/CLI stays oblivious to group keys). null/empty =
     // unrestricted; we only emit the field when non-null to keep the payload
-    // compact (TUI treats absent as null).
+    // compact (CLI treats absent as null).
     const activeAgentType = activeAgent ? requireAgentType(activeAgent.agent_type) : null;
     const allowedToolsOut = activeAgent && activeAgentType
       ? resolveCapabilities(effectiveCapabilityKeys(

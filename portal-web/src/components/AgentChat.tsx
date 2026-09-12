@@ -471,7 +471,7 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
               )}
             </div>
             {skillPanelMsg && (
-              <SkillPanel message={skillPanelMsg} onClose={() => setSkillPanelMsg(null)} />
+              <SkillPanel detailUrl={activeSessionId ? `/siclaw/agents/${encodeURIComponent(agentId)}/chat/sessions/${encodeURIComponent(activeSessionId)}/messages?message_id=${encodeURIComponent(skillPanelMsg.id)}` : undefined} message={skillPanelMsg} onClose={() => setSkillPanelMsg(null)} />
             )}
             {schedulePanelMsg && (
               <SchedulePanel message={schedulePanelMsg} onClose={() => setSchedulePanelMsg(null)} />

@@ -1,15 +1,15 @@
 import { isMemoryEnabled } from "./config.js";
-import { SRE_DEFAULT_PROMPT } from "./agent-types.js";
+import type { SessionMode } from "./types.js";
 
-const MODE_LABELS: Record<string, string> = {
-  cli: "TUI",
+const MODE_LABELS: Record<SessionMode, string> = {
+  cli: "headless CLI",
   web: "Web UI",
   channel: "channel",
   task: "automated task",
 };
 
 export interface BuildSystemPromptInput {
-  mode?: "cli" | "web" | "channel" | "task";
+  mode?: SessionMode;
   templateOverride?: string;
   interactiveProgress?: boolean;
   /** Immutable built-in Agent Type contract. */
@@ -51,8 +51,8 @@ export interface PromptAssembly {
  * 2. `DEFAULT_TEMPLATE` (bundled Platform Kernel)
  *
  * Supported template variables: {{mode}}, {{settingsPath}}, {{credentialsPath}}
- * Mode-conditional blocks: `<!-- web-only -->...<!-- /web-only -->` and
- * `<!-- cli-only -->...<!-- /cli-only -->` — the non-matching block is stripped.
+ * Legacy Web blocks are kept only for Web sessions. Obsolete terminal-only
+ * blocks from persisted templates are discarded in every mode.
  *
  * The immutable Agent Type contract and optional Agent addendum are rendered
  * after mode/capability guidance but before Safety. Safety therefore remains
@@ -60,7 +60,7 @@ export interface PromptAssembly {
  */
 export function buildSystemPromptAssembly(input: BuildSystemPromptInput): PromptAssembly {
   const {
-    mode,
+    mode = "web",
     templateOverride,
     agentTypePrompt,
     agentAddendum,
@@ -91,7 +91,7 @@ export function buildSystemPromptAssembly(input: BuildSystemPromptInput): Prompt
     renderSystemPromptFragment(template, mode, memoryEnabled),
   );
 
-  const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
+  const credentialsPath = mode === "cli" ? "**Clusters / Hosts** in the local Web UI (`siclaw local`)" : "**Settings → Credentials**";
 
   // Type/capability-specific platform guidance is compiled, never hidden in
   // the common template. A legacy platform-level full-template override stays
@@ -101,7 +101,7 @@ export function buildSystemPromptAssembly(input: BuildSystemPromptInput): Prompt
       renderSystemPromptFragment(SRE_PLATFORM_SECTION, mode, memoryEnabled));
   }
 
-  if (!hasTemplateOverride && includeSkillAuthoring) {
+  if (!hasTemplateOverride && includeSkillAuthoring && (mode === "web" || mode === "channel")) {
     add("platform.skill_authoring", "platform", "src/core/prompt.ts#SKILL_AUTHORING_SECTION", false,
       renderSystemPromptFragment(SKILL_AUTHORING_SECTION, mode, memoryEnabled));
   }
@@ -109,6 +109,10 @@ export function buildSystemPromptAssembly(input: BuildSystemPromptInput): Prompt
   if (!hasTemplateOverride && (includePlanningGuidance || includeSubagentGuidance)) {
     add("platform.workflow", "platform", "src/core/prompt.ts#buildWorkflowSection", false,
       buildWorkflowSection(includePlanningGuidance, includeSubagentGuidance));
+  }
+
+  if (mode === "cli") {
+    add("mode.headless", "mode", "src/core/prompt.ts#HEADLESS_SECTION", false, HEADLESS_SECTION);
   }
 
   // Append task-specific section for automated task mode.
@@ -154,26 +158,6 @@ export function buildSystemPrompt(input: BuildSystemPromptInput): string {
   return buildSystemPromptAssembly(input).text;
 }
 
-/** Backward-compatible standalone/TUI helper: an unscoped session is SRE. */
-export function buildSreSystemPrompt(
-  mode?: "cli" | "web" | "channel" | "task",
-  templateOverride?: string,
-  agentPromptFragment?: string,
-): string {
-  return buildSystemPrompt({
-    mode,
-    templateOverride,
-    agentTypePrompt: SRE_DEFAULT_PROMPT,
-    agentAddendum: agentPromptFragment?.trim() || undefined,
-    memoryEnabled: isMemoryEnabled(),
-    includeInfrastructureGuidance: true,
-    includeOperationalSafety: true,
-    includeSkillAuthoring: true,
-    includePlanningGuidance: true,
-    includeSubagentGuidance: true,
-  });
-}
-
 /**
  * Resolve variables and mode-conditional blocks in one system-prompt
  * fragment. Agent-owned addenda keep the same placeholder contract that
@@ -181,12 +165,12 @@ export function buildSreSystemPrompt(
  */
 export function renderSystemPromptFragment(
   fragment: string,
-  mode?: "cli" | "web" | "channel" | "task",
+  mode: SessionMode = "web",
   memoryEnabled = isMemoryEnabled(),
 ): string {
-  const modeLabel = MODE_LABELS[mode ?? "cli"] ?? "Web UI";
-  const settingsPath = mode === "cli" ? "`/setup`" : "sidebar **Settings**";
-  const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
+  const modeLabel = MODE_LABELS[mode];
+  const settingsPath = mode === "cli" ? "the local Web UI (`siclaw local`)" : "sidebar **Settings**";
+  const credentialsPath = mode === "cli" ? "**Clusters / Hosts** in the local Web UI (`siclaw local`)" : "**Settings → Credentials**";
   // Variable substitution
   let prompt = fragment
     .replace(/\{\{mode\}\}/g, modeLabel)
@@ -195,16 +179,20 @@ export function renderSystemPromptFragment(
     .replace(/\{\{memoryIntro\}\}/g, memoryEnabled ? MEMORY_INTRO : "")
     .replace(/\{\{memorySection\}\}/g, memoryEnabled ? MEMORY_SECTION : "");
 
-  // Mode-conditional blocks: strip the non-matching mode block
-  const keepMode = mode === "web" ? "web" : "cli";
-  const dropMode = keepMode === "web" ? "cli" : "web";
-  // Remove the block for the non-matching mode entirely
-  prompt = prompt.replace(new RegExp(`<!-- ${dropMode}-only -->[\\s\\S]*?<!-- /${dropMode}-only -->`, "g"), "");
-  // Unwrap the matching mode block (keep content, remove markers)
-  prompt = prompt.replace(new RegExp(`<!-- ${keepMode}-only -->([\\s\\S]*?)<!-- /${keepMode}-only -->`, "g"), "$1");
+  // Read compatibility for persisted templates: terminal-only instructions are
+  // obsolete and must not leak into headless, channel, or scheduled execution.
+  prompt = prompt.replace(/<!-- cli-only -->[\s\S]*?<!-- \/cli-only -->/g, "");
+  prompt = prompt.replace(/<!-- web-only -->([\s\S]*?)<!-- \/web-only -->/g,
+    (_block, content: string) => mode === "web" ? content : "");
 
   return prompt;
 }
+
+const HEADLESS_SECTION = `
+
+# Non-interactive Execution
+
+This invocation prints a final answer and exits. No user is present to answer follow-up questions during the run. Work within the supplied request and permissions. If required input or authorization is missing, state the blocker and the specific input needed in the final answer; do not wait for an interactive response.`;
 
 // ---------------------------------------------------------------------------
 // Cron section — appended only in automated task (cron) mode
@@ -299,12 +287,10 @@ const SKILL_AUTHORING_SECTION = `
 
 # Skill Authoring
 
-<!-- web-only -->- Whenever you create, modify, optimize, or rewrite a skill, you MUST output the result via \`skill_preview\`. The workflow is: (1) briefly explain what you plan to change, (2) write ALL files (SKILL.md + scripts) to \`.siclaw/user-data/skill-drafts/<name>/\`, (3) call \`skill_preview\` with the directory path. Never skip skill_preview. Never output raw SKILL.md content in your message — it renders as HTML and cannot be copied.
-<!-- /web-only --><!-- cli-only -->- To create or modify a skill, output SKILL.md and scripts in fenced code blocks so the user can copy from the terminal.
-<!-- /cli-only -->`;
+- Whenever you create, modify, optimize, or rewrite a skill, you MUST output the result via \`skill_preview\`. The workflow is: (1) briefly explain what you plan to change, (2) write ALL files (SKILL.md + scripts) to \`.siclaw/user-data/skill-drafts/<name>/\`, (3) call \`skill_preview\` with the directory path. Never skip skill_preview. Never output raw SKILL.md content in your message — it renders as HTML and cannot be copied.`;
 
 function buildWorkflowSection(includePlanning: boolean, includeSubagents: boolean): string {
-  const lines = ["", "", "# Multi-step Work & Sub-agents", ""];
+  const lines = ["", "", includeSubagents ? "# Multi-step Work & Sub-agents" : "# Multi-step Work", ""];
   if (includePlanning) {
     lines.push(
       "## Planning",

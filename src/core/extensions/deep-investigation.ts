@@ -1,13 +1,11 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MutableDpStateRef } from "../types.js";
 
 /**
  * Deep Investigation extension — lightweight mode flag.
  *
  * DP is a USER-OWNED MODE: it turns ON when the user sends a message with
- * the `[Deep Investigation]` prefix (from the web-UI magnifier chip, the
- * `/dp` command, or Ctrl+I) and OFF only when the user sends `[DP_EXIT]`.
+ * the `[Deep Investigation]` prefix and OFF only when the user sends `[DP_EXIT]`.
  *
  * While ON, the first marker-bearing message is rewritten to prepend a
  * prompt addendum that nudges the model toward divergent / rigorous
@@ -105,52 +103,17 @@ export default function deepInvestigationExtension(
     api.appendEntry("dp-mode", { active: dpActive });
   }
 
-  function enableDpMode(ctx: ExtensionContext): void {
+  function enableDpMode(): void {
     if (dpActive) return;
     setActive(true);
     persistState();
-    if (ctx.hasUI) ctx.ui.notify("🔍 Deep Investigation ON — Ctrl+I or /dp to exit");
   }
 
-  function disableDpMode(ctx: ExtensionContext): void {
+  function disableDpMode(): void {
     if (!dpActive) return;
     setActive(false);
     persistState();
-    if (ctx.hasUI) ctx.ui.notify("Deep Investigation OFF");
   }
-
-  function toggleDpMode(ctx: ExtensionContext): void {
-    if (dpActive) disableDpMode(ctx);
-    else enableDpMode(ctx);
-  }
-
-  // --- CLI / TUI entry points ---
-
-  api.registerFlag("dp", {
-    description: "Start in deep investigation mode",
-    type: "boolean",
-    default: false,
-  });
-
-  api.registerShortcut(Key.ctrl("i"), {
-    description: "Toggle deep investigation mode",
-    handler: async (ctx) => toggleDpMode(ctx),
-  });
-
-  api.registerCommand("dp", {
-    description: "Toggle deep investigation mode",
-    handler: async (_args, ctx) => toggleDpMode(ctx),
-  });
-
-  // --- Message renderer for UI-only custom message type ---
-
-  api.registerMessageRenderer("dp-mode-toggle", (message, _options, theme) => {
-    const content = typeof message.content === "string" ? message.content : "";
-    if (!theme?.fg) return new Text(content, 0, 0);
-    const lines = content.split("\n");
-    const styled = lines.map((line) => theme.fg("muted", line));
-    return new Text("\n" + styled.join("\n"), 0, 0);
-  });
 
   // --- [Deep Investigation] marker: activate + inject prompt preamble ---
   //
@@ -159,7 +122,7 @@ export default function deepInvestigationExtension(
   // while already active: just strip the marker — the model stays in DP
   // via conversation history.
 
-  api.on("input", async (event, ctx) => {
+  api.on("input", async (event) => {
     const marker = "[Deep Investigation]\n";
     if (!event.text.startsWith(marker)) return { action: "continue" as const };
 
@@ -168,12 +131,12 @@ export default function deepInvestigationExtension(
     // UI-only hints and must not leak into the prompt.
     const userText = stripChipMarker(event.text.slice(marker.length).trim());
     if (!userText) {
-      enableDpMode(ctx);
+      enableDpMode();
       return { action: "handled" as const };
     }
 
     if (!dpActive) {
-      enableDpMode(ctx);
+      enableDpMode();
       return {
         action: "transform" as const,
         text: `${DP_ACTIVATION_PROMPT}\n\n---\n\n${userText}`,
@@ -185,13 +148,13 @@ export default function deepInvestigationExtension(
 
   // --- [DP_EXIT] marker: deactivate ---
 
-  api.on("input", async (event, ctx) => {
+  api.on("input", async (event) => {
     const hasPrefix = event.text.startsWith("[DP_EXIT]\n");
     const bareMarker = event.text.trim() === "[DP_EXIT]";
     if (!hasPrefix && !bareMarker) return { action: "continue" as const };
 
     const userText = hasPrefix ? event.text.slice("[DP_EXIT]\n".length).trim() : "";
-    disableDpMode(ctx);
+    disableDpMode();
     return {
       action: "transform" as const,
       text: userText
@@ -218,12 +181,6 @@ export default function deepInvestigationExtension(
   api.on("session_start", async (_event, ctx) => {
     setActive(false);
     toolCallsSinceVisibleAssistant = 0;
-
-    if (api.getFlag("dp") === true) {
-      setActive(true);
-      if (ctx.hasUI) ctx.ui.notify("🔍 Deep Investigation (from --dp flag)");
-      return;
-    }
 
     // Restore from the latest dp-mode entry. Accepts the new `{active}` shape
     // plus the two legacy shapes (`{enabled}` and `{dpStatus}`) so sessions

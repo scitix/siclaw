@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { createSkillPreviewTool, registration } from "./skill-preview.js";
+import { ToolResultArtifactStore, withToolResultArtifactCapture } from "../../core/tool-result-artifact.js";
+import os from "node:os";
 
 /** Tests write to the real DRAFTS_BASE (.siclaw/user-data/skill-drafts/) under cwd,
  *  matching production behavior. Each test creates a unique subdirectory and
@@ -41,6 +43,27 @@ describe("skill_preview tool", () => {
     }
     return testSkillDir;
   }
+
+  it("keeps complete preview files in details when artifact capture bounds the model text", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-skill-preview-"));
+    const store = new ToolResultArtifactStore({ rootDir: root, getScope: () => ({ agentId: "a", sessionId: "s" }) });
+    const specs = "---\nname: large-preview\ndescription: Complete preview regression\n---\n" + "Read-only procedure.\n".repeat(800) + "END_OF_SKILL";
+    const script = "#!/bin/sh\nprintf 'PREVIEW_SCRIPT_END'\n";
+    writeSkill(specs, [{ name: "check.sh", content: script }]);
+    try {
+      await store.initialize();
+      const wrapped = withToolResultArtifactCapture(tool, store, 4096);
+      const result = await wrapped.execute("preview-call", { dir: testSkillDir }, undefined, {} as any);
+      const text = result.content.filter(b => b.type === "text").map(b => b.text).join("");
+      expect(text.length).toBeLessThanOrEqual(8000);
+      expect(text).toContain("artifact_id:");
+      const details = JSON.parse(JSON.stringify(result.details)); // SSE/DB round trip
+      expect(details.skillPreview.skill.specs).toBe(specs);
+      expect(details.skillPreview.skill.files.find((f: any) => f.path === "SKILL.md").content).toBe(specs);
+      expect(details.skillPreview.skill.files.find((f: any) => f.path === "scripts/check.sh").content).toBe(script);
+      expect(fs.existsSync(testSkillDir)).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 
   // --- Validation ---
 

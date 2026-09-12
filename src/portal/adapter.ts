@@ -5,6 +5,7 @@
  * Auth: X-Auth-Token header (shared secret).
  */
 
+import { historyMetadataSql, historyContentSql, previewDetailContentSql, preparePreviewMessage } from "./skill-preview-storage.js";
 import { sandboxResolveHandler } from "./script-sandbox.js";
 import crypto from "node:crypto";
 import http from "node:http";
@@ -1304,6 +1305,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }>(req);
     const id = crypto.randomUUID();
     const db = getDb();
+    await preparePreviewMessage(db, body);
     await db.query(
       `INSERT INTO chat_messages (id, session_id, role, content, tool_name, toolset, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1889,18 +1891,19 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const body = await parseBody<{ session_id: string; before?: string; limit?: number }>(req);
+    const body = await parseBody<{ session_id: string; before?: string; limit?: number; message_id?: string }>(req);
     const db = getDb();
-    const limit = body.limit ?? 50;
+    const limit = body.message_id ? 1 : Math.min(200, Math.max(1, body.limit ?? 50));
     const params: unknown[] = [body.session_id];
     let where = `session_id = ? AND ${transcriptVisiblePredicate(db)}`;
+    if (body.message_id) { where += " AND id = ?"; params.push(body.message_id); }
     if (body.before) {
       where += " AND created_at < ?";
       params.push(toSqlTimestamp(body.before));
     }
     params.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms,
+      `SELECT id, session_id, role, ${body.message_id ? previewDetailContentSql(db) : historyContentSql()} AS content, tool_name, tool_input, ${historyMetadataSql(db, Boolean(body.message_id))} AS metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, seq DESC, id DESC LIMIT ?`,
       params,
@@ -2765,6 +2768,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("chat.appendMessage", async (params) => {
     const id = crypto.randomUUID();
     const db = getDb();
+    await preparePreviewMessage(db, params);
     // Ordered at write time by default. The exception is a user message the runtime will
     // order later: it is written on arrival so it cannot be lost, but the box may not
     // consume it until a turn boundary seconds later, and arrival order is not processing
@@ -2847,6 +2851,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("chat.updateMessage", async (params) => {
     const db = getDb();
+    await preparePreviewMessage(db, params);
     await db.query(
       `UPDATE chat_messages
        SET content = ?, tool_name = ?, toolset = COALESCE(?, toolset), tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?,
@@ -2874,6 +2879,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("chat.updateDelegationToolMessage", async (params) => {
     const db = getDb();
+    await preparePreviewMessage(db, params);
     await db.query(
       `UPDATE chat_messages
        SET content = ?, metadata = ?, outcome = ?, duration_ms = ?
@@ -2897,16 +2903,17 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("chat.getMessages", async (params) => {
     const db = getDb();
-    const limit = params.limit ?? 50;
+    const limit = params.message_id ? 1 : Math.min(200, Math.max(1, params.limit ?? 50));
     const sqlParams: unknown[] = [params.session_id];
     let where = `session_id = ? AND ${transcriptVisiblePredicate(db)}`;
+    if (params.message_id) { where += " AND id = ?"; sqlParams.push(params.message_id); }
     if (params.before) {
       where += " AND created_at < ?";
       sqlParams.push(toSqlTimestamp(params.before));
     }
     sqlParams.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, content, tool_name, toolset, tool_input, metadata, outcome, duration_ms,
+      `SELECT id, session_id, role, ${params.message_id ? previewDetailContentSql(db) : historyContentSql()} AS content, tool_name, toolset, tool_input, ${historyMetadataSql(db, Boolean(params.message_id))} AS metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, seq DESC, id DESC LIMIT ?`,
       sqlParams,

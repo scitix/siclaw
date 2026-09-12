@@ -1124,6 +1124,25 @@ describe("consumeAgentSse — tool execution", () => {
     expect(evidence.output).toContain("[REDACTED]");
   });
 
+  it("persists full structured skill previews separately from bounded text, with redaction", async () => {
+    const specs = "Read-only evidence\n".repeat(800) + "sk-example END_OF_SKILL";
+    const text = "[Full tool output stored as a recoverable artifact]\nartifact_id: tra_preview";
+    const events = [
+      { type: "tool_execution_start", toolName: "skill_preview", args: { dir: "drafts/test" } },
+      { type: "tool_execution_end", toolName: "skill_preview", result: {
+        content: [{ type: "text", text }],
+        details: { skillPreview: { skill: { name: "large-preview", specs,
+          files: [{ path: "SKILL.md", content: specs }] } } },
+      } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u",
+      persistMessages: true, redactionConfig: { patterns: [/sk-example/g] } });
+    const row = JSON.parse(JSON.stringify(updateCalls[0]));
+    expect(row.content).toBe(text);
+    expect(row.metadata.skillPreview.skill.specs).toBe(specs.replace("sk-example", "[REDACTED]"));
+    expect(row.metadata.skillPreview.skill.files[0].content).toBe(row.metadata.skillPreview.skill.specs);
+  });
+
   it("extracts task_report into taskReportText and prioritises it over resultText", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "task_report", args: { summary: "done" } },
