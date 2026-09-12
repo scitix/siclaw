@@ -117,8 +117,8 @@ Skill, and configure any required ticket/group readers as read-only. Its system
 prompt should instruct it to use the Skill for each review task and submit the
 result through this MCP. Packaging alone does not create or bind an assistant.
 
-For a control-plane API integration, provision an independent managed Agent Type/release and
-configure its required result contract as
+For a control plane supporting tenant-owned Custom harnesses, create an independent
+Custom Agent instance and configure its required result contract as
 `kind=mcp_tool`, the bound MCP server's ID, `tool_name=submit_ticket_review_result`,
 and `required=true`. Associate a dedicated API Key with that assistant. Reuse the
 existing `POST /api/v1/run` transport:
@@ -136,11 +136,12 @@ continue that ticket's review. Consume the structured result on a successful
 `result` then `done` terminal sequence according to the existing `/run` contract.
 `done` is execution success; it does not turn `needs_review` into `ready`.
 
-When the control plane's type catalogue is code-defined, adding a managed type requires
-coordinated control-plane/runtime registration. This package supplies the MCP and
-Skill, not a new managed type or published API release. A personal Custom preview
-can test the query workflow without changing a shared type's result contract.
-Do not reconfigure the shared Custom or product-support contract for this purpose.
+Use the instance prompt and resource configuration, with a usable platform-published
+Custom model. A new managed Agent Type is not required. This package supplies the
+MCP and Skill; it does not provision an instance or publish an API key. Control
+planes without instance result contracts need that capability before this setup
+can enforce the result through `/run`. Keep the shared Custom and product-support
+release contracts unchanged. See the [two-instance setup and caller example](../../examples/support-review/README.md).
 
 This package does not change the endpoint, session lifecycle or SSE envelope.
 Preview/MCP validation does not establish an API-key HTTP deployment.
