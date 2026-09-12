@@ -60,3 +60,11 @@ it("reports unconfirmed runner cleanup without losing a completed script result"
   expect(result).toMatchObject({ status: "completed", stdout: "summary", cleanup: "pending" });
   expect(result.notices?.join(" ")).toContain("do not automatically retry"); expect(JSON.stringify(result)).not.toContain("private-cleanup-error");
 });
+
+it("preserves unconfirmed cleanup when startup never returns a channel", async () => {
+  const { SandboxToolError } = await import("./errors.js");
+  const service = new ScriptSandboxService(loadScriptSandboxConfig({ SICLAW_SCRIPT_SANDBOX_ENABLED: "true", SICLAW_SCRIPT_SANDBOX_IMAGE: "fixture" }),
+    { start: async () => { throw new SandboxToolError("CLEANUP_PENDING", "UNKNOWN", "pending"); } }, { authorize: async () => {}, call: async () => {} });
+  const result = await service.run({ language: "python", code: "pass" }, { agentId: "a", userId: "u", sessionId: "s", boxId: "b" });
+  expect(result).toMatchObject({ status: "failed", cleanup: "pending" });
+});

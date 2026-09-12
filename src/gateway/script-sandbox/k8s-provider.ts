@@ -76,6 +76,9 @@ export function validateRunnerPod(pod: k8s.V1Pod, config: ScriptSandboxConfig, i
 }
 
 export class K8sScriptSandboxProvider implements ScriptSandboxProvider {
+  private owned = new Map<string, () => Promise<void>>();
+  private pendingCleanup = new Set<string>();
+  private stopped = false;
   private core: k8s.CoreV1Api;
   private batch: k8s.BatchV1Api;
   private kubeConfig: k8s.KubeConfig;
@@ -89,39 +92,83 @@ export class K8sScriptSandboxProvider implements ScriptSandboxProvider {
   }
 
   async start(runId: string, isolated: boolean, seconds: number, signal: AbortSignal): Promise<ScriptChannel> {
+    await Promise.allSettled([...this.pendingCleanup].map(id => this.owned.get(id)?.()));
+    if (this.stopped) throw new SandboxToolError("SERVICE_UNAVAILABLE");
+    if (this.owned.size >= this.config.maxConcurrentRuns + this.config.warmPoolSize) throw new SandboxToolError("RUNNER_CAPACITY");
     const job = scriptJob(runId, isolated, seconds, this.config);
     const name = job.metadata!.name!;
     const namespace = this.config.namespace;
+    if (this.owned.has(name)) throw new SandboxToolError("RUNNER_CAPACITY");
     let socket: Awaited<ReturnType<k8s.Attach["attach"]>> | undefined;
-    let created = false;
+    let attempted = false;
     let jobUid: string | undefined;
+    let created!: () => void;
+    const creationSettled = new Promise<void>(resolve => { created = resolve; });
+    let closing: Promise<void> | undefined;
     const stdout = new PassThrough();
     const stderr = new PassThrough();
     const stdin = new PassThrough();
-    const cleanup = async () => {
+    const missing = (error: unknown) => (error as { code?: number })?.code === 404;
+    const remove = async () => {
+      await creationSettled;
       socket?.terminate();
       stdin.destroy(); stdout.destroy(); stderr.destroy();
-      if (created) {
-        created = false;
-        // With a DELETE body the apiserver reads deletion options from that
-        // body, not the query string. Jobs otherwise default to orphaning Pods.
-        await this.batch.deleteNamespacedJob({ name, namespace, body: { propagationPolicy: "Foreground", preconditions: { uid: jobUid } } }, apiOptions()).catch(() => {
-          console.warn("[script-sandbox] Job cleanup failed; deadline and TTL remain active");
-        });
+      if (!attempted) { this.owned.delete(name); this.pendingCleanup.delete(name); return; }
+      const cleanupSignal = AbortSignal.timeout(10_000);
+      try {
+        if (!jobUid) {
+          // CREATE may have committed even when its reply never reached Runtime.
+          // Recover only this unpredictable invocation name, then fence deletion by UID.
+          const existing = await this.batch.readNamespacedJob({ name, namespace }, apiOptions(cleanupSignal));
+          if (existing.metadata?.labels?.["siclaw.io/component"] !== "script-runner" || !existing.metadata.uid) throw new Error("Unknown Job ownership");
+          jobUid = existing.metadata.uid;
+        }
+        await this.batch.deleteNamespacedJob({ name, namespace, body: { propagationPolicy: "Foreground", preconditions: { uid: jobUid } } }, apiOptions(cleanupSignal));
+        // Accepted DELETE is not a completion acknowledgement. Foreground deletion
+        // keeps the Job until its dependent Pods have been removed.
+        for (;;) {
+          const existing = await this.batch.readNamespacedJob({ name, namespace }, apiOptions(cleanupSignal));
+          if (existing.metadata?.uid !== jobUid) throw new Error("Job identity changed during cleanup");
+          await delay(100, undefined, { signal: cleanupSignal });
+        }
+      } catch (error) {
+        // An absent object is conclusive only after observing the CREATE's UID.
+        // A lost CREATE reply followed by 404 may race an apiserver still committing.
+        if (missing(error) && jobUid) { attempted = false; this.owned.delete(name); this.pendingCleanup.delete(name); return; }
+        this.pendingCleanup.add(name);
+        throw new SandboxToolError("CLEANUP_PENDING", "UNKNOWN", "pending");
       }
     };
+    const cleanup = (): Promise<void> => closing ??= remove().finally(() => { closing = undefined; });
+    this.owned.set(name, cleanup);
     try {
-      signal.throwIfAborted();
-      const result = await this.batch.createNamespacedJob({ namespace, body: job }, apiOptions(signal));
-      created = true;
-      jobUid = result.metadata?.uid;
+      let result: k8s.V1Job;
+      try {
+        signal.throwIfAborted();
+        attempted = true;
+        result = await this.batch.createNamespacedJob({ namespace, body: job }, apiOptions(signal));
+        jobUid = result.metadata?.uid;
+      }
+      catch (error) {
+        const code = (error as { code?: number })?.code;
+        if (code && code >= 400 && code < 500 && code !== 408) attempted = false;
+        throw error;
+      }
+      finally { created(); }
+      if (this.stopped) throw new SandboxToolError("SERVICE_UNAVAILABLE");
       if (!jobUid) throw new Error("Runner Job has no UID");
       const deadline = Date.now() + 90_000;
       let pod: k8s.V1Pod | undefined;
+      let nextEvents = 0;
       while (Date.now() < deadline) {
         signal.throwIfAborted();
         const list = await this.core.listNamespacedPod({ namespace, labelSelector: `job-name=${name}` }, apiOptions(signal));
         pod = list.items.find(p => p.metadata?.ownerReferences?.some(o => o.uid === jobUid));
+        if (!pod && Date.now() >= nextEvents) {
+          nextEvents = Date.now() + 1000;
+          const events = await this.core.listNamespacedEvent({ namespace, fieldSelector: `involvedObject.uid=${jobUid}` }, apiOptions(signal)).catch(() => undefined);
+          if (events?.items.some(e => e.reason === "FailedCreate" && /quota|forbidden|serviceaccount|admission/i.test(e.message ?? ""))) throw new SandboxToolError("RUNNER_CAPACITY");
+        }
         if (pod?.status?.containerStatuses?.some(s => ["ErrImagePull", "ImagePullBackOff", "InvalidImageName"].includes(s.state?.waiting?.reason ?? ""))) throw new SandboxToolError("IMAGE_UNAVAILABLE");
         if (pod?.status?.conditions?.some(c => c.type === "PodScheduled" && c.status === "False" && c.reason === "Unschedulable")) throw new SandboxToolError("RUNNER_CAPACITY");
         if (pod?.status?.containerStatuses?.some(s => s.state?.terminated)) throw new Error("Runner failed before accepting code (check image/isolation support)");
@@ -151,4 +198,11 @@ export class K8sScriptSandboxProvider implements ScriptSandboxProvider {
       throw error;
     }
   }
+
+  async shutdown(): Promise<void> {
+    this.stopped = true;
+    const results = await Promise.allSettled([...this.owned.values()].map(close => close()));
+    if (results.some(r => r.status === "rejected")) throw new SandboxToolError("CLEANUP_PENDING", "UNKNOWN", "pending");
+  }
+
 }

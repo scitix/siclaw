@@ -492,6 +492,14 @@ The supervisor has its own lifetime alarm, and K8s Jobs have an active deadline,
 zero retries and TTL cleanup. These bound orphan lifetime after controller loss.
 Code and input are transferred over attach/stdin, never stored in Pod/Job specs,
 ConfigMaps or labels. Cleanup uses the created Job UID as a delete precondition.
+Runtime waits for foreground deletion to remove the Job before reporting confirmed
+cleanup. Failed deletion retains a cleanup handle and a provider capacity slot;
+later starts and shutdown retry it. A lost CREATE reply is reconciled by its
+unpredictable invocation name and then fenced by the observed UID. An immediate
+404 without an observed UID is still uncertain, so the handle is retained for
+reconciliation instead of assuming that a delayed CREATE cannot commit.
+Quota/admission FailedCreate events return an early capacity error. Runtime only
+needs read access to those events, in addition to its existing runner permissions.
 
 Results report `startup_ms` (provider acquisition/readiness), `warm`, and
 `duration_ms` (authorization + startup + execution + cleanup). A warmed claim

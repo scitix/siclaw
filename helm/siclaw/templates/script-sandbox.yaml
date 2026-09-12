@@ -38,7 +38,7 @@ rules:
     resources: ["jobs"]
     verbs: ["create", "get", "delete"]
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "events"]
     verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["pods/attach"]

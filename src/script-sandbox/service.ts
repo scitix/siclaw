@@ -62,12 +62,13 @@ export class ScriptSandboxService {
     } catch (error) {
       result.status = timedOut ? "timed_out" : controller.signal.aborted ? "cancelled" : "failed";
       // Connector and Kubernetes exceptions can contain credentials; do not relay them.
+      if (error instanceof SandboxToolError) result.cleanup = error.cleanup;
       result.error = error instanceof SandboxToolError ? error.message : "Script execution denied, interrupted or unavailable";
       if (!channel && !controller.signal.aborted && error instanceof ScriptSandboxError) throw error;
     } finally {
       clearTimeout(timer);
       controller.abort();
-      result.cleanup = channel ? "pending" : "not_required";
+      result.cleanup = channel ? "pending" : result.cleanup ?? "not_required";
       if (channel) {
         try { await channel.close(); result.cleanup = "confirmed"; }
         catch { console.warn("[script-sandbox] Instance cleanup failed"); }

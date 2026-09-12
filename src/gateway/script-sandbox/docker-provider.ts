@@ -1,3 +1,4 @@
+import { SandboxToolError } from "../../script-sandbox/errors.js";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { scriptRunnerUid } from "../../script-sandbox/identity.js";
@@ -31,9 +32,12 @@ export class DockerScriptSandboxProvider implements ScriptSandboxProvider {
     let closed = false;
     const close = async () => {
       if (closed) return;
-      closed = true;
       child.kill("SIGKILL");
-      await execFileAsync("docker", ["rm", "--force", name], { timeout: 10_000 }).catch(() => {});
+      try { await execFileAsync("docker", ["rm", "--force", name], { timeout: 10_000 }); }
+      catch (error) {
+        if (!/No such container/i.test(String((error as { stderr?: string }).stderr))) throw new SandboxToolError("CLEANUP_PENDING", "UNKNOWN", "pending");
+      }
+      closed = true;
     };
     return { instanceId: name, stdout: child.stdout, stderr: child.stderr, stdin: child.stdin, done, close };
   }
