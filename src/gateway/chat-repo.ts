@@ -150,7 +150,7 @@ export async function ensureChatSession(
   sessionId: string, agentId: string, userId: string,
   title?: string, preview?: string, origin?: string,
   lineage?: ChatSessionLineageInput,
-  opts?: { senderExternalId?: string | null; channelId?: string | null },
+  opts?: { senderExternalId?: string | null; channelId?: string | null; senderType?: string | null },
 ): Promise<void> {
   const payload: Record<string, unknown> = {
     session_id: sessionId, agent_id: agentId, user_id: userId,
@@ -167,6 +167,14 @@ export async function ensureChatSession(
   // Each gated on != null so web/api/a2a callers leave the payload unchanged.
   if (opts?.senderExternalId != null) payload.sender_external_id = opts.senderExternalId;
   if (opts?.channelId != null) payload.channel_id = opts.channelId;
+  // The provider's own sender kind ("user" / "bot" / …), forwarded VERBATIM —
+  // no mapping, no default, absent rather than empty when the event carried
+  // none. Upstream stores it on the session so a usage count can tell a person
+  // from a machine: an allowlisted or open-tier bot otherwise writes a row
+  // indistinguishable from an unbound human's. Only providers that classify
+  // senders send this (Feishu today), and "absent" must stay distinguishable
+  // from "user" — which is why this is gated on != null like the two above.
+  if (opts?.senderType != null) payload.sender_type = opts.senderType;
   await getClient().request("chat.ensureSession", payload);
 }
 
