@@ -347,3 +347,13 @@ Validation before the final base refresh:
   stale-request cancellation. This follow-up has not been deployed as a service
   or rerun through a live model; earlier deployment evidence above describes
   the preceding implementation.
+
+Final base refresh: rebased onto `main` `fa8f51e4`. The 650 related backend
+checks and the TypeScript build passed after rebase. No runtime implementation
+changed during that rebase. The disposable MySQL namespace and local forwarding
+process were removed; the temporary password was deleted. Existing test
+services were not redeployed by this follow-up.
+
+Upgrade the Web assets before the history API and Runtime. New Web understands
+old full responses; already-open old clients must reload to understand the new
+availability markers.
