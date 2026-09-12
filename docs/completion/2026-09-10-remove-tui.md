@@ -1,8 +1,9 @@
 # Remove the interactive terminal interface
 
-Date: 2026-09-10. Local branch: `codex/remove-tui`, based on `647012a4`.
-Implemented and reviewed in an isolated worktree. The validation images were
-built and deployed only to a disposable test namespace.
+Started: 2026-09-10. Local branch: `codex/remove-tui`, initially based on
+`647012a4`. Implemented and reviewed in an isolated worktree. The latest
+2026-09-12 rebase and integrated Kubernetes acceptance are recorded below;
+earlier sections describe their dated builds and validation limits.
 
 ## Result
 
@@ -203,7 +204,8 @@ SQLite checks run real migrations and the Portal append/update/read RPCs with
 metadata above 64 KiB, including a repeated migration. A live MySQL migration
 was not run in this follow-up.
 
-These repairs have not been redeployed to Kubernetes. Deployment requires the
+At this initial follow-up, the repairs had not been redeployed to Kubernetes.
+Deployment requires the
 updated Runtime scheduler, AgentBox skill tool, and Portal Web assets. The
 previous test namespace remains deleted; the earlier registry tags still refer
 to the pre-repair build.
@@ -230,3 +232,85 @@ scripts, remain visible and copyable. The new regression covers these cases;
 the complete frontend suite and frontend build passed again. Logs:
 `/tmp/siclaw-remove-tui-pr-web.log` and
 `/tmp/siclaw-remove-tui-pr-web-build.log`.
+
+## 2026-09-12 rebase and integrated Kubernetes acceptance
+
+Rebased onto `main` `3df6ccad1415337e7a981242e43415c5eb498142` in the same
+worktree. The tested and deployed implementation is
+`d4390b8067c752878e8b5ab19de18ffe3fa4c549`; later completion-record updates
+change documentation only.
+
+Conflict resolution preserves the current script-sandbox options, shared Pi
+execution session and extension binding, and Planning guidance. The retired
+coordinator/peer tools remain removed. The removal decision is ADR-020, avoiding
+the new sandbox ADR-019. Portal metadata starts as LONGTEXT without a redundant
+intermediate alteration. The rebase adds no new production dependency.
+
+### Automated verification
+
+- Backend: **364 files passed; 7,433 tests passed, 1 skipped**.
+- Frontend: **34 files passed; 288 tests passed**.
+- Both TypeScript configurations, backend build, and Portal Web build passed.
+- Executable smoke passed help/input/provider errors, model-stub prompt and
+  continuation, provider-failure exit status, SIGINT 130 / SIGTERM 143, and
+  fresh local SQLite/Portal/Web startup.
+- A real MySQL server passed the complete Portal migration on a fresh database
+  and on rerun. TINYTEXT, TEXT and MEDIUMTEXT widened; existing LONGTEXT/JSON,
+  old values and NULL were preserved. Each old-column case round-tripped an
+  18 MiB payload. This supersedes the earlier recording-adapter-only limit.
+- All five GitHub checks on the implementation commit passed: Test, Portal
+  Web Test, Type Check, AgentBox Build Graph, and KBC Box Test.
+
+### Deployed verification
+
+Built fresh Runtime and AgentBox images plus the integrated host platform's
+API/Web consumers, then deployed them by immutable digest to an existing test
+namespace. Runtime, host API/Web and AgentBox ran in separate Pods. The existing
+script-sandbox runner/configuration was retained. No production namespace was
+deployed. This run includes the scheduler and full-preview repairs missing
+from the September 10 image.
+
+| Check | Result |
+| --- | --- |
+| Web and effective prompt | Real model conversation and `cluster_list` worked for an agent with no bound infrastructure; the inspected Web prompt had no TUI/setup/terminal-only guidance. No real cluster diagnostics were claimed for this unbound agent. |
+| Full skill preview | Real login, model, skill tools, SSE, API, MySQL and deployed Web UI completed the live preview and history path. The model edited SKILL.md; a 106,301-character reference and other package fixtures were pre-seeded by the test. All five files survived. |
+| Storage and copy | Metadata contained 121,061 characters while model-facing text remained at 8,000. API history matched the MySQL row exactly. Text/script/reference copies matched exactly; empty text was copyable and binary content had no copy button. Reloaded history retained the complete package. |
+| Browser quality | Screenshots were visually checked. Final login/history/copy/reload verification had no page errors or failed HTTP responses. An initial CSS retry problem came from the temporary HTTPS test proxy and disappeared after replacing that proxy; application code was unchanged. |
+| Deep Investigation | Entered DP, released the session from AgentBox memory, resumed with DP still active, then explicitly exited to inactive. This was session release/restoration, not a Pod restart test. |
+| Cancellation | Aborted after actual model output began, then obtained the exact expected response in the same session. |
+| Scheduled tasks | The annual task never fired early. A manual run persisted its exact `task_report`. A minute timer fired once; deleting it during the run did not re-arm it during more than 15 minutes of subsequent checks. |
+| Channel mode | Real model response and prompt inspection passed through internal mTLS. No external IM service received a message. |
+| Linux CLI | Real model `--prompt` and `--continue` passed using the Runtime image, which includes the CLI. The intentionally smaller AgentBox image does not package that entry point. |
+
+### Known limitation found during CLI acceptance
+
+Standalone CLI credential discovery is **not accepted**: after registering a
+temporary kubeconfig, `cluster_list` returned `Credential broker not initialized
+for this session`. The CLI currently supplies only `credentialsDir` to the
+factory. Source comparison confirms that this wiring and the tool's broker
+requirement already exist on the rebased main; removing terminal renderers does
+not change that execution branch. Server AgentBox initializes its broker and
+passed the deployed discovery check.
+
+This independent credential integration issue remains open. A follow-up should
+connect scoped local/snapshot credentials to the broker, preserve per-invocation
+cleanup and empty-snapshot authority, and verify cluster/host tools with real
+read-only credentials. The CLI model smoke does not establish working CLI
+infrastructure diagnostics. No credential-broker implementation was changed in
+this rebase.
+
+### Cleanup and remaining boundaries
+
+Removed the dedicated acceptance agent, its sessions/tasks/runs, temporary
+ServiceAccount/Role/RoleBinding/ConfigMap, and both disposable MySQL databases.
+Kept the existing test namespace and newly deployed services. Final deployment
+generations, replica readiness and API/Web health checks passed; only the three
+intended service Deployments changed from the pre-deployment snapshot.
+
+The host platform's 4,533 pre-existing chat rows retained identical content and
+metadata hashes across its metadata migration. Its test database used a 64 MiB
+packet limit. Production-scale ALTER duration, the maximum escaped preview
+payload, HA/load, external IM delivery and CLI cluster/host access remain outside
+the passed checks. Test success does not establish zero production rollout
+impact: shared prompt behavior, scheduling and metadata storage are part of this
+branch. No production rollout or merge was performed.
