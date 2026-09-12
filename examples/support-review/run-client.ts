@@ -39,6 +39,7 @@ const object = (value: unknown): value is Record<string, unknown> => value !== n
 export function reviewText(context: ReviewContext): string {
   if (!object(context) || !object(context.ticket) || !nonempty(context.ticket.id) ||
       !nonempty(context.ticket.revision) || (context.ticket.title !== undefined && !nonempty(context.ticket.title)) ||
+      (context.ticket.description !== undefined && typeof context.ticket.description !== "string") ||
       !["resolved", "closed"].includes(context.ticket.status) ||
       !Array.isArray(context.records) || !object(context.coverage) ||
       typeof context.coverage.complete !== "boolean" || !Array.isArray(context.coverage.missing) ||
@@ -66,6 +67,9 @@ export function reviewText(context: ReviewContext): string {
 function validateReview(value: unknown, context: ReviewContext): TicketReviewResult {
   const result = parseTicketReviewResult(value);
   if (result.ticket_id !== context.ticket.id) throw new RunError("REVIEW_TICKET_MISMATCH", false);
+  if (!context.coverage.complete && result.review_status === "ready") {
+    throw new RunError("REVIEW_INCOMPLETE_COVERAGE", false);
+  }
   const references = new Set(context.records.map((record) => JSON.stringify([record.source, record.id])));
   references.add(JSON.stringify(["ticket", context.ticket.id]));
   if (result.evidence.some((reference) => !references.has(JSON.stringify([reference.source, reference.id])))) {
