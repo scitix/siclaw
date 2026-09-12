@@ -5,6 +5,7 @@
  * goes through Portal via WS RPC.
  */
 
+import { boundSkillPreviewMetadata, previewSummary } from "../shared/skill-preview-storage.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
@@ -178,6 +179,25 @@ export async function ensureChatSession(
   await getClient().request("chat.ensureSession", payload);
 }
 
+/** Packet failures are explicit rejections; retry once with an explainable marker.
+ * Do not retry timeouts/disconnects: an append may already have committed.
+ */
+async function persistChatMessage(method: string, payload: Record<string, any>) {
+  if (payload.metadata != null) {
+    const metadata = boundSkillPreviewMetadata(JSON.parse(payload.metadata));
+    payload.metadata = JSON.stringify(metadata);
+    if (metadata?.skillPreview?.status === "omitted") payload.content = "Skill preview unavailable: " + metadata.skillPreview.reason;
+  }
+  try {
+    return await getClient().request(method, payload);
+  } catch (error) {
+    const metadata = payload.metadata ? JSON.parse(payload.metadata) : null;
+    if (!metadata?.skillPreview || !/max_allowed_packet|packet.{0,40}too large|ER_NET_PACKET_TOO_LARGE/i.test(String(error))) throw error;
+    metadata.skillPreview = previewSummary(metadata.skillPreview, "storage_error");
+    return getClient().request(method, { ...payload, metadata: JSON.stringify(metadata), content: "Skill preview could not be saved: storage capacity exceeded." });
+  }
+}
+
 /**
  * Insert a single message row via RPC. Returns the generated id.
  *
@@ -192,7 +212,7 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
   // gateway path already stores the original text, so this is a no-op there, but it
   // guards any caller that hands us a brain-recorded user turn.
   const content = msg.role === "user" ? stripLanguageDirective(msg.content) : msg.content;
-  const result = await getClient().request("chat.appendMessage", {
+  const result = await persistChatMessage("chat.appendMessage", {
     session_id: msg.sessionId,
     role: msg.role,
     content,
@@ -358,7 +378,7 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
 
 /** Update an existing persisted message row. Used to turn running tool rows into completed rows. */
 export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
-  await getClient().request("chat.updateMessage", {
+  await persistChatMessage("chat.updateMessage", {
     id: msg.messageId,
     session_id: msg.sessionId,
     content: msg.content,
@@ -398,7 +418,7 @@ export async function sequenceMessage(messageId: string, sessionId: string): Pro
 
 /** Update the parent async delegation tool row after its background batch finishes. */
 export async function updateDelegationToolMessage(msg: UpdateDelegationToolMessageInput): Promise<void> {
-  await getClient().request("chat.updateDelegationToolMessage", {
+  await persistChatMessage("chat.updateDelegationToolMessage", {
     session_id: msg.sessionId,
     tool_name: msg.toolName,
     delegation_id: msg.delegationId,

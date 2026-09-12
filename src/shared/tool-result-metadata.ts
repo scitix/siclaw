@@ -1,3 +1,5 @@
+import { boundSkillPreviewMetadata, previewSummary } from "./skill-preview-storage.js";
+
 /** Preserve structured tool data across Web, IM, delegation and synthetic turns. */
 export function persistableToolDetails(
   details: unknown,
@@ -12,8 +14,11 @@ export function persistableToolDetails(
   } = details as Record<string, unknown>;
   if (!Object.keys(rest).length) return null;
   try {
-    return JSON.parse(redact(JSON.stringify(rest))) as Record<string, unknown>;
+    const bounded = boundSkillPreviewMetadata(rest);
+    return boundSkillPreviewMetadata(JSON.parse(redact(JSON.stringify(bounded))) as Record<string, unknown>);
   } catch {
+    // A failed JSON redaction must not silently resurrect the unredacted text fallback.
+    if (rest.skillPreview) return { skillPreview: previewSummary(null, "redaction_failed") };
     return null;
   }
 }

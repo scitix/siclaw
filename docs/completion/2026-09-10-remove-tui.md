@@ -314,3 +314,36 @@ payload, HA/load, external IM delivery and CLI cluster/host access remain outsid
 the passed checks. Test success does not establish zero production rollout
 impact: shared prompt behavior, scheduling and metadata storage are part of this
 branch. No production rollout or merge was performed.
+
+
+## Review follow-up: bounded preview history (2026-09-12)
+
+Full packages no longer travel with every chat history page. Portal REST,
+internal REST and chat RPC project previews to small availability summaries in
+SQL; the panel requests one message with `message_id` through the same session
+authorization gate. The full detail path also bounds oversized legacy records.
+Ordinary non-preview metadata and legacy text-only previews remain compatible.
+
+Preview metadata has a 1 MiB serialized UTF-8 budget, including JSON escaping
+and duplicate compatibility projections. The shared persistence helper checks
+before synchronous redaction and again after redaction. Database writers also
+account for the actual MySQL packet, other column values, SQL escaping and
+statement overhead. Oversized payloads become explicit omission markers and
+small timeline metadata. Explicit packet rejections get one summary retry;
+uncertain append outcomes (timeouts/disconnects) are not retried. The panel
+explains omissions, allows failed reads to be retried, and ignores stale loads.
+CLAUDE.md now consistently describes invocation-owned snapshot cleanup.
+
+Validation before the final base refresh:
+
+- Backend: 365 files, 7,439 passed, one existing skip; TypeScript/build passed.
+- Portal Web: 35 files, 289 passed; TypeScript and production build passed.
+- Real disposable MySQL 8 with a **4 MiB** packet: a 140,082-byte preview
+  round-tripped completely while its history response was 192 bytes; a
+  2,400,070-byte escaped preview returned an explicit omission marker. Legacy
+  JSON-column projection passed as well as LONGTEXT writes. SQLite tests cover
+  RPC round trips, old oversized rows, session scoping and metadata preservation.
+- Browser component tests exercise lazy load, exact copying, omission, retry and
+  stale-request cancellation. This follow-up has not been deployed as a service
+  or rerun through a live model; earlier deployment evidence above describes
+  the preceding implementation.

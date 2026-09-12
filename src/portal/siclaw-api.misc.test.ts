@@ -95,7 +95,8 @@ describe("siclaw-api misc routes", () => {
     const sqlite = new DatabaseSync(":memory:");
     try {
       sqlite.exec(`CREATE TABLE chat_messages (id TEXT, session_id TEXT, role TEXT, content TEXT,
-        metadata TEXT, seq INTEGER, tool_name TEXT, tool_input TEXT, outcome TEXT, duration_ms INTEGER, created_at TEXT)`);
+        metadata TEXT, seq INTEGER, tool_name TEXT, toolset TEXT, tool_input TEXT, outcome TEXT, duration_ms INTEGER, created_at TEXT,
+        from_agent_id TEXT, parent_session_id TEXT, delegation_id TEXT, target_agent_id TEXT, trace_id TEXT)`);
       const insert = sqlite.prepare("INSERT INTO chat_messages (id, session_id, role, content, metadata, seq, created_at) VALUES (?, 's1', ?, ?, ?, ?, '2026-09-01')");
       insert.run("prompt", "user", "question", null, 1);
       insert.run("answer", "assistant", "answer", null, 2);

@@ -1,8 +1,9 @@
+import { useSkillPreview } from "../../lib/useSkillPreview"
 import { useState } from "react"
 import { X, BookOpen, Tag, ChevronRight, FileText, Terminal, FileCode, Copy, Check } from "lucide-react"
 import { cn } from "./cn"
 import type { PilotMessage } from "./types"
-import { readSkillPreview, type SkillPreviewData } from "../../lib/skillPreview"
+import { type SkillPreviewData } from "../../lib/skillPreview"
 
 function CopyButton({ text, name }: { text: string; name: string }) {
   const [copied, setCopied] = useState(false)
@@ -103,10 +104,11 @@ function decodeSkillPanelFile(file: NonNullable<SkillPreviewData["files"]>[numbe
 export interface SkillPanelProps {
   message: PilotMessage
   onClose: () => void
+  detailUrl?: string
 }
 
-export function SkillPanel({ message, onClose }: SkillPanelProps) {
-  const skill = readSkillPreview(message)
+export function SkillPanel({ message, onClose, detailUrl }: SkillPanelProps) {
+  const { skill, notice, loading, error, retry } = useSkillPreview(message, detailUrl)
 
   if (!skill) {
     return (
@@ -117,7 +119,8 @@ export function SkillPanel({ message, onClose }: SkillPanelProps) {
             <X className="w-4 h-4 text-muted-foreground/70" />
           </button>
         </div>
-        <p className="px-4 py-3 text-sm text-muted-foreground">Ask the agent to generate the preview again.</p>
+        <p className="px-4 py-3 text-sm text-muted-foreground">{loading ? "Loading preview…" : notice?.status === "omitted" ? "The full preview could not be saved within the storage or redaction limits. Generate a smaller preview." : error ? "Could not load the preview. Try again." : "Ask the agent to generate the preview again."}</p>
+        {error && <button type="button" onClick={retry}>Retry</button>}
       </div>
     )
   }

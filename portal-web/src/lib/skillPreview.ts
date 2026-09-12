@@ -34,6 +34,7 @@ function parsePreview(value: unknown): SkillPreviewData | undefined {
 
 /** Live tool details and restored metadata are authoritative; old rows used JSON text. */
 export function readSkillPreview(message: Pick<PilotMessage, "content" | "toolDetails" | "metadata">): SkillPreviewData | undefined {
+  if (skillPreviewNotice(message)) return undefined
   const structured = parsePreview(message.toolDetails?.skillPreview) ?? parsePreview(message.metadata?.skillPreview)
   if (structured) return structured
   try {
@@ -41,4 +42,22 @@ export function readSkillPreview(message: Pick<PilotMessage, "content" | "toolDe
   } catch {
     return undefined
   }
+}
+
+export interface SkillPreviewNotice {
+  status: "deferred" | "omitted"
+  name: string
+  reason?: string
+}
+
+/** Explicit availability markers must never fall back to stale/truncated text. */
+export function skillPreviewNotice(message: Pick<PilotMessage, "toolDetails" | "metadata">): SkillPreviewNotice | undefined {
+  for (const raw of [message.toolDetails?.skillPreview, message.metadata?.skillPreview]) {
+    const preview = record(raw)
+    if (preview?.status === "deferred" || preview?.status === "omitted") {
+      return { status: preview.status, name: typeof preview.name === "string" ? preview.name : "Skill preview", reason: typeof preview.reason === "string" ? preview.reason : undefined }
+    }
+    if (parsePreview(raw)) return undefined
+  }
+  return undefined
 }
