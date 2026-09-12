@@ -10,7 +10,6 @@ const KNOWN_KEYS = CAPABILITY_GROUPS.map((g) => g.key)
 describe("CAPABILITY_GROUPS shape", () => {
   it("declares the designed capability groups, including conversation handoff", () => {
     expect([...KNOWN_KEYS].sort()).toEqual([
-      "delegate_agents",
       "inspect_infra",
       "plan_tasks",
       "read_files",

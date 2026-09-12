@@ -3,8 +3,8 @@
  *
  * indexOnly=true 请求只返回内部目标索引，不附带完整资产。
  * 目标名单由控制面出(`config.getHandoffTargets`),这里只做转发。**不接受调用方
- * 指名 agentId**:名单是照 mTLS 证书里的身份取的,和 `/api/internal/delegates`
- * 一样 —— 一个 box 只能问「我能交给谁」,不能问「别人能交给谁」。
+ * 指名 agentId**:名单是照 mTLS 证书里的身份取的。一个 box 只能问「我能交给谁」,
+ * 不能问「别人能交给谁」。
  *
  * 拿不到就当没有:名单为空 → transfer 工具整个不出现,这一轮退化成 facade 自己
  * 答,而不是长出一个会失败的工具。

@@ -71,7 +71,6 @@ describe("resolveCapabilities", () => {
 
   it("CAPABILITY_GROUPS contains the 12 designed groups", () => {
     expect(Object.keys(CAPABILITY_GROUPS).sort()).toEqual([
-      "delegate_agents",
       "inspect_infra",
       "plan_tasks",
       "read_files",

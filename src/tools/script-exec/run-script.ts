@@ -49,6 +49,6 @@ export function createRunScriptTool(refs: ToolRefs): ToolDefinition {
 
 export const registration: ToolEntry = {
   category: "script-exec", create: createRunScriptTool,
-  available: refs => !!refs.scriptExecutor && !refs.isSubagent && !refs.delegation,
+  available: refs => !!refs.scriptExecutor && !refs.isSubagent,
   modes: ["web"],
 };

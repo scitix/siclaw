@@ -13,7 +13,6 @@ import {
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
-import { notifyCoordinatorsForMembers } from "./coordinator-invalidation.js";
 
 /** Extract the first `server:` value from a kubeconfig YAML string. */
 function extractApiServer(kubeconfig: string): string | null {
@@ -137,9 +136,6 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
         for (const agentId of agentIds) {
           connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["cluster"] });
         }
-        // Same treatment for coordinators that delegate to those members: this
-        // cluster's rename changes the member's coverage in their roster manifest.
-        void notifyCoordinatorsForMembers(connectionMap, agentIds);
       })
       .catch((err: any) => console.warn("[cluster-api] notify failed:", err.message));
   });
@@ -171,9 +167,6 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
     for (const agentId of agentIds) {
       connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["cluster"] });
     }
-    // Coordinators delegating to those members: the deleted cluster vanishes from
-    // their roster coverage too (captured before the cascade, same as agentIds).
-    void notifyCoordinatorsForMembers(connectionMap, agentIds);
   });
 
   // POST /api/v1/clusters/:id/test — test connection (stub)

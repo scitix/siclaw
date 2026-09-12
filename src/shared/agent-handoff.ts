@@ -1,26 +1,8 @@
 /**
- * Wire types for a HANDOFF — one agent passing ownership of a conversation to
- * another, with the user seeing one agent throughout.
- *
- * Not delegation. Delegation is a call: the coordinator asks a peer, gets an
- * artifact back, and keeps the turn (`agent-delegate.ts`). A handoff is a
- * TRANSFER: the receiving agent owns the session from that point on, answers the
- * user directly, and the sender is gone from the conversation until someone
- * hands it back. There is no card, no artifact, and nothing to restate.
- *
- * Why it exists: one Agent per network region (a region's cluster APIs, host
- * SSH, internal MCP and model endpoints are reachable only from a box sitting
- * inside it), but ONE agent as far as the user is concerned. The facade takes
- * the first turn and transfers to whichever region owns the target resource.
- *
- * The box↔gateway contract is one call:
- *   - box → gateway: GET /api/internal/handoff-targets  (→ HandoffTargetsResponse)
- *
- * The transfer itself is NOT an HTTP call. The tool emits a `handoff_requested`
- * control event and ends the turn; the control plane validates the target
- * against the facade's roster, flips the session's executing agent, and
- * re-dispatches the brief to it on the SAME response stream. The runtime never
- * writes that state itself — one writer, and it is the one that can authorize.
+ * Handoff transfers ownership of one conversation between authorized Agents.
+ * The receiver continues the shared history and answers the user directly.
+ * The control plane owns authorization and execution state; Runtime emits a
+ * handoff_requested event and discovers destinations through the internal API.
  */
 
 /** Where a handoff-target list is fetched from (mTLS internal API). */

@@ -247,8 +247,8 @@ export function validTraceId(value: unknown): string | undefined {
  * Any OTHER failure is a genuine one-off and keeps its own line.
  *
  * Lives here, next to bindMessageTraceId, because its dedup only works if every bind
- * caller shares one reporter — server.ts (prompt/steer rows), delegate-api.ts
- * (delegated opening rows) and the lark/dingtalk channels all report through it.
+ * caller shares one reporter — server.ts (prompt/steer rows) and the IM channels
+ * all report through it.
  */
 const unsupportedUpstreamMethodsReported = new Set<string>();
 export function warnTraceBindFailure(kind: string, sessionId: string, messageId: string, err: unknown): void {

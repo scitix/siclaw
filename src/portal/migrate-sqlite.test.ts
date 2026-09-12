@@ -12,6 +12,23 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     await closeDb();
   });
 
+  it("retires peer rosters idempotently and preserves historical transcripts", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    await db.query("CREATE TABLE agent_delegates (coordinator_agent_id TEXT, member_agent_id TEXT)");
+    await db.query("INSERT INTO agents (id, name, agent_type) VALUES ('old', 'Old', 'coordinator'), ('current', 'Current', 'sre')");
+    await db.query("INSERT INTO agent_delegates VALUES ('old', 'current')");
+    await db.query("INSERT INTO chat_sessions (id, user_id, agent_id, origin, delegation_id) VALUES ('history', 'u', 'old', 'delegation', 'leg')");
+    await runPortalMigrations();
+    await runPortalMigrations();
+    const [agents] = await db.query("SELECT id, agent_type, status FROM agents ORDER BY id");
+    expect(agents).toEqual([{ id: "current", agent_type: "sre", status: "active" }, { id: "old", agent_type: "coordinator", status: "disabled" }]);
+    const [sessions] = await db.query("SELECT id, delegation_id FROM chat_sessions WHERE id = 'history'");
+    expect(sessions).toEqual([{ id: "history", delegation_id: "leg" }]);
+    const [roster] = await db.query("SELECT name FROM sqlite_master WHERE name = 'agent_delegates'");
+    expect(roster).toEqual([]);
+  });
+
   it("creates all 34 tables without error", async () => {
     await runPortalMigrations();
     const db = getDb();
@@ -96,7 +113,6 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_skills_overlay",
       "idx_skills_org_name",
       "idx_hosts_jump",
-      "idx_agent_delegates_member",
     ];
 
     await runPortalMigrations();

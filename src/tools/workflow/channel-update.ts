@@ -62,10 +62,5 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: createChannelUpdateTool,
   modes: ["channel"],
-  // Suppressed on a delegated turn: a delegated worker's output must flow back to
-  // the coordinator (which owns the single visible identity), never independently
-  // to the worker's own channel card (design agent-delegation.md §5.6). The
-  // read-only filter already drops it under read-only delegation; this guard also
-  // covers a (future) write-tier delegation.
-  available: (refs) => Boolean(refs.channelMessageExecutor && refs.sessionIdRef && !refs.delegation),
+  available: (refs) => Boolean(refs.channelMessageExecutor && refs.sessionIdRef),
 };

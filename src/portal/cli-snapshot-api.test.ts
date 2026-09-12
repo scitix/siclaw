@@ -527,22 +527,22 @@ describe("GET /api/v1/cli-snapshot", () => {
     const db = getDb();
     await db.query(
       "INSERT INTO agents (id, name, status, agent_type, system_prompt, is_production, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ["coord-legacy", "legacy-coordinator", "active", "coordinator", null, 1, "u"],
+      ["coord-legacy", "legacy-knowledge_qa", "active", "knowledge_qa", null, 1, "u"],
     );
 
     const { status, body } = await runRoute(
       router,
       fakeReq({
-        url: "/api/v1/cli-snapshot?agent=legacy-coordinator",
+        url: "/api/v1/cli-snapshot?agent=legacy-knowledge_qa",
         headers: authedHeaders(),
       }),
     );
 
     expect(status).toBe(200);
-    expect(body.activeAgent.agentType).toBe("coordinator");
+    expect(body.activeAgent.agentType).toBe("knowledge_qa");
     expect(body.activeAgent.systemPrompt).toBeNull();
     expect(body.activeAgent.allowedTools).not.toContain("cluster_list");
-    expect(body.activeAgent.allowedTools).toContain("delegate_to_agent");
+    expect(body.activeAgent.allowedTools).toContain("read");
   });
 
   it("locks Knowledge QA tools in Portal-backed TUI even when the row asks for command execution", async () => {

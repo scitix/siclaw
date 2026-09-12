@@ -134,7 +134,7 @@ export class LocalSpawner implements BoxSpawner {
     // the K8s path
     // (internal-api.ts handleToolCapabilities): a built-in type
     // LOCKS its capability set via effectiveCapabilityKeys and drives the locked
-    // persona via agentTypeState — without this, a Coordinator with an empty raw
+    // persona via agentTypeState — without this, a Knowledge QA Agent with an empty raw
     // tool_capabilities would resolve to null (unrestricted) and keep the default
     // custom persona in Local mode. Custom with null/empty selection keeps that
     // legacy compatibility only after this lookup resolves successfully.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dirname, "../..");
@@ -59,7 +59,7 @@ describe("AgentBox image boundary", () => {
       encoding: "utf8",
     })
       .split("\n")
-      .map((f) => f.trim())
+      .map((f) => f.trim()).filter((f) => existsSync(resolve(repoRoot, f)))
       .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
 
     const offenders: string[] = [];

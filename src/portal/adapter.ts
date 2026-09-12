@@ -2212,50 +2212,6 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       is_production: isProduction,
     };
   });
-
-  // Delegation roster for a coordinator agent: the peer agents it may delegate
-  // to, each with a derived manifest (description + bound cluster/host names) so
-  // the coordinator's LLM can pick a target. Serves BOTH the gateway's
-  // authorization check (peer ∈ members) and the coordinator's prompt manifest.
-  handlers.set("config.getDelegates", async (params) => {
-    const db = getDb();
-    const coordinatorId = params.agentId;
-    const [members] = await db.query(
-      `SELECT a.id, a.name, a.description FROM agent_delegates ad
-       JOIN agents a ON ad.member_agent_id = a.id
-       WHERE ad.coordinator_agent_id = ? AND a.status = 'active'
-       ORDER BY a.name`,
-      [coordinatorId],
-    ) as any;
-    const roster = await Promise.all((members as any[]).map(async (m) => {
-      const [[clusters], [hosts]] = await Promise.all([
-        db.query(
-          `SELECT c.name FROM agent_clusters ac JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
-          [m.id],
-        ),
-        db.query(
-          `SELECT h.name FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
-          [m.id],
-        ),
-      ]) as any;
-      return {
-        id: m.id,
-        name: m.name,
-        description: m.description ?? "",
-        clusters: (clusters as any[]).map((r) => r.name),
-        hosts: (hosts as any[]).map((r) => r.name),
-      };
-    }));
-    return { members: roster };
-  });
-
-  // ⚠️ `delegation.resolveRoute` 与 `delegation.terminal` 删了 —— 没有调用方了。
-  //
-  // 委托改走 A2A:peer 落在哪个 Runtime 由控制面在名册判定里顺带推导,不再由
-  // 发起方先问一次;跨 Runtime 的控制帧回传也不再经由一条独立的 terminal 中继,
-  // 而是走 A2A Task 自己的状态机。standalone 这两个空壳实现存在的唯一理由是
-  // "Runtime 会无条件调它们",而现在它不会了。
-
   handlers.set("config.getSettings", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
@@ -2766,20 +2722,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     };
   });
 
-  // Recent delegation sessions for a coordinator conversation → a given peer,
-  // newest-first. Used by delegate-api to bound session reuse to the coordinator's
-  // most-recent delegations (a long-running conversation can't resume a stale one).
-  handlers.set("chat.recentDelegationSessions", async (params) => {
-    const db = getDb();
-    const limit = Math.min(Math.max(1, Number(params.limit) || 8), 50);
-    const [rows] = await db.query(
-      `SELECT id FROM chat_sessions
-         WHERE parent_session_id = ? AND target_agent_id = ? AND origin = 'delegation' AND deleted_at IS NULL
-         ORDER BY last_active_at DESC LIMIT ?`,
-      [params.parent_session_id, params.target_agent_id, limit],
-    ) as any;
-    return { ids: (rows as any[]).map((r) => r.id as string) };
-  });
+
 
   handlers.set("chat.ensureSession", async (params) => {
     const db = getDb();

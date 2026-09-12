@@ -1,5 +1,7 @@
 # Session resume guarantees and opt-in input requests (2026-09-02)
 
+> Historical design: Coordinator and peer delegation have been retired. See [the retirement design](../design/2026-09-12-coordinator-retirement-assessment.md). Same-Agent subagents remain supported.
+
 Two small, paired capabilities on the `chat.send` path, both opt-in per call by
 the management plane (or any RPC caller):
 

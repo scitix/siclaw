@@ -37,10 +37,7 @@ import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
 import { registration as channelUpdate } from "./workflow/channel-update.js";
-import { registration as reportFindings } from "./workflow/report-findings.js";
 import { registration as requestInput } from "./workflow/request-input.js";
-import { registration as delegateToAgent } from "./workflow/delegate-to-agent.js";
-import { registration as listDelegates } from "./workflow/list-delegates.js";
 import { registration as searchHandoffTargets } from "./workflow/search-handoff-targets.js";
 import { registration as transferToAgent } from "./workflow/transfer-to-agent.js";
 import {
@@ -60,8 +57,8 @@ export const allToolEntries: ToolEntry[] = [
   memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
-  channelUpdate, reportFindings, requestInput,
+  channelUpdate, requestInput,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, jobStop, taskOutput,
-  delegateToAgent, listDelegates, transferToAgent, searchHandoffTargets,
+  transferToAgent, searchHandoffTargets,
 ];

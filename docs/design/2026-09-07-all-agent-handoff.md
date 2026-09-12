@@ -1,5 +1,7 @@
 # All-type conversation handoff and target capability summaries
 
+> Historical design: Coordinator and peer delegation have been retired. See [the retirement design](../design/2026-09-12-coordinator-retirement-assessment.md). Same-Agent subagents remain supported.
+
 ## Behavior
 
 Handoff belongs to a conversation, independently of the Agent's SRE, Coordinator,

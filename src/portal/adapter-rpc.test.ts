@@ -1012,7 +1012,7 @@ describe("credential.hostSearch", () => {
 // chat.*
 // ================================================================
 
-describe("chat.ensureSession", () => {
+describe("chat.sequenceMessage", "chat.ensureSession", () => {
   it("upserts a session", async () => {
     const query = mockQuery([]);
 
@@ -1107,29 +1107,6 @@ describe("chat.resolveSession", () => {
     // re-adds that predicate in a future "cleanup" PR this regresses.
     const sql = (query.mock.calls[0][0] as string).toLowerCase();
     expect(sql).not.toContain("deleted_at");
-  });
-});
-
-describe("chat.recentDelegationSessions", () => {
-  it("returns recent delegation session ids scoped to parent + target, newest-first", async () => {
-    const query = mockQuery([{ id: "s3" }, { id: "s2" }, { id: "s1" }]);
-    const result = await getHandler("chat.recentDelegationSessions")(
-      { parent_session_id: "coord-1", target_agent_id: "peer-1", limit: 8 }, "a1",
-    );
-    expect(result).toEqual({ ids: ["s3", "s2", "s1"] });
-    // Scoped to this coordinator conversation → this peer, delegation-origin only.
-    const sql = (query.mock.calls[0][0] as string).toLowerCase();
-    expect(sql).toContain("parent_session_id = ?");
-    expect(sql).toContain("target_agent_id = ?");
-    expect(sql).toContain("origin = 'delegation'");
-    expect(sql).toContain("order by last_active_at desc");
-    expect(query.mock.calls[0][1]).toEqual(["coord-1", "peer-1", 8]);
-  });
-
-  it("clamps the limit to a sane range", async () => {
-    const query = mockQuery([]);
-    await getHandler("chat.recentDelegationSessions")({ parent_session_id: "c", target_agent_id: "p", limit: 9999 }, "a1");
-    expect((query.mock.calls[0][1] as unknown[])[2]).toBe(50);
   });
 });
 
@@ -2486,11 +2463,9 @@ describe("buildAdapterRpcHandlers", () => {
       "sandbox.resolve", "config.getAgent", "config.getResources", "config.getSettings",
       "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel", "config.getTracingConfig",
-      "config.getDelegates",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.getVisualLink", "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
-      "chat.recentDelegationSessions", "chat.sequenceMessage",
+      "chat.getVisualLink", "chat.sequenceMessage", "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",

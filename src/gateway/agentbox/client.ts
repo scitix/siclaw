@@ -12,7 +12,7 @@ import http from "node:http";
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
-import type { OriginKind, DelegationContext } from "../../core/types.js";
+import type { OriginKind } from "../../core/types.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
 
@@ -28,7 +28,7 @@ export interface PromptOptions {
   sessionId?: string;
   /**
    * Identity of THIS turn, so a later abort can name the turn it means rather than
-   * the session it ran in. A delegated peer session is reused across turns, so an
+   * the session it ran in. A conversation session is reused across turns, so an
    * abort addressed by session alone can land on a successor.
    */
   turnId?: string;
@@ -43,10 +43,8 @@ export interface PromptOptions {
   kubeconfigPath?: string | null;
   /** Session mode — "web" | "channel" */
   mode?: string;
-  /** Entry-form of this prompt (audit + delegation read-only hardening). */
+  /** Entry-form of this prompt (audit categorization). */
   origin?: OriginKind;
-  /** Present when a coordinator agent delegated this turn over the mesh. */
-  delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
   /** Control plane owns this logical turn and will dispatch authorized handoffs. */

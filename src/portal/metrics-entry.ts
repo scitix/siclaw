@@ -185,10 +185,8 @@ export function entryMessagePredicate(
   // branch and lands in Web/Overview, which is precisely where a trace must
   // never appear.
   //
-  // Orphans are legitimate and expected, not corruption: a delegation whose
-  // parent could not be validated is persisted with a NULL parent ON PURPOSE
-  // (delegate-api never writes an unverified parent ref), and a parent removed
-  // by deletion or retention leaves its children behind.
+  // Historical delegation rows may have no validated parent reference, and
+  // deletion or retention can remove a parent while leaving its children behind.
   const predicate =
     `(${baseOriginPredicate(entry, sAlias)} ` +
     `OR (${parentAttributedOriginPredicate(sAlias)} AND ${parentAlias}.id IS NOT NULL ` +

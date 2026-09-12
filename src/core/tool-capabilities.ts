@@ -40,7 +40,6 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   search_memory:   ["memory_search", "memory_get"],
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
   spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
-  delegate_agents: ["delegate_to_agent", "list_delegates"],   // delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage; distinct from spawn
   // Handing the conversation to another agent is NOT delegation and does not
   // belong in that group: delegation calls a peer and keeps the turn, a transfer
   // gives the session away. This key remains for stored selections. Resolved
@@ -48,7 +47,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // the harness compiler, across all Agent types. No roster means no tool.
   transfer_conversation: ["transfer_to_agent", "search_handoff_targets"],
   scheduling:      ["manage_schedule"],
-  session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input", "propose_execution"],   // IM-channel-visible updates + delegation result artifact + clarification / write-approval requests
+  session_output:  ["task_report", "save_feedback", "channel_update", "request_input", "propose_execution"],   // Channel updates and clarification / write-approval requests
 };
 
 /** Strictly decode the stored/wire selection where null means intentional unrestricted. */

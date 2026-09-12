@@ -474,38 +474,6 @@ describe("startRuntime — chat.abort wiring", () => {
     await expect(abort({ agentId: "a", sessionId: "S" })).rejects.toThrow(/box unreachable/);
   });
 
-  // ⚠️ 这里曾有两个用例,钉住"被委托 turn 的终态要经一条带确认的 RPC 回控制面、
-  // 失败要重试",以及"终态要捎上这条腿自己的 traceId"。
-  //
-  // 那条 RPC(`delegation.terminal`)属于私有委托中继的监管层,已随中继一起删除:
-  // 委托切到 A2A 之后控制面永远不会注册 relay,那次调用必然走 rel == nil 分支、
-  // 永远返回 alreadyFinished —— 每个被委托 turn 一次白跑的往返,外加一整套为它
-  // 而存在的重试退避。
-  //
-  // 两件事各自的新归属:
-  //   - 终态:peer 的 prompt_done / done 是 ws control 帧,控制面的 tracker 订阅
-  //     chat.event 直接收到并收敛 task;
-  //   - traceId:控制面在终态时自己解析,放进 statusUpdate.metadata.peerTraceId
-  //     与 task 快照,由传输读回(delegate-a2a-transport)。
-  //
-  // 留下这条是为了钉住**没有人再发它** —— 悄悄回来一个每轮白跑的 RPC,是这类
-  // 删除最容易被撤销的方式。
-  it("no longer reports a delegated turn's terminal to the control plane", async () => {
-    const frontendClient = fakeFrontendClient();
-    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
-    const send = server.rpcMethods.get("chat.send")!;
-
-    await send({
-      agentId: "a", userId: "u", text: "inspect", sessionId: "delegated",
-      delegation: { delegationId: "d1", parentAgentId: "coord" },
-    }, { sendEvent: vi.fn() });
-    await waitFor(() => settleConsumer !== undefined);
-    settleConsumer!();
-    await new Promise((r) => setTimeout(r, 20));
-
-    expect(frontendClient.request.mock.calls.some(([m]: any[]) => m === "delegation.terminal")).toBe(false);
-  });
-
   it("does not ask for an acknowledgement on an ordinary turn", async () => {
     const frontendClient = fakeFrontendClient();
     server = await bootRuntime(fakeAgentBoxManager(), frontendClient);

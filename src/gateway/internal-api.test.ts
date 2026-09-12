@@ -549,11 +549,7 @@ describe("handleDelegationEvents", () => {
     });
   });
 
-  it("accepts a delegated leg's own box, whose cert names the target rather than the owner", async () => {
-    // A delegated leg stays owned by the coordinator that created it (agent-2) while
-    // the turn runs in the delegated peer's box (agent-1 == the calling cert). Its
-    // sub-agent transcript and task-ledger rows used to be refused outright here,
-    // which is what left the leg pointing at sub-agent sessions that never existed.
+  it("rejects historical peer targets as authority to create child sessions", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
     const res = new FakeRes();
     await handleDelegationEvents(
@@ -575,8 +571,8 @@ describe("handleDelegationEvents", () => {
       frontend as unknown as FrontendWsClient,
     );
 
-    expect(res.statusCode).toBe(200);
-    expect(frontend.calls[0].method).toBe("chat.ensureSession");
+    expect(res.statusCode).toBe(403);
+    expect(frontend.calls).toHaveLength(0);
   });
 
   it("refuses ensure_session ON a leg row it only executes, not owns", async () => {
@@ -638,13 +634,7 @@ describe("handleDelegationEvents", () => {
     expect(frontend.calls.find((c) => c.method === "chat.ensureSession")).toBeUndefined();
   });
 
-  it("re-reads a leg cached before its target was known, instead of refusing for the entry's lifetime", async () => {
-    // The state a Runtime restart or eviction can pin: whichever 3-arg caller runs
-    // first (chat.send, a channel, a scheduled task) caches the leg owner-only.
-    // A cache hit never consults the row again, so refusing on the strength of
-    // that entry silently reinstates the data loss this arm exists to fix — and
-    // production runs two Runtimes, so the first caller is not always the one
-    // that knows the delegation fields.
+  it("refuses historical peer targets from both cache and authoritative resolution", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-2");
     const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
     sessionRegistry.setResolver(resolver);
@@ -665,7 +655,7 @@ describe("handleDelegationEvents", () => {
           identity,
           frontend as unknown as FrontendWsClient,
         );
-        expect(res.statusCode, `attempt ${attempt}`).toBe(200);
+        expect(res.statusCode, `attempt ${attempt}`).toBe(403);
       }
       // Bounded to one extra read: the refreshed record records that the row has
       // been consulted, so the second attempt is answered from cache.
@@ -730,12 +720,7 @@ describe("handleDelegationEvents", () => {
     }
   });
 
-  it("lets a delegated leg's box append to the leg but not rewrite its history", async () => {
-    // The asymmetry the append arm must not smuggle in: append_message adds a row
-    // attributed to the peer, while update_message takes a message id and rewrites
-    // THAT row — including rows the coordinator wrote — and nothing in the payload
-    // scopes the rewrite to the caller's own. So the arm that exists to persist a
-    // sub-agent transcript stops short of the conversation's history.
+  it("refuses historical peer targets for both appending and rewriting", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
     const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
     sessionRegistry.setResolver(resolver);
@@ -750,7 +735,7 @@ describe("handleDelegationEvents", () => {
         identity,
         frontend as unknown as FrontendWsClient,
       );
-      expect(appended.statusCode).toBe(200);
+      expect(appended.statusCode).toBe(403);
 
       for (const type of ["delegation.update_message", "delegation.update_tool_message"]) {
         const res = new FakeRes();
@@ -794,8 +779,7 @@ describe("handleDelegationEvents", () => {
       expect(rewrite.statusCode).toBe(403);
       expect(resolver, "the cached record must not answer an ownership question").toHaveBeenCalledTimes(1);
 
-      // The append arm is unaffected: that is the write this whole change exists
-      // to let through, and the refreshed record now names the target.
+      // A historical target does not authorize appending either.
       const appended = new FakeRes();
       await handleDelegationEvents(
         asReq(new FakeReq(JSON.stringify({
@@ -806,7 +790,7 @@ describe("handleDelegationEvents", () => {
         identity,
         frontend as unknown as FrontendWsClient,
       );
-      expect(appended.statusCode).toBe(200);
+      expect(appended.statusCode).toBe(403);
     } finally {
       sessionRegistry.setResolver(undefined);
       sessionRegistry.forget("parent-1");
