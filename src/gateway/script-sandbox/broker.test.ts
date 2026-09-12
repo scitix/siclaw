@@ -9,6 +9,19 @@ const config = () => loadScriptSandboxConfig({ SICLAW_SCRIPT_SANDBOX_IMAGE: "run
 const p = () => ({ agentId: "a", userId: "u", sessionId: "s", boxId: "b", callbackToken: "private-grant" });
 const scope = { language: "python" as const, code: "pass", clusters: [{ name: "prod" }], hosts: ["node"], mcp: [{ server: "metrics", tools: ["query"] }] };
 describe("script connectors", () => {
+  it("audits an out-of-scope built-in rejection without fetching credentials", async () => {
+    const rpc = { request: vi.fn() };
+    const audit = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await expect(new ReadOnlyScriptBroker(rpc, config()).call(p(), scope,
+        { id: "i", tool: "bash", arguments: { cluster: "undeclared", command: "kubectl get nodes" } },
+        new AbortController().signal)).rejects.toThrow();
+      expect(rpc.request).not.toHaveBeenCalled();
+      expect(audit).toHaveBeenCalledExactlyOnceWith(JSON.stringify({
+        event: "script_tool", agentId: "a", userId: "u", sessionId: "s", boxId: "b", tool: "bash", allowed: false,
+      }));
+    } finally { audit.mockRestore(); }
+  });
   it.each([
     ["ssh", { command: "rm -rf /" }], ["k8s.delete_pod", { cluster: "prod" }],
     ["k8s.list_nodes", { cluster: "prod" }],

@@ -146,14 +146,14 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
   }
 
   async call(p: ScriptPrincipal, scope: ScriptRequest, call: ScriptToolCall, signal: AbortSignal): Promise<unknown> {
-    if (["bash", "host_exec", "node_exec", "pod_exec"].includes(call.tool)) {
-      call.arguments = resolveSandboxBuiltin(call, scope).arguments;
-    }
-    const a = call.arguments;
     let allowed = false;
     let release: (() => Promise<void>) | undefined;
     let uncertain = false;
     try {
+      if (["bash", "host_exec", "node_exec", "pod_exec"].includes(call.tool)) {
+        call.arguments = resolveSandboxBuiltin(call, scope).arguments;
+      }
+      const a = call.arguments;
       if (call.tool === "bash") {
         const request = resolveSandboxBuiltin(call, scope).arguments;
         if (!this.builtin || !p.callbackToken) throw new Error("Builtin tool unavailable");
@@ -234,9 +234,11 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
     } finally {
       // Transport loss cannot prove remote completion. Retain the shared lease
       // until its bounded expiry instead of admitting replacement work early.
-      if (!uncertain) await release?.();
-      const { callbackToken: _token, ...audit } = p;
-      console.info(JSON.stringify({ event: "script_tool", ...audit, tool: call.tool, allowed }));
+      try { if (!uncertain) await release?.(); }
+      finally {
+        const { callbackToken: _token, ...audit } = p;
+        console.info(JSON.stringify({ event: "script_tool", ...audit, tool: call.tool, allowed }));
+      }
     }
   }
 }
