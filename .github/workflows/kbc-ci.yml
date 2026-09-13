@@ -30,7 +30,7 @@ jobs:
           python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y poppler-utils ripgrep
       - run: pip install -r kbc/platform/pod/requirements.txt pytest pytest-asyncio
-      - run: python -m pytest -q -p pytest_asyncio.plugin -o asyncio_mode=auto test_pi_engine.py test_pi_file_tools.py test_pi_harness.py test_pi_responses.py test_claude_engine.py test_pi_review_regressions.py
+      - run: python -m pytest -q -p pytest_asyncio.plugin -o asyncio_mode=auto test_pi_engine.py test_pi_file_tools.py test_pi_harness.py test_pi_responses.py test_claude_engine.py test_pi_review_regressions.py test_event_relay.py test_resume_routing.py
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         working-directory: kbc/platform/pod

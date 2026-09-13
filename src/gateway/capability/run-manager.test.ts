@@ -788,4 +788,40 @@ describe("CapabilityRunManager", () => {
     expect(mgr.get(runId)).toBeUndefined();
     expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
   });
+
+  it("a nonterminal event write cannot drop a concurrent cancellation awaiting persistence", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    let started!: () => void;
+    let release!: () => void;
+    const writing = new Promise<void>(resolve => { started = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let failTerminal = true;
+    const send = be.request.bind(be);
+    be.request = async (method: string, params?: any) => {
+      if (method === CAPABILITY_PERSIST_RUN_STATE) {
+        if (params.status === "running") {
+          started();
+          await pending;
+        } else if (failTerminal) throw new Error("cancellation checkpoint unavailable");
+      }
+      return send(method, params);
+    };
+    const eventId = `${"a".repeat(32)}:1`;
+    const commit = mgr.commitRelayEvent(runId, eventId);
+    await writing;
+    const cancel = mgr.endRun(runId, "done");
+    release();
+    await Promise.all([commit, cancel]);
+    expect(be.persists().at(-1)?.params.status).toBe("running");
+    expect(mgr.get(runId)?.status).toBe("done");
+
+    failTerminal = false;
+    await mgr.reconcile();
+    expect(mgr.get(runId)).toBeUndefined();
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId, status: "done", checkpoint: { relay_event_id: eventId },
+    });
+  });
 });

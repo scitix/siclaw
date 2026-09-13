@@ -34,6 +34,7 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
+import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
@@ -43,6 +44,7 @@ import type {
   CapabilityCancelResponse,
   CapabilityCommandRequest,
   CapabilityMessageRequest,
+  CapabilityRunRow,
   CapabilityStartRequest,
   CapabilityStartResponse,
   CapabilityTestCloseRequest,
@@ -1430,7 +1432,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
-  const unsubscribeCapabilityReconnect = frontendClient.onConnected?.(() => capabilityRunManager.reconcile());
+  let retryContainerEvidence: (() => void) | undefined;
+  const unsubscribeCapabilityReconnect = frontendClient.onConnected?.(async () => {
+    await capabilityRunManager.reconcile();
+    retryContainerEvidence?.();
+  });
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
   // Capability-box orphan GC: a box is live iff its run is tracked and
@@ -1635,16 +1641,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // entering while K8s processes the pod deletion.
     const rec = capabilityRunManager.get(runId) ??
       (await capabilityRunManager.adopt(runId, { notifyOnAdopt: false }));
+    let profile = rec?.profile?.trim();
+    if (!profile) {
+      // A previous cancel may have persisted done before Pod deletion failed.
+      // Terminal runs must not be adopted for execution, but their stored
+      // profile is still authoritative for cleanup, including after restart.
+      const row = await frontendClient.request(CAPABILITY_GET_RUN, { run_id: runId }) as CapabilityRunRow | null;
+      if (row?.id === runId) profile = row.profile?.trim();
+    }
+    if (!profile) throw new Error(`cannot resolve box profile for capability run: ${runId}`);
+    getBoxProfile(profile);
     if (rec) await capabilityRunManager.endRun(runId, "done");
 
     // stop() is idempotent and treats an already-absent K8s pod as success. Any
     // other failure is uncertain cleanup and must reach the consumer; claiming
     // success here would let callers mistake a live box for a completed stop.
     try {
-      // Target the run's own pod-name prefix — a compile box is "kbc-box-<id>",
-      // not "agentbox-<id>". rec was just resolved above (get ?? adopt); an
-      // absent profile falls back to the default prefix.
-      await agentBoxManager.stop(runId, rec?.profile);
+      await agentBoxManager.stop(runId, profile);
     } catch (err) {
       console.error(
         `[capability] cancel: stop box run=${runId} failed:`,
@@ -2840,6 +2853,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     console.error("[runtime] Failed to start HTTPS server:", err);
   }
 
+  const containerObservation = spawner?.observeContainers?.((observation) =>
+    frontendClient.request(CAPABILITY_OBSERVE_CONTAINER, observation, 3_000));
+  retryContainerEvidence = () => containerObservation?.retry();
+
   // ── Server handle ────────────────────────────────────────
   const runtimeServer: RuntimeServer = {
     httpServer,
@@ -2849,6 +2866,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
+      await containerObservation?.stop();
       metricsAggregator?.destroy();
       unsubscribeCapabilityReconnect?.();
       await Promise.all([endInFlightTurns(), scriptSandbox.shutdown()]);
