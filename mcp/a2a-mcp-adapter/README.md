@@ -233,3 +233,31 @@ there is just multiple client configurations, one per agent — no alias multipl
 is needed. This local stdio adapter exists for clients that inject credentials from
 env/files rather than per-request headers, and it is where named-key aliasing
 applies.
+
+## Caller contract and the Claude Code plugin
+
+The remote endpoint and this adapter accept the same **caller contract** (v1):
+a structured brief with `target`, `time_window`, `open_question`, optional
+`known_facts` / `already_checked` / `side_evidence` / `assumptions` /
+`constraints`, and a `caller_product`. The contract, its `target` definition and
+the intake warnings are documented in the the control plane product docs
+(`/docs/siclaw/a2a-integration`, "How to brief Siclaw") and taught to the model
+by the `siclaw-brief` skill.
+
+This adapter still sends the model's `question` as a plain text part, i.e. the
+**legacy** form: the control plane accepts it, but answers with `MISSING_TARGET` /
+`MISSING_CALLER` warnings and Siclaw's sub-agents get no anchor. For Claude Code,
+prefer the plugin in this repository, which registers the remote endpoint and
+ships the skill:
+
+```bash
+export SICLAW_CONTROL_PLANE_URL="https://control-plane.example.com" # no trailing slash
+export SICLAW_A2A_KEY=sk-...
+claude plugin marketplace add scitix/siclaw
+claude plugin install siclaw@siclaw
+```
+
+Codex users of this adapter should install the bare skill
+(`siclaw-brief.md` at the repository root → `~/.codex/skills/siclaw-brief/SKILL.md`)
+so the model knows how to phrase the brief even though the adapter forwards it as
+text.

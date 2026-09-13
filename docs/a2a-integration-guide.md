@@ -17,7 +17,18 @@ Three things, nothing else:
 1. **An Agent Card URL** — describes the agent, its skills, capabilities, and the
    base URL for all operations.
 2. **An API key** — `Authorization: Bearer sk-...`. The key is bound to one agent.
-3. **A natural-language problem** — e.g. "pods in kube-system keep restarting on node X".
+3. **A brief** — preferably the structured form (caller contract v1): a data part
+   with `mediaType: application/vnd.siclaw.brief+json` carrying `target`,
+   `time_window {start, end}` (absolute UTC), `open_question`, and optionally
+   `scope`, `known_facts`, `already_checked`, `side_evidence`, `assumptions`,
+   `constraints`; plus `message.metadata.caller_product` naming the product that
+   composes the request. `target` is the entity the investigation must explain —
+   not a suspected cause, not a side observation, not a step. A plain text part
+   (`"pods in kube-system keep restarting on node X"`) still works but is answered
+   with `MISSING_TARGET` warnings. Field reference and examples: the the control plane
+   product doc `/docs/siclaw/a2a-integration` ("How to brief Siclaw") and the
+   Agent Card's `skills[0].examples`, which are complete request bodies. The
+   response's `task.metadata.brief` echoes what the control plane understood; read it.
 
 Base path (all routes are per-agent, because one Portal can host many agents):
 

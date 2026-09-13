@@ -1,0 +1,19 @@
+{
+  "author": {
+    "name": "SciTiX Siclaw",
+    "url": "https://github.com/scitix/siclaw"
+  },
+  "description": "Investigate infrastructure problems through a Siclaw SRE agent (control-plane /api/v1/mcp) and brief it the way its contract expects",
+  "displayName": "Siclaw",
+  "homepage": "https://github.com/scitix/siclaw",
+  "keywords": [
+    "sre",
+    "kubernetes",
+    "gpu",
+    "diagnostics",
+    "siclaw"
+  ],
+  "name": "siclaw",
+  "repository": "https://github.com/scitix/siclaw",
+  "version": "1.0.0"
+}
