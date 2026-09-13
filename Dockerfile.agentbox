@@ -159,6 +159,10 @@ RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
     && find / -perm /2000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
          case "$f" in /usr/local/bin/kubectl) ;; *) chmod g-s "$f" ;; esac; done
 
+# This public policy must remain readable by the agent process. Source archives
+# and the build host's umask can otherwise change COPY's inherited permissions.
+RUN chmod 0644 /etc/siclaw/extra-commands.json
+
 ENV NODE_ENV=production
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
