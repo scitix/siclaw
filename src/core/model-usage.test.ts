@@ -36,6 +36,19 @@ describe("provider evidence from the pinned parsers", () => {
     await expect(processResponsesStream((async function* () { yield { type: "response.failed", response: { status: "failed", usage, error: { code: "fixture", message: "failure" } } }; })(), output, { push() {} } as any, { ...model, api: "openai-codex-responses" })).rejects.toThrow();
     expect(output.providerUsageEvidence.rawUsage).toEqual(usage);
   });
+  it.each([undefined, {}])("preserves absent and empty Responses usage through call recording: %j", async rawUsage => {
+    const output: any = { content: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: {} } };
+    const response = { status: "completed", output: [], ...(rawUsage === undefined ? {} : { usage: rawUsage }) };
+    await processResponsesStream((async function* () { yield { type: "response.completed", response }; })(), output, { push() {} } as any, { ...model, api: "openai-codex-responses" });
+    const events: UsageObservation[] = [];
+    const recorder = new LlmCallRecorder({ warn() {} });
+    recorder.setUsageSink({ context: () => ({ sessionId: "session-example", executionRole: "root" }), record: event => events.push(event) });
+    await recorder.wrapStreamFn(() => ({ async result() { return output; } }))(model, context, {}).result();
+    expect(events.map(event => event.phase)).toEqual(["started", "finished"]);
+    if (rawUsage === undefined) expect(events[1].usageEvidence).toBeUndefined();
+    else expect(events[1].usageEvidence).toMatchObject({ providerUsagePresent: true, rawUsage: {} });
+    expect(JSON.stringify(events[1].usageEvidence ?? {})).not.toContain("input_tokens");
+  });
   it("merges cumulative Anthropic usage without adding repeated snapshots", async () => {
     const result: any = await drain(streamAnthropic({ ...model, api: "anthropic-messages", provider: "anthropic" }, context, { apiKey: "fixture", fetch: fetchEvents([
       { type: "message_start", message: { id: "response-example", role: "assistant", model: "example", content: [], usage: { input_tokens: 40, cache_read_input_tokens: 60, output_tokens: 0 } } },
