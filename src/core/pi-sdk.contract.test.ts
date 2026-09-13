@@ -16,6 +16,7 @@ import { createPiExecutionSession } from "./pi-execution.js";
 import { summarizeWithFallback } from "./compaction.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import { skillsHandler, knowledgeHandler } from "../agentbox/sync-handlers.js";
+import type { UsageObservation } from "../shared/model-usage.js";
 
 // Exercise installed Pi packages through the real HTTP serializer and agent loop.
 // Only the network boundary is replaced; no SDK classes or events are mocked.
@@ -100,7 +101,7 @@ async function createFixture(
   });
   cleanups.push(() => session.dispose());
   const brain = new PiAgentBrain(session, new Map(), llmCallRecorder);
-  return { brain, session, sessionManager, model, services, modelRuntime, onModelEnvelope, modelEnvelopeInspectionRef, sessionStarts };
+  return { brain, session, sessionManager, model, services, modelRuntime, onModelEnvelope, modelEnvelopeInspectionRef, sessionStarts, llmCallRecorder };
 }
 
 function resultTool(execute = vi.fn(async () => ({
@@ -114,6 +115,21 @@ function resultTool(execute = vi.fn(async () => ({
 }
 
 describe("installed Pi SDK contract", () => {
+  it("records provider evidence through the coding-agent's installed SDK dependency", async () => {
+    mockNetwork(() => completion({ content: "Completed." }));
+    const { brain, llmCallRecorder } = await createFixture();
+    const observations: UsageObservation[] = [];
+    llmCallRecorder.setUsageSink({
+      context: () => ({ sessionId: "session-example", executionRole: "root" }),
+      record: observation => observations.push(observation),
+    });
+    await brain.prompt("Confirm readiness.");
+    expect(observations.map(o => o.phase)).toEqual(["started", "finished"]);
+    expect(observations[1].usageEvidence).toMatchObject({
+      protocol: "openai_compatible", finality: "terminal", providerUsagePresent: true,
+      rawUsage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+    });
+  });
   it("retains the requested default effort when a reasoning model is bound after bootstrap", async () => {
     const requests = mockNetwork(() => completion({ content: "Completed." }));
     const { brain, session, services, modelRuntime } = await createFixture();

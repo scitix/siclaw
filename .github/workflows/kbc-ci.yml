@@ -4,10 +4,10 @@ name: KBC Box CI
 on:
   push:
     branches: [main]
-    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
+    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "patches/**", "scripts/install/**", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
   pull_request:
     branches: [main]
-    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
+    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "patches/**", "scripts/install/**", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
 
 # Least-privilege: this job only reads the repo (no PR writes, no packages).
 permissions:

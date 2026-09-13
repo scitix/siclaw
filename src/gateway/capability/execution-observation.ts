@@ -1,3 +1,5 @@
+import { recordCapabilityUsage } from "./model-usage.js";
+import type { UsageObservation } from "../../shared/model-usage.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { CAPABILITY_PERSIST_EXECUTION_OBSERVATION } from "./contract.js";
 
@@ -59,6 +61,16 @@ export class ExecutionObservationRelay {
   }
 
   enqueue(observation: ExecutionObservation | undefined): void {
+    if (!this.closing && observation?.version === 1 && observation.kind === "model_usage") {
+      const usage = observation.data?.observation as UsageObservation | undefined;
+      if (!usage || usage.schemaVersion !== 1 || !/^[0-9a-f-]{36}$/i.test(usage.callId) ||
+          !["started", "finished"].includes(usage.phase) || typeof usage.sessionId !== "string") {
+        this.reportGap(); return;
+      }
+      try { recordCapabilityUsage(this.frontend, this.runId, usage); }
+      catch { this.reportGap(); }
+      return;
+    }
     if (this.closing || !observation || observation.version !== 1 ||
         this.queue.length + (this.pending ? 1 : 0) >= 128 ||
         Buffer.byteLength(JSON.stringify(observation)) > 64 * 1024) {

@@ -20,6 +20,8 @@ WORKDIR /app
 
 # Dependencies layer (cached unless package*.json changes)
 COPY package*.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci
 
 # Copy backend source only (AgentBox runtime graph: agentbox-main + core + tools + knowledge).
@@ -97,6 +99,8 @@ WORKDIR /app
 
 # Production deps (cached unless package*.json changes)
 COPY package*.json ./
+COPY patches/ ./patches/
+COPY scripts/install/ ./scripts/install/
 RUN npm ci --omit=dev
 
 # Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)

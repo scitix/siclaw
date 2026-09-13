@@ -43,6 +43,7 @@ class ExecutionObserver:
             "ready": ("sdk_version",),
             "model_request": ("call", "model", "provider"),
             "model_envelope": ("manifest",),
+            "model_usage": ("observation",),
             "assistant": ("llm_call", "stop_reason"),
             "tool_start": ("call_id", "name"),
             "tool_end": ("call_id", "name", "is_error"),

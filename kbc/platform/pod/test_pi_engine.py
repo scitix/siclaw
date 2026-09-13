@@ -80,10 +80,18 @@ async def allow(*_):
 
 async def test_real_worker_unicode_tool_and_observation(tmp_path):
     content = "故障恢复与编译检查。\n" * 12000
+    observed = []
+
+    async def observe(event):
+        observed.append(event)
     async with provider(lambda _, n: completion(tool=("Write", {"file_path": "page.md", "content": content}))
                         if n == 1 else completion("已写入")) as (config, requests):
         tools = FileTools(str(tmp_path), ["Write"], allow).tools()
-        async with client(tmp_path, config, tools) as instance:
+        with observe_sessions(observe):
+            instance = PiAgentClient(cwd=str(tmp_path), system_prompt="Use the supplied tools.",
+                                     session_id="fixture-session", model_config=config, tools=tools)
+        try:
+            await instance.connect()
             await instance.query("Write the page")
             events = await collect(instance)
             assert instance.sdk_version == "0.85.1"
@@ -95,6 +103,15 @@ async def test_real_worker_unicode_tool_and_observation(tmp_path):
             assert all(event["llm_call"]["model"]["id"] == "fixture-model" for event in assistants)
             assert "content" not in assistants[0]["content"][0]["arguments"]
             assert len(requests) == 2
+            finished = [e["data"]["observation"] for e in observed if e["kind"] == "model_usage"
+                        and e["data"]["observation"]["phase"] == "finished"]
+            assert len(finished) == len(requests)
+            assert len({e["callId"] for e in finished}) == len(requests)
+            assert all(e["executorRole"] == "compile" for e in finished)
+            assert all(e["usageEvidence"]["rawUsage"]["prompt_tokens"] == 20 for e in finished)
+            assert all(e["usageEvidence"]["rawUsage"]["completion_tokens"] == 5 for e in finished)
+        finally:
+            await instance.disconnect()
 
 
 async def test_cancellation_waits_for_host_tool_before_next_turn(tmp_path):
