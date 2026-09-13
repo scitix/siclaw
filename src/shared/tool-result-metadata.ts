@@ -1,5 +1,13 @@
 import { boundSkillPreviewMetadata, previewSummary } from "./skill-preview-storage.js";
 
+/** Thrown failures set the event flag; returned tool failures use details.error. */
+export function toolResultOutcome(details: unknown, isError: unknown): "success" | "error" | "blocked" {
+  const flags = details && typeof details === "object" && !Array.isArray(details)
+    ? details as Record<string, unknown> : undefined;
+  if (flags?.blocked) return "blocked";
+  return isError === true || flags?.error ? "error" : "success";
+}
+
 /** Preserve structured tool data across Web, IM, delegation and synthetic turns. */
 export function persistableToolDetails(
   details: unknown,

@@ -553,6 +553,13 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 | `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
 
+Skill draft previews share the chat metadata budget of 1 MiB, measured as
+serialized UTF-8 JSON (including file projections and escaping). A package
+that exceeds it returns an error and an `omitted` preview notice to the model
+before artifact capture. A recoverable tool-output artifact does not promise
+that a chat panel can display its files. Accepted previews retain complete
+files in metadata; history loading and redaction still enforce their own bounds.
+
 ### allowedTools — Built-in and File-Tool Availability Axis
 
 `allowedTools` is the control over registry tools and framework file tools after

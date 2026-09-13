@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import { AssistantItemStream } from "./assistant-item-stream.js";
 import { assistantTextBlocks, type AssistantItem } from "../shared/assistant-items.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
-import { persistableToolDetails } from "../shared/tool-result-metadata.js";
+import { persistableToolDetails, toolResultOutcome } from "../shared/tool-result-metadata.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
@@ -796,9 +796,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             .join("") ?? "";
         const toolName = (evt.toolName as string) || (evt.name as string) || "tool";
 
-        let outcome: "success" | "error" | "blocked" = "success";
-        if (toolResult?.details?.blocked) outcome = "blocked";
-        else if (toolResult?.details?.error) outcome = "error";
+        const outcome = toolResultOutcome(toolResult?.details, evt.isError);
 
         const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
         const eventToolset = typeof evt.toolset === "string" && evt.toolset.length > 0

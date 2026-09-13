@@ -4396,6 +4396,23 @@ describe("collectChannelResponse — audit persistence", () => {
     expect(toolRows.map((m) => m.outcome)).toEqual(["error", "blocked"]);
   });
 
+  it.each(["tool_execution_end", "tool_end"])("persists thrown tool failures from %s in channel history", async (type) => {
+    const events = [
+      { type: "tool_execution_start", toolName: "spawn_subagent", toolCallId: "bad-handle", args: { resume: "invalid" } },
+      { type, toolName: "spawn_subagent", toolCallId: "bad-handle", isError: true,
+        result: { content: [{ type: "text", text: "Invalid subagent handle" }] } },
+      { type: "tool_execution_start", toolName: "lookup", toolCallId: "bad-lookup", args: {} },
+      { type, toolName: "lookup", toolCallId: "bad-lookup", isError: true,
+        result: { content: [{ type: "text", text: "Lookup failed" }], details: { error: false } } },
+      { type: "tool_execution_start", toolName: "blocked", toolCallId: "blocked", args: {} },
+      { type, toolName: "blocked", toolCallId: "blocked", isError: true, result: { content: [], details: { blocked: true } } },
+    ];
+    await collectChannelResponse(fakeClient(events), "s-error", "lark", { persist: { agentId: "a1" } });
+    const rows = appendMessageMock.mock.calls.map(c => c[0] as any).filter(m => m.role === "tool");
+    expect(rows.map(m => m.outcome)).toEqual(["error", "error", "blocked"]);
+    expect(rows.slice(0, 2).map(m => m.content)).toEqual(["Invalid subagent handle", "Lookup failed"]);
+  });
+
   it("keeps invocation toolsets stable for out-of-order same-name calls", async () => {
     const events = [
       { type: "tool_execution_start", toolCallId: "a", toolName: "query", toolset: "mcp:cluster-a", args: { q: "a" } },

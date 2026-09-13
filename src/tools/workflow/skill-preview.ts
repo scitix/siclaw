@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveUnderDir } from "../../shared/path-utils.js";
 import { collectSkillDirectoryFiles, parseSingleSkillPackage } from "../../shared/skill-package.js";
+import { boundSkillPreviewMetadata } from "../../shared/skill-preview-storage.js";
 
 const DRAFTS_BASE = path.resolve(process.cwd(), ".siclaw/user-data/skill-drafts");
 
@@ -121,12 +122,25 @@ description: >-
           skill: { ...parsed, type },
           summary: `Skill preview for '${parsed.name}'. Click View to inspect and copy.`,
         };
+        // Decide whether the panel can retain the package before the model sees
+        // a success summary or artifact capture replaces it with a text preview.
+        const details = boundSkillPreviewMetadata({ skillPreview: result });
+        if ("status" in details.skillPreview && details.skillPreview.status === "omitted") {
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              ...details.skillPreview,
+              error: true,
+              summary: "Skill preview could not be saved because the package exceeds the preview storage limit. Generate a smaller preview; these files are not available to view or copy in the chat panel.",
+            }) }],
+            details: { ...details, error: true },
+          };
+        }
 
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           // Chat persists details independently of the model's bounded text.
-          // Large previews must remain usable after artifact capture and reload.
-          details: { skillPreview: result },
+          // Accepted previews remain complete after artifact capture and reload.
+          details,
         };
       } finally {
         // Always clean up draft directory
