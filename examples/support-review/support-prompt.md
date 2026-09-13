@@ -24,6 +24,8 @@ not add requirement_kind, info.type or info.result to this result.
   never that a ticket exists or an incident is resolved.
 - A requirement needs a concrete product grounded in product knowledge. Other
   categories may leave product empty when its identity is not established.
+- If a final result remains unknown, leave all llm fields empty and preserve
+  user-stated model or region clues in description and evidence.
 - Use llm_incident for model/API calling failures, and fill the llm hints only
   when supported. Unknown hints stay empty; they do not block human handoff.
 - missing_fields contains machine-readable snake_case identifiers, not questions.

@@ -263,6 +263,16 @@ describe("parseProductSupportResult", () => {
     expect(result.info.llm.region).toBe("domestic");
   });
 
+  it.each([
+    { region: "domestic", aspect: "", model: "" },
+    { region: "", aspect: "network", model: "" },
+    { region: "", aspect: "", model: "example-model" },
+  ])("rejects LLM-specific fields in a final unknown handoff: %j", (llm) => {
+    const input = validResult();
+    input.info = { ...(input.info as Record<string, unknown>), ticket_type: "unknown", llm };
+    expect(() => parseProductSupportResult(input)).toThrow(/llm fields must be empty/);
+  });
+
   it("mirrors the advertised schema: enum values are exact and length applies to the raw string", () => {
     // The host validates the advertised schema before dispatch on the primary
     // path, so the parser must not be more lenient than that schema.

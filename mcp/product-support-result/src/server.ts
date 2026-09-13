@@ -66,7 +66,7 @@ const inputSchema = {
           additionalProperties: false,
           required: ["region", "aspect", "model"],
           description:
-            "Optional; omit it or send all three fields empty for any ticket_type other than llm_incident (absent means all empty). Best-effort intake details for ticket_type=llm_incident, shown to first-line support as hints. Fill each field only from what the conversation establishes; leave it empty rather than guess. May already be filled while ticket_type is still unknown; must be empty once the type resolves to consultation, incident or requirement.",
+            "Optional; absent means all empty. Best-effort intake details for ticket_type=llm_incident. Fill only what the conversation establishes. While label=false and ticket_type=unknown, user-stated details may be kept temporarily. A final label=true result with ticket_type=unknown must omit this block or leave all fields empty; preserve unclassified clues in description and evidence. Fields must also be empty for consultation, incident and requirement.",
           properties: {
             region: {
               type: "string",

@@ -77,9 +77,10 @@ These fields are hints, not gates. Fill each one only from what the
 conversation establishes and leave it empty otherwise; a `label=true`
 `llm_incident` does not require any of them. While still gathering, the
 identifiers `llm_region`, `llm_aspect` and `llm_model` may appear in
-`missing_fields`. The block may already be filled while `ticket_type` is still
-`unknown`, so a region or model the user stated up front has somewhere to
-live; once the type resolves to `consultation`, `incident` or `requirement`
+`missing_fields`. While `label=false` and `ticket_type=unknown`, the block may
+temporarily retain details stated by the user. If the final handoff remains
+`unknown`, leave all three fields empty and retain those clues in `description`
+and `evidence`, without asserting an LLM incident. For `consultation`, `incident` or `requirement`,
 all three fields must be empty, so a stray value is never read as an
 established fact. The block is optional on input: omitting it means all three
 fields are empty, which is the correct value for every type except

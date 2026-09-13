@@ -143,7 +143,12 @@ describe("product support result MCP", () => {
 
   it("rejects final results with outstanding clarification or an empty description", async () => {
     await withClient(async (client) => {
-      for (const patch of [{ missing_fields: ["issue_description"] }, { description: " " }]) {
+      for (const patch of [
+        { missing_fields: ["issue_description"] }, { description: " " },
+        { llm: { region: "domestic", aspect: "", model: "" } },
+        { llm: { region: "", aspect: "network", model: "" } },
+        { llm: { region: "", aspect: "", model: "example-model" } },
+      ]) {
         const response = await client.callTool({
           name: TOOL_NAME,
           arguments: {
