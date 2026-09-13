@@ -1,3 +1,4 @@
+import { createPrivateMemoryTool } from "./private-memory.js";
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import fs from "node:fs/promises";
@@ -107,6 +108,6 @@ Parameters:
 
 export const registration: ToolEntry = {
   category: "query",
-  create: (refs) => createMemoryGetTool(refs.memoryDir!),
-  available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer && !!refs.memoryDir,
+  create: (refs) => refs.privateMemory ? createPrivateMemoryTool(refs.privateMemory, true) : createMemoryGetTool(refs.memoryDir!),
+  available: (refs) => isMemoryEnabled() && (!!refs.privateMemory || (!!refs.memoryIndexer && !!refs.memoryDir)),
 };

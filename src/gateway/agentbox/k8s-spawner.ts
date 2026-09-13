@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 /**
  * K8s Pod Spawner
  *
@@ -5,12 +6,10 @@
  */
 
 import * as k8s from "@kubernetes/client-node";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
-import { CertificateManager } from "../security/cert-manager.js";
+import { CertificateManager, certificateHasInvalidPrintableString } from "../security/cert-manager.js";
 import {
   certExpiryLabel,
   certificateNeedsRenewal,
@@ -27,8 +26,7 @@ export interface K8sSpawnerConfig {
   imagePullPolicy?: "Always" | "IfNotPresent" | "Never";
   /** Pod label prefix */
   labelPrefix?: string;
-  /** Shared PVC for user data persistence (memory, sessions).
-   *  Gateway creates per-user subdirectories; AgentBox pods mount via subPath. */
+  /** @deprecated Rejected at startup; migrate legacy data before removing this setting. */
   persistence?: {
     enabled: boolean;
     /** Name of the pre-existing shared PVC (e.g. "siclaw-data") */
@@ -205,6 +203,7 @@ export class K8sSpawner implements BoxSpawner {
   private certManager: CertificateManager | null = null;
 
   constructor(config?: K8sSpawnerConfig) {
+    if (config?.persistence?.enabled || config?.persistence?.claimName) throw new Error("Shared PVC persistence was removed; migrate existing data first");
     this.config = { ...DEFAULT_CONFIG, ...config };
 
     // Load kubeconfig
@@ -296,16 +295,16 @@ export class K8sSpawner implements BoxSpawner {
    *
    * Null ⇒ the Secret could not be read at all, which the caller treats as stale.
    */
-  private async readCertSecret(name: string): Promise<{ caFp?: string; notAfter: Date | null } | null> {
+  private async readCertSecret(name: string): Promise<{ caFp?: string; notAfter: Date | null; invalidPrintableString: boolean } | null> {
     const { namespace, labelPrefix } = this.config;
     try {
       const s = await this.coreApi.readNamespacedSecret({ name, namespace });
       const encoded = s.data?.["tls.crt"];
+      const pem = encoded ? Buffer.from(encoded, "base64").toString("utf8") : "";
       return {
         caFp: s.metadata?.labels?.[`${labelPrefix}/ca-fp`],
-        notAfter: encoded
-          ? readCertificateNotAfter(Buffer.from(encoded, "base64").toString("utf8"))
-          : null,
+        notAfter: pem ? readCertificateNotAfter(pem) : null,
+        invalidPrintableString: !!pem && certificateHasInvalidPrintableString(pem),
       };
     } catch {
       return null; // unreadable ⇒ treat as stale and take the replace path
@@ -374,6 +373,7 @@ export class K8sSpawner implements BoxSpawner {
     const staleReason =
       !existing ? "unreadable"
       : existing.caFp !== caFp ? `CA rotated (secret=${existing.caFp ?? "none"}, current=${caFp})`
+      : existing.invalidPrintableString ? "invalid ASN.1 PrintableString encoding"
       : certificateNeedsRenewal(existing.notAfter)
         ? `certificate expires ${existing.notAfter?.toISOString() ?? "unknown"}`
         : null;
@@ -459,7 +459,11 @@ export class K8sSpawner implements BoxSpawner {
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
     const podPrefix = profile.podNamePrefix ?? "agentbox";
-    const podName = this.podName(agentId, podPrefix, boxConfig.instance ?? 0);
+    const privateSpace = boxConfig.privateSpace;
+    const podIdentity = privateSpace
+      ? createHash("sha256").update(JSON.stringify([agentId, privateSpace.spaceId, privateSpace.sessionId])).digest("hex").slice(0, 40)
+      : agentId;
+    const podName = this.podName(podIdentity, podPrefix, boxConfig.instance ?? 0);
     const orgId = boxConfig.orgId || "";
 
     console.log(`[k8s-spawner] Creating pod: ${podName} for agent: ${agentId}`);
@@ -499,6 +503,9 @@ export class K8sSpawner implements BoxSpawner {
       //
       // Fail loudly instead. Deleting it would be worse — that is someone else's live box.
       // The caller treats a failed instance as unavailable and moves on to another index.
+      if (privateSpace && (existing.metadata?.labels?.[`${labelPrefix}/private-space`] !== privateSpace.spaceId ||
+        existing.metadata?.labels?.[`${labelPrefix}/private-session`] !== privateSpace.sessionId)) throw new Error("Private AgentBox identity mismatch");
+      if (!privateSpace && existing.metadata?.labels?.[`${labelPrefix}/private-session`]) throw new Error("Private AgentBox cannot join a shared pool");
       const owner = existing.metadata?.labels?.[`${labelPrefix}/agent`];
       if (owner !== undefined && owner !== agentId) {
         throw new Error(
@@ -571,13 +578,16 @@ export class K8sSpawner implements BoxSpawner {
     // reports which pod it actually is (see handleMetricsFlush).
     // The AGENT's name, not a pod's: this identity is shared by every box, and the
     // metrics-flush authorizer accepts `<certBase>-<instance>` from any of them.
-    const certBase = this.podBaseName(agentId, podPrefix);
-    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
-    const certSecretName = this.certSecretName(agentId, podPrefix);
+    const certBase = this.podBaseName(podIdentity, podPrefix);
+    const certBundle = privateSpace
+      ? this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase, privateSpace)
+      : this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
+    const certSecretName = this.certSecretName(podIdentity, podPrefix);
 
     const secretLabels = {
       [`${labelPrefix}/app`]: "agentbox",
       [`${labelPrefix}/agent`]: agentId,
+      ...(privateSpace ? { [`${labelPrefix}/private-space`]: privateSpace.spaceId, [`${labelPrefix}/private-session`]: privateSpace.sessionId } : {}),
       [caFpLabel]: caFp,
       // boxType scopes the orphan sweep: without it the Secret pass could not
       // tell a capability box's cert from a chat box's (review finding).
@@ -699,35 +709,16 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
-    // Shared PVC is now scoped per-agent only — all users of the agent share
-    // this subdirectory (memory is agent-shared per the 2026-04-18 spec).
-    const safeAgentId = this.sanitizePathSegment(agentId);
-
-    // Persistence decision is per-agent: boxConfig.persistence overrides the
-    // spawner's global config (undefined → fall back to global). Mounting the
-    // PVC requires a claimName, so an agent that requests persistence on a
-    // runtime with no shared PVC configured falls back to emptyDir (with a
-    // warning) rather than spawning a pod that can never mount.
-    const persistenceClaimName = this.config.persistence?.claimName;
-    const wantsPersistence = boxConfig.persistence ?? !!this.config.persistence?.enabled;
-    const persistenceEnabled = wantsPersistence && !!persistenceClaimName;
-    if (wantsPersistence && !persistenceClaimName) {
-      console.warn(
-        `[k8s-spawner] Agent ${agentId} requests persistence but no shared PVC claimName is configured; ` +
-        `falling back to emptyDir (session/memory will NOT survive pod restarts)`,
+    if (privateSpace) {
+      env.push(
+        { name: "SICLAW_WORKSPACE_MODE", value: "remote" },
+        { name: "SICLAW_PRIVATE_SPACE_ID", value: privateSpace.spaceId },
+        { name: "SICLAW_PRIVATE_USER_ID", value: privateSpace.userId },
+        { name: "SICLAW_PRIVATE_SESSION_ID", value: privateSpace.sessionId },
       );
     }
-    if (persistenceEnabled) {
-      const subDir = `agents/${safeAgentId}`;
-      console.log(`[k8s-spawner] Persistence enabled for agent ${agentId}: shared PVC "${persistenceClaimName}", subPath "${subDir}"`);
-      this.ensureAgentDir(safeAgentId);
-    }
-
-    // user-data volume: shared PVC when persistence resolved on (claimName is
-    // narrowed to string by the && below), otherwise an ephemeral emptyDir.
-    const userDataVolume: k8s.V1Volume = persistenceEnabled && persistenceClaimName
-      ? { name: "user-data", persistentVolumeClaim: { claimName: persistenceClaimName } }
-      : { name: "user-data", emptyDir: {} };
+    if (boxConfig.persistence && !privateSpace) throw new Error("Durable sessions require remote private workspaces");
+    const userDataVolume: k8s.V1Volume = { name: "user-data", emptyDir: {} };
 
     // Pod definition
     const pod: k8s.V1Pod = {
@@ -753,6 +744,7 @@ export class K8sSpawner implements BoxSpawner {
           // observability (label key kept as boxType for continuity).
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/agent`]: agentId,
+      ...(privateSpace ? { [`${labelPrefix}/private-space`]: privateSpace.spaceId, [`${labelPrefix}/private-session`]: privateSpace.sessionId } : {}),
           [caFpLabel]: caFp,
           // Expiry of the certificate this pod actually mounts — which may be the one
           // ensureCertSecret reused from a sibling, not the one minted above. Omitted when
@@ -804,7 +796,7 @@ export class K8sSpawner implements BoxSpawner {
         },
         // ── Security: dual-user isolation (ADR-010) ─────────────────
         // Container starts as root (entrypoint fixes volume permissions,
-        // then drops to agentbox via runuser). Child processes run as
+        // then execs as agentbox via setpriv). Child processes run as
         // sandbox user via sudo. CHOWN/FOWNER are needed for the
         // entrypoint to fix volume permissions; SETUID/SETGID for user
         // switching. The non-root Codex compile image needs none of those
@@ -889,9 +881,6 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
-                ...(persistenceEnabled
-                  ? { subPath: `agents/${safeAgentId}` }
-                  : {}),
               },
               {
                 name: "client-cert",
@@ -972,25 +961,6 @@ export class K8sSpawner implements BoxSpawner {
       agentId,
       endpoint,
     };
-  }
-
-  /** Sanitize a path segment — keep only safe characters for directory names and K8s subPath. */
-  private sanitizePathSegment(segment: string): string {
-    return segment.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 63);
-  }
-
-  /**
-   * Ensure per-agent subdirectory exists on the shared PVC (synchronous, idempotent).
-   * Expects already-sanitized path segments.
-   * Directory layout: `/app/.siclaw/user-data/agents/{safeAgentId}/`
-   */
-  private ensureAgentDir(safeAgentId: string): void {
-    const base = path.resolve("/app/.siclaw/user-data");
-    const dir = path.join(base, "agents", safeAgentId);
-    if (!dir.startsWith(base)) {
-      throw new Error(`[k8s-spawner] Path traversal detected: ${dir}`);
-    }
-    fs.mkdirSync(dir, { recursive: true });
   }
 
   /**
@@ -1215,7 +1185,7 @@ export class K8sSpawner implements BoxSpawner {
       // will still be old next sweep.
       const createdMs = s.metadata?.creationTimestamp ? new Date(s.metadata.creationTimestamp).getTime() : NaN;
       if (!Number.isFinite(createdMs) || Date.now() - createdMs < minAgeMs) continue;
-      const secretAgent = s.metadata?.labels?.[`${labelPrefix}/agent`];
+      const secretAgent = s.metadata?.labels?.[`${labelPrefix}/private-session`] ? undefined : s.metadata?.labels?.[`${labelPrefix}/agent`];
       if (secretAgent) {
         if (liveAgents.has(secretAgent)) continue; // some box of this agent survives
       } else {
@@ -1242,9 +1212,9 @@ export class K8sSpawner implements BoxSpawner {
    * Undefined before setCertManager() runs. The manager compares it to a pod's
    * stamped `ca-fp` label to decide whether the pod is still reachable over mTLS.
    */
-  /** True when session transcripts land on the shared PVC rather than a per-pod emptyDir. */
+  /** Legacy agent pools have no shared session filesystem. */
   hasSharedSessionStorage(): boolean {
-    return !!this.config.persistence?.claimName;
+    return false;
   }
 
   caFingerprint(): string | undefined {
@@ -1362,6 +1332,8 @@ export class K8sSpawner implements BoxSpawner {
     return {
       boxId: pod.metadata?.name || "",
       agentId: pod.metadata?.labels?.[`${labelPrefix}/agent`] || "",
+      privateSessionId: pod.metadata?.labels?.[`${labelPrefix}/private-session`],
+      privateSpaceId: pod.metadata?.labels?.[`${labelPrefix}/private-space`],
       status: this.mapPodStatus(pod),
       exitedUnexpectedly: this.exitedUnexpectedly(pod),
       endpoint: podIP ? `https://${podIP}:3000` : "",

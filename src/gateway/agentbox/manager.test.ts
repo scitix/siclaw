@@ -2373,3 +2373,46 @@ describe("AgentBoxManager — a wrong staleness judgement must not spin", () => 
   });
 });
 
+
+describe("AgentBoxManager — private workspace placement", () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  function privateBox(sessionId: string, spaceId: string): AgentBoxInfo {
+    return { boxId: `private-${sessionId}`, agentId: "agent-a", privateSessionId: sessionId, privateSpaceId: spaceId,
+      status: "running", endpoint: `https://${sessionId}`, createdAt: new Date(), lastActiveAt: new Date() };
+  }
+
+  it("routes two users of one agent only to their own session Pods while listing both for reload", async () => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    const spawner = new FakeSpawner("k8s");
+    spawner.listReturns = [privateBox("session-a", "space-a"), privateBox("session-b", "space-b")];
+    Object.assign(spawner, { listForAgent: async () => spawner.listReturns });
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPrivateSpaceResolver(async (agentId, sessionId) => ({ agentId, userId: sessionId === "session-a" ? "alice" : "bob", orgId: "org", spaceId: sessionId === "session-a" ? "space-a" : "space-b" }));
+    expect((await mgr.getOrCreate("agent-a", {}, "session-a")).boxId).toBe("private-session-a");
+    expect((await mgr.getForSession("agent-a", "session-b"))?.boxId).toBe("private-session-b");
+    expect((await mgr.list()).map(box => box.boxId)).toHaveLength(2);
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("coalesces concurrent private spawns instead of racing delete/recreate for one session", async () => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPrivateSpaceResolver(async agentId => ({ agentId, userId: "alice", orgId: "org", spaceId: "space" }));
+    const [a, b] = await Promise.all([mgr.getOrCreate("agent-a", {}, "session"), mgr.getOrCreate("agent-a", {}, "session")]);
+    expect(a).toBe(b);
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].privateSpace).toMatchObject({ sessionId: "session", spaceId: "space", userId: "alice" });
+  });
+
+  it("does not adopt private Pods after switching back to local persistence mode", async () => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "local");
+    const spawner = new FakeSpawner("k8s");
+    spawner.listReturns = [privateBox("session-a", "space-a")];
+    Object.assign(spawner, { listForAgent: async () => spawner.listReturns });
+    const mgr = new AgentBoxManager(spawner);
+    expect(await mgr.getForSession("agent-a", "other-session")).toBeUndefined();
+    expect(await mgr.getHolder("agent-a", "other-session")).toBeUndefined();
+    expect(await mgr.list()).toHaveLength(1);
+  });
+});

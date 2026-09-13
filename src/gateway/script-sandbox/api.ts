@@ -13,7 +13,8 @@ import { ExternalScriptTools } from "./external-tools.js";
 import { RemoteScriptTraffic } from "../../script-sandbox/traffic.js";
 
 export function createScriptSandboxApi(deploymentMode: string, controlPlane: SandboxControlPlane, builtin?: SandboxBuiltinExecutor,
-  currentUser?: (sessionId: string, agentId: string) => string) {
+  currentUser?: (sessionId: string, agentId: string) => string,
+  validateExecution?: (principal: import("../../script-sandbox/types.js").ScriptPrincipal, signal: AbortSignal) => Promise<void>) {
   // The actual spawner, not environment flags, determines whether this Runtime
   // can expose untrusted code execution. Ignore even malformed provider/secret
   // configuration in local mode; it must neither initialize nor prewarm runners.
@@ -22,8 +23,10 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
   const external = new ExternalScriptTools(controlPlane);
   const provider = config.enabled ? new ScriptSandboxPool(new ReadyScriptSandboxProvider(config.provider === "e2b"
     ? new E2bScriptSandboxProvider(config, external) : new K8sScriptSandboxProvider(config)), config) : undefined;
-  const service = provider ? new ScriptSandboxService(config, provider, new ReadOnlyScriptBroker(controlPlane, config, builtin, p => {
+  const service = provider ? new ScriptSandboxService(config, provider, new ReadOnlyScriptBroker(controlPlane, config, builtin, async (p, signal) => {
     if (!p.userId || currentUser?.(p.sessionId, p.agentId) !== p.userId) throw new ScriptSandboxError("Active Web caller required", 403);
+    await validateExecution?.(p, signal);
+    if (currentUser?.(p.sessionId, p.agentId) !== p.userId) throw new ScriptSandboxError("Active Web caller required", 403);
   }, new RemoteScriptTraffic(controlPlane))) : undefined;
   provider?.prewarm();
   return {

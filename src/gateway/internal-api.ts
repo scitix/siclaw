@@ -65,6 +65,11 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
  * so a changed owner can be recognized without treating a lookup failure as permission.
  */
 async function sessionBelongsToIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
+  if (identity.privateUserId) {
+    if (!sessionId) return false;
+    const privateOwner = await sessionRegistry.refresh(sessionId);
+    if (!privateOwner?.authoritative || privateOwner.userId !== identity.privateUserId) return false;
+  }
   if (!sessionId) return true;
   const owner = await sessionRegistry.get(sessionId);
   if (!owner) return true;
@@ -92,6 +97,11 @@ async function sessionBelongsToIdentity(sessionId: string | null | undefined, id
  * Missing upstream evidence for an existing session fails closed.
  */
 async function sessionOwnedByIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
+  if (identity.privateUserId) {
+    if (!sessionId) return false;
+    const privateOwner = await sessionRegistry.refresh(sessionId);
+    if (!privateOwner?.authoritative || privateOwner.userId !== identity.privateUserId) return false;
+  }
   if (!sessionId) return true;
   const cached = await sessionRegistry.get(sessionId);
   if (!cached) return true;
