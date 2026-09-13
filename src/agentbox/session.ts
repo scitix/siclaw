@@ -770,7 +770,10 @@ export class AgentBoxSessionManager {
       }
     }
     brain.llmCalls?.setUsageSink?.({
-      context: () => ({ sessionId, executionRole: role, traceId: traceId ?? tracingRecorder.getRootTraceId(sessionId) }),
+      context: () => {
+        const rootTrace = traceId ?? tracingRecorder.getRootTraceId(sessionId);
+        return { sessionId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
+      },
       record: observation => this.usageOutbox!.record(observation),
     });
   }

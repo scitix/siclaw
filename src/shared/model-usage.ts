@@ -19,6 +19,9 @@ export interface UsageObservation {
   phase: "started" | "finished";
   sessionId: string;
   traceId?: string;
+  requestId?: string;
+  parentCallId?: string;
+  executorRole?: string;
   requestAt: string;
   finishedAt?: string;
   kind: "agent" | "aux";
@@ -46,6 +49,6 @@ export interface UsageBatchResponse {
   results: { callId: string; phase: string; status: "accepted" | "duplicate" | "rejected" | "retryable"; reason?: string }[];
 }
 export interface UsageSink {
-  context(): Pick<UsageObservation, "sessionId" | "traceId" | "executionRole">;
+  context(): Pick<UsageObservation, "sessionId" | "traceId" | "executionRole" | "requestId" | "parentCallId" | "executorRole">;
   record(observation: UsageObservation): void;
 }

@@ -19,6 +19,7 @@ export interface WorkerInit {
   system_prompt: string;
   model: Model<Api>;
   api_key: string;
+  executor_role?: string;
   auth_header?: boolean;
   headers?: ProviderHeaders;
   thinking_level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -54,6 +55,7 @@ export function parseWorkerInput(value: unknown): WorkerInput {
       for (const key of ["session_id", "cwd", "state_dir", "api_key"]) text(key);
       text("system_prompt", true);
       if (frame.auth_header !== undefined && typeof frame.auth_header !== "boolean") throw new Error("Invalid auth header mode");
+      if (frame.executor_role !== undefined && (typeof frame.executor_role !== "string" || frame.executor_role.length > 32)) throw new Error("Invalid executor role");
       const model = frame.model;
       if (!model || typeof model !== "object" ||
           !["id", "provider", "api", "baseUrl"].every(key => typeof model[key] === "string" && model[key].trim()) ||

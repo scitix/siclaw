@@ -13,6 +13,8 @@ export class UsageOutbox {
   private timerAt = 0;
   private active?: Promise<void>;
   private stopped = false;
+  private drained?: () => void;
+  retireWhenDrained(callback: () => void): void { this.drained = callback; }
   private retryMs = 1000;
   constructor(
     private readonly directory: string,
@@ -114,6 +116,7 @@ export class UsageOutbox {
       }
       const sessionId = this.state.sessionId || entries[0]?.observation.sessionId;
       if (!sessionId) { this.schedule(30_000); return; }
+      const wasEmpty = this.files.size === 0;
       const response = await this.send({ observations: entries.map(e => e.observation), health: {
         ...this.state, sessionId, pending: this.files.size,
         oldestAt: entries[0]?.observation.requestAt, capturedAt: new Date().toISOString(),
@@ -128,7 +131,10 @@ export class UsageOutbox {
       this.state.lastSuccessAt = new Date().toISOString();
       this.saveState();
       this.retryMs = 1000;
-      this.schedule(this.files.size ? 250 : 30_000);
+      if (wasEmpty && this.files.size === 0 && this.drained) {
+        this.stopped = true; clearTimeout(this.timer); this.drained(); return;
+      }
+      this.schedule(this.files.size || this.drained ? 250 : 30_000);
     } catch {
       this.schedule(this.retryMs);
       this.retryMs = Math.min(this.retryMs * 2, 30_000);
