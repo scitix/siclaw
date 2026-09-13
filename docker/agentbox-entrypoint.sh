@@ -71,9 +71,16 @@ fi
 # the image sets up. Each type is chowned separately below.
 chown agentbox:kubecred /app/.siclaw/credentials 2>/dev/null || true
 chmod 0750 /app/.siclaw/credentials 2>/dev/null || true
+# An emptyDir hides the image's pre-created type directories. Create them as
+# their owner, before the broker can inherit the application's primary group.
+runuser -u agentbox -- mkdir -p /app/.siclaw/credentials/clusters /app/.siclaw/credentials/hosts
 # setgid on each type directory, so whatever is materialized into it inherits that type's group.
+# Repair each directory before recursive traversal. Root has no DAC_OVERRIDE;
+# a reused 2750 directory assigned to another group cannot be opened by chown -R.
+chown agentbox:kubecred /app/.siclaw/credentials/clusters 2>/dev/null || true
 chown -R agentbox:kubecred /app/.siclaw/credentials/clusters 2>/dev/null || true
 runuser -u agentbox -- chmod 2750 /app/.siclaw/credentials/clusters 2>/dev/null || true
+chown agentbox:hostcred /app/.siclaw/credentials/hosts 2>/dev/null || true
 chown -R agentbox:hostcred /app/.siclaw/credentials/hosts 2>/dev/null || true
 runuser -u agentbox -- chmod 2750 /app/.siclaw/credentials/hosts 2>/dev/null || true
 # Group-readable files, for the setgid reader (kubectl) — not for sandbox, which is in no such group.
