@@ -1349,6 +1349,47 @@ describe("knowledgeHandler multi-repo identity", () => {
     }
   }
 
+  it("adds a computed label sample under each library entry, and none for an unlabeled library", async () => {
+    const labeled = packageBase64WithLabeledPages("Library A", [
+      ["device-a.md", "DeviceA", "  - facet: entity\n    value: DeviceA\n  - facet: topic\n    value: Batch Plan\n"],
+      ["device-b.md", "DeviceB", "  - facet: entity\n    value: DeviceB\n  - facet: topic\n    value: Batch Plan\n"],
+      ["nav/_index.md", "Nav", "  - facet: topic\n    value: ShouldNotAppear\n"],
+    ]);
+    const repos = [
+      { id: "repo-a", name: "Library A", version: 2, sizeBytes: 10, consumerDomain: "示例实体与分类", dataBase64: labeled },
+      { id: "repo-b", name: "Plain", version: 1, sizeBytes: 10, dataBase64: packageBase64("plain") },
+    ];
+    await knowledgeHandler.materialize({ version: "v1", repos });
+    const index = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
+    const lines = index.split("\n");
+    const libraryRow = lines.findIndex((line) => line.startsWith(`- [[repos/${knowledgeRepoDirName("Library A", "repo-a")}/index]]`));
+    expect(lines[libraryRow]).toBe(`- [[repos/${knowledgeRepoDirName("Library A", "repo-a")}/index]] - Library A v2 — 示例实体与分类`);
+    // Most frequent first (Batch Plan on 2 pages), then entity before topic on ties; navigation pages excluded.
+    expect(lines[libraryRow + 1]).toBe("    Common labels (sample): Batch Plan / DeviceA / DeviceB");
+    const plainRow = lines.findIndex((line) => line.startsWith(`- [[repos/${knowledgeRepoDirName("Plain", "repo-b")}/index]]`));
+    expect(lines[plainRow + 1]).not.toContain("Common labels");
+    // Still one list item per library.
+    expect(lines.filter((line) => line.startsWith("- [[repos/"))).toHaveLength(2);
+    expect(index).toContain("it is not an inventory");
+  });
+
+  function packageBase64WithLabeledPages(title: string, pages: Array<[file: string, pageTitle: string, labels: string]>): string {
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-package-labels-test-"));
+    const archive = path.join(os.tmpdir(), `knowledge-package-labels-${process.pid}-${Date.now()}-${Math.random()}.tar.gz`);
+    try {
+      fs.writeFileSync(path.join(sourceDir, "index.md"), `# ${title}\n\n${pages.map(([file, pageTitle]) => `- [${pageTitle}](${file})`).join("\n")}\n`);
+      for (const [file, pageTitle, labels] of pages) {
+        fs.mkdirSync(path.dirname(path.join(sourceDir, file)), { recursive: true });
+        fs.writeFileSync(path.join(sourceDir, file), `---\ntype: Topic\ntitle: ${pageTitle}\nlabels:\n${labels}---\n# ${pageTitle}\n`);
+      }
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "."]);
+      return fs.readFileSync(archive).toString("base64");
+    } finally {
+      fs.rmSync(sourceDir, { recursive: true, force: true });
+      fs.rmSync(archive, { force: true });
+    }
+  }
+
   it("says the entries are libraries, since the prompt around it says pages", async () => {
     // The system prompt introduces this file as a page catalog — true when one
     // library unpacks at the root, false here. An agent reading these ten lines

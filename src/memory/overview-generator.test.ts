@@ -371,6 +371,24 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("- [Page 199]");
   });
 
+  it("tells the agent to choose a library first only when several libraries are mounted", () => {
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      "# Knowledge Index\n\n- [[repos/compute/index]] - Library A v1 — example entities\n- [[repos/network/index]] - Library B v1 — example procedures\n",
+    );
+    writeManifest([{ root: "repos/compute" }, { root: "repos/network" }]);
+    const multi = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(multi).toContain("Several libraries are mounted");
+    expect(multi).toContain("listLibraries=true");
+    expect(multi).toContain("Do not grep or list the whole tree");
+
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "# Knowledge Index\n\n- [Page](page.md) - one page\n");
+    writeManifest([{ root: "" }]);
+    const single = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(single).not.toContain("Several libraries are mounted");
+    expect(single).toContain("The complete page catalog is below.");
+  });
+
   it("lifts routes from every library in a multi-library materialization", () => {
     fs.writeFileSync(
       path.join(knowledgeDir, "index.md"),

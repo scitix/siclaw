@@ -8,6 +8,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Knowledge search knows which library it is in
+
+A mount with several knowledge libraries used to look like one flat label index
+to `knowledge_search`: a label shared by many pages of an unrelated library
+diluted a rare, decisive label in the library the question was about, results
+carried no library, and the agent fell back to `find`ing every library's
+`index.md` and grepping the whole tree.
+
+- **Per-library term frequency.** The `(0.6 + 0.4/√pageCount)` dilution now
+  counts pages inside the candidate's own library, so a shared label in a large
+  library no longer weakens a rare match in another library.
+- **Library routing.** Each library is scored from its matched labels plus its
+  catalog name/domain; a clear leader (or leaders within 0.15) is routed to and
+  the flat `results` come from it, while `libraries[]` still lists every
+  library that matched, with `why`, `matchedPages` and its own top pages. No
+  leader → `routing.fallback` and every library stays in play; a near-tie is
+  called out so the agent compares domains instead of reading the wrong leaf.
+- **`library=<root|name>`** searches inside one library; **`listLibraries=true`**
+  returns every library's name, version, domain, page count and dominant labels
+  per facet in one call — the replacement for opening each library's index.
+- **Stale candidates.** A page that vanished from disk after the index was built
+  is skipped and counted in `staleCandidates` instead of being handed to the
+  agent as a path that `read` cannot open.
+- The injected Wiki guidance says, on a multi-library mount only, to pick a
+  library first and not to grep or list the whole tree.
+- **`listLibraries=true` doubles as a label-backfill worklist.** Each library
+  entry reports `unlabeledPages` and up to five `unlabeledSamples` (page titles
+  that declare no labels and are therefore invisible to `knowledge_search`), so
+  a weak match can be traced to the pages that need labels instead of to the
+  search.
+- **Label sample on the root catalog.** Under each library's catalog row the
+  materializer now adds `Common labels (sample): …` — the most frequent
+  entity/task/topic/component labels across that library's pages, computed at
+  materialization (never model-written, so never stale). The header says it is a
+  sample, not an inventory, so a library is not skipped because the sample did
+  not mention a topic. An agent can rule a library in or out from the root
+  catalog instead of opening each 20K-character index first.
+
+Library roots come from the materializer's `.citation-manifest.json` and
+display metadata from the root catalog line the agent already sees — no new
+data format. Single-library output is unchanged, field for field.
+
 #### Handoff: one agent per network region, one agent as far as the user is concerned
 
 A region's cluster APIs, host SSH, internal MCP servers and model endpoints are
