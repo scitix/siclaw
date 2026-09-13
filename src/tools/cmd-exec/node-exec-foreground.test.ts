@@ -59,6 +59,20 @@ describe("node_exec foreground: killable session + abort reap", () => {
 });
 
 describe("node_exec: the command's own failure information survives", () => {
+  it("keeps JSON stdout separate from stderr and redaction notices for SDK callers", async () => {
+    runInDebugPod.mockResolvedValueOnce({ stdout: '{"password":"fixture-secret","ready":true}', stderr: "query warning", exitCode: 0 });
+    const capture = vi.fn();
+    const tool = createNodeExecTool(undefined, undefined, undefined, { outputMode: "data", onOutputData: capture });
+    const result = await tool.execute("data", { node: "node-1", command: "cat /etc/example.json" }, new AbortController().signal, {} as never);
+    expect(capture).toHaveBeenCalledOnce();
+    const data = capture.mock.calls[0][0];
+    expect(JSON.parse(data.text)).toEqual({ password: "**REDACTED**", ready: true });
+    expect(data.stderr).toBe("query warning");
+    expect(data.notices.join("\n")).toContain("redacted");
+    expect(result.content[0].text).toBe(data.text);
+    expect(result.details).toMatchObject({ exitCode: 0, exit_class: "success" });
+  });
+
   it("keeps the target's stderr AND names the class, even when the body is suppressed", async () => {
     // `crictl inspectp` output goes through a STRUCTURAL sanitizer, which suppresses the body when it
     // cannot parse it — which is exactly what a failed run produces. The command's own error text must

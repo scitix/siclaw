@@ -2,10 +2,9 @@ import { BACKGROUND_EXEC_DESCRIPTION } from "../cmd-exec/background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { resolveScript, type SkillScriptResolver } from "../infra/script-resolver.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { loadConfig } from "../../core/config.js";
@@ -40,18 +39,6 @@ export function createPodScriptTool(
   return {
     name: "pod_script",
     label: "Pod Script",
-    renderCall(args: any, theme: any) {
-      const ns = args?.namespace && args.namespace !== "default" ? `-n ${args.namespace}` : "";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("pod_script")) +
-          " " + theme.fg("accent", args?.pod || "") +
-          (ns ? " " + theme.fg("muted", ns) : "") +
-          " " + theme.fg("muted", (args?.skill || "") + "/" + (args?.script || "")) +
-          (args?.args ? " " + args.args : ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Execute a skill or user script inside a Kubernetes pod via kubectl exec.
 
 The script is piped via stdin into the pod and executed with sh. This means the target pod only needs sh (and python3 for .py scripts).

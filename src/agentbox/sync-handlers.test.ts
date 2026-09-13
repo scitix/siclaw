@@ -1055,8 +1055,8 @@ describe("skill directory resolution", () => {
     expect(result).toEqual([resolvedDir]);
   });
 
-  // ── 3. TUI mode: no resolved/ → fallback to core/ + extension/ + platform/
-  it("TUI mode: no resolved/ → falls back to core/ + extension/ + platform/", () => {
+  // ── 3. CLI mode: no resolved/ → fallback to core/ + extension/ + platform/
+  it("CLI mode: no resolved/ → falls back to core/ + extension/ + platform/", () => {
     const coreDir = path.join(tmpDir, "skills", "core");
     const extensionDir = path.join(tmpDir, "skills", "extension");
     const platformDir = path.join(tmpDir, "skills", "platform");
@@ -1068,8 +1068,8 @@ describe("skill directory resolution", () => {
     expect(result).toEqual([coreDir, extensionDir, platformDir]);
   });
 
-  // ── 4. TUI mode: no resolved/, no extension/ → core/ + platform/ ──────
-  it("TUI mode: no resolved/, no extension/ → core/ + platform/ only", () => {
+  // ── 4. CLI mode: no resolved/, no extension/ → core/ + platform/ ──────
+  it("CLI mode: no resolved/, no extension/ → core/ + platform/ only", () => {
     const coreDir = path.join(tmpDir, "skills", "core");
     const platformDir = path.join(tmpDir, "skills", "platform");
     fs.mkdirSync(coreDir, { recursive: true });
@@ -1080,7 +1080,7 @@ describe("skill directory resolution", () => {
     expect(result).not.toContain(path.join(tmpDir, "skills", "extension"));
   });
 
-  // ── 5. platform always loaded: present in both server and TUI modes ───
+  // ── 5. platform always loaded: present in both server and CLI modes ───
   it("platform/ is appended regardless of whether resolved/ exists", () => {
     const resolvedDir = path.join(skillsBase, "resolved");
     const platformDir = path.join(tmpDir, "skills", "platform");
@@ -1091,7 +1091,7 @@ describe("skill directory resolution", () => {
     let result = resolveSkillDirs(tmpDir, skillsBase);
     expect(result).toContain(platformDir);
 
-    // Remove resolved/ (TUI mode) — platform/ should still appear
+    // Remove resolved/ (CLI mode) — platform/ should still appear
     fs.rmdirSync(resolvedDir);
     result = resolveSkillDirs(tmpDir, skillsBase);
     expect(result).toContain(platformDir);

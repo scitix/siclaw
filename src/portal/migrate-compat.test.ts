@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { safeAlterTable, setColumnDefault } from "./migrate-compat.js";
+import { safeAlterTable, setColumnDefault, widenColumn } from "./migrate-compat.js";
 import type { Db } from "../gateway/db.js";
 
 /**
@@ -36,6 +36,48 @@ function fakeMysql(currentDefault: string | null, columnPresent = true): {
 }
 
 const alters = (queries: Array<{ sql: string }>) => queries.filter((q) => q.sql.startsWith("ALTER TABLE"));
+
+describe("chat result text capacity", () => {
+  it.each(["text", "mediumtext", "longtext"])("widens %s only when needed", async current => {
+    const queries: string[] = [];
+    const db = { driver: "mysql", query: async (sql: string) => {
+      queries.push(sql);
+      return [sql.includes("SELECT COLUMN_NAME") ? [{ COLUMN_NAME: "content" }] : [{ COLUMN_TYPE: current }], undefined];
+    } } as unknown as Db;
+    await widenColumn(db, "chat_messages", "content", "MEDIUMTEXT DEFAULT NULL");
+    expect(queries.filter(sql => sql.startsWith("ALTER TABLE"))).toHaveLength(current === "text" ? 1 : 0);
+  });
+});
+
+describe("widenColumn for structured preview metadata", () => {
+  it.each(["tinytext", "text", "mediumtext", "longtext", "json"])("handles existing MySQL %s without narrowing legacy JSON", async initialType => {
+    let columnType = initialType;
+    const queries: Array<{ sql: string }> = [];
+    const db = {
+      driver: "mysql",
+      query: async (sql: string) => {
+        queries.push({ sql });
+        if (sql.includes("SELECT COLUMN_NAME")) return [[{ COLUMN_NAME: "metadata" }], undefined];
+        if (sql.includes("SELECT COLUMN_TYPE")) return [[{ COLUMN_TYPE: columnType }], undefined];
+        if (sql.startsWith("ALTER TABLE")) columnType = "longtext";
+        return [[], undefined];
+      },
+    } as unknown as Db;
+    for (let i = 0; i < 2; i++) {
+      await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
+    }
+    expect(alters(queries).map(q => q.sql)).toEqual(["longtext", "json"].includes(initialType) ? [] : [
+      "ALTER TABLE `chat_messages` MODIFY COLUMN `metadata` LONGTEXT DEFAULT NULL",
+    ]);
+  });
+
+  it("leaves SQLite storage unchanged", async () => {
+    const queries: string[] = [];
+    const db = { driver: "sqlite", query: async (sql: string) => { queries.push(sql); } } as unknown as Db;
+    await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
+    expect(queries).toEqual([]);
+  });
+});
 
 describe("setColumnDefault", () => {
   it("corrects a legacy default on an existing MySQL table", async () => {

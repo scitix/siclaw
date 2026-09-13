@@ -2,10 +2,9 @@ import { BACKGROUND_EXEC_DESCRIPTION } from "../cmd-exec/background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { resolveScript, type SkillScriptResolver } from "../infra/script-resolver.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
@@ -54,16 +53,6 @@ export function createHostScriptTool(
   return {
     name: "host_script",
     label: "Host Script",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("host_script")) +
-          " " + theme.fg("accent", args?.host || "") +
-          " " + theme.fg("muted", (args?.skill || "") + "/" + (args?.script || "")) +
-          (args?.args ? " " + args.args : ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Execute a skill or user script on a host via SSH — incl. Kubernetes nodes registered as SSH hosts (they appear in host_list).
 
 PREFER this over node_script for node-level diagnostics whenever the target is SSH-reachable: SSH runs the script with NO privileged debug pod (cleaner, lighter). node_script is the fallback for nodes not bound as SSH hosts, and for pod-namespace (netns) work. On connection failure (can't connect / auth / timeout / host not bound — not a non-zero script exit) and the target is a Kubernetes node, retry with node_script.

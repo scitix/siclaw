@@ -5,13 +5,13 @@
  * Used by AgentBox to query metadata (settings, agent tasks, etc.)
  */
 
+import { SandboxInvocations } from "./sandbox-invocations.js";
 import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
-import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
 import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
 import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH, type HandoffSearchQuery, type HandoffSearchResponse, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
 import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
@@ -43,6 +43,7 @@ export interface AgentTask {
 }
 
 export class GatewayClient {
+  readonly sandboxInvocations = new SandboxInvocations();
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
   private sessionId?: string;
@@ -153,7 +154,7 @@ export class GatewayClient {
   }
 
   /**
-   * Send background delegation persistence/audit events to Runtime.
+   * Send subagent and background-job persistence/audit events to Runtime.
    *
    * AgentBox must not import Gateway DB/RPC modules directly: in K8s it runs in
    * a separate pod, while Runtime owns the Portal RPC connection.
@@ -173,116 +174,6 @@ export class GatewayClient {
    */
   async sendMetricsFlush(payload: MetricsFlushPayload): Promise<void> {
     await this.request("/api/internal/metrics-flush", "POST", payload);
-  }
-
-  /**
-   * Agent-to-agent delegation (caller side), LIVE-streaming: ask the gateway to
-   * run a bounded read-only task on a PEER agent. The gateway streams the peer's
-   * events back as Server-Sent Events; `onPeerEvent` fires per peer chat.event
-   * (so the coordinator can render the peer's steps live), and the promise
-   * resolves with the final result when the `delegate_result` frame arrives.
-   * The gateway re-validates the peer is in this box's coordinator roster.
-   *
-   * Generous timeout (10 min, matching the exec ceiling) — a real read-only
-   * investigation easily exceeds the 5s default.
-   */
-  delegateStream(req: DelegateRequest, onPeerEvent: (evt: Record<string, unknown>) => void, signal?: AbortSignal): Promise<DelegateResponse> {
-    return new Promise((resolve, reject) => {
-      if (signal?.aborted) {
-        resolve({ ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error: "delegation stopped" });
-        return;
-      }
-      const url = new URL("/api/internal/delegate", this.gatewayUrl);
-      const isHttps = url.protocol === "https:";
-      const requestOptions: https.RequestOptions = {
-        hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
-        path: url.pathname,
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        ...(isHttps && this.tlsOptions ? this.tlsOptions : {}),
-      };
-      const client = isHttps ? https : http;
-      let result: DelegateResponse | undefined;
-      // The peer session and trace ids from the EARLY delegate_session /
-      // delegate_trace frames. Kept so the fallbacks below (Stop, stream ended
-      // without a result) still name the leg: the gateway's own stopped/failed
-      // frame is written into a socket this side has already destroyed, so
-      // whatever arrived early is all there is.
-      let announcedPeerSessionId: string | undefined;
-      let announcedPeerTraceId: string | undefined;
-      const request = client.request(requestOptions, (res: any) => {
-        // Decode the stream as UTF-8 here, once, so Node's own StringDecoder holds
-        // the partial bytes of a character split across two chunks. `chunk.toString()`
-        // per data event decodes each fragment on its own and turns one multibyte
-        // character into two U+FFFD — silently, and only when the split happens to
-        // land inside a character (same reasoning as background-bash-runner.ts).
-        res.setEncoding("utf8");
-        // Pre-stream error (non-200): body is a plain JSON error.
-        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-          let body = "";
-          res.on("data", (c: string) => { body += c; });
-          res.on("end", () => {
-            let error = `Gateway returned ${res.statusCode}`;
-            try { error = (JSON.parse(body) as { error?: string }).error ?? error; } catch { /* keep */ }
-            resolve({ ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error });
-          });
-          return;
-        }
-        let buffer = "";
-        res.on("data", (chunk: string) => {
-          buffer += chunk;
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).replace(/^ /, "");
-            if (!data) continue;
-            let frame: any;
-            try { frame = JSON.parse(data); } catch { continue; }
-            if (frame?.type === "peer_event" && frame.event) {
-              try { onPeerEvent(frame.event as Record<string, unknown>); } catch { /* best-effort render */ }
-            } else if (frame?.type === "delegate_session" && frame.peerSessionId) {
-              // Early frame: peer session id, known at delegation start. Forward as a
-              // synthetic event so the translator can surface it to the card live.
-              announcedPeerSessionId = String(frame.peerSessionId);
-              try { onPeerEvent({ type: "delegate_session", peerSessionId: frame.peerSessionId }); } catch { /* best-effort */ }
-            } else if (frame?.type === "delegate_trace" && frame.peerTraceId) {
-              // Early frame: the leg's own trace id, known at the peer's prompt ack.
-              announcedPeerTraceId = String(frame.peerTraceId);
-            } else if (frame?.type === "delegate_result" && frame.result) {
-              result = frame.result as DelegateResponse;
-            }
-          }
-        });
-        res.on("end", () => {
-          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], peerSessionId: announcedPeerSessionId, peerTraceId: announcedPeerTraceId, error: "delegation stream ended without a result" });
-        });
-      });
-      request.on("error", (err: Error) => reject(new Error(`Delegate request failed: ${err.message}`)));
-      // A delegated diagnosis is a long-running task — the peer runs its sub-agents
-      // FOREGROUND, so a multi-node investigation legitimately takes many minutes
-      // (observed 7-8 min). The old 10 min ceiling cut those off ("coordinator got
-      // no report"). Allow up to 30 min; on timeout the request is destroyed, which
-      // the gateway detects and uses to abort the peer turn.
-      request.setTimeout(1_800_000, () => { request.destroy(); reject(new Error("Delegate request timed out after 30 min")); });
-      // Stop: tearing down the request closes the connection, which the gateway
-      // detects and uses to cancel the peer's turn. Resolve cleanly (the request's
-      // subsequent 'error' is ignored once the promise has settled).
-      if (signal) {
-        signal.addEventListener("abort", () => {
-          try { request.destroy(); } catch { /* already gone */ }
-          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], peerSessionId: announcedPeerSessionId, peerTraceId: announcedPeerTraceId, error: "delegation stopped" });
-        }, { once: true });
-      }
-      request.write(JSON.stringify(req));
-      request.end();
-    });
-  }
-
-  /** Fetch this coordinator's delegation roster (authorization + manifest). */
-  async fetchDelegates(): Promise<DelegatesResponse> {
-    return this.request("/api/internal/delegates", "GET");
   }
 
   /**
@@ -316,10 +207,43 @@ export class GatewayClient {
     };
   }
 
+  private scriptInfoCache?: { expires: number; value: import("../script-sandbox/types.js").ScriptSandboxInfo };
+  private scriptInfoPending?: Promise<import("../script-sandbox/types.js").ScriptSandboxInfo>;
+  async scriptSandboxInfo(): Promise<import("../script-sandbox/types.js").ScriptSandboxInfo> {
+    if (this.scriptInfoCache && this.scriptInfoCache.expires > Date.now()) return this.scriptInfoCache.value;
+    return this.scriptInfoPending ??= this.fetchScriptSandboxInfo().then(value => {
+      this.scriptInfoCache = { value, expires: Date.now() + 30_000 }; return value;
+    }).catch(() => ({ enabled: false, network_isolation: false, require_network_isolation: false }))
+      .finally(() => { this.scriptInfoPending = undefined; });
+  }
+
+  private async fetchScriptSandboxInfo(): Promise<import("../script-sandbox/types.js").ScriptSandboxInfo> {
+    const disabled = { enabled: false, network_isolation: false, require_network_isolation: false };
+    const info = await this.request("/api/internal/script-runs", "GET");
+    if (info?.enabled !== true) return disabled;
+    const raw = info.limits;
+    // Explicitly project the public fields; never pass arbitrary service config to model tools.
+    const limits = raw && [raw.default_timeout_seconds, raw.max_timeout_seconds, raw.max_tool_calls, raw.max_output_bytes]
+      .every(value => Number.isSafeInteger(value) && value > 0) && raw.default_timeout_seconds <= raw.max_timeout_seconds
+      ? { default_timeout_seconds: raw.default_timeout_seconds, max_timeout_seconds: raw.max_timeout_seconds,
+        max_tool_calls: raw.max_tool_calls, max_output_bytes: raw.max_output_bytes,
+        ...(Number.isSafeInteger(raw.max_concurrent_tools) && raw.max_concurrent_tools > 0 && raw.max_concurrent_tools <= 10
+          ? { max_concurrent_tools: raw.max_concurrent_tools } : {}) } : undefined;
+    return { enabled: true, network_isolation: info.network_isolation === true,
+      require_network_isolation: info.require_network_isolation === true, ...(limits ? { limits } : {}) };
+  }
+
+  async runScript(request: import("../script-sandbox/types.js").ScriptRequest, sessionId: string, signal?: AbortSignal): Promise<import("../script-sandbox/types.js").ScriptResult> {
+    const invocation = this.sandboxInvocations.open(sessionId, request, signal);
+    try {
+      return await this.request("/api/internal/script-runs", "POST", { session_id: sessionId, callback_token: invocation.token, request }, 720_000, signal);
+    } finally { invocation.close(); }
+  }
+
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000): Promise<any> {
+  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000, signal?: AbortSignal): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -329,6 +253,7 @@ export class GatewayClient {
         port: url.port || (isHttps ? 443 : 80),
         path: url.pathname + url.search,
         method,
+        signal,
         headers: {
           "Content-Type": "application/json",
         },

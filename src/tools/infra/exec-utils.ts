@@ -12,6 +12,16 @@ import { checkNodeReady } from "./k8s-checks.js";
 
 // ── Name validators ──────────────────────────────────────────────────
 
+/** Shared target spelling for authorization, admission and actual execution. */
+export function normalizeExecTarget<T extends object>(params: T): T {
+  const result = { ...params } as Record<string, unknown>;
+  for (const key of ["node", "pod", "namespace", "container", "netns"]) {
+    if (typeof result[key] === "string") result[key] = result[key].trim();
+  }
+  if ("pod" in result && (result.namespace === undefined || result.namespace === "")) result.namespace = "default";
+  return result as T;
+}
+
 /** Valid node name: RFC 1123 — alphanumeric, hyphens, dots. */
 export const NODE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.\-]*$/;
 

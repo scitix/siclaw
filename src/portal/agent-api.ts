@@ -5,6 +5,8 @@
  * Auth required for every route.
  */
 
+import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
+
 import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
 import { insertIgnorePrefix, isUniqueViolation } from "../gateway/dialect-helpers.js";
@@ -21,7 +23,6 @@ import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
 import { encodeSubagentModelsForDb } from "../core/subagent-models.js";
 import { AGENT_TYPES, agentPromptAddendum, normalizeAgentType } from "../core/agent-types.js";
-import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
@@ -70,7 +71,7 @@ async function validateSubagentTierRefs(
  */
 function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   if (!row) return row;
-  const agentType = normalizeAgentType(row.agent_type);
+  const agentType = row.agent_type === "coordinator" ? undefined : normalizeAgentType(row.agent_type);
   return {
     ...row,
     model_routing: safeParseJson(row.model_routing, null),
@@ -78,7 +79,7 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
     // Additive migration field: old rows may still contain a materialized
     // built-in default in system_prompt. The settings UI edits only the real
     // addendum while legacy clients can keep reading the raw column.
-    agent_prompt_addendum: agentPromptAddendum(agentType, row.system_prompt) ?? null,
+    agent_prompt_addendum: agentType ? agentPromptAddendum(agentType, row.system_prompt) ?? null : null,
     subagent_models: safeParseJson(row.subagent_models, null),
   };
 }
@@ -107,9 +108,6 @@ export function registerAgentRoutes(
 
     const query = parseQuery(req.url ?? "");
     const page = Math.max(1, parseInt(query.page ?? "1", 10));
-    // Cap 500 (not 100): the Delegates roster picker fetches the full agent list
-    // in one page (page_size=500) to choose delegation targets. A 100 cap silently
-    // hid agents beyond the first 100 from the roster.
     const pageSize = Math.min(500, Math.max(1, parseInt(query.page_size ?? "20", 10)));
     const search = query.search ?? "";
     const offset = (page - 1) * pageSize;
@@ -176,6 +174,10 @@ export function registerAgentRoutes(
       return;
     }
 
+    if (body.agent_type === "coordinator") {
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
+      return;
+    }
     const agentType = normalizeAgentType(body.agent_type);
     await db.query(
       `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
@@ -204,7 +206,7 @@ export function registerAgentRoutes(
     );
 
     // Auto-bind builtin skills to new agent — skipped for types that default to
-    // no skills (e.g. a Coordinator, which routes rather than executes).
+    // no skills (for example Knowledge QA).
     if (!AGENT_TYPES[agentType].defaultNoSkills) try {
       const [builtinSkills] = await db.query(
         "SELECT id FROM skills WHERE is_builtin = 1 AND status = 'installed' AND org_id = ?",
@@ -281,6 +283,22 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    // Every mutation checks retirement, including a rename or an empty update.
+    // Reuse this snapshot for change-driven reloads of the full settings form.
+    const [currentRows] = await db.query(
+      "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities, subagent_models FROM agents WHERE id = ?",
+      [params.id],
+    ) as any;
+    const current = currentRows[0];
+    if (!current) {
+      sendJson(res, 404, { error: "Agent not found" });
+      return;
+    }
+    if (body.agent_type === "coordinator" || current.agent_type === "coordinator") {
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
+      return;
+    }
+
     let encodedToolCapabilities: string | null | undefined;
     if ("tool_capabilities" in body) {
       try {
@@ -306,28 +324,7 @@ export function registerAgentRoutes(
       }
     }
 
-    // The Web settings form sends a complete snapshot on every Save. Read the
-    // fields whose side effects must be change-driven so an unrelated rename,
-    // model edit, or binding save does not invalidate warm sessions.
-    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities", "subagent_models"]
-      .some((field) => field in body);
-    let current: {
-      idle_timeout_sec?: unknown;
-      system_prompt?: unknown;
-      agent_type?: unknown;
-      is_production?: unknown;
-      tool_capabilities?: unknown;
-      subagent_models?: unknown;
-    } | undefined;
-    if (needsCurrentState) {
-      const [rows] = await db.query(
-        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities, subagent_models FROM agents WHERE id = ?",
-        [params.id],
-      ) as any;
-      current = rows[0];
-    }
-
-    const currentAgentType = normalizeAgentType(current?.agent_type);
+    const currentAgentType = normalizeAgentType(current.agent_type);
     const nextAgentType = "agent_type" in body
       ? normalizeAgentType(body.agent_type)
       : currentAgentType;
@@ -518,12 +515,6 @@ export function registerAgentRoutes(
       connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
     }
 
-    // A change to this agent's roster-visible attributes must refresh any coordinator
-    // that delegates to it (its manifest line: name / description / status; and its
-    // coverage via is_production, which filters the visible cluster/host set).
-    if ("name" in body || "description" in body || "status" in body || "is_production" in body) {
-      void notifyCoordinatorsForMembers(connectionMap, [params.id]);
-    }
   });
 
   // DELETE /api/v1/agents/:id (admin only)
@@ -552,17 +543,9 @@ export function registerAgentRoutes(
       console.warn(`[agent-api] delete ${params.id}: runtime terminate failed: ${termResult.error}`);
     }
 
-    // Refresh coordinators that delegate to this agent. Order matters: CAPTURE the
-    // coordinator ids BEFORE the delete (the FK cascade removes the agent_delegates
-    // reverse rows), then DELETE, then NOTIFY. Notifying before the delete would let a
-    // coordinator rebuild + re-fetch the still-present row, re-caching the doomed peer
-    // with no later invalidation.
-    const dependentCoordinators = await collectDependentCoordinators([params.id]);
-
     await db.query("DELETE FROM agents WHERE id = ?", [params.id]);
     sendJson(res, 200, { deleted: true, terminate: termResult });
 
-    notifyCoordinators(connectionMap, dependentCoordinators);
   });
 
   // PUT /api/v1/agents/:id/resources — bind resources (admin only)
@@ -577,7 +560,6 @@ export function registerAgentRoutes(
       mcp_server_ids?: string[];
       channel_ids?: string[];
       knowledge_repo_ids?: string[];
-      delegate_agent_ids?: string[];
     }>(req);
 
     const db = getDb();
@@ -631,15 +613,6 @@ export function registerAgentRoutes(
           await conn.query("INSERT INTO agent_knowledge_repos (agent_id, repo_id) VALUES (?, ?)", [agentId, kid]);
         }
       }
-      if (body.delegate_agent_ids !== undefined) {
-        // Delegation roster: peer agents this coordinator may delegate to.
-        // Drop self-references (an agent can't delegate to itself) + dedupe.
-        await conn.query("DELETE FROM agent_delegates WHERE coordinator_agent_id = ?", [agentId]);
-        for (const mid of [...new Set(body.delegate_agent_ids)]) {
-          if (mid === agentId) continue;
-          await conn.query("INSERT INTO agent_delegates (coordinator_agent_id, member_agent_id) VALUES (?, ?)", [agentId, mid]);
-        }
-      }
 
       await conn.commit();
     } catch (err) {
@@ -660,18 +633,12 @@ export function registerAgentRoutes(
       ...(body.skill_ids !== undefined ? ["skills"] : []),
       ...(body.mcp_server_ids !== undefined ? ["mcp"] : []),
       ...(body.knowledge_repo_ids !== undefined ? ["knowledge"] : []),
-      ...(body.delegate_agent_ids !== undefined ? ["tools"] : []),
     ];
     if (reloadResources.length > 0) {
       connectionMap.notify(params.id, "agent.reload", {
         agentId: params.id,
         resources: reloadResources,
       });
-    }
-    // This agent's cluster/host bindings changed → its coverage in any coordinator's
-    // roster is now stale; refresh the coordinators that delegate to it.
-    if (body.cluster_ids !== undefined || body.host_ids !== undefined) {
-      void notifyCoordinatorsForMembers(connectionMap, [params.id]);
     }
   });
 
@@ -683,7 +650,7 @@ export function registerAgentRoutes(
     const db = getDb();
     const agentId = params.id;
 
-    const [[clusters], [hosts], [skills], [mcpServers], [channels], [knowledgeRepos], [delegates]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [channels], [knowledgeRepos]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -714,11 +681,6 @@ export function registerAgentRoutes(
          JOIN knowledge_repos kr ON akr.repo_id = kr.id WHERE akr.agent_id = ?`,
         [agentId],
       ),
-      db.query(
-        `SELECT a.id, a.name, a.description FROM agent_delegates ad
-         JOIN agents a ON ad.member_agent_id = a.id WHERE ad.coordinator_agent_id = ?`,
-        [agentId],
-      ),
     ]) as any;
 
     sendJson(res, 200, {
@@ -728,7 +690,6 @@ export function registerAgentRoutes(
       mcp_servers: mcpServers,
       channels,
       knowledge_repos: knowledgeRepos,
-      delegates,
     });
   });
 
@@ -746,6 +707,10 @@ export function registerAgentRoutes(
       return;
     }
     const source = sourceRows[0];
+    if (source.agent_type === "coordinator") {
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
+      return;
+    }
 
     const newId = crypto.randomUUID();
     // Hash the source name + a random salt so the suffix is stable-looking but collision-free
@@ -840,18 +805,6 @@ export function registerAgentRoutes(
         await conn.query(
           "INSERT INTO agent_knowledge_repos (agent_id, repo_id) VALUES (?, ?)",
           [newId, row.repo_id],
-        );
-      }
-
-      // Copy delegation roster (peer agents this coordinator may delegate to)
-      const [delegateRows] = await conn.query(
-        "SELECT member_agent_id FROM agent_delegates WHERE coordinator_agent_id = ?",
-        [sourceId],
-      ) as any;
-      for (const row of delegateRows) {
-        await conn.query(
-          "INSERT INTO agent_delegates (coordinator_agent_id, member_agent_id) VALUES (?, ?)",
-          [newId, row.member_agent_id],
         );
       }
 

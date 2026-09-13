@@ -130,12 +130,15 @@ export async function setColumnDefault(
  * existing deployment needs an explicit MODIFY. Guarded on the current COLUMN_TYPE so a large
  * table (chat_messages) is copied at most ONCE — never re-copied on every migration run. SQLite
  * has no fixed CHAR width and no cheap MODIFY COLUMN, so it is a no-op there.
+ * `fromTypes` restricts the upgrade when legacy deployments use another valid
+ * type (for example JSON rather than a capacity-limited TEXT column).
  */
 export async function widenColumn(
   db: Db,
   table: string,
   column: string,
   definition: string,
+  fromTypes?: readonly string[],
 ): Promise<void> {
   if (db.driver !== "mysql") return;
   if (!(await columnExists(db, table, column))) return; // a fresh install already made it wide
@@ -145,9 +148,14 @@ export async function widenColumn(
     [table, column],
   );
   const current = (rows[0]?.COLUMN_TYPE ?? "").toLowerCase();
+  if (fromTypes && !fromTypes.includes(current)) return;
   // Target column type = the definition up to its first attribute keyword (DEFAULT/NULL/NOT).
   const targetType = definition.trim().split(/\s+(?=default\b|null\b|not\b)/i)[0].toLowerCase();
   if (!targetType || current === targetType) return; // already at the target type — skip the copy
+  // Existing installations may already use LONGTEXT. A width migration must
+  // never shrink that column or discard previously accepted tool output.
+  const textWidths = ["tinytext", "text", "mediumtext", "longtext"];
+  if (textWidths.includes(targetType) && textWidths.indexOf(current) > textWidths.indexOf(targetType)) return;
   await db.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
   console.log(`[portal-migrate] widened ${table}.${column}: ${current} → ${targetType}`);
 }

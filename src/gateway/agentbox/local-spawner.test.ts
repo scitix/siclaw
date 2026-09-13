@@ -339,24 +339,24 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     expect(box.sessionManager.harnessResolvedState).toBe(true);
   });
 
-  it("locks a Coordinator's capabilities + persona even with an EMPTY raw tool_capabilities", async () => {
+  it("locks a Knowledge QA agent's capabilities + persona even with an EMPTY raw tool_capabilities", async () => {
     // The exact bug: a built-in type with no raw tool_capabilities used to resolve
     // to null (unrestricted) + default "custom" persona in local mode. It must now
     // apply the type's LOCKED capability set and agentTypeState.
     dbQueryImpl = async (_sql, params) => {
       expect(params).toEqual(["a1"]);
-      return [[{ tool_capabilities: null, agent_type: "coordinator" }], undefined];
+      return [[{ tool_capabilities: null, agent_type: "knowledge_qa" }], undefined];
     };
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     // Locked, not unrestricted: a non-null, non-empty whitelist derived from the
-    // coordinator type — and delegate tools present (delegate_agents capability).
+    // Knowledge QA type, with only its configured read capabilities.
     expect(Array.isArray(box.sessionManager.allowedToolsState)).toBe(true);
     expect(box.sessionManager.allowedToolsState.length).toBeGreaterThan(0);
-    expect(box.sessionManager.allowedToolsState).toContain("delegate_to_agent");
+    expect(box.sessionManager.allowedToolsState).toContain("read");
     // Persona is driven by agentTypeState — must reflect the built-in type.
-    expect(box.sessionManager.agentTypeState).toBe("coordinator");
+    expect(box.sessionManager.agentTypeState).toBe("knowledge_qa");
     expect(box.sessionManager.harnessResolvedState).toBe(true);
   });
 

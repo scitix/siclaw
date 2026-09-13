@@ -15,6 +15,7 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { createPiExecutionSession } from "./pi-execution.js";
 import { summarizeWithFallback } from "./compaction.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
+import { skillsHandler, knowledgeHandler } from "../agentbox/sync-handlers.js";
 
 // Exercise installed Pi packages through the real HTTP serializer and agent loop.
 // Only the network boundary is replaced; no SDK classes or events are mocked.
@@ -149,6 +150,48 @@ describe("installed Pi SDK contract", () => {
     expect(resolveSessionThinkingLevel(services.settingsManager, model)).toBe(expected);
     expect(services.settingsManager.getGlobalSettings().defaultThinkingLevel).toBe(settings.defaultThinkingLevel);
   });
+
+  it.each([skillsHandler, knowledgeHandler])(
+    "preserves an in-flight tool context across $type resource updates",
+    async (handler) => {
+      const requests = mockNetwork(() => requests.length === 1
+        ? resultCall() : completion({ content: "Completed." }));
+      let started!: () => void;
+      let finish!: () => void;
+      const ready = new Promise<void>(resolve => { started = resolve; });
+      const gate = new Promise<void>(resolve => { finish = resolve; });
+      const tool: ToolDefinition = {
+        ...resultTool(),
+        async execute(_id, _args, _signal, _update, ctx) {
+          started();
+          await gate;
+          // The actual SDK checks this captured context after reload. A fake
+          // brain cannot detect the stale context that loses the tool result.
+          ctx.getContextUsage();
+          return { content: [{ type: "text", text: "accepted" }], details: { accepted: true } };
+        },
+      };
+      const { brain, session, sessionManager } = await createFixture([tool]);
+      const events: any[] = [];
+      brain.subscribe(event => events.push(event));
+      const invalidate = vi.fn();
+      const prompt = brain.prompt("Submit an answer.");
+      try {
+        await ready;
+        await handler.postReload!({ sessions: [{ id: session.sessionId, brain, invalidate }] });
+      } finally {
+        finish();
+        await prompt;
+      }
+      expect(events.find(e => e.type === "tool_execution_end")).toMatchObject({
+        isError: false, result: { details: { accepted: true } },
+      });
+      expect(invalidate).toHaveBeenCalledOnce();
+      const reopened = SessionManager.open(sessionManager.getSessionFile()!);
+      expect(reopened.buildSessionContext().messages.find(m => m.role === "toolResult"))
+        .toMatchObject({ isError: false, content: [{ type: "text", text: "accepted" }] });
+    },
+  );
 
   it("preserves guards, payload hooks, tool events, timing and persisted checkpoints", async () => {
     const requests = mockNetwork(() => requests.length === 1

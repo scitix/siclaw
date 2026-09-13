@@ -255,6 +255,14 @@ describe("handleToolCapabilities", () => {
     });
   });
 
+  it.each([{ capabilities: ["no_tools"] }, { capabilities: '["no_tools"]' }])("returns a concrete empty whitelist for $capabilities", async ({ capabilities }) => {
+    frontend.responses.set("config.getAgent", { agent_type: "custom", tool_capabilities: capabilities });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ agentType: "custom", allowedTools: [] });
+  });
+
   it("500 when the agent lookup fails", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     frontend.nextError = new Error("agent lookup down");
@@ -549,11 +557,7 @@ describe("handleDelegationEvents", () => {
     });
   });
 
-  it("accepts a delegated leg's own box, whose cert names the target rather than the owner", async () => {
-    // A delegated leg stays owned by the coordinator that created it (agent-2) while
-    // the turn runs in the delegated peer's box (agent-1 == the calling cert). Its
-    // sub-agent transcript and task-ledger rows used to be refused outright here,
-    // which is what left the leg pointing at sub-agent sessions that never existed.
+  it("rejects historical peer targets as authority to create child sessions", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
     const res = new FakeRes();
     await handleDelegationEvents(
@@ -575,8 +579,8 @@ describe("handleDelegationEvents", () => {
       frontend as unknown as FrontendWsClient,
     );
 
-    expect(res.statusCode).toBe(200);
-    expect(frontend.calls[0].method).toBe("chat.ensureSession");
+    expect(res.statusCode).toBe(403);
+    expect(frontend.calls).toHaveLength(0);
   });
 
   it("refuses ensure_session ON a leg row it only executes, not owns", async () => {
@@ -638,13 +642,7 @@ describe("handleDelegationEvents", () => {
     expect(frontend.calls.find((c) => c.method === "chat.ensureSession")).toBeUndefined();
   });
 
-  it("re-reads a leg cached before its target was known, instead of refusing for the entry's lifetime", async () => {
-    // The state a Runtime restart or eviction can pin: whichever 3-arg caller runs
-    // first (chat.send, a channel, a scheduled task) caches the leg owner-only.
-    // A cache hit never consults the row again, so refusing on the strength of
-    // that entry silently reinstates the data loss this arm exists to fix — and
-    // production runs two Runtimes, so the first caller is not always the one
-    // that knows the delegation fields.
+  it("refuses historical peer targets from both cache and authoritative resolution", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-2");
     const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
     sessionRegistry.setResolver(resolver);
@@ -665,7 +663,7 @@ describe("handleDelegationEvents", () => {
           identity,
           frontend as unknown as FrontendWsClient,
         );
-        expect(res.statusCode, `attempt ${attempt}`).toBe(200);
+        expect(res.statusCode, `attempt ${attempt}`).toBe(403);
       }
       // Bounded to one extra read: the refreshed record records that the row has
       // been consulted, so the second attempt is answered from cache.
@@ -730,12 +728,7 @@ describe("handleDelegationEvents", () => {
     }
   });
 
-  it("lets a delegated leg's box append to the leg but not rewrite its history", async () => {
-    // The asymmetry the append arm must not smuggle in: append_message adds a row
-    // attributed to the peer, while update_message takes a message id and rewrites
-    // THAT row — including rows the coordinator wrote — and nothing in the payload
-    // scopes the rewrite to the caller's own. So the arm that exists to persist a
-    // sub-agent transcript stops short of the conversation's history.
+  it("refuses historical peer targets for both appending and rewriting", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-2", "agent-1");
     const resolver = vi.fn(async () => ({ userId: "user-1", agentId: "agent-2", targetAgentId: "agent-1" }));
     sessionRegistry.setResolver(resolver);
@@ -750,7 +743,7 @@ describe("handleDelegationEvents", () => {
         identity,
         frontend as unknown as FrontendWsClient,
       );
-      expect(appended.statusCode).toBe(200);
+      expect(appended.statusCode).toBe(403);
 
       for (const type of ["delegation.update_message", "delegation.update_tool_message"]) {
         const res = new FakeRes();
@@ -794,8 +787,7 @@ describe("handleDelegationEvents", () => {
       expect(rewrite.statusCode).toBe(403);
       expect(resolver, "the cached record must not answer an ownership question").toHaveBeenCalledTimes(1);
 
-      // The append arm is unaffected: that is the write this whole change exists
-      // to let through, and the refreshed record now names the target.
+      // A historical target does not authorize appending either.
       const appended = new FakeRes();
       await handleDelegationEvents(
         asReq(new FakeReq(JSON.stringify({
@@ -806,7 +798,7 @@ describe("handleDelegationEvents", () => {
         identity,
         frontend as unknown as FrontendWsClient,
       );
-      expect(appended.statusCode).toBe(200);
+      expect(appended.statusCode).toBe(403);
     } finally {
       sessionRegistry.setResolver(undefined);
       sessionRegistry.forget("parent-1");
@@ -884,7 +876,7 @@ describe("handleDelegationEvents", () => {
     // the exposure only appears once they are composed:
     //   1. the row is read — the coordinator owns the leg, the peer executes it;
     //   2. this Runtime handles chat.send for the relayed leg and re-remembers it
-    //      under the PEER, correctly dropping provenance but keeping the target;
+    //      under the PEER, correctly dropping provenance;
     //   3. Portal goes away, so the gate cannot ask the row;
     //   4. the peer asks to rewrite a row in the coordinator's conversation.
     // Trusting the cache at step 4 hands over the permission, and hands it over
@@ -895,7 +887,7 @@ describe("handleDelegationEvents", () => {
     try {
       expect(await sessionRegistry.get("parent-1")).toMatchObject({ agentId: "agent-2", authoritative: true });
       sessionRegistry.remember("parent-1", "user-1", "agent-1");
-      expect(sessionRegistry.peek("parent-1")).toMatchObject({ agentId: "agent-1", targetAgentId: "agent-1" });
+      expect(sessionRegistry.peek("parent-1")).toMatchObject({ agentId: "agent-1" });
       expect(sessionRegistry.peek("parent-1")?.authoritative).toBeUndefined();
 
       sessionRegistry.setResolver(async () => { throw new Error("portal unavailable") });
@@ -1170,6 +1162,17 @@ describe("handleDelegationEvents", () => {
             },
             { index: 1, status: "skipped" },
           ],
+          targetCoverage: {
+            artifact_id: "inventory",
+            total: 2,
+            offset: 0,
+            selected: 2,
+            next_offset: null,
+            target_ids: ["node-a", "node-b"],
+            outcomes: { "node-a": "done", "node-b": "done", injected: "secret" },
+            snapshot_complete: true,
+            apiKey: "sk-coverage-leak",
+          },
         },
       }))),
       asRes(res),
@@ -1184,7 +1187,19 @@ describe("handleDelegationEvents", () => {
 
     expect(metadata.item_statuses[0].tier).toEqual({ source: "request", resolvedTier: "fast" });
     expect(metadata.item_statuses[1]).toEqual({ index: 1, status: "skipped" });
+    expect(metadata.target_coverage).toEqual({
+      artifact_id: "inventory",
+      total: 2,
+      offset: 0,
+      selected: 2,
+      next_offset: null,
+      target_ids: ["node-a", "node-b"],
+      outcomes: { "node-a": "done", "node-b": "done" },
+      snapshot_complete: true,
+    });
     expect(raw).not.toContain("sk-group-leak");
+    expect(raw).not.toContain("sk-coverage-leak");
+    expect(raw).not.toContain("injected");
   });
 
   it("delivers background assistant messages to a registered channel even when Portal has no chat session", async () => {

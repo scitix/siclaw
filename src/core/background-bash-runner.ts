@@ -1,10 +1,10 @@
 /**
  * Runtime-agnostic background exec launcher (bash / node_exec / pod_exec).
  *
- * Shared by BOTH runtimes: the agentbox session manager and the TUI host each call
+ * Shared by BOTH runtimes: the agentbox session manager and the CLI host each call
  * `spawnBackgroundBash` with their own JobRegistry and notify closure. The spawn +
  * disk-streaming + completion logic lives here once; only WHERE the notification is
- * delivered (followUp / synthetic prompt / TUI custom message) differs per runtime.
+ * delivered (followUp / synthetic prompt / CLI custom message) differs per runtime.
  *
  * Mirrors Claude Code's spawnShellTask: detach the process, stream output to disk,
  * and on exit fire a single completion notification. Command construction, security

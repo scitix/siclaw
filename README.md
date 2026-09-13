@@ -19,7 +19,7 @@
 
 ---
 
-Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the terminal, the web UI, or your team's chat channels.
+Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the web UI, your team's chat channels, or a non-interactive CLI invocation.
 
 A hosted preview of the Portal UI — 4 specialist agents, recorded investigation sessions, and the built-in diagnostic skill set — is available at **[siclaw.ai/demo](https://www.siclaw.ai/demo/)**.
 
@@ -31,17 +31,17 @@ A hosted preview of the Portal UI — 4 specialist agents, recorded investigatio
 - **Team Workflows** — Shared web UI, credentials, channels, triggers, and scheduled patrols
 - **Reusable Skills** — Turn repeated diagnostic playbooks into reviewable runbooks
 - **Extensible** — Connect external tools and data sources through [MCP](https://modelcontextprotocol.io)
-- **Multi-Channel Access** — Use Siclaw from the terminal, web UI, or chat channels
+- **Multi-Channel Access** — Use Siclaw from the web UI, chat channels, or non-interactive CLI
 - **Agent Tracing** — Export agent behavior (LLM calls, tools, tokens) to [Langfuse](https://langfuse.com), [Phoenix](https://phoenix.arize.com), or any OTLP backend; configured in the web UI and hot-reloaded live
 
 ## Architecture
 
-![Siclaw System Architecture](docs/assets/architecture.png)
+![Siclaw System Architecture](docs/assets/architecture.svg)
 
 > **Control plane** (Portal + Gateway + shared DB) stores the curated agents and their
 > bound resources — Skills, a versioned Knowledge wiki, MCP servers, and Credentials.
-> Each session spawns an isolated **AgentBox** (one Pod per user in Kubernetes, one
-> in-process per user in local dev, embedded in the CLI for standalone TUI) where the
+> Sessions use an **AgentBox** (one Pod per user in Kubernetes, or in-process in local dev).
+> The headless CLI embeds the same core directly. The
 > Agent Brain runs a Deep Investigation Engine against its bound capabilities —
 > read-only across every target it touches.
 
@@ -53,61 +53,14 @@ A hosted preview of the Portal UI — 4 specialist agents, recorded investigatio
 
 ## Quick Start
 
-Siclaw supports three deployment profiles. For local usage, start from a dedicated working directory because Siclaw stores most runtime data in `.siclaw/` relative to where you launch it.
+Start with the local Web UI, or deploy to Kubernetes for a team. The CLI also supports non-interactive diagnostic runs. For local usage, start from a dedicated working directory because Siclaw stores most runtime data in `.siclaw/` relative to where you launch it.
 
 ```bash
 mkdir -p ~/siclaw-work
 cd ~/siclaw-work
 ```
 
-### 1. TUI Mode — Personal, local, lowest barrier
-
-Run the agent directly in your terminal. No server, no database. All operations are read-only by default — safe to run on your workstation.
-
-```bash
-# Install globally
-npm install -g siclaw
-
-# Run (interactive — prompts for LLM provider on first launch)
-siclaw
-
-# Single-shot
-siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
-
-# Continue last session
-siclaw --continue
-```
-
-**Paired with a local server** (see profile 2 below): when `siclaw local` is running in the same working directory, the TUI automatically pairs with it and treats the Portal Web UI as the source of truth for skills, knowledge, credentials, agents, and LLM providers. Useful slash commands in that mode:
-
-| Command | What it does |
-|---|---|
-| `/ls` | Summary of the current session's skills / knowledge / MCP / credentials / agents |
-| `/ls skills` / `/ls credentials` / `/ls agents` / ... | Full listing for one category |
-| `/agent` | Show current Portal agent and all available ones; create / edit happens in Portal Web UI |
-| `/setup` | Read-only view of configured resources with "Open in Portal →" links |
-
-Pass `--agent <name>` to scope the session to one Portal-configured agent (its bound skills / credentials / knowledge / MCP / preferred model). `siclaw agents` lists them non-interactively from the shell.
-
-<details>
-<summary><b>Build from source</b></summary>
-
-```bash
-git clone https://github.com/scitix/siclaw.git && cd siclaw
-npm ci && make build-portal-web && npm run build
-npm link                 # register `siclaw` command globally
-
-siclaw                   # TUI mode
-siclaw --prompt "..."    # single-shot mode
-
-# Uninstall: npm unlink siclaw -g
-```
-
-</details>
-
-> **Tip:** Any OpenAI-compatible endpoint works — swap `baseUrl` for DeepSeek, Qwen, Kimi, or a local Ollama server.
-
-### 2. Local Server — VM or laptop, recommended for daily use
+### 1. Local Server — VM or laptop, recommended for daily use
 
 A lightweight web UI backed by SQLite. No MySQL, no Docker required.
 
@@ -118,7 +71,7 @@ npm install -g siclaw
 siclaw local
 
 # Open http://localhost:3000
-# On first visit: register the first user (becomes admin)
+# On a fresh local workspace: sign in with admin / admin
 # Configure providers in Models
 # Import kubeconfigs in Clusters
 ```
@@ -138,58 +91,31 @@ siclaw local             # start local server
 
 </details>
 
-On first launch, open the web UI and **register the first user** — registration is open for the very first account and that account becomes the admin. Subsequent registrations require admin authentication.
+A fresh local workspace creates the bootstrap account **admin / admin**. Open the Web UI and change its password in **Account**. Configure a model and select an agent to begin an investigation.
 
 **Data locations (defaults, override with env vars):**
 - Database: `.siclaw/data/portal.db` — override with `DATABASE_URL=sqlite:///custom/path.db` or `DATABASE_URL=mysql://...`
 - Secrets: `.siclaw/local-secrets.json` — auto-generated JWT / Runtime / Portal secrets, 0600 perms
 
-#### Pairing the web UI and the CLI
+#### Non-interactive CLI
 
-`siclaw local` runs the Portal **and** makes itself available as a data
-source for the plain `siclaw` TUI. In one terminal start the server; in
-a second terminal (same working directory) start the TUI and it
-auto-pairs against the running Portal.
+In another terminal, use the same working directory to run a single investigation with the local Portal's configuration:
 
 ```bash
-# Terminal A — server + web UI
-siclaw local
-
-# Terminal B — TUI, same cwd
-siclaw
+siclaw agents
+siclaw --agent sre-oncall --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
+siclaw --agent sre-oncall --continue --prompt "Check recent events"
 ```
 
-- **Pairing anchor: cwd.** Both processes read the same
-  `.siclaw/local-secrets.json` and the same `.siclaw/data/portal.db`.
-  Running the TUI from a different directory opens a different,
-  independent workspace — not a lost one.
-- **Portal is the source of truth.** Providers, agents, skills,
-  knowledge, clusters, and hosts are edited in the web UI; the TUI
-  pulls them as an ephemeral read-only snapshot at startup.
-  In-session slash commands like `/setup` become read-only listings
-  that link back to the matching Portal page.
-- **Edits aren't hot-reloaded.** Change a skill or add a cluster in the
-  web UI, then `Ctrl+C` and re-run the TUI to pick up the new snapshot.
-  The snapshot is materialized to `.siclaw/.portal-snapshot/` and wiped
-  on exit (SIGINT / SIGTERM / normal exit).
-- **Custom ports: set both env vars.** The server reads `PORTAL_PORT`;
-  the TUI's snapshot probe reads `SICLAW_PORTAL_PORT`. Leave both
-  unset to use the default 3000:
+Use a name returned by `siclaw agents`. A single configured agent is selected automatically; with multiple agents, `--agent` is required. The invocation prints the final answer and exits. Missing input or model configuration produces an error instead of a setup prompt.
 
-  ```bash
-  PORTAL_PORT=8080        siclaw local
-  SICLAW_PORTAL_PORT=8080 siclaw
-  ```
+The CLI reads Portal configuration through a local authenticated snapshot API. Each invocation materializes skills, knowledge, and credentials under a private `.siclaw/.portal-snapshot/run-<random>/` root and removes only that root on exit. Web UI changes apply to the next invocation. For custom ports, set `PORTAL_PORT` on the server and `SICLAW_PORTAL_PORT` on the CLI to the same value.
 
-- **Back up the workspace** by copying the entire `.siclaw/` directory
-  — DB, secrets, and any materialized snapshots all live under it.
-  Nothing outside `.siclaw/` is state.
+When Portal is unavailable and no agent was selected, the CLI uses `.siclaw/config/settings.json` and local resources. A selected agent must load successfully; snapshot failures stop execution. See [CLI configuration](#headless-cli) below and the [Portal integration guide](https://docs.siclaw.ai/features/portal-cli-integration).
 
-Without a running `siclaw local` in the same directory, `siclaw` falls
-back to standalone file-system mode (`.siclaw/config/settings.json` +
-first-run wizard) — identical to earlier behaviour.
+> **Terminal interface migration:** Bare `siclaw` now shows help. Use `siclaw local` for interactive investigations. Terminal slash commands and the setup wizard have been removed; `--continue` requires a new `--prompt`. Existing `--print --prompt "..."` scripts remain supported.
 
-### 3. Kubernetes — Team / enterprise
+### 2. Kubernetes — Team / enterprise
 
 Production deployment uses Helm plus three container images: `runtime`, `portal`, and `agentbox`.
 
@@ -215,12 +141,12 @@ The default chart exposes the **Portal** Service on service port `3003` and Node
 
 ## Configuration
 
-### TUI / CLI
+### Headless CLI
 
-- TUI reads `.siclaw/config/settings.json` in **standalone mode** (no local Portal running in the same cwd)
-- The first-run wizard can generate `settings.json` for you — but **if a `siclaw local` server is running in the same cwd, the wizard will redirect you to the Portal Web UI** instead (Portal is the single source of truth in that mode)
-- Kubernetes credentials should be imported through `/setup` in standalone TUI; in Portal-paired TUI, `/setup` becomes a read-only view and mutations happen in the Web UI
-- Investigation traces are written to `.siclaw/traces/` (relative to where Siclaw was launched)
+- A reachable local Portal supplies providers and agent-bound resources. Configure these in its Web UI.
+- Without Portal, prepare `.siclaw/config/settings.json` before running `siclaw --prompt "..."`.
+- For cluster and host access, import credentials in the local Web UI and run the CLI from that workspace.
+- Investigation traces are written to `.siclaw/traces/` relative to the working directory.
 
 Minimal example:
 

@@ -50,7 +50,11 @@ export interface McpStateTarget {
   mcpServersState?: Record<string, unknown>;
 }
 
-/** Apply the shared immutable-session invalidation contract consistently. */
+/**
+ * Rebuild at a safe prompt boundary. Even content-only reloads replace the Pi
+ * extension runner and invalidate contexts captured by in-flight tools.
+ * Resource materialization and broker authorization remain immediate.
+ */
 function invalidateSessions(context: ReloadContext): void {
   if (!context.sessions?.length) return;
   for (const session of context.sessions) {
@@ -376,17 +380,7 @@ export function createSkillsHandler(
     },
 
     async postReload(context: ReloadContext): Promise<void> {
-      if (!context.sessions?.length) return;
-
-      for (const session of context.sessions) {
-        try {
-          await session.brain.reload();
-          console.log(`[resource-sync] Skills reloaded for session ${session.id}`);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[resource-sync] Failed to reload skills for session ${session.id}: ${msg}`);
-        }
-      }
+      invalidateSessions(context);
     },
   };
 }
@@ -713,16 +707,7 @@ export function createKnowledgeHandler(
     },
 
     async postReload(context: ReloadContext): Promise<void> {
-      if (!context.sessions?.length) return;
-      for (const session of context.sessions) {
-        try {
-          await session.brain.reload();
-          console.log(`[resource-sync] Knowledge reloaded for session ${session.id}`);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[resource-sync] Failed to reload knowledge for session ${session.id}: ${msg}`);
-        }
-      }
+      invalidateSessions(context);
     },
   };
 }
@@ -802,7 +787,7 @@ interface ToolsPayload {
   subagentTierMenu?: unknown;
 }
 
-const VALID_AGENT_TYPES = new Set(["sre", "coordinator", "knowledge_qa", "product_support", "custom"]);
+const VALID_AGENT_TYPES = new Set(["sre", "knowledge_qa", "product_support", "custom"]);
 
 /**
  * Minimal structural target the tools handler writes to. Deliberately NOT the

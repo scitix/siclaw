@@ -1,5 +1,7 @@
 # spawn_subagent — unified single/batch (map→reduce) fan-out
 
+> Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
+
 **Status:** implemented (branch `para-subagent`)
 **Date:** 2026-07 (v3 single-tool merge — supersedes the interim two-tool `spawn_subagent_group`)
 

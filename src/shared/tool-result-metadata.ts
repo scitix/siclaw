@@ -1,3 +1,13 @@
+import { boundSkillPreviewMetadata, previewSummary } from "./skill-preview-storage.js";
+
+/** Thrown failures set the event flag; returned tool failures use details.error. */
+export function toolResultOutcome(details: unknown, isError: unknown): "success" | "error" | "blocked" {
+  const flags = details && typeof details === "object" && !Array.isArray(details)
+    ? details as Record<string, unknown> : undefined;
+  if (flags?.blocked) return "blocked";
+  return isError === true || flags?.error ? "error" : "success";
+}
+
 /** Preserve structured tool data across Web, IM, delegation and synthetic turns. */
 export function persistableToolDetails(
   details: unknown,
@@ -12,8 +22,11 @@ export function persistableToolDetails(
   } = details as Record<string, unknown>;
   if (!Object.keys(rest).length) return null;
   try {
-    return JSON.parse(redact(JSON.stringify(rest))) as Record<string, unknown>;
+    const bounded = boundSkillPreviewMetadata(rest);
+    return boundSkillPreviewMetadata(JSON.parse(redact(JSON.stringify(bounded))) as Record<string, unknown>);
   } catch {
+    // A failed JSON redaction must not silently resurrect the unredacted text fallback.
+    if (rest.skillPreview) return { skillPreview: previewSummary(null, "redaction_failed") };
     return null;
   }
 }

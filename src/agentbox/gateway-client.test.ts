@@ -102,6 +102,44 @@ describe("GatewayClient — construction & mTLS scope (invariant §3)", () => {
   });
 });
 
+describe("GatewayClient — public sandbox metadata", () => {
+  const limits = { default_timeout_seconds: 30, max_timeout_seconds: 120, max_tool_calls: 12, max_output_bytes: 8192 };
+  async function info(body: unknown, status = 200) {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-sandbox-"));
+    try {
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      const result = await client.scriptSandboxInfo();
+      expect(srv.requests).toEqual([{ method: "GET", url: "/api/internal/script-runs", body: undefined }]);
+      return result;
+    } finally {
+      fs.rmSync(certPath, { recursive: true, force: true });
+      await srv.close();
+    }
+  }
+
+  it("passes the public budgets and removes unrelated service configuration", async () => {
+    expect(await info({ enabled: true, network_isolation: true, require_network_isolation: false,
+      limits: { ...limits, token: "private-fixture" }, image: "private-image", credentials: "private-fixture" }))
+      .toEqual({ enabled: true, network_isolation: true, require_network_isolation: false, limits });
+  });
+
+  it.each([undefined, {}, { ...limits, max_timeout_seconds: 0 }, { ...limits, max_tool_calls: "12" },
+    { ...limits, max_tool_calls: 1.5 }, { ...limits, max_output_bytes: Number.MAX_SAFE_INTEGER + 1 },
+    { ...limits, default_timeout_seconds: 121 }])("omits absent or invalid budgets: %j", async invalid => {
+    expect(await info({ enabled: true, limits: invalid }))
+      .toEqual({ enabled: true, network_isolation: false, require_network_isolation: false });
+  });
+
+  it.each([200, 403, 503])("fails closed on disabled or unavailable metadata (HTTP %s)", async status => {
+    expect(await info({ enabled: false, network_isolation: true, limits }, status))
+      .toEqual({ enabled: false, network_isolation: false, require_network_isolation: false });
+  });
+});
+
 describe("GatewayClient — fetchSettings (GET JSON)", () => {
   let srv: TestServer;
   let client: GatewayClient;

@@ -87,6 +87,7 @@
             "group": "Core",
             "pages": [
               "features/deep-investigation",
+              "features/subagents",
               "features/skills",
               "features/memory"
             ]

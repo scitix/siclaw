@@ -2,7 +2,7 @@
 // capability set and provide an immutable type contract. The Portal edits only
 // an optional Agent Addendum; it never replaces that contract.
 
-export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "product_support" | "custom"
+export type AgentTypeKey = "sre" | "knowledge_qa" | "product_support" | "custom"
 
 export interface AgentTypeOption {
   key: AgentTypeKey
@@ -19,15 +19,8 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "sre",
     label: "SRE Agent",
     description: "Hands-on specialist: inspects, diagnoses and remediates within its authorized clusters/hosts.",
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "run_sandbox", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
     defaultNoSkills: false,
-  },
-  {
-    key: "coordinator",
-    label: "Coordinator Agent",
-    description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
-    capabilities: ["read_files", "delegate_agents", "transfer_conversation"],
-    defaultNoSkills: true,
   },
   {
     key: "knowledge_qa",
@@ -52,6 +45,14 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   },
 ]
 
-export function agentTypeOption(key: string | null | undefined): AgentTypeOption {
+export function isRetiredAgentType(key: unknown): boolean {
+  return key === "coordinator"
+}
+
+export function agentTypeOption(key: string | null | undefined): Omit<AgentTypeOption, "key"> & { key: string } {
+  if (isRetiredAgentType(key)) return {
+    key: "coordinator", label: "Retired Agent", description: "Create a supported Agent and use conversation handoff.",
+    capabilities: [], defaultNoSkills: true,
+  }
   return AGENT_TYPES.find((t) => t.key === key) ?? AGENT_TYPES[AGENT_TYPES.length - 1] // default: custom
 }

@@ -25,6 +25,18 @@ spec:
               containerPort: 3003
               protocol: TCP
           env:
+            {{- if .Values.scriptSandbox.enabled }}
+            {{- if .Values.scriptSandbox.publicUrl }}
+            - name: SICLAW_SANDBOX_PUBLIC_URL
+              value: {{ .Values.scriptSandbox.publicUrl | quote }}
+            {{- end }}
+            - name: SICLAW_SANDBOX_TARGET_CONCURRENCY
+              value: {{ (.Values.scriptSandbox.traffic | default dict).targetConcurrency | default 10 | quote }}
+            - name: SICLAW_SANDBOX_TARGET_RPS
+              value: {{ (.Values.scriptSandbox.traffic | default dict).targetRps | default 10 | quote }}
+            - name: SICLAW_SANDBOX_TARGET_BURST
+              value: {{ (.Values.scriptSandbox.traffic | default dict).targetBurst | default 20 | quote }}
+            {{- end }}
             - name: NODE_ENV
               value: "production"
             - name: PORTAL_PORT

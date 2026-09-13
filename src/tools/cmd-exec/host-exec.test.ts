@@ -18,6 +18,24 @@ beforeEach(() => {
 });
 
 describe("host_exec", () => {
+  it.each([0, 1])("provides separate sanitized SDK channels for exit %s", async exitCode => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "192.0.2.1", port: 22, username: "readonly",
+      auth: { type: "key", privateKeyPath: "/tmp/fixture.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: '{"password":"fixture-secret","ready":true}', stderr: "query warning", exitCode });
+    const capture = vi.fn();
+    const dataTool = createHostExecTool({ credentialBroker: fakeBroker } as any, undefined, { outputMode: "data", onOutputData: capture });
+    const result = await dataTool.execute("data", { host: "h1", command: "cat /etc/example.json" }, undefined, {} as any);
+    expect(capture).toHaveBeenCalledOnce();
+    const data = capture.mock.calls[0][0];
+    expect(JSON.parse(data.text)).toEqual({ password: "**REDACTED**", ready: true });
+    expect(data.stderr).toBe("query warning");
+    expect(data.notices.join("\n")).toContain("redacted");
+    expect(result.content[0].text).toBe(data.text);
+    expect((result.details as any).exitCode).toBe(exitCode);
+  });
+
   it("rejects invalid host name", async () => {
     const result = await tool.execute("id", { host: "bad name with spaces", command: "true" }, undefined, {} as any);
     const text = result.content[0].text as string;

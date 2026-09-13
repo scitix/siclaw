@@ -5,9 +5,9 @@ import { Type } from "@sinclair/typebox";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { readFileSync } from "node:fs";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -22,7 +22,7 @@ import {
   extractCommands as _extractCommands,
   validateShellOperators as _validateShellOperators,
 } from "../infra/command-validator.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { hasPipeline, instrumentPipeline, extractPipelineStatus } from "../infra/pipeline-status.js";
@@ -160,6 +160,7 @@ interface RestrictedBashParams {
 export function createRestrictedBashTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
+  trustedOptions?: TrustedToolOutputOptions & { validateKubeconfig?: (content: string) => unknown; kubeconfigPath?: string },
 ): ToolDefinition {
   // run_in_background is exposed to the model only when the master switch is on AND a
   // runtime executor was injected — otherwise the param stays out of the schema.
@@ -167,14 +168,6 @@ export function createRestrictedBashTool(
   return {
     name: "bash",
     label: "Bash",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("bash")) +
-          " " + (args?.command || ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Execute kubectl and shell commands for Kubernetes cluster operations.
 This is the primary tool for all kubectl interactions. It runs through a shell, so pipes (|), &&, and redirections are fully supported.
 
@@ -241,7 +234,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
       // Async prefetch: load the cluster named by the `cluster` param into the
       // broker registry before the synchronous resolver runs.
-      if (params.cluster) {
+      if (params.cluster && !trustedOptions?.kubeconfigPath) {
         try {
           await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "restricted_bash");
         } catch (err) {
@@ -261,7 +254,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       // prompting the model to pass `cluster` (it decides — no command sniffing).
       let selectedKubeconfigPath = "/dev/null";
       if (params.cluster) {
-        const r = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
+        const r = trustedOptions?.kubeconfigPath ? { path: trustedOptions.kubeconfigPath }
+          : resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
         if ("error" in r) {
           return {
             content: [{ type: "text", text: JSON.stringify({ error: true, message: r.error, available_clusters: r.availableNames }) }],
@@ -269,6 +263,12 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           };
         }
         selectedKubeconfigPath = r.path ?? "/dev/null";
+        // A sandbox callback accepts inline authentication only, even if another
+        // trusted tool supports a wider kubeconfig format. Never expose parser errors.
+        if (trustedOptions?.validateKubeconfig) {
+          try { trustedOptions.validateKubeconfig(readFileSync(selectedKubeconfigPath, "utf8")); }
+          catch { return { content: [{ type: "text", text: "Kubernetes authentication denied" }], details: { blocked: true } }; }
+        }
       }
 
       // Pre-exec security: validate command + determine output sanitizer
@@ -425,6 +425,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           + (tailTruncationNote(params.command, okStdout) ? `\n${tailTruncationNote(params.command, okStdout)}` : "");
         return {
           content: [{ type: "text", text: postExecSecurity(okStdout.trim(), pre.action, {
+            outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: stderr.trim() || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
             ...(okNotes ? { notes: okNotes } : {}),
@@ -480,6 +482,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           + (hitCap ? `\n[cap in force: ${sandboxTimeoutS}s]` : "");
         return {
           content: [{ type: "text", text: postExecSecurity(errStdout, pre.action, {
+            outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: errStderr || undefined,
             hasSensitiveKubectl: pre.hasSensitiveKubectl,
             ...(notes ? { notes } : {}),

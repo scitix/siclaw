@@ -1,4 +1,4 @@
-import { it, expect } from "vitest";
+import { it, expect, vi } from "vitest";
 import {
   persistableToolDetails,
   traceVisualIds,
@@ -50,4 +50,13 @@ it("invalid redacted JSON and untrusted ID mismatches fail closed", () => {
       },
     }),
   ).toEqual([]);
+});
+
+it("bounds UTF-8 and escaped JSON before synchronous redaction and after expansion", () => {
+  const redact = vi.fn((text: string) => text);
+  const metadata = persistableToolDetails({ skillPreview: { skill: { name: "large", specs: "界".repeat(400_000) } }, llm_round: 3 }, redact);
+  expect(metadata).toMatchObject({ skillPreview: { status: "omitted", reason: "size_limit" }, llm_round: 3 });
+  expect(redact.mock.calls[0][0].length).toBeLessThan(1000);
+  expect(persistableToolDetails({ skillPreview: { skill: { name: "escaped", specs: "\u0000".repeat(180_000) } } })?.skillPreview).toMatchObject({ status: "omitted" });
+  expect(persistableToolDetails({ skillPreview: { skill: { name: "expand", specs: "x".repeat(600_000) } } }, s => s.replaceAll("x", "xx"))?.skillPreview).toMatchObject({ status: "omitted" });
 });

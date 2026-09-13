@@ -4,6 +4,9 @@ sidebarTitle: "Tools"
 description: "How to add, modify, and organize tools in the Siclaw agent."
 ---
 
+The opt-in `run_script` container, broker authorization, network profiles and
+one-use warm pool are specified in [Disposable script sandbox](script-sandbox.md).
+
 # Tool Development Guide
 
 > **Purpose**: Guide contributors on how tools are organized, how to add new ones,
@@ -62,7 +65,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 export function createMyTool(dep: SomeDependency): ToolDefinition {
   return {
     name: "my_tool",              // snake_case, unique across all tools
-    label: "My Tool",             // Display name for TUI
+    label: "My Tool",             // Human-readable tool name
     description: "...",           // Markdown — this IS the LLM prompt for tool usage
     parameters: Type.Object({     // TypeBox schema
       param: Type.String({ description: "..." }),
@@ -74,8 +77,6 @@ export function createMyTool(dep: SomeDependency): ToolDefinition {
         details: { exitCode: 0 },
       };
     },
-    renderCall(args, theme) { /* TUI call rendering */ },
-    renderResult: renderTextResult,
   };
 }
 ```
@@ -547,10 +548,21 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 
 | Tool | Field | Value | Reason |
 |------|-------|-------|--------|
-| `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
+| `manage_schedule` | `modes` | `["web", "channel"]` | Requires the Gateway schedule backend |
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 | `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
+
+Skill draft previews enforce a shared ceiling of 1 MiB, measured as
+serialized UTF-8 JSON (including file projections and escaping). A package
+that exceeds it returns an error and an `omitted` preview notice to the model
+before artifact capture. A recoverable tool-output artifact does not promise
+that a chat panel can display its files. Passing this check keeps full files in
+the tool details; it does not confirm persistence. The host may impose a lower
+MySQL packet budget, and later metadata or redaction expansion can exceed the
+remaining budget. Those paths can still omit the preview after the model has
+seen a success summary. See the [preview budget boundary](../completion/2026-09-10-remove-tui.md#remaining-boundary-tool-budget-and-storage-budget)
+for the effective limit and the configuration work needed to close that gap.
 
 ### allowedTools — Built-in and File-Tool Availability Axis
 
@@ -713,10 +725,10 @@ runtime:
   no await gap) and calls `brain.prompt(text)`. This closes the TOCTOU vs. an incoming
   HTTP `/prompt` (it either started first → we degrade to `followUp`, or hits the 409 guard).
   `_backgroundWorkCount` keeps the session alive until jobs finish.
-- **TUI** (`TuiBackgroundHost`, `src/core/tui-background-host.ts`): idle → `sendCustomMessage(triggerTurn:true)`
+- **Headless CLI** (`CliBackgroundHost`, `src/core/cli-background-host.ts`): idle → `sendCustomMessage(triggerTurn:true)`
   (pi routes a not-streaming triggerTurn through `agent.prompt`, waking a turn — `followUp`
   alone does NOT wake an idle agent); streaming → `sendCustomMessage(deliverAs:"followUp")`.
-  TUI wires background **bash + node_exec + pod_exec** (shared `spawnBackgroundBash` executor); only background **sub-agents** are unavailable (no agentbox child-session machinery). Delivery is per-host, not session-scoped — a job finishing after `/new` notifies the current session (the prior one is gone; surfacing beats dropping).
+  The CLI wires background **bash + node_exec + pod_exec** (shared `spawnBackgroundBash` executor); only background **sub-agents** are unavailable (no agentbox child-session machinery). Jobs belong to the current invocation; shutdown terminates detached commands and reclaims their output files.
 
 **Live delivery of an idle synthetic turn to the WebUI.** A synthetic turn runs *after* the
 `/send` SSE stream closed, so it has no live gateway consumer. Two contracts make it visible:

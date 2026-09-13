@@ -14,8 +14,7 @@
 import { formatToolResultArtifactReference } from "../../core/tool-result-artifact.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
 import { BACKGROUND_BASH_ENABLED, RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 import { readTaskOutput, readTaskOutputPage } from "../cmd-exec/disk-output.js";
@@ -29,8 +28,6 @@ export function createTaskOutputTool(
   return {
     name: "task_output",
     label: "Task Output",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("task_output")), 0, 0),
-    renderResult: renderTextResult,
     description:
       "Read the output of a background job (started with run_in_background) by its task_id. " +
       "Reports the job's status (running / completed / failed / stopped) plus its output — use " +

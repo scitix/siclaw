@@ -45,7 +45,7 @@ const portalHandle = await bootstrapPortal({
   jwtSecret: secrets.jwtSecret,
   portalSecret: secrets.portalSecret,
   // Local single-user mode: expose the CLI snapshot endpoint so `siclaw`
-  // (TUI) running on the same machine can fetch providers/MCP/default model
+  // (CLI) running on the same machine can fetch providers/MCP/default model
   // via HTTP instead of maintaining its own settings.json. Prod K8s Portal
   // must NOT set this — the endpoint is not per-tenant scoped.
   enableCliSnapshot: true,

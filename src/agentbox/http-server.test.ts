@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type http from "node:http";
-import type https from "node:https";
+import https from "node:https";
 
 /**
  * Tests for createHttpServer.
@@ -115,7 +115,7 @@ vi.mock("./gateway-client.js", () => ({
 }));
 
 // Import SUT after mocks.
-import { createHttpServer, resolveDelegation } from "./http-server.js";
+import { createHttpServer } from "./http-server.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -265,7 +265,6 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
       _mode?: unknown,
       _systemPromptTemplate?: unknown,
       activeMode?: unknown,
-      _delegation?: unknown,
       userId?: string,
       allowInputRequest?: boolean,
     ) => {
@@ -1274,6 +1273,15 @@ describe("http-server — prompt + session lifecycle", () => {
 
     await getJson(port, "/api/prompt", "POST", { text: "plain question", sessionId: "plain-a" });
     expect(lastMode()).toBe("normal");
+  });
+
+  it("rejects retired peer requests before session creation", async () => {
+    for (const legacy of [{ delegation: { delegationId: "d1" } }, { origin: "delegation" }]) {
+      const result = await getJson(port, "/api/prompt", "POST", { text: "old request", sessionId: "old", ...legacy });
+      expect(result.status).toBe(410);
+      expect(result.data.error).toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
+    }
+    expect(sm.getOrCreateCalls).toHaveLength(0);
   });
 
   it("passes the prompt user identity into session creation", async () => {
@@ -2293,29 +2301,6 @@ describe("http-server — idle self-destruct", () => {
   });
 });
 
-describe("resolveDelegation (worker autonomy)", () => {
-  it("returns undefined for a non-delegated turn", () => {
-    expect(resolveDelegation(undefined, "web")).toBeUndefined();
-    // A malformed marker without a delegationId is treated as non-delegated.
-    expect(resolveDelegation({ delegationId: "" }, "web")).toBeUndefined();
-  });
-
-  // 委托不降级被委托方 —— 它带回来的就是它自己,没有可供调用方拨动的档位。
-  // 这条曾经是 `readOnly` 开关:调用方一句话就能砍掉 peer 的工具表**并换掉它的
-  // persona**,于是"委托给 agent Y"拿到的根本不是 Y。只读是 agent 自己的角色配置
-  // (能力组),不是每次调用的参数。
-  it("carries the marker through unchanged from ANY origin", () => {
-    for (const origin of ["web", "task", "a2a", "api", "channel"] as const) {
-      expect(resolveDelegation({ delegationId: "d1" }, origin)).toEqual({ delegationId: "d1" });
-    }
-  });
-
-  it("has no permission dial a caller could set", () => {
-    const resolved = resolveDelegation({ delegationId: "d1", readOnly: true } as any, "web");
-    expect(resolved).toEqual({ delegationId: "d1" });
-  });
-});
-
 describe("http-server — Skill handler wiring", () => {
   it("does not disable empty-bundle preservation on the K8s/hot-reload path", () => {
     const src = fs.readFileSync(path.resolve(__dirname, "http-server.ts"), "utf8");
@@ -2422,4 +2407,51 @@ describe("handoff prompt trace acknowledgement", () => {
     expect(next.data.traceId).toMatch(/^[0-9a-f]{32}$/);
     expect(next.data.traceId).not.toBe(traceId);
   });
+});
+
+
+describe("sandbox callback authentication", () => {
+  it("rejects an unauthenticated local callback even to an existing session", async () => {
+    await sm.getOrCreate("sandbox-session");
+    const r = await getJson(port, "/api/internal/sandbox-tool", "POST", {
+      session_id: "sandbox-session", callback_token: "a".repeat(64),
+      arguments: { cluster: "prod", command: "kubectl get nodes" },
+    });
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ protocol: 1, ok: false, code: "UNAUTHORIZED", execution: "NOT_DISPATCHED" });
+  });
+
+  it("requires a trusted CA as well as Runtime OU, while preserving certificate-free health probes", async () => {
+    const { CertificateManager } = await import("../gateway/security/cert-manager.js");
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const trusted = await CertificateManager.create();
+    const rogue = await CertificateManager.create();
+    const cert = trusted.issueServerCertificate("localhost");
+    const forged = rogue.issueServerCertificate("localhost");
+    const wrongRole = trusted.issueAgentBoxCertificate("a", "o", "b");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-mtls-"));
+    fs.writeFileSync(path.join(dir, "tls.crt"), cert.cert);
+    fs.writeFileSync(path.join(dir, "tls.key"), cert.key);
+    fs.writeFileSync(path.join(dir, "ca.crt"), trusted.getCACertificate());
+    process.env.SICLAW_CERT_PATH = dir;
+    const tlsServer = createHttpServer(sm as any, { disableIdleShutdown: true });
+    const tlsPort = await startServer(tlsServer);
+    const request = (pathname: string, client?: { cert: string; key: string }) => new Promise<number>((resolve, reject) => {
+      const req = https.request({ hostname: "127.0.0.1", servername: "localhost", family: 4, port: tlsPort, path: pathname,
+        ca: trusted.getCACertificate(), ...client, agent: false }, res => { res.resume(); resolve(res.statusCode!); });
+      req.on("error", reject); req.end();
+    });
+    try {
+      expect(await request("/health")).toBe(200);
+      expect(await request("/api/sessions")).toBe(403);
+      expect(await request("/api/sessions", cert)).toBe(200);
+      expect(await request("/api/sessions", forged)).toBe(403);
+      expect(await request("/api/sessions", wrongRole)).toBe(403);
+    } finally {
+      await new Promise<void>(resolve => tlsServer.close(() => resolve()));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

@@ -1,0 +1,19 @@
+FROM python:3.12-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/script-sandbox/launcher.c /build/launcher.c
+RUN cc -O2 -Wall -Wextra -Werror /build/launcher.c -o /build/siclaw-launcher
+
+FROM python:3.12-slim-bookworm
+# No Node, AgentBox, kubectl, SSH client, package installation or MCP servers.
+RUN useradd --uid 10001 --create-home --home-dir /work --shell /bin/bash runner \
+    && rm -rf /root/.cache /usr/local/lib/python3.12/site-packages/pip* \
+    && mkdir -p /opt/siclaw \
+    && printf '#!/usr/local/bin/python3\nimport sys\nsys.path.insert(0,"/opt/siclaw")\nfrom siclaw import main\nmain()\n' > /usr/local/bin/siclaw-tool \
+    && chmod 0555 /usr/local/bin/siclaw-tool
+COPY --from=builder /build/siclaw-launcher /usr/local/bin/siclaw-launcher
+COPY docker/script-sandbox/runner.py docker/script-sandbox/siclaw.py /opt/siclaw/
+USER 10001:10001
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/siclaw-launcher"]
+CMD ["standard", "/usr/local/bin/python3", "-I", "-B", "-u", "/opt/siclaw/runner.py"]

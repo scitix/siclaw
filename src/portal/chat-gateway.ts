@@ -28,6 +28,7 @@ import {
 import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
 import { resolveAgentModelRouting, resolveAgentSubagentTiers } from "./model-routing-config.js";
 import { authenticateApiKey } from "./api-key-auth.js";
+import { claimWebChatSession } from "./web-session-claim.js";
 
 interface ChatAttachment {
   kind?: string;
@@ -421,6 +422,11 @@ export function registerChatRoutes(
       return;
     }
 
+    if (!await claimWebChatSession(sessionId, agentId, auth.userId, body.text ?? "")) {
+      sendJson(res, 404, errorBody({ code: ErrorCodes.NOT_FOUND, message: "Chat session not found", retriable: false }));
+      return;
+    }
+
     // Set up SSE response
     writeSseHead(res);
 
@@ -502,6 +508,7 @@ export function registerChatRoutes(
     const result = await connectionMap.sendCommand(agentId, "chat.send", {
       agentId,
       userId: auth.userId,
+      origin: "web",
       text: promptText,
       ...(images ? { images } : {}),
       sessionId,

@@ -5,7 +5,6 @@ export interface AgentResourceBindingIds {
   mcp_server_ids: string[]
   channel_ids: string[]
   knowledge_repo_ids: string[]
-  delegate_agent_ids: string[]
 }
 
 const RESOURCE_BINDING_TABS = new Set([
@@ -13,7 +12,6 @@ const RESOURCE_BINDING_TABS = new Set([
   "mcp",
   "knowledge",
   "resources",
-  "delegates",
   "channels",
 ])
 

@@ -19,7 +19,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 
 ### 1.1 Mode Summary
 
-| Aspect | TUI | Gateway + LocalSpawner | Gateway + K8sSpawner |
+| Aspect | Headless CLI | Gateway + LocalSpawner | Gateway + K8sSpawner |
 |--------|-----|------------------------|----------------------|
 | Process | Single monolithic | Gateway + in-process AgentBoxes | Gateway Pod + one Pod per user |
 | Filesystem | Shared (single user) | **ALL users share one filesystem** | Each pod has isolated filesystem |
@@ -28,7 +28,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 | Skills source | Local `./skills/` (standalone) / Portal snapshot (with local Portal) | DB → `.siclaw/skills/agents/<agentId>/resolved/` | DB → pod-local emptyDir |
 | MCP source | Local file (standalone) / Portal snapshot | DB → per-Agent SessionManager state | DB → pod-local config |
 
-TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired** (a `siclaw local` Portal is running and `.siclaw/local-secrets.json` exists). The second sub-mode is described in §1.4.
+Headless CLI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired** (a `siclaw local` Portal is running and `.siclaw/local-secrets.json` exists). The second sub-mode is described in §1.4.
 
 ### 1.2 ⚠️ Critical: LocalSpawner Filesystem Sharing
 
@@ -55,14 +55,14 @@ TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired
 
 **Source**: `src/gateway/agentbox/k8s-spawner.ts` (env injection, label stamp + stale recycle), `src/gateway/server.ts` (`resolveAgentSpawnEnv`), `src/gateway/agentbox/manager.ts` (`isCertFresh` reuse gate), `src/gateway/security/cert-manager.ts` (`caFingerprint`), `src/agentbox/http-server.ts` (idle timer), `src/agentbox-main.ts` (`onIdleShutdown` → graceful shutdown)
 
-### 1.4 TUI + Local Portal: Read-Only Snapshot Contract
+### 1.4 Headless CLI + Local Portal: Read-Only Snapshot Contract
 
-**Invariant**: When `siclaw` (TUI) starts in a cwd where a local Portal is reachable (`.siclaw/local-secrets.json` is present AND `http://127.0.0.1:3000/api/health` responds within the 1.5 s probe budget), Portal is the **read-only source of truth** for the session's skills, knowledge pages, credentials, agents, MCP servers, and LLM providers. The TUI is strictly an observer — it never mutates Portal state from the terminal.
+**Invariant**: When `siclaw --prompt "..."` starts in a cwd where a local Portal is reachable (`.siclaw/local-secrets.json` is present AND `http://127.0.0.1:3000/api/health` responds within the 1.5 s probe budget), Portal is the **read-only source of truth** for the session's skills, knowledge pages, credentials, agents, MCP servers, and LLM providers. The headless CLI is strictly an observer — it never mutates Portal state from the terminal.
 
 **Consequences**:
-- All mutations (create/edit/delete agents, skills, hosts, clusters, providers) happen in Portal Web UI. The TUI's `/setup` slash command detects Portal mode and becomes a read-only list view with "Open in Portal →" links.
-- First-run setup flows redirect to Portal. When Portal is reachable and `settings.json` is missing, `src/cli-first-run.ts` prints instructions, offers an interactive Y/n "open browser now?" prompt, and exits without writing `settings.json`. This prevents per-workstation "ghost providers" that never reach Portal and silently desync between machines.
-- Standalone TUI (no Portal in cwd) keeps the legacy `settings.json` flow — do not break it.
+- All configuration mutations happen in Portal Web UI. The CLI has no interactive setup or terminal slash commands.
+- A diagnostic invocation requires `--prompt`. Missing providers produce a nonzero exit and setup instructions; they never trigger a wizard or write a settings file.
+- Standalone headless CLI (no Portal in cwd) keeps the legacy `settings.json` flow — do not break it.
 
 **Snapshot contract** (`src/portal/cli-snapshot-api.ts`):
 
@@ -72,12 +72,12 @@ X-Siclaw-Cli-Snapshot-Secret: <local-secrets.cliSnapshotSecret>
 
 Response shape (always present):
   providers       { [name]: ProviderConfig }   // LLM provider configs
-  default         string | null                // Default provider name
+  default         { provider, modelId } | null // Default model binding
   mcpServers      { [id]: McpServerConfig }    // MCP servers (agent-scoped when ?agent=)
   skills          CliSnapshotSkill[]           // Full specs + scripts; core skills excluded
   knowledge       CliSnapshotKnowledgeRepo[]   // Tarball payloads, base64
   credentials     { clusters[], hosts[] }      // Kubeconfigs + SSH hosts (agent-scoped when ?agent=)
-  availableAgents CliSnapshotAgentMeta[]       // Always populated; powers picker UX
+  availableAgents CliSnapshotAgentMeta[]       // Agent names for listing and deterministic selection
   activeAgent     CliSnapshotActiveAgent | null
   generatedAt     ISO 8601 timestamp
 ```
@@ -89,14 +89,14 @@ Response shape (always present):
 
 1. `enableCliSnapshot` must be `true` at `startPortal()` time. `cli-local.ts` passes it; `portal-main.ts` (prod K8s) does not. When `false` the route is simply not registered, so no gate beyond this matters.
 2. Request origin must be loopback — `127.0.0.1` / `::1` / `::ffff:127.0.0.1`. A rogue Ingress or a misconfigured helm override that ever flips `enableCliSnapshot` on cannot leak through a remote socket.
-3. Request must carry `X-Siclaw-Cli-Snapshot-Secret` whose value matches `local-secrets.cliSnapshotSecret`. This is a **dedicated** secret — not `jwtSecret`. Reading the snapshot does NOT also grant the caller the ability to self-sign admin JWTs against every other admin-gated route. The TUI in `portal-snapshot-client.ts` reads `.siclaw/local-secrets.json` once, sends only the header, and never forges a JWT.
+3. Request must carry `X-Siclaw-Cli-Snapshot-Secret` whose value matches `local-secrets.cliSnapshotSecret`. This is a **dedicated** secret — not `jwtSecret`. Reading the snapshot does NOT also grant the caller the ability to self-sign admin JWTs against every other admin-gated route. The headless CLI in `portal-snapshot-client.ts` reads `.siclaw/local-secrets.json` once, sends only the header, and never forges a JWT.
 
-The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the Portal cwd", which matches single-user local mode. A missing `cliSnapshotSecret` in an older secrets file (pre-split) degrades gracefully — the client treats it as no-Portal and falls back to `settings.json`.
+The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the Portal cwd", which matches single-user local mode. A missing `cliSnapshotSecret` in an older secrets file (pre-split) degrades gracefully — unscoped invocations can fall back to `settings.json`. An explicitly or automatically selected agent must load successfully; a failed scoped snapshot stops execution.
 
 **Ephemeral materialization** (`src/lib/portal-{skill,knowledge,credential}-materializer.ts`):
 
 ```
-.siclaw/.portal-snapshot/
+.siclaw/.portal-snapshot/run-<random>/
 ├── skills/<skill-name>/              ← SKILL.md + scripts/* per skill
 ├── knowledge/<repo-name>/            ← tarball-unpacked files
 └── credentials/
@@ -106,9 +106,10 @@ The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the
     └── <cluster-name>.kubeconfig
 ```
 
-- The directory is **ephemeral**: TUI wipes it on `SIGINT` / `SIGTERM` / normal exit.
-- These materializers are **distinct from** `skillsHandler.materialize()` (§1.2). The canonical handler mutates `skills/{global,skillset,user}/` and is unsafe in LocalSpawner's shared filesystem; the Portal-snapshot materializers write only to `.siclaw/.portal-snapshot/` inside the cwd and are scoped to the TUI process. Do not consolidate the two without redesigning the skill-bundle contract.
-- `agent-factory.ts` picks up these paths via new `portalSkillsDir` / `portalKnowledgeDir` / `portalCredentialsDir` opts; when set, they override `config.paths.*` so the agent's Read tool, `local_script`, and kubectl use Portal content.
+- Each invocation gets a private **ephemeral** root (mode 0700), removed on `SIGINT`, `SIGTERM`, startup failure, or normal exit. Cleanup never removes sibling invocation directories.
+- Skills, knowledge, and credentials are materialized even when empty; a Portal-scoped invocation must not inherit ambient resources from standalone directories.
+- These materializers are **distinct from** `skillsHandler.materialize()` (§1.2). The canonical handler mutates `skills/{global,skillset,user}/` and is unsafe in LocalSpawner's shared filesystem; the Portal-snapshot materializers write only to `.siclaw/.portal-snapshot/` inside the cwd and are scoped to the headless CLI process. Do not consolidate the two without redesigning the skill-bundle contract.
+- `agent-factory.ts` receives `portalSkillsDir` / `portalKnowledgeDir` and a `kubeconfigRef.credentialsDir` pointing at the materialized credentials. These paths let the agent's Read tool, `local_script`, and kubectl use Portal content.
 
 **Skill filter** (`src/core/agent-factory.ts`):
 For any scoped Agent (Portal or Gateway materialization), pi-coding-agent's
@@ -118,9 +119,9 @@ harness: Portal/Gateway materialized bindings, repo-bundled operational skills
 when execution is permitted, and platform authoring skills when write/preview
 capabilities are permitted. QA, Coordinator, delegated read-only, and unresolved
 harnesses therefore cannot inherit ambient SRE skill context. Standalone,
-unscoped SRE TUI sessions retain the legacy repo/global skill fallback.
+unscoped SRE headless CLI sessions retain the legacy repo/global skill fallback.
 
-**Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-first-run.ts`, `src/cli-main.ts`, `src/core/extensions/{ls,agent,setup}.ts`
+**Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-main.ts`, `src/cli-options.ts`
 
 ---
 
@@ -277,10 +278,10 @@ These are never merged. Do not confuse them.
 The Portal schema is written once (`src/portal/migrate.ts`) using the MySQL + SQLite intersection of SQL syntax. Trade-offs accepted:
 - Timestamps are second precision (no `TIMESTAMP(3)`)
 - `updated_at` is maintained by the application layer (no `ON UPDATE CURRENT_TIMESTAMP`)
-- JSON payloads stored as `TEXT` with application-level `JSON.stringify` / `safeParseJson()`
+- JSON payloads stored in text columns with application-level `JSON.stringify` / `safeParseJson()`; `chat_messages.metadata` uses `LONGTEXT` for full skill previews.
 - No `ENGINE=InnoDB` / `CHARSET` / `COLLATE` clauses (MySQL server defaults apply)
 
-Legacy MySQL production databases are preserved byte-for-byte via `CREATE TABLE IF NOT EXISTS`. Three data states coexist safely: **legacy MySQL with `JSON` + ms precision**, **new MySQL with TEXT + second precision**, **SQLite with TEXT + second precision**. All business reads of JSON columns must go through `safeParseJson()` (`src/gateway/dialect-helpers.ts`).
+`CREATE TABLE IF NOT EXISTS` preserves legacy MySQL table definitions; explicit, idempotent migrations handle required upgrades. Preview metadata upgrades only capacity-limited MySQL text columns to `LONGTEXT`, preserving existing `JSON` columns. Three data states coexist safely: **legacy MySQL with `JSON` + ms precision**, **new MySQL with text columns + second precision**, **SQLite with text columns + second precision**. All business reads of JSON columns must go through `safeParseJson()` (`src/gateway/dialect-helpers.ts`).
 
 ### 5.3 SQLite Single-Process Design
 
@@ -317,7 +318,9 @@ postReload(context)  Notify active sessions to pick up changes
 
 - `fetch` is network I/O with retry (3 attempts, exponential backoff: 1s, 2s, 4s)
 - `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `global/` + `skillset/` + `user/` subdirs then rebuilds)
-- `postReload` calls `brain.reload()` on active sessions
+- `postReload` invalidates sessions for a rebuild after in-flight work and pending
+  completion notifications drain. It must not call `brain.reload()` during tool
+  execution, because that replaces the extension contexts used to deliver results.
 
 ### 6.2 When to Use Each Handler
 
@@ -371,8 +374,7 @@ Phase 2 work (generic `delegate_to_agent` + permission-gated tool calls).
 ### 8.1 User-Owned Mode Invariant
 
 DP is a **user-owned mode**: once the user enables it (via
-`[Deep Investigation]` prefix marker, `/dp` command, Ctrl+I shortcut, or the
-frontend magnifier chip) the flag stays on until the user explicitly exits
+`[Deep Investigation]` prefix marker or the frontend magnifier chip) the flag stays on until the user explicitly exits
 with `[DP_EXIT]`. No backend event — including any "completed" / "idle"
 signal the live path might emit — may flip it off.
 
@@ -417,13 +419,29 @@ Two background modes (bash command, sub-agent) share one core; see tools.md §9,
 - **No concurrent parent prompts**: the idle-notification path (`runSyntheticPrompt`) acquires the SAME `_promptDone`/`_promptInflight` mutex an HTTP `/prompt` uses, set synchronously before any await. An interleaving `/prompt` either started first (synthetic path degrades to `followUp`) or hits the 409 busy guard — two concurrent `brain.prompt()` is unrepresentable.
 - **Model never reads unsanitized background output**: background bash output is sanitized per complete line on write (line-safe `OutputAction`s only); structural (JSON) sanitizers are rejected for background mode. The output file is created and written solely by the node main process under `userDataDir`, `O_NOFOLLOW`.
 - **Session stays alive while work runs**: `_backgroundWorkCount` defers agentbox session release until all background jobs of that session finish.
-- **TUI scope**: the TUI wires background **bash + node_exec + pod_exec** (one shared `spawnBackgroundBash` executor handles both the shell and kubectl-exec argv forms); only background **sub-agents** are unavailable, as they require the agentbox child-session machinery.
+- **Headless CLI scope**: the headless CLI wires background **bash + node_exec + pod_exec** (one shared `spawnBackgroundBash` executor handles both the shell and kubectl-exec argv forms); only background **sub-agents** are unavailable, as they require the agentbox child-session machinery. Completion notifications join only the active CLI turn; they never wake an idle print session. CLI exit marks remaining jobs stopped before aborting them, including connections still starting.
+
+---
+
+## 10c. Scheduled Tasks
+
+- **Never fire a long schedule early**: Node timer delays must stay within
+  `2_147_483_647` ms. Longer waits are split into bounded chunks that retain the
+  original due time; reaching a chunk boundary alone does not execute a task.
+- **Cancellation includes running tasks**: reconciliation tracks every known
+  task, including a task whose callback is running and has no timer. Removing
+  or pausing it prevents that callback from re-arming the schedule. The status
+  precheck also cancels a missing or paused task immediately. RPC failures skip
+  the current fire without treating unavailable state as a confirmed deletion.
+- **One owned timer per task**: replacing, cancelling, or stopping a timer
+  invalidates any queued callback belonging to it. Overlapping runs remain
+  suppressed.
 
 ---
 
 ## 11. mTLS Scope
 
-**Invariant**: mTLS is used **only between Gateway and AgentBox in K8s mode**. It is not used in LocalSpawner mode (same-machine, in-process) or TUI mode (no network).
+**Invariant**: mTLS is used **only between Gateway and AgentBox in K8s mode**. It is not used in LocalSpawner mode (same-machine, in-process) or headless CLI mode (no network).
 
 - CA: 10-year, supplied to the Runtime as configuration (`SICLAW_CA_CERT` / `SICLAW_CA_KEY`, or their `_FILE` forms), falling back to an ephemeral CA for local dev. It is **not** renewed automatically — a 10-year window outlives any deployment, and a CA that rotated itself would invalidate every live box's certificate at a moment nobody chose.
 - Client certs: issued **per AGENT, not per pod** — the certificate asserts the agent (`CN` = agentId, `O` = orgId, `serialNumber` = the agent's base pod name), so every box of an agent presents the same one and they share a single Secret. A box additionally uses it to terminate its own HTTPS, so it is both the client and the server credential.

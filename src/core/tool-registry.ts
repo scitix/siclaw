@@ -10,9 +10,8 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { MCP_TOOL_PREFIX } from "./mcp-client.js";
 import type {
-  SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
+  SessionMode, KubeconfigRef, MemoryRef, DpStateRef,
 } from "./types.js";
-import type { DelegateResponse, DelegateRosterMember, DelegateStep } from "../shared/agent-delegate.js";
 import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
@@ -47,10 +46,28 @@ export type ResolvedToolDefinition = ToolDefinition & {
 /** "launched" is the immediate return for a background spawn; it is never a terminal/persisted status. */
 export type SpawnSubagentStatus = "done" | "partial" | "failed" | "timed_out" | "launched";
 
+export interface SubagentTargetCoverage {
+  artifact_id: string;
+  total: number;
+  offset: number;
+  selected: number;
+  next_offset: number | null;
+  target_ids: string[];
+  outcomes?: Record<string, string>;
+  /** True only when this report covers the entire snapshot and every target completed. */
+  snapshot_complete?: boolean;
+}
+
 export interface SpawnSubagentRequest {
+  parentContext?: import("../agentbox/subagent-context.js").SubagentContextSnapshot;
+  targetCoverage?: SubagentTargetCoverage;
+  childSessionId?: string;
+  resumeHandle?: string;
+  /** Captured parent business policy, independent of the child role. */
+  agentPrompt?: string;
   /** Short UI label for the spawned task. */
   description: string;
-  /** The bounded task briefing — the child's only context besides its system prompt. */
+  /** Initial assignment or follow-up message; resumed children retain their own transcript. */
   prompt: string;
   /** Internal reduce input: full reports, scoped into the receiving child before inference. */
   inputReports?: Array<{ item: string | Record<string, string>; status: GroupItemStatus; summary: string }>;
@@ -80,14 +97,19 @@ export interface SpawnSubagentRequest {
  */
 export type SpawnSubagentResult =
   | {
-      /** Background job launched (gated off today); usable with job_stop. */
+      /** Existing or newly launched background job; usable with job_stop. */
       status: "launched";
       jobId: string;
+      resumeHandle?: string;
+      /** A delivery acknowledgement for the existing job, not a second launch. */
+      steered?: boolean;
       childSessionId: string;
     }
   | SpawnSubagentReport;
 
 export interface SpawnSubagentReport {
+  coverage?: SubagentTargetCoverage;
+  resumeHandle?: string;
   status: Exclude<SpawnSubagentStatus, "launched">;
   /** Budgeted capsule returned to the parent as model-visible tool content. */
   summary: string;
@@ -159,10 +181,16 @@ export type GroupItemStatus = "done" | "partial" | "failed" | "timed_out" | "ski
  * consumes; this is the tool→executor boundary.
  */
 export interface SpawnSubagentGroupRequest {
+  forkTurns?: import("../agentbox/subagent-context.js").SubagentContextSelection;
+  parentContext?: import("../agentbox/subagent-context.js").SubagentContextSnapshot;
+  targetCoverage?: SubagentTargetCoverage;
+  /** Opaque, session-scoped ticket issued by an earlier launch. */
+  resumeHandle?: string;
+  agentPrompt?: string;
   /** Short UI label for the whole call (single task or batch). */
   description: string;
   /** One rendered task per item (item original kept for the report/UI + reduce headers). */
-  renderedTasks: Array<{ item: string | Record<string, string>; prompt: string }>;
+  renderedTasks: Array<{ item: string | Record<string, string>; prompt: string; childSessionId?: string; resumeHandle?: string }>;
   /** Optional reduce stage: when present, a final child synthesises all item results. */
   reducePrompt?: string;
   /** Resolved sub-agent type id, shared by every map child AND the reduce child (v1 limit). */
@@ -193,6 +221,7 @@ export interface SpawnSubagentGroupRequest {
 
 /** Live progress for a FOREGROUND group (background groups report via the group_progress event). */
 export interface GroupItemProgress {
+  item?: string | Record<string, string>;
   index: number;
   status: "queued" | "running" | GroupItemStatus;
   /** Assigned once the item owns an execution slot; absent while it is still queued/skipped. */
@@ -210,6 +239,7 @@ export interface SubagentGroupProgress {
 
 /** One item's terminal record in the group report. */
 export interface SubagentGroupItemResult {
+  resumeHandle?: string;
   fullSummary?: string;
   item: string | Record<string, string>;
   status: GroupItemStatus;
@@ -237,10 +267,11 @@ export interface SubagentGroupItemResult {
  * a finished/foreground run carries the aggregate report.
  */
 export type SubagentGroupResult =
-  | { status: "launched"; jobId: string }
+  | { status: "launched"; jobId: string; children?: Array<{ childSessionId: string; resumeHandle: string; item?: string | Record<string, string> }> }
   | SubagentGroupReport;
 
 export interface SubagentGroupReport {
+  coverage?: SubagentTargetCoverage;
   status: "done" | "partial" | "failed" | "timed_out";
   itemResults: SubagentGroupItemResult[];
   /** Reduce output, ≤ GROUP_REDUCE_SUMMARY_MAX_CHARS (truncation is annotated). Absent when no reduce ran. */
@@ -281,7 +312,7 @@ export interface TaskOutputSnapshot {
 
 /**
  * Reads a background job's CURRENT status from the runtime's JobRegistry. Injected by the
- * agentbox session manager and the TUI host (they own the registry). Enables the task_output
+ * agentbox session manager and the CLI host (they own the registry). Enables the task_output
  * tool to return "running / completed / failed / stopped" instead of the model blindly
  * file-reading the output path (which 404s while the job has produced no output).
  */
@@ -387,44 +418,17 @@ export interface BackgroundExecWiring {
  * Callback a tool can invoke to push a custom event into the parent session's
  * SSE stream (e.g., forwarding a spawned sub-agent's events so the frontend
  * can render them in a nested block). Injected per-session from agentbox; may
- * be undefined in non-gateway contexts (TUI, tests).
+ * be undefined in non-gateway contexts (CLI, tests).
  */
 export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
-/** Live progress of a delegated turn, emitted as the peer streams. Mirrors the
- *  spawn_subagent progress shape so the coordinator card updates identically. */
-export type { DelegateStep };
-
-/** Live progress of a delegated turn. */
-export interface DelegateProgress {
-  toolCalls: number;
-  steps: DelegateStep[];
-  activity?: string;
-  /** The peer session id, known from delegation start — lets the card show the
-   *  "open full session" affordance live (before the final result arrives). */
-  childSessionId?: string;
-}
-
-/**
- * Delegates a bounded read-only task to a PEER agent (its own box, reached via
- * the gateway) and resolves with the peer's final result. `onProgress` fires as
- * the peer streams (live steps), so the caller can render the peer's work in
- * real time. Injected per-session from agentbox (which holds the gatewayClient).
- * Absent → the `delegate_to_agent` tool stays out of the resolved tool list.
- */
-export type DelegateToAgentExecutor = (
-  req: { peerAgentId: string; text: string; peerSessionId?: string; evidenceRefs?: string[] },
-  onProgress?: (p: DelegateProgress) => void,
-  /** Aborts the delegation when the coordinator's turn is stopped: closes the
-   *  relay stream and cancels the peer's turn. */
-  signal?: AbortSignal,
-) => Promise<DelegateResponse>;
-
 /** All dependencies shared by tool factory functions. */
 export interface ToolRefs {
+  scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
+  scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   kubeconfigRef: KubeconfigRef;
   userId: string;
-  /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */
+  /** Agent ID — used for metrics labeling. Null when running outside an agent context (headless CLI). */
   agentId: string | null;
   sessionIdRef: { current: string };
   /**
@@ -455,7 +459,7 @@ export interface ToolRefs {
   sessionEventEmitter?: SessionEventEmitter;
   /**
    * Explicitly exposes `request_input` for a top-level machine-driven turn
-   * (currently A2A). Delegated peer turns use `delegation` instead.
+   * (currently A2A).
    */
   allowInputRequest?: boolean;
   /** Control plane owns this logical turn and will dispatch authorized handoffs. */
@@ -470,6 +474,8 @@ export interface ToolRefs {
    * never sees a non-working tool (children get no executor → no recursion).
    */
   spawnSubagentExecutor?: SpawnSubagentExecutor;
+  /** Internal full-output access, with the same session boundary as the recovery tools. */
+  readToolResult?: (id: string) => Promise<string>;
   /**
    * Force spawn_subagent to run FOREGROUND (block, return results inline) — hides the
    * `run_in_background` param and flips a multi-item batch's default from background to
@@ -495,7 +501,7 @@ export interface ToolRefs {
   /**
    * Launches a background exec job (run_in_background on bash / node_exec / pod_exec).
    * When absent, the `run_in_background` param is not exposed on those tools. Injected by
-   * the agentbox session manager and the TUI background host.
+   * the agentbox session manager and the CLI background host.
    */
   backgroundExecExecutor?: BackgroundExecExecutor;
   /** Reads a background job's live status from the runtime's JobRegistry. Enables task_output. */
@@ -503,33 +509,11 @@ export interface ToolRefs {
   /** Sends an agent-selected visible update to the active IM channel; Gateway owns delivery policy. */
   channelMessageExecutor?: ChannelMessageExecutor;
   /**
-   * Present when this turn was delegated by a coordinator agent to a peer,
-   * siclaw-native via the gateway's internal delegate API. Its presence marks a
-   * delegated turn; `readOnly` drives the read-only
-   * tool filter in `resolve()`. Tools use it to gate visibility (report_findings
-   * appears only when delegated; channel_update is suppressed) and to stamp the
-   * result artifact with `delegationId`. See docs/design/agent-delegation.md.
-   */
-  delegation?: DelegationContext;
-  /**
-   * Delegation roster for a COORDINATOR agent: the peer agents it may delegate
-   * to, with derived manifest (name/description/bindings). Non-empty + an
-   * executor present → the `delegate_to_agent` tool is exposed and its
-   * description lists these peers. Delivered from the gateway (K8s boxes have no
-   * DB). See docs/design/agent-delegation.md §5.
-   */
-  delegationRoster?: DelegateRosterMember[];
-  /** Runs a delegation to a peer agent. See DelegateToAgentExecutor. */
-  delegateToAgentExecutor?: DelegateToAgentExecutor;
-  /**
    * The agents this one may HAND THE CONVERSATION OVER to — its backends if it
    * is a facade, its facade plus siblings if it is a backend. Non-empty exposes
    * `search_handoff_targets` and `transfer_to_agent`; the index stays outside model context. Empty (an ordinary
    * agent, or a fetch that failed) means the tool never appears, which is the
    * right degradation: this agent then answers the turn itself.
-   *
-   * Distinct from `delegationRoster` on purpose — a handoff moves ownership of
-   * the session, a delegation calls out and comes back. See agent-handoff.ts.
    */
   handoffTargets?: HandoffTarget[];
   searchHandoffTargets?: (query: import("../shared/agent-handoff.js").HandoffSearchQuery) => Promise<import("../shared/agent-handoff.js").HandoffSearchResponse>;
@@ -569,8 +553,8 @@ export interface ToolEntry {
   /**
    * Runtime permission metadata.
    *
-   * Use for tools that can branch work, spend meaningful resources, or delegate
-   * to another agent. The registry only annotates the ToolDefinition; execution
+   * Use for tools that can branch work, spend meaningful resources, or create
+   * subagents. The registry only annotates the ToolDefinition; execution
    * gating is owned by the session/runtime layer so existing tools keep their
    * behavior until such a wrapper is installed.
    */
@@ -630,7 +614,7 @@ export class ToolRegistry {
   }): ResolvedToolDefinition[] {
     const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // 1. session-mode + operating-mode + delegation + available check (create not called yet)
+    // 1. session-mode + operating-mode + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&

@@ -7,8 +7,7 @@
 import type { ToolEntry, SessionEventEmitter, ToolRefs } from "../../core/tool-registry.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { getOrCreateLedger, type LedgerTask, type TaskStatus, type TaskView } from "../../core/task-ledger.js";
 import type { TaskEvent } from "../../shared/task-events.js";
 
@@ -20,10 +19,6 @@ function emitUpsert(emit: SessionEventEmitter | undefined, taskListId: string, t
 }
 function emitDelete(emit: SessionEventEmitter | undefined, taskListId: string, taskId: string): void {
   emit?.({ kind: "task_event", taskListId, action: "delete", taskId } satisfies TaskEvent);
-}
-
-function title(theme: any, name: string) {
-  return new Text(theme.fg("toolTitle", theme.bold(name)), 0, 0);
 }
 
 /**
@@ -124,8 +119,6 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
   return {
     name: "task_create",
     label: "Create Task",
-    renderCall: (_a, theme) => title(theme, "task_create"),
-    renderResult: renderTextResult,
     description:
       "Create milestones in the per-session task ledger and return their ids. This is a progress " +
       "checklist, not a separate planning or approval mode. Use it when tracking " +
@@ -222,8 +215,6 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
   return {
     name: "task_update",
     label: "Update Task",
-    renderCall: (_a, theme) => title(theme, "task_update"),
-    renderResult: renderTextResult,
     description:
       "Update a task in the plan: set status (pending/in_progress/completed), subject/description/" +
       "activeForm/owner, add a dependency (addBlockedBy), or delete it (status=deleted). " +
@@ -343,8 +334,6 @@ export function createTaskListTool(taskListId: string): ToolDefinition {
   return {
     name: "task_list",
     label: "List Tasks",
-    renderCall: (_a, theme) => title(theme, "task_list"),
-    renderResult: renderTextResult,
     description: "List the current plan: every task with its status, owner, and ready/blocked state.",
     parameters: Type.Object({}),
     async execute() {
@@ -359,8 +348,6 @@ export function createTaskGetTool(taskListId: string): ToolDefinition {
   return {
     name: "task_get",
     label: "Get Task",
-    renderCall: (_a, theme) => title(theme, "task_get"),
-    renderResult: renderTextResult,
     description: "Get one task's full detail by id.",
     parameters: Type.Object({ id: Type.String() }),
     async execute(_id, raw) {

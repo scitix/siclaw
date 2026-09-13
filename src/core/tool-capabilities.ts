@@ -26,6 +26,9 @@
  * added/renamed without changing stored selections.
  */
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
+  // A non-empty selection of this group resolves to an empty concrete whitelist.
+  // Unlike []/null group selections, it never opts into unrestricted tools.
+  no_tools:        [],
   read_files:      ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
@@ -36,10 +39,10 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // kubectl policy, so it adds round-trip efficiency and no reach.
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec", "k8s_inspect"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
+  run_sandbox:     ["run_script"],
   search_memory:   ["memory_search", "memory_get"],
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
   spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
-  delegate_agents: ["delegate_to_agent", "list_delegates"],   // delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage; distinct from spawn
   // Handing the conversation to another agent is NOT delegation and does not
   // belong in that group: delegation calls a peer and keeps the turn, a transfer
   // gives the session away. This key remains for stored selections. Resolved
@@ -47,7 +50,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // the harness compiler, across all Agent types. No roster means no tool.
   transfer_conversation: ["transfer_to_agent", "search_handoff_targets"],
   scheduling:      ["manage_schedule"],
-  session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input", "propose_execution"],   // IM-channel-visible updates + delegation result artifact + clarification / write-approval requests
+  session_output:  ["task_report", "save_feedback", "channel_update", "request_input", "propose_execution"],   // Channel updates and clarification / write-approval requests
 };
 
 /** Strictly decode the stored/wire selection where null means intentional unrestricted. */
@@ -110,7 +113,9 @@ export function resolveCapabilities(
  *   - an array of strings   → deduped JSON array of group keys.
  *   - anything else         → throw (rejected as HTTP 400 by the caller).
  *
- * Unknown group keys are NOT rejected here: `resolveCapabilities` already
+ * The retired delegate_agents key is removed; removing the final key stores
+ * ["no_tools"]. Empty group selections still mean unrestricted. Other unknown
+ * group keys are NOT rejected here: `resolveCapabilities` already
  * tolerates them (warn + ignore), and a key absent today may become valid in a
  * later release — storing it forward-compatibly beats a hard 400.
  */
@@ -125,5 +130,13 @@ export function encodeToolCapabilitiesForDb(value: unknown): string | null | und
   }
   const deduped = [...new Set(value as string[])];
   if (deduped.length === 0) return null; // empty selection = unrestricted
-  return JSON.stringify(deduped);
+  return JSON.stringify(removeRetiredCapabilityKeys(deduped));
+}
+
+/** Preserve the effective grant when retirement removes the last selected key. */
+export function removeRetiredCapabilityKeys(keys: string[]): string[] {
+  const remaining = keys.filter((key) => key !== "delegate_agents");
+  // An empty group array turns the whitelist OFF. Use the explicit zero-tool
+  // group instead; the resolver then returns [] as concrete allowedTools.
+  return keys.length > 0 && remaining.length === 0 ? ["no_tools"] : remaining;
 }

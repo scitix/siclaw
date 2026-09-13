@@ -4,11 +4,10 @@ import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { resolveScript, type SkillScriptResolver } from "../infra/script-resolver.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
@@ -54,16 +53,6 @@ export function createNodeScriptTool(
   return {
     name: "node_script",
     label: "Node Script",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("node_script")) +
-          " " + theme.fg("accent", args?.node || "") +
-          " " + theme.fg("muted", (args?.skill || "") + "/" + (args?.script || "")) +
-          (args?.args ? " " + args.args : ""),
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     description: `Execute a skill or user script on a Kubernetes node via a privileged debug pod with nsenter.
 
 PREFER host_script when the node is reachable via SSH (check host_list by the node's IP or name): SSH runs the script with NO debug pod. Use node_script when the node is NOT a bound SSH host, or when the script needs pod-namespace access (e.g. a pod's netns) that only the debug pod provides.

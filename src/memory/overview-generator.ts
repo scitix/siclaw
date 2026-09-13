@@ -187,7 +187,7 @@ interface CitationManifestRepo {
  * Read the materializer's per-repo manifest. It is the authoritative source of
  * BOTH each library's on-disk root AND whether that library is authorized to
  * contribute verified routes — so this scan does not hardcode a `repos/` layout
- * (which the flat TUI+Portal materializer does not produce) and does not trust a
+ * (which the flat CLI+Portal materializer does not produce) and does not trust a
  * marker pair that any uploaded index.md could carry.
  */
 function readCitationManifestRepos(knowledgeDir: string): CitationManifestRepo[] {

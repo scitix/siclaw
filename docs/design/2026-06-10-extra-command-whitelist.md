@@ -1,5 +1,7 @@
 # Extra Command Whitelist (Deployment-Configurable)
 
+> Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
+
 **Status**: Approved design, 2026-06-10
 **Related**: `docs/design/security.md` §4, `docs/design/command-whitelist.md`, `docs/design/tools.md` §6
 

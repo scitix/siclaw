@@ -14,7 +14,6 @@ import {
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
-import { notifyCoordinatorsForMembers } from "./coordinator-invalidation.js";
 import { dialSshChain, runCommand, type DialHop } from "../tools/infra/ssh-dial.js";
 import type { ChainHop, CredentialFile } from "../shared/credential-types.js";
 
@@ -385,9 +384,6 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
         for (const agentId of agentIds) {
           connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["host"] });
         }
-        // Same treatment for coordinators delegating to those members (this host's
-        // rename changes the member's coverage in their roster manifest).
-        void notifyCoordinatorsForMembers(connectionMap, agentIds);
       })
       .catch((err: any) => console.warn("[host-api] notify failed:", err.message));
   });
@@ -420,9 +416,6 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
     for (const agentId of agentIds) {
       connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["host"] });
     }
-    // Coordinators delegating to those members: the deleted host vanishes from their
-    // roster coverage too (captured before the cascade, same as agentIds).
-    void notifyCoordinatorsForMembers(connectionMap, agentIds);
   });
 
   // POST /api/v1/hosts/:id/test — test SSH connection (dials the full ProxyJump

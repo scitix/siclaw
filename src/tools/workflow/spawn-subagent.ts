@@ -21,8 +21,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type {
   ToolEntry,
   ToolRefs,
@@ -42,7 +41,13 @@ import {
 import { renderTierMenuForDescription, type ChildModelOutcome } from "../../core/subagent-models.js";
 import { validateAndRenderGroupPlan } from "../../agentbox/subagent-group.js";
 
+import { selectSubagentTargets, type SubagentTargetSource } from "../../agentbox/subagent-targets.js";
+import { validateSubagentContextSelection, type SubagentContextSelection } from "../../agentbox/subagent-context.js";
+
 interface SpawnSubagentParams {
+  fork_turns?: SubagentContextSelection;
+  resume?: string;
+  items_from?: SubagentTargetSource;
   description: string;
   task_template?: string;
   items: Array<string | Record<string, string>>;
@@ -86,63 +91,34 @@ function itemToText(item: string | Record<string, string>): string {
 }
 
 function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean): string {
-  const lines = listSubagentTypes().map((t) => `- ${t.agentType}: ${t.whenToUse}`);
-  // Rollback (SICLAW_SUBAGENT_GROUP_ENABLED=false): the tool is single-task only, so DON'T teach the
-  // batch pattern the tool would then reject — describe the single spawn and point at N separate calls.
-  if (!groupEnabled) {
-    return (
-      "Launch a single isolated sub-agent to handle ONE bounded task and get its findings back. Pass a " +
-      "one-element `items` array holding a single complete task briefing; multi-item batches, " +
-      "`task_template`, and `reduce_prompt` are DISABLED in this deployment. To run the same task across " +
-      "several targets, emit one spawn_subagent call per target. The sub-agent starts fresh and sees ONLY " +
-      "its prompt — brief it like a smart colleague who just walked in: concrete targets, paths, and what " +
-      "to check, and the report format you want back. Never delegate understanding, and never redo work a " +
-      "sub-agent is already doing.\n\nAvailable subagent_type values:\n" +
-      lines.join("\n")
-    );
-  }
-  return (
-    "Launch isolated sub-agent(s) to handle bounded work and get their findings back — one tool for " +
-    "both a single task and a whole batch. You supply a list of `items` (the for-loop) rendered through " +
-    "a shared `task_template`, and optionally a `reduce_prompt` that synthesises every per-item result " +
-    "into ONE summary. Each item runs as its own isolated sub-agent that cannot spawn further sub-agents " +
-    "(one level deep). Use it to run independent work concurrently, to run the SAME investigation across " +
-    "many targets, or to keep a large investigation's raw output out of your own context. Never redo work " +
-    "a sub-agent is already doing.\n\n" +
-    "FAN OUT WITH items, NOT with repeated calls: to run work over several targets, put them all in ONE " +
-    "spawn_subagent call's `items` — do NOT emit multiple spawn_subagent calls in the same turn. One call " +
-    "= one approval + one orchestrated batch; N separate calls lose that and drift. Do NOT use it for a " +
-    "lone lookup you'd do in a single tool call yourself — but the same lookup needed across several " +
-    "targets at once IS a batch (the main agent runs one thing at a time, so concurrency goes to sub-agents).\n\n" +
-    "Examples:\n" +
-    "- Single task: items: [\"Check disk usage on node-01 and report the top offenders.\"] (one complete " +
-    "briefing; runs foreground and returns its findings inline).\n" +
-    "- Batch (same task × N targets): task_template: \"Find the root cause of {{item}} crashing and report " +
-    "evidence.\", items: [\"web-1\",\"web-2\",\"web-3\"], reduce_prompt: \"Group the causes into " +
-    "network/storage/other.\" (runs each pod as its own sub-agent, then synthesises).\n" +
-    "- Heterogeneous batch: task_template: \"Investigate {{pod}} in namespace {{ns}}.\", items: " +
-    "[{\"pod\":\"web-1\",\"ns\":\"prod\"},{\"pod\":\"api-2\",\"ns\":\"staging\"}] (object items; each " +
-    "{{key}} MUST match an item key — a mismatch is rejected before anything runs).\n\n" +
-    "Writing the template + items: the sub-agent starts fresh and sees ONLY its rendered prompt — brief it " +
-    "like a smart colleague who just walked in. The template holds the SHARED framing (goal, what you " +
-    "already know or ruled out, and the exact report format you want back — a uniform format directly " +
-    "improves reduce quality); each item supplies the per-target specifics. For plain string items use " +
-    "{{item}}; omit task_template only when each string item is already a complete prompt. Items must be " +
-    "homogeneous — all strings or all objects. Never delegate understanding — give concrete targets, paths, " +
-    "and what to check, not 'based on your findings, decide X'.\n\n" +
-    (backgroundAllowed
-      ? "A SINGLE item runs FOREGROUND by default and returns its result inline. A MULTI-item batch " +
-        "runs concurrently in the background by default. You may do other independent work while it runs. " +
-        "The user request remains active until required subagents and their reduce finish and you report " +
-        "the findings. Completion results are delivered to you automatically; do not poll or spawn a " +
-        "waiting agent. Use run_in_background:false to receive results inline. Returns a job_id for job_stop."
-      : "Every launch runs FOREGROUND: the call BLOCKS until all items (and the reduce, if any) finish, then " +
-        "returns the results inline. This surface has no detached delivery, so you MUST fold the findings into " +
-        "your reply THIS turn — never tell the user you'll 'report back later'. A large batch can take minutes; " +
-        "that is expected — keep the turn open until it returns.") +
-    "\n\nAvailable subagent_type values (shared by every map + reduce child):\n" +
-    lines.join("\n")
-  );
+  return [
+    "Delegate bounded work to subagents. Use one free-form item for a single task. " +
+    "Describe the goal, relevant context, scope/constraints and useful deliverables; the child chooses how to investigate. " +
+    "It inherits this Agent's business policy, permissions and environment. Parent conversation is omitted by default; " +
+    "use fork_turns:'all' for the active parent context (including existing compaction summaries), or a positive integer for the last N user-message turns. " +
+    "Choose the smallest context needed; all children in the call get the same dispatch snapshot. Historical tool evidence is scoped into each child; " +
+    "parent system instructions, private reasoning, runtime controls and live task ownership are not copied. " +
+    "Children cannot spawn children or edit the parent's plan. Do simple bulk queries yourself when sufficient.",
+    groupEnabled
+      ? "For different independent assignments, pass each complete prompt as a string in items and omit task_template. " +
+        "For the same investigation across many targets, use a shared task_template ({{item}} for strings or {{field}} for objects). " +
+        "All items in one call share the selected role and model tier; use separate calls when those must differ. " +
+        "Optional reduce_prompt adds a synthesis child; omit it when the parent will combine the reports itself. " +
+        "For exhaustive work, obtain the full authorized inventory first. items_from selects targets directly from a complete JSON tool-result artifact, " +
+        "checks its total and stable identities, and returns a next_offset for subsequent bounded batches. " +
+        "A batch finishing does not prove all inventory targets succeeded: reconcile coverage, failures and skipped items."
+      : "Batch mode is disabled: pass exactly one string item without a template or reduce_prompt.",
+    "To guide a running child or ask a completed child a follow-up, pass its returned resume handle and one string item with your message. " +
+    "Running children receive guidance at a safe boundary; completed children continue their own transcript. " +
+    "Do not relaunch duplicate work. Handles belong to this parent session and expire with its output artifacts (normally 24 hours). " +
+    "A follow-up is a new result; a previous batch synthesis remains historical, so integrate the revised findings.",
+    backgroundAllowed
+      ? "Single tasks default to foreground; multi-item batches default to background. Set run_in_background:false to await results inline. " +
+        "Background completion is delivered automatically: continue independent work, never poll or spawn a waiter. " +
+        "Keep the user request active until required work and synthesis finish; use job_stop to cancel."
+      : "This surface runs all tasks in foreground. Await results and report them in this turn; do not promise a later detached reply.",
+    "Available roles:\n" + listSubagentTypes().map(t => `- ${t.agentType}: ${t.whenToUse}`).join("\n"),
+  ].join("\n\n");
 }
 
 export function createSpawnSubagentTool(
@@ -161,13 +137,14 @@ export function createSpawnSubagentTool(
   return {
     name: "spawn_subagent",
     label: "Spawn Sub-agent",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("spawn_subagent")), 0, 0),
-    renderResult: renderTextResult,
     description:
       buildDescription(isSubagentGroupEnabled(), backgroundAllowed) +
       renderTierMenuForDescription(tierMenu),
     parameters: Type.Object({
       description: Type.String({ description: "Short (3-5 word) label for the task or batch." }),
+      fork_turns: Type.Optional(Type.Union([
+        Type.Literal("none"), Type.Literal("all"), Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ], { description: "New children only: 'none' (default) for an independent prompt, 'all' for active parent history, or N for the most recent N user-message turns. Preserves available text, images and completed tool evidence, not archived pre-compaction history. Cannot combine with resume." })),
       task_template: Type.Optional(
         Type.String({
           description:
@@ -175,16 +152,26 @@ export function createSpawnSubagentTool(
             "framing/report format. Omit only when each string item is already a full prompt.",
         }),
       ),
-      items: Type.Array(
+      items: Type.Optional(Type.Array(
         Type.Union([Type.String(), Type.Record(Type.String(), Type.String())]),
         {
           minItems: 1,
           description:
-            "The for-loop list — each item is one sub-agent run (use a single item for one task). Must be " +
-            "homogeneous: all strings (rendered via {{item}}) OR all objects (keys must match the template's " +
-            "{{placeholders}}).",
+            "One child per item. Without task_template, each string is an independent complete prompt and may describe entirely different work. " +
+            "With task_template, items supply target values. Use all strings ({{item}}) OR all objects " +
+            "whose keys match the template's {{placeholders}}; do not mix forms.",
         },
-      ),
+      )),
+      resume: Type.Optional(Type.String({ description: "Opaque resume handle from an earlier launch. Supply exactly one string item; no template, reduce or tier override." })),
+      items_from: Type.Optional(Type.Object({
+        artifact_id: Type.String(),
+        array_pointer: Type.String({ description: "JSON pointer to the complete target array." }),
+        total_pointer: Type.String({ description: "JSON pointer to the source-declared total; must equal the full array length." }),
+        fields: Type.Record(Type.String(), Type.String(), { description: "Template field name to per-row JSON pointer, e.g. {node: /metadata/name, uid: /metadata/uid}." }),
+        identity_field: Type.String({ description: "Selected field containing the unique stable target ID." }),
+        offset: Type.Optional(Type.Integer({ minimum: 0 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1 })),
+      })),
       reduce_prompt: Type.Optional(
         Type.String({
           description:
@@ -217,11 +204,7 @@ export function createSpawnSubagentTool(
             ),
           }
         : {}),
-      // run_in_background is gated OFF (RUN_IN_BACKGROUND_ENABLED) until background jobs notify the
-      // parent model on completion. While gated the param is hidden AND background is force-disabled
-      // (see the runInBackground resolution below), so every launch runs FOREGROUND — this overrides
-      // the conditional default rather than preserving it. Foreground batches still work; only
-      // detached/background launches are unavailable until the notification chain lands.
+      // Advertise detached execution only on surfaces with completion delivery.
       ...(backgroundAllowed
         ? {
             run_in_background: Type.Optional(
@@ -241,6 +224,8 @@ export function createSpawnSubagentTool(
       if (!executor) return errorResult("spawn_subagent is not available in this runtime.");
 
       const p = rawParams as Partial<SpawnSubagentParams>;
+      try { validateSubagentContextSelection(p.fork_turns); }
+      catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
       const description = p.description?.trim();
       if (!description) return errorResult("spawn_subagent requires a non-empty description.");
 
@@ -250,7 +235,20 @@ export function createSpawnSubagentTool(
         return errorResult(`Unknown subagent_type "${p.subagent_type}". Valid types: ${valid}.`);
       }
 
-      const items = (p.items ?? []) as Array<string | Record<string, string>>;
+      let items = (p.items ?? []) as Array<string | Record<string, string>>;
+      let coverage: ReturnType<typeof selectSubagentTargets>["coverage"] | undefined;
+      if (p.resume && (p.fork_turns !== undefined || p.items_from || p.task_template || p.reduce_prompt || p.model_tier || p.subagent_type || items.length !== 1 || typeof items[0] !== "string")) {
+        return errorResult("resume requires exactly one string item and no fork_turns, items_from, template, reduce, type or tier override.");
+      }
+      if (p.items_from) {
+        if (!isSubagentGroupEnabled()) return errorResult("Inventory snapshot batches are disabled in this deployment.");
+        if (p.items || !refs.readToolResult) return errorResult("items_from requires artifact access and cannot be combined with items.");
+        try {
+          const selected = selectSubagentTargets(await refs.readToolResult(p.items_from.artifact_id), p.items_from, getMaxGroupItems());
+          items = selected.items;
+          coverage = selected.coverage;
+        } catch (error) { return errorResult(error instanceof Error ? error.message : String(error)); }
+      }
       const reducePrompt = p.reduce_prompt?.trim() || undefined;
 
       // Ops rollback lever (design decision #20): with the batch capability OFF, spawn_subagent
@@ -294,8 +292,9 @@ export function createSpawnSubagentTool(
               const done = progress.items.filter(
                 (i) => i.status !== "queued" && i.status !== "running",
               ).length;
-              const items = progress.items.map(({ index, status, childSessionId, activity: itemActivity }) => ({
+              const items = progress.items.map(({ index, status, childSessionId, activity: itemActivity, item }) => ({
                 index,
+                ...(item !== undefined ? { item } : {}),
                 status,
                 ...(childSessionId ? { child_session_id: childSessionId } : {}),
                 ...(itemActivity ? { activity: itemActivity } : {}),
@@ -333,6 +332,9 @@ export function createSpawnSubagentTool(
       const result = await executor(
         {
           description,
+          forkTurns: p.fork_turns,
+          resumeHandle: p.resume,
+          targetCoverage: coverage,
           renderedTasks: plan.tasks,
           reducePrompt,
           subagentType: type.agentType,
@@ -350,7 +352,14 @@ export function createSpawnSubagentTool(
         signal,
       );
 
-      return toToolOutput(result, plan.tasks.map((t) => t.item));
+      const output = toToolOutput(result, plan.tasks.map((t) => t.item));
+      if (coverage) {
+        const value = JSON.parse(output.content[0].text);
+        value.coverage = "coverage" in result ? result.coverage ?? coverage : coverage;
+        output.content[0].text = JSON.stringify(value);
+        Object.assign(output.details, { coverage: value.coverage });
+      }
+      return output;
     },
   };
 }
@@ -373,12 +382,17 @@ function toToolOutput(
   items: Array<string | Record<string, string>>,
 ) {
   if (result.status === "launched") {
-    const modelVisible = { status: "launched" as const, job_id: result.jobId, message: LAUNCHED_MESSAGE };
+    const steered = "steered" in result && result.steered;
+    const modelVisible = { status: steered ? "steered" : "launched", job_id: result.jobId,
+      ...("childSessionId" in result ? { child_session_id: result.childSessionId, resume: result.resumeHandle } : {}),
+      ...("children" in result ? { children: result.children?.map(c => ({ child_session_id: c.childSessionId, resume: c.resumeHandle, item: c.item })) } : {}),
+      message: "steered" in result && result.steered ? "Guidance queued for the existing child; no additional run was launched. Await its updated result." : LAUNCHED_MESSAGE };
     return {
       content: [{ type: "text" as const, text: JSON.stringify(modelVisible) }],
       // A collapsed single launch carries a childSessionId; a batch launch does not.
       details: {
         ...modelVisible,
+        ...(steered ? { status: "done", action: "steer", summary: modelVisible.message } : {}),
         ...("childSessionId" in result ? { child_session_id: result.childSessionId } : {}),
       },
     };
@@ -392,7 +406,7 @@ function toToolOutput(
       // Preserve source evidence alongside synthesis. The artifact wrapper bounds model context
       // while keeping all reports recoverable, including evidence a reducer failed to mention.
       item_results: result.itemResults.map((r) => (
-        { item: itemToText(r.item), status: r.status, summary: r.fullSummary ?? r.summary }
+        { item: itemToText(r.item), status: r.status, summary: r.fullSummary ?? r.summary, child_session_id: r.childSessionId, resume: r.resumeHandle }
       )),
     };
     if (hasReduce) modelVisible.reduce_summary = result.reduceSummary;
@@ -405,8 +419,7 @@ function toToolOutput(
       content: [{ type: "text" as const, text: JSON.stringify(modelVisible) }],
       details: {
         ...modelVisible,
-        // Full per-item detail (raw item + child_session_id for UI drill-in) lives in details, not
-        // model-visible content — the group card renders it; skipped items carry an empty id.
+        // Keep raw item labels and compact summaries for the group card; skipped items carry an empty child ID.
         item_results: result.itemResults.map((r) => ({
           item: r.item,
           status: r.status,
@@ -421,7 +434,7 @@ function toToolOutput(
   }
 
   // ── Collapsed single-task report (legacy per-child result wrapped into the uniform envelope) ──
-  const single = { item: itemToText(items[0]), status: result.status, summary: result.fullSummary ?? result.summary };
+  const single = { item: itemToText(items[0]), status: result.status, summary: result.fullSummary ?? result.summary, child_session_id: result.childSessionId, resume: result.resumeHandle };
   const modelVisible = { status: result.status, item_results: [single] };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(modelVisible) }],
@@ -453,7 +466,7 @@ function toToolOutput(
 export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createSpawnSubagentTool(refs),
-  modes: ["web", "channel", "cli"],
+  modes: ["web", "channel"],
   // Hidden unless the runtime injected an executor (same "never show a non-working tool" contract;
   // children get no executor → spawn_subagent is hidden from them → no recursion). The batch
   // capability is gated by isSubagentGroupEnabled() at the CALL layer (item cap), not here — the tool

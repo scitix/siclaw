@@ -9,7 +9,7 @@
 5. **Submit and Contribute are independent**: two separate approval flows, each with its own staging tag, review handler, and withdraw operation.
 6. **No cross-origin name collisions**: skills with the same name but different `originId` are rejected at all entry points (create, fork, rename, move, contribute). Only fork from the same source is allowed to create a same-name copy.
 7. **Content hash for change detection**: SHA-256 of the normalized skill package files determines whether content has changed. Used by `canSubmit`, `canContribute`, `hasUnpublishedChanges`, and builtin sync.
-8. **Skill preview in conversation**: the `skill_preview` tool reads skill draft files from disk and renders a side panel with copy buttons. Agent writes files first via file I/O tools, then calls `skill_preview` with the directory path. Does not persist to DB.
+8. **Skill preview in conversation**: the `skill_preview` tool reads skill draft files from disk and renders a side panel with copy buttons. Agent writes files first via file I/O tools, then calls `skill_preview` with the directory path. This does not install or publish a skill. Complete preview data travels in `details.skillPreview` and is saved in chat message metadata, independently of the model's bounded textual output. Live cards and restored panels read that structured payload first, with legacy JSON content as a fallback. Missing or malformed previews remain visible as unavailable instead of silently disappearing.
 
 ### The Security-Flexibility Trade-off
 
@@ -424,15 +424,15 @@ AgentBox (materialize)
   -> Agent loads all skills from the single resolved/ directory
 ```
 
-### K8s vs Local vs TUI-with-Portal
+### K8s vs Local vs headless CLI-with-Portal
 
 | Mode | Skills path | Written by |
 |------|-------------|-----------|
 | K8s (single-user pod) | `.siclaw/skills/resolved/` | `resource-handlers.ts materialize()` |
 | Local (multi-user process) | `.siclaw/skills/user/{userId}/resolved/` | `local-spawner.ts syncSkills()` |
-| TUI with local Portal | `.siclaw/.portal-snapshot/skills/` (**ephemeral**, cleaned on SIGINT/SIGTERM) | `src/lib/portal-skill-materializer.ts` on TUI startup |
+| headless CLI with local Portal | `.siclaw/.portal-snapshot/run-<random>/skills/` (**ephemeral**, cleaned on SIGINT/SIGTERM) | `src/lib/portal-skill-materializer.ts` on headless CLI startup |
 
-The TUI-with-Portal path is a separate write target from the other two. It never touches `skills/{core,extension,global,skillset,user}/` on disk — see `docs/design/invariants.md` §1.4 for the full snapshot contract.
+The headless CLI-with-Portal path is a separate write target from the other two. It never touches `skills/{core,extension,global,skillset,user}/` on disk — see `docs/design/invariants.md` §1.4 for the full snapshot contract.
 
 ---
 
@@ -499,7 +499,7 @@ This is a secondary path -- `local_script` is preferred.
 
 `agent-factory.ts` first asks the compiled Agent harness which skill roots are
 valid for this session. A Gateway-managed Agent loads the single `resolved/`
-directory built by materialization; a Portal-backed TUI loads its
+directory built by materialization; a Portal-backed headless CLI loads its
 `portalSkillsDir`. Repo-bundled operational skills are a fallback only when the
 harness has execution capability.
 
@@ -520,7 +520,7 @@ available and can invoke them via `local_script`.
 For scoped Portal/Gateway Agents, the factory passes a `skillsOverride` that
 restricts the visible skill set to the roots selected above. This removes
 user-global skills that the loader would otherwise auto-discover from
-`~/.pi/agent/skills/` or similar. QA, Coordinator, delegated read-only, and
+`~/.pi/agent/skills/` or similar. QA and
 unresolved sessions also disable the repo-bundled operational fallback.
 
 Without the override, the prompt could advertise skills the Agent owner never

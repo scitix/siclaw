@@ -11,7 +11,7 @@
  * handler and `job_stop` race to send it. `claimNotification()` is the atomic gate.
  *
  * One registry instance per parent runtime: the agentbox session manager owns one
- * (replacing the old inline `subagentJobs` map); the TUI host owns its own.
+ * (replacing the old inline `subagentJobs` map); the CLI host owns its own.
  */
 
 import type { JobStopResult, TaskOutputSnapshot } from "./tool-registry.js";
@@ -122,7 +122,7 @@ export class JobRegistry {
 
   /**
    * Project a job to the status shape the task_output tool consumes. One owner of the
-   * registry→snapshot mapping so the agentbox and TUI readers can't drift.
+   * registry→snapshot mapping so the agentbox and CLI readers can't drift.
    */
   snapshot(jobId: string): TaskOutputSnapshot {
     const job = this.jobs.get(jobId);
@@ -145,7 +145,7 @@ export class JobRegistry {
 
   /**
    * Stop a running job: fire its kill hook and mark it "stopped". Shared by both runtimes
-   * (agentbox + TUI) so the guard sequence and the stopped-status transition can't drift.
+   * (agentbox + CLI) so the guard sequence and the stopped-status transition can't drift.
    * The message wording adapts to the job type ("sub-agent" vs "command").
    */
   stopJob(jobId: string, opts?: { suppressNotifyTurn?: boolean }): JobStopResult {

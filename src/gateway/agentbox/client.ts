@@ -1,3 +1,5 @@
+import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
+import { readSandboxToolError } from "../../script-sandbox/errors.js";
 /**
  * AgentBox HTTP Client
  *
@@ -5,10 +7,12 @@
  * Supports mTLS when TLS options are provided.
  */
 
+import { SCRIPT_FILE_RESULT_BYTES } from "../../script-sandbox/result-transfer.js";
+import http from "node:http";
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
-import type { OriginKind, DelegationContext } from "../../core/types.js";
+import type { OriginKind } from "../../core/types.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
 
@@ -24,7 +28,7 @@ export interface PromptOptions {
   sessionId?: string;
   /**
    * Identity of THIS turn, so a later abort can name the turn it means rather than
-   * the session it ran in. A delegated peer session is reused across turns, so an
+   * the session it ran in. A conversation session is reused across turns, so an
    * abort addressed by session alone can land on a successor.
    */
   turnId?: string;
@@ -39,10 +43,8 @@ export interface PromptOptions {
   kubeconfigPath?: string | null;
   /** Session mode — "web" | "channel" */
   mode?: string;
-  /** Entry-form of this prompt (audit + delegation read-only hardening). */
+  /** Entry-form of this prompt (audit categorization). */
   origin?: OriginKind;
-  /** Present when a coordinator agent delegated this turn over the mesh. */
-  delegation?: DelegationContext;
   /** Expose `request_input` to a top-level machine-driven turn. */
   allowInputRequest?: boolean;
   /** Control plane owns this logical turn and will dispatch authorized handoffs. */
@@ -105,7 +107,7 @@ export interface PromptOptions {
    * every child fell back; nothing errored and the whole suite stayed green.
    *
    * Required makes each site STATE its answer. Write `undefined` where a path has
-   * no tiers to forward (the TUI, which builds no sub-agents at all) — that is a
+   * no tiers to forward (the CLI, which builds no sub-agents at all) — that is a
    * decision recorded, not a field forgotten.
    */
   subagentTiers: unknown;
@@ -204,6 +206,42 @@ export class AgentBoxClient {
         rejectUnauthorized: true,
       });
     }
+  }
+
+  /** A bounded, cancellable callback. Neither response bodies nor grants enter error logs. */
+  async sandboxTool(body: unknown, signal: AbortSignal): Promise<unknown> {
+    const url = new URL("/api/internal/sandbox-tool", this.endpoint);
+    if (url.protocol === "https:" && !this.httpsAgent) throw new Error("Sandbox callback requires mTLS");
+    if (url.protocol !== "https:" && (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
+      throw new Error("Local sandbox callback requires loopback");
+    }
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(95_000)]);
+    return new Promise((resolve, reject) => {
+      const client = url.protocol === "https:" ? https : http;
+      const req = client.request(url, { method: "POST", signal: bounded,
+        ...(url.protocol === "https:" ? { agent: this.httpsAgent! } : {}),
+        headers: { "Content-Type": "application/json" } }, res => {
+        const chunks: Buffer[] = []; let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > SCRIPT_FILE_RESULT_BYTES) req.destroy(new Error("Sandbox callback response too large"));
+          else chunks.push(chunk);
+        });
+        res.on("error", () => reject(new SandboxCallbackUncertainError()));
+        res.on("end", () => {
+          try {
+            const envelope = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (envelope?.protocol !== 1) throw new Error();
+            const failure = readSandboxToolError(envelope);
+            if (failure) { reject(failure); return; }
+            if (res.statusCode !== 200 || envelope.ok !== true) throw new Error();
+            resolve(envelope.result);
+          } catch { reject(new SandboxCallbackUncertainError()); }
+        });
+      });
+      req.on("error", () => reject(new SandboxCallbackUncertainError()));
+      req.end(JSON.stringify(body));
+    });
   }
 
   /**

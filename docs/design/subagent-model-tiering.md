@@ -1,5 +1,7 @@
 # Sub-agent Model Tiering
 
+> Historical design: Coordinator and peer delegation have been retired. See [the retirement design](../design/2026-09-12-coordinator-retirement-assessment.md). Same-Agent subagents remain supported.
+
 > Status: design (no implementation yet)
 > Baseline: `main` @ `30e2b4f9`
 > Complements `coordinator-routing.md` (delegation vs sub-agent boundary) and
@@ -733,7 +735,7 @@ Referential decay is answered without cascading:
   leak through echoed tool output.
 - The resolution chain lands at `session.ts:2199`
 
-### 11.4 Propagation: 9 forwarding sites (+ the TUI snapshot) plus an invariant
+### 11.4 Propagation: 9 forwarding sites (+ the headless CLI snapshot) plus an invariant
 
 binding → prompt body is a **field-by-field copy everywhere, never a spread**.
 
@@ -760,7 +762,7 @@ The **9** real binding → prompt sites:
 | `channels/lark.ts` | 1 |
 | `channels/dingtalk.ts` | 1 |
 
-Plus the TUI, which is not a binding forward at all but a snapshot — see §11.6.
+Plus the headless CLI, which is not a binding forward at all but a snapshot — see §11.6.
 
 **The invariant test DISCOVERS these by walking the tree; it must never enumerate
 them.** A test that reads a list can only confirm what its author already knew,
@@ -844,20 +846,20 @@ three hand-rolled queries — three copies is how one of them ends up without
 | `adapter.ts` `config.getAgent` handler | Config form (`subagent_model_tiers`) |
 | `adapter.ts` `config.getModelBinding` handler | Candidates |
 | CLI snapshot | **Nothing** — see below |
-**The TUI carries no tier state at all, and must not.** Earlier drafts required the
-CLI snapshot to carry both payloads, on the assumption that the TUI needed a menu
-because it has no tools channel to deliver one. That assumption was wrong: the TUI
+**The headless CLI carries no tier state at all, and must not.** Earlier drafts required the
+CLI snapshot to carry both payloads, on the assumption that the headless CLI needed a menu
+because it has no tools channel to deliver one. That assumption was wrong: the headless CLI
 does not construct a `spawnSubagentExecutor` (`cli-main.ts`, "No
-spawnSubagentExecutor → background sub-agents stay TUI-unavailable; that needs the
+spawnSubagentExecutor → background sub-agents stay headless CLI-unavailable; that needs the
 agentbox child-session machinery"), so `spawn_subagent` is not registered there at
 all.
 
-With no sub-agents there is nothing to tier. Shipping tier state to the TUI would
+With no sub-agents there is nothing to tier. Shipping tier state to the headless CLI would
 mean delivering **credentials** to a surface that has no consumer for them — a
 strictly worse outcome than delivering nothing.
 
 So: no `subagent_models` in the CLI snapshot query, no tier fields in
-`cli-snapshot-types.ts`, and no menu in the TUI's session construction. If the TUI
+`cli-snapshot-types.ts`, and no menu in the headless CLI's session construction. If the headless CLI
 ever gains the child-session machinery, tiering becomes reachable and this section
 has to be revisited **together with** the credential-delivery question, not as a
 mechanical field addition.

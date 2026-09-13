@@ -9,7 +9,7 @@ import {
 } from "./agent-types.js";
 import { buildSystemPromptAssembly, type PromptAssembly } from "./prompt.js";
 import { resolveCapabilities } from "./tool-capabilities.js";
-import type { DelegationContext, SessionMode } from "./types.js";
+import type { SessionMode } from "./types.js";
 
 export const AGENT_CONTEXT_VERSION = "agent-context/v2" as const;
 
@@ -42,12 +42,14 @@ export interface CompileAgentContextInput {
   memoryConfigured: boolean;
   mode: SessionMode;
   agentPrompt?: string;
+  /** Child execution role is separate from the Agent's inherited business policy. */
+  subagentPrompt?: string;
+  isSubagent?: boolean;
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
   handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   systemPromptTemplate?: string;
-  delegation?: DelegationContext;
 }
 
 export interface AgentContextManifest {
@@ -124,7 +126,7 @@ export function resolveAgentHarness(
   // Ownership transfer is a conversation transport capability for every type.
   // The factory proves emitter/roster/owner availability; unresolved harnesses
   // still fail closed. This grants no command, delegation, or resource access.
-  const conversationTools = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
+  const conversationTools = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable
     && Array.isArray(modeTools)
     ? [...new Set([...modeTools, "transfer_to_agent", "search_handoff_targets"])]
     : modeTools;
@@ -158,10 +160,13 @@ export function resolveAgentHarness(
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["write", "edit", "skill_preview"]),
     includePlanningGuidance:
+      !input.isSubagent &&
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
+      !input.isSubagent &&
       resolution === "resolved" &&
+      (input.mode === undefined || input.mode === "web" || input.mode === "channel") &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
     includeInfrastructureGuidance:
       resolution === "resolved" &&
@@ -178,13 +183,12 @@ export function resolveAgentHarness(
 export function compileAgentContext(input: CompileAgentContextInput): CompiledAgentContext {
   const harness = resolveAgentHarness(input);
   const agentPrompt = resolveAgentPromptLayers(harness.agentType, input.agentPrompt);
-  const handoffContract = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable && !input.delegation
+  const handoffContract = ["web", "channel", "task"].includes(input.mode ?? "web") && input.handoffAvailable
     && harness.resolution === "resolved"
     ? "Conversation ownership: transfer_to_agent is available for this main conversation. " +
       "When another authorized destination is better suited to continue the user's request, use its " +
       "coverage evidence from search_handoff_targets to transfer ownership. Query the exact cluster name/ID or host name/ID/IP when known; otherwise search configured capabilities. Do not infer resource ownership from Agent names. General role guidance to route " +
-      "work to a specialist uses this ownership transfer for the main request; reserve delegation for " +
-      "independent subtasks whose results you need back. Handle requests within your own capabilities " +
+      "work to another Agent uses this ownership transfer. Handle requests within your own capabilities " +
       "yourself. Do not guess an ambiguous destination, cycle between agents, or transfer merely to " +
       "repeat an answer. Not knowing an answer is not a reason to transfer: identify a concrete " +
       "capability or resource the destination has that can advance the request. If nobody suitable is " +
@@ -192,25 +196,25 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
       "Before returning to an agent that already participated, identify new verified evidence and why it " +
       "enables that agent to proceed. This does not grant you additional execution or resource permissions."
     : undefined;
-  const handoffClosure = input.handoffPolicy && (input.handoffPolicy.remaining === 0 || !input.handoffAvailable) && !input.delegation
+  const handoffClosure = input.handoffPolicy && (input.handoffPolicy.remaining === 0 || !input.handoffAvailable)
     ? (input.handoffPolicy.remaining === 0
         ? "Further conversation transfers are disabled for this request. "
         : "No eligible authorized transfer destination is available for this request. ") +
       "Continue within your own capabilities. " +
       "Use the available history and verified results to answer the user in their language. If unresolved, " +
       "explain the concrete limitation and ask for specific missing information or access. Do not claim " +
-      "success, repeat failed checks without a new basis, or delegate the main request to bypass this limit."
+      "success, repeat failed checks without a new basis, or bypass this limit with another execution path."
     : undefined;
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
-    interactiveProgress: input.interactiveProgress ?? (input.mode === "web" && !input.delegation),
+    interactiveProgress: input.interactiveProgress ?? (input.mode === "web"),
     templateOverride: input.systemPromptTemplate,
     agentTypePrompt: [agentPrompt.typeContract, handoffContract, handoffClosure].filter(Boolean).join("\n\n") || undefined,
-    agentAddendum: agentPrompt.addendum,
+    agentAddendum: [agentPrompt.addendum, input.isSubagent ? input.subagentPrompt : undefined].filter(Boolean).join("\n\n"),
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,
     includeOperationalSafety: harness.includeOperationalSafety,
-    includeSkillAuthoring: harness.includePlatformSkills,
+    includeSkillAuthoring: harness.includePlatformSkills && hasAnyTool(harness.allowedTools, ["skill_preview"]),
     includePlanningGuidance: harness.includePlanningGuidance,
     includeSubagentGuidance: harness.includeSubagentGuidance,
   });

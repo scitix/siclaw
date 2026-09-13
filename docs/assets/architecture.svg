@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="730" viewBox="0 0 1200 730" role="img" aria-labelledby="title description">
+  <title id="title">Siclaw architecture</title>
+  <desc id="description">Interactive Web and chat sessions use Portal and Gateway, then AgentBox. Headless CLI runs the shared agent core directly and can read a local Portal snapshot. Both use the same diagnostic tools and safety policies.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#2563eb" stroke-width="1.5"/></marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #14213d; }
+      .title { font-size: 30px; font-weight: 700; }
+      .heading { font-size: 19px; font-weight: 700; }
+      .body { font-size: 15px; }
+      .small { font-size: 13px; fill: #475569; }
+      .blue { fill: #1d4ed8; }
+      .panel { fill: #f8faff; stroke: #bfdbfe; stroke-width: 1.5; }
+      .card { fill: #fff; stroke: #dbe3ef; stroke-width: 1.5; }
+      .flow { fill: none; stroke: #2563eb; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1200" height="730" fill="#fff"/>
+  <text x="40" y="43" class="title">Siclaw architecture</text>
+  <text x="40" y="69" class="body" fill="#475569">One agent core for interactive investigations and non-interactive diagnostics</text>
+
+  <rect x="40" y="100" width="720" height="58" rx="12" class="panel"/>
+  <text x="400" y="136" text-anchor="middle" class="heading blue">Web UI · Chat channels · Webhooks · Scheduled tasks</text>
+  <rect x="820" y="100" width="340" height="58" rx="12" class="panel"/>
+  <text x="990" y="136" text-anchor="middle" class="heading blue">Headless CLI · --prompt</text>
+  <path d="M400 158V202" class="flow"/>
+  <path d="M990 158V202" class="flow"/>
+
+  <rect x="40" y="205" width="720" height="156" rx="14" class="panel"/>
+  <text x="60" y="236" class="heading blue">Control plane</text>
+  <rect x="60" y="253" width="270" height="87" rx="10" class="card"/>
+  <text x="78" y="280" class="heading">Portal</text>
+  <text x="78" y="303" class="small">Agents, models, skills, knowledge,</text>
+  <text x="78" y="322" class="small">credentials, MCP, auth, and Web UI</text>
+  <rect x="346" y="253" width="180" height="87" rx="10" class="card"/>
+  <text x="364" y="280" class="heading">Gateway</text>
+  <text x="364" y="303" class="small">Sessions, channels,</text>
+  <text x="364" y="322" class="small">scheduling, spawners</text>
+  <rect x="542" y="253" width="198" height="87" rx="10" class="card"/>
+  <text x="560" y="280" class="heading">Shared database</text>
+  <text x="560" y="303" class="small">SQLite for local use</text>
+  <text x="560" y="322" class="small">MySQL for production</text>
+
+  <path d="M400 361V409" class="flow"/>
+  <text x="415" y="391" class="small">Session orchestration</text>
+  <rect x="40" y="413" width="720" height="141" rx="14" class="panel"/>
+  <text x="60" y="445" class="heading blue">AgentBox · shared agent core</text>
+  <text x="60" y="474" class="body">LocalSpawner: agents run in one process with a shared filesystem</text>
+  <text x="60" y="500" class="body">K8sSpawner: isolated user pods, Gateway ↔ AgentBox mTLS</text>
+  <text x="60" y="532" class="small">Model · Diagnostic tools · Skills · Knowledge · Investigation memory</text>
+
+  <rect x="820" y="205" width="340" height="349" rx="14" class="panel"/>
+  <text x="842" y="237" class="heading blue">Embedded agent core</text>
+  <text x="842" y="274" class="body">One prompt, printed answer, exit</text>
+  <text x="842" y="312" class="small">Configuration sources:</text>
+  <text x="842" y="338" class="body">• Local Portal snapshot (optional)</text>
+  <text x="842" y="364" class="body">• Standalone settings and resources</text>
+  <path d="M842 385H1138" stroke="#dbe3ef"/>
+  <text x="842" y="415" class="body">Same diagnostic tools and policies</text>
+  <text x="842" y="445" class="body">Local investigation memory</text>
+  <text x="842" y="483" class="small">Snapshot credentials are ephemeral.</text>
+  <text x="842" y="507" class="small">Exit cleans snapshots and detached jobs.</text>
+  <text x="842" y="531" class="small">Configure resources in the Web UI.</text>
+
+  <path d="M400 554V614" class="flow"/>
+  <path d="M990 554V614" class="flow"/>
+  <text x="415" y="589" class="small">Read-only by default · command validation · output sanitization</text>
+  <rect x="40" y="619" width="1120" height="67" rx="12" class="card"/>
+  <text x="600" y="660" text-anchor="middle" class="heading">Investigation targets: Kubernetes · SSH hosts · Observability and other MCP services</text>
+  <text x="40" y="715" class="small">Interactive entry point: siclaw local → Web UI</text>
+  <text x="820" y="715" class="small">Automation entry point: siclaw --prompt "…"</text>
+</svg>

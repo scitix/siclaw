@@ -20,6 +20,7 @@ import { registerNotificationRoutes, registerNotificationWs } from "./notificati
 import { registerSiclawRoutes } from "./siclaw-api.js";
 import { registerRuntimeWs } from "./runtime-connection.js";
 import { registerA2aRoutes } from "./a2a-gateway.js";
+import { registerSandboxIngress } from "./sandbox-ingress.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,7 +47,7 @@ export interface PortalConfig {
   portalSecret: string;
   /**
    * Enable the `/api/v1/cli-snapshot` endpoint that returns provider/model/MCP
-   * config (including provider api_key values) for a local TUI to consume.
+   * config (including provider api_key values) for a local CLI to consume.
    *
    * LOCAL MODE ONLY. Leave undefined / false in K8s/prod Portal deployments:
    * the endpoint returns every provider's api_key, every cluster's kubeconfig,
@@ -173,6 +174,7 @@ export function startPortal(config: PortalConfig): http.Server {
 
   // Attach WS upgrade handlers before listen
   const connectionMap = registerRuntimeWs(server, config.portalSecret, rpcHandlers);
+  registerSandboxIngress(router, rpcHandlers, connectionMap, process.env.SICLAW_SANDBOX_PUBLIC_URL);
   registerNotificationWs(server, config.jwtSecret);
 
   // Register routes that need the connectionMap (requires server to exist for WS)

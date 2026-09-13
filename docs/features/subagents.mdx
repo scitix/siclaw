@@ -1,0 +1,174 @@
+---
+title: "Subagents"
+sidebarTitle: "Subagents"
+description: "Delegate independent investigations, guide existing children, and account for complete target inventories."
+---
+
+## Single tasks and batches
+
+The main Agent can delegate a bounded assignment while keeping responsibility for
+the overall plan and final answer. A child has its own conversation, inherits the
+Agent's business rules and authorized tools/resources, and cannot spawn more
+children or change the main Agent's plan.
+
+A single free-form assignment needs no template:
+
+```json
+{
+  "description": "Explain node memory pressure",
+  "items": ["Investigate memory pressure on node-01 in cluster prod. Use read-only evidence. Report the likely cause, supporting observations and unresolved questions."]
+}
+```
+
+Different assignments can also share one batch. Omit `task_template` and give each
+child a complete prompt:
+
+```json
+{
+  "description": "Investigate availability risks",
+  "items": [
+    "Investigate memory pressure on node-01 in cluster prod. Use read-only evidence and report unresolved causes.",
+    "Review the supplied rollout plan for availability risks. Do not execute it; report gaps in rollback coverage."
+  ]
+}
+```
+
+Include the relevant materials in each prompt: children do not automatically receive
+the parent conversation. All items in one call share the selected role and model tier;
+use separate calls when those must differ. Synthesis is optional: omit `reduce_prompt`
+when the parent will combine the reports itself.
+
+For the same investigation across independent targets, use a shared template.
+An optional `reduce_prompt` asks a final child to synthesize every target's report:
+
+```json
+{
+  "description": "Compare node failures",
+  "task_template": "Investigate {{item}} in cluster prod. Report evidence and gaps; choose appropriate diagnostic methods.",
+  "items": ["node-01", "node-02"],
+  "reduce_prompt": "Compare causes and evidence. Distinguish failed checks from unavailable evidence."
+}
+```
+
+The child decides how to investigate. Goals and constraints help it return useful
+findings without prescribing every step. A simple bulk query can be more appropriate
+than launching a child for each node.
+
+## Choose parent context
+
+`fork_turns` controls the starting context of new children:
+
+| Value | Starting context |
+| --- | --- |
+| Omitted or `"none"` | Independent assignment; include the necessary background in its prompt. |
+| Positive integer, such as `2` | The last two user-message turns and their subsequent available messages. |
+| `"all"` | The parent's active model context, retaining existing compaction summaries. |
+
+```json
+{
+  "description": "Verify the previous findings",
+  "fork_turns": 2,
+  "items": ["Independently verify the suspected memory leak using the evidence above. Report confirmations and remaining gaps."]
+}
+```
+
+Select the smallest useful context. Every map child and the optional synthesis child
+receives the same snapshot taken before dispatch yields. This does not replay the
+archived history behind a compaction summary. Turns here are user-message boundaries,
+including guidance or synthetic prompts stored as user messages.
+
+Known historical text, images, completed diagnostic tool evidence and summaries are
+copied as reference data. Parent system/developer messages, private reasoning,
+runtime control messages, pending calls and coordination tool calls/results are
+excluded. The child's business policy, role and authorized tool/resource scope still
+come from its own initialization. History never transfers task ownership or starts
+old tool calls. File paths in history grant no additional filesystem access; file
+contents must be obtained through authorized tools when needed.
+
+Referenced long tool results are copied in full to private child-scoped artifacts,
+with new IDs, existing redaction, integrity checks, quotas and cleanup. Parent resume
+tickets are omitted. Missing/expired evidence, cyclic references, quota exhaustion
+or a context larger than the selected model window fail explicitly; the runtime
+does not silently truncate the history or broaden access. Narrow the selection or
+refresh the evidence if necessary. Images are retained as images.
+
+`fork_turns` cannot be combined with `resume`. Follow-ups retain the child's own
+transcript, including its initial inherited context subject to normal compaction;
+send newly relevant parent findings in the follow-up message.
+
+## Guide or follow up
+
+Launch results include a `resume` handle for each child. Pass that handle with one
+new message to `spawn_subagent`:
+
+```json
+{
+  "description": "Verify the second interface",
+  "resume": "<handle returned by the previous launch>",
+  "items": ["Also inspect eth1 and explain any difference from eth0. Keep the same read-only scope."]
+}
+```
+
+If the child is running, guidance joins its existing execution at a safe boundary.
+If it has finished, the child continues its own saved conversation. The main Agent
+need not copy its previous findings back into a fresh task. A follow-up has a new
+execution record and result, while the child's session remains the same.
+
+Handles only work for the same parent session, Agent and user. They normally expire
+with saved tool outputs after 24 hours. If the transcript or handle is no longer
+available, the tool reports an error so the main Agent can explicitly start a new
+assignment. Once a batch child finishes, wait for the batch's synthesis before
+following up. Revised findings must be integrated into the final answer; they do
+not silently rewrite a previous batch summary.
+
+On persistent conversational surfaces, a single task defaults to foreground and a
+multi-task batch defaults to background. Required background work keeps the request
+active and delivers completion to the main Agent. Channel sessions that require a
+single foreground reply continue to wait for results before responding. This
+feature does not enable detached channel execution.
+
+## Check every target
+
+For "inspect every node", first obtain the complete authorized inventory. Do not
+reconstruct a large target list from a truncated preview. If a saved JSON tool output
+contains a complete array and a source total, `items_from` selects the targets directly:
+
+```json
+{
+  "description": "Inspect inventory nodes",
+  "task_template": "Inspect {{name}} with UID {{uid}} in cluster prod. Report findings and missing evidence.",
+  "items_from": {
+    "artifact_id": "<tool-result artifact ID>",
+    "array_pointer": "/items",
+    "total_pointer": "/total",
+    "fields": {"name": "/metadata/name", "uid": "/metadata/uid"},
+    "identity_field": "uid",
+    "offset": 0,
+    "limit": 50
+  }
+}
+```
+
+This example expects a JSON object containing `total` and `items`, with each item
+containing `metadata.name` and `metadata.uid`. Use pointers matching the actual source.
+Sources without a complete array and a reliable total must first be collected into
+a complete inventory through the authorized source tools.
+
+The tool rejects incomplete pages and duplicate IDs. It returns `coverage` with the
+snapshot total, selected target IDs and `next_offset`. If another offset is returned,
+continue with that offset against the same artifact. Execution results record an
+outcome for each selected ID. Reconcile all waves and call out failures or skipped
+targets before claiming full coverage. A completed task does not mean a healthy node;
+the evidence in its report determines the diagnostic result.
+
+### Continuation records and recovery failures
+
+Caller guidance consumed by a running child is recorded in that child's execution
+history. A completed-child follow-up keeps its native context but creates a new
+execution identity; earlier reports remain historical.
+
+Resuming requires a valid native transcript, including its compaction state. A
+missing, empty or malformed transcript produces an explicit recovery error before
+inference. The runtime does not silently create an empty session or fall back to
+an older transcript. Restore the child's session data or explicitly launch a new
+task with the necessary context. This does not add cross-runtime session storage.

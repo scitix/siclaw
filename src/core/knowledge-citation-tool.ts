@@ -3,8 +3,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../tools/infra/tool-render.js";
+
 import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
 import type { SessionEventEmitter } from "./tool-registry.js";
 import { codePointLength } from "./subagent-models.js";
@@ -350,8 +349,6 @@ export function createKnowledgeCitationSupport(opts: {
   const tool: ToolDefinition = {
     name: "knowledge_cite",
     label: "Cite Knowledge Sources",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("knowledge_cite")), 0, 0),
-    renderResult: renderTextResult,
     description:
       "Use only when the current system prompt says knowledge source citations are available. " +
       "Register the exact evidence refs that materially support your final answer, and unmarked pages if needed — " +

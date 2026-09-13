@@ -1,3 +1,4 @@
+import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
@@ -20,6 +21,8 @@ import { parseHandoffPolicy } from "../shared/agent-handoff.js";
  */
 
 import { normalizeHandoffTrace } from "../shared/handoff-trace.js";
+import { createScriptSandboxApi } from "./script-sandbox/api.js";
+import { SandboxTurnContext } from "./script-sandbox/turn-context.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
@@ -100,12 +103,10 @@ import {
   handleDelegationEvents,
   handleMetricsFlush,
 } from "./internal-api.js";
-import { handleDelegate, handleDelegates } from "./delegate-api.js";
 import { handleSessionHistory } from "./session-history-api.js";
 import { SESSION_HISTORY_PATH } from "../shared/session-history.js";
 import { handleHandoffTargets, handleHandoffSearch } from "./handoff-targets-api.js";
 import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH } from "../shared/agent-handoff.js";
-import { a2aTransportConfig } from "./delegate-a2a-transport.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage, warnTraceBindFailure, validTraceId } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
@@ -167,10 +168,6 @@ export interface StartRuntimeOptions {
  * seconds. Long enough to cover that; short enough that a genuinely missing session fails
  * while the user is still looking at the screen.
  */
-// warnTraceBindFailure moved to chat-repo.ts, next to bindMessageTraceId: the
-// delegation transport (delegate-api.ts) now binds opening rows too, and the
-// once-per-process dedup only works if every bind caller shares one reporter.
-
 const STEER_SESSION_WAIT_MS = 3_000;
 
 /**
@@ -188,27 +185,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── Credential Service ───────────────────────────────────
   if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
   const credentialService = opts.credentialService;
-
-  // ── Delegation transport ─────────────────────────────────
-  // Probed at startup so a misconfigured transport is NAMED here rather than
-  // discovered on the first delegation. Non-fatal on purpose: A2A is now the
-  // default, and a Runtime that never delegates should not fail to boot over
-  // delegation configuration it does not use.
-  //
-  // ⚠️ The dispatch path still THROWS, which is what keeps this warning from
-  // being the only signal: a delegation with a broken config fails loudly at
-  // the point of use. There is no second transport to fall back to, so the only
-  // way this can be unusable is a Runtime missing the server URL or the adapter
-  // secret it needs for everything else too.
-  try {
-    a2aTransportConfig();
-  } catch (err) {
-    console.warn(
-      "[runtime] delegation transport is not usable:",
-      err instanceof Error ? err.message : String(err),
-      "— delegations will fail until this is fixed.",
-    );
-  }
 
   // ── Session Registry resolver ────────────────────────────
   // Cache misses (e.g. async AgentBox callbacks arriving after a Runtime
@@ -239,15 +215,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         | { found: false }
         | { found: true; user_id: string; agent_id: string; target_agent_id?: string | null };
       if (!data.found) return null;
-      // target_agent_id names the peer that executes a delegated leg; dropping it
-      // here left the registry unable to tell that peer from an unrelated agent.
-      // A non-delegated session reports it as null or "", so guard on truthiness
-      // rather than presence. A Portal that omits the field entirely degrades to
-      // the pre-change behaviour — refusals, logged by internal-api, not silence.
+      // Preserve historical peer lineage for readers. It grants no write access;
+      // current session ownership remains the authority for callbacks.
       return {
         userId: data.user_id,
         agentId: data.agent_id,
-        ...(data.target_agent_id ? { targetAgentId: data.target_agent_id } : {}),
       };
     } catch (err) {
       console.error("[session-registry] resolveSession RPC failed:", err);
@@ -269,8 +241,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     ca: certManager.getCACertificate(),
   };
 
+  const sandboxTurns = new SandboxTurnContext();
+  const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
+    const handle = await agentBoxManager.getForSession(principal.agentId, principal.sessionId);
+    // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
+    // Route by the live session binding; only its originating box holds the active
+    // callback grant. A moved/replaced box rejects the grant instead of executing.
+    if (!handle || handle.agentId !== principal.agentId || !principal.callbackToken) {
+      throw new Error("Sandbox callback placement changed");
+    }
+    signal.throwIfAborted();
+    return new AgentBoxClient(handle.endpoint, 95_000, agentBoxTlsOptions).sandboxTool({
+      session_id: principal.sessionId, callback_token: principal.callbackToken, arguments: args,
+      approval,
+    }, signal);
+  }, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId));
+
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
+  rpcMethods.set("sandbox.tool", async params => scriptSandbox.externalTool(params));
 
   // Resolve the per-agent spawn env. Two sources fold together in buildSpawnEnv:
   // the idle self-destruct window (agents.idle_timeout_sec →
@@ -362,7 +351,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * Every turn this Runtime currently has in flight for a session, so an abort can
    * name the one it means.
    *
-   * A session id names a CONVERSATION, and a delegated peer session is reused across
+   * A session id names a CONVERSATION, and a conversation session is reused across
    * turns, so "abort session S" turns ambiguous the moment a turn ends: an abort
    * delayed past that point would land on its successor. Every abort this Runtime
    * sends therefore carries a turn, and the box answers a mismatch as already
@@ -374,21 +363,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * the box would reject the mismatch, and the running turn would continue headless.
    */
   const liveTurnIds = new Map<string, Set<string>>();
-  /**
-   * Which live turns are delegated, so a terminal produced by the SUPERVISOR — a
-   * shutdown, or a box removed under a turn — can be reported with the same
-   * acknowledgement as one produced by the turn itself. Those paths bypass the
-   * turn's own reporting (see supervisorEndedTurns), which is exactly why they
-   * needed their own route to it.
-   */
-  // traceId is the delegated turn's own root trace id, recorded the moment the box's
-  // prompt ack names it. It lives HERE — on the turn's ledger entry — rather than in
-  // the chat.send closure, so both terminal producers (the consumer paths in the
-  // handler and the shutdown/box-roll supervisor above) report the same trace and an
-  // interrupted leg keeps its cross-trace link. (A delegated send that degrades into
-  // a steer of an already-running turn produces no terminal at all — a pre-existing
-  // gap that ends in the source's relay idle-timeout, not a divergent trace.)
-  const delegatedTurns = new Map<string, { delegationId: string; sessionId: string; traceId?: string }>();
+
   /**
    * Work that outlives the turn it belongs to and that shutdown must still flush.
    *
@@ -459,20 +434,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       }
     }
   }
-
-  /**
-   * Wind-down hooks for work that starts turns outside chat.send — today the delegation
-   * endpoint. Registered while that work is under way, so shutdown reaches a delegation
-   * it can no longer refuse, and unregistered when it settles.
-   */
-  const shutdownCancels = new Set<() => Promise<void> | void>();
-  const shutdownGate = {
-    isShuttingDown: () => shuttingDown,
-    register(cancel: () => Promise<void> | void): () => void {
-      shutdownCancels.add(cancel);
-      return () => shutdownCancels.delete(cancel);
-    },
-  };
 
   const pendingShutdownWork = new Set<Promise<void>>();
   const trackForShutdown = (work: Promise<void>): Promise<void> => {
@@ -594,13 +555,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           console.warn(`[runtime] could not report interrupted turn session=${sessionId} turn=${turnId ?? "pending"}:`, err);
         }
       }
-      // ⚠️ 关机时这里以前会给每个被委托 turn 补发一条 `delegation.terminal`,
-      // 理由是"委托方是台机器,不然要干等到 idle 窗口到期才报失败"。那条路随
-      // 私有中继一起删了(见 reportTerminal 上的说明)。
-      //
-      // A2A 之下委托方不会干等:流断了传输就走它自己的 `GET /tasks/{id}` 兜底,
-      // 而控制面的 task 有过期收敛。所以这里不再需要单独的通知路径。
-      for (const turnId of unreported) delegatedTurns.delete(turnId);
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
       // EVERY live turn, not only the streaming one: a turn queued behind the session
@@ -636,11 +590,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   }
 
   /**
-   * Shutdown ends every turn this Runtime is streaming. Delegated ones are reported
-   * with an acknowledgement, which needs the transport that shutdown is about to
-   * close — so wait for those, but briefly: a live connection settles the first
-   * attempt in milliseconds, and a dead one must not hold the process open for the
-   * full retry budget.
+   * Allow in-flight AgentBox abort requests to finish before closing transports,
+   * with a bounded grace period so an unreachable box cannot stall shutdown.
    */
   const SHUTDOWN_TERMINAL_GRACE_MS = 3_000;
 
@@ -649,7 +600,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Fence FIRST, then take stock once.
     //
     // The fence is what makes one snapshot sufficient FOR THE TURNS THIS DRAIN COVERS —
-    // the chat.send and delegation ingresses, which are the only ones ever registered in
+    // the chat.send ingress, whose turns are the only ones ever registered in
     // liveTurnIds. After it, none of their producers can add work this snapshot would
     // miss: no new turn is admitted; a turn that finishes now finds itself already
     // reported and does not report again; and a box removal finds every live turn
@@ -663,14 +614,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // it; closing it means giving those paths the same admission gate and registration,
     // which is its own change.
     shuttingDown = true;
-
-    // Wind down work that is past refusing. Done BEFORE the snapshot below so whatever
-    // these start — a remote delegation.abort, a peer box abort — is waited on too.
-    for (const cancel of [...shutdownCancels]) {
-      trackForShutdown(Promise.resolve().then(cancel).catch((err) => {
-        console.warn("[runtime] shutdown wind-down hook failed:", err);
-      }));
-    }
 
     // Streaming turns AND cold-starting ones: both are ours, and both leave a caller
     // waiting if they simply vanish.
@@ -765,10 +708,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // channels stamp "channel" via their own ensureChatSession. Only consumed
     // when THIS handler creates the session row.
     const origin = params.origin as string | undefined;
-    // Delegation marker: present when a coordinator agent (e.g. the incident
-    // concierge) delegated this turn over the mesh. Forwarded to the agentbox so
-    // the worker gates its toolset read-only and stamps the result artifact.
-    const delegation = params.delegation as PromptOptions["delegation"];
+    if (params.delegation || origin === "delegation") {
+      throw new AgentRetiredError();
+    }
     const allowInputRequest = params.allowInputRequest === true;
     const requireExistingSession = params.requireExistingSession === true || Boolean(params.handoff);
     // The envelope's BINDING CONTEXT must travel with it. The box compares the
@@ -780,13 +722,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // 403 with AUTHORITY_ENVELOPE_MISBOUND.
     const segmentId = typeof params.segmentId === "string" && params.segmentId ? params.segmentId : undefined;
     const boundTaskId = typeof params.taskId === "string" && params.taskId ? params.taskId : undefined;
-    // A cross-Runtime delegation session is created by the coordinator Runtime
-    // before ControlPlane routes this chat.send to the target Runtime. Re-inserting the
-    // session/user row here would overwrite ownership/lineage and duplicate the
-    // delegated task. Only honor the flag on an authenticated delegation turn.
-    // promptMessageId intentionally stays undefined on this path: the source
-    // Runtime already persisted and sequenced the user row, so the target must
-    // not bind or update a second local copy of it.
     // A HANDOFF arrival: the control plane ended the previous agent's turn on a
     // `handoff_requested`, flipped the session's executing agent, and re-sent the
     // brief here — same session, same response stream, new owner.
@@ -794,13 +729,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const handoff = handoffParam?.fromAgentId
       ? { fromAgentId: String(handoffParam.fromAgentId), brief: String(handoffParam.brief ?? "") }
       : undefined;
-    // ⚠️ The flag alone is not enough — it must come with a reason to believe the
-    // user row already exists. Two callers have one: a cross-Runtime delegation
-    // (the source Runtime persisted it) and a handoff hop (the brief is already
-    // in the transfer tool's arguments on the previous turn, so persisting it
-    // again would show the user their question twice under one prompt).
+    // Only skip a row already owned by the control plane: a handoff brief or
+    // explicitly persisted input. The flag alone cannot bypass persistence.
     const skipInitialPersistence = params.skipInitialPersistence === true
-      && (Boolean(delegation?.delegationId) || Boolean(handoff) || params.persistedInput === true);
+      && (Boolean(handoff) || params.persistedInput === true);
     // Machine-facing strict callers cannot safely publish a reusable sessionId
     // until its session and first user message are durable. Interactive chat
     // keeps the legacy best-effort behavior; strict /run opts into this ACK.
@@ -872,27 +804,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       reserveDispatch(dispatchKey, turnId);
     }
 
-    /**
-     * A delegated turn's terminal.
-     *
-     * ⚠️ **这里以前会往控制面回一条 `delegation.terminal`,现在只清账本。**
-     * 那条 RPC 属于私有委托中继的监管层:控制面用它结束一次 relay 的监管。委托
-     * 切到 A2A 之后 relay 永远不会被注册(start 已零调用方),所以那次调用必然
-     * 走 `rel == nil` 分支、永远返回 `alreadyFinished` —— 每个被委托 turn 一次
-     * 白跑的往返,外加一整套为它而存在的重试退避。控制面侧的监管层已整个删除。
-     *
-     * 现在 A2A 从哪知道这一轮结束:peer 的 `prompt_done` / `done` 是 ws control
-     * 帧,tracker 订阅 `chat.event` 直接收到并收敛 task —— 与这条路无关,e2e 里
-     * 也正是这么跑通的。
-     *
-     * ⚠️ 连带丢的是 `traceId`:它以前搭这条终态事件回到发起方 Runtime,存成工具
-     * 行的 `child_trace_id`。补法不在这里 —— 见 delegate-a2a-transport 从 task
-     * 快照读 `peerTraceId`。
-     */
-    const reportTerminal = (_event: Record<string, unknown>): void => {
-      if (!delegation?.delegationId) return;
-      delegatedTurns.delete(turnId);
-    };
     // 交接过来的这一轮,brief 是**上一个 agent 写的**,不是用户写的。不加这一句
     // 框,模型看到的历史就是「用户问 → 助手说了半句 → 用户又问了一遍」—— 它会当成
     // 用户在重复,于是道歉、或者从头再问一次。这段话只进本轮的模型上下文:
@@ -918,7 +829,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
       origin: origin as PromptOptions["origin"],
-      delegation,
       allowInputRequest,
       handoffSupported: params.handoffSupported === true,
       handoffPolicy: parseHandoffPolicy(params.handoffPolicy),
@@ -968,7 +878,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const turnAbort = new AbortController();
     registerPendingStart(sessionId, turnAbort);
     addLiveTurn(sessionId, turnId, turnAbort);
-    if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
+    const releaseSandboxTurn = sandboxTurns.enter(sessionId, agentId, userId, origin);
 
     let promptMessageId: string | undefined = params.persistedInput === true && typeof params.userMessageId === "string"
       ? params.userMessageId : undefined;
@@ -979,9 +889,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await incrementMessageCount(sessionId);
       } catch (persistErr) {
         if (requireSessionPersistence) {
+          releaseSandboxTurn();
           unregisterPendingStart(sessionId, turnAbort);
           dropLiveTurn(sessionId, turnId);
-          delegatedTurns.delete(turnId);
           sessionRegistry.forget(sessionId);
           const err = new Error("chat.send could not durably persist the session before acknowledgement", {
             cause: persistErr,
@@ -1084,16 +994,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           confirmDispatch(dispatchKey);
           console.log(`[runtime] AgentBox prompt result agentId=${agentId} sessionId=${sessionId} turnId=${turnId} boxId=${selectedBoxId} status=200 ok=true durationMs=${Date.now() - promptStartedAt} traceIdPresent=${Boolean(promptResult.traceId)}`);
           // The ack's trace id is gated ONCE and every consumer of it below — the
-          // delegated-turn ledger, the prompt-row bind, the consume's row stamp —
+          // prompt-row bind and the consume's row stamp —
           // uses the gated value: stamping rows with a malformed id one boundary
           // accepts and another rejects is how a turn ends up persisted under an id
           // no link references.
           ackTraceId = validTraceId(promptResult.traceId);
-          // Record the delegated turn's trace id on its ledger entry IMMEDIATELY —
-          // before any Stop/abort handling below — so a turn interrupted between the
-          // ack and the consume still reports the trace its rows were persisted under.
-          const delegated = delegatedTurns.get(turnId);
-          if (delegated) delegated.traceId = ackTraceId;
           // The box now has the session: a steer racing this call can stop waiting, and
           // this row is in line to be processed (see pending-user-rows.ts).
           sessionTurnLocks.markPromptAccepted(sessionId);
@@ -1251,7 +1156,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (!alreadyReported()) {
             const event = promptDoneEvent();
             context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event });
-            reportTerminal(event);
           }
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
@@ -1270,7 +1174,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (!alreadyReported()) {
             const event = promptDoneEvent();
             context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event });
-            reportTerminal(event);
           }
         } finally {
           // Only clear if still ours — a fast re-send for the same session would
@@ -1303,7 +1206,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // `aborted` it reads as a turn that completed.
         if (!supervisorEndedTurns.has(turnId)) {
           context.sendEvent("chat.event", { sessionId, turnId, event: { type: "prompt_done" } });
-          reportTerminal({ type: "prompt_done" });
         }
       } finally {
         // Anything still queued was never consumed — a steer the user sent into a turn
@@ -1311,7 +1213,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         pendingUserRows.clear(sessionId);
         unregisterPendingStart(sessionId, turnAbort);
         dropLiveTurn(sessionId, turnId);
-        delegatedTurns.delete(turnId);
+        releaseSandboxTurn();
         supervisorEndedTurns.delete(turnId);
         boxAbortAsked.delete(turnId);
         releaseTurn?.();
@@ -2622,13 +2524,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
-  // ⚠️ `delegation.control` 删了 —— 它没有发送方了。
-  //
-  // 它是跨 Runtime 委托中继的收尾:目标 Runtime 把控制帧(input_required、
-  // terminal)经控制面可靠投递回源 Runtime,源侧在这里 ack。委托改走 A2A 之后
-  // 这条中继不存在了:peer 的事件由控制面按 A2A 流下发给发起方,ack 语义由
-  // A2A Task 的状态机自己承担。
-
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
   // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to
   // Runtime over the persistent WS connection. We route them through the
@@ -2846,10 +2741,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
-          // Handoff targets — the agents this one may TRANSFER the conversation
-          // to (its backends if it is a facade; the facade + siblings if it is a
-          // backend). Distinct from the delegation roster above: a handoff moves
-          // ownership, it does not call out and come back.
+          // Handoff discovery and authorization are owned by the control plane.
           if (url === HANDOFF_SEARCH_PATH && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             void handleHandoffSearch(req, res, identity, frontendClient);
@@ -2861,18 +2753,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
-          // Delegation roster — peer agents this coordinator may delegate to (via RPC)
-          if (url === "/api/internal/delegates" && method === "GET") {
-            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            void handleDelegates(req, res, identity, frontendClient);
-            return;
-          }
-
-          // Agent-to-agent delegation — coordinator delegates a bounded read-only
-          // task to a peer agent; gateway prompts the peer + returns its artifact.
-          if (url === "/api/internal/delegate" && method === "POST") {
-            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient, shutdownGate });
+          if (url === "/api/internal/script-runs" && (method === "POST" || method === "GET")) {
+            void scriptSandbox.handle(req, res, identity);
             return;
           }
 
@@ -2902,7 +2784,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
-          // Background delegation persistence/audit callback from AgentBox.
+          // Subagent and background-job persistence/audit callback from AgentBox.
           if (url === "/api/internal/delegation-events" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleDelegationEvents(req, res, identity, frontendClient);
@@ -2987,9 +2869,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       await containerObservation?.stop();
       metricsAggregator?.destroy();
       unsubscribeCapabilityReconnect?.();
-      // Before frontendClient.close(): the acknowledged terminal for a delegated turn
-      // travels over that same connection.
-      await endInFlightTurns();
+      await Promise.all([endInFlightTurns(), scriptSandbox.shutdown()]);
       frontendClient.close();
       // Older embedded test/adapter managers may only implement cleanup(); the
       // concrete manager's shutdown() preserves K8s boxes across Runtime rolls.

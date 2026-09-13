@@ -20,6 +20,12 @@ nvm install 22
 nvm use 22
 ```
 
+## The Command Prints Help or Requires a Prompt
+
+The interactive terminal interface has been removed. Use `siclaw local` for the Web UI, or `siclaw --prompt "..."` for one diagnostic run. `--continue` also requires a new `--prompt`.
+
+If a run reports missing providers, configure **Models** in the local Web UI, or prepare `.siclaw/config/settings.json` for a standalone CLI run. The CLI no longer starts a setup wizard.
+
 ## LLM Connection Failures
 
 **Symptom**: "Failed to connect to LLM provider" or empty responses.
@@ -52,8 +58,7 @@ ls .siclaw/credentials/manifest.json
 
 If no kubeconfig has been imported yet:
 
-- TUI: run `/setup`
-- Local Server: open **Credentials** in the Web UI
+Open **Clusters** in the Web UI, import the kubeconfig, and bind it to your agent. A CLI invocation paired with the same local Portal picks it up on its next run.
 
 Then verify the same kubeconfig can read your cluster:
 

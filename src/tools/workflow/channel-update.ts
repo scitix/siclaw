@@ -7,8 +7,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
 
 interface ChannelUpdateParams {
@@ -27,8 +26,6 @@ export function createChannelUpdateTool(refs: ToolRefs): ToolDefinition {
   return {
     name: "channel_update",
     label: "Channel Update",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("channel_update")), 0, 0),
-    renderResult: renderTextResult,
     description:
       "Send a concise user-visible update to the current IM channel when a long-running investigation has " +
       "a meaningful milestone, final conclusion, blocker, or artifact note. Do NOT use this for raw tool " +
@@ -62,10 +59,5 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: createChannelUpdateTool,
   modes: ["channel"],
-  // Suppressed on a delegated turn: a delegated worker's output must flow back to
-  // the coordinator (which owns the single visible identity), never independently
-  // to the worker's own channel card (design agent-delegation.md §5.6). The
-  // read-only filter already drops it under read-only delegation; this guard also
-  // covers a (future) write-tier delegation.
-  available: (refs) => Boolean(refs.channelMessageExecutor && refs.sessionIdRef && !refs.delegation),
+  available: (refs) => Boolean(refs.channelMessageExecutor && refs.sessionIdRef),
 };

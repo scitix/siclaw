@@ -1,3 +1,4 @@
+import { createMcpToolDefinition } from "./mcp-client.js";
 import { describe, it, expect, vi } from "vitest";
 import {
   jsonSchemaToTypebox,
@@ -229,9 +230,8 @@ describe("visualMcpRequestTimeoutMs", () => {
 });
 
 describe("createToolDefinition server description", () => {
-  const manager = new McpClientManager({ mcpServers: {} });
   const makeDef = (serverDescription: string | undefined, toolDescription?: string) =>
-    (manager as any).createToolDefinition(
+    createMcpToolDefinition(
       "grafana",
       serverDescription,
       { name: "query", description: toolDescription },
@@ -259,7 +259,7 @@ describe("createToolDefinition server description", () => {
 
   it("preserves official MCP structuredContent for host-side consumers", async () => {
     const structuredContent = { label: true, info: { summary: "ready" } };
-    const def = (manager as any).createToolDefinition(
+    const def = createMcpToolDefinition(
       "product-support-result",
       undefined,
       { name: "submit_product_support_result" },
@@ -271,7 +271,7 @@ describe("createToolDefinition server description", () => {
       },
     );
 
-    await expect(def.execute("call-1", {})).resolves.toMatchObject({
+    await expect(def.execute("call-1", {}, undefined, undefined, {} as any)).resolves.toMatchObject({
       details: { structuredContent },
     });
   });
@@ -314,4 +314,18 @@ describe("normalizeMcpInputSchema", () => {
     expect(normalizeMcpInputSchema({}) as any).toMatchObject({ type: "object", properties: {} });
     expect(normalizeMcpInputSchema([1, 2]) as any).toMatchObject({ type: "object", properties: {} });
   });
+});
+
+it("shares MCP cancellation and preserves raw structured data only for trusted SDK consumers", async () => {
+  const controller = new AbortController();
+  const response = { content: [{ type: "resource_link", uri: "https://example.test/report", name: "report" }], structuredContent: { rows: [1, 2] } };
+  const client = { callTool: vi.fn(async () => response) };
+  const tool = createMcpToolDefinition("metrics", undefined, { name: "query" }, client, 15000, { includeRawResult: true });
+  expect((await tool.execute("1", {}, controller.signal, undefined, {} as any)).details).toMatchObject({ rawResult: response });
+  expect(client.callTool).toHaveBeenCalledWith({ name: "query", arguments: {} }, undefined, { timeout: 15000, signal: controller.signal });
+  controller.abort();
+  const stopped = await tool.execute("2", {}, controller.signal, undefined, {} as any);
+  expect(stopped.details).toHaveProperty("error"); expect(client.callTool).toHaveBeenCalledOnce();
+  const normal = createMcpToolDefinition("metrics", undefined, { name: "query" }, client);
+  expect((await normal.execute("3", {}, undefined, undefined, {} as any)).details).not.toHaveProperty("rawResult");
 });

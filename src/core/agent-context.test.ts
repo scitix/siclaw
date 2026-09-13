@@ -75,23 +75,6 @@ describe("resolveAgentHarness", () => {
     })).toThrow("Invalid or missing agent_type");
   });
 
-  // 被委托的 turn 跟直接调用解析出同一套 harness。这条曾经断言相反:委托会摘掉
-  // peer 的 MCP、memory 和操作安全段。那是调用方在削被调 agent 的能力,而能力是
-  // 那个 agent 自己的事。
-  it("resolves a delegated turn exactly like a direct one", () => {
-    const input = {
-      agentType: "sre" as const,
-      allowedTools: ["read", "memory_search", "cluster_list"],
-      memoryConfigured: true,
-    };
-    const delegated = resolveAgentHarness({ ...input, delegation: { delegationId: "d1" } });
-    const direct = resolveAgentHarness(input);
-
-    expect(delegated.mcpExposure).toBe(direct.mcpExposure);
-    expect(delegated.memoryEnabled).toBe(direct.memoryEnabled);
-    expect(delegated.includeOperationalSafety).toBe(direct.includeOperationalSafety);
-  });
-
   it("adds the automated-task report tool without broadening interactive capabilities", () => {
     const task = resolveAgentHarness({
       agentType: "knowledge_qa",
@@ -172,22 +155,6 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).toContain("spawn_subagent");
     expect(context.harness.includeBundledSkills).toBe(true);
   });
-
-  it("gives Coordinator resource-locator routing without its own cluster discovery instructions", () => {
-    const context = compileAgentContext({
-      agentType: "coordinator",
-      allowedTools: ["read", "list_delegates", "delegate_to_agent"],
-      memoryConfigured: true,
-      mode: "channel",
-    });
-
-    expect(context.systemPrompt).toContain("# Coordinator Contract");
-    expect(context.systemPrompt).toContain("resource-locator helper");
-    expect(context.systemPrompt).toContain("binding_name_confirmed=true");
-    expect(context.systemPrompt).not.toContain("# Infrastructure Access");
-    expect(context.systemPrompt).not.toContain("Settings → Clusters");
-    expect(context.harness.mcpExposure).toBe("configured");
-  });
 });
 
 describe("createAgentContextManifest", () => {
@@ -221,14 +188,14 @@ describe("createAgentContextManifest", () => {
 
 
 describe("handoff conversation contract", () => {
-  it.each(["sre", "coordinator", "knowledge_qa", "product_support", "custom"])("gives %s the same main-conversation transfer semantics", (agentType) => {
+  it.each(["sre", "knowledge_qa", "product_support", "custom"])("gives %s the same main-conversation transfer semantics", (agentType) => {
     const context = compileAgentContext({ agentType, allowedTools: null, memoryConfigured: false, mode: "web", handoffAvailable: true });
     expect(context.systemPrompt).toContain("Conversation ownership: transfer_to_agent is available");
-    expect(context.systemPrompt).toContain("reserve delegation for independent subtasks");
+    expect(context.systemPrompt).toContain("transfer_to_agent");
   });
   it.each([
     { handoffAvailable: false }, { harnessResolved: false },
-    { mode: "cli" as const }, { delegation: { delegationId: "d1" } },
+    { mode: "cli" as const },
   ])("does not instruct sessions without handoff authority to transfer: %j", (overrides) => {
     const context = compileAgentContext({ agentType: "knowledge_qa", allowedTools: null, memoryConfigured: false, mode: "web", handoffAvailable: true, ...overrides });
     expect(context.systemPrompt).not.toContain("Conversation ownership: transfer_to_agent is available");
@@ -248,4 +215,20 @@ it("asks for concrete missing information when the managed owner has no eligible
     handoffAvailable: false, handoffPolicy: { remaining: 2, visitedAgentIds: ["a"], history: [] } });
   expect(compiled.systemPrompt).toContain("No eligible authorized transfer destination");
   expect(compiled.systemPrompt).toContain("specific missing information or access");
+});
+
+describe("subagent prompt layers", () => {
+  it("retains business policy and safety but omits parent-only planning and spawning guidance", () => {
+    const input = { agentType: "sre", allowedTools: ["read", "cluster_list", "task_create", "task_update", "spawn_subagent"], memoryConfigured: false, agentPrompt: "Only operate in the assigned region" };
+    const parent = compileAgentContext(input);
+    const child = compileAgentContext({ ...input, isSubagent: true, subagentPrompt: "Investigate independently; report gaps to the caller" });
+    expect(child.systemPrompt).toContain(input.agentPrompt);
+    expect(child.systemPrompt).toContain("Investigate independently; report gaps to the caller");
+    expect(child.harness.includePlanningGuidance).toBe(false);
+    expect(child.harness.includeSubagentGuidance).toBe(false);
+    expect(parent.harness.includeSubagentGuidance).toBe(true);
+    expect(child.harness.includeOperationalSafety).toBe(parent.harness.includeOperationalSafety);
+    expect(child.harness.allowedTools).toEqual(parent.harness.allowedTools);
+    expect(parent.systemPrompt).not.toContain("Investigate independently; report gaps to the caller");
+  });
 });

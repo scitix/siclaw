@@ -1,7 +1,4 @@
 import { retainSanitizedToolOutput } from "../../core/tool-output-context.js";
-import { Text } from "@earendil-works/pi-tui";
-
-const PREVIEW_LINES = 5;
 
 /**
  * Maximum characters of tool output sent to the LLM.
@@ -54,37 +51,3 @@ export function processToolOutput(text: string): string {
 
 /** @deprecated Use processToolOutput instead */
 export const truncateOutput = processToolOutput;
-
-/**
- * Shared renderResult for custom tools.
- * Shows last PREVIEW_LINES when collapsed; all lines when expanded (ctrl+o).
- */
-export function renderTextResult(
-  result: any,
-  options: any,
-  theme: any,
-) {
-  const textBlocks = (result.content || []).filter(
-    (c: any) => c.type === "text",
-  );
-  const output: string = textBlocks
-    .map((c: any) => c.text || "")
-    .join("\n")
-    .trim();
-  if (!output) return new Text("", 0, 0);
-
-  const lines = output.split("\n");
-  const styled = lines.map((l: string) => theme.fg("toolOutput", l));
-
-  if (options.expanded || lines.length <= PREVIEW_LINES) {
-    return new Text("\n" + styled.join("\n"), 0, 0);
-  }
-
-  const preview = styled.slice(-PREVIEW_LINES);
-  const skipped = lines.length - PREVIEW_LINES;
-  const hint = theme.fg(
-    "muted",
-    `... (${skipped} earlier lines, ctrl+o to expand)`,
-  );
-  return new Text("\n" + hint + "\n" + preview.join("\n"), 0, 0);
-}

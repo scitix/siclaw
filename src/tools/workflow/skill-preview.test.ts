@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { createSkillPreviewTool, registration } from "./skill-preview.js";
+import { ToolResultArtifactStore, withToolResultArtifactCapture } from "../../core/tool-result-artifact.js";
+import os from "node:os";
+import { persistableToolDetails } from "../../shared/tool-result-metadata.js";
+import { MAX_PREVIEW_METADATA_BYTES } from "../../shared/skill-preview-storage.js";
 
 /** Tests write to the real DRAFTS_BASE (.siclaw/user-data/skill-drafts/) under cwd,
  *  matching production behavior. Each test creates a unique subdirectory and
@@ -41,6 +45,56 @@ describe("skill_preview tool", () => {
     }
     return testSkillDir;
   }
+
+  it("keeps complete preview files in details when artifact capture bounds the model text", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-skill-preview-"));
+    const store = new ToolResultArtifactStore({ rootDir: root, getScope: () => ({ agentId: "a", sessionId: "s" }) });
+    const specs = "---\nname: large-preview\ndescription: Complete preview regression\n---\n" + "Read-only procedure.\n".repeat(800) + "END_OF_SKILL";
+    const script = "#!/bin/sh\nprintf 'PREVIEW_SCRIPT_END'\n";
+    writeSkill(specs, [{ name: "check.sh", content: script }]);
+    try {
+      await store.initialize();
+      const wrapped = withToolResultArtifactCapture(tool, store, 4096);
+      const result = await wrapped.execute("preview-call", { dir: testSkillDir }, undefined, {} as any);
+      const text = result.content.filter(b => b.type === "text").map(b => b.text).join("");
+      expect(text.length).toBeLessThanOrEqual(8000);
+      expect(text).toContain("artifact_id:");
+      const details = JSON.parse(JSON.stringify(result.details)); // SSE/DB round trip
+      expect(details.skillPreview.skill.specs).toBe(specs);
+      expect(details.skillPreview.skill.files.find((f: any) => f.path === "SKILL.md").content).toBe(specs);
+      expect(details.skillPreview.skill.files.find((f: any) => f.path === "scripts/check.sh").content).toBe(script);
+      expect(fs.existsSync(testSkillDir)).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ["ascii", "x".repeat(1_150_000)],
+    ["utf8", "界".repeat(400_000)],
+    ["escaped JSON", '"'.repeat(550_000)],
+  ])("reports an omitted %s preview to the model before artifact capture", async (_kind, reference) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-preview-limit-"));
+    const store = new ToolResultArtifactStore({ rootDir: root, getScope: () => ({ agentId: "a", sessionId: "s" }) });
+    writeSkill("---\nname: oversized-preview\ndescription: Preview limit regression\n---\n# Draft\n");
+    fs.mkdirSync(path.join(testSkillDir, "references"));
+    fs.writeFileSync(path.join(testSkillDir, "references", "notes.txt"), reference + "END_OF_OVERSIZED_REFERENCE");
+    try {
+      await store.initialize();
+      const wrapped = withToolResultArtifactCapture(tool, store, 4096);
+      const result = await wrapped.execute("preview-limit", { dir: testSkillDir }, undefined, {} as any);
+      const text = result.content.filter(b => b.type === "text").map(b => b.text).join("");
+      const modelResult = JSON.parse(text);
+      expect(modelResult).toMatchObject({ error: true, status: "omitted", reason: "size_limit", limitBytes: MAX_PREVIEW_METADATA_BYTES });
+      expect(modelResult.summary).toContain("smaller preview");
+      expect(text).not.toContain("Click View");
+      expect(text).not.toContain("END_OF_OVERSIZED_REFERENCE");
+      expect(result.details).toHaveProperty("error", true);
+      expect(result.details).not.toHaveProperty("toolResultArtifact");
+      const saved = persistableToolDetails(result.details);
+      expect(saved?.skillPreview).toMatchObject({ status: "omitted", reason: modelResult.reason, name: modelResult.name });
+      expect(saved?.skillPreview).not.toHaveProperty("skill");
+      expect(fs.existsSync(testSkillDir)).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 
   // --- Validation ---
 

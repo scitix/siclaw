@@ -1031,7 +1031,7 @@ describe("consumeAgentSse — tool execution", () => {
   it("marks outcome=blocked when details.blocked is true", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "dangerous", args: {} },
-      { type: "tool_execution_end", toolName: "dangerous",
+      { type: "tool_execution_end", toolName: "dangerous", isError: true,
         result: { content: [{ type: "text", text: "blocked" }], details: { blocked: true } } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
@@ -1041,11 +1041,25 @@ describe("consumeAgentSse — tool execution", () => {
   it("marks outcome=error when details.error is true", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "t", args: {} },
-      { type: "tool_execution_end", toolName: "t",
+      { type: "tool_execution_end", toolName: "t", isError: false,
         result: { content: [{ type: "text", text: "oops" }], details: { error: true } } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     expect(updateCalls[0].outcome).toBe("error");
+  });
+
+  it.each(["tool_execution_end", "tool_end"])("persists thrown tool failures from %s even without details.error", async (type) => {
+    const failures = ["Invalid subagent handle", "Handle index out of range", "Handle from another session", "Handle from another caller"];
+    const events = failures.flatMap((text, i) => [
+      { type: "tool_execution_start", toolName: "spawn_subagent", toolCallId: `call-${i}`, args: { resume: `invalid-${i}` } },
+      { type, toolName: "spawn_subagent", toolCallId: `call-${i}`, isError: true,
+        result: { content: [{ type: "text", text }], ...(i === 0 ? {} : { details: i === 1 ? {} : { error: false } }) } },
+    ]);
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const rows = JSON.parse(JSON.stringify(updateCalls));
+    expect(rows.map((row: any) => row.outcome)).toEqual(failures.map(() => "error"));
+    expect(rows.map((row: any) => row.content)).toEqual(failures);
+    expect(rows.map((row: any) => row.messageId)).toEqual(["msg-1", "msg-2", "msg-3", "msg-4"]);
   });
 
   it("persists tool details as metadata (dropping blocked/error flags that are surfaced via outcome)", async () => {
@@ -1122,6 +1136,25 @@ describe("consumeAgentSse — tool execution", () => {
     const evidence = (toolRow.metadata.evidence as Array<{ output: string }>)[0];
     expect(evidence.output).not.toContain("sk-abcdef");
     expect(evidence.output).toContain("[REDACTED]");
+  });
+
+  it("persists full structured skill previews separately from bounded text, with redaction", async () => {
+    const specs = "Read-only evidence\n".repeat(800) + "sk-example END_OF_SKILL";
+    const text = "[Full tool output stored as a recoverable artifact]\nartifact_id: tra_preview";
+    const events = [
+      { type: "tool_execution_start", toolName: "skill_preview", args: { dir: "drafts/test" } },
+      { type: "tool_execution_end", toolName: "skill_preview", result: {
+        content: [{ type: "text", text }],
+        details: { skillPreview: { skill: { name: "large-preview", specs,
+          files: [{ path: "SKILL.md", content: specs }] } } },
+      } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u",
+      persistMessages: true, redactionConfig: { patterns: [/sk-example/g] } });
+    const row = JSON.parse(JSON.stringify(updateCalls[0]));
+    expect(row.content).toBe(text);
+    expect(row.metadata.skillPreview.skill.specs).toBe(specs.replace("sk-example", "[REDACTED]"));
+    expect(row.metadata.skillPreview.skill.files[0].content).toBe(row.metadata.skillPreview.skill.specs);
   });
 
   it("extracts task_report into taskReportText and prioritises it over resultText", async () => {

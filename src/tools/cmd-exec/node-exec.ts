@@ -1,16 +1,17 @@
+import { normalizeExecTarget } from "../infra/exec-utils.js";
+import { ensureSandboxDebugQuota, SANDBOX_DEBUG_NAMESPACE } from "../infra/sandbox-debug.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { DebugPodStartupError } from "../infra/debug-pod.js";
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
@@ -87,11 +88,11 @@ interface NodeExecParams {
   run_in_background?: boolean;
 }
 
-
 export function createNodeExecTool(
   kubeconfigRef?: KubeconfigRef,
   userId?: string,
   bg?: BackgroundExecWiring,
+  trustedOptions?: TrustedToolOutputOptions & { sandboxDiagnostics?: boolean; expiresAtMs?: number },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -181,7 +182,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         description:
           'Diagnostic command to run on the node (e.g. "ip addr show", "nvidia-smi")',
       }),
-      pod: Type.Optional(
+      ...(!trustedOptions?.sandboxDiagnostics ? { pod: Type.Optional(
         Type.String({
           description: "Target pod name. When set, the command runs inside THIS POD's network namespace using host tools (one step — the node + netns are resolved automatically). Use for RDMA/RoCE checks on a pod that lacks the tools (show_gids, ib_write_bw…).",
         }),
@@ -196,17 +197,17 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         Type.String({
           description: 'Advanced: a pre-resolved network namespace name + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
         }),
-      ),
+      ) } : {}),
       cluster: Type.Optional(
         Type.String({
           description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         })
       ),
-      image: Type.Optional(
+      ...(!trustedOptions?.sandboxDiagnostics ? { image: Type.Optional(
         Type.String({
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
         })
-      ),
+      ) } : {}),
       json_path: Type.Optional(
         Type.String({
           description:
@@ -232,20 +233,13 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
           }
         : {}),
     }),
-    renderCall(args: any, theme: any) {
-      const node = args?.node || "...";
-      const cmd = args?.command || "...";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("node_exec")) +
-          " " + theme.fg("accent", node) +
-          " " + theme.fg("toolTitle", theme.bold("$")) +
-          " " + cmd,
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
-      const params = rawParams as NodeExecParams;
+      const params = normalizeExecTarget(rawParams as NodeExecParams);
+      if (trustedOptions?.sandboxDiagnostics && [params.image, params.pod, params.namespace, params.container, params.netns].some(v => v !== undefined)) {
+        // Pod/netns discovery owns a separate debug-pod lifecycle. This managed
+        // invocation must stay on its explicit node and quota-controlled Job.
+        return { content: [{ type: "text", text: "Managed node diagnostics require an explicit node and service-selected image." }], details: { blocked: true } };
+      }
 
       // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
       // would answer with a kubeconfig error and hide the actual mistake.
@@ -416,7 +410,17 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       const fgUserShellEsc = (netnsPrefix + params.command).replace(/'/g, "'\\''");
       const fgPgidFile = backgroundPgidFile(toolCallId);
       const fgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${cap} sh -c '${fgUserShellEsc}'`, fgPgidFile)];
-      const fgSpec = { userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey };
+      if (trustedOptions?.sandboxDiagnostics) {
+        try { await ensureSandboxDebugQuota(env, signal); }
+        catch {
+          return { content: [{ type: "text", text: "Node diagnostic namespace or quota is unavailable. Ask the operator to provision the target cluster." }],
+            details: { blocked: true, reason: "sandbox_facilities_unavailable" } };
+        }
+      }
+      const fgSpec = {
+        ...(trustedOptions?.sandboxDiagnostics ? { namespace: SANDBOX_DEBUG_NAMESPACE, activeDeadlineSeconds: 120, expiresAtMs: trustedOptions.expiresAtMs, confirmCleanup: true } : {}),
+        userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey,
+      };
 
       // Ensure the (idempotent, cache-hit) pod up front, then PIN it for the duration of the exec.
       // runInDebugPod only resets the idle timer AFTER a successful exec, so without a pin a long
@@ -485,6 +489,8 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
           + "command rather than retrying it unchanged.]" : "");
       return {
         content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
+          outputMode: trustedOptions?.outputMode,
+          onOutputData: trustedOptions?.onOutputData,
           stderr: filteredStderr || undefined,
           project: jsonPathProjector(params.json_path),
           // A `--tail=N` window that came back at exactly N lines reads like a complete answer; the
@@ -497,6 +503,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
             : {}),
         }) }],
         details: {
+          ...(trustedOptions?.outputMode === "data" && execResult.truncated ? { truncated: true } : {}),
           exitCode: execResult.exitCode ?? 0,
           exit_class: judgment.exitClass,
           ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),

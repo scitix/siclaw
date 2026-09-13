@@ -38,8 +38,7 @@ export async function createPiExecutionSession(options: PiExecutionOptions) {
   });
   const { session } = result;
 
-  // Web/worker hosts have no TUI binding step to emit session_start. The TUI
-  // may bind again later; state-restoring extensions must remain idempotent.
+  // Restore persisted extension state for every server and headless session.
   await session.bindExtensions({});
 
   const modelEnvelopeManifestRef: { current?: ModelEnvelopeManifest } = {};

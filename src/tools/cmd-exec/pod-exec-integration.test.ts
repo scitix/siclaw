@@ -43,6 +43,22 @@ const run = (params: Record<string, unknown>, signal?: AbortSignal) =>
 
 beforeEach(() => mockExec.mockReset());
 
+it.each([0, 1])("provides separate sanitized SDK channels for exit %s", async exitCode => {
+  const output = { stdout: '{"password":"fixture-secret","ready":true}', stderr: "query warning" };
+  if (exitCode === 0) mockExec.mockResolvedValueOnce(output);
+  else mockExec.mockRejectedValueOnce(Object.assign(new Error("exit"), { code: exitCode, ...output }));
+  const capture = vi.fn();
+  const dataTool = createPodExecTool(undefined, undefined, { outputMode: "data", onOutputData: capture });
+  const result = await dataTool.execute("data", { pod: "p1", command: "cat /etc/example.json" }, new AbortController().signal, {} as never);
+  expect(capture).toHaveBeenCalledOnce();
+  const data = capture.mock.calls[0][0];
+  expect(JSON.parse(data.text)).toEqual({ password: "**REDACTED**", ready: true });
+  expect(data.stderr).toBe("query warning");
+  expect(data.notices.join("\n")).toContain("redacted");
+  expect(result.content[0].text).toBe(data.text);
+  expect(result.details).toMatchObject({ exitCode });
+});
+
 describe("pod_exec: json_path", () => {
   const DOC = JSON.stringify([{ ifname: "eth0", mtu: 1500 }, { ifname: "lo", mtu: 65536 }]);
 

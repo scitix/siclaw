@@ -1,11 +1,9 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 
 import type { ToolEntry } from "../../core/tool-registry.js";
 import type { KnowledgeResolver } from "../../knowledge/resolver.js";
 import { KNOWLEDGE_LABEL_FACETS } from "../../knowledge/labels.js";
-import { renderTextResult } from "../infra/tool-render.js";
 
 interface KnowledgeSearchParams {
   query?: string;
@@ -30,15 +28,6 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
   return {
     name: "knowledge_search",
     label: "Knowledge Search",
-    renderCall(args: any, theme: any) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("knowledge_search")) +
-          " " + theme.fg("accent", args?.query || ""),
-        0,
-        0,
-      );
-    },
-    renderResult: renderTextResult,
     description:
       "Resolve candidate knowledge pages using typed page labels and aliases only; this tool never searches page bodies. " +
       "Use it when the complete Wiki catalog leaves multiple plausible pages or the question uses alternate names, versions, or task terms. " +

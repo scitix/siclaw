@@ -1,0 +1,15 @@
+# Build the normal script runner first, then use this image as an E2B template.
+# No network setup or package installation occurs on the request path.
+ARG SANDBOX_IMAGE=siclaw-script-sandbox:latest
+FROM ${SANDBOX_IMAGE}
+USER root
+COPY docker/script-sandbox/e2b-relay.py /opt/siclaw/e2b-relay.py
+RUN chmod 0700 /root \
+    && chmod -R go-w /opt/siclaw /usr/local/bin \
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
+    && rm -f /usr/bin/sudo /bin/sudo \
+    && chmod 0700 /work && chown 10001:10001 /work
+# envd starts the trusted relay explicitly as root. It drops to UID 10001
+# before launching any user code; secure envd is mandatory at API creation.
+ENTRYPOINT []
+CMD ["/bin/sleep", "infinity"]

@@ -1,12 +1,12 @@
 /**
- * Portal snapshot client — TUI-side.
+ * Portal snapshot client — CLI-side.
  *
- * When `siclaw local` is running on the same machine, `siclaw` (TUI) probes
+ * When `siclaw local` is running on the same machine, `siclaw` (CLI) probes
  * `http://127.0.0.1:<port>/api/health` and, if up, fetches
  * `GET /api/v1/cli-snapshot` to get the Portal's current config snapshot
  * (providers / default model / MCP servers).
  *
- * Auth: the TUI reads `.siclaw/local-secrets.json` to obtain a dedicated
+ * Auth: the CLI reads `.siclaw/local-secrets.json` to obtain a dedicated
  * `cliSnapshotSecret` and sends it in the `X-Siclaw-Cli-Snapshot-Secret`
  * header. The secret is separate from `jwtSecret` on purpose — reading the
  * snapshot does not give the caller the ability to self-sign admin JWTs
@@ -14,9 +14,8 @@
  * request origins, giving a defence-in-depth backstop if `enableCliSnapshot`
  * ever flips on in a non-local deployment.
  *
- * Silent degradation: any failure — file missing, Portal unreachable, HTTP
- * error, wrong secret — returns `null`, and the TUI continues with its
- * settings.json-based loadConfig() path unchanged.
+ * Failures return structured errors. Unscoped CLI invocations may use standalone
+ * settings.json; a selected agent must load successfully before execution.
  */
 
 import fs from "node:fs";
@@ -62,7 +61,7 @@ export interface PortalSnapshot {
   availableAgents: CliSnapshotAgentMeta[];
   activeAgent: CliSnapshotActiveAgent | null;
   generatedAt: string;
-  /** Augmented client-side for /ls display. Not sent by server. */
+  /** Augmented client-side for setup diagnostics. Not sent by server. */
   portalUrl?: string;
 }
 
@@ -81,13 +80,14 @@ const FETCH_TIMEOUT_MS = 3000;
  * snapshot. Knowledge/credential tars are base64-in-JSON so the inflation
  * factor is ~4/3, but 50 MB of decoded payload is already far more than a
  * reasonable per-session wiki. Beyond this, we refuse to buffer rather than
- * risk OOMing the TUI.
+ * risk OOMing the CLI.
  */
 const MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024;
 
 /**
  * Try to load a Portal snapshot. Returns null (silently) if anything goes
- * wrong — caller should fall through to settings.json.
+ * wrong. Callers selecting an agent must use loadPortalSnapshotDetailed and
+ * treat a missing snapshot as a startup failure.
  */
 export interface TryLoadPortalSnapshotOpts {
   /** Override cwd for secrets discovery (tests). */
@@ -113,21 +113,6 @@ export async function tryLoadPortalSnapshot(opts?: TryLoadPortalSnapshotOpts): P
   return result.snapshot;
 }
 
-/**
- * Cheap reachability probe: does `.siclaw/local-secrets.json` exist in cwd and
- * is the Portal answering `/api/health`? Skips the full snapshot fetch — used
- * by the first-run wizard to decide whether to recommend Portal-based setup.
- */
-export async function probeLocalPortal(opts?: { cwd?: string; port?: number }): Promise<{ url: string } | null> {
-  const cwd = opts?.cwd ?? process.cwd();
-  const port = Number(process.env.SICLAW_PORTAL_PORT) || opts?.port || DEFAULT_PORTAL_PORT;
-  const secretsPath = path.resolve(cwd, ".siclaw/local-secrets.json");
-  if (!readSecrets(secretsPath)) return null;
-  const url = `http://127.0.0.1:${port}`;
-  const healthy = await probeHealth(`${url}/api/health`);
-  return healthy ? { url } : null;
-}
-
 export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpts): Promise<{
   snapshot: PortalSnapshot | null;
   error: PortalSnapshotError | null;
@@ -140,8 +125,8 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
   if (!secrets) return { snapshot: null, error: { kind: "no-secrets" } };
   if (!secrets.cliSnapshotSecret) {
     // Older `.siclaw/local-secrets.json` files written before the
-    // cli-snapshot-secret split — treat as no-secrets so the TUI falls
-    // back to settings.json. Re-running `siclaw local` back-fills the
+    // cli-snapshot-secret split — treat as no-secrets so the CLI falls
+    // back to settings.json when no agent was selected. `siclaw local` back-fills the
     // new field.
     return { snapshot: null, error: { kind: "no-secrets" } };
   }
@@ -167,7 +152,7 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
     // Content-Length beyond the cap, abort before buffering a byte of it.
     const advertised = Number(res.headers.get("content-length"));
     if (Number.isFinite(advertised) && advertised > MAX_SNAPSHOT_BYTES) {
-      console.warn(`[portal-snapshot] snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes (advertised=${advertised}) — falling back`);
+      console.warn(`[portal-snapshot] snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes (advertised=${advertised}) — snapshot unavailable`);
       return { snapshot: null, error: { kind: "portal-unreachable" } };
     }
     if (res.status === 404 && opts?.agent) {
@@ -179,7 +164,7 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
       };
     }
     if (!res.ok) {
-      console.warn(`[portal-snapshot] Portal responded ${res.status} — falling back to settings.json`);
+      console.warn(`[portal-snapshot] Portal responded ${res.status} — snapshot unavailable`);
       return { snapshot: null, error: { kind: "auth-failed", status: res.status } };
     }
     // Read with a running byte-count so we stop the moment a chunked response
@@ -187,14 +172,14 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
     // MAX_SNAPSHOT_BYTES even if the server lies about its size.
     const body = await readBodyWithCap(res, MAX_SNAPSHOT_BYTES);
     if (!body) {
-      console.warn(`[portal-snapshot] snapshot exceeded ${MAX_SNAPSHOT_BYTES} bytes mid-stream — falling back`);
+      console.warn(`[portal-snapshot] snapshot exceeded ${MAX_SNAPSHOT_BYTES} bytes mid-stream — snapshot unavailable`);
       return { snapshot: null, error: { kind: "portal-unreachable" } };
     }
     const payload = JSON.parse(body) as PortalSnapshot;
     payload.portalUrl = baseUrl;
     return { snapshot: payload, error: null };
   } catch (err) {
-    console.warn("[portal-snapshot] fetch failed, falling back to settings.json:", (err as Error).message);
+    console.warn("[portal-snapshot] snapshot fetch failed:", (err as Error).message);
     return { snapshot: null, error: { kind: "portal-unreachable" } };
   }
 }

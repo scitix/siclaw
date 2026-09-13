@@ -1,8 +1,7 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { flattenClusterMeta } from "./cluster-meta.js";
 import type { KubeconfigRef } from "../../core/types.js";
 import type { ProbeResult } from "../../agentbox/credential-broker.js";
@@ -41,11 +40,6 @@ export function createClusterListTool(kubeconfigRef: KubeconfigRef): ToolDefinit
   return {
     name: "cluster_list",
     label: "Cluster List",
-    renderCall(args: any, theme: any) {
-      const name = args?.name ? " " + theme.fg("accent", args.name) : "";
-      return new Text(theme.fg("toolTitle", theme.bold("cluster_list")) + name, 0, 0);
-    },
-    renderResult: renderTextResult,
     description: `List and search the Kubernetes clusters bound to this agent — the
 authoritative source for which clusters exist and their admin-maintained context.
 Each cluster always has \`name\` and \`is_production\`; the following appear only

@@ -24,8 +24,11 @@ npm test
 ## Running Locally
 
 ```bash
-# TUI mode (terminal)
+# Local Web UI (Portal + Runtime)
 npm run dev
+
+# Non-interactive diagnostic invocation
+npm run dev:cli -- --prompt "Check recent events"
 
 # Runtime (control plane)
 npm run dev:runtime
@@ -54,11 +57,11 @@ New architectural decisions should get an ADR entry in `docs/design/decisions.md
 
 ## Project Architecture
 
-Siclaw has three entry points, each serving a different deployment role:
+Siclaw has these entry points, each serving a different deployment role:
 
 | How to launch | Source | Role |
 |---------------|--------|------|
-| `siclaw` | `src/cli-main.ts` | Interactive TUI for local diagnostics |
+| `siclaw --prompt "..."` | `src/cli-main.ts` | Non-interactive local diagnostics |
 | `siclaw local` | `src/cli-local.ts` | Single-process Portal + Runtime for local web UI |
 | `node siclaw-gateway.mjs` (or `npm run start:runtime`) | `src/gateway-main.ts` | Runtime control plane (channels, cron, AgentBox spawner) |
 | `npm run start:portal` | `src/portal-main.ts` | Portal: Web UI + REST API + DB + auth + skill/MCP/knowledge admin |
@@ -88,7 +91,7 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 
 **Types:** `feat`, `fix`, `refactor`, `docs`, `chore`, `test`, `perf`, `ci`
 
-**Scope** (optional): the module affected — e.g. `gateway`, `agentbox`, `tui`, `tools`, `memory`, `skills`, `portal-web`
+**Scope** (optional): the module affected — e.g. `gateway`, `agentbox`, `cli`, `tools`, `memory`, `skills`, `portal-web`
 
 **Rules:**
 - Subject line: imperative mood, lowercase, no period, ≤72 characters

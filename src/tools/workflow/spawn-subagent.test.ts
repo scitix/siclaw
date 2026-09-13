@@ -69,7 +69,7 @@ describe("spawn_subagent tool — single-task collapse path", () => {
     const mv = JSON.parse(text(r));
     expect(mv.status).toBe("done");
     expect(mv.item_results).toEqual([
-      { item: "Check disk usage on node-01", status: "done", summary: "node-01 disk 92% full" },
+      { item: "Check disk usage on node-01", status: "done", summary: "node-01 disk 92% full", child_session_id: "child-1" },
     ]);
     expect(mv.reduce_summary).toBeUndefined();
     // details keep the legacy single-spawn fields the AgentWorkCard renders.
@@ -105,7 +105,7 @@ describe("spawn_subagent tool — single-task collapse path", () => {
 });
 
 describe("spawn_subagent tool — availability by session mode (real ToolRegistry.resolve)", () => {
-  // The tool's registration limits it to modes ["web","channel","cli"]. Resolve the REAL tool
+  // The tool's registration limits it to modes ["web","channel"]. Resolve the REAL tool
   // list per entry path (not a hand-built tool) so we assert what each session actually gets:
   // only `channel` (of the modes that have the tool) needs the foreground gate; a2a/api/task
   // don't expose spawn_subagent at all, so foregrounding them would be a no-op.
@@ -114,10 +114,10 @@ describe("spawn_subagent tool — availability by session mode (real ToolRegistr
   const names = (mode: string): string[] =>
     reg.resolve({ mode: mode as any, refs: makeRefs(vi.fn() as any) }).map((t) => t.name);
 
-  it("exposes spawn_subagent in web/channel/cli, and NOT in task/api/a2a", () => {
+  it("exposes spawn_subagent in web/channel, and NOT in cli/task/api/a2a", () => {
     expect(names("channel")).toContain("spawn_subagent");
     expect(names("web")).toContain("spawn_subagent");
-    expect(names("cli")).toContain("spawn_subagent");
+    expect(names("cli")).not.toContain("spawn_subagent");
     expect(names("task")).not.toContain("spawn_subagent");
     expect(names("api")).not.toContain("spawn_subagent");
     expect(names("a2a")).not.toContain("spawn_subagent");
@@ -205,6 +205,40 @@ describe("spawn_subagent tool — validation fail-fast (zero executor calls)", (
 });
 
 describe("spawn_subagent tool — batch (map→reduce) path", () => {
+  it("passes context selection and rejects invalid modes or resume overrides before dispatch", async () => {
+    const executor = vi.fn(async (_req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "job" }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    for (const fork_turns of ["none", "all", 2]) {
+      await tool.execute("context", { description: "Inspect node", items: ["Inspect node"], fork_turns });
+      expect(executor.mock.calls.at(-1)?.[0].forkTurns).toBe(fork_turns);
+    }
+    executor.mockClear();
+    for (const fork_turns of [0, -1, 1.5, "recent", null]) {
+      const result = await tool.execute("context", { description: "Inspect node", items: ["Inspect node"], fork_turns });
+      expect((result.details as any).error).toBe(true);
+    }
+    const result = await tool.execute("resume", { description: "Inspect node", items: ["Inspect node"], resume: "ticket", fork_turns: "none" });
+    expect((result.details as any).error).toBe(true);
+    expect(executor).not.toHaveBeenCalled();
+  });
+
+  it("preserves different complete assignments without a shared template or forced synthesis", async () => {
+    const executor = vi.fn(async (_req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => ({
+      status: "launched", jobId: "independent-work",
+    }));
+    const prompts = [
+      "Investigate node-01 memory pressure. Report evidence and unresolved causes.",
+      "Review the supplied rollout plan for availability risks. Do not execute it.",
+    ];
+    const result = await createSpawnSubagentTool(makeRefs(executor)).execute("independent", {
+      description: "Investigate availability risks", items: prompts,
+    });
+    expect((result.details as any).error).not.toBe(true);
+    expect(executor).toHaveBeenCalledOnce();
+    expect(executor.mock.calls[0][0].renderedTasks).toEqual(prompts.map(prompt => ({ item: prompt, prompt })));
+    expect(executor.mock.calls[0][0].reducePrompt).toBeUndefined();
+  });
+
   it("renders items, passes renderedTasks through, and defaults a multi-item batch to background", async () => {
     let captured: SpawnSubagentGroupRequest | undefined;
     const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => {
@@ -268,8 +302,8 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     // preserve the reduce's context savings), all under the uniform `item_results` key.
     expect(mv.reduce_summary).toBe("All pods hit OOM.");
     expect(mv.item_results).toEqual([
-      { item: "pod-a", status: "done", summary: "OOM" },
-      { item: "pod-b", status: "failed", summary: "unreachable" },
+      { item: "pod-a", status: "done", summary: "OOM", child_session_id: "c1" },
+      { item: "pod-b", status: "failed", summary: "unreachable", child_session_id: "c2" },
     ]);
     expect(mv.status).toBe("partial");
     // details carries the full per-item drill-in data.
@@ -349,8 +383,8 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     const mv = JSON.parse(text(r));
     expect(mv.reduce_summary).toBeUndefined();
     expect(mv.item_results).toEqual([
-      { item: "pod-a", status: "done", summary: "capsule-a" },
-      { item: "pod-b", status: "done", summary: "capsule-b" },
+      { item: "pod-a", status: "done", summary: "capsule-a", child_session_id: "c1" },
+      { item: "pod-b", status: "done", summary: "capsule-b", child_session_id: "c2" },
     ]);
   });
 
@@ -400,5 +434,34 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
       if (prev === undefined) delete process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
       else process.env.SICLAW_SUBAGENT_GROUP_ENABLED = prev;
     }
+  });
+});
+
+describe("spawn_subagent follow-ups and target snapshots", () => {
+  it("sends one follow-up message and exposes its guidance acknowledgement without a ghost running card", async () => {
+    const executor = vi.fn(async () => ({ status: "launched" as const, jobId: "original-job", childSessionId: "child", resumeHandle: "ticket", steered: true }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const result = await tool.execute("new-call", { description: "Verify interfaces", items: ["Also check eth1"], resume: "ticket" });
+    expect(executor.mock.calls[0][0]).toMatchObject({ resumeHandle: "ticket", renderedTasks: [{ prompt: "Also check eth1" }] });
+    expect(JSON.parse(text(result))).toMatchObject({ status: "steered", resume: "ticket" });
+    expect(result.details).toMatchObject({ status: "done", action: "steer" });
+  });
+  it("rejects batch or role overrides when resuming before invoking the executor", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    for (const extra of [{ items: ["a", "b"] }, { subagent_type: "general-purpose" }, { reduce_prompt: "merge" }, { model_tier: "large" }]) {
+      const result = await tool.execute("x", { description: "Follow up", resume: "ticket", items: ["a"], ...extra });
+      expect(JSON.parse(text(result)).error).toBe(true);
+    }
+    expect(executor).not.toHaveBeenCalled();
+  });
+  it("extracts the inventory in the runtime, passing every selected ID and coverage to the executor", async () => {
+    const executor = vi.fn(async () => ({ status: "launched" as const, jobId: "batch" }));
+    const refs = makeRefs(executor);
+    refs.readToolResult = vi.fn(async () => JSON.stringify({ total: 2, nodes: [{ uid: "u1", name: "node1" }, { uid: "u2", name: "node2" }] }));
+    const tool = createSpawnSubagentTool(refs);
+    const result = await tool.execute("batch", { description: "Inspect all nodes", task_template: "Inspect {{name}} ({{uid}})", items_from: { artifact_id: "inventory", array_pointer: "/nodes", total_pointer: "/total", fields: { name: "/name", uid: "/uid" }, identity_field: "uid" } });
+    expect(executor.mock.calls[0][0]).toMatchObject({ renderedTasks: [{ prompt: "Inspect node1 (u1)" }, { prompt: "Inspect node2 (u2)" }], targetCoverage: { total: 2, target_ids: ["u1", "u2"] } });
+    expect(JSON.parse(text(result)).coverage).toMatchObject({ total: 2, selected: 2, next_offset: null });
   });
 });

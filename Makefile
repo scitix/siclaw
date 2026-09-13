@@ -23,6 +23,7 @@ TAG       ?= $(if $(GIT_TAG),$(GIT_TAG),$(VERSION)-$(GIT_COMMIT)$(GIT_DIRTY))
 RUNTIME_IMAGE  = $(REGISTRY)/siclaw-runtime:$(TAG)
 AGENTBOX_IMAGE = $(REGISTRY)/siclaw-agentbox:$(TAG)
 PORTAL_IMAGE   = $(REGISTRY)/siclaw-portal:$(TAG)
+SCRIPT_SANDBOX_IMAGE = $(REGISTRY)/siclaw-script-sandbox:$(TAG)
 OCR_IMAGE      = $(REGISTRY)/siclaw-ocr:$(TAG)
 KBC_IMAGE      = $(REGISTRY)/siclaw-kbc-box:$(TAG)
 
@@ -42,8 +43,8 @@ help: ## Show this help
 # ==================== Development ====================
 ##@ Development
 
-tui: ## Run TUI agent (interactive terminal)
-	npx tsx src/cli-main.ts
+local: ## Run the local Web UI (Portal + Runtime + SQLite)
+	npx tsx src/cli-local.ts
 
 runtime: ## Run Agent Runtime (multi-user, local spawner)
 	npx tsx src/gateway-main.ts
@@ -54,7 +55,7 @@ portal: ## Run Portal server (standalone web UI + management)
 portal-web: ## Run Portal frontend dev server
 	cd portal-web && npm run dev
 
-dev: tui ## Alias for tui
+dev: local ## Alias for local
 
 dev-all: ## Run Runtime + Portal together (use in two terminals)
 	@echo "Terminal 1: make runtime"
@@ -65,7 +66,7 @@ dev-all: ## Run Runtime + Portal together (use in two terminals)
 ##@ Build
 
 build: ## Compile TypeScript
-	npx tsc --project tsconfig.json
+	npm run build
 
 build-portal-web: ## Compile Portal frontend (Vite)
 	cd portal-web && npm install && npm run build
@@ -73,7 +74,9 @@ build-portal-web: ## Compile Portal frontend (Vite)
 # ==================== Docker ====================
 ##@ Docker
 
-docker: docker-runtime docker-agentbox docker-portal docker-ocr docker-kbc ## Build all Docker images
+WITH_SCRIPT_SANDBOX ?= false
+
+docker: docker-runtime docker-agentbox docker-portal docker-ocr docker-kbc $(if $(filter true,$(WITH_SCRIPT_SANDBOX)),docker-script-sandbox) ## Build images (WITH_SCRIPT_SANDBOX=true includes runner)
 
 docker-runtime: ## Build runtime image
 	docker build -f Dockerfile.runtime $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
@@ -84,13 +87,16 @@ docker-agentbox: ## Build agentbox image
 docker-portal: ## Build portal image
 	docker build -f Dockerfile.portal $(DOCKER_LABELS) -t $(PORTAL_IMAGE) .
 
+docker-script-sandbox: ## Build the optional lightweight Python/Bash runner
+	docker build -f Dockerfile.script-sandbox $(DOCKER_LABELS) -t $(SCRIPT_SANDBOX_IMAGE) .
+
 docker-ocr: ## Build OCR backend image
 	docker build -f Dockerfile.ocr $(DOCKER_LABELS) -t $(OCR_IMAGE) .
 
 docker-kbc: ## Build KB compile-box image siclaw-kbc-box (spawned per compile run; helm agentbox.compileBoxEnabled derives this tag)
 	docker build -f kbc/platform/pod/Dockerfile $(DOCKER_LABELS) -t $(KBC_IMAGE) .
 
-push: push-runtime push-agentbox push-portal push-ocr push-kbc ## Push all images to registry
+push: push-runtime push-agentbox push-portal push-ocr push-kbc $(if $(filter true,$(WITH_SCRIPT_SANDBOX)),push-script-sandbox) ## Push images (WITH_SCRIPT_SANDBOX=true includes runner)
 
 push-runtime: ## Push runtime image
 	docker push $(RUNTIME_IMAGE)
@@ -100,6 +106,9 @@ push-agentbox: ## Push agentbox image
 
 push-portal: ## Push portal image
 	docker push $(PORTAL_IMAGE)
+
+push-script-sandbox: ## Push the optional script runner image
+	docker push $(SCRIPT_SANDBOX_IMAGE)
 
 push-ocr: ## Push OCR backend image
 	docker push $(OCR_IMAGE)
@@ -113,7 +122,7 @@ push-kbc: ## Push KB compile-box image siclaw-kbc-box
 test: typecheck unit ## Type check + unit tests
 
 typecheck: ## Type check (no emit)
-	npx tsc --project tsconfig.json --noEmit
+	npm run build --noEmit
 
 unit: ## Run unit tests
 	npx vitest run
@@ -166,9 +175,9 @@ clean: ## Remove build artifacts
 	rm -rf dist *.tsbuildinfo portal-web/dist
 
 # ── All targets are phony (no file outputs) ──
-.PHONY: help tui runtime portal portal-web dev dev-all \
+.PHONY: help local runtime portal portal-web dev dev-all \
 	build build-portal-web \
-	docker docker-runtime docker-agentbox docker-portal \
-	push push-runtime push-agentbox push-portal \
+	docker docker-runtime docker-agentbox docker-portal docker-script-sandbox \
+	push push-runtime push-agentbox push-portal push-script-sandbox \
 	test typecheck unit \
 	info logs logs-runtime logs-portal logs-agentbox status clean

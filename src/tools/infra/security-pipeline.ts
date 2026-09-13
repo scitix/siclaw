@@ -14,7 +14,7 @@ import {
   redactSensitiveContent,
   type OutputAction,
 } from "./output-sanitizer.js";
-import { processToolOutput } from "./tool-render.js";
+import { processToolOutput, sanitizeOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
 import { detectSensitiveResource, redactDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
 
@@ -60,7 +60,20 @@ export function preExecSecurity(
 
 // ── Post-exec ───────────────────────────────────────────────────────
 
-export interface PostExecOptions {
+export interface ToolOutputData {
+  /** Complete sanitized stdout; advisory text belongs in notices or stderr. */
+  text: string;
+  stderr: string;
+  notices: string[];
+}
+
+export interface TrustedToolOutputOptions {
+  /** Trusted, separately bounded data consumers keep complete sanitized channels. */
+  outputMode?: "data";
+  onOutputData?: (data: ToolOutputData) => void;
+}
+
+export interface PostExecOptions extends TrustedToolOutputOptions {
   /** Stderr output — appended after sanitization with "\n\nSTDERR:\n" prefix */
   stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
@@ -97,32 +110,37 @@ export interface PostExecOptions {
 }
 
 /**
- * Post-execution security: sanitize stdout → combine with stderr → truncate.
+ * Post-execution security: sanitize stdout and stderr → combine → render.
  *
- * Sanitization (applySanitizer, redactSensitiveContent) applies to stdout ONLY,
- * not stderr — this preserves JSON validity when kubectl outputs valid JSON to
- * stdout and deprecation warnings to stderr.
+ * Structural stdout sanitization and document stderr redaction run separately
+ * to preserve JSON validity before combining output.
  *
  * This is the ONLY place processToolOutput is called. All tools (cmd-exec and
  * script-exec) must route their final output through this function.
  *
  * For cmd-exec tools: pass the action from preExecSecurity().
- * For script-exec tools: pass null (no command sanitization, just truncate).
+ * Pass null when there is no command-specific output action. Trusted data
+ * consumers may opt out of display truncation/host temp files with outputMode;
+ * they must enforce their own transport and memory budgets.
  */
 export function postExecSecurity(
   stdout: string,
   action: OutputAction | null,
   opts?: PostExecOptions,
 ): string {
+  const notices: string[] = [];
+  const report = opts?.outputMode === "data"
+    ? (notice: string) => { if (!notices.includes(notice)) notices.push(notice); }
+    : undefined;
   // Sanitize the command's own stdout, and only when there IS one. An empty body
   // holds nothing to redact, whereas a structural sanitizer would fail to parse
   // it and suppress the result — dropping the exit code and stderr that are the
   // only evidence of what went wrong.
   let sanitized = stdout;
   if (stdout.trim()) {
-    sanitized = applySanitizer(sanitized, action);
+    sanitized = applySanitizer(sanitized, action, report);
     if (opts?.hasSensitiveKubectl) {
-      sanitized = redactSensitiveContent(sanitized);
+      sanitized = redactSensitiveContent(sanitized, report);
     }
   }
 
@@ -130,6 +148,21 @@ export function postExecSecurity(
   // and nothing we appended to it.
   if (opts?.project) {
     sanitized = opts.project(sanitized);
+  }
+
+  // SDK consumers parse stdout. Keep stderr, sanitizer notices and execution
+  // annotations separate while using the same sanitizers as direct tool calls.
+  if (opts?.outputMode === "data") {
+    const stderr = redactDocument(opts.stderr ?? "");
+    if (stderr.redacted) report!(REDACTION_NOTICE.trim());
+    if (opts.notes) report!(redactDocument(opts.notes).text.trim());
+    const data = {
+      text: sanitizeOutput(sanitized),
+      stderr: sanitizeOutput(stderr.text),
+      notices: notices.map(sanitizeOutput),
+    };
+    opts.onOutputData?.(data);
+    return data.text;
   }
 
   // Everything below is literal text we generate, so it is appended after

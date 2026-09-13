@@ -1,5 +1,5 @@
 /**
- * Unified configuration loader for AgentBox / TUI.
+ * Unified configuration loader for AgentBox / CLI.
  *
  * LLM provider config (API key, base URL, models) is stored exclusively in
  * settings.json — environment variables are NOT used for sensitive credentials.
@@ -42,7 +42,7 @@ export interface ProviderModelConfig {
    * disagreeing. Never emit an empty string — pi drops such a model from its
    * registry outright ("model not found", not a protocol error).
    *
-   * Optional only because the TUI's hand-written settings.json may omit it.
+   * Optional only because the CLI's hand-written settings.json may omit it.
    */
   api?: string;
   reasoning?: boolean;
@@ -244,7 +244,7 @@ export function normalizeReplicas(v: unknown): number {
 export function isMemoryEnabled(): boolean {
   // Off by default — memory (memory_search/memory_get + session auto-save) is an
   // opt-in feature. Enable explicitly via SICLAW_MEMORY_ENABLED=true (helm:
-  // runtime.memory.enabled). When the env is unset (local dev, TUI, tests) memory
+  // runtime.memory.enabled). When the env is unset (local dev, CLI, tests) memory
   // stays disabled so no memory-facing prompt text or tools leak in.
   return parseBooleanEnv(process.env.SICLAW_MEMORY_ENABLED, false);
 }
@@ -601,7 +601,7 @@ export function validateLlmConfig(): string[] {
 
   const providerEntries = Object.entries(config.providers);
   if (providerEntries.length === 0) {
-    warnings.push("No LLM providers configured. Use /setup → Models to configure.");
+    warnings.push("No LLM providers configured. Configure providers in the local Web UI (siclaw local) or .siclaw/config/settings.json.");
     return warnings;
   }
 
@@ -616,7 +616,7 @@ export function validateLlmConfig(): string[] {
   if (!provider.apiKey) {
     warnings.push(
       `Provider "${defaultProviderName}" has no apiKey. ` +
-      `Use /setup → Models to configure.`,
+      `Configure providers in the local Web UI (siclaw local) or .siclaw/config/settings.json.`,
     );
   }
 

@@ -1,13 +1,13 @@
+import { normalizeExecTarget } from "../infra/exec-utils.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "./background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
-import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity, type TrustedToolOutputOptions } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
@@ -103,6 +103,7 @@ function noteSshFailure(host: string, stage: string): string {
 export function createHostExecTool(
   kubeconfigRef?: KubeconfigRef,
   bg?: BackgroundExecWiring,
+  trustedOptions?: TrustedToolOutputOptions & { hostKeyPins?: Record<string, string> },
 ): ToolDefinition {
   // run_in_background is exposed only when the switch is on AND a runtime executor was
   // injected — otherwise the param stays out of the schema.
@@ -188,20 +189,8 @@ Examples (pass the id from host_list; names shown here for readability):
           }
         : {}),
     }),
-    renderCall(args: any, theme: any) {
-      const host = args?.host || "...";
-      const cmd = args?.command || "...";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("host_exec")) +
-          " " + theme.fg("accent", host) +
-          " " + theme.fg("toolTitle", theme.bold("$")) +
-          " " + cmd,
-        0, 0,
-      );
-    },
-    renderResult: renderTextResult,
     async execute(toolCallId, rawParams, signal) {
-      const params = rawParams as HostExecParams;
+      const params = normalizeExecTarget(rawParams as HostExecParams);
 
       // An unsupported PARAMETER COMBINATION is decided before any work: resolving a cluster first
       // would answer with a kubeconfig error and hide the actual mistake.
@@ -235,6 +224,13 @@ Examples (pass the id from host_list; names shown here for readability):
       let target;
       try {
         target = await acquireSshTarget(kubeconfigRef?.credentialBroker, params.host, "host_exec");
+        if (trustedOptions?.hostKeyPins) {
+          for (let hop = target; hop; hop = hop.jumpHost!) {
+            const key = `${hop.host}:${hop.port}`;
+            if (!Object.hasOwn(trustedOptions.hostKeyPins, key)) throw new Error("Host key pin required");
+            hop.expectedHostKey = trustedOptions.hostKeyPins[key];
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -378,6 +374,8 @@ Examples (pass the id from host_list; names shown here for readability):
         content: [{
           type: "text",
           text: postExecSecurity(result.stdout.trim(), pre.action, {
+            outputMode: trustedOptions?.outputMode,
+            onOutputData: trustedOptions?.onOutputData,
             stderr: result.stderr.trim() || undefined,
             project: jsonPathProjector(params.json_path),
             ...(notes ? { notes } : {}),
@@ -391,6 +389,7 @@ Examples (pass the id from host_list; names shown here for readability):
           }),
         }],
         details: {
+          ...(trustedOptions?.outputMode === "data" && result.truncated ? { truncated: true } : {}),
           exitCode: result.exitCode,
           exit_class: judgment.exitClass,
           ...(judgment.channelLeg ? { channel_leg: judgment.channelLeg } : {}),

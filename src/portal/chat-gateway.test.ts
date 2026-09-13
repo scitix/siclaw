@@ -1,3 +1,5 @@
+vi.mock("./web-session-claim.js", () => ({ claimWebChatSession: vi.fn().mockResolvedValue(true) }));
+import { claimWebChatSession } from "./web-session-claim.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
@@ -73,7 +75,7 @@ function makeConnMap(overrides: Partial<RuntimeConnectionMap> = {}): RuntimeConn
   };
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); vi.mocked(claimWebChatSession).mockResolvedValue(true); });
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
@@ -176,10 +178,26 @@ describe("chat-gateway routes", () => {
       expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.send", expect.objectContaining({
         agentId: "a1",
         userId: "u1",
+        origin: "web",
         text: "hi",
         sessionId: "s1",
         systemPrompt: "You are an ops bot.",
       }));
+    });
+
+    it("rejects another user's session before opening SSE or sending a command", async () => {
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+      vi.mocked(claimWebChatSession).mockResolvedValueOnce(false);
+      const res = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send", method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` }, body: { text: "hi", session_id: "foreign" },
+      }));
+      expect(res._status).toBe(404);
+      expect(connMap.subscribe).not.toHaveBeenCalled();
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
     });
 
     it("forwards agent modelRouting to Runtime chat.send", async () => {

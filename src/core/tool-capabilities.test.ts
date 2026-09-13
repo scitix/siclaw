@@ -4,12 +4,14 @@ import {
   resolveCapabilities,
   encodeToolCapabilitiesForDb,
   parseToolCapabilitiesAtBoundary,
+  removeRetiredCapabilityKeys,
 } from "./tool-capabilities.js";
 // Frontend catalog (the hand-maintained UI copy). Imported directly so the
 // drift guard below compares the live constants — refactor-safe and
 // type-checked, unlike text-parsing the source. This import only resolves under
 // vitest (esbuild); the tsc build/typecheck exclude **/*.test.ts, so the
 // cross-tree `.ts` import never reaches the Node16 build resolver.
+import { effectiveCapabilityKeys } from "./agent-types.js";
 import { CAPABILITY_GROUPS as FRONTEND_CAPABILITY_GROUPS } from "../../portal-web/src/lib/toolCapabilities.ts";
 
 describe("resolveCapabilities", () => {
@@ -27,6 +29,11 @@ describe("resolveCapabilities", () => {
     expect(resolveCapabilities(["read_files"])).toEqual([
       "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
     ]);
+  });
+
+  it("sandbox capability does not grant legacy script or command tools", () => {
+    expect(resolveCapabilities(["run_sandbox"])).toEqual(["run_script"]);
+    expect(resolveCapabilities(["run_scripts"])).not.toContain("run_script");
   });
 
   it("multiple groups resolve to the union of their tools", () => {
@@ -64,13 +71,14 @@ describe("resolveCapabilities", () => {
     expect(result).toEqual(["manage_schedule"]);
   });
 
-  it("CAPABILITY_GROUPS contains the 12 designed groups", () => {
+  it("CAPABILITY_GROUPS includes an explicit zero-tool group", () => {
     expect(Object.keys(CAPABILITY_GROUPS).sort()).toEqual([
-      "delegate_agents",
       "inspect_infra",
+      "no_tools",
       "plan_tasks",
       "read_files",
       "run_commands",
+      "run_sandbox",
       "run_scripts",
       "scheduling",
       "search_memory",
@@ -161,5 +169,37 @@ describe("frontend ↔ backend CAPABILITY_GROUPS parity", () => {
     expect(normalizeFrontend(FRONTEND_CAPABILITY_GROUPS)).toEqual(
       normalizeBackend(CAPABILITY_GROUPS),
     );
+  });
+});
+
+describe("retired capability grant preservation", () => {
+  const resolveStoredCustom = (value: unknown) => resolveCapabilities(
+    effectiveCapabilityKeys("custom", parseToolCapabilitiesAtBoundary(value)),
+  );
+
+  it.each([
+    [["delegate_agents"], []],
+    [["delegate_agents", "delegate_agents"], []],
+    [["read_files", "delegate_agents"], CAPABILITY_GROUPS.read_files],
+    [["delegate_agents", "future_key"], []],
+    [["no_tools"], []],
+    [[], null],
+    [null, null],
+  ])("preserves the concrete grant after encoding %j", (input, expected) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const stored = encodeToolCapabilitiesForDb(input);
+      expect(resolveStoredCustom(stored)).toEqual(expected);
+      if (Array.isArray(input)) {
+        expect(resolveStoredCustom(removeRetiredCapabilityKeys(input))).toEqual(expected);
+      }
+    } finally { warn.mockRestore(); }
+  });
+
+  it("makes an explicit zero-tool group additive without changing empty selection compatibility", () => {
+    expect(resolveStoredCustom('["no_tools","read_files"]')).toEqual(CAPABILITY_GROUPS.read_files);
+    expect(resolveStoredCustom('["no_tools"]')).toEqual([]);
+    expect(resolveStoredCustom('[]')).toBeNull();
+    expect(resolveStoredCustom(null)).toBeNull();
   });
 });

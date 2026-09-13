@@ -1,5 +1,7 @@
 # Context Episode Lifecycle
 
+> Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
+
 > Status: design (no implementation yet)
 > Author: discussion-driven (lrli)
 > Supersedes nothing; complements `guards.md` (compaction) and the per-agent

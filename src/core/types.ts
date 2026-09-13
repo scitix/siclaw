@@ -12,41 +12,12 @@ import type { MemoryIndexer } from "../memory/indexer.js";
 
 export type SessionMode = "web" | "channel" | "cli" | "task";
 
-// ── Delegation (agent-to-agent, siclaw-native via the gateway) ──
-
 /**
  * Entry-form of a prompt, as stamped by the caller (web / api / a2a / channel /
  * cron). Used for audit categorization and to carry the entry context into a
- * delegated turn. `undefined` ⇒ web.
+ * conversation turn. `undefined` ⇒ web.
  */
-export type OriginKind = "web" | "api" | "a2a" | "channel" | "task";
-
-/**
- * Present when this turn was delegated by a coordinator agent to a peer,
- * siclaw-native via the gateway's internal delegate API. Its presence marks the
- * turn as delegated. Carried end-to-end from the delegate request to the
- * worker's ToolRefs so the worker can stamp the result artifact with
- * `delegationId`.
- *
- * ⚠️ THERE IS NO PERMISSION TIER HERE, and there should not be one. A peer runs
- * under ITS OWN configuration — capabilities, persona, model. "Read-only" is a
- * property of an agent, expressed by its capability groups, not a dial the
- * caller turns per call: an agent whose prompt says "diagnose and fix" with its
- * write tools stripped is told to act and cannot, which is why the flag that
- * used to live here also had to delete the peer's persona to stay coherent.
- * Want a read-only investigator? Define one as an agent and put it in the
- * roster.
- *
- * Wire contract: see docs/design/agent-delegation.md.
- */
-export interface DelegationContext {
-  /** Correlates this delegated turn back to the coordinator's delegation record. */
-  delegationId: string;
-  /** Coordinator's session id (metadata; not load-bearing for the worker). */
-  parentSessionId?: string;
-  /** Coordinator's agent id (metadata; not load-bearing for the worker). */
-  parentAgentId?: string;
-}
+export type OriginKind = "web" | "webchat" | "api" | "a2a" | "channel" | "task";
 
 // ── Mutable ref types ──
 

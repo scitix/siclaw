@@ -7,8 +7,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { renderTextResult } from "../infra/tool-render.js";
+
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
 import { BACKGROUND_BASH_ENABLED, RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 
@@ -19,8 +18,6 @@ export function createJobStopTool(
   return {
     name: "job_stop",
     label: "Stop Job",
-    renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("job_stop")), 0, 0),
-    renderResult: renderTextResult,
     description: "Cancel a running background job (sub-agent or bash command) by its job_id, returned when it was launched with run_in_background.",
     parameters: Type.Object({
       job_id: Type.String({ description: "The job_id returned by a background spawn_subagent or background bash launch." }),

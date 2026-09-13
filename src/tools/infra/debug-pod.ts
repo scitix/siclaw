@@ -77,6 +77,7 @@ export function buildDebugJobManifest(
   image: string,
   activeDeadlineSeconds: number,
   nodeName: string,
+  expiresAtMs?: number,
 ): Record<string, unknown> {
   return {
     apiVersion: "batch/v1",
@@ -97,7 +98,11 @@ export function buildDebugJobManifest(
             name: "debug",
             image,
             securityContext: { privileged: true },
-            command: ["sleep", "infinity"],
+            // An absolute stop time also fences Jobs whose controller or scheduler
+            // resumes after the admission lease. Never start a fresh full TTL then.
+            command: expiresAtMs === undefined ? ["sleep", "infinity"] : ["sh", "-c",
+              'remaining=$(( $1 - $(date +%s) )); [ "$remaining" -gt 0 ] && exec sleep "$remaining"',
+              "deadline", String(Math.floor(expiresAtMs / 1000))],
             resources: { limits: DEBUG_POD_RESOURCE_LIMITS },
           }],
         },
@@ -182,7 +187,7 @@ const CLEANUP_RETRY_INTERVAL_MS = 2_000;
  * final warning but does NOT throw — the Job's activeDeadlineSeconds +
  * ttlSecondsAfterFinished are the safety net (the cluster cleans it up regardless).
  *
- * Note: does not support AbortSignal. Worst-case retry loop is 6s (3 × 2s).
+ * Note: does not support AbortSignal. Worst-case retry loop is 34s (three 10s attempts plus two 2s gaps).
  * Callers on shutdown paths (evictAll) use Promise.allSettled; awaits may be
  * truncated by process exit, which is acceptable since the Job self-cleans.
  */
@@ -193,11 +198,13 @@ export async function deleteDebugJob(
     namespace: string;
     nodeName: string;
     force?: boolean;
+    confirmCleanup?: boolean;
   },
 ): Promise<boolean> {
   const deleteArgs = [
     "delete", "job", jobName,
     ...(opts.force ? ["--force", "--grace-period=0"] : []),
+    ...(opts.confirmCleanup ? ["--cascade=foreground", "--wait=true", "--timeout=8s"] : []),
   ];
 
   for (let attempt = 1; attempt <= CLEANUP_MAX_RETRIES; attempt++) {
@@ -306,10 +313,19 @@ export interface CachedPod {
  */
 export class DebugPodCache {
   private readonly pods = new Map<string, CachedPod>();
+  private readonly owned = new Map<string, Map<string, { env: ExecEnv; namespace: string; nodeName: string }>>();
   private readonly creating = new Map<string, Promise<void>>();
 
   private key(userId: string, clusterKey: string, nodeName: string): string {
     return `${userId}:${clusterKey}:${nodeName}`;
+  }
+
+  /** Cleanup ownership survives cache removal and failed creation replies. */
+  own(userId: string, clusterKey: string, nodeName: string, jobName: string, namespace: string, env: ExecEnv): void {
+    const key = this.key(userId, clusterKey, nodeName);
+    const jobs = this.owned.get(key) ?? new Map();
+    jobs.set(jobName, { env, namespace, nodeName });
+    this.owned.set(key, jobs);
   }
 
   /**
@@ -486,13 +502,14 @@ export class DebugPodCache {
    * Moving pods.delete after deleteDebugJob would risk returning a stale
    * (being-deleted) entry to concurrent get() callers, which is worse.
    */
-  private async evict(key: string): Promise<void> {
+  private async evict(key: string, confirmCleanup = false): Promise<void> {
     const entry = this.pods.get(key);
     if (!entry) return;
     // Pinned by an in-flight holder (e.g. a background job streaming a long exec) —
     // do not delete; re-arm so we retry after the next idle window.
     if (entry.refCount > 0) {
       this.armIdle(entry, key);
+      if (confirmCleanup) throw new Error("Diagnostic still has an active owner");
       return;
     }
     clearTimeout(entry.idleTimer);
@@ -506,10 +523,12 @@ export class DebugPodCache {
       userId: entry.userId,
     });
 
-    await deleteDebugJob(entry.jobName, entry.env, {
+    const deleted = await deleteDebugJob(entry.jobName, entry.env, {
       namespace: entry.namespace,
       nodeName: entry.nodeName,
+      ...(confirmCleanup ? { confirmCleanup: true } : {}),
     });
+    if (confirmCleanup && !deleted) throw new Error("Sandbox diagnostic cleanup unconfirmed");
   }
 
   /** Check if a pod is being created for this key (for testing/diagnostics). */
@@ -522,9 +541,26 @@ export class DebugPodCache {
     return this.pods.size;
   }
 
-  /**
-   * Evict all cached pods immediately. Used for graceful shutdown.
-   */
+  /** Dispose only the caller-owned diagnostic Job while its credentials still exist. */
+  async evictFor(userId: string, clusterKey: string, nodeName: string): Promise<void> {
+    const key = this.key(userId, clusterKey, nodeName);
+    const jobs = this.owned.get(key);
+    if (!jobs) { await this.evict(key, true); return; }
+    const cached = this.pods.get(key);
+    if (cached?.refCount) throw new Error("Diagnostic still has an active owner");
+    this.remove(userId, clusterKey, nodeName);
+    try {
+      const results = await Promise.allSettled([...jobs].map(([jobName, handle]) =>
+        deleteDebugJob(jobName, handle.env, { namespace: handle.namespace, nodeName, confirmCleanup: true })));
+      if (results.some(result => result.status !== "fulfilled" || !result.value)) throw new Error("Sandbox diagnostic cleanup unconfirmed");
+    } finally {
+      // The caller disposes its credential snapshot after this bounded attempt.
+      // On failure the Job deadline/quota and retained admission lease remain.
+      this.owned.delete(key);
+    }
+  }
+
+  /** Evict all cached pods immediately. Used for graceful shutdown. */
   async evictAll(): Promise<void> {
     const keys = [...this.pods.keys()];
     await Promise.allSettled(keys.map((k) => this.evict(k)));
@@ -537,6 +573,11 @@ export const debugPodCache = new DebugPodCache();
 // ── Debug Pod spec & orchestrator ───────────────────────────────────
 
 export interface DebugPodSpec {
+  /** Trusted infrastructure overrides; never exposed in tool arguments. */
+  namespace?: string;
+  activeDeadlineSeconds?: number;
+  expiresAtMs?: number;
+  confirmCleanup?: boolean;
   userId: string;
   nodeName: string;
   /** Full command array for the container (including nsenter if needed). */
@@ -573,7 +614,7 @@ export async function ensureDebugPodReady(
   const config = loadConfig();
   const image = spec.image || config.debugImage;
   const clusterKey = spec.clusterKey || "default";
-  const debugNamespace = config.debugNamespace;
+  const debugNamespace = spec.namespace ?? config.debugNamespace;
   const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
 
   // A node that just failed to host a debug pod is not asked again straight away — replay the
@@ -598,17 +639,20 @@ export async function ensureDebugPodReady(
       const debugId = randomBytes(4).toString("hex");
       const jobName = `node-debug-${debugId}`;
       const labels = { ...buildDebugPodLabels(spec.userId, spec.nodeName), [LABEL_DEBUG_ID]: debugId };
+      if (spec.confirmCleanup) debugPodCache.own(spec.userId, clusterKey, spec.nodeName, jobName, debugNamespace, env);
 
       // A Job (not a bare Pod) so the cluster self-cleans it: when the pod hits
       // activeDeadlineSeconds (or its owner is deleted), the Job finishes and
       // ttlSecondsAfterFinished deletes it — no external GC, on every cluster.
       const manifest = JSON.stringify(
-        buildDebugJobManifest(jobName, labels, image, config.debugPodTTL, spec.nodeName),
+        buildDebugJobManifest(jobName, labels, image, spec.activeDeadlineSeconds ?? config.debugPodTTL, spec.nodeName, spec.expiresAtMs),
       );
 
       try {
         await ensureDebugNamespace(debugNamespace, env);
 
+        opts.signal?.throwIfAborted();
+        if (spec.expiresAtMs !== undefined && spec.expiresAtMs <= Date.now()) throw new Error("Diagnostic deadline expired");
         await spawnAsync(
           "kubectl",
           [...env.kubeconfigArgs, "-n", debugNamespace, "create", "-f", "-"],
@@ -639,6 +683,7 @@ export async function ensureDebugPodReady(
             namespace: debugNamespace,
             nodeName: spec.nodeName,
             force: true,
+            ...(spec.confirmCleanup ? { confirmCleanup: true } : {}),
           });
           // Carry the phase out. Discarding it left one sentence for every startup failure, so a
           // pod that reached a terminal phase read exactly like an API error.
@@ -655,6 +700,7 @@ export async function ensureDebugPodReady(
           namespace: debugNamespace,
           nodeName: spec.nodeName,
           force: true,
+          ...(spec.confirmCleanup ? { confirmCleanup: true } : {}),
         }).catch(() => {});
         // Remembered HERE, still holding the creation lock. getOrCreate's `finally` resolves every
         // waiter before our caller's catch block runs, so a memo written out there loses the race:
@@ -892,7 +938,7 @@ export async function runInDebugPod(
 ): Promise<ExecResult> {
   const config = loadConfig();
   const clusterKey = spec.clusterKey || "default";
-  const debugNamespace = config.debugNamespace;
+  const debugNamespace = spec.namespace ?? config.debugNamespace;
   const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
 
   // ── Phase 0: Get or create a reusable pod ─────────────────────────

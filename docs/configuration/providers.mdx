@@ -6,7 +6,7 @@ description: "Configure Siclaw to use Anthropic, OpenAI, Ollama, or any compatib
 
 Siclaw needs an LLM to power its investigation engine.
 
-- **TUI mode** reads `.siclaw/config/settings.json`
+- **Standalone headless CLI** reads `.siclaw/config/settings.json`
 - **Local Server / Gateway** is typically configured through the **Models** page in the Web UI
 
 ## Anthropic (Recommended)
@@ -92,7 +92,7 @@ See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/setting
 
 ## Configuration Methods
 
-- **TUI mode**: First-run wizard or `/setup` command inside a session
+- **Headless CLI**: Prepare `.siclaw/config/settings.json`, or reuse a local Portal snapshot from the same workspace
 - **Local Server / Gateway**: Configure providers and models in the Web UI
 
 ## Embedding Provider

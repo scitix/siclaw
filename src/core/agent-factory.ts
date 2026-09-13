@@ -39,9 +39,6 @@ import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
-import setupExtension from "./extensions/setup.js";
-import lsExtension from "./extensions/ls.js";
-import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
@@ -50,7 +47,8 @@ import {
   type ModelEnvelopeManifest,
 } from "./model-envelope.js";
 import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
-import { McpClientManager } from "./mcp-client.js";
+import type { McpClientManager } from "./mcp-client.js";
+import { resolveSessionMcpTools } from "./session-mcp-tools.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
@@ -69,9 +67,11 @@ import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
 
 import { allowsBackgroundExec } from "./background-execution-policy.js";
-import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
+import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
+  scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
+  scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
@@ -79,18 +79,6 @@ export interface CreateSiclawSessionOpts {
   activeMode?: AgentMode;
   /** True when building a spawned sub-agent (child) — hides the plan/task tools. */
   isSubagent?: boolean;
-  /**
-   * Present when this turn was delegated by a coordinator agent over the mesh.
-   * When `readOnly`, the resolved toolset is filtered to read-only-delegable tools
-   * (registry `readOnlyDelegable` + read file tools), so a delegated worker cannot
-   * write/remediate. See docs/design/agent-delegation.md §8.
-   */
-  delegation?: DelegationContext;
-  /** Coordinator side: peer agents this agent may delegate to (manifest for the
-   *  delegate_to_agent tool). Non-empty + executor → the tool is exposed. */
-  delegationRoster?: import("./tool-registry.js").ToolRefs["delegationRoster"];
-  /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
-  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /** Facade / backend side: agents this one may HAND the conversation to
    *  (internal index only). Non-empty plus a search executor exposes discovery and transfer. */
   handoffTargets?: import("./tool-registry.js").ToolRefs["handoffTargets"];
@@ -106,6 +94,7 @@ export interface CreateSiclawSessionOpts {
   harnessResolved?: boolean;
   /** Persisted Agent-owned addendum; built-in type contracts are compiled separately. */
   systemPromptAppend?: string;
+  subagentPrompt?: string;
   /** Legacy platform-template override for standalone callers; not an Agent setting. */
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
@@ -120,16 +109,16 @@ export interface CreateSiclawSessionOpts {
   mcpServers?: Record<string, unknown>;
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
-  /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
+  /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (headless CLI). */
   agentId?: string | null;
   /**
    * Absolute knowledge directory override for an AgentBox. LocalSpawner uses
    * this to isolate agents that otherwise share one cwd. Unset keeps the
-   * config-driven pod/TUI path.
+   * config-driven pod/CLI path.
    */
   knowledgeDir?: string;
   /**
-   * Authoritative scoped resolved-skill directory. Portal-paired TUI and
+   * Authoritative scoped resolved-skill directory. Portal-paired CLI and
    * LocalSpawner pass this so the session never falls back to process-shared
    * skills while the scoped sync is missing or pending.
    */
@@ -141,24 +130,6 @@ export interface CreateSiclawSessionOpts {
    * markdown links and legacy `[[page]]` links to Portal-managed content.
    */
   portalKnowledgeDir?: string;
-  /**
-   * Absolute path to a directory that a local Portal snapshot has materialized
-   * credentials (kubeconfigs + SSH) into. CLI mode only: when set, replaces
-   * `config.paths.credentialsDir` so kubectl / ssh tools + `/setup` list
-   * see Portal-managed credentials. `/setup` writes in this mode go to the
-   * ephemeral dir and are lost on cleanup — edits should happen in Portal UI.
-   */
-  portalCredentialsDir?: string;
-  /** Metadata for all Portal-configured agents (used by /agent + /ls to show list). */
-  portalAvailableAgents?: import("../portal/cli-snapshot-types.js").CliSnapshotAgentMeta[];
-  /** The Portal agent this session is scoped to, null/undefined = unscoped. */
-  portalActiveAgent?: import("../portal/cli-snapshot-types.js").CliSnapshotActiveAgent | null;
-  /**
-   * Base URL of the live local Portal (e.g. http://127.0.0.1:3000). When set,
-   * `/setup` switches to read-only mode + opens Portal Web UI for writes so
-   * edits don't silently dead-end in the ephemeral `.portal-snapshot/` dirs.
-   */
-  portalUrl?: string;
   /**
    * Optional callback injected by agentbox. When present, tools may call it to
    * push custom events into the parent session's SSE stream (used by citation
@@ -182,9 +153,9 @@ export interface CreateSiclawSessionOpts {
   subagentTierMenu?: import("./subagent-models.js").SubagentTierMenu | null;
   /** Runtime bridge that cancels a background job — sub-agent or bash (design §7). */
   jobStopExecutor?: import("./tool-registry.js").JobStopExecutor;
-  /** Runtime bridge that launches a background bash command. Injected by agentbox / TUI host. */
+  /** Runtime bridge that launches a background bash command. Injected by agentbox / CLI host. */
   backgroundExecExecutor?: import("./tool-registry.js").BackgroundExecExecutor;
-  /** Runtime bridge that reads a background job's live status. Injected by agentbox / TUI host. */
+  /** Runtime bridge that reads a background job's live status. Injected by agentbox / CLI host. */
   taskOutputReader?: import("./tool-registry.js").TaskOutputReader;
   /** Runtime bridge for explicit IM-channel visible updates. Injected by agentbox. */
   channelMessageExecutor?: import("./tool-registry.js").ChannelMessageExecutor;
@@ -194,7 +165,7 @@ export interface SiclawSessionResult {
   brain: BrainSession;
   toolResultArtifactStore: ToolResultArtifactStore;
   session: AgentSession;  // backward compat — only set for pi-agent brain
-  /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the TUI */
+  /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the CLI */
   services: AgentSessionServices;
   /** Loaded extensions result — required when wrapping the session in an AgentSessionRuntime */
   extensionsResult: LoadExtensionsResult;
@@ -433,11 +404,12 @@ export async function createSiclawSession(
     memoryConfigured: isMemoryEnabled(),
     mode,
     agentPrompt: opts?.systemPromptAppend,
+    subagentPrompt: opts?.subagentPrompt,
+    isSubagent: opts?.isSubagent,
     systemPromptTemplate: opts?.systemPromptTemplate,
-    delegation: opts?.delegation,
     handoffPolicy: opts?.handoffPolicy,
-    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent && !opts?.delegation),
-    interactiveProgress: mode === "web" && !opts?.isSubagent && !opts?.delegation,
+    handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent),
+    interactiveProgress: mode === "web" && !opts?.isSubagent,
   });
   const allowedTools = compiledContext.harness.allowedTools;
   const memoryEnabled = compiledContext.harness.memoryEnabled;
@@ -523,7 +495,7 @@ export async function createSiclawSession(
   // Knowledge routing is independent from investigation memory and embedding
   // configuration. Typed page labels become available after one local
   // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
-  // shared resolver, while standalone TUI owns this fallback instance.
+  // shared resolver, while standalone CLI owns this fallback instance.
   let knowledgeIndexer = opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
     let candidate: KnowledgeResolver | undefined;
@@ -550,6 +522,8 @@ export async function createSiclawSession(
     mode,
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
+      scriptExecutor: opts?.scriptExecutor,
+      scriptSandboxInfo: opts?.scriptSandboxInfo,
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
@@ -562,10 +536,10 @@ export async function createSiclawSession(
       handoffPolicy: opts?.handoffPolicy,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
+      readToolResult: async (id) => (await toolResultArtifactStore.readFull(id)).text,
       // Channels currently deliver one foreground response. Do not advertise
       // background launches until they support an owned, resumable delivery lifecycle.
-      // Delegated peers retain foreground subagents for their synchronous result contract.
-      foregroundSubagentOnly: mode === "channel" || opts?.delegation != null,
+      foregroundSubagentOnly: mode === "channel",
       // The tier menu this session will advertise. Passed in rather than read from
       // box state because the tool schema is built HERE, once: the menu the lead is
       // shown has to be the one its choice is later resolved against.
@@ -575,9 +549,6 @@ export async function createSiclawSession(
         ? opts.backgroundExecExecutor : undefined,
       taskOutputReader: opts?.taskOutputReader,
       channelMessageExecutor: opts?.channelMessageExecutor,
-      delegation: opts?.delegation,
-      delegationRoster: opts?.delegationRoster,
-      delegateToAgentExecutor: opts?.delegateToAgentExecutor,
       handoffTargets: opts?.handoffTargets,
       searchHandoffTargets: opts?.searchHandoffTargets,
       handoffSearchMatches: new Map(),
@@ -595,6 +566,8 @@ export async function createSiclawSession(
 
   // -- MCP external tools (dynamic discovery, not in registry) --
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
+  const sandboxOnly = allowedTools?.length && allowedTools.every(name => name === "run_script");
+  const mcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
   const toolResultArtifactStore = new ToolResultArtifactStore({
     rootDir: toolResultArtifactsDir,
     getScope: () => ({
@@ -610,39 +583,17 @@ export async function createSiclawSession(
       error instanceof Error ? error.message : String(error),
     );
   }
-  let mcpManager: McpClientManager | undefined = exposeConfiguredMcp
-    ? opts?.mcpManager
-    : undefined;
-  const mcpServers = exposeConfiguredMcp ? (opts?.mcpServers ?? config.mcpServers) : {};
-  let mcpTools: ToolDefinition[] = [];
-  if (mcpManager) {
-    const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
-    if (sharedTools.length > 0) {
-      mcpTools = sharedTools.map((tool) => withToolResultArtifactCapture(tool, toolResultArtifactStore));
-      console.log(`[agent-factory] Reusing ${sharedTools.length} shared MCP tools`);
-    }
-  } else if (mcpServers && Object.keys(mcpServers).length > 0) {
-    mcpManager = new McpClientManager({ mcpServers } as any);
-    try {
-      await mcpManager.initialize();
-      const discovered = mcpManager.getTools();
-      console.log(`[agent-factory] MCP initialization complete: ${discovered.length} tools discovered`);
-      if (discovered.length > 0) {
-        mcpTools = discovered.map((tool) => withToolResultArtifactCapture(tool, toolResultArtifactStore));
-        console.log(`[agent-factory] Added ${discovered.length} MCP tools: ${discovered.map(t => t.name).join(", ")}`);
-      }
-    } catch (err) {
-      console.warn(`[agent-factory] MCP initialization failed:`, err);
-      mcpManager = undefined;
-    }
-  } else if (exposeConfiguredMcp) {
-    console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
-  } else {
-    console.log(`[agent-factory] Configured MCP tools disabled by ${compiledContext.harness.resolution} harness`);
-  }
+  const { mcpManager, mcpTools: discoveredMcpTools } = await resolveSessionMcpTools({
+    enabled: exposeConfiguredMcp, allowedTools,
+    mcpServers,
+    mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
+  });
+  const mcpTools = discoveredMcpTools.map(tool => withToolResultArtifactCapture(tool, toolResultArtifactStore));
+  // Sandbox-only agents use the reviewed broker; the harness gate and artifact
+  // recovery remain in effect for every other MCP selection.
   // Configured MCP tools are orthogonal to the built-in `allowedTools`
-  // whitelist, but they are NOT exempt from the Agent harness: unresolved and
-  // delegated-read-only contexts never initialize or append them. In a scoped
+  // whitelist, but they are NOT exempt from the Agent harness: unresolved
+  // contexts never initialize or append them. In a scoped
   // AgentBox/Portal session the config already contains that Agent's resource
   // bindings; standalone config is the user's explicit settings.json selection.
   // Dynamic MCP tool names cannot be enumerated in static capability groups.
@@ -735,8 +686,8 @@ export async function createSiclawSession(
     }),
   ].map((tool) => Object.assign(tool, { toolset: "filesystem" }) as ResolvedToolDefinition);
   // Push into customTools so they override framework defaults via extension mechanism.
-  // Subject to allowedTools (same chokepoint as MCP append above): file tools are
-  // created outside the registry, so the shared name-based whitelist is applied here.
+  // File tools are created outside the registry, so apply the same name-based
+  // capability whitelist here before exposing them to the model.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
 
   for (let i = 0; i < customTools.length; i++) {
@@ -775,7 +726,7 @@ export async function createSiclawSession(
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
   // K8s uses the pod-local shared resolved/ tree. LocalSpawner and Portal-paired
-  // TUI pass an authoritative scoped directory; if it does not exist yet, the
+  // CLI pass an authoritative scoped directory; if it does not exist yet, the
   // session intentionally sees no bound skills instead of falling back to a
   // process-shared tree.
   const resolvedSkillsDir = path.join(skillsBase, "resolved");
@@ -791,7 +742,7 @@ export async function createSiclawSession(
   const extensionPath = path.resolve(cwd, "skills", "extension");
   const platformPath = path.resolve(cwd, "skills", "platform");
   // A scoped Agent must not inherit pi's ambient ~/.pi/agent/skills discovery.
-  // Keep standalone SRE/TUI compatibility only when there is no Portal/Gateway
+  // Keep standalone SRE/CLI compatibility only when there is no Portal/Gateway
   // scope and the harness explicitly permits bundled operational skills.
   const filterSkillsToHarness =
     Boolean(opts?.portalSkillsDir) ||
@@ -804,39 +755,6 @@ export async function createSiclawSession(
   const overlayPolicyDir = opts?.portalSkillsDir
     ? path.dirname(path.resolve(opts.portalSkillsDir))
     : skillsBase;
-
-  // Resolve credentials directory for tools and /setup extension
-  // Credentials dir: Portal snapshot override > explicit kubeconfigRef > config default.
-  // Portal-materialized dir wins so kubectl / ssh / /setup list see the
-  // Portal-managed credentials in CLI mode with a live local Portal.
-  const credentialsDir = (opts?.portalCredentialsDir && fs.existsSync(opts.portalCredentialsDir))
-    ? opts.portalCredentialsDir
-    : (kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir));
-
-  // Forward-declared so the CLI-only /ls extension factory can close over it.
-  // Safe because extension command handlers run long after the constructor
-  // returns.
-  let loader!: DefaultResourceLoader;
-
-  const cliOnlyFactories = mode === "cli"
-    ? [
-        (api: ExtensionAPI) =>
-          lsExtension(api, {
-            getLoadedSkills: () => loader.getSkills().skills,
-            credentialsDir,
-            knowledgeDir,
-            activeAgentName: opts?.portalActiveAgent?.name ?? null,
-            availableAgents: opts?.portalAvailableAgents ?? [],
-            activeAgent: opts?.portalActiveAgent ?? null,
-          }),
-        (api: ExtensionAPI) =>
-          agentExtension(api, {
-            activeAgent: opts?.portalActiveAgent ?? null,
-            availableAgents: opts?.portalAvailableAgents ?? [],
-            portalUrl: opts?.portalUrl ?? null,
-          }),
-      ]
-    : [];
 
   // pi 0.73 split session creation into services + session. agentDir is the
   // global config root pi uses for personal skills/extensions (~/.pi/agent);
@@ -865,8 +783,6 @@ export async function createSiclawSession(
         compactionSafeguardExtension,
         ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
         (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
-        (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
-        ...cliOnlyFactories,
       ],
       // First enforce the context compiler's authoritative roots, then apply
       // the personal Preview's Built-in master switch / per-name mask. Both
@@ -892,7 +808,7 @@ export async function createSiclawSession(
       additionalSkillPaths: skillsDirs,
     },
   });
-  loader = services.resourceLoader as DefaultResourceLoader;
+  const loader = services.resourceLoader as DefaultResourceLoader;
 
   // Log discovered skills for diagnostics
   const { skills: loadedSkills, diagnostics: skillDiagnostics } = loader.getSkills();

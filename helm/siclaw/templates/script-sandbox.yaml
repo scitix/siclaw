@@ -1,0 +1,80 @@
+{{- if and .Values.scriptSandbox.enabled (eq (include "siclaw.runtime.enabled" .) "true") }}
+{{- if not (has .Values.scriptSandbox.provider (list "k8s" "e2b")) }}
+{{- fail "scriptSandbox.provider must be k8s or e2b" }}
+{{- end }}
+{{- if and (eq .Values.scriptSandbox.provider "e2b") .Values.portal.enabled }}
+{{- $_ := required "scriptSandbox.publicUrl is required for E2B with standalone Portal" .Values.scriptSandbox.publicUrl }}
+{{- end }}
+{{- if eq .Values.scriptSandbox.provider "k8s" }}
+{{- $namespace := .Values.scriptSandbox.namespace | default (printf "%s-execution" (include "siclaw.fullname" .)) }}
+{{- if eq $namespace .Release.Namespace }}
+{{- fail "scriptSandbox.namespace must be separate from the Runtime namespace" }}
+{{- end }}
+{{- if .Values.scriptSandbox.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.scriptSandbox.serviceAccount }}
+  namespace: {{ $namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: siclaw-script-controller
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/attach"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: siclaw-script-controller
+  namespace: {{ $namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: siclaw-script-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "siclaw.fullname" . }}-gateway
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: siclaw-script-budget
+  namespace: {{ $namespace }}
+spec:
+  hard:
+    pods: {{ .Values.scriptSandbox.podQuota | quote }}
+    count/jobs.batch: {{ mul .Values.scriptSandbox.podQuota 4 | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "siclaw.fullname" . }}-script-policy
+  namespace: {{ .Release.Namespace }}
+data:
+  mcp.json: {{ .Values.scriptSandbox.mcpPolicy | toJson | quote }}
+  hosts.json: {{ .Values.scriptSandbox.hostKeyPins | toJson | quote }}
+{{- end }}

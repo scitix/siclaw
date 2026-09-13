@@ -32,6 +32,7 @@ import type {
   SubagentGroupReport,
   SubagentGroupResult,
   SubagentGroupItemResult,
+  SubagentTargetCoverage,
   JobStopExecutor,
   BackgroundExecExecutor,
   TaskOutputReader,
@@ -47,10 +48,8 @@ import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
-import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "../core/types.js";
-import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
+import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import { normalizeAgentType } from "../core/agent-types.js";
-import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
@@ -79,7 +78,11 @@ import { assistantTextBlocks } from "../shared/assistant-items.js";
 import { scheduleToolOutputCleanup } from "../core/tool-output-cleanup.js";
 import { ToolResultArtifactStore, toolResultArtifactRoot, formatToolResultArtifactReference, getToolResultArtifactDetails } from "../core/tool-result-artifact.js";
 import { prepareReduceEvidence } from "./subagent-evidence.js";
+import { finishTargetCoverage } from "./subagent-targets.js";
+import { createSubagentTickets, readSubagentTicket, SubagentMailbox } from "./subagent-lifecycle.js";
+import { openSubagentTranscript } from "./subagent-transcript.js";
 import { runSubagentToAcceptance } from "./subagent-completion.js";
+import { captureSubagentContext, materializeSubagentContext, validateSubagentContextSelection } from "./subagent-context.js";
 import { restoreTaskLedgerFromHistory } from "./task-ledger-recovery.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
 import { getOrCreateLedger, peekLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
@@ -120,6 +123,7 @@ import { extractToolResultId } from "../core/message-utils.js";
 type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanContext };
 
 export interface ManagedSession {
+  agentPrompt?: string;
   id: string;
   /** User identity bound to this conversation's tools and child-session persistence. */
   userId?: string;
@@ -131,7 +135,7 @@ export interface ManagedSession {
   skillNames: string[];
   /** SHA-256 of the actual SKILL.md loaded for each visible Skill. */
   skillDigests: Record<string, string>;
-  /** Re-read Skills after an in-session hot reload before recording evidence. */
+  /** Re-read loaded Skills before recording evidence. */
   getSkillSnapshot?: () => { skillNames: string[]; skillDigests: Record<string, string> };
   /** Exact on-demand prompt/tool inspection; never emitted through routine status or logs. */
   getPromptInspection: () => PromptInspection;
@@ -221,7 +225,7 @@ export interface ManagedSession {
   /**
    * Caller-supplied identity of the turn currently running, when it supplied one.
    *
-   * A session id names a CONVERSATION, which a delegated peer session deliberately
+   * A session id names a CONVERSATION, which a multi-turn session deliberately
    * reuses across turns, so an abort addressed by session alone cannot distinguish
    * "stop what is running" from "stop the turn I dispatched" — a late abort for a
    * finished turn lands on its successor. Callers that know which turn they mean
@@ -234,9 +238,6 @@ export interface ManagedSession {
   mode: SessionMode;
   /** Active operating mode (normal/dp/…) this agent was built for — drives rebuild on change. */
   activeMode: AgentMode;
-  /** Delegation context this agent was built for (undefined = non-delegated). Drives
-   *  rebuild when the delegation tier changes on a reused session id. */
-  delegation?: DelegationContext;
   /** Whether this session was built with top-level `request_input` available. */
   allowInputRequest: boolean;
   handoffSupported?: boolean;
@@ -368,13 +369,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Rebuild key for the delegation tier: "none" (non-delegated) | "ro" | "rw".
- *  The ids do not affect the resolved toolset, so a re-delegation of the same
- *  session reuses the built agent. */
-function delegationSignature(d: DelegationContext | undefined): "none" | "delegated" {
-  return d ? "delegated" : "none";
-}
-
 async function abortBrainBestEffort(
   brain: Pick<BrainSession, "abort">,
   label: string,
@@ -396,6 +390,7 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
+  private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string; restoredSession?: SessionManager }>();
   // Retain the launching request owner until notification, even if Stop/handoff
   // replaces the session's current request before a late child/process exit.
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
@@ -940,7 +935,7 @@ export class AgentBoxSessionManager {
     // history dir, and a Stop on it would otherwise arm a latch the user's next
     // prompt consumes. A turn-scoped latch cannot do that — only that turn's own
     // prompt consumes it — so skipping the check is what lets a Stop on a REUSED
-    // session (a delegated peer thread always has a dir) arm anything at all.
+    // session (a restored thread already has a dir) arm anything at all.
     if (turnId === undefined) {
       try {
         if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
@@ -1034,7 +1029,78 @@ export class AgentBoxSessionManager {
    * only branch on request.runInBackground.
    */
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
+    const dispatch = this.createRawSpawnSubagentExecutor();
     return async (request, onProgress, signal) => {
+      validateSubagentContextSelection(request.forkTurns);
+      if (request.resumeHandle && request.forkTurns !== undefined) throw new Error("Cannot change fork_turns on a resumed child");
+      const parent = this.sessions.get(request.parentSessionId);
+      if (request.forkTurns !== undefined && request.forkTurns !== "none") {
+        if (!parent || parent.userId !== request.userId || !Array.isArray(parent.session.messages)) {
+          throw new Error("Active parent context is unavailable for this session and user");
+        }
+        request = { ...request, parentContext: captureSubagentContext(parent.session.messages, request.forkTurns, request.spawnId) };
+      } else {
+        request = { ...request, parentContext: undefined };
+      }
+      if (signal?.aborted || this.sessions.get(request.parentSessionId)?._aborted) {
+        if (request.resumeHandle) throw new Error("Subagent follow-up cancelled");
+        return dispatch(request, onProgress, signal);
+      }
+      const store = new ToolResultArtifactStore({
+        rootDir: toolResultArtifactRoot(this.getSessionDir(request.parentSessionId)),
+        getScope: () => ({ agentId: request.parentAgentId ?? `user:${request.userId}`, sessionId: request.parentSessionId }),
+      });
+      let restoredSession: SessionManager | undefined;
+      if (request.resumeHandle) {
+        if (request.renderedTasks.length !== 1 || request.reducePrompt || request.modelTier) throw new Error("Follow-up requires one task without reduce or tier override");
+        const ticket = await readSubagentTicket(store, request.resumeHandle, request.userId);
+        const active = this.subagentRuns.get(ticket.childSessionId);
+        if (active) {
+          await active.mailbox.send(request.renderedTasks[0].prompt);
+          return { status: "launched", jobId: active.jobId, childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle, steered: true };
+        }
+        // A ticket is not proof of an executed transcript (a queued task may have been skipped).
+        restoredSession = openSubagentTranscript(this.getSessionDir(ticket.childSessionId));
+        request = { ...request, subagentType: ticket.subagentType, renderedTasks: [{ ...request.renderedTasks[0], childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle }] };
+      } else {
+        const tickets = await createSubagentTickets(store, request.userId, request.subagentType, request.renderedTasks.length);
+        request = { ...request, renderedTasks: request.renderedTasks.map((task, index) => ({
+          ...task, childSessionId: tickets[index].childSessionId, resumeHandle: tickets[index].resumeHandle,
+        })) };
+      }
+      // Reserve all IDs before yielding: concurrent follow-ups never start two brains for one transcript.
+      for (const task of request.renderedTasks) {
+        if (this.subagentRuns.has(task.childSessionId!)) throw new Error("Subagent is already running; retry with its handle");
+        this.subagentRuns.set(task.childSessionId!, { mailbox: new SubagentMailbox(), jobId: request.spawnId, restoredSession });
+      }
+      let detached = false;
+      try {
+        const result = await dispatch(request, onProgress, signal);
+        if (result.status === "launched") {
+          detached = this.jobs.get(request.spawnId)?.status === "running";
+          const children = request.renderedTasks.map(t => ({ childSessionId: t.childSessionId!, resumeHandle: t.resumeHandle!, item: t.item }));
+          if ("childSessionId" in result) return { ...result, resumeHandle: children[0].resumeHandle };
+          return { ...result, children };
+        }
+        return result;
+      } finally {
+        if (!detached) {
+          for (const task of request.renderedTasks) this.releaseSubagentRun(task.childSessionId, request.spawnId);
+        }
+      }
+    };
+  }
+
+  private releaseSubagentRun(childSessionId: string | undefined, jobId: string): void {
+    // A finished group's cleanup may race a newly started continuation of the same child.
+    if (childSessionId && this.subagentRuns.get(childSessionId)?.jobId === jobId) {
+      this.subagentRuns.delete(childSessionId);
+    }
+  }
+
+  private createRawSpawnSubagentExecutor(): SpawnSubagentExecutor {
+    return async (request, onProgress, signal) => {
+      request = { ...request, agentPrompt: this.sessions.get(request.parentSessionId)?.agentPrompt };
       // Capture the parent's trace context ONCE at dispatch — synchronously, while the parent
       // turn's trace is still live (a background parent may end its prompt before the child
       // starts). request.spawnId === the tool-call id BOTH here and as the batch groupId, so this
@@ -1053,13 +1119,18 @@ export class AgentBoxSessionManager {
       // straddle a configuration change and report both halves as one result.
       const tierPlan = this.buildTierPlan(request.parentSessionId, request.modelTier, request.subagentType);
 
-      const isCollapse = request.renderedTasks.length === 1 && !request.reducePrompt;
+      const isCollapse = request.renderedTasks.length === 1 && !request.reducePrompt && !request.targetCoverage;
 
       if (isCollapse) {
         const task = request.renderedTasks[0];
         // Derive the per-child request. spawnId stays the bare toolCallId (request.spawnId) so the
         // collapse path's delegation_event folds via the single-subagent UI path, exactly as before.
         const childReq: SpawnSubagentRequest = {
+          parentContext: request.parentContext,
+          agentPrompt: request.agentPrompt,
+          childSessionId: task.childSessionId,
+          resumeHandle: task.resumeHandle,
+          targetCoverage: request.targetCoverage,
           description: request.description,
           prompt: task.prompt,
           subagentType: request.subagentType,
@@ -1176,6 +1247,16 @@ export class AgentBoxSessionManager {
     signal?: AbortSignal,
     traceCtx?: SubagentTraceContext,
   ): Promise<SubagentGroupReport> {
+    try { return await this.executeSubagentGroup(request, onProgress, signal, traceCtx); }
+    finally { for (const task of request.renderedTasks) this.releaseSubagentRun(task.childSessionId, request.spawnId); }
+  }
+
+  private async executeSubagentGroup(
+    request: SpawnSubagentGroupRequest,
+    onProgress?: (progress: SubagentGroupProgress) => void,
+    signal?: AbortSignal,
+    traceCtx?: SubagentTraceContext,
+  ): Promise<SubagentGroupReport> {
     const startedAt = Date.now();
     const groupId = request.spawnId;
     const tasks = request.renderedTasks;
@@ -1223,6 +1304,7 @@ export class AgentBoxSessionManager {
         phase,
         items: states.map((s, index) => ({
           index,
+          item: tasks[index].item,
           status: s.status,
           ...(s.childSessionId ? { childSessionId: s.childSessionId } : {}),
           ...(s.activity ? { activity: s.activity } : {}),
@@ -1248,6 +1330,9 @@ export class AgentBoxSessionManager {
         return;
       }
       const childReq: SpawnSubagentRequest = {
+        agentPrompt: request.agentPrompt,
+        parentContext: request.parentContext,
+        resumeHandle: tasks[i].resumeHandle,
         description: `${request.description} [${i + 1}/${total}]`,
         prompt: tasks[i].prompt,
         subagentType: request.subagentType,
@@ -1280,7 +1365,7 @@ export class AgentBoxSessionManager {
           // limiter slot must stay `queued`, not report as running. Pre-assign the exact session
           // id runSpawnedSubagent will persist so the live UI can open the child transcript from
           // the first running frame instead of waiting for the terminal result.
-          const childSessionId = randomUUID();
+          const childSessionId = tasks[i].childSessionId ?? randomUUID();
           state.childSessionId = childSessionId;
           state.status = "running";
           emit("map");
@@ -1382,6 +1467,8 @@ export class AgentBoxSessionManager {
           summary: s.fullSummary ?? s.summary,
         }));
         const reduceReq: SpawnSubagentRequest = {
+          agentPrompt: request.agentPrompt,
+          parentContext: request.parentContext,
           description: `${request.description} — summary`,
           prompt: request.reducePrompt,
           inputReports: outcomes,
@@ -1455,6 +1542,7 @@ export class AgentBoxSessionManager {
     const durationMs = Date.now() - startedAt;
     const itemResults: SubagentGroupItemResult[] = states.map((s, i) => ({
       item: tasks[i].item,
+      resumeHandle: tasks[i].resumeHandle,
       status: s.status as GroupItemStatus,
       summary: s.summary,
       fullSummary: s.fullSummary,
@@ -1476,6 +1564,7 @@ export class AgentBoxSessionManager {
     // Persisted terminal event content: reduce summary, else the group explanation, else a status
     // digest — always non-empty.
     const capsule = reduceSummary ?? groupSummary ?? summarizeItemStatuses(itemResults);
+    const targetCoverage = finishTargetCoverage(request.targetCoverage, itemResults.map(item => item.status));
 
     // Group terminal delegation_event (design §"Persistence & lineage"): delegationId == groupId ties the
     // per-child events (`{groupId}#{i}`) together so the UI rebuilds the card on reload. The per-item
@@ -1496,6 +1585,7 @@ export class AgentBoxSessionManager {
         status: r.status,
         ...(r.tierOutcome ? { tier: persistableTierOutcome(r.tierOutcome) } : {}),
       })),
+      targetCoverage,
       durationMs,
       traceId: traceCtx?.mainTraceId,
     });
@@ -1503,6 +1593,7 @@ export class AgentBoxSessionManager {
     return {
       status,
       itemResults,
+      coverage: targetCoverage,
       ...(reduceSummary !== undefined ? { reduceSummary } : {}),
       ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
       ...(circuitBroken ? { circuitBroken } : {}),
@@ -1520,6 +1611,7 @@ export class AgentBoxSessionManager {
       summaryTruncated: boolean;
       reduceChildSessionId?: string;
       itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
+      targetCoverage?: SubagentTargetCoverage;
       durationMs: number;
       traceId?: string;
     },
@@ -1540,6 +1632,7 @@ export class AgentBoxSessionManager {
         fullSummary: outcome.capsule,
         summaryTruncated: outcome.summaryTruncated,
         ...(outcome.itemStatuses ? { itemStatuses: outcome.itemStatuses } : {}),
+        ...(outcome.targetCoverage ? { targetCoverage: outcome.targetCoverage } : {}),
         scope: request.description,
         toolCalls: 0,
         durationMs: outcome.durationMs,
@@ -1586,6 +1679,7 @@ export class AgentBoxSessionManager {
         capsule: `Sub-agent group "${request.description}" was stopped before it started.`,
         summaryTruncated: false,
         itemStatuses: request.renderedTasks.map((_, i) => ({ index: i, status: "skipped" as GroupItemStatus })),
+        targetCoverage: finishTargetCoverage(request.targetCoverage, request.renderedTasks.map(() => "skipped")),
         durationMs: 0,
         traceId: traceCtx?.mainTraceId,
       });
@@ -1641,6 +1735,7 @@ export class AgentBoxSessionManager {
           summary: stopped
             ? `Sub-agent group "${request.description}" was stopped`
             : buildGroupNotificationSummary(request.description, report) +
+              (report.coverage ? `\nSnapshot coverage: ${JSON.stringify(report.coverage)}` : "") +
               `\nComplete reports: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`,
         });
       })
@@ -1687,8 +1782,9 @@ export class AgentBoxSessionManager {
       lastEmitAt = Date.now();
       const snapshot = latest;
       latest = null;
-      const items = snapshot.items.map(({ index, status, childSessionId, activity }) => ({
+      const items = snapshot.items.map(({ index, status, childSessionId, activity, item }) => ({
         index,
+        ...(item !== undefined ? { item } : {}),
         status,
         ...(childSessionId ? { child_session_id: childSessionId } : {}),
         ...(activity ? { activity } : {}),
@@ -1732,7 +1828,7 @@ export class AgentBoxSessionManager {
   }
 
   private createJobStopExecutor(): JobStopExecutor {
-    // Shared stop logic lives on JobRegistry (same as the TUI path).
+    // Shared stop logic lives on JobRegistry (same as the CLI path).
     return async (jobId) => this.jobs.stopJob(jobId);
   }
 
@@ -1749,7 +1845,7 @@ export class AgentBoxSessionManager {
   }
 
   private createTaskOutputReader(parentSessionId: string): TaskOutputReader {
-    // Snapshot the job's live status so task_output can report running/terminal (same as TUI).
+    // Snapshot the job's live status so task_output can report running/terminal (same as CLI).
     return (jobId) => this.jobs.get(jobId)?.parentSessionId === parentSessionId
       ? this.jobs.snapshot(jobId) : { found: false };
   }
@@ -1903,7 +1999,7 @@ export class AgentBoxSessionManager {
    */
   private startBackgroundSubagent(request: SpawnSubagentRequest, traceCtx?: SubagentTraceContext): SpawnSubagentResult {
     this.registerBackgroundWork(request.parentSessionId, request.spawnId);
-    const childSessionId = randomUUID();
+    const childSessionId = request.childSessionId ?? randomUUID();
     const jobId = request.spawnId;
     // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
     // ("stopped") and skip runSpawnedSubagent so no child run/LLM work starts. suppressNotifyTurn
@@ -2034,7 +2130,7 @@ export class AgentBoxSessionManager {
             : `Sub-agent "${request.description}" failed: ${err instanceof Error ? err.message : String(err)}`,
         });
       })
-      .finally(() => this.releaseBackgroundWork(request.parentSessionId));
+      .finally(() => { this.releaseSubagentRun(childSessionId, request.spawnId); this.releaseBackgroundWork(request.parentSessionId); });
 
     return {
       status: "launched",
@@ -2670,7 +2766,7 @@ export class AgentBoxSessionManager {
     signal?: AbortSignal,
   ): Promise<SpawnSubagentResult> {
     const startedAt = Date.now();
-    const childSessionId = opts?.childSessionId ?? randomUUID();
+    const childSessionId = opts?.childSessionId ?? request.childSessionId ?? randomUUID();
     // Trace context captured at dispatch by createSpawnSubagentExecutor (see there):
     //  - mainTraceId: the parent interaction's root trace id → stamps chat_messages.trace_id
     //    on every child row so a whole interaction shares one trace_id (DB audit).
@@ -2680,7 +2776,8 @@ export class AgentBoxSessionManager {
     const mainTraceId = opts?.mainTraceId;
     const spawnSpanContext = opts?.spawnSpanContext;
     const childSessionDir = this.getSessionDir(childSessionId);
-    const childSessionManager = SessionManager.continueRecent(process.cwd(), childSessionDir);
+    const childSessionManager = this.subagentRuns.get(childSessionId)?.restoredSession
+      ?? SessionManager.continueRecent(process.cwd(), childSessionDir);
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
@@ -2728,11 +2825,14 @@ export class AgentBoxSessionManager {
       // intentionally NOT shared with the child (nothing there would consume it).
       isSubagent: true,
       // The agent-type's prompt flavour for this child.
-      systemPromptAppend: type.systemPromptAddendum,
+      systemPromptAppend: request.agentPrompt,
+      subagentPrompt: type.systemPromptAddendum,
       // Deliberately omit spawnSubagentExecutor + delegate executors → the child
       // never sees spawn_subagent (no recursion).
     });
     child.sessionIdRef.current = childSessionId;
+    const mailbox = this.subagentRuns.get(childSessionId)?.mailbox;
+    mailbox?.attach(child.brain);
 
     // ── Model selection: tier, or the parent's effective model ──────────────
     //
@@ -2877,6 +2977,18 @@ export class AgentBoxSessionManager {
       // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
       if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
       if (reviewing) return;
+      if (event?.type === "message_end" && event.message?.role === "user") {
+        const text = typeof event.message.content === "string" ? event.message.content : extractEventText(event.message.content);
+        for (const guidance of mailbox?.consumeGuidance(text) ?? []) {
+          enqueuePersist(async () => {
+            await this.persistAppendMessage({
+              sessionId: childSessionId, role: "user", content: redactText(guidance, redactionConfig),
+              metadata: { kind: "steer" }, fromAgentId: agentId,
+              parentSessionId: request.parentSessionId, delegationId, targetAgentId: agentId, traceId: mainTraceId,
+            });
+          });
+        }
+      }
       if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
         toolCalls++;
         const toolName = (event.toolName as string) || (event.name as string) || "tool";
@@ -2983,15 +3095,31 @@ export class AgentBoxSessionManager {
         childTimer.unref?.();
       });
       const execution = async () => {
+        if (request.parentContext) {
+          const source = new ToolResultArtifactStore({
+            rootDir: toolResultArtifactRoot(this.getSessionDir(request.parentSessionId)),
+            getScope: () => ({ agentId: request.parentAgentId ?? `user:${request.userId}`, sessionId: request.parentSessionId }),
+          });
+          const content = await materializeSubagentContext(request.parentContext, source, child.toolResultArtifactStore,
+            text => redactText(text, redactionConfig), () => stopRequested || deadlineReached);
+          if (stopRequested || deadlineReached) throw new Error("stopped before context inheritance completed");
+          await child.session.sendCustomMessage({ customType: "subagent-parent-context", content, display: false }, { triggerTurn: false });
+        }
         const promptRequest = request.inputReports ? {
           ...request,
           prompt: await prepareReduceEvidence(request.prompt, request.inputReports, child.toolResultArtifactStore),
         } : request;
+        const model = child.brain.getModel();
+        if (request.parentContext && model && child.brain.checkContextFitForModelPrompt) {
+          const fit = child.brain.checkContextFitForModelPrompt(model, this.buildSpawnedSubagentPrompt(promptRequest));
+          if (!fit.ok) throw new Error("Inherited context exceeds the child model window; use a smaller fork_turns selection or a larger model tier.");
+        }
         if (stopRequested || deadlineReached) throw new Error("stopped before sub-agent prompt started");
         return runSubagentToAcceptance({
         brain: child.brain,
         prompt: this.buildSpawnedSubagentPrompt(promptRequest),
-        assignment: request.prompt,
+        assignment: `Task: ${request.description}\n\n${request.prompt}`,
+        mailbox,
         stopped: () => stopRequested || deadlineReached,
         stopReason: () => lastStopReason,
         reviewing: (active) => { reviewing = active; },
@@ -3031,6 +3159,7 @@ export class AgentBoxSessionManager {
         finalText = finalText || `Sub-agent failed: ${failureText}`;
       }
     } finally {
+      mailbox?.close();
       if (childTimer) clearTimeout(childTimer);
       unsubscribe();
       // Shut down only connections this child opened. A manager shared with the
@@ -3102,6 +3231,8 @@ export class AgentBoxSessionManager {
         status,
         summary: bundle.capsule,
         fullSummary: bundle.fullSummary,
+        resumeHandle: request.resumeHandle,
+        coverage: finishTargetCoverage(request.targetCoverage, [status]),
         childSessionId,
         toolCalls,
         durationMs,
@@ -3121,7 +3252,7 @@ export class AgentBoxSessionManager {
     const langDirective = lang !== "English" ? `[System: respond in ${lang}]\n` : "";
     return `${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
       `Complete this task now and end with a concise findings report — the caller only sees your ` +
-      `final report, not your intermediate steps. Do not ask for confirmation.`;
+      `final report, not your intermediate steps. Report missing authorization or other blockers to the caller; do not assume approval.`;
   }
 
   /**
@@ -3255,7 +3386,6 @@ export class AgentBoxSessionManager {
     mode?: SessionMode,
     systemPromptTemplate?: string,
     activeMode: AgentMode = "normal",
-    delegation?: DelegationContext,
     requestUserId?: string,
     allowInputRequest = false,
     handoffSupported = false,
@@ -3299,44 +3429,20 @@ export class AgentBoxSessionManager {
           existing._releaseTimer = null;
           console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
         }
-        // Reuse unless the operating mode, delegation tier, or explicit input
-        // capability changed mid-session
-        // (e.g. user toggled Deep Investigation, or a reused session id flips between a
-        // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
-        // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
-        const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
+        // Rebuild an idle session when its execution context changes.
         const sameInputCapability = existing.allowInputRequest === allowInputRequest
           && Boolean(existing.handoffSupported) === handoffSupported
           && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
           && existing.mode === (mode ?? "web");
-        // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
-        // change falls through to a rebuild below), but every delegation turn gets a NEW
-        // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
-        // it is the SAME object we store here (agent-factory passes it by reference), so an
-        // in-place update makes report_findings / request_input stamp the CURRENT call's id
-        // instead of the previous one — no rebuild needed, conversation preserved.
-        //
-        // ONLY when the session is idle: a concurrent continuation targeting the SAME busy
-        // peer session is rejected with 409 by the HTTP layer AFTER this getOrCreate returns
-        // — mutating the shared context first would stamp the running turn's later
-        // report_findings/request_input with the REJECTED request's id. The gate MUST match
-        // the 409 condition exactly (`!_promptDone || _promptInflight`): `_promptInflight`
-        // can be set while `_promptDone` is momentarily true during synthetic-parent-prompt
-        // setup (background-job completion turn), so check both.
-        if (sameDelegation && existing._promptDone && !existing._promptInflight && existing.delegation && delegation) {
-          existing.delegation.delegationId = delegation.delegationId;
-          existing.delegation.parentSessionId = delegation.parentSessionId;
-          existing.delegation.parentAgentId = delegation.parentAgentId;
-        }
         if (
-          (existing.activeMode === activeMode && sameDelegation && sameInputCapability && !needsUserIdentityRebuild) ||
+          (existing.activeMode === activeMode && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
           existing._promptInflight
         ) {
           return existing;
         }
         console.log(
-          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/${delegationSignature(existing.delegation)}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/${delegationSignature(delegation)}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
         );
         await this.releaseForRebuild(id, existing);
       }
@@ -3367,7 +3473,7 @@ export class AgentBoxSessionManager {
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       // Prefer the per-user dir set by LocalSpawner; fall back to the
-      // config-driven global path (K8s mode and TUI both use this).
+      // config-driven global path (K8s mode and CLI both use this).
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
       credentialBroker: this.credentialBroker,
     };
@@ -3429,35 +3535,10 @@ export class AgentBoxSessionManager {
     // full pod/process restart from the PV snapshot. taskListId == session id.
     this.rehydrateLedger(id);
 
-    // Delegation roster (coordinator side): the peer agents this agent may
-    // delegate to, delivered from the gateway (K8s boxes have no DB). Skipped on
-    // a delegated turn (a peer can't re-delegate — one-level). Best-effort: a
-    // fetch failure just means the delegate_to_agent tool stays hidden.
-    let delegationRoster: DelegateRosterMember[] | undefined;
     const gc = this.gatewayClient;
-    if (gc && !delegation) {
-      // Retry once on a transient failure: a single fetch miss would otherwise hide
-      // the whole delegate_to_agent tool for this session's lifetime. (The reverse
-      // coordinator-invalidation path refreshes on member changes, but that can't help
-      // a coordinator whose FIRST fetch failed — hence the immediate retry here.)
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const r = await gc.fetchDelegates();
-          delegationRoster = r.members?.length ? r.members : undefined;
-          break;
-        } catch (err) {
-          console.warn(`[agentbox-session] fetchDelegates failed for ${id} (attempt ${attempt + 1}):`, err);
-        }
-      }
-    }
-    // Handoff destinations: the agents this one may transfer the conversation
-    // to. Same delivery as the delegation roster (K8s boxes have no DB) and the
-    // same degradation — a fetch miss just means transfer_to_agent stays hidden
-    // and this agent answers the turn itself, which is a worse answer but not a
-    // broken one. Skipped on a delegated turn: a peer has no standing to dispose
-    // of the coordinator's session.
+    // Load the authorized handoff index from the control plane.
     let handoffTargets: HandoffTarget[] | undefined;
-    if (gc && !delegation) {
+    if (gc) {
       try {
         const r = await gc.fetchHandoffTargets();
         handoffTargets = r.targets?.length ? r.targets : undefined;
@@ -3465,65 +3546,10 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
       }
     }
-    const delegateToAgentExecutor: DelegateToAgentExecutor | undefined = (gc && delegationRoster)
-      ? async (req, onProgress, signal) => {
-          // Translate the peer's live event stream into coordinator-card steps
-          // (same shape spawn_subagent uses), pushing progress as they arrive.
-          const steps: DelegateStep[] = [];
-          let toolCalls = 0;
-          // Match the main window: the command + args arrive on tool_execution_start
-          // (kept by call id), the result on tool_execution_end; assistant reasoning
-          // on message_end. Build the same {assistant|tool} step shape the card renders.
-          const pending = new Map<string, { toolName?: string; args?: unknown }>();
-          let childSessionId: string | undefined;
-          return gc.delegateStream(
-            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId, evidenceRefs: req.evidenceRefs },
-            (evt) => {
-              const e = evt as any;
-              const t = String(e?.type ?? "");
-              if (t === "delegate_session") {
-                // Peer session id known at start → surface it live so the card can
-                // offer "open full session" immediately.
-                childSessionId = e.peerSessionId ? String(e.peerSessionId) : undefined;
-                onProgress?.({ toolCalls, steps: [...steps], childSessionId });
-                return;
-              }
-              if (t === "tool_execution_start") {
-                if (e.toolCallId) pending.set(String(e.toolCallId), { toolName: e.toolName, args: e.args });
-                return;
-              }
-              if (t === "tool_execution_end") {
-                const meta = e.toolCallId ? pending.get(String(e.toolCallId)) : undefined;
-                const toolName = meta?.toolName ?? e.toolName;
-                const args = meta?.args;
-                const resultText = (e.result?.content ?? [])
-                  .filter((c: { type?: string }) => c.type === "text")
-                  .map((c: { text?: string }) => c.text ?? "").join("").slice(0, 2000);
-                toolCalls++;
-                steps.push({
-                  kind: "tool",
-                  toolName,
-                  toolInput: args !== undefined ? (typeof args === "string" ? args : JSON.stringify(args)) : undefined,
-                  content: resultText,
-                  outcome: e.isError ? "error" : "success",
-                  durationMs: typeof e.durationMs === "number" ? e.durationMs : null,
-                });
-                onProgress?.({ toolCalls, steps: [...steps], activity: toolName ? `Ran ${toolName}` : undefined, childSessionId });
-                return;
-              }
-              if (t === "message_end" && e.message?.role === "assistant") {
-                const content: Array<{ type?: string; text?: string; thinking?: string }> = e.message.content ?? [];
-                const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim()
-                  || content.filter((c) => c.type === "thinking").map((c) => c.thinking ?? "").join("").trim();
-                if (text) { steps.push({ kind: "assistant", text }); onProgress?.({ toolCalls, steps: [...steps], activity: text.slice(0, 80), childSessionId }); }
-              }
-            },
-            signal,
-          );
-        }
-      : undefined;
-
+    const scriptInfo = effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
     const result = await createSiclawSession({
+      scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
+      scriptSandboxInfo: scriptInfo,
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
@@ -3545,17 +3571,8 @@ export class AgentBoxSessionManager {
       // platform template so safety/mode rules and dynamic context continue to
       // be assembled by agent-factory.
       systemPromptTemplate: undefined,
-      // Delegated read-only turn: gate the toolset (agent-factory filters to
-      // readOnlyDelegable + read file tools) and prepend the worker persona so
-      // the model knows to end with report_findings.
-      delegation,
-      // Built-in types compile their immutable contract plus this persisted
-      // Agent addendum. A delegated peer keeps its OWN contract — being called
-      // by a coordinator does not change who it is.
+      // Use the Agent-owned prompt addendum.
       systemPromptAppend: systemPromptTemplate,
-      // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
-      delegationRoster,
-      delegateToAgentExecutor,
       // Keep an internal target index; discover matching coverage on demand.
       handoffTargets,
       searchHandoffTargets: gc ? query => gc.searchHandoffTargets(query) : undefined,
@@ -3592,6 +3609,7 @@ export class AgentBoxSessionManager {
     }
 
     const managed: ManagedSession = {
+      agentPrompt: systemPromptTemplate,
       id,
       userId: effectiveUserId,
       brain: result.brain,
@@ -3624,7 +3642,6 @@ export class AgentBoxSessionManager {
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
       activeMode,
-      delegation,
       allowInputRequest,
       handoffSupported,
       handoffPolicy,

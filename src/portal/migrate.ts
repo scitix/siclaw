@@ -5,11 +5,11 @@
  *   - No ENGINE=... / COLLATE=... / CHARSET=... (MySQL uses server defaults)
  *   - No TIMESTAMP(3) millisecond precision (second precision only)
  *   - No ON UPDATE CURRENT_TIMESTAMP (application layer manages `updated_at`)
- *   - JSON columns stored as TEXT (application layer JSON.stringify/parse)
+ *   - JSON values stored in text columns (application layer JSON.stringify/parse)
  *   - Inline INDEX declarations moved to separate `ensureIndex()` calls
  *
- * Legacy MySQL production databases are preserved byte-for-byte thanks to
- * `CREATE TABLE IF NOT EXISTS` — no schema changes touch existing tables.
+ * `CREATE TABLE IF NOT EXISTS` preserves legacy MySQL table definitions.
+ * Explicit, idempotent upgrades below handle columns that require changes.
  * Indexes use names that match the historical MySQL DDL so `ensureIndex`
  * is idempotent on old deployments.
  */
@@ -18,6 +18,7 @@ import { getDb } from "../gateway/db.js";
 import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull, setColumnDefault } from "./migrate-compat.js";
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
 import type { Db } from "../gateway/db.js";
+import { removeRetiredCapabilityKeys } from "../core/tool-capabilities.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
   // Users (simple auth, no org/RBAC)
@@ -100,17 +101,6 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_ah_host FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
   )`,
 
-  // Delegation roster: which peer agents a coordinator agent is authorized to
-  // delegate to (agent-to-agent delegation). Membership IS the authorization
-  // (config-time, not derived). Both columns reference agents(id); a delete of
-  // either side cascades the roster row. Mirrors agent_clusters/agent_hosts.
-  `CREATE TABLE IF NOT EXISTS agent_delegates (
-    coordinator_agent_id CHAR(36) NOT NULL,
-    member_agent_id CHAR(36) NOT NULL,
-    PRIMARY KEY (coordinator_agent_id, member_agent_id),
-    CONSTRAINT fk_ad_coordinator FOREIGN KEY (coordinator_agent_id) REFERENCES agents(id) ON DELETE CASCADE,
-    CONSTRAINT fk_ad_member FOREIGN KEY (member_agent_id) REFERENCES agents(id) ON DELETE CASCADE
-  )`,
 
   // Skills + MCP servers must be created BEFORE their junction tables below,
   // otherwise CREATE TABLE agent_skills / agent_mcp_servers fails on MySQL with
@@ -338,13 +328,13 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     id CHAR(36) PRIMARY KEY,
     session_id CHAR(36) NOT NULL,
     role VARCHAR(20) NOT NULL,
-    content TEXT,
+    content MEDIUMTEXT,
     tool_name VARCHAR(100),
     toolset VARCHAR(255) DEFAULT NULL,
     tool_input MEDIUMTEXT,
     outcome VARCHAR(16),
     duration_ms INT,
-    metadata TEXT,
+    metadata LONGTEXT,
     from_agent_id CHAR(36) DEFAULT NULL,
     parent_session_id CHAR(36) DEFAULT NULL,
     delegation_id VARCHAR(64) DEFAULT NULL,
@@ -617,9 +607,6 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_repo", "repo_id, created_at");
   // hosts jump chain reverse lookup
   await ensureIndex(db, "hosts", "idx_hosts_jump", "jump_host_id");
-  // agent_delegates reverse lookup (who may delegate to this member) — the PK
-  // already covers the forward (coordinator → members) direction.
-  await ensureIndex(db, "agent_delegates", "idx_agent_delegates_member", "member_agent_id");
 }
 
 export async function runPortalMigrations(): Promise<void> {
@@ -759,6 +746,14 @@ export async function runPortalMigrations(): Promise<void> {
   // above only ADDs missing columns; widenColumn MODIFYs the existing type (idempotent, MySQL-only).
   await widenColumn(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await widenColumn(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  // Bounded script output can exceed MySQL TEXT's 64 KiB, both in the displayed
+  // tool content and the structured result used to rebuild history. SQLite has
+  // no corresponding width limit; widenColumn is a no-op there.
+  await widenColumn(db, "chat_messages", "content", "MEDIUMTEXT DEFAULT NULL");
+
+  // Complete skill preview packages exceed TEXT's 64 KiB capacity. Preserve
+  // legacy JSON columns; SQLite TEXT already has no equivalent width limit.
+  await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
 
   // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
   // indexes added later). Safe to run now that all referenced columns exist.
@@ -774,6 +769,25 @@ export async function runPortalMigrations(): Promise<void> {
   // Data backfill (safe to run repeatedly).
   await db.query("UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'");
   await db.query("UPDATE skills SET is_builtin = 1 WHERE created_by = 'system' AND is_builtin = 0");
+
+  await db.query("UPDATE agents SET status = 'disabled' WHERE agent_type = ? AND status <> 'disabled'", ["coordinator"]);
+  await db.query("DROP TABLE IF EXISTS agent_delegates");
+
+  // Repeatable data cleanup also repairs installs that already ran retirement.
+  // Parse in JS so malformed legacy TEXT and both SQL dialects remain safe.
+  const [capabilityRows] = await db.query<Array<{ id: string; tool_capabilities: string }>>(
+    "SELECT id, tool_capabilities FROM agents WHERE tool_capabilities LIKE ?", ["%delegate_agents%"],
+  );
+  for (const row of capabilityRows) {
+    let keys: unknown;
+    try { keys = JSON.parse(row.tool_capabilities); } catch { continue; }
+    if (!Array.isArray(keys) || !keys.every((key) => typeof key === "string") || !keys.includes("delegate_agents")) continue;
+    // Both [] and null group selections are unrestricted. If nothing remains,
+    // use ["no_tools"] so resolution still grants no built-in capabilities.
+    const cleaned = JSON.stringify(removeRetiredCapabilityKeys(keys));
+    await db.query("UPDATE agents SET tool_capabilities = ? WHERE id = ? AND tool_capabilities = ?",
+      [cleaned, row.id, row.tool_capabilities]);
+  }
 
   console.log("[portal-migrate] All tables ready");
 }

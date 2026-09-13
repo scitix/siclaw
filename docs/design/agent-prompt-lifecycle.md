@@ -13,7 +13,7 @@ The effective system prompt is an ordered set of owned layers:
 2. **Capability and mode policy** — only sections supported by the compiled
    harness, such as SRE infrastructure guidance, planning, sub-agents, channel
    format, or automated-task behavior.
-3. **Agent Type Contract** — immutable behavior for `sre`, `coordinator`, or
+3. **Agent Type Contract** — immutable behavior for `sre` or
    `knowledge_qa`. `custom` intentionally has no built-in contract.
 4. **Agent Addendum** — optional administrator-authored specialization stored
    in the legacy `agents.system_prompt` column. It extends a built-in contract;
@@ -38,8 +38,8 @@ progress update alone is not a completed turn.
 
 ## Type and capability alignment
 
-Each entry point passes Agent type, resolved capabilities, mode, and delegation
-constraints to `compileAgentContext()`. The compiler returns:
+Each entry point passes Agent type, resolved capabilities, mode, and handoff
+policy to `compileAgentContext()`. The compiler returns:
 
 - the prompt assembly described above;
 - an enforceable harness for built-in tools, configured MCP exposure, memory,
@@ -49,15 +49,13 @@ The model-visible tool schemas and Skill index are filtered from the same
 policy that selected prompt guidance:
 
 - SRE, and Custom Agents with discovery tools, receive infrastructure guidance;
-  QA and Coordinator do not.
+  QA does not.
 - Planning and sub-agent guidance appears only when those tools are available.
 - Automated-task mode grants only its transport-owned `task_report` tool in
   addition to the type's ordinary capabilities, keeping the required terminal
   report aligned for every Agent Type.
-- QA/Coordinator do not inherit repo-bundled or user-global operational Skills;
+- QA Agents do not inherit repo-bundled or user-global operational Skills;
   explicitly bound Skills, knowledge, and MCP remain available.
-- Delegated read-only sessions suppress MCP, memory, writes, and operational
-  guidance, and use an exclusive read-only worker contract.
 - An unresolved control-plane lookup exposes no tools, MCP, memory, or ambient
   Skills until a successful sync.
 
@@ -66,7 +64,6 @@ The two availability axes remain independent:
 | Agent type | Built-in capability groups | Explicitly configured resources |
 |---|---|---|
 | SRE | infrastructure, commands, scripts, files, memory, planning, sub-agents, session output | Skills, knowledge, MCP |
-| Coordinator | files and delegation; no own `cluster_list` / `host_list` | knowledge/Skills for answering and routing, MCP for an attached resource locator |
 | Knowledge QA | `knowledge_search`, Grep/Find, Read, `knowledge_cite` | knowledge, explicitly bound Skills and query/visual MCP |
 | Custom | Portal selection, or legacy unrestricted built-ins only when an explicit Custom type has no selection | Skills, knowledge, MCP |
 

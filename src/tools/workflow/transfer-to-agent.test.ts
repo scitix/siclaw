@@ -40,11 +40,6 @@ describe("transfer_to_agent 的可用性", () => {
     expect(registration.available?.(refs())).toBe(true);
   });
 
-  // 一个 peer 没有资格处置 coordinator 的会话:委托来的 turn 不给这个工具。
-  it("委托来的 turn 不给", () => {
-    expect(registration.available?.(refs({ delegation: { delegationId: "d1" } as never }))).toBe(false);
-  });
-
   // channel 的 turn 在 runtime 本地跑、不经网关,没有人接住那条帧做链式转发。
   it("supports every control-plane conversation mode", () => {
     expect(registration.modes).toEqual(["web", "channel", "task"]);
@@ -183,7 +178,7 @@ describe("conversation handoff across Agent types", () => {
     });
     return registry.resolve({ mode: "web", refs: toolRefs, allowedTools: harness.allowedTools });
   }
-  it.each(["sre", "coordinator", "knowledge_qa", "product_support", "custom"])("offers transfer to a resolved %s conversation owner", (type) => {
+  it.each(["sre", "knowledge_qa", "product_support", "custom"])("offers transfer to a resolved %s conversation owner", (type) => {
     expect(toolsFor(type).map(t => t.name)).toEqual(["transfer_to_agent", "search_handoff_targets"]);
   });
   it("adds only ownership transfer to a restricted Custom allowance", () => {
@@ -204,7 +199,7 @@ describe("conversation handoff across Agent types", () => {
   });
   it.each([
     { handoffTargets: [] }, { sessionEventEmitter: undefined }, { searchHandoffTargets: undefined },
-    { isSubagent: true }, { delegation: { delegationId: "d1" } },
+    { isSubagent: true },
   ])("does not expose a transfer without ownership and transport: %j", (overrides) => {
     expect(toolsFor("custom", undefined, refs(overrides))).toEqual([]);
   });

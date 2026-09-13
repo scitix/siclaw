@@ -39,7 +39,7 @@ function wikiRuntimeContext(): string {
 }
 
 describe("createPromptInspection", () => {
-  for (const agentType of ["sre", "coordinator", "knowledge_qa", "custom"] as const satisfies readonly AgentType[]) {
+  for (const agentType of ["sre", "knowledge_qa", "knowledge_qa", "custom"] as const satisfies readonly AgentType[]) {
     it(`exposes the exact ${agentType} prompt, layers, actual tools, and design verdict`, () => {
       const context = compileAgentContext({
         agentType,
@@ -81,7 +81,7 @@ describe("createPromptInspection", () => {
     });
   }
 
-  for (const agentType of ["sre", "coordinator", "knowledge_qa", "custom"] as const satisfies readonly AgentType[]) {
+  for (const agentType of ["sre", "knowledge_qa", "knowledge_qa", "custom"] as const satisfies readonly AgentType[]) {
     it(`keeps automated-task instructions aligned with the ${agentType} tool surface`, () => {
       const context = compileAgentContext({
         agentType,
@@ -108,7 +108,7 @@ describe("createPromptInspection", () => {
 
   it("shows a provider replacement as a separate effective-prompt layer", () => {
     const context = compileAgentContext({
-      agentType: "coordinator",
+      agentType: "knowledge_qa",
       allowedTools: null,
       memoryConfigured: false,
       mode: "web",

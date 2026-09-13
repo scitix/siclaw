@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import { AssistantItemStream } from "./assistant-item-stream.js";
 import { assistantTextBlocks, type AssistantItem } from "../shared/assistant-items.js";
 import type { ChatMessageMetadata } from "../shared/message-kinds.js";
-import { persistableToolDetails } from "../shared/tool-result-metadata.js";
+import { persistableToolDetails, toolResultOutcome } from "../shared/tool-result-metadata.js";
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
@@ -796,9 +796,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             .join("") ?? "";
         const toolName = (evt.toolName as string) || (evt.name as string) || "tool";
 
-        let outcome: "success" | "error" | "blocked" = "success";
-        if (toolResult?.details?.blocked) outcome = "blocked";
-        else if (toolResult?.details?.error) outcome = "error";
+        const outcome = toolResultOutcome(toolResult?.details, evt.isError);
 
         const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
         const eventToolset = typeof evt.toolset === "string" && evt.toolset.length > 0
@@ -818,6 +816,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         const toolInput = pendingCall?.input || "";
         const existingMessageId = pendingCall?.messageId;
         const detailsMeta = persistableToolDetails(toolResult?.details, value => redactText(value, redactionConfig));
+        // Forward the same bounded, redacted preview to the UI. A downgrade is
+        // visible during this turn and cannot fall back to unredacted JSON text.
+        if (toolResult?.details?.skillPreview && detailsMeta?.skillPreview) {
+          toolResult.details.skillPreview = detailsMeta.skillPreview;
+          if ((detailsMeta.skillPreview as { status?: string }).status === "omitted") {
+            toolResult.content = [{ type: "text", text: "Skill preview omitted from history: size or redaction limit." }];
+          }
+        }
         // Re-stamp the round markers — persistableToolDetails only looks at
         // the tool *result*, and updateMessage REPLACES metadata wholesale.
         const roundMeta = pendingCall?.roundMeta ?? timeline.toolMetadata(evt);
@@ -832,7 +838,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         if (persist) {
           const payload = {
             sessionId,
-            content: redactText(text, redactionConfig),
+            content: redactText((detailsMeta?.skillPreview as { status?: string } | undefined)?.status === "omitted" ? "Skill preview omitted from history: size or redaction limit." : text, redactionConfig),
             toolName,
             toolset: toolset ?? null,
             toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,

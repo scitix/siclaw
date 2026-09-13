@@ -1,151 +1,90 @@
 ---
 title: "CLI + Local Portal Integration"
 sidebarTitle: "CLI ↔ Portal"
-description: "How the terminal TUI pairs with a local Portal to share a single source of truth for skills, credentials, agents, and providers."
+description: "Reuse local Portal configuration for non-interactive diagnostic runs."
 ---
 
 ## Overview
 
-Siclaw ships two ways to run on a single workstation:
+Use `siclaw local` for interactive investigations and configuration in the Web UI. Use `siclaw --prompt "..."` for a single diagnostic invocation that prints its answer and exits.
 
-- **Standalone TUI** — `siclaw`, no server, reads `.siclaw/config/settings.json`
-- **Local Portal** — `siclaw local`, a single process that runs Portal + Runtime + embedded SQLite and serves a Web UI at `http://localhost:3000`
+When started from the same working directory, the CLI can reuse the local Portal's providers, agents, skills, knowledge, MCP servers, and credentials. Configuration changes happen in the Web UI and apply to the next invocation.
 
-When both are started from the **same working directory**, the TUI automatically pairs with the local Portal and treats it as the single source of truth for skills, knowledge pages, kubeconfigs, SSH hosts, agents, MCP servers, and LLM providers. Web UI becomes the place you configure things; the TUI becomes an observer that reflects whatever Portal currently has.
-
-## Why pair them
-
-Running the TUI standalone works, but every change lives inside one `.siclaw/config/settings.json` file on one machine:
-
-- Adding a provider API key on laptop A means re-adding it on laptop B
-- Adding a kubeconfig inside one TUI session doesn't help the next session in a different directory
-- Teammates can't share the investigation set-up you just built
-
-Pairing the TUI with a local Portal solves that without any external infrastructure:
-
-- Portal stores providers, credentials, skills, MCP servers, agents, knowledge pages in a local SQLite database
-- The Web UI at `localhost:3000` is where you edit them
-- Every paired TUI pulls the **same** snapshot and materializes it into an ephemeral cache for that session
-- Changes in the Web UI are visible to the next TUI session — no restart of the Portal server required
-
-## How it works
-
-On startup, the TUI looks in the current working directory for `.siclaw/local-secrets.json` (written by `siclaw local`) and probes `http://127.0.0.1:3000/api/health`. If both succeed, the TUI:
-
-1. Reads the dedicated `cliSnapshotSecret` from `.siclaw/local-secrets.json`
-2. Fetches `GET /api/v1/cli-snapshot` (or `?agent=<name>` when `--agent` is given), presenting the secret in the `X-Siclaw-Cli-Snapshot-Secret` header
-3. Materializes the response into `.siclaw/.portal-snapshot/{skills,knowledge,credentials}/`
-4. Points the agent's Read tool, `local_script`, kubectl, and SSH config at those ephemeral paths
-5. Registers a cleanup hook: the directory is wiped on `SIGINT`, `SIGTERM`, or normal exit
-
-If any step fails (Portal not running, 401, network blip), the TUI silently falls back to the standalone `.siclaw/config/settings.json` flow — Portal is an optional upgrade, never a hard dependency.
-
-Portal rejects the request if any of three conditions fail: the `enableCliSnapshot` flag is off (prod Portal leaves it off), the request origin is not loopback, or the secret doesn't match. The secret is distinct from Portal's `jwtSecret` on purpose — reading the snapshot does not also grant the caller the ability to self-sign admin JWTs against every other Portal route.
-
-### Cwd-scoped pairing
-
-The TUI decides which Portal to pair with by **looking for `.siclaw/local-secrets.json` in its own cwd**. Consequences:
-
-- `siclaw` in `~/projectA` sees the `siclaw local` started from `~/projectA`. It will **not** see a Portal running from `~/projectB`, even if that Portal is reachable at `127.0.0.1:3000`.
-- Running `siclaw local` in two different cwds on the same machine will fail to start the second one — port 3000 is already bound by the first.
-- A shared workstation model is therefore "one Portal, one cwd"; anyone who wants to use that Portal must run `siclaw` from the same cwd.
-
-This model is deliberate: it binds Portal's ephemeral caches, SQLite path, and credential materialization to a directory the user already curates, so there is no cross-directory bleed-through of skills / credentials / history.
-
-## Session commands
-
-These slash commands are read-only observers of the current Portal snapshot. Mutations always happen in the Web UI.
-
-| Command | What it shows |
-|---|---|
-| `/ls` | Summary: counts of skills / knowledge / MCP / credentials / agents for this session |
-| `/ls skills` | Full skill list with one-line descriptions |
-| `/ls knowledge` | Knowledge pages available to the session |
-| `/ls mcp` | MCP servers with transport + URL / command |
-| `/ls credentials` | Kubeconfigs and SSH hosts, grouped by type |
-| `/ls agents` | Current active agent + all Portal-configured agents |
-| `/agent` | Active Portal agent details + a hint linking to Portal's Agents page for create / edit |
-| `/setup` | Read-only list of providers, clusters, hosts, channels — each with an "Open in Portal →" link |
-
-## Agent scoping
-
-A Portal agent bundles a curated set of skills, credentials, knowledge, MCP servers, and a preferred LLM model. The TUI can scope a whole session to one agent:
+## Start a Diagnostic Run
 
 ```bash
-siclaw --agent sre-oncall
+# Terminal A — local Web UI
+cd ~/siclaw-work
+siclaw local
+
+# Terminal B — same workspace, after configuring a model and agent
+cd ~/siclaw-work
+siclaw agents
+siclaw --agent sre-oncall --prompt "Why is the API pod Pending?"
+siclaw --agent sre-oncall --continue --prompt "Check recent events"
 ```
 
-That fetches a snapshot filtered by the agent's bindings — only the agent's skills, its kubeconfigs, its hosts, its knowledge pages. Useful for tight-focus investigations and for CI-style runs.
+Replace `sre-oncall` with a name returned by `siclaw agents`. With one configured agent, selection is automatic. With multiple agents, pass `--agent`; the CLI exits with a list of names if selection is ambiguous.
 
-To see what Portal has configured without entering the TUI:
+`--prompt` is required for diagnostic execution, including with `--continue`. Bare `siclaw` prints help. The CLI has no interactive setup or slash commands. Use the Web UI to inspect and edit resources.
+
+## Snapshot Lifecycle
+
+On startup, the CLI looks for `.siclaw/local-secrets.json` in the working directory and probes the local Portal. It then:
+
+1. Uses the dedicated `cliSnapshotSecret` to authenticate snapshot requests.
+2. Fetches `GET /api/v1/cli-snapshot?agent=<name>` directly for an explicit agent; otherwise discovers available agents and selects deterministically.
+3. Materializes skills, knowledge, and credentials under a private `.siclaw/.portal-snapshot/run-<random>/` directory, including empty resource sets.
+4. Runs the shared agent engine with those resources.
+5. Cleans the snapshot on normal exit, startup failure, `SIGINT`, or `SIGTERM`.
+
+Without a selected agent, an unavailable Portal allows standalone execution using `.siclaw/config/settings.json` and local resources. Once an agent is selected (explicitly or automatically), its snapshot must load successfully or the CLI exits nonzero. It never silently substitutes another configuration. Missing model configuration produces an error and exits; it never opens a setup prompt. `siclaw agents` requires Portal and exits nonzero if it is unavailable.
+
+The snapshot endpoint is enabled only by `siclaw local`, accepts loopback requests only, and requires `X-Siclaw-Cli-Snapshot-Secret`. The dedicated secret does not grant Portal admin API access. Production Portal keeps this endpoint disabled.
+
+## Workspace and Ports
+
+Both processes must use the same working directory and its local secrets. The CLI reads configuration over HTTP; it does not open Portal's database directly.
+
+For a custom Portal port:
 
 ```bash
-$ siclaw agents
-NAME         MODEL               DESCRIPTION
-sre-oncall   anthropic/sonnet-4  Production incident response
-network-dbg  (use default)       Network and RDMA diagnostics
-
-Use: siclaw --agent <name>
+PORTAL_PORT=8080 siclaw local
+SICLAW_PORTAL_PORT=8080 siclaw --agent sre-oncall --prompt "Check cluster health"
 ```
 
-`siclaw agents` exits non-zero if Portal is unreachable.
+The local server also needs free Runtime and internal ports (3001 and 3002 by default). Set `SICLAW_PORT` and `SICLAW_INTERNAL_PORT` when running multiple local servers.
 
-## First-run wizard
+## Filesystem Layout
 
-When you run `siclaw` for the first time in a cwd that has a running local Portal but no `.siclaw/config/settings.json` yet, the wizard **does not** write a local settings file. Instead it:
-
-1. Prints a note explaining that provider setup has moved to Portal
-2. Asks an interactive Y/n: "Open `http://localhost:3000/settings/models` in your browser now?"
-3. If yes, launches the default browser (macOS `open`, Windows `start`, Linux `xdg-open`) and exits
-4. If no, prints the URL so you can visit it later and exits
-5. If the browser launcher throws, falls back to a "couldn't launch a browser automatically, please open this URL manually" message — the URL stays visible either way
-
-Re-run `siclaw` after configuring a provider in Portal and it will pick up the provider automatically. This design avoids a per-workstation "ghost provider" in a local `settings.json` that silently desyncs across machines.
-
-Standalone TUI (no Portal in the cwd) keeps the legacy presets picker — OpenAI / Anthropic / Compatible API — unchanged.
-
-## Filesystem layout
-
-Standalone TUI writes and reads under `.siclaw/`:
-
-```
+```text
 .siclaw/
-├── config/settings.json        provider config (standalone mode only)
-├── credentials/                kubeconfigs, SSH keys (standalone mode only)
-├── skills/                     locally authored skills
-├── traces/                     investigation traces
-└── user-data/memory/           investigation memory (always local)
+├── config/settings.json       standalone CLI configuration
+├── credentials/               standalone credential store
+├── .portal-snapshot/
+│   └── run-<random>/          private to one invocation; removed on exit
+│       ├── skills/
+│       ├── knowledge/
+│       └── credentials/
+├── local-secrets.json          generated by siclaw local, mode 0600
+├── data/portal.db              local Portal database
+└── user-data/memory/           local investigation memory
 ```
 
-Portal-paired TUI adds an **ephemeral** subtree that gets wiped on exit:
+Concurrent invocations use separate snapshot roots and clean only their own files. Empty Portal bindings remain empty rather than inheriting standalone resources. Portal snapshots do not replace the standalone configuration files. Investigation memory remains a separate persistence domain from Portal configuration.
 
-```
-.siclaw/
-├── .portal-snapshot/           ephemeral — source of truth is Portal
-│   ├── skills/<name>/          full skill package per skill
-│   ├── knowledge/<repo>/       knowledge pages, per repo
-│   └── credentials/
-│       ├── manifest.json       { name, type, metadata } per entry
-│       ├── <host>.ssh_config   + <host>.password or <host>.privateKey
-│       └── <cluster>.kubeconfig
-├── local-secrets.json          generated by `siclaw local`, 0600
-├── data/portal.db              Portal's SQLite DB, owned by `siclaw local`
-└── user-data/memory/           still local — memory is the user's
-```
+## Choose an Entry Point
 
-Investigation memory stays local in both modes — Siclaw does not upload your investigation traces to Portal.
-
-## When to use which
-
-| Your situation | Suggested mode |
+| Need | Entry point |
 |---|---|
-| One laptop, quick diagnostics, no sharing | Standalone TUI |
-| Regular use, want skills + credentials to survive across sessions | `siclaw local` + pair TUI |
-| Team or SRE rotation sharing one Portal instance | `siclaw local` on a shared VM, team uses TUI pointing at the same cwd (or deploy via Kubernetes for production) |
-| CI / automation | `siclaw local` + `siclaw --agent <name> --prompt "..."` |
+| Interactive diagnosis and resource configuration | `siclaw local`, then open the Web UI |
+| One diagnostic run from a shell or script | `siclaw --prompt "..."` |
+| Reuse a specific local agent's bindings | `siclaw --agent <name> --prompt "..."` |
+| Remote automation against a deployed team instance | [External API](/features/deep-investigation#external-api) |
+| Production team deployment | [Kubernetes](/install/kubernetes) |
 
 ## Related
 
-- [CLI & Local Server install guide](/install/cli)
-- [Skills architecture](/features/skills)
-- Architecture invariants: `docs/design/invariants.md` §1.4 (snapshot contract, materialization, skill filter)
+- [CLI & Local Server](/install/cli)
+- [LLM Providers](/configuration/providers)
+- Snapshot contract: `docs/design/invariants.md` §1.4

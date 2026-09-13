@@ -38,6 +38,7 @@ export type DialHopAuth =
   | { managed: true; passphrase?: string };
 
 export interface DialHop {
+  expectedHostKey?: string;
   host: string;
   port: number;
   username: string;
@@ -165,7 +166,9 @@ function buildHopConfig(hop: DialHop, timeoutMs: number, sock?: Duplex, managedK
     keepaliveCountMax: 3,
     // host/port are still used for the verifier cache key even when `sock` is
     // set (ssh2 then ignores them for transport but we keep them meaningful).
-    hostVerifier: makeHostVerifier(hop.host, hop.port),
+    hostVerifier: hop.expectedHostKey
+      ? (key: Buffer) => `SHA256:${fingerprint(key).replace(/=+$/, "")}` === hop.expectedHostKey
+      : makeHostVerifier(hop.host, hop.port),
   };
   if (sock) config.sock = sock;
   if ("managed" in hop.auth) {
