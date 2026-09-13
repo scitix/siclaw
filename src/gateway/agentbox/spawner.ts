@@ -8,6 +8,7 @@
  */
 
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
+import type { ContainerObservation } from "../capability/container-evidence.js";
 
 export interface BoxSpawner {
   /** Spawner name */
@@ -37,6 +38,9 @@ export interface BoxSpawner {
    * Clean up resources
    */
   cleanup(): Promise<void>;
+
+  /** K8s-only, read-only lifecycle evidence. Stop the observer before transport shutdown. */
+  observeContainers?(send: (observation: ContainerObservation) => Promise<unknown>): { retry(): void; stop(): Promise<void> };
 
   /**
    * Fingerprint of the CA the spawner currently issues mTLS certs from, if the

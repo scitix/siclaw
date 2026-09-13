@@ -63,6 +63,7 @@ export const TEST_SESSION_LIMIT_ERROR_CODE = "test_session_limit" as const;
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
 export const CAPABILITY_PERSIST_ARTIFACTS = "capability.persistArtifacts" as const;
+export const CAPABILITY_OBSERVE_CONTAINER = "capability.observeContainer" as const;
 export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
 
 /**
@@ -77,6 +78,11 @@ export const CAPABILITY_LIST_ACTIVE_RUNS = "capability.listActiveRuns" as const;
 
 /** Durably persist an assistant conversational turn (generalizes compile.assistantTurn). */
 export const CAPABILITY_PERSIST_TURN = "capability.persistTurn" as const;
+
+/** Box event_ack=1 identity: lowercase UUID hex epoch and a positive sequence. */
+export function isRelayEventId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{32}:[1-9][0-9]{0,15}$/.test(value);
+}
 
 // ---- Lifecycle ----
 
