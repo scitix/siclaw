@@ -156,6 +156,8 @@ describe("capability.cancel", () => {
       stop_confirmed: true,
     });
     expect(stop).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenNthCalledWith(1, started.run_id, "kb-compile");
+    expect(stop).toHaveBeenNthCalledWith(2, started.run_id, "kb-compile");
     const terminalPersists = frontend.request.mock.calls.filter(
       ([method, params]: any[]) => method === "capability.persistRunState" && params.status === "done",
     );
@@ -200,6 +202,55 @@ describe("capability.cancel", () => {
     const cancel = server.rpcMethods.get("capability.cancel")!;
 
     await expect(cancel({ run_id: "   " })).rejects.toThrow("run_id is required");
+    expect(manager.stop).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["kb-compile", "done"],
+    ["kb-compile", "failed"],
+    ["kb-compile-codex", "done"],
+  ])("cleans up a stored %s %s run after restart without reviving execution", async (profile, status) => {
+    const frontend = fakeFrontendClient({
+      rows: [{ id: "run-after-restart", profile, org_id: "org-1", status }],
+    });
+    const manager = fakeAgentBoxManager();
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: manager,
+      frontendClient: frontend,
+      credentialService: {} as any,
+    });
+
+    await expect(server.rpcMethods.get("capability.cancel")!({ run_id: "run-after-restart" })).resolves.toMatchObject({
+      ok: true,
+      stop_confirmed: true,
+    });
+    expect(manager.stop).toHaveBeenCalledWith("run-after-restart", profile);
+    expect(manager.getAsync).not.toHaveBeenCalled();
+    expect(manager.getOrCreate).not.toHaveBeenCalled();
+    expect(frontend.rows.get("run-after-restart")).toMatchObject({ status });
+    expect(frontend.request.mock.calls.filter(([method]: any[]) => method === "capability.persistRunState")).toHaveLength(0);
+  });
+
+  it.each(["missing", "no-profile", "store-error"])("does not confirm cleanup when run addressing is %s", async (failure) => {
+    const frontend = fakeFrontendClient({
+      rows: failure === "no-profile" ? [{ id: "unresolved-run", status: "done" }] : [],
+    });
+    const manager = fakeAgentBoxManager();
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: manager,
+      frontendClient: frontend,
+      credentialService: {} as any,
+    });
+    if (failure === "store-error") {
+      const request = frontend.request.getMockImplementation();
+      frontend.request.mockImplementation((method: string, params: unknown) => {
+        if (method === "capability.getRun") throw new Error("store unavailable");
+        return request(method, params);
+      });
+    }
+    await expect(server.rpcMethods.get("capability.cancel")!({ run_id: "unresolved-run" })).rejects.toThrow();
     expect(manager.stop).not.toHaveBeenCalled();
   });
 });
