@@ -1,5 +1,5 @@
 import { UsageOutbox } from "./usage-outbox.js";
-import { exportInvestigationRows, restoreInvestigationRows } from "./private-memory-snapshot.js";
+import { exportInvestigationRows } from "./private-memory-snapshot.js";
 import { privateWorkspaceEnabled, validPrivateId } from "../shared/private-workspace.js";
 import { privateWorkspaceRoots } from "../shared/private-workspace-paths.js";
 import { PrivateWorkspace, captureWorkspaceFiles } from "./private-workspace.js";
@@ -11,7 +11,7 @@ import { capturePiSession, restorePiSession, validatePiSnapshot } from "./pi-ses
  * Reuses createSiclawSession() to create Agents.
  * Supports session checkpoints through remote private workspaces.
  *
- * The memory indexer is shared at the AgentBox level and reused across sessions.
+ * Memory learners are session-scoped; durable progress belongs to the memory backend.
  * MCP connections are created per-session by createSiclawSession and shut down on release.
  * Sessions are released after each prompt completes (request-level lifecycle)
  * and restored from JSONL on the next prompt.
@@ -60,10 +60,10 @@ import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
-import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
+import { MemoryLearner, configuredMemoryClassifier } from "../memory/learning.js";
+import type { LocalMemoryStore } from "../memory/local-store.js";
 import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
-import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
+import { loadConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { isTracingEnabled } from "../shared/tracing/otel-provider.js";
@@ -250,8 +250,9 @@ export interface ManagedSession {
   handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
-  /** Memory indexer — shared at AgentBox level, NOT per-session */
-  memoryIndexer?: MemoryIndexer;
+  /** Background memory learner and optional local evidence store */
+  memoryLearner?: MemoryLearner;
+  localMemory?: LocalMemoryStore;
   /** Knowledge label resolver — shared at AgentBox level and scoped to this Agent's mount. */
   knowledgeIndexer?: KnowledgeResolver;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
@@ -263,8 +264,6 @@ export interface ManagedSession {
    * attempt instead of the whole session.
    */
   turnRef?: { current: number };
-  /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
-  _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
   /** A config reload requires this in-memory brain to rebuild before its next idle prompt. */
@@ -401,8 +400,8 @@ export class AgentBoxSessionManager {
   private privateRestore?: Promise<boolean>;
   private privateLifecycle: Promise<unknown> = Promise.resolve();
   private privateCheckpoint: Promise<unknown> = Promise.resolve();
-  private privateLearning?: Promise<void>;
-  private privateLearningRequested = false;
+  private readonly memoryLearners = new Map<string, MemoryLearner>();
+  private readonly localMemoryStores = new Map<string, LocalMemoryStore>();
   private promptSetup?: Promise<void>;
   private shuttingDown = false;
   private closingAll?: Promise<void>;
@@ -452,8 +451,6 @@ export class AgentBoxSessionManager {
       deleteLedger(id);
     }
     this.piManagers.clear();
-    this._sharedMemoryIndexer?.close();
-    this._sharedMemoryIndexer = null;
     this._sharedKnowledgeIndexer?.close();
     this._sharedKnowledgeIndexer = null;
     this._sharedInitialized = false;
@@ -541,24 +538,23 @@ export class AgentBoxSessionManager {
     if (completed) {
       fs.rmSync(path.join(this.getSessionDir(this.privateWorkspace.sessionId), ".pending-turn.json"), { force: true });
       // Learning is optional and must not turn a committed snapshot into a
-      // reported persistence failure. A later completed turn retries extraction.
+      // reported persistence failure. The learner retries independently of turns.
       if (isMemoryEnabled()) this.schedulePrivateLearning();
     }
   }
 
+  /** A restarted resident box resumes its committed learning job immediately,
+   * without restoring files, acquiring execution or waiting for another prompt. */
+  startPrivateMemoryLearning(): void {
+    const id=process.env.SICLAW_PRIVATE_SESSION_ID, space=process.env.SICLAW_PRIVATE_SPACE_ID;
+    if(this.shuttingDown || !privateWorkspaceEnabled() || !isMemoryEnabled() || !this.harnessResolvedState || !this.gatewayClient || !id || !space || this.memoryLearners.has(id))return;
+    if(this.allowedToolsState!==null && !this.allowedToolsState.some(v=>["memory_search","memory_get","memory_catalog","memory_update"].includes(v)))return;
+    const learner=new MemoryLearner(new PrivateWorkspace(this.gatewayClient,id,space),configuredMemoryClassifier);
+    this.memoryLearners.set(id,learner);learner.wake();
+  }
+
   private schedulePrivateLearning(): void {
-    this.privateLearningRequested = true;
-    if (this.privateLearning || !this.privateWorkspace || this.shuttingDown) return;
-    const workspace = this.privateWorkspace;
-    // Coalesce completed turns while a bounded host classification is running.
-    // Checkpoint completion and the user's final response never await the model.
-    this.privateLearning = (async () => {
-      while (this.privateLearningRequested && workspace === this.privateWorkspace && !this.shuttingDown) {
-        this.privateLearningRequested = false;
-        try { await workspace.learn(); }
-        catch { console.warn("[private-workspace] memory extraction deferred"); break; }
-      }
-    })().finally(() => { this.privateLearning = undefined; });
+    for (const learner of this.memoryLearners.values()) learner.wake();
   }
 
   async preparePrivateTurn(sessionId: string, input: { turnId?: string; text?: string; images?: unknown; files?: unknown }): Promise<void> {
@@ -696,7 +692,6 @@ export class AgentBoxSessionManager {
   private delegationModelConfig?: Record<string, unknown>;
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
-  private _sharedMemoryIndexer: MemoryIndexer | null = null;
   private _sharedKnowledgeIndexer: KnowledgeResolver | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
@@ -1028,17 +1023,6 @@ export class AgentBoxSessionManager {
     return path.join(userDataDir, "memory");
   }
 
-  private async createSharedMemoryIndexer(memoryDir: string): Promise<MemoryIndexer> {
-    if (!fs.existsSync(memoryDir)) {
-      fs.mkdirSync(memoryDir, { recursive: true });
-    }
-    const embeddingOpts = getEmbeddingConfig() ?? undefined;
-    const indexer = await createMemoryIndexer(memoryDir, embeddingOpts);
-    await indexer.sync();
-    indexer.startWatching();
-    return indexer;
-  }
-
   private async createSharedKnowledgeIndexer(): Promise<KnowledgeResolver> {
     const config = loadConfig();
     const knowledgeDir = this.knowledgeDir ?? path.resolve(process.cwd(), config.paths.knowledgeDir);
@@ -1053,7 +1037,7 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Lazily initialize shared components (memory indexer, MCP manager).
+   * Lazily initialize shared knowledge components.
    * Called on first getOrCreate(). Idempotent.
    */
   private async ensureSharedComponents(): Promise<void> {
@@ -1068,22 +1052,6 @@ export class AgentBoxSessionManager {
       this._sharedKnowledgeIndexer = null;
     }
 
-    if (!isMemoryEnabled()) {
-      this._sharedMemoryIndexer = null;
-      console.log(`[agentbox-session] Memory disabled by SICLAW_MEMORY_ENABLED`);
-      return;
-    }
-
-    const memoryDir = this.getMemoryDir();
-
-    // ── Memory indexer ──
-    try {
-      this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
-      console.log(`[agentbox-session] Shared memory indexer initialized for ${memoryDir}`);
-    } catch (err) {
-      console.warn(`[agentbox-session] Shared memory indexer init failed:`, err);
-      this._sharedMemoryIndexer = null;
-    }
     // MCP is initialized per-session inside createSiclawSession via loadConfig().mcpServers.
   }
 
@@ -3045,7 +3013,6 @@ export class AgentBoxSessionManager {
       sessionManager: childSessionManager,
       kubeconfigRef,
       mode: "web",
-      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       privateMemory: this.privateWorkspace,
       knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: request.userId,
@@ -3579,7 +3546,6 @@ export class AgentBoxSessionManager {
       if (!this.privateRestore) {
         this.privateWorkspace = new PrivateWorkspace(this.gatewayClient, id, process.env.SICLAW_PRIVATE_SPACE_ID);
         this.privateRestore = this.privateWorkspace.restore(this.privateRoots()).then(restored => {
-          if (restored) restoreInvestigationRows(this.privateRoots().memory);
           return restored;
         });
       }
@@ -3857,7 +3823,6 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: effectiveMode,
       activeMode,
-      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       privateMemory: this.privateWorkspace,
       knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: effectiveUserId,
@@ -3905,12 +3870,14 @@ export class AgentBoxSessionManager {
     result.sessionIdRef.current = id;
     this.attachUsage(result.brain, id, "root");
 
-    // New session: sync memory index, then purge stale investigations (chained to avoid race)
-    if (isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
-      const memDir = this.getMemoryDir();
-      this._sharedMemoryIndexer.sync()
-        .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
-        .catch(err => console.warn("[agentbox-session] Memory sync/purge failed:", err));
+    await this.memoryLearners.get(id)?.close(0);
+    this.memoryLearners.delete(id);
+    this.localMemoryStores.get(id)?.close();
+    this.localMemoryStores.delete(id);
+    if (result.localMemory) this.localMemoryStores.set(id, result.localMemory);
+    if (result.memoryLearner) {
+      this.memoryLearners.set(id, result.memoryLearner);
+      result.memoryLearner.wake();
     }
 
     const managed: ManagedSession = {
@@ -3952,11 +3919,11 @@ export class AgentBoxSessionManager {
       handoffPolicy,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
-      memoryIndexer: result.memoryIndexer,
+      memoryLearner: result.memoryLearner,
+      localMemory: result.localMemory,
       knowledgeIndexer: result.knowledgeIndexer,
       dpStateRef: result.dpStateRef,
       turnRef: result.turnRef,
-      _lastSavedMessageCount: 0,
       _releaseTimer: null,
       _invalidated: false,
       _backgroundWorkCount: 0,
@@ -4293,10 +4260,9 @@ export class AgentBoxSessionManager {
   /**
    * Release a session after prompt completion.
    *
-   * When memory is enabled, performs memory auto-save (if new messages since
-   * last save) and syncs the shared memory index, then removes the session
-   * from the in-memory map.
-   * Shared components (memory indexer, MCP) are NOT destroyed.
+   * Checkpoints before removing the session from the in-memory map. Background
+   * learning has an independent lease and never blocks foreground release.
+   * Shared knowledge routing remains available to other sessions.
    *
    * The session can be transparently restored from JSONL on the next getOrCreate().
    */
@@ -4333,29 +4299,6 @@ export class AgentBoxSessionManager {
 
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
 
-    // 1. Auto-save session memory (dedup: only if new messages since last save)
-    if (isMemoryEnabled() && !privateWorkspaceEnabled()) {
-      try {
-        const sessionDir = this.getSessionDir(sessionId);
-        const memoryDir = this.getMemoryDir();
-        const currentMessageCount = this.countJsonlMessages(sessionDir);
-
-        if (currentMessageCount > managed._lastSavedMessageCount) {
-          const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
-          if (saved) {
-            managed._lastSavedMessageCount = currentMessageCount;
-            console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved.map(f => path.basename(f)).join(", ")}`);
-          }
-        } else {
-          console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);
-        }
-      } catch (err) {
-        console.warn(`[agentbox-session] Memory auto-save failed for ${sessionId}:`, err);
-      }
-    } else {
-      console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (memory disabled)`);
-    }
-
     // 2. Shutdown per-session MCP connections
     if (managed.mcpManager) {
       try {
@@ -4365,15 +4308,7 @@ export class AgentBoxSessionManager {
       }
     }
 
-    // 3. Sync shared memory index to pick up the new summary file
-    if (isMemoryEnabled() && this._sharedMemoryIndexer) {
-      await this._sharedMemoryIndexer.sync().catch((err) => {
-        console.warn(`[agentbox-session] Memory sync on release failed:`, err);
-      });
-    }
-
     if (privateWorkspaceEnabled() && !preserveWorkspace) {
-      await this.privateLearning;
       try { await this.checkpointPrivateWorkspace(); }
       catch { console.warn("[private-workspace] release retained the last durable checkpoint"); }
       await this.privateWorkspace?.close().catch(() => {});
@@ -4401,9 +4336,8 @@ export class AgentBoxSessionManager {
 
   /**
    * Drop the on-disk transcript of a session this box handed away, if it is
-   * marked. Ordered after `release`'s memory auto-save on purpose: what this box
-   * LEARNED in its own turns is worth keeping; what it is dropping is only its
-   * stale view of a conversation someone else now owns.
+   * marked. Durable memory evidence and learning progress live in the backend;
+   * this drops only the stale local view of a conversation another box owns.
    */
   private dropEvictedTranscript(sessionId: string): void {
     if (!this.evictedSessions.delete(sessionId) && !fs.existsSync(`${this.getSessionDir(sessionId)}.handoff`)) return;
@@ -4484,14 +4418,6 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] MCP shutdown failed for ${sessionId}:`, err);
         }
       }
-      // Sync shared memory index (don't close it — it's shared)
-      if (this._sharedMemoryIndexer) {
-        try {
-          await this._sharedMemoryIndexer.sync();
-        } catch (err) {
-          console.warn(`[agentbox-session] Memory sync on close failed:`, err);
-        }
-      }
       this.sessions.delete(sessionId);
       // Permanent closure — drop the in-memory ledger so it doesn't accumulate
       // (the durable snapshot + Portal task_events remain for history/recovery).
@@ -4524,6 +4450,7 @@ export class AgentBoxSessionManager {
    * Called on AgentBox shutdown.
    */
   async closeAll(): Promise<void> {
+    this.beginShutdown();
     if (!this.closingAll) this.closingAll = this.closeAllInner();
     return this.closingAll;
   }
@@ -4541,7 +4468,6 @@ export class AgentBoxSessionManager {
       await Promise.all([...this.sessions.values()].map(managed => abortBrainBestEffort(managed.brain, `shutdown ${managed.id}`)));
       const settled = await this.waitPrivateWorkSettled();
       if (settled) {
-        await this.privateLearning;
         try { await this.checkpointPrivateWorkspace(); }
         catch { console.warn("[private-workspace] shutdown retained the last durable checkpoint"); }
         await this.privateWorkspace.close().catch(() => {});
@@ -4592,18 +4518,10 @@ export class AgentBoxSessionManager {
 
     await this.usageOutbox?.close();
 
-    // Close shared memory indexer
-    if (this._sharedMemoryIndexer) {
-      try {
-        await this._sharedMemoryIndexer.sync();
-        this._sharedMemoryIndexer.close();
-        console.log(`[agentbox-session] Shared memory indexer closed`);
-      } catch (err) {
-        console.warn(`[agentbox-session] Shared memory indexer close error:`, err);
-      }
-      this._sharedMemoryIndexer = null;
-    }
-
+    await Promise.all([...this.memoryLearners.values()].map(learner => learner.close()));
+    this.memoryLearners.clear();
+    for (const memory of this.localMemoryStores.values()) memory.close();
+    this.localMemoryStores.clear();
     if (this._sharedKnowledgeIndexer) {
       try {
         this._sharedKnowledgeIndexer.close();
@@ -4642,44 +4560,4 @@ export class AgentBoxSessionManager {
     return false;
   }
 
-  /**
-   * Reset the shared memory indexer.
-   * Called after Gateway has cleared local memory files.
-   * Gateway deletes the full memory/ directory, including .memory.db, so a
-   * live AgentBox must close the old sqlite handle and build a fresh indexer.
-   */
-  async resetMemory(): Promise<void> {
-    if (!isMemoryEnabled()) {
-      if (this._sharedMemoryIndexer) {
-        try {
-          this._sharedMemoryIndexer.close();
-        } catch (err) {
-          console.warn(`[agentbox-session] Memory indexer close during disabled reset failed:`, err);
-        }
-        this._sharedMemoryIndexer = null;
-      }
-      console.log(`[agentbox-session] Memory disabled; resetMemory is a no-op`);
-      return;
-    }
-
-    if (!this._sharedMemoryIndexer) {
-      console.log(`[agentbox-session] No memory indexer to reset`);
-      return;
-    }
-
-    try {
-      this._sharedMemoryIndexer.close();
-    } catch (err) {
-      console.warn(`[agentbox-session] Memory indexer close before reset failed:`, err);
-    }
-    this._sharedMemoryIndexer = null;
-
-    try {
-      const memoryDir = this.getMemoryDir();
-      this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
-      console.log(`[agentbox-session] Memory indexer rebuilt after local cleanup`);
-    } catch (err) {
-      console.warn(`[agentbox-session] Memory indexer rebuild after reset failed:`, err);
-    }
-  }
 }

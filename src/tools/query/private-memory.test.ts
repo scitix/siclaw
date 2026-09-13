@@ -70,10 +70,10 @@ it("does not interpret transport or old-schema responses as no matching history"
 
 it("never falls back to local memory tools in remote mode", () => {
   vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote"); vi.stubEnv("SICLAW_MEMORY_ENABLED", "true");
-  const refs = { memoryIndexer: {}, memoryDir: "/tmp" } as any;
+  const refs = {} as any;
   for (const entry of [searchRegistration, getRegistration]) {
     expect(entry.available!(refs)).toBe(false);
-    expect(() => entry.create(refs)).toThrow("Private memory backend is unavailable");
+    expect(() => entry.create(refs)).toThrow("Memory backend is unavailable");
   }
 });
 

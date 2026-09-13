@@ -238,6 +238,8 @@ async function main() {
     }
   }
 
+  sessionManager.startPrivateMemoryLearning();
+
   // K8s-only: whether to push a final metrics flush to the Gateway on shutdown.
   // Gated identically to the 9090 metrics server (mTLS/https) plus a configured
   // gatewayUrl to push to.

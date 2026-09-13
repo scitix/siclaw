@@ -27,6 +27,7 @@ describe("capability-group registry coverage", () => {
       sessionIdRef: { current: "coverage-probe" },
       sessionEventEmitter: () => {},
       knowledgeCitationTool: { name: "knowledge_cite" },
+      privateMemory: { search() {}, read() {} },
     } as unknown as ToolRefs;
 
     const missing: string[] = [];

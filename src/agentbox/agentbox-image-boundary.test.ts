@@ -40,7 +40,7 @@ describe("AgentBox image boundary", () => {
     // The guard on the guard: a pathspec that matches almost nothing makes the
     // assertion below vacuous, which is how the first version of this test
     // passed while the offending import was still there.
-    const files = execSync(`git ls-files ${allowedDirs.map((d) => `'src/${d}/'`).join(" ")}`, {
+    const files = execSync(`git ls-files --cached --others --exclude-standard ${allowedDirs.map((d) => `'src/${d}/'`).join(" ")}`, {
       cwd: repoRoot,
       encoding: "utf8",
     }).split("\n").filter((f) => f.trim().endsWith(".ts"));
@@ -54,7 +54,7 @@ describe("AgentBox image boundary", () => {
     // in src/agentbox and skipped http-server.ts — the very file that broke the
     // image build. The first version of this test passed with the bad import
     // still in place.
-    const files = execSync(`git ls-files ${allowedDirs.map((d) => `'src/${d}/'`).join(" ")}`, {
+    const files = execSync(`git ls-files --cached --others --exclude-standard ${allowedDirs.map((d) => `'src/${d}/'`).join(" ")}`, {
       cwd: repoRoot,
       encoding: "utf8",
     })

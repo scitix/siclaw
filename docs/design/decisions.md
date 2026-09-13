@@ -28,7 +28,7 @@ The local/TUI deployment needs persistent storage with zero installation require
 - MySQL: Requires separate server process, too heavy for single-user local dev
 
 **Decision**:
-Use `sql.js` for local/default SQLite deployment. `node:sqlite` (built-in) is used only for the memory database (chunked embeddings) where WAL mode and performance matter more.
+Use `sql.js` for local/default SQLite deployment. `node:sqlite` (built-in) is used only for transactional local memory state where WAL mode and performance matter more.
 
 **Consequences**:
 - ✅ Zero installation friction for local dev and TUI mode
@@ -122,23 +122,13 @@ Whitelist-only model with 4-pass validation: binary allowlist → per-command va
 
 ## ADR-005: Hybrid Memory Search (Vector + FTS5)
 
-**Status**: Active
+**Status**: Superseded by [evidence-backed memory](memory-v2-alignment.md).
 
-**Context**:
-Memory search needs to handle both semantic similarity ("find memories about OOMKilled pods") and exact keyword matching ("find memories mentioning node-23"). Pure vector search misses exact terms; pure BM25 misses semantic similarity.
-
-**Decision**:
-Hybrid scoring: `score = vectorWeight × cosineSimilarity + ftsWeight × BM25`
-
-Default: `vectorWeight = 0.70`, `ftsWeight = 0.30` (source: `src/memory/indexer.ts:14-15`). Configurable via `MemorySearchConfig`.
-
-**Consequences**:
-- ✅ Handles both "find semantically similar incidents" and "find the exact error message I saw"
-- ✅ CJK-aware: Chinese queries use bigram OR matching; Latin queries use AND
-- ⚠️ Requires embedding API to be configured — memory search is unavailable without it
-- ⚠️ In-memory cosine similarity over all chunks: acceptable for personal-scale (~1000 chunks), not for team-scale (use sqlite-vec extension for that)
-
-**Future**: When chunk count consistently exceeds ~10k, evaluate sqlite-vec GPU-accelerated vector search.
+The former design combined vector similarity with FTS5/BM25 over local files.
+Its indexer, embedding configuration and sqlite-vec dependency have been retired.
+The current design uses source-bound model extraction, scoped topic consolidation
+and bounded on-demand source tools. Keeping the historical decision here does
+not imply the old implementation or configuration is supported.
 
 ---
 
@@ -218,9 +208,9 @@ DB-based coordination with heartbeat. Each cron instance:
 **Status**: Active
 
 **Context**:
-AgentBox needs LLM provider config (API keys, base URLs, models) and embedding config from Gateway. Previously, Gateway delivered this through two redundant channels:
+AgentBox needs LLM provider config (API keys, base URLs, models)  from Gateway. Previously, Gateway delivered this through two redundant channels:
 
-1. **settings.json** — `GET /api/internal/settings` (mTLS-protected) returns full provider/embedding config; AgentBox writes it to `.siclaw/config/settings.json`
+1. **settings.json** — `GET /api/internal/settings` (mTLS-protected) returns full provider config; AgentBox writes it to `.siclaw/config/settings.json`
 2. **Environment variables** — Gateway's `envResolver` injected `SICLAW_LLM_API_KEY`, `SICLAW_LLM_BASE_URL`, `SICLAW_LLM_MODEL`, `SICLAW_EMBEDDING_*` into spawned pods/processes
 
 The env var channel has a larger attack surface:
@@ -233,7 +223,7 @@ Meanwhile, `.siclaw/config/settings.json` is protected: `restricted-bash.ts` blo
 Additionally, K8s DIR env vars (`SICLAW_SKILLS_DIR`, `SICLAW_USER_DATA_DIR`) were injected with values identical to `config.ts` defaults — redundant since each pod is isolated.
 
 **Decision**:
-Remove the env var delivery channel for LLM/embedding config. Settings.json (via mTLS `GET /api/internal/settings`) is the sole channel for delivering sensitive config to AgentBox in K8s mode.
+Remove the env var delivery channel for LLM provider config. Settings.json (via mTLS `GET /api/internal/settings`) is the sole channel for delivering sensitive config to AgentBox in K8s mode.
 
 Removed:
 - `envResolver` in `server.ts` (injected `SICLAW_LLM_*`, `SICLAW_EMBEDDING_*`)
@@ -396,7 +386,7 @@ Checked at workspace creation time in the Gateway API layer. No enforcement need
 
 ### Investigation Memory Isolation
 
-Each workspace has its own memory database. Investigations in a prod workspace do not appear in a test workspace's context, and vice versa. Memory DB path: `<userDataDir>/<workspaceId>/.memory.db`.
+Each workspace has its own memory database. Investigations in a prod workspace do not appear in a test workspace's context, and vice versa. Current local memory is keyed by user under `memory-v2/`; remote memory uses the host owner/space identity. See the current memory contract.
 
 ### Credential Payload Building (Gateway)
 

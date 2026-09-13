@@ -12,7 +12,7 @@ import https from "node:https";
 /**
  * Tests for createHttpServer.
  *
- * We mock heavy subsystems (metrics registries, memory indexer, config
+ * We mock heavy subsystems (metrics registries, configuration
  * loader) so we can exercise the routing table against a
  * lightweight fake session manager. The server itself is a real http.Server;
  * we send HTTP requests to it from the same process.
@@ -53,7 +53,7 @@ vi.mock("../shared/detect-language.js", () => ({
   detectLanguage: (s: string) => (s.includes("你") ? "Chinese" : "English"),
 }));
 
-// Config loader — point paths at /tmp (no PROFILE.md → no update)
+// Config loader uses the isolated test paths.
 vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
     paths: {
@@ -287,7 +287,6 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     },
     close: async (id: string) => { sessions.delete(id); },
     closeAll: async () => { sessions.clear(); },
-    resetMemory: async () => {},
     scheduleRelease: (_id: string) => {},
     invalidate: (_id: string) => {},
     setDelegationModel: vi.fn(),
@@ -2153,11 +2152,9 @@ describe("http-server — session status (liveness)", () => {
 });
 
 describe("http-server — memory reset", () => {
-  it("DELETE /api/memory calls sessionManager.resetMemory", async () => {
-    const spy = vi.spyOn(sm, "resetMemory");
+  it("does not expose the retired unscoped memory reset endpoint", async () => {
     const r = await getJson(port, "/api/memory", "DELETE");
-    expect(r.status).toBe(200);
-    expect(spy).toHaveBeenCalled();
+    expect(r.status).toBe(404);
   });
 });
 

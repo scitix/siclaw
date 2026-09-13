@@ -10,7 +10,7 @@ import { allToolEntries } from "./all-entries.js";
 function refs(): ToolRefs {
   return {
     kubeconfigRef: {}, userId: "user-1", agentId: "entry",
-    sessionIdRef: { current: "session-1" }, memoryRef: {}, dpStateRef: { active: false },
+    sessionIdRef: { current: "session-1" }, dpStateRef: { active: false },
     sessionEventEmitter: vi.fn(), allowInputRequest: true, handoffSupported: true,
     handoffTargets: [{ id: "receiver", name: "Receiver", routeKey: "receiver", description: "Arithmetic", isFacade: false }],
     searchHandoffTargets: vi.fn(),

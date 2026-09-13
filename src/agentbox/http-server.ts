@@ -1216,12 +1216,7 @@ export function createHttpServer(
     // Prepending would break marker detection in pi-agent extension input handlers
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     //
-    // The directive is injected UNCONDITIONALLY (not gated on memory): following the
-    // user's language is a baseline behaviour every agent needs, independent of whether
-    // it has long-term memory. Only the PROFILE.md persistence below is a memory concern.
-    // (Previously this was accidentally gated on isMemoryEnabled() as a side effect of
-    // "disable memory by default", which left memory-off agents — e.g. the GPU-cloud
-    // sales-guide — with no language enforcement, so they drifted to the model's bias.)
+    // Current response language is independent from durable memory.
     const detectedLang = detectLanguage(promptText);
     if (detectedLang !== "English") {
       // Only two DP markers remain after the refactor: activation and exit.
@@ -1234,32 +1229,6 @@ export function createHttpServer(
         promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
       }
     }
-
-    // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
-    // Only update on non-English detection to avoid flapping: English is the default,
-    // so we only persist when the user actively uses another language.
-    if (detectedLang !== "English") {
-      try {
-        const cfg = loadConfig();
-        const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
-        const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
-        if (fs.existsSync(profilePath)) {
-          const content = fs.readFileSync(profilePath, "utf-8");
-          const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
-          const currentLang = currentLangMatch?.[1]?.trim();
-          if (currentLang !== detectedLang) {
-            const updated = content.replace(
-              /(\*\*Language\*\*:\s*).+/i,
-              `$1${detectedLang}`,
-            );
-            fs.writeFileSync(profilePath, updated);
-          }
-        }
-      } catch { /* best-effort, don't block prompt */ }
-    }
-
-    // Execute prompt asynchronously; notify SSE to close on completion
-    console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
 
     // Metrics: snapshot stats before prompt for delta calculation
     const prevStats = managed.brain.getSessionStats();
@@ -2148,20 +2117,6 @@ export function createHttpServer(
     const { sessionId } = params;
     await sessionManager.close(sessionId);
     sendJson(res, 200, { ok: true });
-  });
-
-  /**
-   * DELETE /api/memory - reset memory indexer after Gateway clears PVC files
-   */
-  addRoute("DELETE", "/api/memory", async (_req, res) => {
-    console.log(`[agentbox-http] Resetting memory indexer`);
-    try {
-      await sessionManager.resetMemory();
-      sendJson(res, 200, { ok: true });
-    } catch (err: any) {
-      console.error(`[agentbox-http] Memory reset failed: ${err.message}`);
-      sendJson(res, 500, { error: `Memory reset failed: ${err.message}` });
-    }
   });
 
   // ==================== Server ====================

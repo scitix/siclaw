@@ -6,7 +6,6 @@
  * Apr 2026 DP refactor continue to live here.
  */
 
-import type { MemoryIndexer } from "../memory/indexer.js";
 
 // ── Session mode ──
 
@@ -27,11 +26,6 @@ export interface KubeconfigRef {
   credentialBroker?: import("../agentbox/credential-broker.js").CredentialBroker;
 }
 
-/** Mutable ref to the shared memory indexer (set after session creation). */
-export interface MemoryRef {
-  indexer?: MemoryIndexer;
-  dir?: string;
-}
 
 // ── DP lifecycle types ──
 //

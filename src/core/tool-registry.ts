@@ -11,11 +11,10 @@ import type { PrivateMemorySource } from "../shared/private-workspace.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { MCP_TOOL_PREFIX } from "./mcp-client.js";
 import type {
-  SessionMode, KubeconfigRef, MemoryRef, DpStateRef,
+  SessionMode, KubeconfigRef, DpStateRef,
 } from "./types.js";
 import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { ChildModelOutcome, SubagentTierMenu, SubagentTierPlan } from "./subagent-models.js";
-import type { MemoryIndexer } from "../memory/indexer.js";
 import type { KnowledgeResolver } from "../knowledge/resolver.js";
 import type { SkillScriptResolver } from "../tools/infra/script-resolver.js";
 
@@ -448,15 +447,12 @@ export interface ToolRefs {
    * shared ledger would have no SSE emitter, so its changes wouldn't reach the UI.
    */
   isSubagent?: boolean;
-  memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
-  memoryIndexer?: MemoryIndexer;
   privateMemory?: PrivateMemorySource;
   /** Labels-only resolver over the knowledge pages mounted for this Agent. */
   knowledgeIndexer?: KnowledgeResolver;
   /** Session-scoped Skill script lookup. Required for LocalSpawner isolation. */
   skillScriptResolver?: SkillScriptResolver;
-  memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
   /**
@@ -540,7 +536,7 @@ export interface ToolEntry {
 
   /**
    * Factory function — receives shared refs, returns a ToolDefinition.
-   * If your tool accesses optional refs (memoryIndexer, memoryDir),
+   * If your tool accesses optional refs (privateMemory),
    * you MUST provide an `available` guard that checks them. The registry calls
    * `available` before `create` — the guard is the safety net for `!` assertions.
    */
@@ -566,7 +562,7 @@ export interface ToolEntry {
   /**
    * Runtime availability check. Return false to skip this tool (create is not called).
    * Use for tools that depend on resources that may not be available
-   * (e.g. memoryIndexer initialization failure).
+   * (e.g. memory backend unavailability).
    * Omit = always available.
    */
   available?: (refs: ToolRefs) => boolean;

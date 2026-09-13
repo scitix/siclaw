@@ -52,7 +52,7 @@ GatewayClient automatically:
 
 #### `fetchSettings()`
 
-Fetch Gateway configuration (providers, models, embedding).
+Fetch Gateway configuration (providers and models).
 
 ```typescript
 const settings = await gatewayClient.fetchSettings();
@@ -61,7 +61,6 @@ const settings = await gatewayClient.fetchSettings();
 // {
 //   providers: [...],
 //   models: [...],
-//   embedding: { ... }
 // }
 ```
 
@@ -128,11 +127,7 @@ Host: siclaw-runtime.siclaw.svc.cluster.local
       "providerId": "anthropic",
       "maxTokens": 200000
     }
-  ],
-  "embedding": {
-    "provider": "openai",
-    "model": "text-embedding-3-small"
-  }
+  ]
 }
 ```
 

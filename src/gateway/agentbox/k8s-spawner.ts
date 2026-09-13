@@ -614,16 +614,16 @@ export class K8sSpawner implements BoxSpawner {
       // handleMetricsFlush). Downward API rather than a literal so it cannot drift.
       { name: "SICLAW_POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
     ];
-    // Normal AgentBoxes need Runtime-level memory/embedding/sub-agent settings.
+    // Normal AgentBoxes need Runtime-level memory/sub-agent settings.
     // Lean capability profiles do not use those features, and inheriting this
-    // base allowlist would copy SICLAW_EMBEDDING_API_KEY into an unrelated KB
-    // PodSpec. Capability boxes receive only their profile-declared env below.
+    // base allowlist would copy unrelated settings into a KB PodSpec. Capability boxes receive only their profile-declared env below.
     if (profile.name === "agent") {
       if (process.env.SICLAW_MEMORY_ENABLED !== undefined) {
         env.push({ name: "SICLAW_MEMORY_ENABLED", value: process.env.SICLAW_MEMORY_ENABLED });
       }
 
       const AGENTBOX_FORWARDED_ENV = [
+        "SICLAW_MEMORY_CATALOG_INJECTION",
         // Sub-agent capacity: per conversation, and the box-wide ceiling. Both are read
         // inside the box, so forwarding is what makes the runtime-level setting real.
         "SICLAW_SUBAGENT_CONCURRENCY",
@@ -641,13 +641,6 @@ export class K8sSpawner implements BoxSpawner {
         // existing session only when its pod is recycled or idles out.
         "SICLAW_SUBAGENT_MODEL_TIER",
         "SICLAW_SUBAGENT_GROUP_ENABLED",
-        // Embedding endpoint for the memory indexer. The agentbox reads these via
-        // loadConfig() env overrides (config.ts); set on the runtime deployment to
-        // configure every normal AgentBox it spawns.
-        "SICLAW_EMBEDDING_BASE_URL",
-        "SICLAW_EMBEDDING_MODEL",
-        "SICLAW_EMBEDDING_DIMENSIONS",
-        "SICLAW_EMBEDDING_API_KEY",
         // Visual tools execute inside the AgentBox, while their renderer is
         // configured on Runtime. Forward the narrow non-secret contract.
         "SICLAW_VISUAL_EXPORT_URL",

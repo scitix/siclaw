@@ -8,7 +8,6 @@ function stubRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
     userId: "u1",
     agentId: null,
     sessionIdRef: { current: "" },
-    memoryRef: {},
     dpStateRef: { active: false },
     ...overrides,
   };

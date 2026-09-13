@@ -65,7 +65,7 @@ vi.mock("../core/agent-factory.js", async () => {
         skillsDirs: ["skills/core"],
         mode: opts.mode ?? "web",
         mcpManager: { shutdown: async () => {} },
-        memoryIndexer: undefined,
+        localMemory: { clear: vi.fn(), close: vi.fn() },
         dpStateRef: { active: false },
       };
     },
@@ -74,21 +74,6 @@ vi.mock("../core/agent-factory.js", async () => {
 
 const lastCreateSiclawSession = { calls: (globalThis as any).__createSessionCalls ?? [] };
 if (!(globalThis as any).__createSessionCalls) (globalThis as any).__createSessionCalls = lastCreateSiclawSession.calls;
-
-// Avoid real memory indexer / embeddings
-vi.mock("../memory/index.js", () => ({
-  createMemoryIndexer: vi.fn(async () => ({
-    sync: vi.fn(async () => {}),
-    startWatching: vi.fn(),
-    purgeStaleInvestigations: vi.fn(async () => {}),
-    clearInvestigations: vi.fn(),
-    close: vi.fn(),
-  })),
-}));
-
-vi.mock("../memory/session-summarizer.js", () => ({
-  saveSessionKnowledge: vi.fn(async () => null),
-}));
 
 // Scoped config mock — points paths to the per-test temp dir.
 let _cfgUserDataDir = "";
@@ -105,7 +90,6 @@ vi.mock("../core/config.js", () => ({
     },
     providers: {},
   }),
-  getEmbeddingConfig: () => null,
   isMemoryEnabled: () => _memoryEnabled,
 }));
 
@@ -399,10 +383,10 @@ it("does not delay checkpoint completion for memory classification and drains it
   try {
     await create();
     _memoryEnabled = true;
-    const source = (manager as any).privateWorkspace;
     let finish!: () => void;
     const pending = new Promise<void>(resolve => { finish = resolve; });
-    const learn = vi.spyOn(source, "learn").mockReturnValue(pending);
+    const learn = vi.fn();
+    (manager as any).memoryLearners.set("sid", { wake: learn, drain: () => pending, close: () => pending });
     await manager.checkpointPrivateWorkspace(true);
     expect(learn).toHaveBeenCalledOnce();
     // The completed checkpoint is available even with the classifier blocked.

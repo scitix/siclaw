@@ -99,7 +99,7 @@ export class GatewayClient {
   }
 
   /**
-   * Fetch settings (providers, models, embedding config) from Gateway
+   * Fetch settings (providers and models) from Gateway
    */
     async fetchSettings(): Promise<any> {
     return this.request("/api/internal/settings", "GET");

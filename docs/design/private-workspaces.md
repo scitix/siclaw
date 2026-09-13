@@ -49,14 +49,16 @@ this change is not a new sandbox for malicious trusted skills or services.
 The trusted host holds OSS credentials and a separate metadata database. Neither
 credentials nor direct bucket authority are sent to Runtime/AgentBox. The generic
 RPC actions are `resolve`, `acquire`, `renew`, `release`, `put`, `get`, `commit`,
-`learn` and `memory_search`. The internal HTTP endpoint requires a private client
+`memory_prepare`, `memory_publish`, `memory_fail`, `memory_search`, `memory_read`,
+`memory_catalog`, `memory_note` and `memory_feedback`. The internal HTTP endpoint requires a private client
 certificate and overwrites caller-provided routing identity.
 
 Bodies live in versioned objects. References contain space/backend/object IDs,
 key, exact version ID, SHA-256 and size. A manifest names file paths and ordered
 4 MiB chunks. The maximum checkpoint is 256 MiB and 4,096 objects; oversized data
-fails explicitly. SQLite indexes and WALs remain local. Authoritative investigation
-and feedback rows are exported as JSON and rebuilt independently from FTS/vectors.
+fails explicitly. Legacy SQLite/WAL files are not replicated as live databases. Historical
+investigation and feedback rows are exported as portable JSON; no retired index
+is rebuilt or used for recall.
 User-created `.db`, `.sqlite` and `.tmp` files remain user data.
 
 The host checks ownership, backend placement generation and writer epoch, uploads
@@ -158,7 +160,7 @@ for credential-compromise scope, retention and rollout requirements.
 | Pi tree, selected leaf, plan/router/turn ledgers and child sessions | `user-data/agent/sessions` plus live Pi managers | Session manifest, including `.pi-session.json` |
 | Task output and artifacts | `user-data/agent/tasks` | Session manifest |
 | User files, reports, traces and migration archives | `user-data/{files,reports,traces,archive}` | Session manifest |
-| Investigation/feedback rows | `user-data/memory` | Exported authoritative JSON; derived SQLite/FTS/vector indexes are rebuilt |
+| Investigation/feedback rows | `user-data/memory` | Portable migration JSON; retired indexes are not rebuilt |
 | Learned personal memory | Retrieved through `memory_search/get` | Host-authorized user-space records and referenced OSS bodies |
 | Effective Skills, knowledge packages, configuration and credentials | Separate pod-local mounts/caches | Trusted Runtime configuration/release sync; image Built-ins are baked in |
 | Temporary command scratch | `/tmp` | No recovery contract |

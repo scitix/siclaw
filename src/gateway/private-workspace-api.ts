@@ -28,7 +28,7 @@ export async function handlePrivateWorkspace(
     try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
     catch { send(400, { error: "Invalid workspace request" }); return; }
     if (!body || !validPrivateId(body.sessionId) || body.sessionId !== identity.privateSessionId || typeof body.incarnation !== "string" ||
-      !["acquire", "renew", "release", "put", "get", "commit", "learn", "memory_search", "memory_read"].includes(String(body.action))) {
+      !["acquire", "renew", "release", "put", "get", "commit", "memory_prepare", "memory_publish", "memory_fail", "memory_search", "memory_read", "memory_catalog", "memory_note", "memory_feedback"].includes(String(body.action))) {
       send(400, { error: "Invalid workspace request" }); return;
     }
     const result = await client.request("workspace.exchange", {

@@ -50,13 +50,18 @@ export interface WorkspaceCommit extends WorkspaceBinding {
 }
 
 export type WorkspaceRequest = {
-  action: "acquire" | "renew" | "release" | "put" | "get" | "commit" | "learn" | "memory_search" | "memory_read";
+  action: "acquire" | "renew" | "release" | "put" | "get" | "commit" | "memory_prepare" | "memory_publish" | "memory_fail" | "memory_search" | "memory_read" | "memory_catalog" | "memory_note" | "memory_feedback";
   sessionId: string;
   incarnation: string;
   binding?: WorkspaceBinding;
   commit?: WorkspaceCommit;
   objectId?: string;
   data?: string;
+  catalog?: MemoryCatalogRequest;
+  note?: MemoryNoteRequest;
+  feedback?: MemoryFeedbackRequest;
+  token?: string;
+  submission?: MemoryLearningSubmission;
   search?: MemorySearchRequest;
   read?: MemoryReadRequest;
 };
@@ -109,6 +114,9 @@ export interface MemoryReadPage {
   expires_at?: number;
 }
 export interface PrivateMemorySource {
+  catalog?(request: MemoryCatalogRequest): Promise<MemoryCatalogPage>;
+  note?(request: MemoryNoteRequest): Promise<{ status: "accepted" | "applied"; id: string }>;
+  feedback?(request: MemoryFeedbackRequest): Promise<{ ok: boolean }>;
   validateExecution?(): Promise<void>;
   search(request: MemorySearchRequest): Promise<MemorySearchPage>;
   read(request: MemoryReadRequest): Promise<MemoryReadPage>;
@@ -123,3 +131,30 @@ export function privateWorkspaceEnabled(): boolean {
 export function validPrivateId(id: unknown): id is string {
   return typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(id);
 }
+
+export interface MemoryLearningSource {
+  id: string; text: string; role: string; sourceEntryId: string; sourceSessionId: string;
+  createdAt: number; expiresAt: number; sourceOrder?: number; tool?: string; isError?: boolean; target?: MemoryHint;
+}
+export interface MemoryHint { id: string; scope: string; claim: string; summary: string }
+export interface MemoryLearningBatch {
+  token: string; generation: number; revision: number; inputs: MemoryLearningSource[];
+  hints: MemoryHint[]; context?: MemoryLearningSource[]; more: boolean; retryAfterMs?: number;
+}
+export interface MemoryDecision {
+  entryId: string; kind: "ignore" | "preference" | "constraint" | "correction" | "experience" | "task" | "forget";
+  quote?: string; scope?: string; claim?: string; summary?: string; keywords?: string; replaces?: string[];
+  status?: "observed" | "failed" | "proposed" | "uncertain" | "user-confirmed";
+  evidence?: { entryId: string; quote: string }[];
+}
+export interface MemoryLearningSubmission { token: string; decisions: MemoryDecision[] }
+export interface MemoryLearningBackend {
+  prepareLearning(): Promise<MemoryLearningBatch>;
+  publishLearning(input: MemoryLearningSubmission): Promise<{ count: number; more: boolean }>;
+  failLearning(token: string): Promise<void>;
+}
+
+export interface MemoryCatalogRequest { scope?: string; query?: string }
+export interface MemoryCatalogPage { entries: { path: string; scope: string; claim: string; label: string; created_at: number }[]; truncated: boolean; generation: number }
+export interface MemoryNoteRequest { action: "remember" | "correct" | "forget"; path?: string; quote: string; operation_id: string }
+export interface MemoryFeedbackRequest { path: string; outcome: "used" | "incorrect" | "irrelevant"; operation_id: string }

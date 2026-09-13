@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   WORKSPACE_OBJECT_BYTES, WORKSPACE_MAX_OBJECTS, WorkspaceTransportError,
   type WorkspaceBinding, type WorkspaceObjectRef, type WorkspaceRequest,
-  type MemorySearchRequest, type MemorySearchPage, type MemoryReadRequest, type MemoryReadPage,
+  type MemoryCatalogRequest, type MemoryCatalogPage, type MemoryNoteRequest, type MemoryFeedbackRequest, type MemoryLearningBatch, type MemoryLearningSubmission, type MemorySearchRequest, type MemorySearchPage, type MemoryReadRequest, type MemoryReadPage,
 } from "../shared/private-workspace.js";
 
 export interface WorkspaceTransport { exchange<T>(request: WorkspaceRequest): Promise<T> }
@@ -171,7 +171,14 @@ export class PrivateWorkspace {
   /** Fence tools immediately while retaining the lease for a final checkpoint. */
   stopExecution(): void { this.executionStopped = true; }
 
-  async learn(): Promise<void> { this.assertHealthy(); await this.request("learn"); }
+  // Learning has a host-owned lease and can continue after foreground release.
+  async prepareLearning(): Promise<MemoryLearningBatch> { return this.request("memory_prepare"); }
+  async publishLearning(submission: MemoryLearningSubmission): Promise<{ count: number; more: boolean }> { return this.request("memory_publish", { submission }); }
+  async failLearning(token: string): Promise<void> { await this.request("memory_fail", { token }); }
+
+  async catalog(catalog: MemoryCatalogRequest): Promise<MemoryCatalogPage> { this.assertHealthy(); return this.request("memory_catalog", { catalog }); }
+  async note(note: MemoryNoteRequest): Promise<{ status: "accepted" | "applied"; id: string }> { this.assertHealthy(); return this.request("memory_note", { note }); }
+  async feedback(feedback: MemoryFeedbackRequest): Promise<{ ok: boolean }> { this.assertHealthy(); return this.request("memory_feedback", { feedback }); }
 
   async search(search: MemorySearchRequest): Promise<MemorySearchPage> {
     this.assertHealthy();

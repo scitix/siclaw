@@ -397,7 +397,7 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
-  it("keeps agent-only embedding credentials out of lean KB PodSpecs", async () => {
+  it("does not forward retired embedding credentials into any pod", async () => {
     process.env.SICLAW_EMBEDDING_BASE_URL = "https://embedding.example/v1";
     process.env.SICLAW_EMBEDDING_API_KEY = "embedding-secret";
 
@@ -421,8 +421,8 @@ describe("K8sSpawner — spawn branches", () => {
         .slice(1)
         .map((call: any) => call.body.spec.containers[0].env);
 
-      expect(agentEnv).toContainEqual({ name: "SICLAW_EMBEDDING_BASE_URL", value: "https://embedding.example/v1" });
-      expect(agentEnv).toContainEqual({ name: "SICLAW_EMBEDDING_API_KEY", value: "embedding-secret" });
+      expect(agentEnv).not.toContainEqual({ name: "SICLAW_EMBEDDING_BASE_URL", value: "https://embedding.example/v1" });
+      expect(agentEnv).not.toContainEqual({ name: "SICLAW_EMBEDDING_API_KEY", value: "embedding-secret" });
       for (const env of capabilityEnvs) {
         expect(env.some((entry: any) => entry.name.startsWith("SICLAW_EMBEDDING_"))).toBe(false);
       }

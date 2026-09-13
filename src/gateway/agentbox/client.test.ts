@@ -272,10 +272,7 @@ describe("AgentBoxClient — model + context endpoints", () => {
     expect(r.active).toBe(true);
   });
 
-  it("resetMemory() issues DELETE /api/memory", async () => {
-    const r = await client.resetMemory();
-    expect(r.ok).toBe(true);
-  });
+
 });
 
 describe("AgentBoxClient — reloadResource + post", () => {

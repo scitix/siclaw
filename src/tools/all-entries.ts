@@ -25,6 +25,7 @@ import { registration as hostList } from "./query/host-list.js";
 // resolve_pod_netns removed — node_exec/pod_exec/*_script auto-resolve pod→netns
 // internally via pod= (shared pod-netns-resolve.ts); the standalone tool was redundant.
 import { registration as memorySearch } from "./query/memory-search.js";
+import { catalogRegistration, updateRegistration, feedbackRegistration } from "./query/memory-actions.js";
 import { registration as memoryGet } from "./query/memory-get.js";
 import { registration as knowledgeSearch } from "./query/knowledge-search.js";
 import { registration as knowledgeCite } from "./query/knowledge-cite.js";
@@ -54,7 +55,7 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript, runScript,
   // ── query ──
   clusterList, hostList, k8sInspect,
-  memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
+  memorySearch, memoryGet, catalogRegistration, updateRegistration, feedbackRegistration, knowledgeSearch, knowledgeCite,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, requestInput,

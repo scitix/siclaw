@@ -54,7 +54,7 @@ snapshot, K8s/Docker/Helm, or user-facing workflows.
 - Shell execution security is layered: OS-level isolation first, whitelist-only
   command validation second, plus pre/post execution sanitization.
 - Portal/Gateway DB and Memory DB are separate persistence domains. Do not mix
-  user/session config with embedding/chunk/investigation storage.
+  user/session config with memory evidence, learning progress or recall metadata.
 - AgentBox and Runtime are separate processes in K8s mode. Code under
   `src/agentbox/**` must not import Gateway or Portal persistence modules such
   as `src/gateway/chat-repo.ts`; LocalSpawner's shared process can hide this.
@@ -72,7 +72,7 @@ Tests: vitest
 Frontend: React + Vite + Tailwind
 Agent: @mariozechner/pi-coding-agent
 Gateway DB: mysql2 / node:sqlite raw SQL
-Memory DB: node:sqlite + FTS5 + sqlite-vec
+Memory: host evidence service (remote); per-user node:sqlite transactions (local)
 ```
 
 - Use named exports; avoid default exports.

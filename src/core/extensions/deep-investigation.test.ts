@@ -87,7 +87,7 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
   it("first marker-bearing message flips dpActive on and prepends the prompt preamble", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const results = await callAll(handlers, "input",
       { text: "[Deep Investigation]\n排查集群 DNS 异常" },
@@ -111,7 +111,7 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
   it("strips UI-only prefix chip markers before forwarding DP input to the model", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const results = await callAll(handlers, "input",
       { text: `[Deep Investigation]
@@ -130,7 +130,7 @@ Additional direction from user: focus on ingress` },
   it("strips current DP checkpoint prefix markers but preserves their hidden instruction body", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const results = await callAll(handlers, "input",
       { text: `[Deep Investigation]
@@ -150,7 +150,7 @@ Additional direction from user: compare H2 with kube-proxy evidence` },
   it("subsequent [Deep Investigation]-prefixed messages only strip the marker (no preamble re-injection)", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "input",
       { text: "[Deep Investigation]\nfirst question" },
@@ -171,7 +171,7 @@ Additional direction from user: compare H2 with kube-proxy evidence` },
   it("bare marker enables DP mode without forwarding marker text", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
     const results = await callAll(handlers, "input",
       { text: "[Deep Investigation]\n   " },
       makeCtx(),
@@ -185,7 +185,7 @@ describe("deepInvestigationExtension — deactivation via [DP_EXIT] marker", () 
   it("turns dpActive off and transforms the message into a user-exited notice", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "input", { text: "[Deep Investigation]\nq" }, makeCtx());
     expect(stateRef.active).toBe(true);
@@ -204,7 +204,7 @@ describe("deepInvestigationExtension — deactivation via [DP_EXIT] marker", () 
   it("bare [DP_EXIT] without trailing newline/text also deactivates", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
     await callAll(handlers, "input", { text: "[Deep Investigation]\nq" }, makeCtx());
     expect(stateRef.active).toBe(true);
 
@@ -217,7 +217,7 @@ describe("deepInvestigationExtension — session restoration", () => {
   it("clean session_start (no entries) leaves dpActive false", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "session_start", {}, makeCtx());
     expect(stateRef.active).toBe(false);
@@ -226,7 +226,7 @@ describe("deepInvestigationExtension — session restoration", () => {
   it("restores active=true from the new {active:true} entry shape", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const ctx = makeCtx({
       sessionEntries: [{ type: "custom", customType: "dp-mode", data: { active: true } }],
@@ -238,7 +238,7 @@ describe("deepInvestigationExtension — session restoration", () => {
   it("restores active=true from the legacy {enabled:true} shape", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const ctx = makeCtx({
       sessionEntries: [{ type: "custom", customType: "dp-mode", data: { enabled: true } }],
@@ -250,7 +250,7 @@ describe("deepInvestigationExtension — session restoration", () => {
   it("restores active=true from the legacy {dpStatus:'investigating'} shape", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const ctx = makeCtx({
       sessionEntries: [{ type: "custom", customType: "dp-mode", data: { dpStatus: "investigating" } }],
@@ -262,7 +262,7 @@ describe("deepInvestigationExtension — session restoration", () => {
   it("legacy {dpStatus:'idle'} leaves dpActive false", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     const ctx = makeCtx({
       sessionEntries: [{ type: "custom", customType: "dp-mode", data: { dpStatus: "idle" } }],
@@ -294,7 +294,7 @@ describe("deepInvestigationExtension — investigation checkpoint budget", () =>
   it("blocks the next tool call after twenty DP tool results without visible synthesis", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
     await callAll(handlers, "context", {
@@ -321,7 +321,7 @@ describe("deepInvestigationExtension — investigation checkpoint budget", () =>
   it("counts pi-agent toolResult messages toward the DP checkpoint budget", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
     await callAll(handlers, "context", {
@@ -347,7 +347,7 @@ describe("deepInvestigationExtension — investigation checkpoint budget", () =>
   it("allows tool calls before the DP checkpoint budget is exhausted", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
     await callAll(handlers, "context", {
@@ -372,7 +372,7 @@ describe("deepInvestigationExtension — investigation checkpoint budget", () =>
   it("resets the DP checkpoint budget after a visible assistant checkpoint", async () => {
     const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
+    deepInvestigationExtension(api, stateRef);
 
     await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
     await callAll(handlers, "context", {

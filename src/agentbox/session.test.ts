@@ -100,7 +100,7 @@ vi.mock("../core/agent-factory.js", async () => {
         skillsDirs: ["skills/core"],
         mode: opts.mode ?? "web",
         mcpManager: { shutdown: async () => {} },
-        memoryIndexer: undefined,
+        localMemory: { clear: vi.fn(), close: vi.fn() },
         dpStateRef: { active: false },
       };
     },
@@ -109,21 +109,6 @@ vi.mock("../core/agent-factory.js", async () => {
 
 const lastCreateSiclawSession = { calls: (globalThis as any).__createSessionCalls ?? [] };
 if (!(globalThis as any).__createSessionCalls) (globalThis as any).__createSessionCalls = lastCreateSiclawSession.calls;
-
-// Avoid real memory indexer / embeddings
-vi.mock("../memory/index.js", () => ({
-  createMemoryIndexer: vi.fn(async () => ({
-    sync: vi.fn(async () => {}),
-    startWatching: vi.fn(),
-    purgeStaleInvestigations: vi.fn(async () => {}),
-    clearInvestigations: vi.fn(),
-    close: vi.fn(),
-  })),
-}));
-
-vi.mock("../memory/session-summarizer.js", () => ({
-  saveSessionKnowledge: vi.fn(async () => null),
-}));
 
 // Scoped config mock — points paths to the per-test temp dir.
 let _cfgUserDataDir = "";
@@ -140,15 +125,12 @@ vi.mock("../core/config.js", () => ({
     },
     providers: {},
   }),
-  getEmbeddingConfig: () => null,
   isMemoryEnabled: () => _memoryEnabled,
 }));
 
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
-import { createMemoryIndexer } from "../memory/index.js";
-import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import * as subagentRegistry from "../core/subagent-registry.js";
 import { getSubagentConcurrency } from "../core/subagent-registry.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
@@ -461,8 +443,6 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
 
     await mgr.getOrCreate("sess-1");
 
-    expect(createMemoryIndexer).not.toHaveBeenCalled();
-    expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
     expect(fs.existsSync(path.join(_cfgUserDataDir, "memory"))).toBe(false);
   });
 
@@ -508,7 +488,6 @@ describe("AgentBoxSessionManager — release", () => {
     await mgr.getOrCreate("sess-1");
     await mgr.release("sess-1");
 
-    expect(saveSessionKnowledge).not.toHaveBeenCalled();
   });
 
   it("release skips delete when a new getOrCreate has replaced the session mid-release", async () => {
@@ -774,29 +753,6 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
   });
 });
 
-describe("AgentBoxSessionManager — resetMemory", () => {
-  it("is a no-op when memory indexer was never initialized", async () => {
-    const mgr = new AgentBoxSessionManager();
-    await expect(mgr.resetMemory()).resolves.toBeUndefined();
-  });
-
-  it("closes and rebuilds the shared indexer after Gateway deletes the memory dir", async () => {
-    const mgr = new AgentBoxSessionManager();
-    // Trigger shared init via getOrCreate
-    await mgr.getOrCreate("sess-1");
-
-    const firstIndexer = await (createMemoryIndexer as any).mock.results[0].value;
-
-    await mgr.resetMemory();
-
-    expect(firstIndexer.close).toHaveBeenCalledTimes(1);
-    expect(createMemoryIndexer).toHaveBeenCalledTimes(2);
-    const secondIndexer = await (createMemoryIndexer as any).mock.results[1].value;
-    expect(secondIndexer.sync).toHaveBeenCalledTimes(1);
-    expect(secondIndexer.startWatching).toHaveBeenCalledTimes(1);
-    expect(mgr.activeCount()).toBe(1);
-  });
-});
 
 describe("AgentBoxSessionManager — list + get + activeCount", () => {
   it("list returns all managed sessions", async () => {
@@ -1949,7 +1905,7 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
 
     // cleanup: stop, let it settle, and cancel the coalesce timer so no stray synthetic turn.
     await mgr.createJobStopExecutor()("grpbg");
-    await new Promise((r) => setTimeout(r, 30));
+    await vi.waitFor(() => expect(managed._backgroundWorkCount).toBe(0));
     mgr.discardPendingNotifications("p1");
   });
 
@@ -1966,7 +1922,7 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
     expect(stop.stopped).toBe(true);
     expect(mgr.jobs.get(res.jobId).status).toBe("stopped");
 
-    await new Promise((r) => setTimeout(r, 30)); // let the group settle
+    await vi.waitFor(() => expect(mgr.sessions.get("p1")._backgroundWorkCount).toBe(0));
     expect(hooks.abortCount).toBe(3); // every in-flight child was aborted by the group controller
     mgr.discardPendingNotifications("p1");
   });
@@ -1996,7 +1952,7 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
 
     const res = mgr.startBackgroundSubagentGroup(bgReq());
     expect(res.status).toBe("launched");
-    await new Promise((r) => setTimeout(r, 120)); // let the group settle (before the 600ms coalesce)
+    await vi.waitFor(() => expect(mgr.sessions.get("p1")._backgroundWorkCount).toBe(0));
 
     // group_progress is LIVE-ONLY (emit_chat_event, never append_event) and carries the groupId
     // + per-item status/session array so the card animates and can open a running child's

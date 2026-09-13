@@ -39,7 +39,7 @@ describe("resolveCapabilities", () => {
   it("multiple groups resolve to the union of their tools", () => {
     const result = resolveCapabilities(["read_files", "search_memory"]);
     expect(new Set(result)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get", "memory_catalog"]),
     );
   });
 
@@ -74,6 +74,7 @@ describe("resolveCapabilities", () => {
   it("CAPABILITY_GROUPS includes an explicit zero-tool group", () => {
     expect(Object.keys(CAPABILITY_GROUPS).sort()).toEqual([
       "inspect_infra",
+      "manage_memory",
       "no_tools",
       "plan_tasks",
       "read_files",

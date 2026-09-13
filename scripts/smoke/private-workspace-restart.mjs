@@ -44,7 +44,7 @@ const { AgentBoxSessionManager } = await import("../../dist/agentbox/session.js"
 const { privateWorkspaceRoots } = await import("../../dist/shared/private-workspace-paths.js");
 const { capturePiSession } = await import("../../dist/agentbox/pi-session-snapshot.js");
 const { getOrCreateLedger } = await import("../../dist/core/task-ledger.js");
-const { initMemoryDb } = await import("../../dist/memory/schema.js");
+const { DatabaseSync } = await import("node:sqlite");
 const manager = new AgentBoxSessionManager();
 manager.gatewayClient = { exchange };
 const roots = privateWorkspaceRoots(process.cwd(), ".siclaw/user-data");
@@ -83,7 +83,8 @@ try {
       fs.writeFileSync(path.join(roots[prefix], "probe.txt"), marker);
     }
     fs.mkdirSync(roots.memory, { recursive: true });
-    const db = initMemoryDb(path.join(roots.memory, ".memory.db"));
+    const db = new DatabaseSync(path.join(roots.memory, ".memory.db"));
+    db.exec("CREATE TABLE investigations(id TEXT PRIMARY KEY, question TEXT, created_at INTEGER, feedback_note TEXT)");
     db.prepare("INSERT INTO investigations (id,question,created_at,feedback_note) VALUES (?,?,?,?)")
       .run("probe", marker, 1, "verified feedback");
     db.close();
@@ -102,10 +103,9 @@ try {
     for (const prefix of ["reports", "traces", "tasks", "archive"]) {
       assert.equal(fs.readFileSync(path.join(roots[prefix], "probe.txt"), "utf8"), marker);
     }
-    const db = initMemoryDb(path.join(roots.memory, ".memory.db"));
-    assert.equal(db.prepare("SELECT question FROM investigations WHERE id='probe'").get().question, marker);
-    assert.equal(db.prepare("SELECT feedback_note FROM investigations WHERE id='probe'").get().feedback_note, "verified feedback");
-    db.close();
+    const rows = JSON.parse(fs.readFileSync(path.join(roots.memory, ".investigations.json"), "utf8")).rows;
+    assert.equal(rows.find(row => row.id === "probe").question, marker);
+    assert.equal(rows.find(row => row.id === "probe").feedback_note, "verified feedback");
     if (stage === "resume") {
       const count = pi.buildSessionContext().messages.length;
       pi.appendMessage({ role: "user", content: "What was my session marker?", timestamp: 4 });

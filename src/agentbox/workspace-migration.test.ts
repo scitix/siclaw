@@ -5,8 +5,8 @@ import { afterEach, expect, it } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { exportLegacyWorkspace, type LegacyWorkspaceMapping } from "./workspace-migration.js";
 import { capturePiSession } from "./pi-session-snapshot.js";
-import { initMemoryDb } from "../memory/schema.js";
-import { exportInvestigationRows, restoreInvestigationRows } from "./private-memory-snapshot.js";
+import { DatabaseSync } from "node:sqlite";
+import { exportInvestigationRows } from "./private-memory-snapshot.js";
 const dirs: string[] = [];
 function dir() { const d = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-migration-")); dirs.push(d); return d; }
 afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
@@ -30,14 +30,14 @@ it("exports a complete branch tree without modifying legacy files and marks unkn
   expect(() => exportLegacyWorkspace({ ...mapping, piFile: "alias" })).toThrow(/symlinks/);
 });
 it("preserves investigation and feedback rows independently of SQLite indexes", () => {
-  const root = dir(), db = initMemoryDb(path.join(root, ".memory.db"));
+  const root = dir(), db = new DatabaseSync(path.join(root, ".memory.db"));
+  db.exec("CREATE TABLE investigations (id TEXT PRIMARY KEY, question TEXT, created_at INTEGER, feedback_signal REAL, feedback_note TEXT)");
   db.prepare("INSERT INTO investigations(id,question,created_at,feedback_signal,feedback_note) VALUES (?,?,?,?,?)").run("case", "why?", 1, 0.2, "disproved");
   exportInvestigationRows(root); db.close();
   const restored = dir(); fs.copyFileSync(path.join(root, ".investigations.json"), path.join(restored, ".investigations.json"));
-  restoreInvestigationRows(restored);
-  const read = initMemoryDb(path.join(restored, ".memory.db"));
-  try { expect(read.prepare("SELECT feedback_signal, feedback_note FROM investigations WHERE id='case'").get()).toMatchObject({ feedback_signal: 0.2, feedback_note: "disproved" }); }
-  finally { read.close(); }
+  const snapshot = JSON.parse(fs.readFileSync(path.join(restored, ".investigations.json"), "utf8"));
+  expect(snapshot.rows).toEqual([expect.objectContaining({ id: "case", feedback_signal: 0.2, feedback_note: "disproved" })]);
+  expect(fs.existsSync(path.join(restored, ".memory.db"))).toBe(false);
 });
 
 it("migrates child trees, sidecars and task output while blocking unknown child branches", () => {
