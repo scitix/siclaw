@@ -26,7 +26,11 @@ export function safeWorkspacePath(name: string): string {
   return name;
 }
 
-/** Capture regular files only. No archive-controlled paths, links, owners or modes. */
+/**
+ * Capture regular files exactly for recovery, without chat-output redaction.
+ * These bytes may contain secrets; see docs/operations/private-workspaces.md.
+ * No archive-controlled paths, links, owners or modes.
+ */
 export function captureWorkspaceFiles(roots: Record<string, string>): Map<string, Buffer> {
   const files = new Map<string, Buffer>();
   let bytes = 0;
