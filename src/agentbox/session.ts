@@ -400,6 +400,8 @@ export class AgentBoxSessionManager {
   private privateRestore?: Promise<boolean>;
   private privateLifecycle: Promise<unknown> = Promise.resolve();
   private privateCheckpoint: Promise<unknown> = Promise.resolve();
+  private privateLearning?: Promise<void>;
+  private privateLearningRequested = false;
   private promptSetup?: Promise<void>;
   private shuttingDown = false;
   private closingAll?: Promise<void>;
@@ -539,8 +541,23 @@ export class AgentBoxSessionManager {
       fs.rmSync(path.join(this.getSessionDir(this.privateWorkspace.sessionId), ".pending-turn.json"), { force: true });
       // Learning is optional and must not turn a committed snapshot into a
       // reported persistence failure. A later completed turn retries extraction.
-      if (isMemoryEnabled()) await this.privateWorkspace.learn().catch(() => console.warn("[private-workspace] memory extraction deferred"));
+      if (isMemoryEnabled()) this.schedulePrivateLearning();
     }
+  }
+
+  private schedulePrivateLearning(): void {
+    this.privateLearningRequested = true;
+    if (this.privateLearning || !this.privateWorkspace || this.shuttingDown) return;
+    const workspace = this.privateWorkspace;
+    // Coalesce completed turns while a bounded host classification is running.
+    // Checkpoint completion and the user's final response never await the model.
+    this.privateLearning = (async () => {
+      while (this.privateLearningRequested && workspace === this.privateWorkspace && !this.shuttingDown) {
+        this.privateLearningRequested = false;
+        try { await workspace.learn(); }
+        catch { console.warn("[private-workspace] memory extraction deferred"); break; }
+      }
+    })().finally(() => { this.privateLearning = undefined; });
   }
 
   async preparePrivateTurn(sessionId: string, input: { turnId?: string; text?: string; images?: unknown; files?: unknown }): Promise<void> {
@@ -4323,6 +4340,7 @@ export class AgentBoxSessionManager {
     }
 
     if (privateWorkspaceEnabled() && !preserveWorkspace) {
+      await this.privateLearning;
       try { await this.checkpointPrivateWorkspace(); }
       catch { console.warn("[private-workspace] release retained the last durable checkpoint"); }
       await this.privateWorkspace?.close().catch(() => {});
@@ -4490,6 +4508,7 @@ export class AgentBoxSessionManager {
       await Promise.all([...this.sessions.values()].map(managed => abortBrainBestEffort(managed.brain, `shutdown ${managed.id}`)));
       const settled = await this.waitPrivateWorkSettled();
       if (settled) {
+        await this.privateLearning;
         try { await this.checkpointPrivateWorkspace(); }
         catch { console.warn("[private-workspace] shutdown retained the last durable checkpoint"); }
         await this.privateWorkspace.close().catch(() => {});

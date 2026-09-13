@@ -736,7 +736,11 @@ describe("AgentBoxClient — interrupted streams", () => {
         res.writeHead(200, { "Content-Type": "text/event-stream" });
         res.write(": heartbeat\n\n");
         const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 20);
-        const finish = setTimeout(() => res.end('data: {"done":true}\n\n'), 400);
+        const finish = setTimeout(() => {
+          // close can arrive after another timer tick; stop writes before end.
+          clearInterval(heartbeat);
+          res.end('data: {"done":true}\n\n');
+        }, 400);
         res.on("close", () => { clearInterval(heartbeat); clearTimeout(finish); });
       });
       try {

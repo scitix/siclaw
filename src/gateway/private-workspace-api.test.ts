@@ -48,3 +48,12 @@ it("rejects another session, legacy certificates and unknown actions before any 
     expect(result.status).toBeGreaterThanOrEqual(400); expect(result.request).not.toHaveBeenCalled();
   }
 });
+
+it.each([
+  { action: "memory_search", search: { queries: ["harbor"], max_results: 2 } },
+  { action: "memory_read", read: { path: `memory/${"a".repeat(64)}.md`, line_offset: 2, max_lines: 3 } },
+])("forwards the structured $action contract with certificate authority", async input => {
+  const result = await call({ ...input, sessionId: "session", incarnation: "incarnation", agentId: "forged" });
+  expect(result.status).toBe(200);
+  expect(result.request.mock.calls[0][1]).toMatchObject({ ...input, agentId: "agent", spaceId: "space", boxId: "box" });
+});
