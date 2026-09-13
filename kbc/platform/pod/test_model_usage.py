@@ -44,6 +44,16 @@ class ModelUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["finality"], "intermediate")
         self.assertEqual(sink.events[-1]["outcome"], "error")
 
+    async def test_failure_before_provider_response_still_records_the_dispatch(self):
+        recorder, sink = self.make()
+        await recorder.begin("turn")
+        await recorder.finish("error", "turn")
+        self.assertEqual(len(sink.events), 2)
+        self.assertEqual(sink.events[0]["callId"], sink.events[1]["callId"])
+        self.assertEqual(sink.events[1]["outcome"], "error")
+        self.assertFalse(sink.events[1]["usageEvidence"]["providerUsagePresent"])
+        self.assertEqual(sink.events[1]["usageEvidence"]["rawUsage"], {})
+
     async def test_sdk_only_message_is_unknown_and_repeated_blocks_do_not_duplicate(self):
         recorder, sink = self.make()
         await recorder.record_unobserved("sdk-message", "turn")

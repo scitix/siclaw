@@ -20,25 +20,33 @@ class ClaudeUsageRecorder:
         self.response_id = None
         self.response_model = None
 
+    async def begin(self, turn_id):
+        await self.finish("incomplete", turn_id)
+        model = self.config["model"]
+        self.call = {
+            "schemaVersion": 1, "callId": str(uuid.uuid4()), "phase": "started",
+            "sessionId": self.session_id, "requestId": turn_id, "requestAt": _now(),
+            "kind": "agent", "executionRole": "root", "routingAttempt": 1,
+            "executorRole": self.config.get("role", "compile"),
+            "model": {"configId": "", "name": model.get("name", model["id"]),
+                      "sourceKind": "unknown", "sourceId": "", "sourceName": "",
+                      "requestedId": model["id"], "runtimeProvider": model["provider"]},
+        }
+        self.response_id, self.response_model = None, None
+        self.raw, self.terminal = {}, False
+        await self._emit(self.call, turn_id)
+
     async def observe(self, event, turn_id):
         kind = event.get("type")
         if kind == "message_start":
-            await self.finish("incomplete", turn_id)
-            model = self.config["model"]
-            self.call = {
-                "schemaVersion": 1, "callId": str(uuid.uuid4()), "phase": "started",
-                "sessionId": self.session_id, "requestId": turn_id, "requestAt": _now(),
-                "kind": "agent", "executionRole": "root", "routingAttempt": 1,
-                "executorRole": self.config.get("role", "compile"),
-                "model": {"configId": "", "name": model.get("name", model["id"]),
-                          "sourceKind": "unknown", "sourceId": "", "sourceName": "",
-                          "requestedId": model["id"], "runtimeProvider": model["provider"]},
-            }
+            # Reuse the initial dispatch record. Later model-loop messages
+            # start a new call when their provider boundary becomes visible.
+            if self.call is None or self.response_id is not None:
+                await self.begin(turn_id)
             message = event.get("message") or {}
             self.response_id, self.response_model = message.get("id"), message.get("model")
             self.raw, self.terminal = {}, False
             self._merge(message.get("usage"))
-            await self._emit(self.call, turn_id)
         elif kind == "message_delta" and self.call:
             self._merge(event.get("usage"))
         elif kind == "message_stop" and self.call:
@@ -75,6 +83,10 @@ class ClaudeUsageRecorder:
         # A legacy SDK message can establish that a call happened, but its
         # normalized usage is not raw provider evidence.
         if message_id in self.seen or (self.call is not None and message_id == self.response_id):
+            return
+        if self.call is not None and self.response_id is None:
+            self.response_id = message_id
+            await self.finish("incomplete", turn_id)
             return
         model = self.config["model"]
         at = _now()
