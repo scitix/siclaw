@@ -64,10 +64,12 @@ runtime:
   nodeMaxOldSpaceMB: 1024
   memory:
     # Disabled by default for integrated production deployments. Enabling
-    # this re-exposes memory_search/memory_get and session memory auto-save.
+    # this enables memory_search/memory_get. Remote workspaces use the host's
+    # evidence store; local mode uses the local memory database.
     enabled: false
-  # Embedding endpoint for memory's hybrid vector search. Only used when
-  # memory.enabled=true. When baseUrl is empty, memory falls back to FTS
+  # Embedding endpoint for local memory's hybrid vector search. Only used when
+  # memory.enabled=true and workspace.mode=local; remote recall uses the host.
+  # When baseUrl is empty, local memory falls back to FTS
   # (keyword) search only — no semantic vector recall. The endpoint must be
   # OpenAI-compatible (POST {baseUrl}/embeddings); e.g. a self-hosted TEI /
   # vLLM / Ollama service. Forwarded to each AgentBox pod via the runtime

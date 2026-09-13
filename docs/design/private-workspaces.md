@@ -20,6 +20,15 @@ Changing the Runtime does not change the space's storage backend. New spaces may
 use different Runtime defaults. Moving an existing space between buckets requires
 an explicit data migration, not a configuration edit.
 
+`placementEpoch` is reserved for that migration contract. It currently starts at
+1 and has no production update path; it does not implement bucket migration.
+A future migration must increment it under the space lock in the transaction
+changing placement, so old bindings fail validation. Copying and verifying objects,
+rewriting exact references and coordinating in-flight work require their own
+migration implementation. Regression tests directly advance only this field and
+check stale bindings and reads crossing the change; these are fence tests, not
+evidence of a working migration.
+
 The container still separates the trusted agentbox UID from the sandbox UID.
 Sandbox may read `user-data/files` (directories 2750, files 0640), while only the
 trusted agent process writes durable content. Session trees, configuration and
