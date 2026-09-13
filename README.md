@@ -175,6 +175,22 @@ All configuration happens through the web UI:
 - Manage users and roles in **Users**
 - Schedule recurring investigations in **My Tasks**
 
+## Use Siclaw from Claude Code
+
+Talk to a hosted Siclaw agent from Claude Code with one plugin: it registers
+the remote MCP server and ships the `siclaw-brief` skill that teaches how to brief the
+agent (see [plugins/siclaw/README.md](plugins/siclaw/README.md)).
+
+```bash
+export SICLAW_CONTROL_PLANE_URL="https://control-plane.example.com" # no trailing slash
+export SICLAW_A2A_KEY=sk-...          # agent API key from the control plane
+claude plugin marketplace add scitix/siclaw
+claude plugin install siclaw@siclaw
+```
+
+Codex and other clients: drop [`siclaw-brief.md`](siclaw-brief.md) into your skills
+directory and register `https://<control-plane-host>/api/v1/mcp` with your own MCP client.
+
 ## Documentation
 
 - [Getting Started](https://docs.siclaw.ai/start/getting-started)

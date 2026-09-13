@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "siclaw": {
+      "headers": {
+        "Authorization": "Bearer ${SICLAW_A2A_KEY}"
+      },
+      "type": "http",
+      "url": "${SICLAW_CONTROL_PLANE_URL}/api/v1/mcp"
+    }
+  }
+}

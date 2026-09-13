@@ -1,0 +1,18 @@
+{
+  "metadata": {
+    "description": "Siclaw SRE agent: MCP server + the siclaw-brief skill (caller contract v1)"
+  },
+  "name": "siclaw",
+  "owner": {
+    "name": "SciTiX Siclaw",
+    "url": "https://github.com/scitix/siclaw"
+  },
+  "plugins": [
+    {
+      "description": "Delegate SRE investigations to a hosted Siclaw agent with a well-formed brief",
+      "name": "siclaw",
+      "source": "./plugins/siclaw",
+      "version": "1.0.0"
+    }
+  ]
+}

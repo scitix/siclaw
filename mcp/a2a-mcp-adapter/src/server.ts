@@ -5,7 +5,9 @@ import type { AgentRouter } from "./router.js";
 import { buildToolDefinitions, createToolHandler } from "./tools.js";
 
 const BASE_INSTRUCTIONS = [
-  "Use siclaw_investigate for operational questions that require the configured Siclaw SRE agent.",
+  "Use siclaw_investigate to delegate operational diagnosis to the configured Siclaw SRE agent.",
+  "Give Siclaw a self-contained brief with the user's goal, observed symptoms, known facts and identifiers, relevant time facts, checks already performed and their results, the unresolved question, and explicit user constraints. Separate known facts from assumptions or uncertain context.",
+  "Do not invent or prescribe data sources, query ranges, tool calls, hypotheses, investigation steps, or execution order unless the user explicitly requires a method. Siclaw owns investigation scoping, planning, evidence selection and correlation, execution order, and stopping conditions.",
   "When it returns a non-terminal task, keep the current turn open and call siclaw_wait_task with the same task_id until terminal, unless the user requests fire-and-forget, asks to stop, or the overall investigation deadline is exhausted.",
   "Never resubmit the same question merely because a task is still working.",
   "Use siclaw_list_tasks to recover server-side tasks after a client restart.",
