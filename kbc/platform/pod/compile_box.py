@@ -1731,6 +1731,15 @@ def _render_command(run: "CompileRun", command: dict) -> str:
                 produced = list(recovery.get("produced_pages") or [])
                 produced_count = int(recovery.get("produced_count") or len(produced))
                 produced_set = set(produced)
+                # Check the exact candidate snapshot used for classification.
+                # A count-correct but mismatched path must not turn output into
+                # inherited pages. Pending batch plans never use this branch.
+                missing = sorted(produced_set.difference(pages))
+                if missing:
+                    sample = json.dumps([page[:160] for page in missing[:5]])
+                    raise CommandRejected(
+                        f"recovery provenance references {len(missing)} page(s) absent from candidate/: {sample}; "
+                        "use exact POSIX paths relative to candidate/", 409)
                 inherited = [page for page in all_pages if page not in produced_set]
             else:
                 produced, produced_count, inherited = all_pages, len(all_pages), []
@@ -1772,10 +1781,9 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
             raise CommandRejected("the proposed plan changed; refresh before approving", 409)
     if action == "compile.incremental" and not incremental.has_changes(incremental.load_raw_changes(run.workdir)):
         raise CommandRejected("no structured source changes are available for incremental compile", 409)
-    # compile.resume is never refused here: the control plane sends it for every
-    # recovery lineage and _resume_workspace_state decides the route (pending
-    # batch plan → orchestrator; landed pages → finish the ledger; empty → full
-    # compile). A refusal used to suspend the recovery with "command rejected".
+    # A missing batch plan does not reject compile.resume: workspace state
+    # decides whether to continue batching, finish coverage, or compile afresh.
+    # Explicit completion provenance must still pass validation before dispatch.
     run._recovery = None
     if action == "compile.resume":
         mode = params.get("recovery_mode")

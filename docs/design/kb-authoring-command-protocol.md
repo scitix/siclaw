@@ -128,6 +128,13 @@ not discard a persisted batch plan or its reset marker: `compile.resume` still
 continues that existing batch train. Without a plan/reset marker, resume uses
 the recovery decision and available workspace described above.
 
+Before rendering a completion directive, every produced-page reference must
+match an existing candidate page by its exact POSIX path relative to `candidate/`.
+A mismatched reference returns 409 with a bounded sample before the command id
+is accepted or a model turn is dispatched, even when the count matches. Corrected
+provenance can retry the rejected id. This classification check does not replace
+the pending batch plan/reset marker's recovery route.
+
 ## Layer responsibilities
 
 ### ControlPlane
