@@ -1,0 +1,25 @@
+{
+  "version": "0.85.1",
+  "files": [
+    {
+      "path": "dist/api/openai-completions.js",
+      "before": "1e2097ced37cf0e21aa5711297eecc77916de8a4ed81a9019bc7d97b22825fa3",
+      "after": "78536857d76a3b31169e133467ed469695c7c884f1212d5d7eedccf243bf8221"
+    },
+    {
+      "path": "dist/api/openai-responses-shared.js",
+      "before": "b5d9f001e97bfafa8dfeef2e292f923c39f77fa8aef014132bf3530760f222e3",
+      "after": "1fe40a253fb60edf9f372e4186d7d3efba14189ba5654203e539b64151ef1bee"
+    },
+    {
+      "path": "dist/api/anthropic-messages.js",
+      "before": "f748560c80fe91bb5736b62f6f34c5e2e2bfa224cd5eb959134ca903c226b604",
+      "after": "85fbdc6869e547444adcc005b80de9550e5c0542ac9388abe762b6444f66323c"
+    },
+    {
+      "path": "dist/api/usage-evidence.js",
+      "before": null,
+      "after": "f561ace2311d56aa0e132c8449ce5b1b6be2c2a0d7f41febfd3e893c0a492b6f"
+    }
+  ]
+}

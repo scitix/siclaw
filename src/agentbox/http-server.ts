@@ -1000,6 +1000,7 @@ export function createHttpServer(
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
     );
+    sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root");
     if (managed.mcpManager) {
       observedMcpServers = managed.mcpManager.getServerConnections();
     }

@@ -179,6 +179,11 @@ async function validateDelegationEventActor(
   identity: CertificateIdentity,
 ): Promise<{ status: number; error: string } | null> {
   switch (event.type) {
+    case "usage.record_calls": {
+      if (!event.batch || !Array.isArray(event.batch.observations) || event.batch.observations.length > 128 ||
+          Buffer.byteLength(JSON.stringify(event.batch)) > 512 * 1024) return { status: 400, error: "invalid usage batch" };
+      return null;
+    }
     case "delegation.ensure_session": {
       if (!event.userId) return { status: 400, error: "delegation.ensure_session requires userId" };
       if (!agentMatchesIdentity(event.agentId, identity)) return { status: 403, error: "delegation agent mismatch" };
@@ -766,6 +771,26 @@ export async function handleDelegationEvents(
     let response: DelegationPersistenceResponse = { ok: true };
 
     switch (event.type) {
+      case "usage.record_calls": {
+        const ownership = new Map<string, "allowed" | "rejected" | "retryable">();
+        const sessionIds = new Set(event.batch.observations.map(o => o.sessionId));
+        if (event.batch.health) sessionIds.add(event.batch.health.sessionId);
+        for (const sessionId of sessionIds) {
+          if (!sessionId) { ownership.set(sessionId, "rejected"); continue; }
+          const owner = await sessionRegistry.get(sessionId);
+          ownership.set(sessionId, !owner ? "retryable" : await sessionBelongsToIdentity(sessionId, identity) ? "allowed" : "rejected");
+        }
+        const observations = event.batch.observations.filter(o => ownership.get(o.sessionId) === "allowed");
+        const health = event.batch.health && ownership.get(event.batch.health.sessionId) === "allowed" ? event.batch.health : undefined;
+        const usage: NonNullable<DelegationPersistenceResponse["usage"]> = observations.length || health
+          ? await frontendClient.request("usage.recordCalls", { observations, health }) : { results: [] };
+        for (const o of event.batch.observations) {
+          const status = ownership.get(o.sessionId);
+          if (status === "rejected" || status === "retryable") usage.results.push({ callId: o.callId, phase: o.phase, status, reason: "session_unavailable" });
+        }
+        response = { ok: true, usage };
+        break;
+      }
       case "delegation.ensure_session": {
         await frontendClient.request("chat.ensureSession", {
           session_id: event.sessionId,

@@ -32,6 +32,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
+import { recoverCapabilityUsage } from "./capability/model-usage.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
@@ -1431,6 +1432,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
   const unsubscribeCapabilityReconnect = frontendClient.onConnected?.(() => capabilityRunManager.reconcile());
+  recoverCapabilityUsage(frontendClient);
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
   // Capability-box orphan GC: a box is live iff its run is tracked and

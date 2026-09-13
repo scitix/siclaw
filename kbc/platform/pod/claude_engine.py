@@ -14,6 +14,7 @@ import uuid
 
 from agent_protocol import AgentEvent, AgentTransportError, EngineTool
 from execution_observation import ExecutionObserver
+from model_usage import ClaudeUsageRecorder
 
 
 def sdk_version() -> str:
@@ -33,6 +34,7 @@ class ClaudeAgentClient:
         self.max_model_calls = max_model_calls
         self.sdk_version = sdk_version()
         self._observations = ExecutionObserver(session_id, self.config)
+        self._usage_recorder = ClaudeUsageRecorder(session_id, self.config, self._observations)
         self._client = None
         self._reader = None
         self._state = None
@@ -145,6 +147,7 @@ class ClaudeAgentClient:
         if self._assistant is None:
             return
         message, self._assistant = self._assistant, None
+        await self._usage_recorder.record_unobserved(message["id"], self._turn_id)
         self._model_calls += 1
         self._usage = dict(self._message_usage)
         await self._emit("assistant", {
@@ -158,6 +161,7 @@ class ClaudeAgentClient:
                 kind = type(message).__name__
                 if kind == "StreamEvent":
                     event = message.event
+                    await self._usage_recorder.observe(event, self._turn_id)
                     if event.get("type") == "message_start":
                         await self._flush_assistant()
                         self._message_usage = dict((event.get("message") or {}).get("usage") or {})
@@ -195,6 +199,7 @@ class ClaudeAgentClient:
                             blocks.append({"type": "toolCall", "id": value["id"],
                                            "name": self._names.get(value["name"], value["name"]), "arguments": value["input"]})
                 elif kind == "ResultMessage":
+                    await self._usage_recorder.finish("cancelled" if self._aborted else "error" if message.is_error else "success", self._turn_id)
                     await self._flush_assistant()
                     await self._stop_tools()
                     data = {"outcome": "aborted" if self._aborted else "failed" if message.is_error else "completed",
@@ -208,6 +213,7 @@ class ClaudeAgentClient:
             if not self._closing:
                 raise AgentTransportError("Claude SDK stream closed before the session was closed")
         except Exception as error:
+            await self._usage_recorder.finish("error", self._turn_id)
             # Background transport boundary: wake the consumer with a failure.
             self._failure = AgentTransportError(self._safe_error(error))
             await self._observations.emit("transport_error", {}, self._turn_id)
@@ -222,12 +228,18 @@ class ClaudeAgentClient:
         if not self._client or self._closing or not self._settled.is_set():
             raise AgentTransportError("Previous Claude turn has not settled or session is unavailable")
         self._turn_id = str(uuid.uuid4())
+        self._usage_recorder.seen.clear()
         self._settled.clear()
         self._aborted, self._tool_calls, self._model_calls, self._status = False, 0, 0, None
         await self._emit("model_request", {"call": 1, "model": self.config["model"]["id"], "provider": self.config["model"]["provider"]})
         await self._emit("model_envelope", {"manifest": {"system_prompt_sha256": hashlib.sha256(self.system_prompt.encode()).hexdigest(),
                                                        "tools": list(self.tools), "model": self.config["model"]["id"]}})
-        await self._client.query(message)
+        await self._usage_recorder.begin(self._turn_id)
+        try:
+            await self._client.query(message)
+        except Exception:
+            await self._usage_recorder.finish("error", self._turn_id)
+            raise
 
     async def receive_messages(self):
         while True:

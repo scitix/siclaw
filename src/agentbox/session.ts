@@ -1,3 +1,4 @@
+import { UsageOutbox } from "./usage-outbox.js";
 /**
  * AgentBox session manager
  *
@@ -747,6 +748,36 @@ export class AgentBoxSessionManager {
    * Get base session storage directory.
    * Reads userDataDir from settings.json.
    */
+  private usageOutbox?: UsageOutbox;
+  setUsageRole(sessionId: string, role: "root" | "delegated"): void {
+    const managed = this.sessions.get(sessionId);
+    if (managed) this.attachUsage(managed.brain, sessionId, role);
+  }
+  private attachUsage(brain: BrainSession, sessionId: string, role: "root" | "internal_subagent" | "delegated", traceId?: string): void {
+    if (!this.gatewayClient || !this.agentId) return;
+    if (!this.usageOutbox) {
+      // Agent identity partitions local spawners that share a user data directory.
+      const agentKey = Buffer.from(this.agentId + ":" + (process.env.SICLAW_POD_NAME || "local")).toString("hex");
+      try {
+        this.usageOutbox = new UsageOutbox(path.join(this.getBaseSessionDir(), "..", "usage-outbox", agentKey), async batch => {
+          const result = await this.gatewayClient!.sendDelegationPersistenceEvent({ type: "usage.record_calls", batch });
+          if (!result.ok || !result.usage) throw new Error("usage persistence unavailable");
+          return result.usage;
+        });
+      } catch {
+        console.warn("[model-usage] collector unavailable; usage coverage is unknown");
+        return;
+      }
+    }
+    brain.llmCalls?.setUsageSink?.({
+      context: () => {
+        const rootTrace = traceId ?? tracingRecorder.getRootTraceId(sessionId);
+        return { sessionId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
+      },
+      record: observation => this.usageOutbox!.record(observation),
+    });
+  }
+
   private getBaseSessionDir(): string {
     const config = loadConfig();
     const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
@@ -2833,6 +2864,7 @@ export class AgentBoxSessionManager {
     child.sessionIdRef.current = childSessionId;
     const mailbox = this.subagentRuns.get(childSessionId)?.mailbox;
     mailbox?.attach(child.brain);
+    this.attachUsage(child.brain, childSessionId, "internal_subagent", mainTraceId);
 
     // ── Model selection: tier, or the parent's effective model ──────────────
     //
@@ -3599,6 +3631,7 @@ export class AgentBoxSessionManager {
 
     // Populate sessionIdRef so skill_call events can associate with this session
     result.sessionIdRef.current = id;
+    this.attachUsage(result.brain, id, "root");
 
     // New session: sync memory index, then purge stale investigations (chained to avoid race)
     if (isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
@@ -4223,6 +4256,8 @@ export class AgentBoxSessionManager {
       this.teardownTracing(id, managed);
       emitDiagnostic({ type: "session_released", sessionId: id });
     }
+
+    await this.usageOutbox?.close();
 
     // Close shared memory indexer
     if (this._sharedMemoryIndexer) {

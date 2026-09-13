@@ -163,7 +163,12 @@ export class PiCompilerWorker {
       guards,
       onModelEnvelope: manifest => this.emit("model_envelope", { manifest }),
     });
-    const { session } = this.execution;
+    const { session, llmCallRecorder } = this.execution;
+    llmCallRecorder.setUsageSink({
+      context: () => ({ sessionId: config.session_id, requestId: this.active?.id,
+        executionRole: "root", executorRole: config.executor_role ?? "compile" }),
+      record: observation => this.emit("model_usage", { observation }),
+    });
     const stream = session.agent.streamFunction;
     session.agent.streamFunction = (requestedModel, context, options) => {
       if (this.calls >= config.max_model_calls) throw new Error("KBC_MODEL_CALL_BUDGET_EXCEEDED");
