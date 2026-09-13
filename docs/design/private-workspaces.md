@@ -144,6 +144,15 @@ backend placement, the current manifest/revision, writer epochs/leases, operatio
 receipts and memory metadata. Object bodies and exact versions live in OSS. Back
 up both the metadata database and encryption key as well as the object store.
 
+Recovery snapshots can contain unredacted input, tool output and files even when
+chat telemetry displays `[REDACTED]`. Checkpoint capture preserves source bytes;
+it does not apply chat redaction or encrypt object bodies. Bucket-side encryption
+and its key policy must be verified independently. Do not apply age-based object
+or noncurrent-version expiration to the workspace data prefix: a current manifest
+can still reference an old version. The application retains versions without an
+automatic deletion deadline. See [storage operations](../operations/private-workspaces.md)
+for credential-compromise scope, retention and rollout requirements.
+
 | Data | Runtime location | Restore source |
 | --- | --- | --- |
 | Pi tree, selected leaf, plan/router/turn ledgers and child sessions | `user-data/agent/sessions` plus live Pi managers | Session manifest, including `.pi-session.json` |
