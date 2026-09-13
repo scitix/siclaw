@@ -69,8 +69,19 @@ host must emit structured RPC errors (`code`, `retriable`, `status`, safe `messa
 conflict 409, denial 403, invalid request 400, temporary service failure 503. Both
 Runtime and AgentBox preserve the distinction without forwarding private details.
 Checkpoint failures still block subsequent work and durable publication.
-Moving a live session may wait for
-release or expiry; storage outages never trigger empty-history fallback. A failed
+The first temporary renewal failure in an outage emits a warning with remaining
+local validity; repeated failures do not flood logs. Successful renewal emits a
+recovery message, and local expiry emits a final warning. These logs exclude raw
+errors, response bodies and user/session identifiers.
+
+After a crash or `abandon()`, a replacement may wait up to **120 seconds (2 minutes)**
+for the existing server lease, measured from the last successful server-side
+lease extension (acquire, renew or commit). It waits only the remaining lease
+time, not an extra fixed two minutes. A successful graceful release removes that
+wait. An in-flight renewal or commit can still finish after the process dies,
+and Pod startup or a database/storage
+outage adds time; 120 seconds is the lease duration, not an end-to-end recovery SLA.
+Storage outages never trigger empty-history fallback. A failed
 restore can be retried after connectivity or ownership recovers.
 
 The script sandbox broker also revalidates the private lease through the active
@@ -183,6 +194,8 @@ committed active Pi branch. Assistant prose and arbitrary script results are not
 promoted into facts. Source entries, snapshot references, observation time and
 expiry accompany every record. The seven-day expiry uses the original event time;
 repeated extraction cannot make old evidence fresh again.
+The host checks expiry again after object reads, so a slow recall cannot return
+an observation that expired while its body was being fetched.
 
 The host rechecks user membership, source-session visibility and agent access on
 recall. Forgetting disables extraction and advances an independent memory generation,

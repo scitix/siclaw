@@ -71,6 +71,7 @@ export class PrivateWorkspace {
   private closing?: Promise<void>;
   private closed = false;
   private executionStopped = false;
+  private renewalDelayed = false;
   readonly incarnation = randomUUID();
 
   constructor(
@@ -111,7 +112,10 @@ export class PrivateWorkspace {
     if (this.closed) throw new Error("Private workspace is closed");
     if (this.failure) throw this.failure;
     if (!this.binding) throw new Error("Workspace has not been acquired");
-    if (Date.now() >= this.validUntil) { this.markFailed(); throw this.failure; }
+    if (Date.now() >= this.validUntil) {
+      console.warn("[private-workspace] lease validity expired; recovery required");
+      this.markFailed(); throw this.failure;
+    }
   }
 
   async validateExecution(): Promise<void> {
@@ -139,12 +143,23 @@ export class PrivateWorkspace {
       // A failed renewal never extends validity. Even transient failures become
       // terminal once the old window expires; tool callers still receive an error.
       this.assertHealthy();
+      if (!this.renewalDelayed) {
+        this.renewalDelayed = true;
+        // Log once per outage, without raw errors, identities or response bodies.
+        console.warn("[private-workspace] lease renewal failed; retrying within existing validity window", {
+          remainingValidityMs: Math.max(0, this.validUntil - Date.now()),
+        });
+      }
       throw error;
     }
     // Do not let a late success revive an expired, closed or fenced executor.
     this.assertHealthy();
     this.validUntil = started + 90_000;
     this.assertHealthy();
+    if (this.renewalDelayed) {
+      this.renewalDelayed = false;
+      console.info("[private-workspace] lease renewal recovered");
+    }
   }
   markFailed(): void { this.failure = new Error("Private workspace requires recovery"); }
 
