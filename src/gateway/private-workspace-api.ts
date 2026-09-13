@@ -2,6 +2,7 @@ import type http from "node:http";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { validPrivateId } from "../shared/private-workspace.js";
+import { ErrorCodes, isErrorDetail } from "../lib/error-envelope.js";
 
 /** All routing/owner fields are replaced with the authenticated certificate. */
 export async function handlePrivateWorkspace(
@@ -23,7 +24,9 @@ export async function handlePrivateWorkspace(
       if (size > 6 * 1024 * 1024) { send(413, { error: "Workspace request is too large" }); return; }
       chunks.push(Buffer.from(chunk));
     }
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    let body: Record<string, unknown>;
+    try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+    catch { send(400, { error: "Invalid workspace request" }); return; }
     if (!body || !validPrivateId(body.sessionId) || body.sessionId !== identity.privateSessionId || typeof body.incarnation !== "string" ||
       !["acquire", "renew", "release", "put", "get", "commit", "learn", "memory_search"].includes(String(body.action))) {
       send(400, { error: "Invalid workspace request" }); return;
@@ -33,10 +36,21 @@ export async function handlePrivateWorkspace(
       agentId: identity.agentId,
       spaceId: identity.privateSpaceId,
       boxId: identity.boxId,
-    }, 90_000);
+    }, body.action === "renew" ? 10_000 : 90_000);
     send(200, result);
-  } catch {
+  } catch (error) {
     // Don't expose upstream DB/provider errors, credentials or foreign IDs.
-    send(409, { error: "Private workspace is unavailable or its execution changed" });
+    // Legacy negative RPC replies are non-retriable; connection failures have
+    // no envelope. Only a classified temporary failure may preserve the lease.
+    const detail = isErrorDetail(error) ? error : undefined;
+    const status = detail?.code === ErrorCodes.FORBIDDEN ? 403
+      : detail?.code === ErrorCodes.UNAUTHORIZED ? 401
+      : detail?.code === ErrorCodes.BAD_REQUEST ? 400
+      : detail?.code === ErrorCodes.CONFLICT ? 409
+      : detail && !detail.retriable ? 409 : 503;
+    const code = status === 403 ? ErrorCodes.FORBIDDEN : status === 401 ? ErrorCodes.UNAUTHORIZED
+      : status === 400 ? ErrorCodes.BAD_REQUEST : status === 409 ? ErrorCodes.CONFLICT : ErrorCodes.SERVICE_UNAVAILABLE;
+    send(status, { error: { code, retriable: status === 503, status,
+      message: "Private workspace is unavailable or its execution changed" } });
   }
 }

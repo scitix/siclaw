@@ -11,7 +11,7 @@
 
 import crypto from "node:crypto";
 import WebSocket from "ws";
-import { wrapRpcError } from "../lib/error-envelope.js";
+import { isErrorDetail, RpcResponseError, wrapRpcError } from "../lib/error-envelope.js";
 
 // ── Public types ─────────────────────────────────────────────
 
@@ -37,6 +37,7 @@ export interface FrontendWsClientOptions {
 // ── Internal types ───────────────────────────────────────────
 
 interface PendingRpc {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -130,7 +131,7 @@ export class FrontendWsClient {
       }, timeoutMs);
       timer.unref?.();
 
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
       this.ws!.send(frame);
     });
   }
@@ -341,7 +342,12 @@ export class FrontendWsClient {
         const errMsg = typeof msg.error === "string"
           ? msg.error
           : msg.error?.message ?? `RPC error (id=${msg.id})`;
-        entry.reject(new Error(errMsg));
+        if (isErrorDetail(msg.error)) entry.reject(new RpcResponseError(msg.error));
+        else if (entry.method === "workspace.exchange") {
+          // A legacy negative reply might mean fencing. Do not reinterpret it
+          // as a transport outage just because it lacks structured metadata.
+          entry.reject(new RpcResponseError({ code: "INTERNAL_ERROR", message: errMsg, retriable: false }));
+        } else entry.reject(new Error(errMsg));
       }
       return;
     }

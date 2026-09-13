@@ -4,12 +4,12 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { afterEach, expect, it, vi } from "vitest";
 import { PrivateWorkspace, captureWorkspaceFiles, safeWorkspacePath, type WorkspaceTransport } from "./private-workspace.js";
-import type { WorkspaceBinding, WorkspaceObjectRef, WorkspaceRequest } from "../shared/private-workspace.js";
+import { WorkspaceTransportError, type WorkspaceBinding, type WorkspaceObjectRef, type WorkspaceRequest } from "../shared/private-workspace.js";
 import { privateWorkspaceRoots } from "../shared/private-workspace-paths.js";
 
 const dirs: string[] = [];
 function dir() { const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "private-workspace-"))); dirs.push(d); return d; }
-afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
+afterEach(() => { vi.useRealTimers(); for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
 
 class Store implements WorkspaceTransport {
   objects = new Map<string, { ref: WorkspaceObjectRef; data: Buffer }>();
@@ -175,4 +175,93 @@ it("does not publish after being fenced during a slow upload", async () => {
     await expect(workspace.checkpoint(new Map([["files/a", Buffer.from("output")]]))).rejects.toThrow(/recovery/);
     expect(store.binding.revision).toBe(0);
   } finally { await workspace.close(); }
+});
+
+const outage = () => new WorkspaceTransportError(503);
+
+it.each([undefined, {}, { ok: false }])("refuses an invalid renewal acknowledgement: %j", async response => {
+  const store = new Store(), original = store.exchange.bind(store);
+  store.exchange = async <T>(request: WorkspaceRequest): Promise<T> => request.action === "renew" ? response as T : original(request);
+  const workspace = new PrivateWorkspace(store, "sid", "space");
+  try {
+    await workspace.acquire();
+    await expect(workspace.validateExecution()).rejects.toThrow(/recovery/);
+  } finally { await workspace.close(); }
+});
+
+it("retries transient background renewals within the original window without bypassing tool validation", async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  const store = new Store(), original = store.exchange.bind(store);
+  let unavailable = true, renewals = 0;
+  store.exchange = async request => {
+    if (request.action === "renew") { renewals++; if (unavailable) throw outage(); }
+    return original(request);
+  };
+  const workspace = new PrivateWorkspace(store, "sid", "space");
+  try {
+    await workspace.acquire();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renewals).toBe(2);
+    expect(() => workspace.assertHealthy()).not.toThrow();
+    await expect(workspace.validateExecution()).rejects.toBeInstanceOf(WorkspaceTransportError);
+    // A fresh validation can recover before the unchanged 90-second deadline.
+    await vi.advanceTimersByTimeAsync(15_000); unavailable = false;
+    await workspace.validateExecution();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(() => workspace.assertHealthy()).not.toThrow();
+  } finally { await workspace.close(); }
+});
+
+it("never refreshes local validity on transient failure and fences at the original deadline", async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  const store = new Store(), original = store.exchange.bind(store);
+  let renewals = 0;
+  store.exchange = async request => {
+    if (request.action === "renew") { renewals++; throw outage(); }
+    return original(request);
+  };
+  const workspace = new PrivateWorkspace(store, "sid", "space");
+  try {
+    await workspace.acquire();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(renewals).toBe(2);
+    await expect(workspace.validateExecution()).rejects.toThrow(/recovery/);
+    await expect(workspace.acquire()).rejects.toThrow(/recovery/);
+    await expect(workspace.checkpoint(new Map())).rejects.toThrow(/recovery/);
+    expect(store.receipts.size).toBe(0);
+  } finally { await workspace.close(); }
+});
+
+it.each([409, 403, 400, "legacy"] as const)("permanently fences a %s rejection even before local expiry", async status => {
+  const store = new Store(), original = store.exchange.bind(store);
+  store.exchange = async request => {
+    if (request.action === "renew") throw status === "legacy" ? new Error("unclassified rejection")
+      : new WorkspaceTransportError(status);
+    return original(request);
+  };
+  const workspace = new PrivateWorkspace(store, "sid", "space");
+  try {
+    await workspace.acquire();
+    await expect(workspace.validateExecution()).rejects.toThrow(/recovery/);
+    store.exchange = original;
+    await expect(workspace.validateExecution()).rejects.toThrow(/recovery/);
+    await expect(workspace.acquire()).rejects.toThrow(/recovery/);
+  } finally { await workspace.close(); }
+});
+
+it.each(["expired", "fenced"])("does not revive an %s lease after a delayed successful renewal", async reason => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  const store = new Store(), original = store.exchange.bind(store);
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  store.exchange = async request => { if (request.action === "renew") await gate; return original(request); };
+  const workspace = new PrivateWorkspace(store, "sid", "space");
+  try {
+    await workspace.acquire();
+    vi.setSystemTime(89_000);
+    const validation = expect(workspace.validateExecution()).rejects.toThrow(/recovery/);
+    if (reason === "expired") vi.setSystemTime(91_000); else workspace.markFailed();
+    finish(); await validation;
+    await expect(workspace.acquire()).rejects.toThrow(/recovery/);
+  } finally { finish(); await workspace.close(); }
 });

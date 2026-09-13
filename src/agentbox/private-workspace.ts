@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  WORKSPACE_OBJECT_BYTES, WORKSPACE_MAX_OBJECTS,
+  WORKSPACE_OBJECT_BYTES, WORKSPACE_MAX_OBJECTS, WorkspaceTransportError,
   type WorkspaceBinding, type WorkspaceObjectRef, type WorkspaceRequest,
 } from "../shared/private-workspace.js";
 
@@ -100,7 +100,9 @@ export class PrivateWorkspace {
     this.validUntil = started + 90_000;
     this.assertHealthy();
     this.timer = setInterval(() => {
-      void this.renewLease().catch(() => { this.markFailed(); });
+      // renewInner classifies failures. A temporary outage must not permanently
+      // fence a still-valid lease; the next interval may retry within its window.
+      void this.renewLease().catch(() => {});
     }, 30_000);
     this.timer.unref();
   }
@@ -128,8 +130,19 @@ export class PrivateWorkspace {
 
   private async renewInner(): Promise<void> {
     const started = Date.now();
-    try { await this.request("renew"); }
-    catch { this.markFailed(); throw this.failure; }
+    try {
+      const result = await this.request<{ ok: boolean }>("renew");
+      if (result?.ok !== true) throw new Error("Invalid private workspace renewal response");
+    }
+    catch (error) {
+      if (!(error instanceof WorkspaceTransportError) || !error.retriable) this.markFailed();
+      // A failed renewal never extends validity. Even transient failures become
+      // terminal once the old window expires; tool callers still receive an error.
+      this.assertHealthy();
+      throw error;
+    }
+    // Do not let a late success revive an expired, closed or fenced executor.
+    this.assertHealthy();
     this.validUntil = started + 90_000;
     this.assertHealthy();
   }
