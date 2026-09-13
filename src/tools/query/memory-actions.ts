@@ -55,7 +55,7 @@ export const catalogRegistration: ToolEntry = {
     name: "memory_catalog",
     label: "Memory Catalog",
     description:
-      "List a small authorized directory of prior project topics and source paths when you need relevant history but do not know its scope. Labels are derived navigation aids, not facts. Search/read only relevant entries. Skip for self-contained tasks.",
+      "List a small authorized directory of prior project topics and source paths when you need relevant history but do not know its scope. Labels are derived navigation aids, not facts. If refine_query is true, supply a project/entity or scope. Search/read only relevant entries. Skip for self-contained tasks.",
     parameters: catalog,
     async execute(_id, raw) {
       if (!Value.Check(catalog, raw))

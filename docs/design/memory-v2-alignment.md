@@ -45,12 +45,39 @@ restart recovery, multi-runtime ownership, stale and polluted evidence, and
 same-model task/cost comparisons. Official Codex source mechanisms are a design
 reference; equivalence of product effectiveness requires measured evidence.
 
-Operational bounds: the host allows at most 64 batches per user per UTC day.
+Operational bounds: the host allows 64 background model batches per user per UTC
+day, plus independent reserves of 16 explicit and 16 second-stage batches.
+Trivial batches are admitted before reserving model quota.
 Each batch has at most 24 primary fragments plus eight adjacent read-only context
 fragments, sharing 32 KiB of text. Repeated failures reduce primary batch size;
 eight failures cause a one-day cooldown. Learning leases last 120 seconds; model
-requests have a 25-second deadline. Startup resumes the certificate-bound session
-without a foreground execution binding. A completed unchanged source revision
+requests have a 25-second deadline. Startup resumes eligible pending sessions of the authenticated owner through
+a rotating metadata scan, without a foreground execution binding. The host
+rechecks each historical session; publish/fail resolve its source from the
+authority-issued token rather than a client-selected session. A completed unchanged source revision
 and note watermark requires no object read. Sources expire after 90 days; explicit
 forget tombstones persist within the memory generation. Auxiliary batch/note/job,
 review, receipt and feedback metadata is collected without deleting OSS versions.
+
+
+The second stage has its own durable lease, revision fencing and receipt. It
+consumes chronological groups of phase-one evidence records and a filtered
+previous outline; it does not open original transcripts or call executable tools.
+The output is a bounded navigation plan. Stable statements are rendered from
+authorized original quotes at read time. Complete short tasks include their
+goal and evidence directly; long task pointers require source reading. This deliberately uses validated records instead of freeform summary
+files as the factual authority. Independent task attempts remain readable.
+
+Automatic briefs require the selected Agent's Memory Search capability. Clear,
+expiry, source revocation and supersession are rechecked on every read; cached
+context bookkeeping never grants access. Optional automatic recall has a 1.5-second
+foreground deadline; late results neither enter context nor count as delivered.
+The host batches source authorization and reads at most five source bodies. A final structured citation counts only
+evidence supplied within the current context. Search exposure, explicit read and
+cited usage are observed separately; usage affects ranking, never truth.
+
+Local and remote use the same lexical metadata fields, ranking formula, query
+anchors and shared fixtures. Each query inspects at most 1,001 metadata candidates;
+1,001 means an explicit refine_query response with no partial matches. Source
+ownership is checked in batches and repeated at the return boundary. There is no
+vector database, BM25, embedding service or automatic Skill writer.

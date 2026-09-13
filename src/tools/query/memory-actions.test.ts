@@ -57,7 +57,7 @@ it("shares the context ceiling with catalog injection and checks before mutation
 it("counts repeated citations once without a model feedback round trip", async () => {
   const source = {
       search: vi.fn(),
-      read: vi.fn(),
+      read: vi.fn().mockResolvedValue({path,found:true,content:"Verified historical evidence",start_line_number:1,truncated:false}),
       feedback: vi.fn().mockResolvedValue({ ok: true }),
     },
     turn = { current: 1 };
@@ -76,10 +76,13 @@ it("counts repeated citations once without a model feedback round trip", async (
     messages: [
       {
         role: "assistant",
-        content: [{ type: "text", text: `Source ${path}` }],
+        content: [{ type: "text", text: `Answer.\n<memory-citations>["${path}"]</memory-citations>` }],
       },
     ],
   };
+  await handlers.get("agent_end")!(event);
+  expect(source.feedback).not.toHaveBeenCalled();
+  await createPrivateMemoryGetTool(source, turn).execute("read", {path});
   await handlers.get("agent_end")!(event);
   await handlers.get("agent_end")!(event);
   expect(source.feedback).toHaveBeenCalledOnce();

@@ -246,8 +246,8 @@ continues oversized lines without losing text. Search cursors are bound to the
 query, generation and authorized result set; changes require a fresh search.
 Unknown fields are rejected. Neither tool can write memory or access physical
 paths. An unavailable remote backend cannot fall back to local file/FTS memory.
-Local mode retains its separate file memory implementation. Upgrade the host before
-Runtime and AgentBox; hosts retain the old query form only for rolling compatibility.
+Local mode implements the same evidence protocol in per-user transactional SQLite.
+Upgrade the host before Runtime and AgentBox; retired query forms are rejected.
 
 The host rechecks user membership, source-session visibility and agent access on
 recall. Forgetting disables extraction and advances an independent memory generation,
@@ -255,8 +255,9 @@ so an in-flight learner cannot restore the forgotten generation. Object versions
 complete secret detection. Tool success is evidence of an invocation, not proof
 that its result is universally true. Current infrastructure facts require new reads.
 
-This is a conservative evidence store with bounded lexical retrieval. It does not
-claim Codex-equivalent consolidation, retrieval quality, or zero hallucinations.
+The pipeline uses source extraction, independently leased consolidation, compact
+context and demand-driven evidence reading. Technical alignment with a reference
+implementation does not establish equal retrieval quality or zero hallucinations.
 Quality claims require an incident replay dataset and measured recall/false-memory
 rates. Model reasoning can still misinterpret correct evidence; tool authority is
 controlled independently.

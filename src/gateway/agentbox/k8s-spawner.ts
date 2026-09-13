@@ -623,7 +623,6 @@ export class K8sSpawner implements BoxSpawner {
       }
 
       const AGENTBOX_FORWARDED_ENV = [
-        "SICLAW_MEMORY_CATALOG_INJECTION",
         // Sub-agent capacity: per conversation, and the box-wide ceiling. Both are read
         // inside the box, so forwarding is what makes the runtime-level setting real.
         "SICLAW_SUBAGENT_CONCURRENCY",

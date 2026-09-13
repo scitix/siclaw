@@ -22,17 +22,26 @@ The host selects committed snapshots and checks source access, learning leases,
 quotes and generations before publishing. Transient failures retry while the box
 is resident. Restarted boxes resume eligible learning without another question.
 Learning never writes skills, executes scripts or restores historical permission.
+A separately leased second stage groups cross-session task evidence into a small
+source-backed outline. It can merge equivalent durable topics, retain aliases,
+and resolve later corrections without overwriting independent task attempts.
+Task records require a literal user goal; a request to verify success is not
+confirmation that verification succeeded.
 
 ## Recall without filling the context
 
 Use `memory_search` for relevant prior decisions and `memory_get` for precise
 source windows. `memory_catalog` provides at most eight navigation entries when
 the topic is unclear. Historical evidence must be verified against current facts.
-Memory is skipped for self-contained calculations, translations and questions
-already answered by the current conversation.
+A small relevant brief is available at the start of a task when the Agent has
+Memory Search capability. It permits zero entries and shares recall budgets.
+Memory is skipped for self-contained calculations and translations; duplicate
+briefs are suppressed until context compaction. Queries exceeding the metadata
+candidate budget explicitly request a narrower project/entity or scope.
 
 Search/read/catalog share response, turn and context budgets. Compaction clears
-only disposable recall bookkeeping. Cited sources record usage automatically;
+only disposable recall bookkeeping. Only evidence actually returned and cited in the final response records usage automatically;
+internal attribution is hidden from chat presentation. Exposure and use are separate;
 `memory_feedback` flags incorrect or irrelevant evidence. Repeated use is a small
 ranking signal, not proof.
 
@@ -57,8 +66,9 @@ personal space. Local/CLI uses per-user transactional SQLite under
 `memory-v2/<owner hash>/memory-v2.db`; local development is not a substitute for
 production operating-system isolation.
 
-Recall expires at most 90 days after the source event. Learning is capped at 64
-batches per user per UTC day, with smaller batches after repeated failures and a
+Recall expires at most 90 days after the source event. Background model learning is capped at 64
+batches per user per UTC day, with separate reserves of 16 explicit batches and
+16 consolidation batches. Deterministically trivial batches do not consume model quota, with smaller batches after repeated failures and a
 one-day cooldown after eight failed attempts. Each batch has at most 24 primary source
 fragments and eight adjacent read-only context fragments, sharing 32 KiB of input. These limits bound memory cost independently of
 the foreground task.

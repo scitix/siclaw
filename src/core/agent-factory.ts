@@ -1,3 +1,4 @@
+import { createMemoryConsolidator } from "../memory/consolidation.js";
 import { assertPrivateFileHasNoLinks } from "./private-file-guard.js";
 import type { PrivateMemorySource } from "../shared/private-workspace.js";
 import { privateWorkspaceRoots } from "../shared/private-workspace-paths.js";
@@ -691,7 +692,7 @@ export async function createSiclawSession(
       extensionFactories: [
         contextPruningExtension,
         compactionSafeguardExtension,
-        ...(memorySource ? [(api: ExtensionAPI) => memoryContextExtension(api, memorySource, turnRef)] : []),
+        ...(memorySource ? [(api: ExtensionAPI) => memoryContextExtension(api, memorySource, turnRef, customTools)] : []),
         (api) => deepInvestigationExtension(api, mutableDpStateRef),
       ],
       // First enforce the context compiler's authoritative roots, then apply
@@ -774,7 +775,7 @@ export async function createSiclawSession(
     }),
   );
   const learningBackend = memorySource && "prepareLearning" in memorySource ? memorySource as import("../shared/private-workspace.js").MemoryLearningBackend : undefined;
-  const memoryLearner = learningBackend ? new MemoryLearner(learningBackend, createMemoryClassifier(modelRuntime, () => session.model)) : undefined;
+  const memoryLearner = learningBackend ? new MemoryLearner(learningBackend, createMemoryClassifier(modelRuntime, () => session.model), 5000, createMemoryConsolidator(modelRuntime, () => session.model)) : undefined;
   if (localMemory && memoryLearner) {
     localMemory.capture(sessionManagerId, sessionManager);
     memoryLearner.wake();

@@ -5,6 +5,15 @@ import { countMermaidEdges, validateMermaidSource } from "./MermaidRenderer"
 
 const incompleteChart = '```chart\n{"type":"bar","data":\n```'
 
+it("hides final and partial memory attribution while preserving the answer", () => {
+  for (const suffix of ['<memory-citations>["memory/' + 'a'.repeat(64) + '.md"]</memory-citations>', '< memory-citations>["memory/', '<memory-citati']) {
+    const html = renderToStaticMarkup(<Markdown isStreaming>{'The service is healthy.\n' + suffix}</Markdown>)
+    expect(html).toContain('The service is healthy.')
+    expect(html).not.toContain('memory-citat')
+    expect(html).not.toContain('memory/')
+  }
+})
+
 describe("Markdown chart fences", () => {
   it("keeps incomplete chart fences in loading state while streaming", () => {
     const html = renderToStaticMarkup(<Markdown isStreaming>{incompleteChart}</Markdown>)

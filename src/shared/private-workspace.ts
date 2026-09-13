@@ -50,13 +50,15 @@ export interface WorkspaceCommit extends WorkspaceBinding {
 }
 
 export type WorkspaceRequest = {
-  action: "acquire" | "renew" | "release" | "put" | "get" | "commit" | "memory_prepare" | "memory_publish" | "memory_fail" | "memory_search" | "memory_read" | "memory_catalog" | "memory_note" | "memory_feedback";
+  action: "memory_consolidate_prepare" | "memory_consolidate_publish" | "memory_consolidate_fail" | "memory_brief" | "acquire" | "renew" | "release" | "put" | "get" | "commit" | "memory_prepare" | "memory_publish" | "memory_fail" | "memory_search" | "memory_read" | "memory_catalog" | "memory_note" | "memory_feedback";
   sessionId: string;
   incarnation: string;
   binding?: WorkspaceBinding;
   commit?: WorkspaceCommit;
   objectId?: string;
   data?: string;
+  consolidation?: MemoryConsolidationSubmission;
+  brief?: MemoryBriefRequest;
   catalog?: MemoryCatalogRequest;
   note?: MemoryNoteRequest;
   feedback?: MemoryFeedbackRequest;
@@ -78,6 +80,8 @@ export interface MemorySearchRequest {
 export interface MemorySearchMatch {
   path: string;
   kind: string;
+  status?: string;
+  task_id?: string;
   scope?: string;
   claim?: string;
   content: string;
@@ -90,6 +94,7 @@ export interface MemorySearchMatch {
   expires_at: number;
 }
 export interface MemorySearchPage {
+  refine_query?: boolean;
   matches: MemorySearchMatch[];
   next_cursor?: string;
   truncated: boolean;
@@ -114,6 +119,7 @@ export interface MemoryReadPage {
   expires_at?: number;
 }
 export interface PrivateMemorySource {
+  brief?(request: MemoryBriefRequest): Promise<MemoryBrief>;
   catalog?(request: MemoryCatalogRequest): Promise<MemoryCatalogPage>;
   note?(request: MemoryNoteRequest): Promise<{ status: "accepted" | "applied"; id: string }>;
   feedback?(request: MemoryFeedbackRequest): Promise<{ ok: boolean }>;
@@ -134,12 +140,12 @@ export function validPrivateId(id: unknown): id is string {
 
 export interface MemoryLearningSource {
   id: string; text: string; role: string; sourceEntryId: string; sourceSessionId: string;
-  createdAt: number; expiresAt: number; sourceOrder?: number; tool?: string; isError?: boolean; target?: MemoryHint;
+  createdAt: number; expiresAt: number; sourceOrder?: number; taskId?: string; toolCallId?: string; tool?: string; isError?: boolean; target?: MemoryHint;
 }
 export interface MemoryHint { id: string; scope: string; claim: string; summary: string }
 export interface MemoryLearningBatch {
   token: string; generation: number; revision: number; inputs: MemoryLearningSource[];
-  hints: MemoryHint[]; context?: MemoryLearningSource[]; more: boolean; retryAfterMs?: number;
+  hints: MemoryHint[]; context?: MemoryLearningSource[]; skipModel?: boolean; more: boolean; retryAfterMs?: number;
 }
 export interface MemoryDecision {
   entryId: string; kind: "ignore" | "preference" | "constraint" | "correction" | "experience" | "task" | "forget";
@@ -152,9 +158,29 @@ export interface MemoryLearningBackend {
   prepareLearning(): Promise<MemoryLearningBatch>;
   publishLearning(input: MemoryLearningSubmission): Promise<{ count: number; more: boolean }>;
   failLearning(token: string): Promise<void>;
+  prepareConsolidation?(): Promise<MemoryConsolidationBatch>;
+  publishConsolidation?(input: MemoryConsolidationSubmission): Promise<{ ok: boolean }>;
+  failConsolidation?(token: string): Promise<void>;
 }
 
+/** Phase one records are grouped into chronological, source-backed task accounts.
+ * Phase two chooses routes and equivalent durable topics, never executable text. */
+export interface MemoryConsolidationRecord {
+  id: string; scope: string; claim: string; kind: string; status?: string;
+  text: string; summary: string; sourceSessionId: string; createdAt: number;
+  usageCount: number; negativeCount: number;
+}
+export interface MemoryTaskRollout { sessionId: string; ids: string[] }
+export interface MemoryOutline { topics: { scope: string; title: string; ids: string[] }[]; merges: string[][] }
+export interface MemoryConsolidationBatch {
+  token: string; generation: number; revision: number; records: MemoryConsolidationRecord[];
+  rollouts: MemoryTaskRollout[]; previous: MemoryOutline; retryAfterMs?: number;
+}
+export interface MemoryConsolidationSubmission { token: string; outline: MemoryOutline }
+export interface MemoryBriefRequest { query: string; scope?: string }
+export interface MemoryBrief { generation: number; items: MemorySearchMatch[] }
+
 export interface MemoryCatalogRequest { scope?: string; query?: string }
-export interface MemoryCatalogPage { entries: { path: string; scope: string; claim: string; label: string; created_at: number }[]; truncated: boolean; generation: number }
+export interface MemoryCatalogPage { refine_query?: boolean; entries: { path: string; scope: string; claim: string; label: string; created_at: number }[]; truncated: boolean; generation: number }
 export interface MemoryNoteRequest { action: "remember" | "correct" | "forget"; path?: string; quote: string; operation_id: string }
 export interface MemoryFeedbackRequest { path: string; outcome: "used" | "incorrect" | "irrelevant"; operation_id: string }

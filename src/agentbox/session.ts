@@ -60,7 +60,7 @@ import type { HandoffTarget } from "../shared/agent-handoff.js";
 import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
 import type { PromptInspection } from "../core/prompt-inspection.js";
 import type { McpClientManager } from "../core/mcp-client.js";
-import { MemoryLearner, configuredMemoryClassifier } from "../memory/learning.js";
+import { MemoryLearner, configuredMemoryClassifier, configuredMemoryConsolidator } from "../memory/learning.js";
 import type { LocalMemoryStore } from "../memory/local-store.js";
 import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
 import { loadConfig, isMemoryEnabled } from "../core/config.js";
@@ -549,7 +549,7 @@ export class AgentBoxSessionManager {
     const id=process.env.SICLAW_PRIVATE_SESSION_ID, space=process.env.SICLAW_PRIVATE_SPACE_ID;
     if(this.shuttingDown || !privateWorkspaceEnabled() || !isMemoryEnabled() || !this.harnessResolvedState || !this.gatewayClient || !id || !space || this.memoryLearners.has(id))return;
     if(this.allowedToolsState!==null && !this.allowedToolsState.some(v=>["memory_search","memory_get","memory_catalog","memory_update"].includes(v)))return;
-    const learner=new MemoryLearner(new PrivateWorkspace(this.gatewayClient,id,space),configuredMemoryClassifier);
+    const learner=new MemoryLearner(new PrivateWorkspace(this.gatewayClient,id,space),configuredMemoryClassifier,5000,configuredMemoryConsolidator);
     this.memoryLearners.set(id,learner);learner.wake();
   }
 

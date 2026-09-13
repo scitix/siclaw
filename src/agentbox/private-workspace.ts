@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
   WORKSPACE_OBJECT_BYTES, WORKSPACE_MAX_OBJECTS, WorkspaceTransportError,
+  type MemoryConsolidationBatch, type MemoryConsolidationSubmission, type MemoryBriefRequest, type MemoryBrief,
   type WorkspaceBinding, type WorkspaceObjectRef, type WorkspaceRequest,
   type MemoryCatalogRequest, type MemoryCatalogPage, type MemoryNoteRequest, type MemoryFeedbackRequest, type MemoryLearningBatch, type MemoryLearningSubmission, type MemorySearchRequest, type MemorySearchPage, type MemoryReadRequest, type MemoryReadPage,
 } from "../shared/private-workspace.js";
@@ -175,6 +176,11 @@ export class PrivateWorkspace {
   async prepareLearning(): Promise<MemoryLearningBatch> { return this.request("memory_prepare"); }
   async publishLearning(submission: MemoryLearningSubmission): Promise<{ count: number; more: boolean }> { return this.request("memory_publish", { submission }); }
   async failLearning(token: string): Promise<void> { await this.request("memory_fail", { token }); }
+
+  async prepareConsolidation(): Promise<MemoryConsolidationBatch> { return this.request("memory_consolidate_prepare"); }
+  async publishConsolidation(consolidation: MemoryConsolidationSubmission): Promise<{ ok: boolean }> { return this.request("memory_consolidate_publish", { consolidation }); }
+  async failConsolidation(token: string): Promise<void> { await this.request("memory_consolidate_fail", { token }); }
+  async brief(brief: MemoryBriefRequest): Promise<MemoryBrief> { this.assertHealthy(); return this.request("memory_brief", { brief }); }
 
   async catalog(catalog: MemoryCatalogRequest): Promise<MemoryCatalogPage> { this.assertHealthy(); return this.request("memory_catalog", { catalog }); }
   async note(note: MemoryNoteRequest): Promise<{ status: "accepted" | "applied"; id: string }> { this.assertHealthy(); return this.request("memory_note", { note }); }

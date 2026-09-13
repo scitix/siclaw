@@ -8,6 +8,201 @@ import type {
   MemoryLearningBatch,
   MemoryDecision,
 } from "../shared/private-workspace.js";
+
+it("consolidates aliases across sessions, follows later corrections and preserves forget", async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  f.append("Harbor reports should begin with the impact statement.");
+  await learn(f);
+  await vi.advanceTimersByTimeAsync(10);
+  const other = SessionManager.inMemory();
+  other.appendMessage({
+    role: "user",
+    content: "Harbor reports should now begin with the incident identifier.",
+    timestamp: Date.now(),
+  });
+  f.store.capture("second", other);
+  const b = await f.store.prepareLearning();
+  await f.store.publishLearning({
+    token: b.token,
+    decisions: decisions(b).map((v) => ({ ...v, claim: "opening" })),
+  });
+  const phase = await f.store.prepareConsolidation();
+  expect(phase.records).toHaveLength(2);
+  expect(phase.rollouts).toHaveLength(2);
+  const ids = phase.records.map((v) => v.id),
+    input = {
+      token: phase.token,
+      outline: {
+        topics: [{ scope: "harbor", title: "Report opening", ids }],
+        merges: [ids],
+      },
+    };
+  const rival = fixture(f.dir);
+  expect((await rival.store.prepareConsolidation()).token).toBe("");
+  await f.store.publishConsolidation(input);
+  await f.store.publishConsolidation(input);
+  await expect(
+    f.store.publishConsolidation({
+      ...input,
+      outline: { topics: [], merges: [] },
+    }),
+  ).rejects.toThrow();
+  let brief = await f.store.brief({ query: "Harbor report" });
+  expect(brief.items).toHaveLength(1);
+  expect(brief.items[0].content).toContain("incident identifier");
+  await vi.advanceTimersByTimeAsync(10);
+  f.append("Harbor reports should now begin with the recovery result.");
+  await learn(f);
+  brief = await f.store.brief({ query: "Harbor report" });
+  expect(brief.items).toHaveLength(1);
+  expect(brief.items[0].content).toContain("recovery result");
+  const quote = "Please forget the Harbor report opening convention.";
+  f.append(quote);
+  await f.store.note({
+    action: "forget",
+    path: brief.items[0].path,
+    quote,
+    operation_id: "forget",
+  });
+  expect((await f.store.brief({ query: "Harbor report" })).items).toEqual([]);
+});
+
+it("fences phase two after clear, source expiry and another publication", async () => {
+  vi.useFakeTimers();
+  for (const kind of ["clear", "expiry", "new-source"]) {
+    const f = fixture();
+    f.append("Harbor reports should use concise bullets.");
+    await learn(f);
+    const phase = await f.store.prepareConsolidation();
+    if (kind === "clear") f.store.clear();
+    if (kind === "expiry") await vi.advanceTimersByTimeAsync(120001);
+    if (kind === "new-source") {
+      await vi.advanceTimersByTimeAsync(1);
+      f.append("Harbor reports should use a single paragraph.");
+      await learn(f);
+    }
+    await expect(
+      f.store.publishConsolidation({
+        token: phase.token,
+        outline: { topics: [], merges: [] },
+      }),
+    ).rejects.toThrow();
+  }
+});
+
+it("discovers an older user's pending session from a fresh foreground session", async () => {
+  const f = fixture();
+  f.append("Harbor reports should always start with impact.");
+  const restarted = fixture(f.dir);
+  restarted.store.capture("new-session", SessionManager.inMemory());
+  const batch = await restarted.store.prepareLearning();
+  expect(batch.inputs[0].sourceSessionId).toBe("session");
+  await restarted.store.publishLearning({
+    token: batch.token,
+    decisions: decisions(batch),
+  });
+  expect(
+    (await restarted.store.search({ queries: ["Harbor report"] })).matches,
+  ).toHaveLength(1);
+});
+
+it("reserves explicit learning when the background model quota is exhausted", async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  for (let i = 0; i < 64; i++) {
+    f.append(`Investigate a distinct staging incident number ${i}.`);
+    const batch = await f.store.prepareLearning();
+    expect(batch.token).not.toBe("");
+    await f.store.publishLearning({
+      token: batch.token,
+      decisions: batch.inputs.map((v) => ({
+        entryId: v.sourceEntryId,
+        kind: "ignore",
+      })),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+  }
+  f.append("A further background investigation needs no durable memory.");
+  expect((await f.store.prepareLearning()).token).toBe("");
+  f.append("Please remember Harbor reports start with impact.");
+  expect((await f.store.prepareLearning()).token).not.toBe("");
+});
+
+it("retains separate task attempts and downgrades unconfirmed success", async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  for (let i = 0; i < 2; i++) {
+    f.append(
+      `Please investigate Harbor staging outage attempt ${i}; confirm the repair works.`,
+    );
+    f.manager.appendMessage({
+      role: "toolResult",
+      toolCallId: `probe-${i}`,
+      toolName: "probe",
+      content: [
+        {
+          type: "text",
+          text: `Attempt ${i}: service probe returned an error.`,
+        },
+      ],
+      isError: true,
+      timestamp: Date.now(),
+    });
+    f.store.capture("session", f.manager);
+    const b = await f.store.prepareLearning(),
+      goal = b.inputs.find((v) => v.role === "user")!,
+      tool = b.inputs.find((v) => v.role === "toolResult")!;
+    const ds: MemoryDecision[] = b.inputs.map((v) => ({
+      entryId: v.sourceEntryId,
+      kind: "ignore",
+    }));
+    ds[ds.findIndex((v) => v.entryId === tool.sourceEntryId)] = {
+      entryId: tool.sourceEntryId,
+      kind: "experience",
+      quote: tool.text,
+      scope: "harbor",
+      claim: "outage",
+      summary: "Harbor staging outage",
+      status: "user-confirmed",
+      evidence: [
+        { entryId: goal.sourceEntryId, quote: goal.text },
+        { entryId: tool.sourceEntryId, quote: tool.text },
+      ],
+    };
+    await f.store.publishLearning({ token: b.token, decisions: ds });
+    await vi.advanceTimersByTimeAsync(1);
+  }
+  const results = await f.store.search({ queries: ["Harbor outage"] });
+  expect(results.matches).toHaveLength(2);
+  expect(results.matches.every((v) => v.status === "uncertain")).toBe(true);
+  expect(results.matches.every((v) => v.task_id)).toBe(true);
+  const phase = await f.store.prepareConsolidation();
+  await f.store.publishConsolidation({
+    token: phase.token,
+    outline: {
+      topics: [
+        {
+          scope: "harbor",
+          title: "Failed outage attempts",
+          ids: phase.records.map((v) => v.id),
+        },
+      ],
+      merges: [],
+    },
+  });
+  const brief = await f.store.brief({ query: "Harbor outage" });
+  expect(brief.items).toHaveLength(2);
+  for (const item of brief.items) {
+    expect(item.truncated).toBe(false);
+    expect(item.content).toContain("confirm the repair works");
+    expect(item.content).toContain("service probe returned an error");
+    expect(item.status).toBe("uncertain");
+    expect(item.content).toBe(
+      (await f.store.read({ path: item.path })).content,
+    );
+  }
+});
 const dirs: string[] = [],
   stores: LocalMemoryStore[] = [];
 function fixture(directory?: string) {
@@ -55,37 +250,74 @@ afterEach(() => {
 });
 it("rejects a neighboring claim's value in a second memory quote atomically", async () => {
   const f = fixture();
-  f.append("Harbor reports use H-OLD for titles; body uses impact before action.");
+  f.append(
+    "Harbor reports use H-OLD for titles; body uses impact before action.",
+  );
   const batch = await f.store.prepareLearning();
-  const first = { ...decisions(batch)[0], claim: "title", quote: "use H-OLD for titles" };
+  const first = {
+    ...decisions(batch)[0],
+    claim: "title",
+    quote: "use H-OLD for titles",
+  };
   const second = { ...first, claim: "body", quote: batch.inputs[0].text };
-  await expect(f.store.publishLearning({ token: batch.token, decisions: [first, second] })).rejects.toThrow("disjoint");
+  await expect(
+    f.store.publishLearning({ token: batch.token, decisions: [first, second] }),
+  ).rejects.toThrow("disjoint");
   expect((await f.store.search({ queries: ["Harbor"] })).matches).toEqual([]);
-  await f.store.publishLearning({ token: batch.token, decisions: [first, { ...second, quote: "body uses impact before action." }] });
+  await f.store.publishLearning({
+    token: batch.token,
+    decisions: [first, { ...second, quote: "body uses impact before action." }],
+  });
   const results = await f.store.search({ queries: ["Harbor"] });
   expect(results.matches).toHaveLength(2);
-  expect(results.matches.find(v => v.claim === "body")!.content).not.toContain("H-OLD");
+  expect(
+    results.matches.find((v) => v.claim === "body")!.content,
+  ).not.toContain("H-OLD");
 });
 it("keeps project identifiers strict and lets usage only rank equally matching records", async () => {
   vi.useFakeTimers();
   const f = fixture();
   f.append("Harbor42 reports should use short bullets.");
   let b = await f.store.prepareLearning();
-  await f.store.publishLearning({ token: b.token, decisions: decisions(b).map((d) => ({ ...d, scope: "harbor42", claim: "format", summary: "Harbor42 report format" })) });
+  await f.store.publishLearning({
+    token: b.token,
+    decisions: decisions(b).map((d) => ({
+      ...d,
+      scope: "harbor42",
+      claim: "format",
+      summary: "Harbor42 report format",
+    })),
+  });
   await vi.advanceTimersByTimeAsync(1);
   f.append("Harbor43 reports should start with a concise impact statement.");
   b = await f.store.prepareLearning();
-  await f.store.publishLearning({ token: b.token, decisions: decisions(b).map((d) => ({ ...d, scope: "harbor43", claim: "format", summary: "Harbor43 report format" })) });
+  await f.store.publishLearning({
+    token: b.token,
+    decisions: decisions(b).map((d) => ({
+      ...d,
+      scope: "harbor43",
+      claim: "format",
+      summary: "Harbor43 report format",
+    })),
+  });
   const query = { queries: ["report format"] };
   const before = (await f.store.search(query)).matches;
   expect(before).toHaveLength(2);
   expect(before[0].scope).toBe("harbor43");
-  await f.store.feedback({ path: before[1].path, outcome: "used", operation_id: "used" });
+  await f.store.feedback({
+    path: before[1].path,
+    outcome: "used",
+    operation_id: "used",
+  });
   expect((await f.store.search(query)).matches[0].scope).toBe("harbor42");
   const exact = await f.store.search({ queries: ["Harbor43 report format"] });
   expect(exact.matches.map((v) => v.scope)).toEqual(["harbor43"]);
-  expect((await f.store.search({ queries: ["Harbor44 report format"] })).matches).toEqual([]);
-  expect((await f.store.catalog({ query: "Harbor44 report format" })).entries).toEqual([]);
+  expect(
+    (await f.store.search({ queries: ["Harbor44 report format"] })).matches,
+  ).toEqual([]);
+  expect(
+    (await f.store.catalog({ query: "Harbor44 report format" })).entries,
+  ).toEqual([]);
   await vi.advanceTimersByTimeAsync(91 * 86400_000);
   expect((await f.store.search(query)).matches).toEqual([]);
 });
@@ -182,7 +414,15 @@ it("forgets an exact topic idempotently and blocks implicit resurrection", async
   expect((await f.store.catalog({})).entries).toEqual([]);
   await vi.advanceTimersByTimeAsync(1);
   f.append("请重新记住：Harbor reports should use concise bullet points.");
-  expect((await f.store.note({ action: "remember", quote: "请重新记住：Harbor reports should use concise bullet points.", operation_id: "remember-again" })).status).toBe("accepted");
+  expect(
+    (
+      await f.store.note({
+        action: "remember",
+        quote: "请重新记住：Harbor reports should use concise bullet points.",
+        operation_id: "remember-again",
+      })
+    ).status,
+  ).toBe("accepted");
   await learn(f);
   expect((await f.store.catalog({})).entries).toHaveLength(1);
 });
@@ -257,8 +497,20 @@ it("feedback is idempotent and cannot change another operation", async () => {
 });
 
 it("does not learn recursively from memory tool results", async () => {
- const f=fixture();f.append("What was my earlier Harbor report convention?");
- f.manager.appendMessage({role:"toolResult",toolCallId:"memory-read",toolName:"memory_search",isError:false,content:[{type:"text",text:"Remember to reuse this old memory result."}],timestamp:Date.now()});
- f.store.capture("session",f.manager);
- expect((await f.store.prepareLearning()).inputs.map(v=>v.role)).toEqual(["user"]);
+  const f = fixture();
+  f.append("What was my earlier Harbor report convention?");
+  f.manager.appendMessage({
+    role: "toolResult",
+    toolCallId: "memory-read",
+    toolName: "memory_search",
+    isError: false,
+    content: [
+      { type: "text", text: "Remember to reuse this old memory result." },
+    ],
+    timestamp: Date.now(),
+  });
+  f.store.capture("session", f.manager);
+  expect((await f.store.prepareLearning()).inputs.map((v) => v.role)).toEqual([
+    "user",
+  ]);
 });
