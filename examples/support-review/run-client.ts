@@ -6,7 +6,8 @@ export interface RunOptions {
   apiKey: string;
   signal: AbortSignal;
   sessionId?: string;
-  onChatEvent?: (event: Record<string, unknown>) => void;
+  /** Observation only, never awaited. Failures log a payload-free warning and do not affect the run. */
+  onChatEvent?: (event: Record<string, unknown>) => void | Promise<void>;
 }
 
 export interface RunResult<T> {
@@ -88,7 +89,12 @@ function runUrl(baseUrl: string): string {
   return url.href;
 }
 
-/** Accept a result only after its successful terminal event. No automatic business retry. */
+/**
+ * Accept a result only after its successful terminal event. No automatic business retry.
+ * Every data frame must explicitly name a supported event: session, chat.event,
+ * result, error or done. Default-typed message data is rejected; comment-only
+ * heartbeat frames are allowed.
+ */
 async function run<T>(options: RunOptions, text: string, validate: (value: unknown) => T): Promise<RunResult<T>> {
   if (!nonempty(options.apiKey) || !nonempty(text)) throw new RunError("INVALID_RUN_REQUEST", false);
   const url = runUrl(options.baseUrl);
@@ -142,7 +148,13 @@ async function run<T>(options: RunOptions, text: string, validate: (value: unkno
       return { ...session, result: result as T };
     } else if (event === "chat.event") {
       if (!session || !object(value)) throw new RunError("RUN_CHAT_SEQUENCE", false);
-      options.onChatEvent?.(value);
+      if (options.onChatEvent) {
+        // Logging/UI failures must not cancel a valid ticket run or trigger a
+        // business retry. Do not log the event or the observer's error payload.
+        const warn = () => console.warn("[support-review] onChatEvent failed; continuing run validation.");
+        try { void Promise.resolve(options.onChatEvent(value)).catch(warn); }
+        catch { warn(); }
+      }
     } else {
       throw new RunError("RUN_UNEXPECTED_EVENT", false);
     }
