@@ -199,7 +199,7 @@ class ClaudeAgentClient:
                             blocks.append({"type": "toolCall", "id": value["id"],
                                            "name": self._names.get(value["name"], value["name"]), "arguments": value["input"]})
                 elif kind == "ResultMessage":
-                    await self._usage_recorder.finish("error" if message.is_error else "success", self._turn_id)
+                    await self._usage_recorder.finish("cancelled" if self._aborted else "error" if message.is_error else "success", self._turn_id)
                     await self._flush_assistant()
                     await self._stop_tools()
                     data = {"outcome": "aborted" if self._aborted else "failed" if message.is_error else "completed",
@@ -234,7 +234,12 @@ class ClaudeAgentClient:
         await self._emit("model_request", {"call": 1, "model": self.config["model"]["id"], "provider": self.config["model"]["provider"]})
         await self._emit("model_envelope", {"manifest": {"system_prompt_sha256": hashlib.sha256(self.system_prompt.encode()).hexdigest(),
                                                        "tools": list(self.tools), "model": self.config["model"]["id"]}})
-        await self._client.query(message)
+        await self._usage_recorder.begin(self._turn_id)
+        try:
+            await self._client.query(message)
+        except Exception:
+            await self._usage_recorder.finish("error", self._turn_id)
+            raise
 
     async def receive_messages(self):
         while True:

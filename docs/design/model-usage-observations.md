@@ -58,8 +58,10 @@ AgentBox. The Claude adapter captures numeric usage from native message stream
 events, including cache read/write fields. It emits one completed observation
 per provider message, regardless of how many SDK content blocks represent that
 message. SDK-only messages remain missing evidence; interrupted streams retain
-partial evidence. Timing for Claude starts at the observed message start;
-SDK-internal HTTP retries before that event are not individually measured.
+partial evidence. Claude records the initial turn dispatch before waiting for
+the provider, so an early failure remains a call with unknown usage. Subsequent
+model-loop calls start at their observed message start; SDK-internal HTTP
+retries before that event are not individually measured.
 
 Compiler observations bypass the bounded diagnostic queue. On receipt, Runtime
 writes them to `capability-usage-outbox/<run>` and retries
