@@ -65,19 +65,6 @@ vi.mock("@kubernetes/client-node", () => {
   return { KubeConfig: FakeKubeConfig, CoreV1Api: FakeCoreV1Api };
 });
 
-// Mock fs.mkdirSync used by ensureUserDir (persistence enabled).
-vi.mock("node:fs", async () => {
-  const real = await vi.importActual<typeof import("node:fs")>("node:fs");
-  return {
-    ...real,
-    default: {
-      ...real,
-      mkdirSync: vi.fn((_p: string, _o?: any) => undefined as any),
-    },
-    mkdirSync: vi.fn((_p: string, _o?: any) => undefined as any),
-  };
-});
-
 // Shortcut aliases for readability in tests.
 const g = globalThis as any;
 const calls = new Proxy({} as any, { get: (_t, k) => g.__k8sCalls[k as string] });
@@ -129,7 +116,7 @@ class FakeCertManager {
  * BYTES rather than from a label beside them, so a placeholder string exercises only the
  * unparseable path. 512-bit keys keep this fast — nothing here verifies a signature.
  */
-function pemValidUntil(notAfter: Date): string {
+function pemValidUntil(notAfter: Date, ou?: string): string {
   const keys = forge.pki.rsa.generateKeyPair(512);
   const cert = forge.pki.createCertificate();
   cert.publicKey = keys.publicKey;
@@ -137,6 +124,7 @@ function pemValidUntil(notAfter: Date): string {
   cert.validity.notBefore = new Date(notAfter.getTime() - 30 * 24 * 60 * 60 * 1000);
   cert.validity.notAfter = notAfter;
   const attrs = [{ name: "commonName", value: "agent-x" }];
+  if (ou) attrs.push({ name: "organizationalUnitName", value: ou });
   cert.setSubject(attrs);
   cert.setIssuer(attrs);
   cert.sign(keys.privateKey);
@@ -1034,95 +1022,41 @@ describe("K8sSpawner — list + cleanup", () => {
   });
 });
 
-describe("K8sSpawner — per-agent persistence (PVC override)", () => {
-  // Drive readNamespacedPod: first call 404 (new pod), then a Running pod so
-  // spawn() resolves. Lets us inspect the createNamespacedPod body.
-  function readReturnsRunningAfter404() {
-    let r = 0;
+describe("K8sSpawner — private remote workspaces", () => {
+  function readyAfterMissing() {
+    let reads = 0;
     readPodImpl.fn = async () => {
-      r++;
-      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
-      return {
-        status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
-        metadata: { name: "agentbox-default-0", labels: {} },
-      };
+      if (++reads === 1) throw Object.assign(new Error("missing"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
   }
-
-  function userDataVolume() {
+  it("rejects legacy PVC configuration instead of silently discarding data", () => {
+    for (const persistence of [{ enabled: true, claimName: "data" }, { enabled: false, claimName: "data" }]) {
+      expect(() => new K8sSpawner({ persistence })).toThrow(/migrate existing data/);
+    }
+  });
+  it("requires remote persistence for a durable session", async () => {
+    const s = new K8sSpawner(); s.setCertManager(new FakeCertManager() as any); readyAfterMissing();
+    await expect(s.spawn({ agentId: "agent", persistence: true })).rejects.toThrow(/remote private/);
+    expect(calls.createNamespacedPod).toHaveLength(0);
+  });
+  it("binds one private pod and certificate to one user session, with emptyDir only", async () => {
+    const s = new K8sSpawner(), cm = new FakeCertManager(); s.setCertManager(cm as any); readyAfterMissing();
+    const privateSpace = { agentId: "agent", orgId: "org", userId: "alice", spaceId: "space-a", sessionId: "session-a" };
+    await s.spawn({ agentId: "agent", orgId: "org", privateSpace });
     const body = calls.createNamespacedPod[0].body;
-    const vols = body.spec.volumes as any[];
-    return vols.find((v) => v.name === "user-data");
-  }
-
-  function userDataMount() {
-    const body = calls.createNamespacedPod[0].body;
-    const mounts = body.spec.containers[0].volumeMounts as any[];
-    return mounts.find((m) => m.name === "user-data");
-  }
-
-  it("boxConfig.persistence=true mounts the shared PVC with a per-agent subPath", async () => {
-    const cm = new FakeCertManager();
-    const s = new K8sSpawner({ persistence: { enabled: false, claimName: "siclaw-data" } });
-    s.setCertManager(cm as any);
-    readReturnsRunningAfter404();
-
-    await s.spawn({ agentId: "diagnose-1", persistence: true });
-
-    expect(userDataVolume().persistentVolumeClaim).toEqual({ claimName: "siclaw-data" });
-    expect(userDataVolume().emptyDir).toBeUndefined();
-    expect(userDataMount().subPath).toBe("agents/diagnose-1");
+    expect(body.spec.volumes.find((v: any) => v.name === "user-data")).toEqual({ name: "user-data", emptyDir: {} });
+    expect(body.spec.volumes.some((v: any) => v.persistentVolumeClaim)).toBe(false);
+    expect(body.metadata.labels["siclaw.io/private-session"]).toBe("session-a");
+    expect(cm.issuedCalls[0][3]).toEqual(privateSpace);
+    expect(body.spec.containers[0].env).toContainEqual({ name: "SICLAW_PRIVATE_USER_ID", value: "alice" });
+    expect(body.spec.containers[0].volumeMounts.find((v: any) => v.name === "user-data").subPath).toBeUndefined();
   });
-
-  it("boxConfig.persistence=false uses emptyDir even when global persistence is enabled", async () => {
-    const cm = new FakeCertManager();
-    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
-    s.setCertManager(cm as any);
-    readReturnsRunningAfter404();
-
-    await s.spawn({ agentId: "shopping-1", persistence: false });
-
-    expect(userDataVolume().emptyDir).toEqual({});
-    expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
-    expect(userDataMount().subPath).toBeUndefined();
-  });
-
-  it("undefined boxConfig.persistence falls back to the spawner's global config (enabled)", async () => {
-    const cm = new FakeCertManager();
-    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
-    s.setCertManager(cm as any);
-    readReturnsRunningAfter404();
-
-    await s.spawn({ agentId: "legacy-1" });
-
-    expect(userDataVolume().persistentVolumeClaim).toEqual({ claimName: "siclaw-data" });
-    expect(userDataMount().subPath).toBe("agents/legacy-1");
-  });
-
-  it("undefined boxConfig.persistence falls back to the spawner's global config (disabled)", async () => {
-    const cm = new FakeCertManager();
-    const s = new K8sSpawner(); // no persistence config at all
-    s.setCertManager(cm as any);
-    readReturnsRunningAfter404();
-
-    await s.spawn({ agentId: "legacy-2" });
-
-    expect(userDataVolume().emptyDir).toEqual({});
-    expect(userDataMount().subPath).toBeUndefined();
-  });
-
-  it("persistence requested but no claimName configured → falls back to emptyDir (no broken mount)", async () => {
-    const cm = new FakeCertManager();
-    const s = new K8sSpawner(); // global persistence undefined → no claimName
-    s.setCertManager(cm as any);
-    readReturnsRunningAfter404();
-
-    await s.spawn({ agentId: "diagnose-2", persistence: true });
-
-    // Must not emit a PVC volume that can never bind.
-    expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
-    expect(userDataVolume().emptyDir).toEqual({});
-    expect(userDataMount().subPath).toBeUndefined();
+  it("refuses a private identity mismatch without deleting the other pod", async () => {
+    const s = new K8sSpawner(); s.setCertManager(new FakeCertManager() as any);
+    readPodImpl.fn = async () => ({ metadata: { labels: { "siclaw.io/private-space": "other" } }, status: { phase: "Running" } });
+    await expect(s.spawn({ agentId: "agent", privateSpace: { agentId: "agent", orgId: "org", userId: "alice", spaceId: "space", sessionId: "session" } })).rejects.toThrow(/identity mismatch/);
+    expect(calls.deleteNamespacedPod).toHaveLength(0);
   });
 });
 
@@ -1556,6 +1490,25 @@ describe("K8sSpawner — a cert Secret is stale when the LEAF expires, not only 
 
     expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
     expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1);
+  });
+
+  it("reissues a fresh certificate with known-invalid PrintableString identity encoding", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new PemCertManager(daysFromNow(30)) as any);
+    newPodThenRunning();
+    let creates = 0;
+    g.__k8sImpls.createNamespacedSecret = async () => {
+      if (++creates === 1) throw Object.assign(new Error("exists"), { code: 409 });
+      return {};
+    };
+    const bad = pemValidUntil(daysFromNow(30), '{"spaceId":"space","userId":"alice","sessionId":"session"}');
+    g.__k8sImpls.readNamespacedSecret = async () => ({
+      metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } },
+      data: { "tls.crt": Buffer.from(bad).toString("base64") },
+    });
+    await s.spawn({ agentId: "agent-x", profile: "agent" });
+    expect(calls.deleteNamespacedSecret.map((c: any) => c.name)).toEqual(["agentbox-agent-x-cert"]);
+    expect(creates).toBe(2);
   });
 
   /**

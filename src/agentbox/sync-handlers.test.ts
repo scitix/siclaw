@@ -397,6 +397,23 @@ describe("skillsHandler", () => {
     fs.rmSync(skillsTmpDir, { recursive: true, force: true });
   });
 
+  it("preserves read-only Skill access under the private workspace umask", async () => {
+    const previous = process.umask(0o027);
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    try {
+      await skillsHandler.materialize({ version: "v1", skills: [{ dirName: "check", scope: "global", specs: "# Check", scripts: [], files: [
+        { path: "references/nested/notes.txt", content: "readable", encoding: "utf8" },
+        { path: "scripts/check.py", content: "print('ok')", encoding: "utf8", executable: true },
+      ] }] });
+      for (const relative of ["", "check", "check/references", "check/references/nested", "check/scripts"]) {
+        expect(fs.statSync(path.join(resolvedDir(), relative)).mode & 0o777).toBe(0o755);
+      }
+      expect(fs.statSync(path.join(resolvedDir(), "check/SKILL.md")).mode & 0o777).toBe(0o644);
+      expect(fs.statSync(path.join(resolvedDir(), "check/references/nested/notes.txt")).mode & 0o777).toBe(0o644);
+      expect(fs.statSync(path.join(resolvedDir(), "check/scripts/check.py")).mode & 0o777).toBe(0o755);
+    } finally { process.umask(previous); vi.unstubAllEnvs(); }
+  });
+
   it("has type 'skills'", () => {
     expect(skillsHandler.type).toBe("skills");
   });

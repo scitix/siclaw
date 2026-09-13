@@ -1,3 +1,4 @@
+import { privateWorkspaceEnabled, type PrivateSpaceIdentity } from "../../shared/private-workspace.js";
 /**
  * AgentBox Manager
  *
@@ -165,6 +166,9 @@ export interface AgentBoxAcquisition {
 
 export class AgentBoxManager {
   private spawner: BoxSpawner;
+  private privateSpaceResolver?: (agentId: string, sessionId: string) => Promise<PrivateSpaceIdentity>;
+  private privateAcquisitions = new Map<string, Promise<AgentBoxAcquisition>>();
+  setPrivateSpaceResolver(resolver: (agentId: string, sessionId: string) => Promise<PrivateSpaceIdentity>): void { this.privateSpaceResolver = resolver; }
   private config: Required<AgentBoxManagerConfig>;
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
@@ -424,6 +428,35 @@ export class AgentBoxManager {
     sessionId?: string,
   ): Promise<AgentBoxAcquisition> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
+    if (privateWorkspaceEnabled() && (!config?.profile || config.profile === "agent")) {
+      if (!this.isK8s || !sessionId || !this.privateSpaceResolver) throw new Error("Private persistence requires an isolated K8s session and a trusted space service");
+      const owner = await this.privateSpaceResolver(agentId, sessionId);
+      if (owner.agentId !== agentId || !owner.userId || !owner.spaceId) throw new Error("Private space identity is unavailable");
+      const key = JSON.stringify([agentId, owner.spaceId, sessionId]);
+      const pending = this.privateAcquisitions.get(key);
+      if (pending) return pending;
+      const operation = (async (): Promise<AgentBoxAcquisition> => {
+        const existing = (await this.listPool(agentId)).find(box => box.privateSessionId === sessionId && box.privateSpaceId === owner.spaceId);
+        if (existing?.status === "running" && existing.endpoint && this.isCertUsable(existing)) {
+          const stale = this.isStaleImage(existing, "agent") || !this.isCertFresh(existing);
+          const drained = stale && this.boxStatusProbe ? (await this.boxStatusProbe(existing.endpoint)).drained : false;
+          if (!drained) {
+            this.bindings.remember(agentId, sessionId, existing.boxId);
+            return { handle: { boxId: existing.boxId, endpoint: existing.endpoint, agentId }, created: false };
+          }
+          await this.spawner.stop(existing.boxId);
+        }
+        const env = await this.resolveEnv(agentId, config?.env);
+        const handle = await this.spawner.spawn({ ...config, agentId, orgId: owner.orgId, privateSpace: { ...owner, sessionId }, env, persistence: false });
+        this.bindings.remember(agentId, sessionId, handle.boxId);
+        // Concurrent callers can adopt the same pod. Conservative ownership prevents
+        // failed request setup from deleting another caller's running session.
+        return { handle, created: false };
+      })();
+      this.privateAcquisitions.set(key, operation);
+      try { return await operation; }
+      finally { if (this.privateAcquisitions.get(key) === operation) this.privateAcquisitions.delete(key); }
+    }
     if (this.isK8s) {
       // A capability box is a per-run job, not a long-lived agent, so it never pools.
       const wantProfile = config?.profile ?? "agent";
@@ -449,6 +482,7 @@ export class AgentBoxManager {
     const name = this.podName(agentId, wantProfile);
 
     const info = await this.spawner.get(name);
+    if (info?.privateSessionId) throw new Error("Private AgentBox cannot join a shared pool");
 
     // 🔴 A single-box agent must still pick up a new AgentBox image. Nothing else does it:
     // this path compares phase, profile and CA but never the image, and a box under
@@ -540,7 +574,7 @@ export class AgentBoxManager {
     replicas: number,
   ): Promise<AgentBoxAcquisition> {
     const wantProfile = config?.profile ?? "agent";
-    const pool = await this.listPool(agentId);
+    const pool = (await this.listPool(agentId)).filter(box => !box.privateSessionId);
     this.markStaleBoxesDraining(agentId, pool, wantProfile);
     this.bindings.retainBoxes(agentId, new Set(pool.map((b) => b.boxId)));
 
@@ -788,16 +822,22 @@ export class AgentBoxManager {
    * which is the honest answer, not a reason to guess at instance 0.
    */
   async getForSession(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    if (privateWorkspaceEnabled() && (!profile || profile === "agent")) {
+      const owner = await this.privateSpaceResolver?.(agentId, sessionId);
+      if (!owner) return undefined;
+      const box = (await this.listPool(agentId)).find(b => b.privateSessionId === sessionId && b.privateSpaceId === owner.spaceId && b.status === "running");
+      return box?.endpoint ? { boxId: box.boxId, endpoint: box.endpoint, agentId } : undefined;
+    }
     const bound = this.bindings.get(agentId, sessionId);
     if (bound) {
       const info = await this.spawner.get(bound).catch(() => null);
-      if (info && info.status === "running" && info.endpoint) {
+      if (info && !info.privateSessionId && info.status === "running" && info.endpoint) {
         return { boxId: bound, endpoint: info.endpoint, agentId };
       }
       // The bound box is gone; fall through to the agent's remaining boxes.
     }
     for (const box of await this.listPool(agentId)) {
-      if (box.status === "running" && box.endpoint && (box.profile ?? "agent") === (profile ?? "agent")) {
+      if (!box.privateSessionId && box.status === "running" && box.endpoint && (box.profile ?? "agent") === (profile ?? "agent")) {
         return { boxId: box.boxId, endpoint: box.endpoint, agentId };
       }
     }
@@ -820,8 +860,7 @@ export class AgentBoxManager {
     this.unsharedWarned.add(agentId);
     console.warn(
       `[agentbox-manager] agent ${agentId} runs more than one box but its session transcripts are NOT on shared ` +
-      `storage — a conversation that moves between boxes will lose its history. Configure a shared volume ` +
-      `(SICLAW_PERSISTENCE_CLAIM_NAME) or set replicas back to 1.`,
+      `storage — use remote private workspaces for durable conversations, or set replicas back to 1.`,
     );
   }
 
@@ -835,6 +874,7 @@ export class AgentBoxManager {
    * may still hold it, so a hint pointing at an unreachable-but-live box counts.
    */
   async getHolder(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    if (privateWorkspaceEnabled() && (!profile || profile === "agent")) return this.getForSession(agentId, sessionId, profile);
     const wantProfile = profile ?? "agent";
     const pool = (await this.listPool(agentId)).filter((b) => this.isReachable(b, wantProfile));
     if (pool.length === 0) return undefined;
@@ -888,7 +928,7 @@ export class AgentBoxManager {
   /** A box the Runtime can talk to right now. Says nothing about whether it accepts NEW
    *  sessions — a draining box is still reachable and still serves what it holds. */
   private isReachable(box: AgentBoxInfo, wantProfile: string): boolean {
-    return box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
+    return !box.privateSessionId && box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
   }
 
   /**
@@ -1448,7 +1488,7 @@ export class AgentBoxManager {
 
     const byAgent = new Map<string, AgentBoxInfo[]>();
     for (const box of all) {
-      if ((box.profile ?? "agent") !== "agent" || !box.agentId) continue;
+      if (box.privateSessionId || (box.profile ?? "agent") !== "agent" || !box.agentId) continue;
       const list = byAgent.get(box.agentId) ?? [];
       list.push(box);
       byAgent.set(box.agentId, list);

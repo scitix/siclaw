@@ -1,9 +1,10 @@
+import type { PrivateSpaceIdentity } from "../../shared/private-workspace.js";
 /**
  * AgentBox type definitions.
  *
- * An agent's boxes are shared by every user who addresses that agent; per-user state
- * is carried in the request's sessionId, not in the pod identity. No userId here.
- * An agent may run several boxes — see `AgentBoxConfig.instance`.
+ * Legacy agent pools share pods. Remote private workspaces instead bind a pod
+ * and certificate to one authenticated user's session; they never join a pool.
+ * Legacy replicas are described by `AgentBoxConfig.instance`.
  */
 
 /** AgentBox status */
@@ -11,6 +12,8 @@ export type AgentBoxStatus = "starting" | "running" | "stopping" | "stopped" | "
 
 /** AgentBox configuration */
 export interface AgentBoxConfig {
+  /** Authenticated personal space; a private box serves exactly one session. */
+  privateSpace?: PrivateSpaceIdentity & { sessionId: string };
   /** Agent ID — the pod identity; also the cert CN. For a capability box (e.g. a
    *  KB compile run) this is the run id (the run is a job, not a long-lived agent). */
   agentId: string;
@@ -37,13 +40,7 @@ export interface AgentBoxConfig {
     cpuRequest?: string;
     memoryRequest?: string;
   };
-  /**
-   * Per-agent session/memory persistence override.
-   * - true  → mount the shared PVC (session JSONL + memory survive pod restarts)
-   * - false → use emptyDir (session cleared on pod restart/idle release)
-   * - undefined → fall back to the spawner's global persistence config
-   * Only honored by K8sSpawner; ignored by Local/Process spawners.
-   */
+  /** Legacy durable-session request. Requires remote private workspaces in K8s. */
   persistence?: boolean;
   /**
    * Which replica of the agent this box is. Defaults to 0.
@@ -71,6 +68,8 @@ export interface AgentBoxConfig {
 
 /** AgentBox information */
 export interface AgentBoxInfo {
+  privateSpaceId?: string;
+  privateSessionId?: string;
   boxId: string;
   agentId: string;
   status: AgentBoxStatus;

@@ -1,3 +1,4 @@
+import type { PrivateMemorySource } from "../shared/private-workspace.js";
 /**
  * Tool Registry — declarative tool registration and resolution.
  *
@@ -450,6 +451,7 @@ export interface ToolRefs {
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
   memoryIndexer?: MemoryIndexer;
+  privateMemory?: PrivateMemorySource;
   /** Labels-only resolver over the knowledge pages mounted for this Agent. */
   knowledgeIndexer?: KnowledgeResolver;
   /** Session-scoped Skill script lookup. Required for LocalSpawner isolation. */

@@ -56,10 +56,8 @@ spec:
           value: "siclaw-agentbox:latest"
         - name: SICLAW_SKILLS_DIR
           value: "/app/.siclaw/skills"
-        - name: SICLAW_PERSISTENCE_ENABLED
-          value: "true"
-        - name: SICLAW_PERSISTENCE_CLAIM_NAME
-          value: "siclaw-data"
+        - name: SICLAW_WORKSPACE_MODE
+          value: "local" # Set remote only with a trusted workspace service.
         - name: SICLAW_PROXY_SECRET
           valueFrom:
             secretKeyRef:
@@ -87,14 +85,9 @@ spec:
         volumeMounts:
         - name: skills-local
           mountPath: /app/.siclaw/skills
-        - name: user-data
-          mountPath: /app/.siclaw/user-data
       volumes:
       - name: skills-local
         emptyDir: {}
-      - name: user-data
-        persistentVolumeClaim:
-          claimName: siclaw-data
 
 ---
 apiVersion: v1
@@ -139,9 +132,6 @@ rules:
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["get", "list", "create", "delete"]
-- apiGroups: [""]
-  resources: ["persistentvolumeclaims"]
-  verbs: ["get", "list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

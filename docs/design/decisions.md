@@ -876,3 +876,29 @@ workflows in Portal reduces maintenance while preserving scriptable diagnostics.
   carry its own terminal packages transitively; Siclaw does not expose that UI.
 - Builds clear `dist/` before compiling, so removed terminal modules cannot leak
   into packages built in an existing checkout.
+
+## ADR-021: Persist Private Sessions Through a Trusted Object Storage Service
+
+**Status**: Accepted (2026-09-13); remote mode is opt-in.
+
+**Context**: Shared application-data volumes couple session recovery to a Runtime
+and complicate user isolation. A replacement Pod needs the exact Pi tree and
+selected branch, while historical memory must not become executable policy.
+
+**Decision**: Bind each private session Pod to an authenticated owner and a stable
+space. A trusted host owns object storage credentials and a separate metadata
+database. Publish immutable, verified session checkpoints through fenced writer
+leases and revision checks; restore into pod-local scratch before execution.
+Persist an unfinished-turn marker before dispatch and require explicit recovery
+after an uncertain interruption. Query personal memory as attributed historical
+evidence. Keep Skills, configuration and execution permissions on their existing
+trusted release paths. See [private-workspaces.md](private-workspaces.md).
+
+**Consequences**: Runtime changes retain the original storage placement. Remote
+mode requires isolated K8s Pods and a compatible host workspace service; local
+mode remains available. Application-data PVC creation/mounting is removed, so
+existing installations need verified migration before enabling remote mode.
+Unknown-owner history is retained as inert operator archives. SIGTERM attempts a
+final checkpoint; SIGKILL retains only the last committed version. Leases do not
+provide exactly-once external effects. The container execs the application as
+PID 1 after dropping privileges so its shutdown handler receives SIGTERM.

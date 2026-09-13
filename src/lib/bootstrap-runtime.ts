@@ -1,3 +1,4 @@
+import type { PrivateSpaceIdentity } from "../shared/private-workspace.js";
 /**
  * Runtime bootstrap — assembles spawner, AgentBoxManager, FrontendWsClient,
  * credential service, cert manager, Runtime HTTP server, ChannelManager,
@@ -107,6 +108,8 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
 
   const k8sNamespace = opts.k8sNamespace ?? process.env.SICLAW_K8S_NAMESPACE ?? "default";
   const agentBoxManager = new AgentBoxManager(spawner, { namespace: k8sNamespace });
+  agentBoxManager.setPrivateSpaceResolver((agentId, sessionId) =>
+    frontendClient.request("workspace.exchange", { action: "resolve", agentId, sessionId }) as Promise<PrivateSpaceIdentity>);
   agentBoxManager.startHealthCheck();
 
   const runtime = await startRuntime({
@@ -193,28 +196,9 @@ function createSpawner(
   if (kind === "k8s") {
     const image = opts.k8sImage ?? process.env.SICLAW_AGENTBOX_IMAGE ?? "siclaw-agentbox:latest";
     const namespace = opts.k8sNamespace ?? process.env.SICLAW_K8S_NAMESPACE ?? "default";
-    // claimName identifies the shared PVC the deployer actually created — its name
-    // differs per deployment, so there is NO hardcoded default. It is "available"
-    // only when explicitly configured (helm opt or SICLAW_PERSISTENCE_CLAIM_NAME).
-    const claimName = opts.k8sPersistenceClaimName ?? process.env.SICLAW_PERSISTENCE_CLAIM_NAME;
-    const globalEnabled = process.env.SICLAW_PERSISTENCE_ENABLED === "true";
-    // Behaviour change vs the old hardcoded "siclaw-data" default: a raw-env
-    // deploy that set only SICLAW_PERSISTENCE_ENABLED=true (no claim name) now
-    // silently degrades to emptyDir instead of binding a PVC named "siclaw-data".
-    // Warn once at startup so that regression is visible (Helm always injects the
-    // claim name when a PVC is available, so chart users never hit this).
-    if (globalEnabled && !claimName) {
-      console.warn(
-        "[runtime] SICLAW_PERSISTENCE_ENABLED=true but SICLAW_PERSISTENCE_CLAIM_NAME is unset — " +
-        "persistence falls back to emptyDir (no shared PVC mounted; session/memory will NOT survive pod restarts)",
-      );
+    if (opts.k8sPersistenceClaimName || process.env.SICLAW_PERSISTENCE_CLAIM_NAME || process.env.SICLAW_PERSISTENCE_ENABLED === "true") {
+      throw new Error("Shared PVC persistence was removed. Migrate and verify existing data before enabling remote workspaces and removing legacy persistence settings.");
     }
-    // Decouple infrastructure (claimName: is a shared PVC available?) from policy
-    // (enabled: the global default for callers that don't specify per-agent).
-    // Pass claimName whenever it's configured — so a per-agent opt-in
-    // (boxConfig.persistence, e.g. from an external portal) can mount the PVC even
-    // when the global flag is off. The spawner gates the actual mount on claimName,
-    // so when it's absent persistence simply degrades to emptyDir.
     // Optional node scheduling constraint for spawned AgentBox pods. Passed as a
     // JSON object map via env (Helm renders agentbox.nodeSelector with toJson).
     // Malformed JSON is ignored with a warning rather than crashing startup.
@@ -223,7 +207,6 @@ function createSpawner(
     return new K8sSpawner({
       namespace,
       image,
-      persistence: claimName ? { enabled: globalEnabled, claimName } : undefined,
       nodeSelector,
     });
   }

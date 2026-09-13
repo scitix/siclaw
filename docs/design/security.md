@@ -301,7 +301,8 @@ CMD ["node", "dist/agentbox-main.js"]
 ```
 
 **Why no `USER agentbox` directive**: The entrypoint must run as root to fix emptyDir volume
-permissions (chown/chmod), then drops to agentbox via `exec runuser -u agentbox -- "$@"`.
+permissions (chown/chmod), then drops to agentbox via `setpriv --reuid=agentbox --regid=agentbox --init-groups`, which execs
+the application as PID 1 so SIGTERM reaches its graceful shutdown handler.
 The agentbox user then uses `sudo` (with its SUID bit) to run child processes as sandbox.
 
 ### 3.6 Code Changes
@@ -566,14 +567,14 @@ does not need timestamp caching, so no additional writable paths are needed for 
 |------------|-----------|------|
 | `SETUID` | `sudo`'s SUID bit requires this cap to switch effective UID (agentbox → sandbox) | Low — only used to drop privileges, not gain them |
 | `SETGID` | `sudo` also switches GID; kubectl's setgid bit requires kernel enforcement | Low — setgid only grants kubecred group |
-| `CHOWN` | Entrypoint fixes volume mount ownership (runs as root before `runuser`) | Low — kernel clears effective/permitted caps on UID transition via `runuser` |
-| `FOWNER` | Entrypoint fixes volume mount permissions regardless of ownership | Low — same as CHOWN, cleared after `runuser` |
+| `CHOWN` | Entrypoint fixes volume mount ownership (runs as root before `setpriv`) | Low — kernel clears effective/permitted caps on UID transition via `setpriv` |
+| `FOWNER` | Entrypoint fixes volume mount permissions regardless of ownership | Low — same as CHOWN, cleared after `setpriv` |
 | `AUDIT_WRITE` | Required by `sudo` to write kernel audit records; without it every command emits stderr noise (`unable to send audit message`) | Low — only grants write to kernel audit log, no privilege escalation path; included in Docker default cap set |
 | All others | Dropped | N/A |
 
 ### 5.3 What Is Blocked
 
-With `drop: ALL` + only SETUID/SETGID/CHOWN/FOWNER/AUDIT_WRITE (CHOWN/FOWNER used only during root entrypoint, cleared after `runuser`):
+With `drop: ALL` + only SETUID/SETGID/CHOWN/FOWNER/AUDIT_WRITE (CHOWN/FOWNER used only during root entrypoint, cleared after `setpriv`):
 
 - `CAP_NET_RAW` dropped — no raw sockets, no packet sniffing
 - `CAP_SYS_PTRACE` dropped — no debugging/attaching to other processes
@@ -744,13 +745,13 @@ spec:
 - [x] App code: `agentbox:agentbox 0755/0644` (sandbox: read-only via `chmod -R o+rX`)
 - [x] User data dir: `agentbox:agentbox 0777` (sandbox: read-write — the only writable area)
 - [x] Strip all SUID except `/usr/bin/sudo`; verify only kubectl has SGID
-- [x] Entrypoint: fixes volume permissions as root, drops to agentbox via `runuser`
+- [x] Entrypoint: fixes volume permissions as root, drops to agentbox via `setpriv`
 
 ### 10.2 K8s Manifests
 
 - [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"] }`
 - [x] Add `seccompProfile: { type: RuntimeDefault }`
-- [x] Entrypoint handles volume permission fixing (no init container needed; CHOWN/FOWNER cleared after `runuser`)
+- [x] Entrypoint handles volume permission fixing (no init container needed; CHOWN/FOWNER cleared after `setpriv`)
 - [x] Keep `automountServiceAccountToken: false`
 - [x] Add `readOnlyRootFilesystem: true` with emptyDir for `/tmp`
 - [ ] Deploy NetworkPolicy for egress restriction

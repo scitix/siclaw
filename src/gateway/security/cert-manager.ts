@@ -12,14 +12,14 @@
  *   CN           = agentId — primary identity, used for mTLS authz + routing
  *   O            = orgId   — RBAC scope
  *   serialNumber = boxId   — pod/process identifier for audit correlation
+ *   OU           = UTF-8 JSON ownership binding in remote workspace mode
  *
  * `is_production` is deliberately NOT encoded in the cert. The current
  * value is looked up from the agents table on every authz decision in
  * Upstream (SQL join on agents.is_production = resource.is_production) —
  * this way a toggle reflects immediately without requiring pod rebuild
- * or cert re-issue. AgentBox is user-unaware end-to-end: no userId in
- * cert, no userId in request payloads; user attribution is resolved at
- * Runtime boundaries via sessionId.
+ * or cert re-issue. Remote workspaces additionally bind space, user and session
+ * to the certificate; Runtime validates that binding against durable ownership.
  */
 
 import crypto from "node:crypto";
@@ -29,6 +29,18 @@ import { AGENTBOX_CERT_VALIDITY_DAYS } from "../../shared/cert-validity.js";
 
 /** CA validity: 10 years */
 const CA_VALIDITY_DAYS = 3650;
+// node-forge expects a string TYPE here; its declaration incorrectly names Class.
+const DN_UTF8 = forge.asn1.Type.UTF8 as unknown as forge.asn1.Class;
+
+/** Detect known-invalid ASN.1 strings without treating every parser failure as stale. */
+export function certificateHasInvalidPrintableString(pem: string): boolean {
+  try {
+    const cert = forge.pki.certificateFromPem(pem);
+    return [...cert.subject.attributes, ...cert.issuer.attributes].some(attr =>
+      Number(attr.valueTagClass) === forge.asn1.Type.PRINTABLESTRING &&
+      typeof attr.value === "string" && !/^[A-Za-z0-9 '()+,\-./:=?]*$/.test(attr.value));
+  } catch { return false; }
+}
 
 /**
  * A random serial as a MINIMAL positive DER integer.
@@ -62,6 +74,9 @@ export interface CertificateIdentity {
   agentId: string;
   orgId: string;
   boxId: string;
+  privateSpaceId?: string;
+  privateUserId?: string;
+  privateSessionId?: string;
   issuedAt: Date;
   expiresAt: Date;
 }
@@ -175,6 +190,7 @@ export class CertificateManager {
     agentId: string,
     orgId: string,
     boxId: string,
+    privateIdentity?: { spaceId: string; userId: string; sessionId: string },
   ): CertificateBundle {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -186,7 +202,7 @@ export class CertificateManager {
     const expiresAt = new Date(issuedAt.getTime() + AGENTBOX_CERT_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
 
     const cert = CertificateManager.createCertificateStatic({
-      subject: { CN: agentId, O: orgId, serialNumber: boxId },
+      subject: { CN: agentId, O: orgId, serialNumber: boxId, ...(privateIdentity ? { OU: JSON.stringify(privateIdentity) } : {}) },
       issuerAttrs: this.caSubjectAttrs,
       publicKey,
       signingKey: this.caKey,
@@ -212,7 +228,7 @@ export class CertificateManager {
       cert,
       key: privateKey,
       ca: this.caCert,
-      identity: { agentId, orgId, boxId, issuedAt, expiresAt },
+      identity: { agentId, orgId, boxId, issuedAt, expiresAt, ...(privateIdentity ? { privateSpaceId: privateIdentity.spaceId, privateUserId: privateIdentity.userId, privateSessionId: privateIdentity.sessionId } : {}) },
     };
   }
 
@@ -251,7 +267,14 @@ export class CertificateManager {
         return null;
       }
 
-      return { agentId, orgId, boxId, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
+      const ou = getAttr("organizationalUnitName");
+      let privateIdentity: { privateSpaceId?: string; privateUserId?: string; privateSessionId?: string } = {};
+      if (ou?.startsWith("{")) {
+        const parsed = JSON.parse(ou);
+        if (typeof parsed.spaceId !== "string" || typeof parsed.userId !== "string" || typeof parsed.sessionId !== "string") return null;
+        privateIdentity = { privateSpaceId: parsed.spaceId, privateUserId: parsed.userId, privateSessionId: parsed.sessionId };
+      }
+      return { agentId, orgId, boxId, ...privateIdentity, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
     } catch (err) {
       console.error("[cert-manager] Certificate verification error:", err);
       return null;
@@ -312,7 +335,9 @@ export class CertificateManager {
     const subjectAttrs = [];
     if (opts.subject.CN) subjectAttrs.push({ name: "commonName", value: opts.subject.CN });
     if (opts.subject.O) subjectAttrs.push({ name: "organizationName", value: opts.subject.O });
-    if (opts.subject.OU) subjectAttrs.push({ name: "organizationalUnitName", value: opts.subject.OU });
+    // Private ownership is JSON. Braces/quotes are not ASN.1 PrintableString
+    // characters; strict X.509 readers (including kubelet) reject that encoding.
+    if (opts.subject.OU) subjectAttrs.push({ name: "organizationalUnitName", value: opts.subject.OU, valueTagClass: DN_UTF8 });
     if (opts.subject.serialNumber) subjectAttrs.push({ name: "serialNumber", value: opts.subject.serialNumber });
     cert.setSubject(subjectAttrs);
 
@@ -327,7 +352,7 @@ export class CertificateManager {
       const issuerAttrs = [];
       if (issuerData.CN) issuerAttrs.push({ name: "commonName", value: issuerData.CN });
       if (issuerData.O) issuerAttrs.push({ name: "organizationName", value: issuerData.O });
-      if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU });
+      if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU, valueTagClass: DN_UTF8 });
       cert.setIssuer(issuerAttrs);
     }
 

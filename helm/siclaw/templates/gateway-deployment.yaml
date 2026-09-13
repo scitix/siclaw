@@ -1,3 +1,4 @@
+{{- include "siclaw.workspace.validate" . }}
 {{- if eq (include "siclaw.runtime.enabled" .) "true" }}
 apiVersion: apps/v1
 kind: Deployment
@@ -165,18 +166,8 @@ spec:
             - name: SICLAW_SUBAGENT_POD_CONCURRENCY
               value: {{ .Values.runtime.subagentPodConcurrency | quote }}
             {{- end }}
-            {{- if .Values.agentbox.persistence.enabled }}
-            # Global default policy: callers that omit per-agent persistence use the PVC.
-            - name: SICLAW_PERSISTENCE_ENABLED
-              value: "true"
-            {{- end }}
-            {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
-            # PVC availability (infra): present whenever the chart provisions a PVC
-            # OR a pre-existing claim is referenced — independent of the global
-            # default above, so a per-agent persistence:true can mount it.
-            - name: SICLAW_PERSISTENCE_CLAIM_NAME
-              value: {{ include "siclaw.dataPvcName" . | quote }}
-            {{- end }}
+            - name: SICLAW_WORKSPACE_MODE
+              value: {{ .Values.agentbox.workspace.mode | quote }}
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
@@ -275,10 +266,6 @@ spec:
             {{- end }}
             - name: skills
               mountPath: /app/.siclaw/skills
-            {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
-            - name: user-data
-              mountPath: /app/.siclaw/user-data
-            {{- end }}
           livenessProbe:
             httpGet:
               path: /api/health
@@ -299,9 +286,5 @@ spec:
         {{- end }}
         - name: skills
           emptyDir: {}
-        {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
-        - name: user-data
-          persistentVolumeClaim:
-            claimName: {{ include "siclaw.dataPvcName" . }}
-        {{- end }}
+
 {{- end }}

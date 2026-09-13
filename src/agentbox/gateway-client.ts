@@ -1,3 +1,4 @@
+import { PRIVATE_WORKSPACE_PATH, type WorkspaceRequest } from "../shared/private-workspace.js";
 /**
  * Gateway Client for AgentBox
  *
@@ -44,6 +45,11 @@ export interface AgentTask {
 
 export class GatewayClient {
   readonly sandboxInvocations = new SandboxInvocations();
+
+  async exchange<T>(request: WorkspaceRequest): Promise<T> {
+    if (!this.tlsOptions) throw new Error("Private workspace requires authenticated transport");
+    return this.request(PRIVATE_WORKSPACE_PATH, "POST", request, 90_000) as Promise<T>;
+  }
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
   private sessionId?: string;

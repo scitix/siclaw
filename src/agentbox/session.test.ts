@@ -2381,6 +2381,73 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
     expect(JSON.stringify(events)).toContain("spawn-followup");
     expect(restored.subagentRuns.size).toBe(0);
   });
+  async function privateChildFixture() {
+    const mgr = new AgentBoxSessionManager() as any;
+    success();
+    const first = await mgr.createSpawnSubagentExecutor()(request());
+    const native = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
+    const { capturePiSession } = await import("./pi-session-snapshot.js");
+    const directory = mgr.getSessionDir(first.childSessionId);
+    const transcript = native.SessionManager.create("/previous-runtime-cwd", directory);
+    transcript.appendMessage({ role: "user", content: "Inspect eth0", timestamp: 1 });
+    const leaf = transcript.appendMessage({ role: "assistant", content: [{ type: "text", text: "eth0 verified" }], api: "openai-responses", provider: "fixture", model: "fixture", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 2 });
+    transcript.appendMessage({ role: "user", content: "Unselected branch", timestamp: 3 });
+    transcript.branch(leaf);
+    const file = path.join(directory, ".pi-session.json");
+    fs.writeFileSync(file, JSON.stringify(capturePiSession(first.childSessionId, transcript)), { mode: 0o600 });
+    return { first, transcript, directory, file, leaf };
+  }
+
+  it("resumes the selected private child branch and checkpoints follow-ups through the same manager", async () => {
+    const { first, file, leaf } = await privateChildFixture();
+    const restored = new AgentBoxSessionManager() as any;
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    try {
+      success();
+      await restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, spawnId: "private-followup" }));
+      const resumed = (globalThis as any).__createSessionCalls.at(-1).sessionManager;
+      expect(resumed.getLeafId()).toBe(leaf);
+      expect(resumed.getCwd()).toBe(process.cwd());
+      expect(JSON.stringify(resumed.buildSessionContext())).toContain("eth0 verified");
+      expect(JSON.stringify(resumed.buildSessionContext())).not.toContain("Unselected branch");
+      expect(restored.piManagers.get(first.childSessionId)).toBe(resumed);
+      // A later continuation must use live state even before the next disk snapshot.
+      const followup = resumed.appendMessage({ role: "user", content: "Inspect eth1 next", timestamp: 4 });
+      success();
+      await restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, spawnId: "private-followup-2" }));
+      expect((globalThis as any).__createSessionCalls.at(-1).sessionManager).toBe(resumed);
+      expect(resumed.getLeafId()).toBe(followup);
+      const checkpoint = vi.fn(async (_files: Map<string, Buffer>) => {});
+      restored.privateWorkspace = { sessionId: "parent", assertHealthy() {}, checkpoint };
+      await restored.checkpointPrivateWorkspace();
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+      expect(saved.entries).toEqual(resumed.getEntries());
+      expect(saved.activeLeafId).toBe(followup);
+      const files = checkpoint.mock.calls[0][0] as Map<string, Buffer>;
+      expect(JSON.parse(files.get(`sessions/${first.childSessionId}/.pi-session.json`)!.toString())).toEqual(saved);
+      expect(restored.subagentRuns.size).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(["missing", "corrupt", "oversized", "wrong-owner", "empty"])("rejects a %s private child snapshot without falling back to JSONL", async (kind) => {
+    const { first, file } = await privateChildFixture();
+    const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (kind === "missing") fs.rmSync(file);
+    if (kind === "corrupt") fs.writeFileSync(file, "{broken");
+    if (kind === "oversized") fs.truncateSync(file, 64 * 1024 * 1024 + 1);
+    if (kind === "wrong-owner") fs.writeFileSync(file, JSON.stringify({ ...snapshot, sessionId: "other-child" }));
+    if (kind === "empty") fs.writeFileSync(file, JSON.stringify({ ...snapshot, entries: [], activeLeafId: null }));
+    const restored = new AgentBoxSessionManager() as any;
+    const calls = (globalThis as any).__createSessionCalls.length;
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    try {
+      await expect(restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle }))).rejects.toThrow(/private transcript/);
+      expect((globalThis as any).__createSessionCalls).toHaveLength(calls);
+      expect(restored.piManagers.size).toBe(0);
+      expect(restored.subagentRuns.size).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("queues a running child's guidance without starting another child or background job", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let finish!: () => void;
