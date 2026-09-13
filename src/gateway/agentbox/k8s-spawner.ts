@@ -135,16 +135,10 @@ export function clampRequestToLimit(request: string, limit: string, podName: str
  *   t+59s   30th probe fails → kubelet: "Container agentbox failed startup probe", KillPod
  *   t+119s  termination grace elapses → SIGKILL → exitCode 137, phase Failed
  *
- * The box was not slow at anything it logs — measured from its own first line to `listen()`
- * is 0.4s. The time went to the entrypoint's `chown -R` over the NFS-backed user-data
- * subPath, which runs before node starts, is silent, and grows with the agent's accumulated
- * session history. **That is the root cause and it is NOT fixed here** — this number only
- * stops a slow start from being a permanent one.
- *
- * Which is also why the margin is wide rather than merely sufficient: the span this window
- * has to cover includes pre-node work that no code here can see or time, and it grows on its
- * own. Nobody connects "the agent accumulated more state" to "pods stopped starting", and
- * being one second short costs a pod that never runs again.
+ * That incident was caused by recursive chown of the former NFS user-data mount,
+ * before Node could emit logs. Remote workspaces removed that mount and traversal.
+ * Keep a margin for the remaining permission initialization and configuration sync;
+ * the application cannot time work that precedes its own startup.
  *
  * Named constants rather than literals at the call site because two other timeouts are
  * defined RELATIVE to this window — the Runtime's readiness wait above it and the box's own
@@ -499,7 +493,7 @@ export class K8sSpawner implements BoxSpawner {
       // agentIds can map to one pod name ("a.b" and "a-b" both become "a-b"), and the
       // instance suffix adds the pair X / X-<n> ("foo" instance 1 and agent "foo-1"
       // instance 0 are both agentbox-foo-1). Reusing another agent's pod would serve this
-      // agent's sessions from a box holding the OTHER agent's certificate and PVC subPath.
+      // agent's sessions from a box holding the OTHER agent's certificate and local state.
       //
       // Fail loudly instead. Deleting it would be worse — that is someone else's live box.
       // The caller treats a failed instance as unavailable and moves on to another index.
@@ -974,7 +968,7 @@ export class K8sSpawner implements BoxSpawner {
    * and then passed its probe in 40s is healthy and Ready at t=70s, yet the runtime had
    * already declared the spawn failed at t=60s — which is exactly what the pool-fill
    * storm was made of: several boxes of one agent cold-starting together contend for the
-   * node and the shared PVC, every one of them is reported failed, and every failure feeds
+   * node and image downloads, every one of them is reported failed, and every failure feeds
    * another fill attempt.
    *
    * Raising this does NOT hide a broken pod: a genuinely failed one leaves through the

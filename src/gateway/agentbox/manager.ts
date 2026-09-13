@@ -324,16 +324,10 @@ export class AgentBoxManager {
   }
 
   /**
-   * Inject a resolver for the per-agent PVC persistence mode. Same contract as
-   * setSpawnEnvResolver: consulted on EVERY cold spawn (from any entry point —
-   * chat RPCs, channel webhooks, cron tasks, abort/steer) and NEVER on warm
-   * reuse. This is what makes persistence a true agent-level property: the
-   * value is resolved by agentId, independent of which entry point first
-   * cold-spawns the (one-per-agent) pod. Without it, only entry points that
-   * happened to pass `config.persistence` would honour it, so a pod cold-spawned
-   * by e.g. a Lark message would silently fall to the global default and ignore
-   * the agent's configured mode. Returns undefined to fall back to the global
-   * config (the spawner gates the actual mount on a claimName regardless).
+   * Resolve legacy per-agent durability requests on cold spawns from every
+   * entry point. K8s rejects true without a private workspace, preventing a
+   * stale setting from silently becoming ephemeral. Remote sessions use the
+   * authenticated space resolver instead and bypass this legacy setting.
    */
   setPersistenceResolver(fn: (agentId: string) => Promise<boolean | undefined>): void {
     this.persistenceResolver = fn;
@@ -395,17 +389,10 @@ export class AgentBoxManager {
   /**
    * Get a running AgentBox for the agent, or spawn one.
    *
-   * Per-agent config — the injected `spawnEnvResolver` (env, e.g. idle timeout)
-   * and `persistenceResolver` (PVC mode) — is resolved ONLY on a cold spawn,
-   * never on warm-pod reuse, so the chat hot path and channel/cron paths pay no
-   * RPC when the pod already exists.
-   *
-   * Because a pod is keyed by agentId, the persistence/env mode is resolved on
-   * each cold spawn (including a cert-stale recreate) from the agent-level
-   * resolver — NOT from whichever entry point happens to call first. The volume
-   * mount is fixed at pod creation (K8s cannot hot-change a running pod's
-   * mounts), so a configuration change applies on the agent's next cold spawn
-   * (after restart/idle-release), not immediately on a warm pod.
+   * Spawn environment and legacy durability requests are resolved on cold
+   * spawns; changing them does not reconfigure an existing pod. Remote mode
+   * resolves authoritative ownership on every acquisition, including warm
+   * reuse, and keys pods by agent, private space and session.
    */
   async getOrCreate(
     agentId: string,
@@ -529,8 +516,7 @@ export class AgentBoxManager {
       const hasProfile = info.profile ?? "agent";
       if (hasProfile === wantProfile) {
         // Warm reuse: return the running pod without spawning. Per-agent config
-        // (env/persistence) is NOT re-resolved here — the pod's volume mount is
-        // already fixed, so a changed mode applies on the next cold spawn.
+        // (env/legacy durability request) is resolved on the next cold spawn.
         return { handle: { boxId: name, endpoint: info.endpoint, agentId }, created: false };
       }
       // Profile changed under the same identity — reusing the old-shaped pod would
@@ -1148,8 +1134,8 @@ export class AgentBoxManager {
     // ours to fill — and resolve it LAZILY rather than up front behind an `if`. Deciding
     // that no slot needs it, and then acting on that decision further down, would be
     // correct only as long as nothing awaits in between; that is invisible to anyone
-    // editing this later, and getting it wrong means spawning a pod with an empty env and a
-    // default persistence mode. Memoised, so concurrent slots share the one resolution.
+    // editing this later, and getting it wrong means spawning a pod with an empty env and
+    // dropping its legacy durability request. Concurrent slots share one resolution.
     let context: Promise<{ env: Record<string, string>; persistence: boolean | undefined }> | undefined;
     const spawnContext = () => (context ??= (async () => ({
       env: await this.resolveEnv(agentId, config?.env),
@@ -1626,11 +1612,11 @@ export class AgentBoxManager {
   }
 
   /**
-   * Resolve the per-agent PVC persistence mode for a cold spawn. An explicit
+   * Resolve a legacy durability request for a cold spawn. An explicit
    * `configValue` (e.g. task-coordinator passing `binding.persistence`) wins;
    * otherwise the injected `persistenceResolver` is consulted by agentId. Either
-   * may be undefined → the spawner falls back to its global config. Only called
-   * on a cold spawn, so warm-pod reuse pays no RPC.
+   * may be undefined. K8s rejects true without a private workspace; this no
+   * longer selects a PVC or falls back to a global persistence configuration.
    */
   private async resolvePersistence(agentId: string, configValue?: boolean): Promise<boolean | undefined> {
     if (configValue !== undefined) return configValue;
