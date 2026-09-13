@@ -33,7 +33,10 @@ function serve(text: string, stride = 7) {
   return fetch;
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 describe("supplied ticket context", () => {
   it("keeps records inside text and permits honest incomplete reviews", () => {
@@ -72,6 +75,8 @@ describe("strict API result consumer", () => {
   });
 
   it.each([
+    [encode("session", session) + 'data: {}\n\n', "RUN_UNEXPECTED_EVENT"],
+    [encode("session", session) + encode("message", {}), "RUN_UNEXPECTED_EVENT"],
     [encode("result", drafts[0]) + encode("done", {}), "RUN_RESULT_SEQUENCE"],
     [encode("session", session) + encode("done", {}), "RUN_RESULT_MISSING"],
     [encode("session", session) + encode("result", drafts[0]), "RUN_INTERRUPTED"],
@@ -84,6 +89,23 @@ describe("strict API result consumer", () => {
   ])("rejects a failed or invalid result: %s", async (wire, code) => {
     serve(wire);
     await expect(runTicketReview(options(), contextFor())).rejects.toMatchObject({ code });
+  });
+
+  it.each(["sync", "async"])("isolates %s observer failures while still validating terminal outcomes", async (mode) => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = new Error("synthetic observer details must not be logged");
+    const onChatEvent = vi.fn(mode === "sync"
+      ? () => { throw error; }
+      : () => Promise.reject(error));
+    const prefix = encode("session", session) + encode("chat.event", { type: "text", text: "Progress" });
+
+    serve(prefix + encode("result", drafts[0]) + encode("done", {}));
+    await expect(runTicketReview({ ...options(), onChatEvent }, contextFor())).resolves.toEqual({ ...session, result: drafts[0] });
+    expect(warning).toHaveBeenCalledExactlyOnceWith("[support-review] onChatEvent failed; continuing run validation.");
+
+    serve(prefix + encode("result", drafts[0]) + encode("error", { code: "RUN_FAILED", retriable: true }));
+    await expect(runTicketReview({ ...options(), onChatEvent }, contextFor())).rejects.toMatchObject({ code: "RUN_FAILED", retriable: true });
+    expect(onChatEvent).toHaveBeenCalledTimes(2);
   });
 
   it("checks resumed session identity and rejects oversized frames", async () => {
