@@ -107,6 +107,29 @@ const sessionsActive = new Gauge({
   registers: [metricsRegistry],
 });
 
+/**
+ * UPPER BOUND on measurements that failed to reach the Runtime.
+ *
+ * An upper bound, not a count of losses: the box gives up on a batch when its
+ * budget runs out, but an abandoned request can still land afterwards — and
+ * because the receiver is idempotent on `call_id`, it lands correctly. So this
+ * counts "we stopped waiting", which is a superset of "it was lost".
+ *
+ * Worth exporting anyway: without it an under-collected day is indistinguishable
+ * from a cheap one, and a coverage report built on `llm_calls` alone would state
+ * a total it cannot vouch for. Read it as "up to N measurements may be missing".
+ */
+const meteringUnconfirmedTotal = new Counter({
+  name: "siclaw_metering_unconfirmed_total",
+  help: "Upper bound on LLM-call measurements not confirmed delivered (queue overflow, exhausted retries, close deadline); an abandoned send may still have landed",
+  registers: [metricsRegistry],
+});
+
+/** Record measurements whose delivery was never confirmed. */
+export function recordMeteringLoss(count: number): void {
+  if (count > 0) meteringUnconfirmedTotal.inc(count);
+}
+
 const toolCallsTotal = new Counter({
   name: "siclaw_tool_calls_total",
   help: "Total tool invocations",

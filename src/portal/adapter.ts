@@ -9,6 +9,9 @@ import { sandboxResolveHandler } from "./script-sandbox.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import { getDb, type Db } from "../gateway/db.js";
+import { persistLlmCallMeasurements } from "./llm-call-repo.js";
+import { resolveAttributionFromDb } from "../gateway/llm-call-api.js";
+import type { LlmCallMeasurement } from "../shared/llm-call-record.js";
 import { buildUpsert, insertIgnorePrefix, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
 // Shared with the gateway so both layers normalize the admission tier identically — a drift here
 // means the runtime treats a bot as open while this adapter refuses to bind it.
@@ -2885,6 +2888,29 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("chat.recordFeedback", async (params) => {
     const db = getDb();
     return recordMessageFeedback(db, params);
+  });
+
+  /**
+   * Persist LLM-call measurements.
+   *
+   * Lives here because the DATABASE lives here: a standalone Runtime never
+   * initialises one and reaches persistence through this RPC. A handler that
+   * called `getDb()` on the Runtime side worked only in the single-process
+   * local mode, where Portal had already booted — and returned 500 anywhere else.
+   *
+   * Attribution is resolved here too, for the same reason: it needs the session
+   * row. Idempotent on `call_id`, so a redelivery is a no-op.
+   */
+  handlers.set("llmCall.persist", async (params) => {
+    const db = getDb();
+    const { session_id: sessionId, measurements } = params as {
+      session_id: string;
+      measurements: LlmCallMeasurement[];
+    };
+    const attribution = await resolveAttributionFromDb(db, sessionId);
+    if (!attribution) return { ok: false, error: "unknown session" };
+    const result = await persistLlmCallMeasurements(db, { session_id: sessionId, ...attribution }, measurements);
+    return { ok: true, ...result };
   });
 
   /**

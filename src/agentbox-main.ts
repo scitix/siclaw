@@ -159,6 +159,23 @@ async function main() {
     }
     await debugPodCache.evictAll();
     await sessionManager.closeAll();
+    // Second, SMALL flush after closeAll: metering teardown increments its
+    // counter inside closeAll, i.e. after the flush above — so a delivery gap
+    // discovered during shutdown reached the local registry but never the
+    // federation, which is precisely when it matters most. closeAll is already
+    // time-bounded per session, so this adds one bounded request, not a stall.
+    if (federationFlushEnabled) {
+      try {
+        const client = new GatewayClient({ gatewayUrl: config.server.gatewayUrl });
+        await client.sendMetricsFlush({
+          incarnation: processIncarnation,
+          prom: await getMetricsAsJSON(),
+          ...(process.env.SICLAW_POD_NAME ? { boxId: process.env.SICLAW_POD_NAME } : {}),
+        });
+      } catch (err) {
+        console.warn("[agentbox] Post-teardown metrics flush failed (continuing shutdown):", err);
+      }
+    }
     server.close();
     // Flush + shut down tracing last (forceFlush is capped at 3s internally so a
     // dead in-network backend cannot stall SIGTERM past the K8s grace period).

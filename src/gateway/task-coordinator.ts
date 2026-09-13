@@ -305,6 +305,12 @@ export class TaskCoordinator {
           text: prompt,
           mode: "task",
           agentId,
+          // A scheduled run IS the request here, and `runId` already names it —
+          // using it means a metered call joins the run row an operator is
+          // already looking at, instead of a second id minted beside it. Empty
+          // when the run row could not be reserved: then there is no stable id
+          // to carry, and sending none is honest.
+          turnId: runId || undefined,
           modelProvider: binding.modelProvider,
           modelId: binding.modelId,
           releaseId: binding.releaseId,

@@ -3706,6 +3706,31 @@ describe("handleLarkMessage — streaming card flow", () => {
     const last = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content ?? "";
     expect(last).toContain("\u7ED3\u8BBA\u597D\u4E86");
     expect(last).not.toContain("409");
+
+    // One inbound message is ONE turn, even when it was queued behind a busy
+    // session first. A fresh id per attempt would split one request's metering
+    // across two correlations \u2014 which is why the id is minted at the entry and
+    // not inside the client.
+    const turnIds = promptMock.mock.calls.map((c: any[]) => c[0]?.turnId);
+    expect(turnIds[0]).toBeTruthy();
+    expect(turnIds[1]).toBe(turnIds[0]);
+  });
+
+  it("gives each inbound message its own turn id, so two requests do not merge", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-1" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("\u4E00"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+    await handleLarkMessage(makeTextEvent("\u4E8C"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const turnIds = promptMock.mock.calls.map((c: any[]) => c[0]?.turnId);
+    expect(turnIds).toHaveLength(2);
+    expect(turnIds[0]).toBeTruthy();
+    expect(turnIds[1]).not.toBe(turnIds[0]);
   });
 
   it("shows a friendly busy notice when 409 persists past the retry window", async () => {

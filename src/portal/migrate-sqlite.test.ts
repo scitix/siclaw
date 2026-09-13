@@ -76,6 +76,10 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_chat_sessions_parent",
       "idx_chat_sessions_delegation",
       "idx_chat_messages_session",
+      // Token metering: per-request cost, per-model spend, per-user consumption.
+      "idx_llm_calls_session",
+      "idx_llm_calls_model",
+      "idx_llm_calls_user",
       "idx_chat_messages_session_seq",
       "idx_chat_messages_audit",
       "idx_chat_messages_parent",

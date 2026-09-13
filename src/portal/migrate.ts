@@ -334,6 +334,54 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     deleted_at TIMESTAMP NULL DEFAULT NULL
   )`,
 
+  // One row per model call. `call_id` is the PRIMARY KEY, which is what makes a
+  // redelivered batch idempotent: the sender holds no "already sent" state, so
+  // dedup has to live here.
+  //
+  // Token columns are NULLable on purpose — NULL means "the provider did not
+  // report this", which is a different fact from a reported 0. A NOT NULL
+  // DEFAULT 0 here would erase that distinction at the last possible moment.
+  //
+  // No JSON columns (SQLite compatibility); `request_snapshot` is TEXT holding
+  // serialized JSON, and `cost_micros` stays NULL until prices are verified.
+  `CREATE TABLE IF NOT EXISTS llm_calls (
+    call_id VARCHAR(64) PRIMARY KEY,
+    session_id CHAR(36) NOT NULL,
+    prompt_id VARCHAR(64) NOT NULL,
+    root_request_id VARCHAR(64) DEFAULT NULL,
+    parent_call_id VARCHAR(64) DEFAULT NULL,
+    org_id CHAR(36) DEFAULT NULL,
+    user_id CHAR(36) DEFAULT NULL,
+    agent_id CHAR(36) DEFAULT NULL,
+    agent_type VARCHAR(64) DEFAULT NULL,
+    session_origin VARCHAR(32) DEFAULT NULL,
+    workload VARCHAR(32) NOT NULL DEFAULT 'unattributed',
+    kind VARCHAR(16) NOT NULL,
+    round INT NOT NULL DEFAULT 0,
+    attempt INT NOT NULL DEFAULT 1,
+    network_attempts INT NOT NULL DEFAULT 0,
+    provider VARCHAR(128) NOT NULL DEFAULT '',
+    model_id VARCHAR(128) NOT NULL DEFAULT '',
+    api_type VARCHAR(50) NOT NULL DEFAULT '',
+    usage_status VARCHAR(16) NOT NULL,
+    usage_source VARCHAR(16) NOT NULL,
+    reported_fields VARCHAR(255) NOT NULL DEFAULT '',
+    input_tokens_total BIGINT DEFAULT NULL,
+    output_tokens_total BIGINT DEFAULT NULL,
+    reasoning_tokens BIGINT DEFAULT NULL,
+    cache_read_tokens BIGINT DEFAULT NULL,
+    cache_write_tokens BIGINT DEFAULT NULL,
+    payload_bytes BIGINT DEFAULT NULL,
+    payload_tokens_estimated BIGINT DEFAULT NULL,
+    cost_micros BIGINT DEFAULT NULL,
+    request_snapshot TEXT,
+    inconsistencies TEXT,
+    request_at VARCHAR(40) NOT NULL,
+    response_end_at VARCHAR(40) NOT NULL,
+    since_prev_ms BIGINT DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
   `CREATE TABLE IF NOT EXISTS chat_messages (
     id CHAR(36) PRIMARY KEY,
     session_id CHAR(36) NOT NULL,
@@ -578,6 +626,11 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_delegation", "delegation_id");
   // chat_messages
   await ensureIndex(db, "chat_messages", "idx_chat_messages_session", "session_id, created_at");
+  // The three questions this table exists to answer: what did one request cost,
+  // what does a provider/model cost over time, and what does a user consume.
+  await ensureIndex(db, "llm_calls", "idx_llm_calls_session", "session_id, created_at");
+  await ensureIndex(db, "llm_calls", "idx_llm_calls_model", "provider, model_id, created_at");
+  await ensureIndex(db, "llm_calls", "idx_llm_calls_user", "user_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");

@@ -82,13 +82,34 @@ vi.mock("../core/agent-factory.js", async () => {
       getContextUsage: () => null,
       getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 }),
       registerProvider: behavior.registerProvider ?? (() => {}),
+      // Enough of the metering boundary to observe what a spawn hands its child.
+      // Kept stateful rather than a spy: the claim under test is that the value a
+      // call is recorded under is the one bound when it opened.
+      llmCalls: (() => {
+        let rootRequestId: string | null = null;
+        let parentCallId: string | null = null;
+        let toolDispatchCallId: string | null = null;
+        return {
+          setRootRequestId(id: string | null | undefined) { rootRequestId = id || null; },
+          getRootRequestId() { return rootRequestId; },
+          setParentCallId(id: string | null | undefined) { parentCallId = id || null; },
+          getParentCallId() { return parentCallId; },
+          getToolDispatchCallId() { return toolDispatchCallId; },
+          /** Test-only: stand in for "a round just sealed". */
+          __setToolDispatchCallId(id: string | null) { toolDispatchCallId = id; },
+          beginPrompt() {}, endPrompt() {}, beginAttempt() {}, rollbackAttempt() {},
+        };
+      })(),
     };
   }
   return {
     createSiclawSession: async (opts: any) => {
       g.__createSessionCalls.push(opts);
+      const brain = createFakeBrain();
+      g.__createdBrains = g.__createdBrains ?? [];
+      g.__createdBrains.push(brain);
       return {
-        brain: createFakeBrain(),
+        brain,
         session: { sessionId: "fake-session" },
         sessionIdRef: { current: "" },
         kubeconfigRef: opts.kubeconfigRef,
@@ -1329,6 +1350,67 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
       expect(call[1]?.childSessionId).toMatch(/^[0-9a-f-]{36}$/);
     }
     expect(new Set(runSpy.mock.calls.map((call: any[]) => call[1]?.childSessionId)).size).toBe(4);
+  });
+
+  it("threads the parent's request correlation to every child, snapshotted once at dispatch", async () => {
+    // A sub-agent's spend is the parent request's spend — that is the gap this
+    // metering work exists to close. Captured at dispatch for the same reason the
+    // trace ids are: a background child can start after the parent turn is over.
+    const mgr = new AgentBoxSessionManager() as any;
+    const parent = await mgr.getOrCreate("p1", "web");
+    parent.brain.llmCalls.setRootRequestId("turn-parent");
+    parent.brain.llmCalls.__setToolDispatchCallId("call-round-2");
+    const runSpy = vi.spyOn(mgr, "runSpawnedSubagent").mockImplementation(async (_request: any, opts: any) => {
+      // The parent moving on mid-batch must not reach a child already dispatched.
+      parent.brain.llmCalls.setRootRequestId("turn-later");
+      parent.brain.llmCalls.__setToolDispatchCallId("call-round-3");
+      return { status: "done", summary: "ok", childSessionId: opts.childSessionId, toolCalls: 0, durationMs: 1 };
+    });
+
+    await mgr.createSpawnSubagentExecutor()(baseReq({ reducePrompt: "Summarize" }), undefined, undefined);
+
+    expect(runSpy).toHaveBeenCalledTimes(4); // 3 map + 1 reduce
+    for (const call of runSpy.mock.calls) {
+      expect(call[1]?.rootRequestId).toBe("turn-parent");
+      // Which request they share, and which call dispatched them, are separate
+      // facts — a shared root alone cannot name the dispatcher.
+      expect(call[1]?.parentCallId).toBe("call-round-2");
+    }
+    await mgr.closeAll();
+  });
+
+  it("records null when the parent bound no request, rather than inventing one for the child", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    await mgr.getOrCreate("p1", "web");
+    const runSpy = vi.spyOn(mgr, "runSpawnedSubagent").mockImplementation(async (_r: any, opts: any) => ({
+      status: "done", summary: "ok", childSessionId: opts.childSessionId, toolCalls: 0, durationMs: 1,
+    }));
+
+    await mgr.createSpawnSubagentExecutor()(baseReq({ renderedTasks: [{ item: "pod-a", prompt: "Check pod-a" }] }), undefined, undefined);
+
+    expect(runSpy.mock.calls[0][1]?.rootRequestId).toBeNull();
+    await mgr.closeAll();
+  });
+
+  it("the child adopts the inherited correlation, so its own calls bill to the parent request", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const parent = await mgr.getOrCreate("p1", "web");
+    parent.brain.llmCalls.setRootRequestId("turn-parent");
+    parent.brain.llmCalls.__setToolDispatchCallId("call-round-7");
+    pushPromptDrivenBrains(1);
+    const before = ((globalThis as any).__createdBrains ?? []).length;
+
+    await mgr.createSpawnSubagentExecutor()(
+      baseReq({ renderedTasks: [{ item: "pod-a", prompt: "Check pod-a" }] }),
+      undefined,
+      undefined,
+    );
+
+    const childBrains = ((globalThis as any).__createdBrains ?? []).slice(before);
+    expect(childBrains).toHaveLength(1);
+    expect(childBrains[0].llmCalls.getRootRequestId()).toBe("turn-parent");
+    expect(childBrains[0].llmCalls.getParentCallId()).toBe("call-round-7");
+    await mgr.closeAll();
   });
 
   it("does not expose the reduce session until its execution slot is acquired", async () => {

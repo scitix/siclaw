@@ -593,3 +593,86 @@ export function useChannelSenders(
 
   return { senders, loading }
 }
+
+// ── Token usage (the llm_calls fact table) ───────────────
+//
+// Separate from useSummary on purpose: that one reads message metadata, which
+// never covered sub-agent calls. These figures come from the per-call fact
+// table, so they include spend Portal previously could not see at all.
+
+/** A sum, plus how many calls actually reported the field it sums. */
+export interface TokenFieldTotals {
+  /** null = no call in this group reported the field. NOT the same as 0. */
+  total: number | null
+  reportedCalls: number
+}
+
+export interface UsageGroup {
+  provider: string
+  modelId: string
+  apiType: string
+  calls: number
+  input: TokenFieldTotals
+  output: TokenFieldTotals
+  reasoning: TokenFieldTotals
+  cacheRead: TokenFieldTotals
+  cacheWrite: TokenFieldTotals
+  /** Charged tokens, computed per protocol; null when not computable. */
+  billable: number | null
+}
+
+export interface UsageActor {
+  kind: "user" | "channel"
+  id: string
+  calls: number
+  input: TokenFieldTotals
+  output: TokenFieldTotals
+  cacheRead: TokenFieldTotals
+  cacheWrite: TokenFieldTotals
+  billable: number | null
+  /** This actor's calls span protocols that bill cache differently. */
+  mixedProtocols: boolean
+}
+
+export type UsageSortKey = "billable" | "input" | "output" | "cacheRead" | "cacheWrite" | "calls"
+
+export interface TokenUsageData {
+  from: string
+  to: string
+  sort: UsageSortKey
+  models: UsageGroup[]
+  actors: UsageActor[] | null
+  /** How much of the window these figures actually cover. */
+  coverage: { trustworthy: number; excluded: number }
+}
+
+/**
+ * Sorting is a SERVER round-trip, never a client-side re-sort.
+ *
+ * The result is capped, so re-ordering the returned page would rank the wrong
+ * rows: the top 50 by total tokens is not the set containing the top 50 by
+ * cache write.
+ */
+export function useTokenUsage(
+  range: TimeRange,
+  sort: UsageSortKey = "billable",
+): { data: TokenUsageData | null; loading: boolean; refresh: () => void } {
+  const [data, setData] = useState<TokenUsageData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const paramsRef = useRef({ range, sort })
+  paramsRef.current = { range, sort }
+
+  const fetchOnce = useCallback(() => {
+    setLoading(true)
+    const { range: r, sort: s } = paramsRef.current
+    const { fromMs, toMs } = resolveRange(r)
+    const q = new URLSearchParams({ from: String(fromMs), to: String(toMs), sort: s })
+    return api<TokenUsageData>(`/siclaw/metrics/token-usage?${q.toString()}`)
+      .then((d) => { setData(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { fetchOnce() }, [range.from, range.to, sort, fetchOnce])
+
+  return { data, loading, refresh: fetchOnce }
+}

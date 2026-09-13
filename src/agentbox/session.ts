@@ -109,6 +109,8 @@ import {
   type TierSelectionSource,
 } from "../core/subagent-models.js";
 import type { GatewayClient } from "./gateway-client.js";
+import { LlmCallMeasurementDispatcher } from "./llm-call-dispatcher.js";
+import { recordMeteringLoss } from "../shared/metrics.js";
 import { extractToolResultId } from "../core/message-utils.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -117,7 +119,26 @@ import { extractToolResultId } from "../core/message-utils.js";
  * `mainTraceId` stamps chat_messages.trace_id (DB audit); `spawnSpanContext` nests the child
  * ROOT under the parent's spawn_subagent tool span (Langfuse). Both undefined when tracing is off.
  */
-type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanContext };
+/**
+ * What a spawn captures from its parent AT DISPATCH, while the parent turn is
+ * still live.
+ *
+ * Trace ids and the metering correlation are captured together because they
+ * share one hazard: a background child can start after its parent's prompt has
+ * ended, so anything re-read later resolves against a turn that is over.
+ */
+type SubagentDispatchContext = {
+  mainTraceId?: string;
+  spawnSpanContext?: SpanContext;
+  /** The user request this whole spawn serves; children inherit it verbatim. */
+  rootRequestId?: string | null;
+  /**
+   * The parent's LLM call that issued this spawn. Tells "which model call
+   * dispatched this child" apart from "which request they both belong to" —
+   * `rootRequestId` alone can only answer the second.
+   */
+  parentCallId?: string | null;
+};
 
 export interface ManagedSession {
   id: string;
@@ -396,6 +417,69 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
+  /**
+   * Metering dispatchers, one per session id (main and sub-agent alike).
+   *
+   * Held here so release can flush the tail: the last calls of a turn settle
+   * after the stream ends, and a dispatcher dropped on the floor takes exactly
+   * the measurements that describe how the turn finished.
+   */
+  private _measurementDispatchers = new Map<string, LlmCallMeasurementDispatcher>();
+  /** Bounded "wait for outstanding measurements" per session; see finishMetering. */
+  private _measurementSettlers = new Map<string, () => Promise<void>>();
+  /** In-flight metering teardown per session, so concurrent callers share it. */
+  private _meteringFinish = new Map<string, Promise<void>>();
+
+  /**
+   * Close out metering for one session, in the only order that works:
+   * wait for the recorder to hand over what is still in flight, THEN drain the
+   * delivery queue.
+   *
+   * Reversing it loses the tail. A turn's last calls settle after its stream has
+   * ended — the observation branch is still reading a teed body — so draining
+   * first empties a queue those measurements have not reached yet.
+   *
+   * Every teardown path must call this: release, close, closeAll and sub-agent
+   * completion alike. A path that skips it both loses the data and leaks a map
+   * entry per session.
+   */
+  private finishMetering(sessionId: string): Promise<void> {
+    // Concurrent callers SHARE one completion, they do not race it. Deleting the
+    // settler up front and letting a second caller skip straight to closing the
+    // dispatcher is how release + closeAll together lost the tail: the second
+    // call found no settler, waited for nothing, and closed the queue before the
+    // first call's measurements had been handed over.
+    const existing = this._meteringFinish.get(sessionId);
+    if (existing) return existing;
+
+    const task = (async () => {
+      const settle = this._measurementSettlers.get(sessionId);
+      if (settle) await settle().catch(() => {});
+      const dispatcher = this._measurementDispatchers.get(sessionId);
+      if (dispatcher) {
+        await dispatcher.close().catch(() => {});
+        // Report the delivery gap before the dispatcher is dropped. Without
+        // this the only record of a loss dies with the object: 1,024 produced
+        // and 512 delivered looked exactly like 512 produced, so a coverage
+        // report could not tell under-collection from reduced spend.
+        const stats = dispatcher.stats();
+        if (stats.dropped > 0) {
+          console.warn(
+            `[agentbox-session] metering gap for ${sessionId}: delivered=${stats.delivered} ` +
+            `dropped=${stats.dropped} failedBatches=${stats.failedBatches}`,
+          );
+          recordMeteringLoss(stats.dropped);
+        }
+      }
+      // Removed only once the work is done, so a late caller still joins the
+      // in-flight completion rather than starting a second, shorter one.
+      this._measurementSettlers.delete(sessionId);
+      this._measurementDispatchers.delete(sessionId);
+    })();
+    this._meteringFinish.set(sessionId, task);
+    void task.finally(() => { this._meteringFinish.delete(sessionId); });
+    return task;
+  }
   // Retain the launching request owner until notification, even if Stop/handoff
   // replaces the session's current request before a late child/process exit.
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
@@ -1041,9 +1125,23 @@ export class AgentBoxSessionManager {
       // ensureToolSpan resolves the ONE spawn_subagent tool span; every child (collapse / map /
       // reduce) nests under it (spawnSpanContext) and shares the DB trace_id (mainTraceId).
       // ⚠️ Never re-capture per child with a derived `${groupId}#i` id — that mints phantom spans.
-      const traceCtx = {
+      const dispatchCtx: SubagentDispatchContext = {
         mainTraceId: tracingRecorder.getRootTraceId(request.parentSessionId),
         spawnSpanContext: tracingRecorder.ensureToolSpan(request.parentSessionId, request.spawnId, "spawn_subagent"),
+        // Captured here for the same reason as the trace ids: a background child
+        // can start after the parent's prompt has ended, and the parent session
+        // may not even be resident by then. Null when the parent never set one
+        // (an older caller) — never a value invented for the child.
+        // Every hop optional on purpose: reading a correlation must never be able
+        // to break a spawn, and a brain without a recorder is an ordinary state
+        // (metering off, or a session built by a harness).
+        rootRequestId:
+          this.sessions.get(request.parentSessionId)?.brain?.llmCalls?.getRootRequestId() ?? null,
+        // The round now executing its tools IS the dispatcher. Read here, before
+        // any await, for the same reason as everything else in this snapshot:
+        // the parent's next round would overwrite it.
+        parentCallId:
+          this.sessions.get(request.parentSessionId)?.brain?.llmCalls?.getToolDispatchCallId() ?? null,
       };
 
       // Tier plan captured ONCE, here, for the same reason the trace context is:
@@ -1071,7 +1169,7 @@ export class AgentBoxSessionManager {
           spawnId: request.spawnId,
           tierPlan,
         };
-        if (childReq.runInBackground) return this.startBackgroundSubagent(childReq, traceCtx);
+        if (childReq.runInBackground) return this.startBackgroundSubagent(childReq, dispatchCtx);
         // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
         // acquire a slot or spin up a throwaway child session — short-circuit cleanly.
         if (signal?.aborted) {
@@ -1108,7 +1206,7 @@ export class AgentBoxSessionManager {
           // Flip a previously-queued card to "running" immediately on slot acquisition,
           // before the child's first tool call emits progress (avoids a stale "Queued").
           onProgress?.({ status: "running", toolCalls: 0, steps: [] });
-          return this.runSpawnedSubagent(childReq, { ...traceCtx }, onProgress, signal);
+          return this.runSpawnedSubagent(childReq, { ...dispatchCtx }, onProgress, signal);
         }));
       }
 
@@ -1121,7 +1219,7 @@ export class AgentBoxSessionManager {
       const plannedRequest: SpawnSubagentGroupRequest = { ...request, tierPlan };
 
       if (plannedRequest.runInBackground) {
-        return this.startBackgroundSubagentGroup(plannedRequest, traceCtx);
+        return this.startBackgroundSubagentGroup(plannedRequest, dispatchCtx);
       }
       // Already aborted before we queue anything (whole turn cancelled): short-circuit
       // without creating any child session — every item is skipped.
@@ -1144,7 +1242,7 @@ export class AgentBoxSessionManager {
       // separate throttled group_progress emitter instead.
       const throttled = onProgress ? throttleTrailing(onProgress, GROUP_PROGRESS_THROTTLE_MS) : undefined;
       try {
-        return await this.runSubagentGroup(plannedRequest, throttled?.call, signal, traceCtx);
+        return await this.runSubagentGroup(plannedRequest, throttled?.call, signal, dispatchCtx);
       } finally {
         throttled?.cancel();
       }
@@ -1174,7 +1272,7 @@ export class AgentBoxSessionManager {
     request: SpawnSubagentGroupRequest,
     onProgress?: (progress: SubagentGroupProgress) => void,
     signal?: AbortSignal,
-    traceCtx?: SubagentTraceContext,
+    dispatchCtx?: SubagentDispatchContext,
   ): Promise<SubagentGroupReport> {
     const startedAt = Date.now();
     const groupId = request.spawnId;
@@ -1286,7 +1384,7 @@ export class AgentBoxSessionManager {
           emit("map");
           return this.runSpawnedSubagent(
             childReq,
-            { ...traceCtx, childSessionId },
+            { ...dispatchCtx, childSessionId },
             (progress) => {
               const activity = progress.activity?.trim();
               if (!activity || activity === state.activity) return;
@@ -1409,7 +1507,7 @@ export class AgentBoxSessionManager {
             emit("reduce");
             return this.runSpawnedSubagent(
               reduceReq,
-              { ...traceCtx, childSessionId: reduceChildSessionId },
+              { ...dispatchCtx, childSessionId: reduceChildSessionId },
               undefined,
               userAbort.signal,
             );
@@ -1497,7 +1595,7 @@ export class AgentBoxSessionManager {
         ...(r.tierOutcome ? { tier: persistableTierOutcome(r.tierOutcome) } : {}),
       })),
       durationMs,
-      traceId: traceCtx?.mainTraceId,
+      traceId: dispatchCtx?.mainTraceId,
     });
 
     return {
@@ -1555,7 +1653,7 @@ export class AgentBoxSessionManager {
    * (reusing type "subagent" + isGroup), returns "launched" immediately, and notifies the
    * parent on completion. Background work blocks session release until it finishes.
    */
-  private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest, traceCtx?: SubagentTraceContext): SubagentGroupResult {
+  private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest, dispatchCtx?: SubagentDispatchContext): SubagentGroupResult {
     this.registerBackgroundWork(request.parentSessionId, request.spawnId);
     const jobId = request.spawnId;
     const controller = new AbortController();
@@ -1587,7 +1685,7 @@ export class AgentBoxSessionManager {
         summaryTruncated: false,
         itemStatuses: request.renderedTasks.map((_, i) => ({ index: i, status: "skipped" as GroupItemStatus })),
         durationMs: 0,
-        traceId: traceCtx?.mainTraceId,
+        traceId: dispatchCtx?.mainTraceId,
       });
       void this.notifyParent(request.parentSessionId, jobId, {
         taskId: jobId,
@@ -1627,7 +1725,7 @@ export class AgentBoxSessionManager {
     // (unknown event type ignored) and no-ops when persistence isn't wired (gatewayClient absent).
     const onProgress = this.makeGroupProgressEmitter(request.parentSessionId, jobId);
 
-    void this.runSubagentGroup(request, onProgress.emit, controller.signal, traceCtx)
+    void this.runSubagentGroup(request, onProgress.emit, controller.signal, dispatchCtx)
       .then(async (report) => {
         await this.persistSubagentJobOutput(jobId, JSON.stringify(report));
         onProgress.settle();
@@ -1901,7 +1999,7 @@ export class AgentBoxSessionManager {
    * "launched"; on completion notifyParent injects a <task_notification> into the
    * parent model. Background work blocks session release until it finishes.
    */
-  private startBackgroundSubagent(request: SpawnSubagentRequest, traceCtx?: SubagentTraceContext): SpawnSubagentResult {
+  private startBackgroundSubagent(request: SpawnSubagentRequest, dispatchCtx?: SubagentDispatchContext): SpawnSubagentResult {
     this.registerBackgroundWork(request.parentSessionId, request.spawnId);
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
@@ -1954,7 +2052,7 @@ export class AgentBoxSessionManager {
               scope: request.prompt,
               toolCalls: 0,
               durationMs: 0,
-              traceId: traceCtx?.mainTraceId,
+              traceId: dispatchCtx?.mainTraceId,
             });
           } catch { /* best-effort */ }
         })();
@@ -1996,7 +2094,7 @@ export class AgentBoxSessionManager {
     // "launched" immediately; queueing delays the child's start, never the tool call.
     const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
     void sessionLim.run(() => this.podSubagentLimiter.run(() =>
-      this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })))
+      this.runSpawnedSubagent(request, { childSessionId, jobId, ...dispatchCtx })))
       .then(async (res) => {
         if (res.status !== "launched") await this.persistSubagentJobOutput(jobId, res.fullSummary ?? res.summary);
         const job = this.jobs.get(jobId);
@@ -2232,6 +2330,13 @@ export class AgentBoxSessionManager {
         managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
         let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
         let currentModelRouteMetadata: Record<string, unknown> | null = null;
+        // A synthetic turn belongs to NO user request, so it carries none. Two
+        // reasons this is not merely conservative: the recorder would otherwise
+        // keep whatever the last real prompt bound — a request that has since
+        // finished — and notifications COALESCE, so one turn can answer jobs from
+        // several different requests. Its spend stays attributed to the session,
+        // agent and user; it is simply not folded into one request.
+        managed.brain.llmCalls?.setRootRequestId(null);
         managed.brain.llmCalls?.beginPrompt(Date.now(), { explicit: true });
         const handleRouteEvent = (event: ModelRouteEvent): void => {
           if (event.type === "model_route_attempt" && event.status === "started") {
@@ -2665,7 +2770,7 @@ export class AgentBoxSessionManager {
    */
   private async runSpawnedSubagent(
     request: SpawnSubagentRequest,
-    opts?: { childSessionId?: string; jobId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
+    opts?: { childSessionId?: string; jobId?: string } & SubagentDispatchContext,
     onProgress?: (progress: SpawnSubagentProgress) => void,
     signal?: AbortSignal,
   ): Promise<SpawnSubagentResult> {
@@ -2704,7 +2809,22 @@ export class AgentBoxSessionManager {
      */
     const sharedMcpManager = this.sessions.get(request.parentSessionId)?.mcpManager;
 
+    // A sub-agent's calls are the parent request's spend, and they are the ones
+    // Portal never saw — metering them is the whole point of this work.
+    const childDispatcher = this.gatewayClient
+      ? new LlmCallMeasurementDispatcher({
+          sessionId: childSessionId,
+          send: (batch) => this.gatewayClient!.sendLlmCallMeasurements(batch),
+          warn: (message) => console.warn(message),
+        })
+      : undefined;
+    if (childDispatcher) this._measurementDispatchers.set(childSessionId, childDispatcher);
+
     const child = await createSiclawSession({
+      onLlmCallMeasurement: childDispatcher ? (m) => childDispatcher.record(m) : undefined,
+      onLlmCallSettler: childDispatcher
+        ? (settle) => this._measurementSettlers.set(childSessionId, settle)
+        : undefined,
       mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
       kubeconfigRef,
@@ -2733,6 +2853,11 @@ export class AgentBoxSessionManager {
       // never sees spawn_subagent (no recursion).
     });
     child.sessionIdRef.current = childSessionId;
+    // A sub-agent's spend belongs to the request that spawned it. Inherited from
+    // the dispatch snapshot rather than re-read from the parent, which may have
+    // finished its turn (or been released) before a background child starts.
+    child.brain?.llmCalls?.setRootRequestId(opts?.rootRequestId ?? null);
+    child.brain?.llmCalls?.setParentCallId(opts?.parentCallId ?? null);
 
     // ── Model selection: tier, or the parent's effective model ──────────────
     //
@@ -3033,6 +3158,10 @@ export class AgentBoxSessionManager {
     } finally {
       if (childTimer) clearTimeout(childTimer);
       unsubscribe();
+      // A child session ends here and nowhere else — it never reaches release()
+      // or close(). Without this its measurements are lost and its map entries
+      // accumulate for the life of the box.
+      await this.finishMetering(childSessionId);
       // Shut down only connections this child opened. A manager shared with the
       // parent outlives every child and is torn down with the parent session.
       if (child.mcpManager && child.mcpManager !== sharedMcpManager) {
@@ -3524,7 +3653,23 @@ export class AgentBoxSessionManager {
       : undefined;
 
     const scriptInfo = effectiveMode === "web" && !delegation && gc ? await gc.scriptSandboxInfo() : undefined;
+    // Metering rides the Runtime link: without a gateway there is nowhere to
+    // deliver, and turning observation on would cost work nothing can read.
+    const measurementDispatcher = gc
+      ? new LlmCallMeasurementDispatcher({
+          sessionId: id,
+          send: (batch) => gc.sendLlmCallMeasurements(batch),
+          warn: (message) => console.warn(message),
+        })
+      : undefined;
+    if (measurementDispatcher) this._measurementDispatchers.set(id, measurementDispatcher);
     const result = await createSiclawSession({
+      onLlmCallMeasurement: measurementDispatcher
+        ? (measurement) => measurementDispatcher.record(measurement)
+        : undefined,
+      onLlmCallSettler: measurementDispatcher
+        ? (settle) => this._measurementSettlers.set(id, settle)
+        : undefined,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
       sessionManager: frameworkSessionManager,
@@ -3990,6 +4135,7 @@ export class AgentBoxSessionManager {
   }
 
   async release(sessionId: string): Promise<void> {
+    await this.finishMetering(sessionId);
     const managed = this.sessions.get(sessionId);
     if (!managed) {
       // Not resident — but a handed-away session still has to lose its on-disk
@@ -4118,6 +4264,9 @@ export class AgentBoxSessionManager {
    * are still NOT destroyed (they belong to the AgentBox).
    */
   async close(sessionId: string): Promise<void> {
+    // Before anything else, and regardless of residency: a session closed
+    // without a resident entry can still have measurements queued.
+    await this.finishMetering(sessionId);
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);
@@ -4179,6 +4328,14 @@ export class AgentBoxSessionManager {
     // from emitting a duplicate session_released for the same session.
     const snapshot = new Map(this.sessions);
     this.sessions.clear();
+
+    // SIGTERM exits straight after this, so an unflushed dispatcher is a
+    // guaranteed loss. Settle every session's metering first, in parallel and
+    // bounded — each finishMetering already caps its own waits.
+    await Promise.all(
+      [...new Set([...this._measurementSettlers.keys(), ...this._measurementDispatchers.keys()])]
+        .map((id) => this.finishMetering(id)),
+    );
 
     for (const [id, managed] of snapshot) {
       if (managed._releaseTimer) {

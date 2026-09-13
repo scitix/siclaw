@@ -358,6 +358,10 @@ export async function handleDingTalkMessage(
       agentId,
       mode: "channel",
       sessionId,
+      // One id per turn, minted at the entry rather than in the client (which
+      // runs per attempt). Without it every call this turn makes — sub-agents
+      // included — is metered with no request correlation.
+      turnId: crypto.randomUUID(),
       modelProvider: modelBinding?.modelProvider,
       modelId: modelBinding?.modelId,
       releaseId: modelBinding?.releaseId,

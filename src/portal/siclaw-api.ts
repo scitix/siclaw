@@ -61,6 +61,7 @@ import { nonTraceOriginPredicate, traceOriginSqlList } from "./session-origin.js
 import { humanPromptPredicate } from "./human-prompt.js";
 import { transcriptVisiblePredicate } from "./transcript-rows.js";
 import { summariseLatency, extractLlmCallMs } from "./metrics-timing.js";
+import { usageByModel, usageByActor, USAGE_SORT_KEYS, type UsageSortKey } from "./llm-usage-repo.js";
 import {
   assembleExporterHeaders,
   maskExporterAuth,
@@ -4084,6 +4085,46 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       total: summariseLatency(totalValues),
       tools,
       truncated: aRows.length > TIMING_ROW_LIMIT || tRows.length > TIMING_ROW_LIMIT,
+    });
+  });
+
+  // GET /api/v1/siclaw/metrics/token-usage — token spend per provider × model,
+  // and per actor. Reads the `llm_calls` fact table, NOT message metadata: the
+  // latter never covered sub-agent calls, which is the spend this exists to show.
+  //
+  // The response carries `coverage` alongside every figure, and each field
+  // carries the count of calls that reported it. That is not decoration: sums
+  // over partially-reported data look identical to complete ones, and a page
+  // that cannot see the difference will present a gap as a fact.
+  router.get("/api/v1/siclaw/metrics/token-usage", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const query = parseQuery(req.url ?? "");
+    const window = resolveWindow(query);
+    if (!window) { sendJson(res, 400, { error: "Invalid time range" }); return; }
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit || "50", 10)));
+    // Ranking metric is server-side because the result is CAPPED: re-sorting a
+    // truncated page in the browser ranks the wrong rows — "top spenders by
+    // cache write" over the top 50 by total is a different list.
+    const sort = USAGE_SORT_KEYS.includes(query.sort as never) ? (query.sort as UsageSortKey) : undefined;
+    const db = getDb();
+    const scope = { from: window.from, to: window.to, limit, sort };
+
+    const [byModel, byActor] = await Promise.all([
+      usageByModel(db, scope),
+      // Skipped when only the model breakdown was asked for — it is the more
+      // expensive of the two (two session joins).
+      query.actors === "0" ? Promise.resolve(null) : usageByActor(db, scope),
+    ]);
+
+    sendJson(res, 200, {
+      from: window.from.toISOString(),
+      to: window.to.toISOString(),
+      sort: sort ?? "billable",
+      models: byModel.groups,
+      actors: byActor?.actors ?? null,
+      coverage: byModel.coverage,
     });
   });
 

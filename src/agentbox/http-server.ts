@@ -1075,6 +1075,11 @@ export function createHttpServer(
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
+    // Bind this turn's calls to the user request BEFORE the first one opens.
+    // `turnId` already identifies one accepted prompt execution and survives
+    // model-routing retries, which is exactly the correlation metering needs — so
+    // no second id is minted for it.
+    managed.brain.llmCalls?.setRootRequestId(body.turnId ?? null);
     // LLM-call timeline: the prompt is accepted NOW. Everything between here and
     // the first provider request (model setup, media preflight, language
     // detection, routing preflight) is round 1's `since_prev_ms` (= setup).

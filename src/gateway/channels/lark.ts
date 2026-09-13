@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { ConversationClient, supportsConversations } from "../conversation-client.js";
 /**
  * Lark (飞书) channel handler.
@@ -2053,6 +2055,12 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       agentId,
       mode: "channel",
       sessionId,
+      // Minted HERE, not inside the client: a turn id names one turn, while the
+      // client is called once per ATTEMPT — `promptWithBusyRetry` reuses this
+      // same object, so a queued-then-accepted message stays one turn. Without
+      // it a channel turn reaches the box with no id at all, and metering
+      // records every channel call — sub-agents included — uncorrelated.
+      turnId: randomUUID(),
       modelProvider: modelBinding?.modelProvider,
       modelId: modelBinding?.modelId,
       releaseId: modelBinding?.releaseId,

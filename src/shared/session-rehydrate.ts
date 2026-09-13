@@ -71,6 +71,8 @@ export type RehydratedMessage =
       };
       stopReason: "stop" | "toolUse";
       timestamp: number;
+      /** Present only on messages this module synthesised — see REHYDRATED_USAGE_MARK. */
+      siclaw_usage_provenance?: typeof REHYDRATED_PROVENANCE;
     }
   | {
       role: "toolResult";
@@ -85,6 +87,34 @@ const ZERO_USAGE = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+/**
+ * Marks a message whose usage numbers are reconstruction placeholders, not a
+ * provider's report. Persisted with the message so a later reader can still
+ * tell — the zeros themselves are indistinguishable from a genuine zero, and
+ * from the SDK's pre-request initialisation.
+ *
+ * `api`/`provider` cannot carry this: the assistant-text branch restores the
+ * ORIGINAL values from `assistant_item` when they were recorded, so a rebuilt
+ * message can look native. This field is never overwritten.
+ */
+export const REHYDRATED_USAGE_MARK = "siclaw_usage_provenance" as const;
+
+/** The mark's value on every message this module synthesises. */
+export const REHYDRATED_PROVENANCE = "rehydrated" as const;
+
+/** True when this message's usage is a rebuild placeholder rather than a report. */
+export function isRehydratedUsage(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  return (message as Record<string, unknown>)[REHYDRATED_USAGE_MARK] === REHYDRATED_PROVENANCE;
+}
+
+type RehydratedUsage = Extract<RehydratedMessage, { role: "assistant" }>["usage"];
+
+/** Fresh placeholder object per message — callers must not share one instance. */
+function rehydratedUsage(): RehydratedUsage {
+  return { ...ZERO_USAGE, cost: { ...ZERO_USAGE.cost } };
+}
 
 function tsOf(row: RehydrateRow): number {
   const raw = row.createdAt;
@@ -145,7 +175,8 @@ export function toRehydratedMessages(
         role: "assistant",
         content: [{ type: "toolCall", id: callId, name, arguments: parseArgs(row.toolInput) }],
         api: "rehydrated", provider: "rehydrated", model: REHYDRATED_MODEL,
-        usage: { ...ZERO_USAGE, cost: { ...ZERO_USAGE.cost } },
+        usage: rehydratedUsage(),
+        [REHYDRATED_USAGE_MARK]: REHYDRATED_PROVENANCE,
         stopReason: "toolUse",
         timestamp,
       });
@@ -169,7 +200,10 @@ export function toRehydratedMessages(
       role: "assistant",
       content: [{ type: "text", text: row.content, ...(typeof item?.textSignature === "string" ? { textSignature: item.textSignature } : {}) }],
       api: source("api", "rehydrated"), provider: source("provider", "rehydrated"), model: source("model", REHYDRATED_MODEL),
-      usage: { ...ZERO_USAGE, cost: { ...ZERO_USAGE.cost } },
+      usage: rehydratedUsage(),
+      // Marked even though api/provider may have been restored to their originals —
+      // that restoration is exactly what makes a rebuild otherwise invisible here.
+      [REHYDRATED_USAGE_MARK]: REHYDRATED_PROVENANCE,
       stopReason: "stop",
       timestamp,
     });

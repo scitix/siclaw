@@ -114,6 +114,9 @@ import { MetricsAggregator } from "./metrics-aggregator.js";
 import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
+import { handleLlmCallMeasurements } from "./llm-call-api.js";
+import { sessionReportableByIdentity } from "./internal-api.js";
+import { LLM_CALL_MEASUREMENTS_PATH } from "../shared/llm-call-validation.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 import { pendingUserRows } from "./pending-user-rows.js";
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
@@ -2920,6 +2923,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/delegation-events" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleDelegationEvents(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Per-call token metering from an AgentBox. Attribution is resolved
+          // here from the session registry — a box may state its own session,
+          // never someone else's org/user/agent.
+          if (url === LLM_CALL_MEASUREMENTS_PATH && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            void handleLlmCallMeasurements(
+              req,
+              res,
+              // Persistence belongs to whoever owns the database. A standalone
+              // Runtime has none — it reaches it through this RPC — so calling
+              // getDb() here only ever worked in single-process local mode.
+              (batch) => frontendClient.request("llmCall.persist", batch),
+              (sessionId) => sessionReportableByIdentity(sessionId, identity),
+            );
             return;
           }
 

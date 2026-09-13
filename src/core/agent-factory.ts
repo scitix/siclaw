@@ -35,6 +35,7 @@ import {
   type AgentContextManifest,
 } from "./agent-context.js";
 import type { AgentType } from "./agent-types.js";
+import type { LlmCallMeasurement } from "../shared/llm-call-record.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
@@ -105,6 +106,19 @@ export interface CreateSiclawSessionOpts {
   allowedTools?: string[] | null;
   /** Agent kind used by the shared context compiler. Legacy standalone callers default to SRE. */
   agentType?: AgentType;
+  /**
+   * Per-call metering sink. Core produces the measurement and hands it over;
+   * the caller owns attribution and persistence. Omitting it leaves metering off.
+   */
+  onLlmCallMeasurement?: (measurement: LlmCallMeasurement) => void;
+  /**
+   * Receives a bounded "wait for outstanding measurements" function.
+   *
+   * Teardown needs it: a turn's final calls settle AFTER the stream ends, so a
+   * release that only drains the delivery queue drains an empty one and loses
+   * precisely the measurements describing how the turn finished.
+   */
+  onLlmCallSettler?: (settle: () => Promise<void>) => void;
   /** False when the control plane could not prove the Agent's type/capability policy. */
   harnessResolved?: boolean;
   /** Persisted Agent-owned addendum; built-in type contracts are compiled separately. */
@@ -917,6 +931,7 @@ export async function createSiclawSession(
     model: configuredModel,
     thinkingLevel: resolveSessionThinkingLevel(services.settingsManager, configuredModel),
     customTools,
+    onLlmCallMeasurement: opts?.onLlmCallMeasurement,
     onModelEnvelope: (manifest) => {
       console.log(`[model-envelope] ${JSON.stringify({
         agentType: compiledContext.harness.agentType,
@@ -932,6 +947,9 @@ export async function createSiclawSession(
       return toolset ? [[tool.name, toolset] as const] : [];
     }),
   );
+  // Hand the settler out before the brain wraps the recorder away: teardown is
+  // the only caller, and it has no other route to it.
+  opts?.onLlmCallSettler?.(() => llmCallRecorder.settleMeasurements());
   const brain: BrainSession = new PiAgentBrain(session, toolsetsByName, llmCallRecorder);
   const getSkillSnapshot = () => {
     const currentSkills = loader.getSkills().skills;

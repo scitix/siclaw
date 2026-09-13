@@ -12,6 +12,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
+import type { LlmCallMeasurementBatch } from "../shared/llm-call-record.js";
+import { LLM_CALL_MEASUREMENTS_PATH } from "../shared/llm-call-validation.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
 import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
 import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH, type HandoffSearchQuery, type HandoffSearchResponse, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
@@ -175,6 +177,17 @@ export class GatewayClient {
    */
   async sendMetricsFlush(payload: MetricsFlushPayload): Promise<void> {
     await this.request("/api/internal/metrics-flush", "POST", payload);
+  }
+
+  /**
+   * Hand completed LLM-call measurements to the Runtime for persistence.
+   *
+   * Core produces measurements; the Runtime owns the database. Batched because
+   * a busy turn settles several calls in quick succession, and idempotent on
+   * `call_id` so a delivery retry cannot double-count a call.
+   */
+  async sendLlmCallMeasurements(payload: LlmCallMeasurementBatch): Promise<void> {
+    await this.request(LLM_CALL_MEASUREMENTS_PATH, "POST", payload);
   }
 
   /**

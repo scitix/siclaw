@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { REHYDRATED_MODEL, toRehydratedMessages, type RehydrateRow } from "./session-rehydrate.js";
+import { REHYDRATED_MODEL, isRehydratedUsage, toRehydratedMessages, type RehydrateRow } from "./session-rehydrate.js";
 
 const at = "2026-09-05T01:02:03.000Z";
 const row = (r: Partial<RehydrateRow> & { role: string }): RehydrateRow => ({ content: "", createdAt: at, ...r });
@@ -107,5 +107,34 @@ describe("toRehydratedMessages", () => {
     expect(out[0].usage).not.toBe(out[1].usage);
     expect(out[0].usage?.cost).not.toBe(out[1].usage?.cost);
     expect(out[0].usage).toMatchObject({ totalTokens: 0, cost: { total: 0 } });
+  });
+});
+
+describe("usage provenance marking", () => {
+  it("marks a rebuilt tool call so its zeros are never read as a report", () => {
+    const [assistant] = toRehydratedMessages([
+      row({ role: "tool", content: "ok", toolName: "bash", toolInput: "{}", outcome: "success" }),
+    ]);
+    expect(isRehydratedUsage(assistant)).toBe(true);
+  });
+
+  it("marks a rebuilt assistant even when api/provider were restored to the originals", () => {
+    // The case api/provider cannot detect: restored values make the message look
+    // native, so this mark is the only surviving evidence of a rebuild.
+    const [assistant] = toRehydratedMessages([
+      row({
+        role: "assistant",
+        content: "hello",
+        metadata: { assistant_item: { api: "openai-responses", provider: "example-gateway", model: "gpt-5" } },
+      }),
+    ]);
+    expect(assistant).toMatchObject({ api: "openai-responses", model: "gpt-5" });
+    expect(isRehydratedUsage(assistant)).toBe(true);
+  });
+
+  it("does not mark a message it did not synthesise", () => {
+    expect(isRehydratedUsage({ role: "assistant", usage: { input: 0 } })).toBe(false);
+    expect(isRehydratedUsage(null)).toBe(false);
+    expect(isRehydratedUsage("assistant")).toBe(false);
   });
 });

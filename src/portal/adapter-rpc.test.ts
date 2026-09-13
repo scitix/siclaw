@@ -2489,7 +2489,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getDelegates",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.getVisualLink", "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
+      "chat.getVisualLink", "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "llmCall.persist", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "chat.recentDelegationSessions", "chat.sequenceMessage",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",

@@ -1,9 +1,10 @@
 import { useCallback, useMemo, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
-import { useSummary, useTiming, useUsers, useChannels, useChannelSenders, rangeLabel, ENTRY_LABELS, DEFAULT_RANGE, type EntryMode, type TimeRange } from "../hooks/useMetrics"
+import { useSummary, useTiming, useTokenUsage, useUsers, useChannels, useChannelSenders, rangeLabel, ENTRY_LABELS, DEFAULT_RANGE, type EntryMode, type TimeRange, type UsageSortKey } from "../hooks/useMetrics"
 import { KpiCards } from "../components/metrics/KpiCards"
 import { TrendChart } from "../components/metrics/TrendChart"
 import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
+import { TokenUsageCard } from "../components/metrics/TokenUsageCard"
 import { AuditTable } from "../components/metrics/AuditTable"
 import { SessionTable } from "../components/metrics/SessionTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
@@ -24,6 +25,10 @@ export function Metrics() {
   const [senderId, setSenderId] = useState<string>("")     // exact channel sender open_id/staffId (channel entry only)
   const [timeRange, setTimeRange] = useState<TimeRange>(DEFAULT_RANGE)
   const [entry, setEntry] = useState<EntryMode>("all")     // entry-form axis, shared across tabs
+  // Ranking metric for the token tables. Held here (not in the card) because it
+  // drives a REFETCH: the result is capped server-side, so re-sorting what came
+  // back would rank the wrong rows.
+  const [usageSort, setUsageSort] = useState<UsageSortKey>("billable")
 
   // The "who" axis is origin-aware. Channel actors are open_ids, NOT portal
   // users, so the portal-user filter does not apply on the channel entry (it
@@ -45,14 +50,19 @@ export function Metrics() {
   // an individual — so summary/timing are fetched without a user filter.
   const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, null, entry)
   const { data: timing, loading: timingLoading, refresh: refreshTiming } = useTiming(timeRange, null, entry)
+  const { data: tokenUsage, loading: tokenUsageLoading, refresh: refreshTokenUsage } = useTokenUsage(timeRange, usageSort)
 
   const [spinning, setSpinning] = useState(false)
   const handleRefresh = useCallback(() => {
     setSpinning(true)
-    Promise.all([Promise.resolve(refreshSummary()), Promise.resolve(refreshTiming())]).finally(() => {
+    Promise.all([
+      Promise.resolve(refreshSummary()),
+      Promise.resolve(refreshTiming()),
+      Promise.resolve(refreshTokenUsage()),
+    ]).finally(() => {
       setTimeout(() => setSpinning(false), 600)
     })
-  }, [refreshSummary, refreshTiming])
+  }, [refreshSummary, refreshTiming, refreshTokenUsage])
 
   const selectedUsername = useMemo(() => {
     if (!userId) return null
@@ -190,6 +200,18 @@ export function Metrics() {
                 ) : (
                   <TimingStatsCard data={timing} rangeLabel={rLabel} entryLabel={ENTRY_LABELS[entry]} entry={entry} />
                 )}
+
+                {/* Token spend from the per-call fact table. Deliberately NOT
+                    entry-filtered: the entry axis is a property of the session,
+                    while these rows are attributed per actor across every path
+                    a sub-agent's calls take. */}
+                <TokenUsageCard
+                  data={tokenUsage}
+                  loading={tokenUsageLoading}
+                  rangeLabel={rLabel}
+                  sort={usageSort}
+                  onSort={setUsageSort}
+                />
               </>
             )}
           </section>

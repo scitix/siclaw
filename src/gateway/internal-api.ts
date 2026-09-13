@@ -142,6 +142,39 @@ async function sessionBelongsToIdentity(sessionId: string | null | undefined, id
  * Every `true` this returns is therefore either "no such session" or a comparison
  * against a row-sourced record. There is no third source.
  */
+/**
+ * May this certificate file records against this session?
+ *
+ * Accepts the session's OWNER or, for a delegated leg, its TARGET — the box that
+ * actually ran the turn is a legitimate reporter of what that turn cost. An
+ * unknown or non-authoritative session stays permissive for the same reason the
+ * owner check does: refusing on missing information would break legitimate
+ * traffic during a cache miss.
+ */
+export async function sessionReportableByIdentity(
+  sessionId: string | null | undefined,
+  identity: CertificateIdentity,
+): Promise<boolean> {
+  if (!sessionId) return false;
+  // FAIL CLOSED. This gate decides whether one agent may file spend against
+  // another's session, so "we could not establish ownership" must not read as
+  // "go ahead" — a non-authoritative cache entry or a failed lookup was enough
+  // to let a worker's certificate write to an owner's session.
+  let record = await sessionRegistry.get(sessionId).catch(() => undefined);
+  if (!record?.authoritative) {
+    try {
+      record = await sessionRegistry.refresh(sessionId);
+    } catch (err) {
+      console.warn(`[internal-api] could not establish ownership of ${sessionId}: ${String(err)}`);
+      return false;
+    }
+  }
+  if (!record?.authoritative) return false;
+  if (record.agentId === identity.agentId) return true;
+  // The delegated executor legitimately reports what its own turn cost.
+  return Boolean(record.targetAgentId && record.targetAgentId === identity.agentId);
+}
+
 async function sessionOwnedByIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
   if (!sessionId) return true;
   const cached = await sessionRegistry.get(sessionId);

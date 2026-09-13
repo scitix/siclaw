@@ -11,12 +11,19 @@ import {
 } from "./model-envelope.js";
 import { createGuardRegistry, installGuardPipeline, type GuardRegistry } from "./guard-pipeline.js";
 import { LlmCallRecorder } from "./llm-call-recorder.js";
+import type { LlmCallMeasurement } from "../shared/llm-call-record.js";
 
 export interface PiExecutionOptions extends Omit<CreateAgentSessionFromServicesOptions, "noTools" | "tools" | "excludeTools"> {
   /** Harness-owned guards. Omission retains the standard message/tool guards. */
   guards?: GuardRegistry;
   /** Receives hashes and counts, never prompt or tool contents. */
   onModelEnvelope?: (manifest: ModelEnvelopeManifest) => void;
+  /**
+   * Per-call metering sink. Supplying it turns on raw-usage observation for
+   * this session; omitting it leaves the recorder in its pre-metering behaviour
+   * (no fetch instrumented, no measurement produced).
+   */
+  onLlmCallMeasurement?: (measurement: LlmCallMeasurement) => void;
 }
 
 /**
@@ -29,7 +36,7 @@ export interface PiExecutionOptions extends Omit<CreateAgentSessionFromServicesO
  * guards and per-request recorder below it.
  */
 export async function createPiExecutionSession(options: PiExecutionOptions) {
-  const { guards, onModelEnvelope, ...sessionOptions } = options;
+  const { guards, onModelEnvelope, onLlmCallMeasurement, ...sessionOptions } = options;
   const result = await createAgentSessionFromServices({
     ...sessionOptions,
     // Every harness supplies its own bounded tools. Never enable SDK built-ins
@@ -62,7 +69,7 @@ export async function createPiExecutionSession(options: PiExecutionOptions) {
 
   // Recorder stays closest to the provider: input/output guard work belongs to
   // setup/tool time rather than network latency. Preserve this wrapper order.
-  const llmCallRecorder = new LlmCallRecorder();
+  const llmCallRecorder = new LlmCallRecorder({ onMeasurement: onLlmCallMeasurement });
   session.agent.streamFunction = llmCallRecorder.wrapStreamFn(session.agent.streamFunction);
   installGuardPipeline(guards ?? createGuardRegistry(options.model?.contextWindow ?? 128_000), {
     agent: session.agent,
