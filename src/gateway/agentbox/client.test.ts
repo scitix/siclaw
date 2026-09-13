@@ -689,3 +689,66 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
     expect(body.images).toHaveLength(1); // ...but the image was still resolved (full URL fetched)
   });
 });
+
+describe("AgentBoxClient — interrupted streams", () => {
+  let serverBundle: ReturnType<CertificateManager["issueAgentBoxCertificate"]>;
+  let clientBundle: ReturnType<CertificateManager["issueServerCertificate"]>;
+  beforeAll(async () => {
+    const manager = await CertificateManager.create();
+    serverBundle = manager.issueAgentBoxCertificate("stream-test", "test-org", "stream-box");
+    clientBundle = manager.issueServerCertificate("runtime.test");
+  }, 60_000);
+
+  for (const tls of [false, true]) {
+    async function serve(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
+      const server = tls ? https.createServer({ cert: serverBundle.cert, key: serverBundle.key,
+        ca: serverBundle.ca, requestCert: true, rejectUnauthorized: true }, handler) : http.createServer(handler);
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const client = new AgentBoxClient(`${tls ? "https" : "http"}://127.0.0.1:${(server.address() as AddressInfo).port}`, 30_000,
+        tls ? { cert: clientBundle.cert, key: clientBundle.key, ca: serverBundle.ca } : undefined);
+      return { client, close: () => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }) };
+    }
+
+    it(`${tls ? "mTLS" : "HTTP"} cancels a silent open stream without another event`, async () => {
+      const srv = await serve((_req, res) => { res.writeHead(200, { "Content-Type": "text/event-stream" }); res.write('data: {"ready":true}\n\n'); });
+      try {
+        const abort = new AbortController();
+        const iterator = srv.client.streamEvents("s", { signal: abort.signal })[Symbol.asyncIterator]();
+        expect((await iterator.next()).value).toEqual({ ready: true });
+        const pending = iterator.next();
+        const rejected = expect(pending).rejects.toThrow();
+        abort.abort();
+        await rejected;
+      } finally { await srv.close(); }
+    });
+
+    it(`${tls ? "mTLS" : "HTTP"} bounds a read when heartbeats disappear`, async () => {
+      const srv = await serve((_req, res) => { res.writeHead(200, { "Content-Type": "text/event-stream" }); res.write('data: {"ready":true}\n\n'); });
+      try {
+        const iterator = srv.client.streamPath("/events/s", { idleTimeoutMs: 150 })[Symbol.asyncIterator]();
+        await iterator.next();
+        await expect(iterator.next()).rejects.toThrow("stopped sending heartbeats");
+      } finally { await srv.close(); }
+    });
+
+    it(`${tls ? "mTLS" : "HTTP"} preserves a quiet healthy stream receiving heartbeat comments`, async () => {
+      const srv = await serve((_req, res) => {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(": heartbeat\n\n");
+        const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 20);
+        const finish = setTimeout(() => {
+          // close can arrive after another timer tick; stop writes before end.
+          clearInterval(heartbeat);
+          res.end('data: {"done":true}\n\n');
+        }, 400);
+        res.on("close", () => { clearInterval(heartbeat); clearTimeout(finish); });
+      });
+      try {
+        const comments = vi.fn(), events: unknown[] = [];
+        for await (const event of srv.client.streamPath("/events/s", { idleTimeoutMs: 150, onComment: comments })) events.push(event);
+        expect(events).toEqual([{ done: true }]);
+        expect(comments.mock.calls.length).toBeGreaterThan(2);
+      } finally { await srv.close(); }
+    });
+  }
+});

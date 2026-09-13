@@ -135,6 +135,12 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log("[agentbox] Shutting down...");
+    sessionManager.beginShutdown();
+    server.close();
+    // Leave five seconds of the Pod's default grace period to terminate child
+    // processes. A stalled storage request must not keep an executor alive.
+    const deadline = setTimeout(() => { process.exit(1); }, 55_000);
+    deadline.unref();
     // Final metrics flush FIRST: capture the last <pull-interval of increments before
     // the pod is recycled, and before the (possibly slow) closeAll() risks hitting the
     // K8s SIGKILL grace deadline. Best-effort — never let it block shutdown. This
@@ -157,9 +163,8 @@ async function main() {
         console.warn("[agentbox] Final metrics flush failed (continuing shutdown):", err);
       }
     }
-    await debugPodCache.evictAll();
     await sessionManager.closeAll();
-    server.close();
+    await debugPodCache.evictAll();
     // Flush + shut down tracing last (forceFlush is capped at 3s internally so a
     // dead in-network backend cannot stall SIGTERM past the K8s grace period).
     await shutdownTracing();

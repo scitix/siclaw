@@ -1,3 +1,4 @@
+import { createPrivateMemorySearchTool } from "./private-memory.js";
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -101,6 +102,10 @@ Returns matching memory chunks with file path, heading context, content snippet,
 
 export const registration: ToolEntry = {
   category: "query",
-  create: (refs) => createMemorySearchTool(refs.memoryIndexer!),
-  available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer,
+  create: (refs) => {
+    if (refs.privateMemory) return createPrivateMemorySearchTool(refs.privateMemory, refs.turnRef);
+    if (process.env.SICLAW_WORKSPACE_MODE === "remote") throw new Error("Private memory backend is unavailable");
+    return createMemorySearchTool(refs.memoryIndexer!);
+  },
+  available: (refs) => isMemoryEnabled() && (!!refs.privateMemory || (process.env.SICLAW_WORKSPACE_MODE !== "remote" && !!refs.memoryIndexer)),
 };

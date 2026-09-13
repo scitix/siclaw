@@ -1240,6 +1240,21 @@ describe("consumeAgentSse — tool execution", () => {
 });
 
 describe("consumeAgentSse — abort finalization", () => {
+  it("cancels a pending transport read and still finalizes an in-flight tool", async () => {
+    const controller = new AbortController();
+    const client = {
+      async *streamEvents(_sessionId: string, opts?: { signal?: AbortSignal }) {
+        yield { type: "tool_execution_start", toolName: "node_exec", args: { command: "sleep 30" } };
+        await new Promise<never>((_resolve, reject) => {
+          opts!.signal!.addEventListener("abort", () => reject(new Error("transport aborted")), { once: true });
+          controller.abort();
+        });
+      },
+    } as unknown as AgentBoxClient;
+    await consumeAgentSse({ client, sessionId: "s", userId: "u", persistMessages: true, signal: controller.signal });
+    expect(updateCalls.find((row) => row.metadata?.status === "stopped")).toMatchObject({ toolName: "node_exec" });
+  });
+
   it("finalizes an in-flight tool row as stopped and persists partial assistant text on abort", async () => {
     const controller = new AbortController();
     const client = {

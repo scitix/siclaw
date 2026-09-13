@@ -42,7 +42,7 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
   private readonly deliveredGrant = new WeakMap<ScriptToolCall, string>();
   private readonly deliveredPolicy = new WeakMap<ScriptToolCall, string>();
   constructor(private readonly controlPlane: SandboxControlPlane, private readonly config: ScriptSandboxConfig, private readonly builtin?: SandboxBuiltinExecutor,
-    private readonly verifyCaller?: (principal: ScriptPrincipal) => void,
+    private readonly verifyCaller?: (principal: ScriptPrincipal, signal: AbortSignal) => void | Promise<void>,
     private readonly traffic: ScriptTrafficAdmission = new LocalScriptTraffic()) {}
 
   private trafficKeys(grant: SandboxGrant, call: ScriptToolCall): string[] {
@@ -85,7 +85,7 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
 
   private async resolve(p: ScriptPrincipal, source = "", name = "", signal: AbortSignal, requiredTool?: string): Promise<SandboxGrant> {
     signal.throwIfAborted();
-    this.verifyCaller?.(p);
+    await this.verifyCaller?.(p, signal);
     const budget = (maximum: number) => {
       const remaining = Math.min(maximum, (p.deadlineMs ?? Infinity) - Date.now());
       if (remaining <= 0) throw new SandboxToolError("TARGET_BUSY");
@@ -99,7 +99,8 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
     const value = await this.controlPlane.request("sandbox.resolve", { agent_id: p.agentId, session_id: p.sessionId, source, name }, budget(10_000)) as SandboxGrant;
     signal.throwIfAborted();
     // The turn can end or change owner while either control-plane RPC is pending.
-    this.verifyCaller?.(p);
+    await this.verifyCaller?.(p, signal);
+    signal.throwIfAborted();
     if (!value?.user_id || (p.userId && p.userId !== value.user_id)) throw new ScriptSandboxError("Sandbox authorization denied", 403);
     p.userId = value.user_id;
     return value;

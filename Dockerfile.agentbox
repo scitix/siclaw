@@ -88,6 +88,7 @@ RUN userdel -r node 2>/dev/null || true \
     && groupadd --gid 1003 hostcred \
     && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred agentbox \
     && useradd --uid 1001 -M -s /bin/false sandbox \
+    && usermod -aG sandbox agentbox \
     && echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
     && chmod 440 /etc/sudoers.d/sandbox-exec \
     && chgrp kubecred /usr/local/bin/kubectl \
@@ -151,12 +152,16 @@ RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
     && chmod 2750 ./.siclaw/credentials/hosts \
     && chmod 0700 ./.siclaw/config \
     && chmod 0755 ./.siclaw/skills \
-    && chmod 0777 ./.siclaw/user-data \
+    && chmod 0711 ./.siclaw/user-data \
     && chmod -R o+rX ./dist/ ./skills/ ./node_modules/ \
     && find / -perm /4000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
          case "$f" in /usr/bin/sudo) ;; *) chmod u-s "$f" ;; esac; done \
     && find / -perm /2000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
          case "$f" in /usr/local/bin/kubectl) ;; *) chmod g-s "$f" ;; esac; done
+
+# This public policy must remain readable by the agent process. Source archives
+# and the build host's umask can otherwise change COPY's inherited permissions.
+RUN chmod 0644 /etc/siclaw/extra-commands.json
 
 ENV NODE_ENV=production
 

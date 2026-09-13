@@ -38,10 +38,22 @@ for grp in kubecred hostcred; do
   fi
 done
 
+# Root has no DAC_OVERRIDE/DAC_READ_SEARCH in the production Pod. Once the
+# credential parent becomes 0750, root must itself hold the credential groups
+# to repair and verify children (including after a container restart). These
+# groups belong only to the initialization process; setpriv below resets the
+# final agent's groups and never grants them to sandbox.
+if [ "$(id -u)" = 0 ]; then
+  root_groups=" $(id -nG) "
+  if [[ "$root_groups" != *" kubecred "* || "$root_groups" != *" hostcred "* ]]; then
+    exec setpriv --reuid=root --regid=kubecred --groups=hostcred -- bash "$0" "$@"
+  fi
+fi
+
 # ── Fix volume mount permissions ──────────────────────────────────
 # The main container has CAP_CHOWN + CAP_FOWNER so these succeed in
 # both K8s and standalone Docker. Capabilities are dropped after
-# runuser switches to the agentbox user (no security impact).
+# setpriv switches to the agentbox user (no security impact).
 
 # Credentials.
 #
@@ -59,11 +71,18 @@ done
 # the image sets up. Each type is chowned separately below.
 chown agentbox:kubecred /app/.siclaw/credentials 2>/dev/null || true
 chmod 0750 /app/.siclaw/credentials 2>/dev/null || true
+# An emptyDir hides the image's pre-created type directories. Create them as
+# their owner, before the broker can inherit the application's primary group.
+runuser -u agentbox -- mkdir -p /app/.siclaw/credentials/clusters /app/.siclaw/credentials/hosts
 # setgid on each type directory, so whatever is materialized into it inherits that type's group.
+# Repair each directory before recursive traversal. Root has no DAC_OVERRIDE;
+# a reused 2750 directory assigned to another group cannot be opened by chown -R.
+chown agentbox:kubecred /app/.siclaw/credentials/clusters 2>/dev/null || true
 chown -R agentbox:kubecred /app/.siclaw/credentials/clusters 2>/dev/null || true
-chmod 2750 /app/.siclaw/credentials/clusters 2>/dev/null || true
+runuser -u agentbox -- chmod 2750 /app/.siclaw/credentials/clusters 2>/dev/null || true
+chown agentbox:hostcred /app/.siclaw/credentials/hosts 2>/dev/null || true
 chown -R agentbox:hostcred /app/.siclaw/credentials/hosts 2>/dev/null || true
-chmod 2750 /app/.siclaw/credentials/hosts 2>/dev/null || true
+runuser -u agentbox -- chmod 2750 /app/.siclaw/credentials/hosts 2>/dev/null || true
 # Group-readable files, for the setgid reader (kubectl) — not for sandbox, which is in no such group.
 find /app/.siclaw/credentials -type f -exec chmod 0640 {} \; 2>/dev/null || true
 
@@ -106,65 +125,33 @@ fi
 chown -R agentbox:agentbox /app/.siclaw/skills 2>/dev/null || true
 chmod 0755 /app/.siclaw/skills 2>/dev/null || true
 
-# 🔴 user-data is the one directory here that is NOT a local emptyDir: it is a subPath on a
-# shared NFS PVC, and EVERY box of an agent mounts the SAME path (by design — session history
-# lives there, so a session can be picked up by another box). Two consequences that an
-# unconditional `chown -R` gets badly wrong:
-#
-#   - It is O(agent's whole history), over NFS, one SETATTR round trip per file, and that
-#     history only grows. It ran BEFORE node starts and is silent, so it was invisible from
-#     every angle: it consumed the entire 60s startupProbe window, kubelet killed the
-#     container, and under `restartPolicy: Never` that is permanent. The box's own startup
-#     work, once it got to run, took 0.4 seconds.
-#   - Boxes starting together each run it over the SAME inodes — the same idempotent work N
-#     times, contending on one NFS server, while any already-serving box takes the IO hit.
-#
-# So the root directory's ownership IS the completion marker: correct means "this tree has
-# already been claimed", and every later start is one stat.
-#
-# ORDER IS LOAD-BEARING — contents first, root last. `chown -R` does the opposite (root, then
-# recurse), which is exactly what makes it unsafe to resume: killed midway it leaves the root
-# already correct and the tree half-done, so every future start skips the repair forever. And
-# "killed midway" is not hypothetical here; it is the failure this whole block is about.
-#
-# `-h` is not pedantry: without it chown FOLLOWS symlinks and changes the target's owner, and
-# this tree holds agent-written content — one link pointing outside would let the root-owned
-# entrypoint retitle a file beyond it.
-#
-# Numeric ids rather than names, so nothing depends on name resolution inside the container.
-# 1000 is `useradd --uid 1000 agentbox` in Dockerfile.agentbox — keep in step. Both halves are
-# checked: a root left at `1000:0` is not claimed, and reading only the uid would call it done.
-#
-# Assumes the export preserves the writer's ids. If it maps them (all_squash / anonuid) every
-# file reads as wrongly-owned forever, the guard never matches, and this degenerates into the
-# full walk on every start — that has to be fixed at the mount, not here.
+# Application data is pod-local. Never recursively chown a shared data tree.
+# Only files/ is accessible to the sandbox group; Pi state and memory stay private.
+if [ "${SICLAW_WORKSPACE_MODE:-local}" = "remote" ]; then umask 027; fi
 user_data_dir=/app/.siclaw/user-data
-if [ "$(stat -c '%u:%g' "$user_data_dir" 2>/dev/null || echo '')" != "1000:1000" ]; then
-  if find "$user_data_dir" -xdev -mindepth 1 \( ! -uid 1000 -o ! -gid 1000 \) \
-       -exec chown -h 1000:1000 {} + 2>/dev/null \
-     && chown 1000:1000 "$user_data_dir" 2>/dev/null
-  then
-    :
-  else
-    # Deliberately not fatal, unlike the credential checks above. Those guard an isolation
-    # property — running without it is worse than not running. This is a degradation: the
-    # directory itself is world-writable (below), so the box still works, it just may not be
-    # able to write some pre-existing file. Exiting here would also brick `docker run` without
-    # CAP_CHOWN, which every `|| true` in this script exists to keep working.
-    #
-    # But it must not be SILENT — a silent chown over this directory is what made the outage
-    # unreadable. Not marking the root is the other half: the repair simply runs again next
-    # start.
-    echo "WARNING: could not claim ownership of $user_data_dir — the box may be unable to" >&2
-    echo "         write files left by an earlier version; retrying on next start." >&2
-  fi
+mkdir -p "$user_data_dir/files"
+chown agentbox:agentbox "$user_data_dir"
+chmod 0711 "$user_data_dir"
+chown agentbox:sandbox "$user_data_dir/files"
+if [ "${SICLAW_WORKSPACE_MODE:-local}" = "remote" ]; then
+  # Only the trusted file tools publish durable files. A sandbox writer could
+  # otherwise race their path checks by replacing a parent with a symlink.
+  # Root deliberately has no CAP_FSETID in K8s. chmod by root can silently
+  # clear setgid for a group it does not belong to. The owner is a sandbox
+  # group member and can set it without expanding the container capabilities.
+  runuser -u agentbox -- chmod 2750 "$user_data_dir/files"
+else
+  runuser -u agentbox -- chmod 2770 "$user_data_dir/files"
 fi
-# Outside the guard: O(1), idempotent, and a freshly provisioned subPath needs it before the
-# box can write at all.
-chmod 0777 "$user_data_dir" 2>/dev/null || true
 
 chown -R agentbox:agentbox /app/.siclaw/config 2>/dev/null || true
 chmod 0700 /app/.siclaw/config 2>/dev/null || true
 
 # ── Drop to agentbox and exec CMD ────────────────────────────────
-exec runuser -u agentbox -- "$@"
+# Keep the application as PID 1. runuser leaves a supervising process that
+# kills its child after two seconds on SIGTERM, before an OSS checkpoint can
+# finish; nested runuser instances can prevent the Node handler running at all.
+# setpriv is supplied by the same base image's util-linux package. Preserve the
+# account environment that runuser initialized without clearing Runtime config.
+exec setpriv --reuid=agentbox --regid=agentbox --init-groups -- \
+  env HOME=/home/agentbox USER=agentbox LOGNAME=agentbox SHELL=/bin/bash "$@"

@@ -1,3 +1,4 @@
+import { privateWorkspaceEnabled, type PrivateSpaceIdentity } from "../../shared/private-workspace.js";
 /**
  * AgentBox Manager
  *
@@ -165,6 +166,9 @@ export interface AgentBoxAcquisition {
 
 export class AgentBoxManager {
   private spawner: BoxSpawner;
+  private privateSpaceResolver?: (agentId: string, sessionId: string) => Promise<PrivateSpaceIdentity>;
+  private privateAcquisitions = new Map<string, Promise<AgentBoxAcquisition>>();
+  setPrivateSpaceResolver(resolver: (agentId: string, sessionId: string) => Promise<PrivateSpaceIdentity>): void { this.privateSpaceResolver = resolver; }
   private config: Required<AgentBoxManagerConfig>;
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
@@ -320,16 +324,10 @@ export class AgentBoxManager {
   }
 
   /**
-   * Inject a resolver for the per-agent PVC persistence mode. Same contract as
-   * setSpawnEnvResolver: consulted on EVERY cold spawn (from any entry point —
-   * chat RPCs, channel webhooks, cron tasks, abort/steer) and NEVER on warm
-   * reuse. This is what makes persistence a true agent-level property: the
-   * value is resolved by agentId, independent of which entry point first
-   * cold-spawns the (one-per-agent) pod. Without it, only entry points that
-   * happened to pass `config.persistence` would honour it, so a pod cold-spawned
-   * by e.g. a Lark message would silently fall to the global default and ignore
-   * the agent's configured mode. Returns undefined to fall back to the global
-   * config (the spawner gates the actual mount on a claimName regardless).
+   * Resolve legacy per-agent durability requests on cold spawns from every
+   * entry point. K8s rejects true without a private workspace, preventing a
+   * stale setting from silently becoming ephemeral. Remote sessions use the
+   * authenticated space resolver instead and bypass this legacy setting.
    */
   setPersistenceResolver(fn: (agentId: string) => Promise<boolean | undefined>): void {
     this.persistenceResolver = fn;
@@ -391,17 +389,10 @@ export class AgentBoxManager {
   /**
    * Get a running AgentBox for the agent, or spawn one.
    *
-   * Per-agent config — the injected `spawnEnvResolver` (env, e.g. idle timeout)
-   * and `persistenceResolver` (PVC mode) — is resolved ONLY on a cold spawn,
-   * never on warm-pod reuse, so the chat hot path and channel/cron paths pay no
-   * RPC when the pod already exists.
-   *
-   * Because a pod is keyed by agentId, the persistence/env mode is resolved on
-   * each cold spawn (including a cert-stale recreate) from the agent-level
-   * resolver — NOT from whichever entry point happens to call first. The volume
-   * mount is fixed at pod creation (K8s cannot hot-change a running pod's
-   * mounts), so a configuration change applies on the agent's next cold spawn
-   * (after restart/idle-release), not immediately on a warm pod.
+   * Spawn environment and legacy durability requests are resolved on cold
+   * spawns; changing them does not reconfigure an existing pod. Remote mode
+   * resolves authoritative ownership on every acquisition, including warm
+   * reuse, and keys pods by agent, private space and session.
    */
   async getOrCreate(
     agentId: string,
@@ -424,6 +415,35 @@ export class AgentBoxManager {
     sessionId?: string,
   ): Promise<AgentBoxAcquisition> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
+    if (privateWorkspaceEnabled() && (!config?.profile || config.profile === "agent")) {
+      if (!this.isK8s || !sessionId || !this.privateSpaceResolver) throw new Error("Private persistence requires an isolated K8s session and a trusted space service");
+      const owner = await this.privateSpaceResolver(agentId, sessionId);
+      if (owner.agentId !== agentId || !owner.userId || !owner.spaceId) throw new Error("Private space identity is unavailable");
+      const key = JSON.stringify([agentId, owner.spaceId, sessionId]);
+      const pending = this.privateAcquisitions.get(key);
+      if (pending) return pending;
+      const operation = (async (): Promise<AgentBoxAcquisition> => {
+        const existing = (await this.listPool(agentId)).find(box => box.privateSessionId === sessionId && box.privateSpaceId === owner.spaceId);
+        if (existing?.status === "running" && existing.endpoint && this.isCertUsable(existing)) {
+          const stale = this.isStaleImage(existing, "agent") || !this.isCertFresh(existing);
+          const drained = stale && this.boxStatusProbe ? (await this.boxStatusProbe(existing.endpoint)).drained : false;
+          if (!drained) {
+            this.bindings.remember(agentId, sessionId, existing.boxId);
+            return { handle: { boxId: existing.boxId, endpoint: existing.endpoint, agentId }, created: false };
+          }
+          await this.spawner.stop(existing.boxId);
+        }
+        const env = await this.resolveEnv(agentId, config?.env);
+        const handle = await this.spawner.spawn({ ...config, agentId, orgId: owner.orgId, privateSpace: { ...owner, sessionId }, env, persistence: false });
+        this.bindings.remember(agentId, sessionId, handle.boxId);
+        // Concurrent callers can adopt the same pod. Conservative ownership prevents
+        // failed request setup from deleting another caller's running session.
+        return { handle, created: false };
+      })();
+      this.privateAcquisitions.set(key, operation);
+      try { return await operation; }
+      finally { if (this.privateAcquisitions.get(key) === operation) this.privateAcquisitions.delete(key); }
+    }
     if (this.isK8s) {
       // A capability box is a per-run job, not a long-lived agent, so it never pools.
       const wantProfile = config?.profile ?? "agent";
@@ -449,6 +469,7 @@ export class AgentBoxManager {
     const name = this.podName(agentId, wantProfile);
 
     const info = await this.spawner.get(name);
+    if (info?.privateSessionId) throw new Error("Private AgentBox cannot join a shared pool");
 
     // 🔴 A single-box agent must still pick up a new AgentBox image. Nothing else does it:
     // this path compares phase, profile and CA but never the image, and a box under
@@ -495,8 +516,7 @@ export class AgentBoxManager {
       const hasProfile = info.profile ?? "agent";
       if (hasProfile === wantProfile) {
         // Warm reuse: return the running pod without spawning. Per-agent config
-        // (env/persistence) is NOT re-resolved here — the pod's volume mount is
-        // already fixed, so a changed mode applies on the next cold spawn.
+        // (env/legacy durability request) is resolved on the next cold spawn.
         return { handle: { boxId: name, endpoint: info.endpoint, agentId }, created: false };
       }
       // Profile changed under the same identity — reusing the old-shaped pod would
@@ -540,7 +560,7 @@ export class AgentBoxManager {
     replicas: number,
   ): Promise<AgentBoxAcquisition> {
     const wantProfile = config?.profile ?? "agent";
-    const pool = await this.listPool(agentId);
+    const pool = (await this.listPool(agentId)).filter(box => !box.privateSessionId);
     this.markStaleBoxesDraining(agentId, pool, wantProfile);
     this.bindings.retainBoxes(agentId, new Set(pool.map((b) => b.boxId)));
 
@@ -788,16 +808,22 @@ export class AgentBoxManager {
    * which is the honest answer, not a reason to guess at instance 0.
    */
   async getForSession(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    if (privateWorkspaceEnabled() && (!profile || profile === "agent")) {
+      const owner = await this.privateSpaceResolver?.(agentId, sessionId);
+      if (!owner) return undefined;
+      const box = (await this.listPool(agentId)).find(b => b.privateSessionId === sessionId && b.privateSpaceId === owner.spaceId && b.status === "running");
+      return box?.endpoint ? { boxId: box.boxId, endpoint: box.endpoint, agentId } : undefined;
+    }
     const bound = this.bindings.get(agentId, sessionId);
     if (bound) {
       const info = await this.spawner.get(bound).catch(() => null);
-      if (info && info.status === "running" && info.endpoint) {
+      if (info && !info.privateSessionId && info.status === "running" && info.endpoint) {
         return { boxId: bound, endpoint: info.endpoint, agentId };
       }
       // The bound box is gone; fall through to the agent's remaining boxes.
     }
     for (const box of await this.listPool(agentId)) {
-      if (box.status === "running" && box.endpoint && (box.profile ?? "agent") === (profile ?? "agent")) {
+      if (!box.privateSessionId && box.status === "running" && box.endpoint && (box.profile ?? "agent") === (profile ?? "agent")) {
         return { boxId: box.boxId, endpoint: box.endpoint, agentId };
       }
     }
@@ -820,8 +846,7 @@ export class AgentBoxManager {
     this.unsharedWarned.add(agentId);
     console.warn(
       `[agentbox-manager] agent ${agentId} runs more than one box but its session transcripts are NOT on shared ` +
-      `storage — a conversation that moves between boxes will lose its history. Configure a shared volume ` +
-      `(SICLAW_PERSISTENCE_CLAIM_NAME) or set replicas back to 1.`,
+      `storage — use remote private workspaces for durable conversations, or set replicas back to 1.`,
     );
   }
 
@@ -835,6 +860,7 @@ export class AgentBoxManager {
    * may still hold it, so a hint pointing at an unreachable-but-live box counts.
    */
   async getHolder(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    if (privateWorkspaceEnabled() && (!profile || profile === "agent")) return this.getForSession(agentId, sessionId, profile);
     const wantProfile = profile ?? "agent";
     const pool = (await this.listPool(agentId)).filter((b) => this.isReachable(b, wantProfile));
     if (pool.length === 0) return undefined;
@@ -888,7 +914,7 @@ export class AgentBoxManager {
   /** A box the Runtime can talk to right now. Says nothing about whether it accepts NEW
    *  sessions — a draining box is still reachable and still serves what it holds. */
   private isReachable(box: AgentBoxInfo, wantProfile: string): boolean {
-    return box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
+    return !box.privateSessionId && box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
   }
 
   /**
@@ -1108,8 +1134,8 @@ export class AgentBoxManager {
     // ours to fill — and resolve it LAZILY rather than up front behind an `if`. Deciding
     // that no slot needs it, and then acting on that decision further down, would be
     // correct only as long as nothing awaits in between; that is invisible to anyone
-    // editing this later, and getting it wrong means spawning a pod with an empty env and a
-    // default persistence mode. Memoised, so concurrent slots share the one resolution.
+    // editing this later, and getting it wrong means spawning a pod with an empty env and
+    // dropping its legacy durability request. Concurrent slots share one resolution.
     let context: Promise<{ env: Record<string, string>; persistence: boolean | undefined }> | undefined;
     const spawnContext = () => (context ??= (async () => ({
       env: await this.resolveEnv(agentId, config?.env),
@@ -1448,7 +1474,7 @@ export class AgentBoxManager {
 
     const byAgent = new Map<string, AgentBoxInfo[]>();
     for (const box of all) {
-      if ((box.profile ?? "agent") !== "agent" || !box.agentId) continue;
+      if (box.privateSessionId || (box.profile ?? "agent") !== "agent" || !box.agentId) continue;
       const list = byAgent.get(box.agentId) ?? [];
       list.push(box);
       byAgent.set(box.agentId, list);
@@ -1586,11 +1612,11 @@ export class AgentBoxManager {
   }
 
   /**
-   * Resolve the per-agent PVC persistence mode for a cold spawn. An explicit
+   * Resolve a legacy durability request for a cold spawn. An explicit
    * `configValue` (e.g. task-coordinator passing `binding.persistence`) wins;
    * otherwise the injected `persistenceResolver` is consulted by agentId. Either
-   * may be undefined → the spawner falls back to its global config. Only called
-   * on a cold spawn, so warm-pod reuse pays no RPC.
+   * may be undefined. K8s rejects true without a private workspace; this no
+   * longer selects a PVC or falls back to a global persistence configuration.
    */
   private async resolvePersistence(agentId: string, configValue?: boolean): Promise<boolean | undefined> {
     if (configValue !== undefined) return configValue;

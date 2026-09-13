@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { GatewayClient } from "./gateway-client.js";
+import type { WorkspaceRequest } from "../shared/private-workspace.js";
 
 /**
  * Tests for GatewayClient — the AgentBox-side HTTP client that talks to the
@@ -423,5 +424,54 @@ describe("GatewayClient — error handling", () => {
     } finally {
       await srv.close();
     }
+  });
+});
+
+describe("GatewayClient — private workspace failure classification", () => {
+  const renewal: WorkspaceRequest = { action: "renew", sessionId: "session", incarnation: "incarnation" };
+  function privateClient(port: number) {
+    // The HTTP harness tests response/transport handling; certificate validation
+    // remains covered by the dedicated mTLS tests.
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-gwc-"));
+    try {
+      for (const name of ["tls.crt", "tls.key", "ca.crt"]) fs.writeFileSync(path.join(certPath, name), "test certificate");
+      return new GatewayClient({ gatewayUrl: `http://127.0.0.1:${port}`, certPath });
+    } finally { fs.rmSync(certPath, { recursive: true, force: true }); }
+  }
+
+  it.each([400, 401, 403, 409, 429, 500, 502, 503, 504])("classifies HTTP %i without exposing the response body", async status => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(status); res.end("private upstream details");
+    });
+    try {
+      await expect(privateClient(srv.port).exchange(renewal)).rejects.toMatchObject({
+        status, retriable: status === 429 || status >= 500,
+        message: "Private workspace is unavailable or its execution changed",
+      });
+    } finally { await srv.close(); }
+  });
+
+  it("allows a fresh request after an interrupted renewal response", async () => {
+    let interrupt = true;
+    const srv = await startServer((_req, res) => {
+      res.writeHead(200); res.write('{"ok":');
+      if (interrupt) setImmediate(() => res.destroy()); else res.end("true}");
+    });
+    try {
+      const client = privateClient(srv.port);
+      await expect(client.exchange(renewal)).rejects.toMatchObject({ name: "WorkspaceTransportError", retriable: true });
+      interrupt = false;
+      await expect(client.exchange(renewal)).resolves.toEqual({ ok: true });
+    } finally { await srv.close(); }
+  });
+
+  it("bounds the whole stalled renewal before the next 30-second interval", async () => {
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => timeout(25));
+    const srv = await startServer(() => {});
+    try {
+      await expect(privateClient(srv.port).exchange(renewal)).rejects.toMatchObject({ retriable: true });
+      expect(spy).toHaveBeenCalledWith(10_000);
+    } finally { await srv.close(); }
   });
 });

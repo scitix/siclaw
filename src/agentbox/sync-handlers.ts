@@ -376,6 +376,21 @@ export function createSkillsHandler(
       }
     }
 
+    if (process.env.SICLAW_WORKSPACE_MODE === "remote") {
+      // The private-data umask must not remove the existing read access to
+      // trusted Skill assets. This Pod contains one user's session; scripts
+      // and references stay read-only to sandbox, with no access to credentials.
+      const restoreReadAccess = (dir: string): void => {
+        fs.chmodSync(dir, 0o755);
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) restoreReadAccess(full);
+          else if (entry.isFile()) fs.chmodSync(full, fs.statSync(full).mode & 0o111 ? 0o755 : 0o644);
+          else throw new Error("Invalid Skill asset type");
+        }
+      };
+      restoreReadAccess(resolvedDir);
+    }
     return seen.size;
     },
 

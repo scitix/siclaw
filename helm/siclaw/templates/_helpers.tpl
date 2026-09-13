@@ -123,31 +123,16 @@ Name of the OCR backend Service.
 {{- printf "%s-ocr-backend" (include "siclaw.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
-{{/*
-Name of the shared data PVC. Defaults to "<fullname>-data" so two releases
-in the same namespace don't collide; users can override via
-.Values.agentbox.persistence.claimName.
-*/}}
-{{- define "siclaw.dataPvcName" -}}
-{{- default (printf "%s-data" (include "siclaw.fullname" .)) .Values.agentbox.persistence.claimName -}}
-{{- end }}
-
-{{/*
-Is a shared PVC available for AgentBox pods to mount? Returns "true" or "".
-
-Decouples PVC availability (infrastructure) from the global default policy
-(persistence.enabled). Available when EITHER:
-  - persistence.enabled       — the chart provisions & mounts its own PVC, or
-  - persistence.claimName set  — the deployer references a pre-existing RWX PVC
-                                 they created out-of-band (mount it, inject the
-                                 claim name) WITHOUT turning the global default on.
-When available, the runtime gets SICLAW_PERSISTENCE_CLAIM_NAME so a per-agent
-opt-in (chat.send persistence:true) can actually mount the PVC even while the
-global default stays off.
-*/}}
-{{- define "siclaw.persistence.pvcAvailable" -}}
+{{/* Fail before upgrading a deployment which still relies on application PVC data. */}}
+{{- define "siclaw.workspace.validate" -}}
 {{- $p := .Values.agentbox.persistence | default dict -}}
-{{- if or $p.enabled (ne ($p.claimName | default "") "") -}}true{{- end -}}
+{{- if or $p.enabled ($p.claimName | default "") -}}
+{{- fail "Shared PVC persistence was removed. Migrate and verify existing data, then remove agentbox.persistence settings. Retained PVCs require manual retirement." -}}
+{{- end -}}
+{{- $mode := .Values.agentbox.workspace.mode -}}
+{{- if not (has $mode (list "local" "remote")) -}}
+{{- fail "agentbox.workspace.mode must be local or remote" -}}
+{{- end -}}
 {{- end }}
 
 {{/*

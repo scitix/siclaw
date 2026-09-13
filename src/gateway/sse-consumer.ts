@@ -564,7 +564,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // dropped — would otherwise take the operator's only explanation of the
   // failure with it, and leave no row for the reload either.
   try {
-    for await (const event of client.streamEvents(sessionId)) {
+    for await (const event of client.streamEvents(sessionId, { signal })) {
       if (signal?.aborted) break;
 
       const evt = { ...event as SseEvent };
@@ -1222,6 +1222,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // which emits another agent_start/agent_end cycle. The loop ends naturally
       // when the agentbox closes the SSE stream after prompt() fully resolves.
     }
+  } catch (err) {
+    // Cancellation must wake a pending network read as well as the event loop.
+    // Preserve the normal Stop finalization below when the transport rejects it.
+    if (!signal?.aborted) throw err;
   } finally {
     await flushTerminalError();
   }

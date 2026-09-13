@@ -53,5 +53,5 @@ ocr:
   enabled: true
 
 agentbox:
-  persistence:
-    enabled: false
+  workspace:
+    mode: local

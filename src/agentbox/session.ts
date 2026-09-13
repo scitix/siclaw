@@ -1,9 +1,14 @@
+import { exportInvestigationRows, restoreInvestigationRows } from "./private-memory-snapshot.js";
+import { privateWorkspaceEnabled, validPrivateId } from "../shared/private-workspace.js";
+import { privateWorkspaceRoots } from "../shared/private-workspace-paths.js";
+import { PrivateWorkspace, captureWorkspaceFiles } from "./private-workspace.js";
+import { capturePiSession, restorePiSession, validatePiSnapshot } from "./pi-session-snapshot.js";
 /**
  * AgentBox session manager
  *
  * Manages multiple sessions within a single AgentBox (a user may have multiple conversations).
  * Reuses createSiclawSession() to create Agents.
- * Supports session persistence via User PV.
+ * Supports session checkpoints through remote private workspaces.
  *
  * The memory indexer is shared at the AgentBox level and reused across sessions.
  * MCP connections are created per-session by createSiclawSession and shut down on release.
@@ -80,7 +85,7 @@ import { ToolResultArtifactStore, toolResultArtifactRoot, formatToolResultArtifa
 import { prepareReduceEvidence } from "./subagent-evidence.js";
 import { finishTargetCoverage } from "./subagent-targets.js";
 import { createSubagentTickets, readSubagentTicket, SubagentMailbox } from "./subagent-lifecycle.js";
-import { openSubagentTranscript } from "./subagent-transcript.js";
+import { MAX_SUBAGENT_TRANSCRIPT_BYTES, openSubagentTranscript } from "./subagent-transcript.js";
 import { runSubagentToAcceptance } from "./subagent-completion.js";
 import { captureSubagentContext, materializeSubagentContext, validateSubagentContextSelection } from "./subagent-context.js";
 import { restoreTaskLedgerFromHistory } from "./task-ledger-recovery.js";
@@ -391,6 +396,204 @@ async function abortBrainBestEffort(
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
   private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string; restoredSession?: SessionManager }>();
+  private privateWorkspace?: PrivateWorkspace;
+  private privateRestore?: Promise<boolean>;
+  private privateLifecycle: Promise<unknown> = Promise.resolve();
+  private privateCheckpoint: Promise<unknown> = Promise.resolve();
+  private privateLearning?: Promise<void>;
+  private privateLearningRequested = false;
+  private promptSetup?: Promise<void>;
+  private shuttingDown = false;
+  private closingAll?: Promise<void>;
+  private piManagers = new Map<string, SessionManager>();
+
+  get isShuttingDown(): boolean { return this.shuttingDown; }
+  get isPreparingPrivatePrompt(): boolean { return !!this.promptSetup; }
+
+  private serializePrivate<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.privateLifecycle.then(operation);
+    this.privateLifecycle = next.catch(() => {});
+    return next;
+  }
+
+  /** Pin the local projection throughout HTTP admission, including async setup. */
+  beginPrivatePromptSetup(): (() => void) | undefined {
+    if (this.shuttingDown || this.promptSetup) return undefined;
+    let finish!: () => void;
+    this.promptSetup = new Promise<void>(resolve => { finish = resolve; });
+    for (const managed of this.sessions.values()) {
+      if (managed._releaseTimer) clearTimeout(managed._releaseTimer);
+      managed._releaseTimer = null;
+    }
+    return () => {
+      finish();
+      this.promptSetup = undefined;
+      for (const managed of this.sessions.values()) {
+        if (managed._promptDone && !managed._promptInflight) this.scheduleRelease(managed.id);
+      }
+    };
+  }
+
+  private privateRoots(): Record<string, string> {
+    return privateWorkspaceRoots(process.cwd(), loadConfig().paths.userDataDir);
+  }
+
+  private async clearPrivateProjectionState(): Promise<void> {
+    const ids = new Set([...this.piManagers.keys(), ...this.sessions.keys()]);
+    for (const id of ids) {
+      const timer = this.ledgerHideTimers.get(id);
+      if (timer) clearTimeout(timer);
+      this.ledgerHideTimers.delete(id);
+    }
+    await Promise.all([...this._modelRouteStatePersists.values()]);
+    for (const id of ids) {
+      await this.persistLedgerSnapshot.drain(id);
+      deleteLedger(id);
+    }
+    this.piManagers.clear();
+    this._sharedMemoryIndexer?.close();
+    this._sharedMemoryIndexer = null;
+    this._sharedKnowledgeIndexer?.close();
+    this._sharedKnowledgeIndexer = null;
+    this._sharedInitialized = false;
+  }
+
+  private openPiManager(id: string, directory: string): SessionManager {
+    if (privateWorkspaceEnabled() && this.piManagers.has(id)) return this.piManagers.get(id)!;
+    const file = path.join(directory, ".pi-session.json");
+    let manager: SessionManager;
+    if (privateWorkspaceEnabled()) {
+      if (fs.existsSync(file)) {
+        manager = restorePiSession(validatePiSnapshot(JSON.parse(fs.readFileSync(file, "utf8")), id), directory, process.cwd());
+      } else {
+        if (fs.existsSync(directory) && fs.readdirSync(directory).some(name => name.endsWith(".jsonl"))) {
+          throw new Error("Private session snapshot is missing; refusing to select a transcript by timestamp");
+        }
+        manager = SessionManager.create(process.cwd(), directory);
+      }
+    } else manager = SessionManager.continueRecent(process.cwd(), directory);
+    if (privateWorkspaceEnabled()) this.piManagers.set(id, manager);
+    return manager;
+  }
+
+  private openSubagentPiManager(id: string, directory: string): SessionManager {
+    if (!privateWorkspaceEnabled()) return openSubagentTranscript(directory);
+    try {
+      const cached = this.piManagers.get(id);
+      const file = path.join(directory, ".pi-session.json");
+      if (!cached) {
+        const dir = fs.lstatSync(directory), stat = fs.lstatSync(file);
+        if (!dir.isDirectory() || dir.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink() ||
+            stat.size > MAX_SUBAGENT_TRANSCRIPT_BYTES) throw new Error("Invalid private transcript");
+      }
+      // A remote resume must keep the selected leaf and the live manager tracked
+      // by checkpoints. Reopening a JSONL by mtime can lose either of them.
+      const snapshot = cached ? capturePiSession(id, cached)
+        : validatePiSnapshot(JSON.parse(fs.readFileSync(file, "utf8")), id);
+      if (Buffer.byteLength(JSON.stringify(snapshot)) > MAX_SUBAGENT_TRANSCRIPT_BYTES ||
+          snapshot.activeLeafId === null ||
+          !snapshot.entries.some(e => e.type === "message" && e.message.role === "assistant")) {
+        throw new Error("Incomplete private transcript");
+      }
+      const manager = cached ?? restorePiSession(snapshot, directory, process.cwd());
+      if (!manager.buildSessionContext().messages.length) throw new Error("Empty restored context");
+      this.piManagers.set(id, manager);
+      return manager;
+    } catch {
+      throw new Error("This child has no valid recoverable private transcript within the 64 MiB resume limit; restore its session data or launch a new task explicitly.");
+    }
+  }
+
+  async checkpointPrivateWorkspace(completed = false): Promise<void> {
+    if (!privateWorkspaceEnabled()) return;
+    const workspace = this.privateWorkspace;
+    const next = this.privateCheckpoint.then(() => {
+      if (!workspace || workspace !== this.privateWorkspace) throw new Error("Private workspace was not restored");
+      return this.checkpointPrivateWorkspaceInner(completed);
+    });
+    this.privateCheckpoint = next.catch(() => {});
+    return next;
+  }
+
+  private async checkpointPrivateWorkspaceInner(completed: boolean): Promise<void> {
+    if (!this.privateWorkspace) throw new Error("Private workspace was not restored");
+    this.privateWorkspace.assertHealthy();
+    // A checkpoint is not a process freezer. Refuse while managed work still
+    // owns outputs, including stopped jobs whose completion callback is pending.
+    if ([...this.sessions.values()].some(s => s._backgroundWorkCount > 0) || this.jobs.list().some(j => j.status === "running")) throw new Error("Private workspace still has active background work");
+    await Promise.all([...this._modelRouteStatePersists.values()]);
+    for (const [id, manager] of this.piManagers) {
+      await Promise.all([this.persistLedgerSnapshot.drain(id), this.taskEventQueue.drain(id)]);
+      // Capture the live ledger/router rather than trusting best-effort disk writes.
+      const ledger = peekLedger(id);
+      if (ledger) fs.writeFileSync(this.ledgerFile(id), JSON.stringify(ledger.snapshot()), { mode: 0o600 });
+      const managed = this.sessions.get(id);
+      if (managed) fs.writeFileSync(this.modelRouteStateFile(id), JSON.stringify(managed.modelRouteState), { mode: 0o600 });
+      fs.writeFileSync(path.join(this.getSessionDir(id), ".pi-session.json"), JSON.stringify(capturePiSession(id, manager)), { mode: 0o600 });
+    }
+    const roots = this.privateRoots();
+    exportInvestigationRows(roots.memory);
+    const files = captureWorkspaceFiles(roots);
+    const pendingPath = `sessions/${this.privateWorkspace.sessionId}/.pending-turn.json`;
+    if (completed) files.delete(pendingPath);
+    await this.privateWorkspace.checkpoint(files);
+    if (completed) {
+      fs.rmSync(path.join(this.getSessionDir(this.privateWorkspace.sessionId), ".pending-turn.json"), { force: true });
+      // Learning is optional and must not turn a committed snapshot into a
+      // reported persistence failure. A later completed turn retries extraction.
+      if (isMemoryEnabled()) this.schedulePrivateLearning();
+    }
+  }
+
+  private schedulePrivateLearning(): void {
+    this.privateLearningRequested = true;
+    if (this.privateLearning || !this.privateWorkspace || this.shuttingDown) return;
+    const workspace = this.privateWorkspace;
+    // Coalesce completed turns while a bounded host classification is running.
+    // Checkpoint completion and the user's final response never await the model.
+    this.privateLearning = (async () => {
+      while (this.privateLearningRequested && workspace === this.privateWorkspace && !this.shuttingDown) {
+        this.privateLearningRequested = false;
+        try { await workspace.learn(); }
+        catch { console.warn("[private-workspace] memory extraction deferred"); break; }
+      }
+    })().finally(() => { this.privateLearning = undefined; });
+  }
+
+  async preparePrivateTurn(sessionId: string, input: { turnId?: string; text?: string; images?: unknown; files?: unknown }): Promise<void> {
+    if (!privateWorkspaceEnabled()) return;
+    if (this.shuttingDown || sessionId !== this.privateWorkspace?.sessionId) throw new Error("Private workspace is not available for this turn");
+    await this.privateWorkspace.validateExecution();
+    if (this.hasUncertainPrivateTurn(sessionId)) throw new Error("A prior turn has an uncertain execution result. Inspect its recovery record before continuing.");
+    if (input.turnId) this.recordAcceptedTurn(sessionId, input.turnId);
+    fs.writeFileSync(path.join(this.getSessionDir(sessionId), ".pending-turn.json"), JSON.stringify({ ...input, state: "execution_uncertain" }), { mode: 0o600 });
+    await this.checkpointPrivateWorkspace();
+  }
+
+  async releaseUncertainPrivateTurn(): Promise<void> {
+    return this.serializePrivate(async () => {
+      if ([...this.sessions.values()].some(s => !s._promptDone || s._promptInflight || s._backgroundWorkCount > 0)) return;
+      const sessionId = this.privateWorkspace?.sessionId;
+      if (sessionId && this.sessions.has(sessionId)) { await this.releaseInner(sessionId); return; }
+      await this.privateWorkspace?.close().catch(() => {});
+      await this.clearPrivateProjectionState();
+      this.privateWorkspace = undefined;
+      this.privateRestore = undefined;
+    });
+  }
+
+  hasUncertainPrivateTurn(sessionId: string): boolean {
+    return privateWorkspaceEnabled() && fs.existsSync(path.join(this.getSessionDir(sessionId), ".pending-turn.json"));
+  }
+
+  async validatePrivateExecution(sessionId: string): Promise<void> {
+    if (!privateWorkspaceEnabled()) return;
+    const managed = this.sessions.get(sessionId);
+    if (!managed || managed._promptDone || sessionId !== process.env.SICLAW_PRIVATE_SESSION_ID ||
+        this.privateWorkspace?.sessionId !== sessionId) throw new Error("Private execution is no longer active");
+    await this.privateWorkspace.validateExecution();
+  }
+
   // Retain the launching request owner until notification, even if Stop/handoff
   // replaces the session's current request before a late child/process exit.
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
@@ -759,11 +962,12 @@ export class AgentBoxSessionManager {
    * sessions are isolated and correctly restored after pod restarts.
    */
   private getSessionDir(sessionId: string): string {
+    if (!validPrivateId(sessionId)) throw new Error("Invalid session identifier");
     const base = this.getBaseSessionDir();
     scheduleToolOutputCleanup(base);
     const dir = path.join(base, sessionId);
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: privateWorkspaceEnabled() ? 0o700 : 0o755 });
     }
     return dir;
   }
@@ -1060,7 +1264,7 @@ export class AgentBoxSessionManager {
           return { status: "launched", jobId: active.jobId, childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle, steered: true };
         }
         // A ticket is not proof of an executed transcript (a queued task may have been skipped).
-        restoredSession = openSubagentTranscript(this.getSessionDir(ticket.childSessionId));
+        restoredSession = this.openSubagentPiManager(ticket.childSessionId, this.getSessionDir(ticket.childSessionId));
         request = { ...request, subagentType: ticket.subagentType, renderedTasks: [{ ...request.renderedTasks[0], childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle }] };
       } else {
         const tickets = await createSubagentTickets(store, request.userId, request.subagentType, request.renderedTasks.length);
@@ -2255,6 +2459,10 @@ export class AgentBoxSessionManager {
    * the TOCTOU documented at the _promptInflight declaration.
    */
   private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
+    // Private mode only executes within the persisted foreground turn. Detached
+    // notifications remain in the chat timeline; they cannot reopen tool execution
+    // after ownership may have moved to another runtime.
+    if (privateWorkspaceEnabled()) return Promise.resolve();
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
@@ -2609,7 +2817,7 @@ export class AgentBoxSessionManager {
   // ── Backend task-ledger durability (design §14) ────────────────────────────
   // The ledger is in-memory (task-ledger.ts), keyed by taskListId == session id.
   // The module map survives session release within a process; these helpers add
-  // a PV-backed snapshot so the plan also survives a full pod/process restart.
+  // a session sidecar included in remote checkpoints for pod/process recovery.
   private ledgerFile(taskListId: string): string {
     return path.join(this.getSessionDir(taskListId), ".plan-ledger.json");
   }
@@ -2664,13 +2872,13 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Best-effort: write the current ledger snapshot to the PV session dir. Writes to a
+   * Best-effort: write the current ledger snapshot to the local session dir. Writes to a
    * unique temp file then atomically renames over the target, so a wide fan-out's
    * interleaved snapshot writes can never leave a half-written / truncated file for a
    * concurrent reader (rehydrate-on-restart) — last writer wins cleanly.
    */
   /**
-   * Snapshot the ledger to the PV, one write in flight per taskListId.
+   * Snapshot the ledger locally, one write in flight per taskListId.
    *
    * Serialisation is a correctness requirement, not a throughput one: write-tmp-then-rename gives no
    * ordering between concurrent pairs, so the rename that lands last wins. One task_event per turn
@@ -2698,7 +2906,7 @@ export class AgentBoxSessionManager {
     }
   });
 
-  /** Restore the ledger from the PV snapshot — only when the in-memory copy is
+  /** Restore the ledger from the session sidecar — only when the in-memory copy is
    *  empty (i.e. after a process restart; a release-survived ledger is kept). */
   private rehydrateLedger(taskListId: string): void {
     const ledger = getOrCreateLedger(taskListId);
@@ -2777,7 +2985,7 @@ export class AgentBoxSessionManager {
     const spawnSpanContext = opts?.spawnSpanContext;
     const childSessionDir = this.getSessionDir(childSessionId);
     const childSessionManager = this.subagentRuns.get(childSessionId)?.restoredSession
-      ?? SessionManager.continueRecent(process.cwd(), childSessionDir);
+      ?? this.openPiManager(childSessionId, childSessionDir);
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
@@ -2807,6 +3015,7 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: "web",
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      privateMemory: this.privateWorkspace,
       knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: request.userId,
       agentId,
@@ -3160,6 +3369,7 @@ export class AgentBoxSessionManager {
       }
     } finally {
       mailbox?.close();
+      if (privateWorkspaceEnabled()) fs.writeFileSync(path.join(childSessionDir, ".pi-session.json"), JSON.stringify(capturePiSession(childSessionId, childSessionManager)), { mode: 0o600 });
       if (childTimer) clearTimeout(childTimer);
       unsubscribe();
       // Shut down only connections this child opened. A manager shared with the
@@ -3268,7 +3478,10 @@ export class AgentBoxSessionManager {
       clearTimeout(managed._releaseTimer);
       managed._releaseTimer = null;
     }
-    await this.release(sessionId);
+    // Reconfiguring the brain does not change the session's durable owner.
+    // Keep the exact Pi manager and lease instead of closing a shared tool source.
+    if (privateWorkspaceEnabled()) await this.releaseInner(sessionId, true);
+    else await this.release(sessionId);
   }
 
   /**
@@ -3319,8 +3532,45 @@ export class AgentBoxSessionManager {
    * HTTP boundary rejects them rather than starting with missing context.
    */
   async ensureSessionContext(sessionId?: string): Promise<boolean> {
+    if (privateWorkspaceEnabled()) return this.serializePrivate(() => this.ensureSessionContextInner(sessionId));
+    return this.ensureSessionContextInner(sessionId);
+  }
+
+  private async ensureSessionContextInner(sessionId?: string): Promise<boolean> {
+    if (this.shuttingDown) throw new Error("AgentBox is shutting down");
     const id = sessionId?.trim();
     if (!id) return false;
+    if (privateWorkspaceEnabled()) {
+      const resident = this.sessions.get(id);
+      if (resident?._releaseTimer) { clearTimeout(resident._releaseTimer); resident._releaseTimer = null; }
+      if (!validPrivateId(id) || id !== process.env.SICLAW_PRIVATE_SESSION_ID || !process.env.SICLAW_PRIVATE_SPACE_ID || !this.gatewayClient) throw new Error("Private session identity mismatch");
+      if (!this.privateRestore) {
+        this.privateWorkspace = new PrivateWorkspace(this.gatewayClient, id, process.env.SICLAW_PRIVATE_SPACE_ID);
+        this.privateRestore = this.privateWorkspace.restore(this.privateRoots()).then(restored => {
+          if (restored) restoreInvestigationRows(this.privateRoots().memory);
+          return restored;
+        });
+      }
+      const workspace = this.privateWorkspace!;
+      try { await this.privateRestore; workspace.assertHealthy(); }
+      catch (error) {
+        // A failed lease must never be rebound under an old brain or while its
+        // tools still own the projection. The current turn will stop on fencing.
+        if (resident && (!resident._promptDone || resident._promptInflight || resident._backgroundWorkCount > 0)) throw error;
+        if (resident) await this.releaseInner(id);
+        else {
+          await workspace.close().catch(() => {});
+          if (this.privateWorkspace === workspace) {
+            await this.clearPrivateProjectionState();
+            this.privateWorkspace = undefined;
+            this.privateRestore = undefined;
+          }
+        }
+        throw error;
+      }
+      if (this.shuttingDown) { workspace.stopExecution(); throw new Error("AgentBox is shutting down"); }
+      return this.hasRestorableSessionContext(id);
+    }
     // Release a completed resident brain before rebuilding its stale transcript.
     // Keep the durable marker until a nonempty history has been written.
     const marker = `${this.getSessionDir(id)}.handoff`;
@@ -3371,7 +3621,7 @@ export class AgentBoxSessionManager {
     const sessionDir = path.join(this.getBaseSessionDir(), id);
     if (!fs.existsSync(sessionDir)) return false;
     try {
-      return SessionManager.continueRecent(process.cwd(), sessionDir).getEntries().some(
+      return this.openPiManager(id, sessionDir).getEntries().some(
         (entry: { type?: string; message?: { role?: string } }) =>
           entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant"),
       );
@@ -3391,8 +3641,27 @@ export class AgentBoxSessionManager {
     handoffSupported = false,
     handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
   ): Promise<ManagedSession> {
+    if (privateWorkspaceEnabled()) return this.serializePrivate(async () => {
+      await this.ensureSessionContextInner(sessionId);
+      return this.getOrCreateInner(sessionId, mode, systemPromptTemplate, activeMode, requestUserId, allowInputRequest, handoffSupported, handoffPolicy);
+    });
+    return this.getOrCreateInner(sessionId, mode, systemPromptTemplate, activeMode, requestUserId, allowInputRequest, handoffSupported, handoffPolicy);
+  }
+
+  private async getOrCreateInner(
+    sessionId?: string,
+    mode?: SessionMode,
+    systemPromptTemplate?: string,
+    activeMode: AgentMode = "normal",
+    requestUserId?: string,
+    allowInputRequest = false,
+    handoffSupported = false,
+    handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
+  ): Promise<ManagedSession> {
+    if (this.shuttingDown) throw new Error("AgentBox is shutting down");
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
+    if (privateWorkspaceEnabled() && (effectiveUserId !== process.env.SICLAW_PRIVATE_USER_ID || id !== process.env.SICLAW_PRIVATE_SESSION_ID)) throw new Error("Private session owner mismatch");
 
     const existing = this.sessions.get(id);
     if (existing) {
@@ -3437,7 +3706,9 @@ export class AgentBoxSessionManager {
         if (
           (existing.activeMode === activeMode && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
-          existing._promptInflight
+          existing._promptInflight ||
+          existing._backgroundWorkCount > 0 ||
+          this.hasPendingNotificationWork(existing)
         ) {
           return existing;
         }
@@ -3467,7 +3738,7 @@ export class AgentBoxSessionManager {
     // NOTE: cwd is the first arg (stored in session header), sessionDir is
     // the second (where JSONL files are stored). Passing sessionDir as cwd
     // caused pi-agent to encode the path and store JSONL in a different dir.
-    const frameworkSessionManager = SessionManager.continueRecent(process.cwd(), sessionDir);
+    const frameworkSessionManager = this.openPiManager(id, sessionDir);
     const isNewSession = frameworkSessionManager.getEntries().length <= 1; // only session header
 
     const config = loadConfig();
@@ -3510,8 +3781,8 @@ export class AgentBoxSessionManager {
         // fresh one or re-adds a deleted task. Batching made that ordinary: one turn now emits
         // several in a single synchronous loop.
         this.taskEventQueue.push(event.taskListId ?? id, { sessionId: id, event });
-        // Snapshot the (shared) ledger to the PV session dir so the backend plan
-        // survives a pod/process restart — keyed by the event's taskListId (the
+        // Snapshot the (shared) ledger in the checkpointed session dir — keyed
+        // by the event's taskListId (the
         // parent's id, even when a sub-agent mutated a task it owns).
         this.persistLedgerSnapshot(event.taskListId ?? id);
         // CC V2 parity: once the whole plan is completed, auto-clear it after a
@@ -3532,7 +3803,7 @@ export class AgentBoxSessionManager {
 
     // Rehydrate the task ledger before the agent runs. The module-level ledger
     // map survives session release within a process; this restores it after a
-    // full pod/process restart from the PV snapshot. taskListId == session id.
+    // full pod/process restart from the restored sidecar. taskListId == session id.
     this.rehydrateLedger(id);
 
     const gc = this.gatewayClient;
@@ -3555,6 +3826,7 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       activeMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      privateMemory: this.privateWorkspace,
       knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: effectiveUserId,
       agentId: this.agentId ?? null,
@@ -3819,8 +4091,10 @@ export class AgentBoxSessionManager {
       const sessionDir = path.join(this.getBaseSessionDir(), sessionId);
       if (!fs.existsSync(sessionDir)) return null;
 
-      const frameworkSessionManager = SessionManager.continueRecent(process.cwd(), sessionDir);
-      const entry = frameworkSessionManager.getEntries()
+      const frameworkSessionManager = privateWorkspaceEnabled()
+        ? this.openPiManager(sessionId, sessionDir) : SessionManager.continueRecent(process.cwd(), sessionDir);
+      const entries = privateWorkspaceEnabled() ? frameworkSessionManager.getBranch() : frameworkSessionManager.getEntries();
+      const entry = entries
         .filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "dp-mode")
         .pop() as { data?: {
           active?: boolean;
@@ -3915,6 +4189,7 @@ export class AgentBoxSessionManager {
    * docs/design/mcp-session-lifecycle.md.
    */
   scheduleRelease(sessionId: string, ttlMs: number = SESSION_RELEASE_TTL_MS): void {
+    if (this.shuttingDown) return;
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
 
@@ -4004,6 +4279,16 @@ export class AgentBoxSessionManager {
   }
 
   async release(sessionId: string): Promise<void> {
+    if (!privateWorkspaceEnabled()) return this.releaseInner(sessionId);
+    return this.serializePrivate(async () => {
+      if (this.promptSetup || this.shuttingDown) return;
+      const current = this.sessions.get(sessionId);
+      if (current && (!current._promptDone || current._promptInflight || current._backgroundWorkCount > 0)) return;
+      await this.releaseInner(sessionId);
+    });
+  }
+
+  private async releaseInner(sessionId: string, preserveWorkspace = false): Promise<void> {
     const managed = this.sessions.get(sessionId);
     if (!managed) {
       // Not resident — but a handed-away session still has to lose its on-disk
@@ -4016,7 +4301,7 @@ export class AgentBoxSessionManager {
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
 
     // 1. Auto-save session memory (dedup: only if new messages since last save)
-    if (isMemoryEnabled()) {
+    if (isMemoryEnabled() && !privateWorkspaceEnabled()) {
       try {
         const sessionDir = this.getSessionDir(sessionId);
         const memoryDir = this.getMemoryDir();
@@ -4054,6 +4339,15 @@ export class AgentBoxSessionManager {
       });
     }
 
+    if (privateWorkspaceEnabled() && !preserveWorkspace) {
+      await this.privateLearning;
+      try { await this.checkpointPrivateWorkspace(); }
+      catch { console.warn("[private-workspace] release retained the last durable checkpoint"); }
+      await this.privateWorkspace?.close().catch(() => {});
+      await this.clearPrivateProjectionState();
+      this.privateWorkspace = undefined;
+      this.privateRestore = undefined;
+    }
     // 3. Remove session from map (shared components remain alive).
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
@@ -4132,6 +4426,15 @@ export class AgentBoxSessionManager {
    * are still NOT destroyed (they belong to the AgentBox).
    */
   async close(sessionId: string): Promise<void> {
+    if (privateWorkspaceEnabled()) {
+      return this.serializePrivate(async () => {
+        const managed = this.sessions.get(sessionId);
+        if (this.promptSetup || (managed && (!managed._promptDone || managed._promptInflight || managed._backgroundWorkCount > 0))) {
+          throw new Error("Private session is still running; stop it before closing");
+        }
+        await this.releaseInner(sessionId);
+      });
+    }
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);
@@ -4188,7 +4491,37 @@ export class AgentBoxSessionManager {
    * Called on AgentBox shutdown.
    */
   async closeAll(): Promise<void> {
+    if (!this.closingAll) this.closingAll = this.closeAllInner();
+    return this.closingAll;
+  }
+
+  private async closeAllInner(): Promise<void> {
+    this.beginShutdown();
+    if (privateWorkspaceEnabled()) {
+      // Admission may still be awaiting the control plane. It will reject new
+      // execution on shutdown; wait before touching its local projection.
+      await this.promptSetup;
+      await this.privateLifecycle;
+    }
     console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
+    if (privateWorkspaceEnabled() && this.privateWorkspace) {
+      await Promise.all([...this.sessions.values()].map(managed => abortBrainBestEffort(managed.brain, `shutdown ${managed.id}`)));
+      const settled = await this.waitPrivateWorkSettled();
+      if (settled) {
+        await this.privateLearning;
+        try { await this.checkpointPrivateWorkspace(); }
+        catch { console.warn("[private-workspace] shutdown retained the last durable checkpoint"); }
+        await this.privateWorkspace.close().catch(() => {});
+      } else {
+        // A stopped job can still be flushing its output. Neither publish a
+        // partial snapshot nor release ownership while that writer survives.
+        this.privateWorkspace.abandon();
+        console.warn("[private-workspace] shutdown work did not drain; retaining the durable checkpoint and lease until expiry");
+      }
+      this.privateWorkspace = undefined;
+      this.privateRestore = undefined;
+      this.piManagers.clear();
+    }
     // Snapshot and clear the map atomically — prevents in-flight release()
     // from emitting a duplicate session_released for the same session.
     const snapshot = new Map(this.sessions);
@@ -4249,9 +4582,34 @@ export class AgentBoxSessionManager {
     this._sharedInitialized = false;
   }
 
+  /** Synchronous admission barrier; call before metrics or network cleanup. */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+    this.privateWorkspace?.stopExecution();
+    for (const managed of this.sessions.values()) {
+      if (managed._releaseTimer) clearTimeout(managed._releaseTimer);
+      managed._releaseTimer = null;
+      if (privateWorkspaceEnabled()) {
+        managed._aborted = true;
+        managed._backgroundWorkTurn?.cancel();
+        this.stopSessionJobs(managed.id);
+      }
+    }
+  }
+
+  private async waitPrivateWorkSettled(): Promise<boolean> {
+    const until = Date.now() + 20_000;
+    do {
+      if ([...this.sessions.values()].every(s => s._promptDone && !s._promptInflight && s._backgroundWorkCount === 0) &&
+          !this.jobs.list().some(job => job.status === "running")) return true;
+      await delay(25);
+    } while (Date.now() < until);
+    return false;
+  }
+
   /**
    * Reset the shared memory indexer.
-   * Called after Gateway has cleared memory files on PVC.
+   * Called after Gateway has cleared local memory files.
    * Gateway deletes the full memory/ directory, including .memory.db, so a
    * live AgentBox must close the old sqlite handle and build a fresh indexer.
    */
@@ -4284,7 +4642,7 @@ export class AgentBoxSessionManager {
     try {
       const memoryDir = this.getMemoryDir();
       this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
-      console.log(`[agentbox-session] Memory indexer rebuilt after PVC cleanup`);
+      console.log(`[agentbox-session] Memory indexer rebuilt after local cleanup`);
     } catch (err) {
       console.warn(`[agentbox-session] Memory indexer rebuild after reset failed:`, err);
     }

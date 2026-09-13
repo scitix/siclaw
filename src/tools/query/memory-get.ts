@@ -1,3 +1,4 @@
+import { createPrivateMemoryGetTool } from "./private-memory.js";
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import fs from "node:fs/promises";
@@ -107,6 +108,10 @@ Parameters:
 
 export const registration: ToolEntry = {
   category: "query",
-  create: (refs) => createMemoryGetTool(refs.memoryDir!),
-  available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer && !!refs.memoryDir,
+  create: (refs) => {
+    if (refs.privateMemory) return createPrivateMemoryGetTool(refs.privateMemory, refs.turnRef);
+    if (process.env.SICLAW_WORKSPACE_MODE === "remote") throw new Error("Private memory backend is unavailable");
+    return createMemoryGetTool(refs.memoryDir!);
+  },
+  available: (refs) => isMemoryEnabled() && (!!refs.privateMemory || (process.env.SICLAW_WORKSPACE_MODE !== "remote" && !!refs.memoryIndexer && !!refs.memoryDir)),
 };
