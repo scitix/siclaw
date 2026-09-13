@@ -251,16 +251,15 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
     },
   };
 
-  // The llm block belongs to llm_incident. Once the type has resolved to a
-  // non-LLM one, a stray region or model would be read by first-line support as
-  // an established fact, so the block must be empty. While the type is still
-  // `unknown` the agent may already have heard the region or model name and
-  // needs somewhere to record it, so `unknown` is exempt.
-  if (result.info.ticket_type !== "llm_incident" && result.info.ticket_type !== "unknown") {
+  // Unknown intake may temporarily retain user-stated LLM details. A final
+  // unknown handoff keeps those clues in description/evidence instead: typed
+  // LLM fields must not imply that an LLM incident has been established.
+  const gatheringUnknown = !result.label && result.info.ticket_type === "unknown";
+  if (result.info.ticket_type !== "llm_incident" && !gatheringUnknown) {
     const { region, aspect, model } = result.info.llm;
     if (region !== "" || aspect !== "" || model !== "") {
       throw new Error(
-        "input.info.llm fields must be empty unless ticket_type is llm_incident or unknown",
+        "input.info.llm fields must be empty unless ticket_type is llm_incident or label=false with ticket_type=unknown; preserve unclassified clues in description and evidence",
       );
     }
   }
