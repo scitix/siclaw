@@ -1,4 +1,4 @@
-import { PRIVATE_WORKSPACE_PATH, type WorkspaceRequest } from "../shared/private-workspace.js";
+import { PRIVATE_WORKSPACE_PATH, WorkspaceTransportError, type WorkspaceRequest } from "../shared/private-workspace.js";
 /**
  * Gateway Client for AgentBox
  *
@@ -48,7 +48,11 @@ export class GatewayClient {
 
   async exchange<T>(request: WorkspaceRequest): Promise<T> {
     if (!this.tlsOptions) throw new Error("Private workspace requires authenticated transport");
-    return this.request(PRIVATE_WORKSPACE_PATH, "POST", request, 90_000) as Promise<T>;
+    // Bound the whole renewal, including connect/TLS and response reads, so a
+    // stalled request cannot occupy all subsequent 30-second renewal slots.
+    const renewing = request.action === "renew";
+    return this.request(PRIVATE_WORKSPACE_PATH, "POST", request, renewing ? 10_000 : 90_000,
+      renewing ? AbortSignal.timeout(10_000) : undefined) as Promise<T>;
   }
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
@@ -250,6 +254,8 @@ export class GatewayClient {
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
   private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000, signal?: AbortSignal): Promise<any> {
+    const privateRequest = path === PRIVATE_WORKSPACE_PATH;
+    const transportError = () => new WorkspaceTransportError();
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -279,6 +285,9 @@ export class GatewayClient {
         res.on("data", (chunk: string) => {
           data += chunk;
         });
+        // An interrupted response may never emit end. In private mode it must
+        // reject the pending renewal so a later interval can retry.
+        if (privateRequest) res.on("error", () => reject(transportError()));
 
         res.on("end", () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
@@ -290,21 +299,21 @@ export class GatewayClient {
               const json = JSON.parse(data);
               resolve(json);
             } catch (err) {
-              reject(new Error(`Failed to parse JSON response: ${data}`));
+              reject(new Error(privateRequest ? "Invalid private workspace response" : `Failed to parse JSON response: ${data}`));
             }
           } else {
-            reject(new Error(`Gateway returned ${res.statusCode}: ${data}`));
+            reject(privateRequest ? new WorkspaceTransportError(res.statusCode) : new Error(`Gateway returned ${res.statusCode}: ${data}`));
           }
         });
       });
 
       req.on("error", (err: Error) => {
-        reject(new Error(`Gateway request failed: ${err.message}`));
+        reject(privateRequest ? transportError() : new Error(`Gateway request failed: ${err.message}`));
       });
 
       req.setTimeout(timeoutMs, () => {
         req.destroy();
-        reject(new Error("Gateway request timeout"));
+        reject(privateRequest ? transportError() : new Error("Gateway request timeout"));
       });
 
       if (body) {

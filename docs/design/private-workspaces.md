@@ -25,7 +25,9 @@ Sandbox may read `user-data/files` (directories 2750, files 0640), while only th
 trusted agent process writes durable content. Session trees, configuration and
 credentials remain private. Ordinary file writes/edits in remote mode are confined
 to `files`. File tools reject links and paths writable by another UID, group or
-the world; `/tmp` is not a remote file-tool root. Sandboxed processing uses scratch
+the world. On Linux, trusted owners are root and the actual agent process UID;
+changing that UID never disables permission checks, and an unavailable UID refuses
+access. `/tmp` is not a remote file-tool root. Sandboxed processing uses scratch
 and returns its results through tool output. This prevents a sandbox writer from
 swapping parents between trusted path checks and writes. Skills come from the existing trusted configuration/release path;
 workspace restore has no skill, configuration, tool-registration or permission
@@ -56,8 +58,18 @@ commit uses the same operation and content. Unpublished objects are unreachable;
 there is no distributed OSS/database transaction.
 
 Lease duration is 120 seconds. The worker uses a conservative 90-second local
-validity window, renews every 30 seconds and revalidates before/after tools. Failure
-blocks subsequent work and durable publication. Moving a live session may wait for
+validity window, renews every 30 seconds and revalidates before/after tools. Each
+renewal has a 10-second transport deadline. Transport failures and classified
+temporary service errors leave the existing deadline unchanged, allowing a later
+renewal to succeed before it expires. A failed tool validation still refuses that
+tool call. Explicit conflict/denial, invalid or unclassified negative replies, and
+local expiry permanently fence the executor; a late successful reply cannot revive
+it. Authorization lookups that cannot establish permission remain denials. The
+host must emit structured RPC errors (`code`, `retriable`, `status`, safe `message`):
+conflict 409, denial 403, invalid request 400, temporary service failure 503. Both
+Runtime and AgentBox preserve the distinction without forwarding private details.
+Checkpoint failures still block subsequent work and durable publication.
+Moving a live session may wait for
 release or expiry; storage outages never trigger empty-history fallback. A failed
 restore can be retried after connectivity or ownership recovers.
 

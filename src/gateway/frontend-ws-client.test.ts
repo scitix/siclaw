@@ -485,6 +485,31 @@ describe("FrontendWsClient", () => {
 
   // ── close() rejects pending RPCs ─────────────────────────────
 
+  it.each(["legacy conflict", { code: "INTERNAL", message: "legacy conflict" }])("keeps unclassified workspace rejections terminal: %j", async error => {
+    const client = await createClient();
+    const connecting = client.connect(), ws = openLatestWs();
+    await connecting;
+    const response = client.request("workspace.exchange", { action: "renew" });
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({ type: "res", id: frame.id, ok: false, error }));
+    await expect(response).rejects.toMatchObject({ code: "INTERNAL_ERROR", retriable: false, message: "legacy conflict" });
+    client.close();
+  });
+
+  it.each([
+    { code: "CONFLICT", status: 409, retriable: false, message: "execution changed" },
+    { code: "SERVICE_UNAVAILABLE", status: 503, retriable: true, message: "temporary outage" },
+  ])("preserves structured inbound $code errors", async detail => {
+    const client = await createClient();
+    const connecting = client.connect(), ws = openLatestWs();
+    await connecting;
+    const response = client.request("workspace.exchange", { action: "renew" });
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({ type: "res", id: frame.id, ok: false, error: detail }));
+    await expect(response).rejects.toMatchObject(detail);
+    client.close();
+  });
+
   it("close() rejects all pending RPCs", async () => {
     const client = await createClient();
 
