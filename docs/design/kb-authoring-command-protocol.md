@@ -176,6 +176,20 @@ inside that window, ControlPlane's operation/generation and artifact-write fence
 remain the safety boundary; the same command may be redelivered to a rehydrated
 box, but stale generations cannot commit.
 
+## Cancellation confirmation
+
+The consumer fences its domain operation before sending `capability.cancel`.
+Runtime makes the execution terminal before stopping its box, preventing new
+commands during cleanup. A terminal run record therefore does not establish
+that the box was stopped: deletion can fail after the terminal write succeeds.
+
+The consumer must retry the explicitly addressed run even when it is terminal.
+Runtime resolves that run's stored profile on every cleanup retry, including
+after restart, without reviving execution or reattaching its relay. Missing
+addressing, a store failure, or a failed box stop returns an error. Only a
+successful stop of the correctly addressed box, including an already-absent
+box, returns `stop_confirmed=true`. These rules apply to either compiler engine.
+
 ## Rolling migration
 
 Existing message-prefix detection remains a temporary compatibility adapter for
