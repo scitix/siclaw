@@ -362,3 +362,37 @@ Final compatibility check: single-message detail preserves legacy JSON text up
 to the same byte budget, so malformed structured metadata can still fall back.
 Oversized detail text is suppressed. The 259 affected Portal checks and backend
 build passed after this adjustment.
+
+### Remaining boundary: tool budget and storage budget
+
+The tool now checks the shared 1 MiB serialized UTF-8 ceiling before returning
+its result to the model or capturing an output artifact. This prevents previews
+above that ceiling from claiming they can be viewed or copied. It does **not**
+make tool acceptance a guarantee that the host will persist the package.
+
+For MySQL, `preparePreviewWrite` uses this per-message limit, in bytes:
+
+```text
+max(1024, min(1048576, floor(max_allowed_packet / 2) - otherBytes - 32768))
+otherBytes = utf8Bytes(content) + utf8Bytes(tool_input)
+```
+
+With a 1 MiB packet and small content/input, a 600 KiB preview can pass the tool
+check and still be omitted by the writer. With a 4 MiB packet and the same small
+columns, the shared 1 MiB ceiling is the tighter limit. The earlier 4 MiB
+database acceptance did not exercise the first case. The 1/4 MiB packet unit
+cases in `src/portal/skill-preview-storage.test.ts` cover both writer outcomes;
+they do not establish live-model agreement under the smaller packet limit.
+
+On a late omission, the writer replaces the history metadata and content with
+an omission notice, but it cannot retract a success summary already delivered
+to the model in the current turn. Metadata added downstream and expansion
+during redaction can also cause a late omission. These remain known limits of
+the model/panel consistency fix.
+
+Closing the capacity gap requires the host to derive a conservative effective
+preview budget and pass it through Runtime configuration to AgentBox, reserving
+space for the other columns, envelope metadata and escaping. AgentBox must not
+import the database layer to discover that budget. The host still needs its
+write-time guard for capacity changes and unexpected expansion. This budget
+propagation is follow-up work, not implemented by the shared-ceiling check.

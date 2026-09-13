@@ -553,6 +553,17 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 | `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
 
+Skill draft previews enforce a shared ceiling of 1 MiB, measured as
+serialized UTF-8 JSON (including file projections and escaping). A package
+that exceeds it returns an error and an `omitted` preview notice to the model
+before artifact capture. A recoverable tool-output artifact does not promise
+that a chat panel can display its files. Passing this check keeps full files in
+the tool details; it does not confirm persistence. The host may impose a lower
+MySQL packet budget, and later metadata or redaction expansion can exceed the
+remaining budget. Those paths can still omit the preview after the model has
+seen a success summary. See the [preview budget boundary](../completion/2026-09-10-remove-tui.md#remaining-boundary-tool-budget-and-storage-budget)
+for the effective limit and the configuration work needed to close that gap.
+
 ### allowedTools — Built-in and File-Tool Availability Axis
 
 `allowedTools` is the control over registry tools and framework file tools after

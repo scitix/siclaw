@@ -9,7 +9,7 @@ import { ConversationClient, supportsConversations } from "../conversation-clien
 
 import { AssistantItemStream } from "../assistant-item-stream.js";
 import { assistantTextBlocks } from "../../shared/assistant-items.js";
-import { persistableToolDetails, traceVisualIds } from "../../shared/tool-result-metadata.js";
+import { persistableToolDetails, toolResultOutcome, traceVisualIds } from "../../shared/tool-result-metadata.js";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
@@ -3385,9 +3385,7 @@ export async function collectChannelResponse(
           const resultText = Array.isArray(ev.result?.content)
             ? ev.result.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("")
             : "";
-          let outcome: "success" | "error" | "blocked" = "success";
-          if (ev.result?.details?.blocked) outcome = "blocked";
-          else if (ev.result?.details?.error) outcome = "error";
+          const outcome = toolResultOutcome(ev.result?.details, ev.isError);
           const key = toolKey(ev, name);
           const input = shiftQ(toolInputs, key) || "";
           const start = shiftQ(toolStarts, key);

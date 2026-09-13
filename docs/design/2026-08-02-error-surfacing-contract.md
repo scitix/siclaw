@@ -153,6 +153,13 @@ consumer behaviour on the strength of it.
 
 ## Consequences
 
+Tool-call failures have two representations: the event's `isError` flag for a
+thrown failure, and `result.details.error` for a returned tool error. Either
+must persist as `outcome: error` in Web and channel history, even if the other
+flag is absent or false. An explicit `details.blocked` retains the more specific
+`blocked` outcome. These are individual tool outcomes, not failed-turn render
+signals; they must not manufacture a `stream_error` for the whole turn.
+
 - Adding a render path for a new error-shaped event means asking whether it is
   a fact or an instruction. If a consumer must decide *whether* to show
   something, the decision belongs in `sse-consumer.ts`, where suppression and
