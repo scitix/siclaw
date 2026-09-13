@@ -122,8 +122,8 @@ description: >-
           skill: { ...parsed, type },
           summary: `Skill preview for '${parsed.name}'. Click View to inspect and copy.`,
         };
-        // Decide whether the panel can retain the package before the model sees
-        // a success summary or artifact capture replaces it with a text preview.
+        // Enforce the shared ceiling before model output and artifact capture.
+        // The host's packet budget or redaction may still require a later omission.
         const details = boundSkillPreviewMetadata({ skillPreview: result });
         if ("status" in details.skillPreview && details.skillPreview.status === "omitted") {
           return {
@@ -139,7 +139,7 @@ description: >-
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           // Chat persists details independently of the model's bounded text.
-          // Accepted previews remain complete after artifact capture and reload.
+          // Keep full files here; persistence applies its own remaining limits.
           details,
         };
       } finally {
