@@ -126,6 +126,7 @@ class PiAgentClient:
                 "cwd": self.cwd, "state_dir": self._state.name,
                 "system_prompt": self.system_prompt,
                 "model": self.config["model"], "api_key": self.config["api_key"],
+                "executor_role": self.config.get("role", "compile"),
                 "auth_header": self.config.get("auth_header", True),
                 "headers": self.config.get("headers", {}),
                 "thinking_level": self.config.get("thinking_level", "off"),
@@ -211,7 +212,7 @@ class PiAgentClient:
                     if task:
                         task.cancel()
                     continue
-                if kind not in {"activity", "assistant", "tool_start", "tool_end", "model_request", "model_envelope", "result"}:
+                if kind not in {"activity", "assistant", "tool_start", "tool_end", "model_request", "model_envelope", "model_usage", "result"}:
                     raise AgentTransportError("Pi worker returned an unknown event")
                 if kind == "result":
                     if frame.get("outcome") not in {"completed", "failed", "aborted"} or self._executions:

@@ -156,6 +156,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
   }
 
   private promptOpen = false;
+  private usageRequestId = "";
   private promptExplicit = false;
   private promptReceivedAt?: number;
   private round = 0;
@@ -177,6 +178,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
     // fires later from inside the routing runner and must not reset the rounds.
     if (this.promptOpen && this.promptExplicit && !opts?.explicit) return;
     this.promptOpen = true;
+    this.usageRequestId = randomUUID();
     this.promptExplicit = opts?.explicit === true;
     this.promptReceivedAt = receivedAt ?? this.now();
     this.round = 0;
@@ -301,7 +303,7 @@ export class LlmCallRecorder implements LlmCallPromptBoundary {
       const provider = call.modelProvider ?? "";
       const identity = this.usageIdentities.get(provider) ?? { configId: "", name: call.modelId ?? "",
         sourceKind: "unknown" as const, sourceId: "", sourceName: "" };
-      call.observation = { schemaVersion: 1, callId: randomUUID(), phase: "started", ...this.usageSink.context(),
+      call.observation = { schemaVersion: 1, callId: randomUUID(), phase: "started", requestId: this.usageRequestId, ...this.usageSink.context(),
         requestAt: iso(call.requestAt), kind: call.kind, routingAttempt: this.attempt,
         model: { ...identity, requestedId: call.modelId ?? "", runtimeProvider: provider } };
       this.emitUsage(call.observation);

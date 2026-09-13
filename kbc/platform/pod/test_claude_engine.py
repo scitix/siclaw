@@ -107,6 +107,14 @@ async def test_selected_claude_executes_host_tools_and_records_observations(tmp_
         assert events[-1].data["outcome"] == "completed"
         assert events[-1].data["tool_calls"] == 2
         assert len(requests) == 3
+        usage = [e["data"]["observation"] for e in observed if e["kind"] == "model_usage"]
+        finished = [e for e in usage if e["phase"] == "finished"]
+        assert len(finished) == len(requests)
+        assert len({e["callId"] for e in finished}) == len(requests)
+        assert all(e["executorRole"] == "compile" for e in finished)
+        assert all(e["usageEvidence"]["finality"] == "terminal" for e in finished)
+        assert all(e["usageEvidence"]["rawUsage"]["input_tokens"] == 42 for e in finished)
+        assert all(e["usageEvidence"]["rawUsage"]["output_tokens"] == 8 for e in finished)
         assert {"ready", "model_request", "model_envelope", "assistant", "tool_start", "tool_end", "result"} <= {e["kind"] for e in observed}
         assert "fixture-private-key" not in json.dumps(observed)
         assert "Synthetic retention" not in json.dumps(observed)
