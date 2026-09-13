@@ -1382,7 +1382,9 @@ describe("knowledgeHandler multi-repo identity", () => {
         fs.mkdirSync(path.dirname(path.join(sourceDir, file)), { recursive: true });
         fs.writeFileSync(path.join(sourceDir, file), `---\ntype: Topic\ntitle: ${pageTitle}\nlabels:\n${labels}---\n# ${pageTitle}\n`);
       }
-      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "."]);
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "index.md", ...pages.map(([file]) => file)], {
+        env: { ...process.env, COPYFILE_DISABLE: "1" },
+      });
       return fs.readFileSync(archive).toString("base64");
     } finally {
       fs.rmSync(sourceDir, { recursive: true, force: true });

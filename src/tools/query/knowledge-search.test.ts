@@ -35,6 +35,9 @@ describe("knowledge_search", () => {
     }
     fs.writeFileSync(path.join(knowledgeDir, "index.md"),
       `# Knowledge Index\n\n- [[repos/a/index]] - ${otherName} v1\n- [[repos/b/index]] - ${selectedName} v1\n`);
+    fs.writeFileSync(path.join(knowledgeDir, ".citation-manifest.json"), JSON.stringify({
+      repos: [{ root: "repos/a" }, { root: "repos/b" }],
+    }));
     await resolver.sync();
 
     const tool = createKnowledgeSearchTool(resolver);
@@ -663,5 +666,60 @@ describe("knowledge_search on a multi-library mount", () => {
     const list = JSON.parse((await tool.execute("c-single-list", { listLibraries: true })).content[0].text as string);
     expect(list.multiLibrary).toBe(false);
     expect(list.libraries).toEqual([expect.objectContaining({ library: "", index: "index.md", pageCount: 1 })]);
+  });
+
+  it.each([true, false])("preserves single-library scoring across section indexes (manifest present: %s)", async (withManifest) => {
+    if (withManifest) {
+      fs.writeFileSync(path.join(knowledgeDir, ".citation-manifest.json"), JSON.stringify({ repos: [{ root: "" }] }));
+    }
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [Section A](a/index.md)\n- [Section B](b/index.md)\n");
+    for (const section of ["a", "b"]) {
+      fs.mkdirSync(path.join(knowledgeDir, section));
+      const files = section === "a" ? ["one.md", "two.md"] : ["three.md"];
+      fs.writeFileSync(path.join(knowledgeDir, section, "index.md"), files.map(file => `- [Entry](${file})`).join("\n"));
+      for (const file of files) page(`${section}/${file}`, "Entry", "  - facet: topic\n    value: Widget\n");
+    }
+    await resolver.sync();
+    const tool = createKnowledgeSearchTool(resolver);
+    const payload = JSON.parse((await tool.execute("section-search", { query: "Widget" })).content[0].text as string);
+    expect(payload).not.toHaveProperty("routing");
+    expect(payload).not.toHaveProperty("libraries");
+    expect(payload.results).toHaveLength(3);
+    for (const row of payload.results) {
+      expect(row).not.toHaveProperty("library");
+      expect(row.matchedLabels).toEqual([{ facet: "topic", value: "Widget", matchedBy: "Widget", pageCount: 3 }]);
+    }
+    const list = JSON.parse((await tool.execute("section-libraries", { listLibraries: true })).content[0].text as string);
+    expect(list.multiLibrary).toBe(false);
+    expect(list.libraries).toEqual([expect.objectContaining({ library: "", pageCount: 3 })]);
+  });
+
+  it("reports only actual omissions when short descriptions and trails need no trimming", async () => {
+    const labels = Array.from({ length: 32 }, (_, i) =>
+      `  - facet: topic\n    value: Term${i}${"x".repeat(85)}\n    aliases: [shared]\n`).join("");
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [One](one.md)\n- [Two](two.md)\n- [Three](three.md)\n");
+    for (const name of ["one", "two", "three"]) page(`${name}.md`, name, labels);
+    await resolver.sync();
+    const tool = createKnowledgeSearchTool(resolver);
+    const payload = JSON.parse((await tool.execute("omissions", { query: "shared" })).content[0].text as string);
+    expect(payload.results).toHaveLength(3);
+    expect(payload.omitted).toEqual(["every result compacted; Read a path for its full page"]);
+  });
+
+  it("warns when both selected libraries fall within the routing margin", async () => {
+    fs.writeFileSync(path.join(knowledgeDir, ".citation-manifest.json"), JSON.stringify({ repos: [{ root: "a" }, { root: "b" }] }));
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a/index]] - Extra More v1\n- [[b/index]] - Library B v1\n");
+    for (const library of ["a", "b"]) {
+      fs.mkdirSync(path.join(knowledgeDir, library));
+      fs.writeFileSync(path.join(knowledgeDir, library, "index.md"), "- [One](one.md)\n- [Two](two.md)\n- [Three](three.md)\n");
+      for (const file of ["one", "two", "three"]) page(`${library}/${file}.md`, file, "  - facet: topic\n    value: Widget Extra More\n");
+    }
+    await resolver.sync();
+    const tool = createKnowledgeSearchTool(resolver);
+    const payload = JSON.parse((await tool.execute("near-tie", { query: "Widget Extra More", topK: 1 })).content[0].text as string);
+    expect(payload.routing.selected).toEqual(["a", "b"]);
+    expect(payload.routing.margin).toBeGreaterThan(0.1);
+    expect(payload.routing.margin).toBeLessThanOrEqual(0.15);
+    expect(payload.message).toContain("Several libraries match about equally");
   });
 });

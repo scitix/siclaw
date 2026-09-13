@@ -1,5 +1,6 @@
 import * as k8s from "@kubernetes/client-node";
 import { createHash } from "node:crypto";
+import { KB_BOX_PROFILE_NAMES } from "../agentbox/box-profile.js";
 
 interface PendingObservation {
   observation: ContainerObservation;
@@ -59,7 +60,7 @@ function termination(value: k8s.V1ContainerStateTerminated | undefined): Contain
 export function containerObservation(pod: k8s.V1Pod, source: ContainerObservation["source"], prefix: string): ContainerObservation | undefined {
   const profile = pod.metadata?.labels?.[`${prefix}/boxType`];
   const runId = pod.metadata?.labels?.[`${prefix}/agent`];
-  if (!profile?.startsWith("kb-") || !runId || !pod.metadata?.uid || !pod.metadata.name || !pod.metadata.namespace) return;
+  if (!profile || !KB_BOX_PROFILE_NAMES.includes(profile) || !runId || !pod.metadata?.uid || !pod.metadata.name || !pod.metadata.namespace) return;
   const groups = [
     { role: "container" as const, specs: pod.spec?.containers, statuses: pod.status?.containerStatuses },
     { role: "init" as const, specs: pod.spec?.initContainers, statuses: pod.status?.initContainerStatuses },
@@ -196,7 +197,7 @@ export class ContainerEvidenceQueue {
 
 export function observeContainerLifecycle(kc: k8s.KubeConfig, api: k8s.CoreV1Api, namespace: string, prefix: string,
   send: (observation: ContainerObservation) => Promise<unknown>) {
-  const selector = `${prefix}/app=agentbox,${prefix}/boxType in (kb-compile,kb-compile-codex,kb-compile-pi,kb-test)`;
+  const selector = `${prefix}/app=agentbox,${prefix}/boxType in (${KB_BOX_PROFILE_NAMES.join(",")})`;
   const informer = k8s.makeInformer<k8s.V1Pod>(kc, `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`,
     () => api.listNamespacedPod({ namespace, labelSelector: selector }), selector);
   const queue = new ContainerEvidenceQueue(send);

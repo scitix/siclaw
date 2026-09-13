@@ -15,6 +15,8 @@ state or heartbeat time.
 
 A namespace informer records additions, updates and deletions. Before explicit
 cleanup, the last cached snapshot is also recorded without delaying deletion.
+The list/watch selector and snapshot projection use the same KB profile names,
+derived from the registered BoxProfile factories; unknown profiles are excluded.
 One RPC is in flight at a time, with a 3 second transport deadline. Pending and
 reconnect backlogs each retain at most 256 observations; acknowledged dedupe
 retains at most 1024 keys. A full backlog evicts a previously declined snapshot

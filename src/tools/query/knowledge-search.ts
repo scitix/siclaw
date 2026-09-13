@@ -3,7 +3,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import type { ToolEntry } from "../../core/tool-registry.js";
 import type { KnowledgeResolver } from "../../knowledge/resolver.js";
-import { KNOWLEDGE_LABEL_FACETS } from "../../knowledge/labels.js";
+import { KNOWLEDGE_LABEL_FACETS, LIBRARY_ROUTE_MARGIN } from "../../knowledge/labels.js";
 
 interface KnowledgeSearchParams {
   query?: string;
@@ -54,12 +54,19 @@ const COMPACT_MATCHED_LABELS = 1;
 
 function compactRow(row: RenderedResult): RenderedResult {
   const proof = row.routeProof as { reachable: true; trail: unknown[] } | undefined;
+  const description = typeof row.description === "string"
+    ? truncateUtf16Safe(row.description, COMPACT_DESCRIPTION_CHARS) : row.description;
+  const matchedLabels = Array.isArray(row.matchedLabels) && row.matchedLabels.length > COMPACT_MATCHED_LABELS
+    ? row.matchedLabels.slice(0, COMPACT_MATCHED_LABELS) : row.matchedLabels;
+  const routeProof = proof && proof.trail.length > 1
+    ? { reachable: true, trail: [proof.trail[proof.trail.length - 1]] } : row.routeProof;
+  if (row.labels === undefined && description === row.description && matchedLabels === row.matchedLabels && routeProof === row.routeProof) return row;
   return {
     ...row,
     labels: undefined,
-    description: typeof row.description === "string" ? truncateUtf16Safe(row.description, COMPACT_DESCRIPTION_CHARS) : row.description,
-    matchedLabels: Array.isArray(row.matchedLabels) ? row.matchedLabels.slice(0, COMPACT_MATCHED_LABELS) : row.matchedLabels,
-    routeProof: proof && proof.trail.length > 1 ? { reachable: true, trail: [proof.trail[proof.trail.length - 1]] } : row.routeProof,
+    description,
+    matchedLabels,
+    routeProof,
   };
 }
 
@@ -84,36 +91,31 @@ function fitResultsToBudget(
   const omitted: string[] = [];
   let rows = results;
   if (measure(rows) <= budget) return { results: rows, omitted };
-  if (rows.some((row, index) => index >= KEEP_FULL_RESULTS && row.labels !== undefined)) {
-    rows = rows.map((row, index) => index >= KEEP_FULL_RESULTS ? { ...row, labels: undefined } : row);
-    omitted.push(`labels beyond the top ${KEEP_FULL_RESULTS} results`);
-    if (measure(rows) <= budget) return { results: rows, omitted };
-  }
-  rows = rows.map((row) => typeof row.description === "string" && row.description.length > 200
+  const trim = (transform: (row: RenderedResult, index: number) => RenderedResult, description: string): boolean => {
+    const next = rows.map(transform);
+    if (next.some((row, index) => row !== rows[index])) {
+      rows = next;
+      omitted.push(description);
+    }
+    return measure(rows) <= budget;
+  };
+  if (trim((row, index) => index >= KEEP_FULL_RESULTS && row.labels !== undefined ? { ...row, labels: undefined } : row,
+    `labels beyond the top ${KEEP_FULL_RESULTS} results`)) return { results: rows, omitted };
+  if (trim((row) => typeof row.description === "string" && row.description.length > 200
     ? { ...row, description: truncateUtf16Safe(row.description, 200) }
-    : row);
-  omitted.push("descriptions shortened to 200 characters");
-  if (measure(rows) <= budget) return { results: rows, omitted };
-  rows = rows.map((row, index) => index < KEEP_FULL_RESULTS ? row : rootAndLeaf(row));
-  omitted.push(`catalog trails reduced to root and leaf beyond the top ${KEEP_FULL_RESULTS} results`);
-  if (measure(rows) <= budget) return { results: rows, omitted };
-  if (rows.some((row) => row.labels !== undefined)) {
-    rows = rows.map((row) => ({ ...row, labels: undefined }));
-    omitted.push("labels on every result; matchedLabels are kept");
-    if (measure(rows) <= budget) return { results: rows, omitted };
-  }
-  rows = rows.map(rootAndLeaf);
-  omitted.push("catalog trails reduced to root and leaf on every result");
-  if (measure(rows) <= budget) return { results: rows, omitted };
-  rows = rows.map((row, index) => index < KEEP_FULL_RESULTS ? row : compactRow(row));
-  omitted.push(`results beyond the top ${KEEP_FULL_RESULTS} compacted to path, title, score, one matched label, ` +
-    `a ${COMPACT_DESCRIPTION_CHARS}-character description and the catalog leaf`);
-  if (measure(rows) <= budget) return { results: rows, omitted };
-  rows = rows.map(compactRow);
-  omitted.push("every result compacted; Read a path for its full page");
-  if (measure(rows) <= budget) return { results: rows, omitted };
+    : row, "descriptions shortened to 200 characters")) return { results: rows, omitted };
+  if (trim((row, index) => index < KEEP_FULL_RESULTS ? row : rootAndLeaf(row),
+    `catalog trails reduced to root and leaf beyond the top ${KEEP_FULL_RESULTS} results`)) return { results: rows, omitted };
+  if (trim((row) => row.labels !== undefined ? { ...row, labels: undefined } : row,
+    "labels on every result; matchedLabels are kept")) return { results: rows, omitted };
+  if (trim(rootAndLeaf, "catalog trails reduced to root and leaf on every result")) return { results: rows, omitted };
+  if (trim((row, index) => index < KEEP_FULL_RESULTS ? row : compactRow(row),
+    `results beyond the top ${KEEP_FULL_RESULTS} compacted to path, title, score, one matched label, ` +
+    `a ${COMPACT_DESCRIPTION_CHARS}-character description and the catalog leaf`)) return { results: rows, omitted };
+  if (trim(compactRow, "every result compacted; Read a path for its full page")) return { results: rows, omitted };
+  const countBeforeTruncation = rows.length;
   while (rows.length > KEEP_FULL_RESULTS && measure(rows) > budget) rows = rows.slice(0, -1);
-  omitted.push(`results truncated to ${rows.length}; raise topK deliberately if you need more`);
+  if (rows.length < countBeforeTruncation) omitted.push(`results truncated to ${rows.length}; raise topK deliberately if you need more`);
   return { results: rows, omitted };
 }
 
@@ -259,11 +261,10 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
         const results = fitted.results.map((row) =>
           Object.fromEntries(Object.entries(row).filter(([, v]) => v !== undefined)) as RenderedResult & { score: number });
         const hasMore = result.matchedPages > results.length;
-        // Two libraries scoring within 0.1 of each other is a routing tie whether
-        // both were selected or none was: the Agent should compare domains (or
-        // search each library) before reading a leaf from the wrong one.
+        // Use the routing margin for ambiguity too, including weak routes where
+        // neither library met the confidence floor.
         const crossLibraryTie = multiLibrary && result.libraries.length > 1 && !library &&
-          result.libraries[0].score - result.libraries[1].score < 0.1;
+          result.routing.margin !== null && result.routing.margin <= LIBRARY_ROUTE_MARGIN;
         const weakOrAmbiguous = results.length > 0 && (
           results[0].score < 0.7 ||
           (hasMore && results.length > 1 && results[0].score - results[1].score < 0.05) ||

@@ -286,7 +286,7 @@ function pageScore(
 /** Weakest library score that still counts as a confident route. */
 const LIBRARY_ROUTE_MIN_SCORE = 0.55;
 /** A library within this gap of the best one is routed to as well. */
-const LIBRARY_ROUTE_MARGIN = 0.15;
+export const LIBRARY_ROUTE_MARGIN = 0.15;
 const TOP_LABELS_PER_FACET = 3;
 
 /** Terms a library's name/domain contribute to routing, split on punctuation only (CJK stays whole). */
@@ -363,8 +363,8 @@ export class KnowledgeLabelIndex {
     this.invalidLabeledPages = invalidLabeledPages;
     this.unlabeledPages = unlabeledPages;
 
-    // Library dimension: roots from the materializer manifest (or the root
-    // catalog's library links), each page assigned by path prefix. A
+    // Library dimension: roots from the materializer manifest, each page
+    // assigned by path prefix. A
     // single-library mount collapses to one root "" so every consumer can treat
     // "one library" and "no library dimension" the same way.
     this.libraries = discoverKnowledgeLibraries(this.knowledgeDir);
@@ -572,7 +572,6 @@ export class KnowledgeLabelIndex {
       const score = pages.length === 0 && domainScore === 0
         ? 0
         : Math.min(1, 0.7 * bestPage + 0.1 * density + 0.2 * domainScore);
-      if (score === 0 && !multiLibrary) continue;
       if (score === 0) continue;
       libraries.push({ ...library, score: Math.round(score * 1000) / 1000, why, matchedPages: pages.length, pages: pages.slice(0, topK) });
     }
@@ -587,7 +586,8 @@ export class KnowledgeLabelIndex {
       return { libraries, routing: { multiLibrary, selected: [], fallback: candidates.length > 0, margin } };
     }
     const selected = libraries
-      .filter((library) => library.score >= LIBRARY_ROUTE_MIN_SCORE && top - library.score <= LIBRARY_ROUTE_MARGIN)
+      .filter((library) => library.score >= LIBRARY_ROUTE_MIN_SCORE &&
+        Math.round((top - library.score) * 1000) / 1000 <= LIBRARY_ROUTE_MARGIN)
       .map((library) => library.root);
     return { libraries, routing: { multiLibrary, selected, fallback: false, margin } };
   }

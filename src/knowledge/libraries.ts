@@ -45,7 +45,7 @@ function libraryRootFromLink(target: string): string | null {
   return withoutIndex;
 }
 
-/** Roots the materializer declared, "" meaning the root library. Empty when no manifest. */
+/** Roots the materializer declared, "" meaning the root library; null without a usable manifest. */
 export function readManifestLibraryRoots(knowledgeDir: string): string[] | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(path.join(knowledgeDir, CITATION_MANIFEST), "utf-8")) as {
@@ -80,7 +80,7 @@ export function parseRootCatalogLibraries(rootIndex: string): Map<string, Omit<K
 
 /**
  * Discover the libraries of a mount. Returns a single entry with root "" for a
- * single-library mount (or a mount without manifest and without library links),
+ * single-library mount (including legacy flat mounts without a manifest),
  * so callers can treat "one library" and "no library dimension" identically.
  */
 export function discoverKnowledgeLibraries(knowledgeDir: string): KnowledgeLibraryInfo[] {
@@ -89,9 +89,10 @@ export function discoverKnowledgeLibraries(knowledgeDir: string): KnowledgeLibra
   const fromCatalog = parseRootCatalogLibraries(rootIndex);
   const manifestRoots = readManifestLibraryRoots(knowledgeDir);
 
-  const roots = manifestRoots && manifestRoots.some((root) => root !== "")
-    ? manifestRoots.filter((root) => root !== "")
-    : [...fromCatalog.keys()];
+  // A section index is navigation inside a library, not evidence of a separate
+  // mount. Only the materializer can declare library boundaries. Legacy CLI
+  // materialization is flat and writes no manifest, so it remains one library.
+  const roots = [...new Set(manifestRoots ?? [])];
 
   if (roots.length === 0) {
     return [{ root: "", name: "", domain: "", version: null }];

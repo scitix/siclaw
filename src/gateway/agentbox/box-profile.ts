@@ -155,6 +155,11 @@ const BUILTIN_PROFILES: Record<string, () => BoxProfile> = {
   "kb-test": kbTestProfile,
 };
 
+/** Registered KB profiles shared by Pod selection and status projection. */
+export const KB_BOX_PROFILE_NAMES: readonly string[] = Object.freeze(
+  Object.keys(BUILTIN_PROFILES).filter((name) => name.startsWith("kb-")),
+);
+
 /**
  * Resolve a BoxProfile by name. Env-derived fields (e.g. the compile image) are
  * read at call time.

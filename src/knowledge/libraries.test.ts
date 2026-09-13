@@ -52,4 +52,12 @@ describe("knowledge libraries", () => {
     expect(libraryRootForFile("repos/a/x.md", roots)).toBe("repos/a");
     expect(libraryRootForFile("elsewhere/x.md", roots)).toBe("");
   });
+
+  it.each([true, false])("keeps section indexes in one library (manifest present: %s)", (withManifest) => {
+    if (withManifest) {
+      fs.writeFileSync(path.join(dir, ".citation-manifest.json"), JSON.stringify({ repos: [{ root: "" }] }));
+    }
+    fs.writeFileSync(path.join(dir, "index.md"), "- [Section A](a/index.md)\n- [Section B](b/index.md)\n");
+    expect(discoverKnowledgeLibraries(dir)).toEqual([{ root: "", name: "", domain: "", version: null }]);
+  });
 });

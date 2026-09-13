@@ -216,9 +216,17 @@ Runtime persists the reply/artifacts and the run-state transition before
 acknowledging delivery. The last committed event id is included in the opaque
 run checkpoint, so a Runtime restart can acknowledge an already committed turn
 without replaying its reply or resetting a newer turn to idle. The consumer's
-assistant-turn sink must support adjacent retries after a lost persistence
-response; the existing authoring sink provides this deduplication. Artifact
-batch ACKs remain independent durability barriers and still precede event ACKs.
+assistant-turn sink must support retries after a lost persistence response.
+There is also a crash window between saving a turn and committing its event id:
+after process restart the turn write can repeat. The existing authoring sink
+compares trimmed reply content with the most recent assistant reply in the same
+organization, repository and attempt; it does not use a durable event-id key.
+Consequently, separate identical replies can also be suppressed by that sink.
+This protocol provides at-least-once persistence delivery, not exactly-once
+assistant-message creation across process crashes. Distinguishing separate
+identical turns requires a consumer contract with a durable turn/event identity.
+Artifact batch ACKs remain independent durability barriers and still precede
+event ACKs.
 
 Turn and run-checkpoint writes each have a fixed 120-second retry window, with
 backoff from 250 milliseconds up to 5 seconds. Only the failed persistence phase
@@ -231,16 +239,40 @@ Cancellation stops nonterminal retries. If the write still cannot be committed,
 delivery fails without an event ACK; a terminal outcome already selected stays
 terminal while reconciliation retries its persistence.
 
+Artifact persistence and `/artifacts/ack` retain their earlier retry policy:
+250-millisecond to 5-second backoff without a separate elapsed-time cap while
+the run remains nonterminal. They block delivery of later events so a later
+completion cannot expose a draft whose preceding artifact batch was not saved.
+Cancellation, termination and the run-manager's stale-activity watchdog bound
+this wait; retry attempts do not refresh activity. Only after the artifact batch
+and its ACK succeed does the 120-second run-checkpoint window begin. The
+120-second cap above therefore does not cover the entire `syncArtifacts` event.
+
 A legacy box that omits the handshake keeps its prior stream behavior; Runtime
 does not automatically reconnect that stream after a transport failure. Runtime
 adoption also requires the handshake before accepting replayed events. A live
 legacy stream cannot switch to acknowledged delivery, because its discarded
 history cannot be reconstructed. A new Runtime/box pair enables the protocol
-without a deployment setting. Reconnect attempts are bounded per run; they are
-not reset by replay traffic. Reliable streams ending without an end frame are
-transport failures, not evidence of successful completion.
+without a deployment setting. Each invocation of the Runtime session driver has
+six reconnect attempts; replay traffic does not reset that budget. A new driver
+invocation, including adoption after a Runtime restart, starts a new budget.
+Reliable streams ending without an end frame are transport failures, not
+evidence of successful completion.
 
 An upgrade or rollback across this protocol boundary cannot safely adopt an
 in-flight legacy Runtime/box pair. Drain active compiles before rollout, or plan
 for their interruption and recovery from the last persisted workspace in a new
 pair. There is no transparent in-place conversion of discarded legacy events.
+
+### Images and rollout order
+
+Deploy the compatible recovery-context producer and diagnostic receiver before
+the Runtime. This delivery changes three image roles: Runtime, compiler box
+(`SICLAW_COMPILE_BOX_IMAGE`) and conversational AgentBox
+(`SICLAW_AGENTBOX_IMAGE`). The AgentBox image contains the knowledge discovery,
+library routing and mount materialization changes; rebuilding only Runtime and
+the compiler box does not update those features. Rebuild and configure all
+affected images, drain active compiles across the protocol boundary, and recycle
+existing conversational AgentBox Pods after updating their image reference.
+`imagePullPolicy: Always` applies when a Pod is created; it does not replace
+code inside an already running Pod.

@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import { containerObservation, ContainerEvidenceQueue, observeContainerLifecycle } from "./container-evidence.js";
+import { getBoxProfile, KB_BOX_PROFILE_NAMES } from "../agentbox/box-profile.js";
 
-const watch = vi.hoisted(() => ({ handlers: new Map<string, (pod: unknown) => void>(), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), get: vi.fn() }));
-vi.mock("@kubernetes/client-node", () => ({ makeInformer: () => ({ ...watch, on: (event: string, cb: (pod: unknown) => void) => watch.handlers.set(event, cb) }) }));
+const watch = vi.hoisted(() => ({ handlers: new Map<string, (pod: unknown) => void>(), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), get: vi.fn(), factory: vi.fn() }));
+vi.mock("@kubernetes/client-node", () => ({ makeInformer: (...args: unknown[]) => {
+  watch.factory(...args);
+  return { ...watch, on: (event: string, cb: (pod: unknown) => void) => watch.handlers.set(event, cb) };
+} }));
 
 function pod(): k8s.V1Pod {
   return {
@@ -15,9 +19,29 @@ function pod(): k8s.V1Pod {
   };
 }
 const flush = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
-afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); watch.handlers.clear(); watch.start.mockReset().mockResolvedValue(); watch.get.mockReset(); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); watch.handlers.clear(); watch.start.mockReset().mockResolvedValue(); watch.get.mockReset(); watch.factory.mockReset(); });
 
 describe("container evidence", () => {
+  it("uses registered profiles consistently for listing, watching and projecting Pods", async () => {
+    const api = { listNamespacedPod: vi.fn(async () => ({ items: [] })) };
+    const observer = observeContainerLifecycle({} as k8s.KubeConfig, api as unknown as k8s.CoreV1Api, "work", "test", vi.fn());
+    try {
+      const [, , list, selector] = watch.factory.mock.calls[0];
+      await list();
+      expect(api.listNamespacedPod).toHaveBeenCalledWith({ namespace: "work", labelSelector: selector });
+      expect(selector).toBe(`test/app=agentbox,test/boxType in (${KB_BOX_PROFILE_NAMES.join(",")})`);
+      for (const name of KB_BOX_PROFILE_NAMES) {
+        expect(getBoxProfile(name).name).toBe(name);
+        const candidate = pod();
+        candidate.metadata!.labels!["test/boxType"] = name;
+        expect(containerObservation(candidate, "observed", "test")?.profile).toBe(name);
+      }
+      expect(selector).not.toContain("kb-compile-pi");
+    } finally {
+      await observer.stop();
+    }
+  });
+
   it("keeps all container roles, previous exits and immutable image/Pod identities without content", () => {
     const snapshot = containerObservation(pod(), "deleted", "test")!;
     expect(snapshot).toMatchObject({ run_id: "run-1", pod_uid: "pod-1", source: "deleted", node_name: "node-1" });
@@ -27,6 +51,8 @@ describe("container evidence", () => {
     const replaced = pod(); replaced.metadata!.uid = "pod-2";
     expect(containerObservation(replaced, "observed", "test")!.pod_uid).toBe("pod-2");
     replaced.metadata!.labels!["test/boxType"] = "agent";
+    expect(containerObservation(replaced, "observed", "test")).toBeUndefined();
+    replaced.metadata!.labels!["test/boxType"] = "kb-unknown";
     expect(containerObservation(replaced, "observed", "test")).toBeUndefined();
   });
 

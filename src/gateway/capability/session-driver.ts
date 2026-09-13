@@ -83,7 +83,7 @@ export interface DriveCapabilitySessionOptions {
 }
 
 export interface StreamReconnectPolicy {
-  /** Reconnect attempts per run before the relay gives up and fails the run. */
+  /** Reconnect attempts per driver invocation before the relay fails the run. */
   maxAttempts: number;
   baseDelayMs: number;
   maxDelayMs: number;
@@ -91,7 +91,7 @@ export interface StreamReconnectPolicy {
   isBoxAlive: (client: AgentBoxClient) => Promise<boolean>;
 }
 
-// Six attempts per run with 2s→60s backoff allow 122 seconds of backoff
+// Six attempts per driver invocation with 2s→60s backoff allow 122 seconds of backoff
 // in total; the run-manager's data-stale watchdog still bounds a box that is
 // alive but silent. A box that answers /health is worth reconnecting to — the
 // alternative (relay_failed → stop the box) throws away the whole in-flight
