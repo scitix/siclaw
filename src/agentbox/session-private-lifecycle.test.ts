@@ -393,3 +393,25 @@ it("does not let a release-survived plan override a newer checkpoint from anothe
     expect(getOrCreateLedger("sid")).not.toBe(ledger);
   } finally { await manager.closeAll(); }
 });
+
+it("does not delay checkpoint completion for memory classification and drains it before release", async () => {
+  const { manager, create } = await fixture();
+  try {
+    await create();
+    _memoryEnabled = true;
+    const source = (manager as any).privateWorkspace;
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const learn = vi.spyOn(source, "learn").mockReturnValue(pending);
+    await manager.checkpointPrivateWorkspace(true);
+    expect(learn).toHaveBeenCalledOnce();
+    // The completed checkpoint is available even with the classifier blocked.
+    let released = false;
+    const release = manager.release("sid").then(() => { released = true; });
+    await Promise.resolve();
+    expect(released).toBe(false);
+    finish();
+    await release;
+    expect(released).toBe(true);
+  } finally { _memoryEnabled = false; await manager.closeAll(); }
+});

@@ -50,19 +50,68 @@ export interface WorkspaceCommit extends WorkspaceBinding {
 }
 
 export type WorkspaceRequest = {
-  action: "acquire" | "renew" | "release" | "put" | "get" | "commit" | "learn" | "memory_search";
+  action: "acquire" | "renew" | "release" | "put" | "get" | "commit" | "learn" | "memory_search" | "memory_read";
   sessionId: string;
   incarnation: string;
   binding?: WorkspaceBinding;
   commit?: WorkspaceCommit;
   objectId?: string;
   data?: string;
-  query?: string;
+  search?: MemorySearchRequest;
+  read?: MemoryReadRequest;
 };
 
+/** Virtual document paths never designate files, object keys, or skills. */
+export interface MemorySearchRequest {
+  queries: string[];
+  match_mode?: "any" | "all";
+  scope?: string;
+  cursor?: string;
+  context_lines?: number;
+  max_results?: number;
+}
+export interface MemorySearchMatch {
+  path: string;
+  kind: string;
+  scope?: string;
+  claim?: string;
+  content: string;
+  content_start_line_number: number;
+  truncated: boolean;
+  matched_queries: string[];
+  source_session_id: string;
+  source_entry_id: string;
+  created_at: number;
+  expires_at: number;
+}
+export interface MemorySearchPage {
+  matches: MemorySearchMatch[];
+  next_cursor?: string;
+  truncated: boolean;
+  enabled: boolean;
+}
+export interface MemoryReadRequest {
+  path: string;
+  line_offset?: number;
+  max_lines?: number;
+  char_offset?: number;
+}
+export interface MemoryReadPage {
+  path: string;
+  found: boolean;
+  content: string;
+  start_line_number: number;
+  next_char_offset?: number;
+  truncated: boolean;
+  source_session_id?: string;
+  source_entry_id?: string;
+  created_at?: number;
+  expires_at?: number;
+}
 export interface PrivateMemorySource {
   validateExecution?(): Promise<void>;
-  search(query: string): Promise<{ records: Array<{ id: string; kind: string; text: string; sourceSessionId: string; sourceEntryId: string; expiresAt: number }> }>;
+  search(request: MemorySearchRequest): Promise<MemorySearchPage>;
+  read(request: MemoryReadRequest): Promise<MemoryReadPage>;
 }
 
 export function privateWorkspaceEnabled(): boolean {

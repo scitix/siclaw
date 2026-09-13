@@ -206,14 +206,46 @@ failed writes block execution instead of turning into an empty deduplication set
 
 Remote memory is queried as historical evidence through `memory_search/get`.
 It is not injected as a PROFILE/system instruction and cannot create skills.
-The first implementation extracts exact, explicitly requested user memories and
-paired, explicitly successful `host_list`/`cluster_list` observations from the
-committed active Pi branch. Assistant prose and arbitrary script results are not
-promoted into facts. Source entries, snapshot references, observation time and
-expiry accompany every record. The seven-day expiry uses the original event time;
-repeated extraction cannot make old evidence fresh again.
-The host checks expiry again after object reads, so a slow recall cannot return
-an observation that expired while its body was being fetched.
+After a completed checkpoint, a coalesced background request asks the trusted
+host to select useful exact user quotes from the committed active Pi branch.
+Checkpoint completion does not await the classifier. Normal release and graceful
+shutdown drain an in-flight request; interrupted extraction retries on a later
+completed turn. The host must reject execution-pending snapshots and select its
+own configured model; the worker cannot submit a replacement memory body.
+
+Compatible hosts admit lasting preferences, scoped conventions and natural user
+corrections, and skip routine tool inventories, temporary state, assistant claims
+and arbitrary script results. Generated summaries aid retrieval; source quotes
+and current evidence remain necessary when wording or exceptions matter. New
+records expire 90 days after the original event. Old records retain their original
+expiry. The host publishes scoped replacement relationships atomically and excludes
+superseded records from search and ID reads, including when the newer source loses
+access. Source entries, snapshot references and event times remain attached.
+
+Search is selective, not mandatory for every task. It returns at most five short
+source excerpts; source quotes are read through memory_get only when useful. Both tools
+share a 16 KiB per-turn budget and have an 8 KiB per-call output cap, counted in
+UTF-8 bytes. Repeated results in the same turn return virtual paths, while still rechecking
+the authority. The next turn can re-read; this is not a context-wide token budget.
+Empty queries do not load arbitrary history. An unavailable service is an error,
+not evidence that a user has no memory. The host rechecks expiry, supersession and
+generation after object reads.
+
+The remote tools use independent search/read backend contracts, inspired by the
+Codex memory extension's search/read APIs. Search takes 1–4 relevance query clauses
+(total 1000 UTF-8 bytes), any/all clause matching, optional exact scope, a cursor,
+0–5 context lines and at most five matches. Unlike Codex's substring same-line/window
+modes, these are relevance clauses. Matches expose literal source excerpts, virtual
+`memory/<id>.md` handles, source line numbers, provenance and expiration.
+
+`memory_get` calls `memory_read` directly, with a 1-based line offset and at most
+200 lines (default 40); it never encodes an ID as a search query. A character cursor
+continues oversized lines without losing text. Search cursors are bound to the
+query, generation and authorized result set; changes require a fresh search.
+Unknown fields are rejected. Neither tool can write memory or access physical
+paths. An unavailable remote backend cannot fall back to local file/FTS memory.
+Local mode retains its separate file memory implementation. Upgrade the host before
+Runtime and AgentBox; hosts retain the old query form only for rolling compatibility.
 
 The host rechecks user membership, source-session visibility and agent access on
 recall. Forgetting disables extraction and advances an independent memory generation,

@@ -122,7 +122,7 @@ it("refuses work before acquire and after close, including old tool references",
   await workspace.acquire();
   await workspace.close();
   await expect(workspace.validateExecution()).rejects.toThrow(/closed/);
-  await expect(workspace.search("anything")).rejects.toThrow(/closed/);
+  await expect(workspace.search({ queries: ["anything"] })).rejects.toThrow(/closed/);
   await expect(workspace.checkpoint(new Map())).rejects.toThrow(/closed/);
   await expect(workspace.acquire()).rejects.toThrow(/closed/);
 });
@@ -278,4 +278,19 @@ it.each(["expired", "fenced"])("does not revive an %s lease after a delayed succ
     finish(); await validation;
     await expect(workspace.acquire()).rejects.toThrow(/recovery/);
   } finally { finish(); await workspace.close(); }
+});
+
+it("routes structured search and independent reads without a synthetic search query", async () => {
+  const store = new Store(), original = store.exchange.bind(store), requests: WorkspaceRequest[] = [];
+  store.exchange = async request => { requests.push(request); return original(request); };
+  const workspace = new PrivateWorkspace(store, "sid", "space");
+  try {
+    await workspace.acquire();
+    const search = { queries: ["harbor"], scope: "harbor", cursor: "page", max_results: 2 };
+    const read = { path: `memory/${"a".repeat(64)}.md`, line_offset: 2, max_lines: 3 };
+    await workspace.search(search); await workspace.read(read);
+    expect(requests[1]).toMatchObject({ action: "memory_search", search });
+    expect(requests[2]).toMatchObject({ action: "memory_read", read });
+    expect(requests[2]).not.toHaveProperty("query");
+  } finally { await workspace.close(); }
 });

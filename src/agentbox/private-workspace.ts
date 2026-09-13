@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   WORKSPACE_OBJECT_BYTES, WORKSPACE_MAX_OBJECTS, WorkspaceTransportError,
   type WorkspaceBinding, type WorkspaceObjectRef, type WorkspaceRequest,
+  type MemorySearchRequest, type MemorySearchPage, type MemoryReadRequest, type MemoryReadPage,
 } from "../shared/private-workspace.js";
 
 export interface WorkspaceTransport { exchange<T>(request: WorkspaceRequest): Promise<T> }
@@ -172,9 +173,18 @@ export class PrivateWorkspace {
 
   async learn(): Promise<void> { this.assertHealthy(); await this.request("learn"); }
 
-  async search(query: string): Promise<{ records: Array<{ id: string; kind: string; text: string; sourceSessionId: string; sourceEntryId: string; expiresAt: number }> }> {
+  async search(search: MemorySearchRequest): Promise<MemorySearchPage> {
     this.assertHealthy();
-    return this.request("memory_search", { query });
+    const result = await this.request<MemorySearchPage>("memory_search", { search });
+    this.assertHealthy();
+    return result;
+  }
+
+  async read(read: MemoryReadRequest): Promise<MemoryReadPage> {
+    this.assertHealthy();
+    const result = await this.request<MemoryReadPage>("memory_read", { read });
+    this.assertHealthy();
+    return result;
   }
 
   private async get(ref: WorkspaceObjectRef): Promise<Buffer> {
