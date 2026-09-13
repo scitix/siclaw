@@ -81,6 +81,15 @@ reachability set. Do not grant version-deletion permission merely to run it.
 
 ## Placement and release checks
 
+An AgentBox crash can leave its event connection silent without closing TCP.
+Runtime cancels pending event reads when Stop is requested and rejects a read
+after 60 seconds without data or a heartbeat. This ends the client stream; it
+does not acknowledge an uncertain execution or release the crashed writer's
+lease. A replacement writer can still wait up to 120 seconds for that lease.
+Review and acknowledge the exact committed revision before clearing an
+`execution_uncertain` marker. Recovery archives the marker and never replays
+the interrupted input automatically.
+
 Existing spaces keep their assigned backend when changing Runtime or its default
 storage setting. Cross-bucket migration is not implemented. `placementEpoch` has
 no production update entry point; future migration must advance it transactionally

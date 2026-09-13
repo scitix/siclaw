@@ -469,8 +469,8 @@ export class AgentBoxClient {
    *
    * Returns an AsyncIterable that can be iterated with for-await-of.
    */
-  async *streamEvents(sessionId: string): AsyncIterable<unknown> {
-    yield* this.streamPath(`/api/stream/${sessionId}`);
+  async *streamEvents(sessionId: string, opts?: { signal?: AbortSignal }): AsyncIterable<unknown> {
+    yield* this.streamPath(`/api/stream/${sessionId}`, opts);
   }
 
   /**
@@ -478,7 +478,31 @@ export class AgentBoxClient {
    * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
    * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
    */
-  async *streamPath(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+  async *streamPath(path: string, opts?: { onComment?: () => void; signal?: AbortSignal; idleTimeoutMs?: number }): AsyncIterable<unknown> {
+    const controller = new AbortController();
+    const signal = opts?.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal;
+    // A removed pod can leave TCP open without further data. Bound each pending
+    // read, including headers; heartbeat comments count as activity. Do not time
+    // out a caller while it is persisting an event yielded by this iterator.
+    const read = async <T>(operation: () => Promise<T>): Promise<T> => {
+      const timer = setTimeout(() => controller.abort(new Error("AgentBox event stream stopped sending heartbeats")), opts?.idleTimeoutMs ?? 60_000);
+      timer.unref();
+      try { return await operation(); }
+      catch (err) { throw controller.signal.aborted ? controller.signal.reason : err; }
+      finally { clearTimeout(timer); }
+    };
+    try {
+      yield* this.streamPathInner(path, { ...opts, signal, read });
+    } finally {
+      controller.abort();
+    }
+  }
+
+  private async *streamPathInner(path: string, opts: {
+    onComment?: () => void;
+    signal: AbortSignal;
+    read: <T>(operation: () => Promise<T>) => Promise<T>;
+  }): AsyncIterable<unknown> {
     const url = `${this.endpoint}${path}`;
 
     // Use https.request for HTTPS with mTLS
@@ -487,9 +511,10 @@ export class AgentBoxClient {
       return;
     }
 
-    const resp = await fetch(url, {
+    const resp = await opts.read(() => fetch(url, {
       headers: { Accept: "text/event-stream" },
-    });
+      signal: opts.signal,
+    }));
 
     if (!resp.ok) {
       throw new Error(`Stream request failed: ${resp.status}`);
@@ -507,7 +532,7 @@ export class AgentBoxClient {
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await opts.read(() => reader.read());
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -531,7 +556,7 @@ export class AgentBoxClient {
             // SSE comment — the box's keep-alive. Callers that watchdog on data
             // events can opt in to hear it (a healthy-but-quiet compile must not
             // be reaped as stale); it is never yielded as an event.
-            opts?.onComment?.();
+            opts.onComment?.();
           }
         }
       }
@@ -540,6 +565,7 @@ export class AgentBoxClient {
       throw err;
     } finally {
       console.log(`[agentbox-client] SSE closed path=${path} (${eventCount} events)`);
+      await reader.cancel().catch(() => {});
       reader.releaseLock();
     }
   }
@@ -547,10 +573,14 @@ export class AgentBoxClient {
   /**
    * SSE stream over HTTPS with mTLS, on an arbitrary path.
    */
-  private async *streamPathHttps(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+  private async *streamPathHttps(path: string, opts: {
+    onComment?: () => void;
+    signal: AbortSignal;
+    read: <T>(operation: () => Promise<T>) => Promise<T>;
+  }): AsyncIterable<unknown> {
     const urlObj = new URL(path, this.endpoint);
 
-    const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    const res = await opts.read(() => new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
       const req = https.request(
         {
           hostname: urlObj.hostname,
@@ -559,14 +589,16 @@ export class AgentBoxClient {
           method: "GET",
           headers: { Accept: "text/event-stream" },
           agent: this.httpsAgent!,
+          signal: opts.signal,
         },
         resolve,
       );
       req.on("error", reject);
       req.end();
-    });
+    }));
 
     if (res.statusCode !== 200) {
+      res.destroy();
       throw new Error(`Stream request failed: ${res.statusCode}`);
     }
 
@@ -580,7 +612,10 @@ export class AgentBoxClient {
     let eventCount = 0;
 
     try {
-      for await (const chunk of res) {
+      const iterator = res[Symbol.asyncIterator]();
+      while (true) {
+        const { done, value: chunk } = await opts.read(() => iterator.next());
+        if (done) break;
         // TLS chunks are arbitrary byte boundaries. A stateful decoder preserves
         // multi-byte UTF-8 characters that straddle two chunks.
         buffer += decoder.decode(chunk, { stream: true });
@@ -605,7 +640,7 @@ export class AgentBoxClient {
             // SSE comment — the box's keep-alive. Callers that watchdog on data
             // events can opt in to hear it (a healthy-but-quiet compile must not
             // be reaped as stale); it is never yielded as an event.
-            opts?.onComment?.();
+            opts.onComment?.();
           }
 
           newlineIndex = buffer.indexOf("\n", newlineSearchFrom);
@@ -620,6 +655,7 @@ export class AgentBoxClient {
       throw err;
     } finally {
       console.log(`[agentbox-client] SSE closed (HTTPS) path=${path} (${eventCount} events)`);
+      res.destroy();
     }
   }
 
