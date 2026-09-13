@@ -1,0 +1,192 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Ticket retrospective result v0.1",
+  "description": "Result contract for the independent post-closure ticket review assistant. The complete serialized result must fit within 24576 UTF-8 bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ticket_id",
+    "ticket_type",
+    "requirement_kind",
+    "type",
+    "result",
+    "review_status",
+    "evidence",
+    "open_questions"
+  ],
+  "properties": {
+    "ticket_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Current task ticket ID, preserved exactly."
+    },
+    "ticket_type": {
+      "enum": [
+        "incident",
+        "requirement",
+        "consultation",
+        null
+      ],
+      "description": "Classify the current ticket first. Model API incidents are incident too. Unknown cause does not erase a known incident classification."
+    },
+    "requirement_kind": {
+      "enum": [
+        "governance",
+        "product",
+        null
+      ],
+      "description": "For requirements only: governance repairs or remediates an existing module for its owner; product requests product functionality from its product manager. Use null when unresolved or not a requirement."
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Short concrete category name in the requested language. Free text; use a pending-classification name if unknown."
+    },
+    "result": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Evidence-based retrospective: issue, cause or actual disposition, handling and verification. Separate confirmed facts from inferences. Closed does not mean the cause is known or a feature shipped."
+    },
+    "review_status": {
+      "enum": [
+        "ready",
+        "needs_review"
+      ],
+      "description": "ready means an evidence-sufficient machine draft, never human approval. Unknown or inferred cause, incomplete material or unresolved conflict requires needs_review. An explicitly deferred or rejected request may be ready."
+    },
+    "evidence": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "id"
+        ],
+        "properties": {
+          "source": {
+            "enum": [
+              "ticket",
+              "ticket_comment",
+              "operate_log",
+              "group_message",
+              "attachment"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        }
+      },
+      "description": "References to content actually read for this ticket; links alone are not evidence. This stateless validator cannot verify source existence."
+    },
+    "open_questions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "description": "Specific material gaps or unresolved questions for the reviewer. Empty only when ready."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ticket_type": {
+            "enum": [
+              "incident",
+              "consultation",
+              null
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "requirement_kind": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ticket_type": {
+            "const": null
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "review_status": {
+            "const": "needs_review"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ticket_type": {
+            "const": "requirement"
+          },
+          "requirement_kind": {
+            "const": null
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "review_status": {
+            "const": "needs_review"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {
+            "const": "ready"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "minItems": 1
+          },
+          "open_questions": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {
+            "const": "needs_review"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "open_questions": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

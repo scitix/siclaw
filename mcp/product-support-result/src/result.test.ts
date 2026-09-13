@@ -86,21 +86,23 @@ describe("parseProductSupportResult", () => {
         )).toThrow(/requires info\.product/);
   });
 
-  it("rejects unresolved ticket-ready results", () => {
-    expect(() =>
-        parseProductSupportResult(
-          validResult({
-            info: {
-              ticket_type: "unknown",
-              product: "",
-              summary: "Needs support",
-              description: "The request cannot be resolved automatically.",
-              evidence: [],
-              missing_fields: [],
-              llm: emptyLlm(),
-            },
-          }),
-        )).toThrow(/resolved ticket_type/);
+  it("preserves an unknown type when the user declines clarification and requests handoff", () => {
+    const result = parseProductSupportResult({
+      label: true,
+      info: {
+        ticket_type: "unknown",
+        product: "",
+        summary: "User requests human support",
+        description: "After one clarification, the user cannot describe the issue and declines further questions. Type and product remain unknown.",
+        evidence: ["User explicitly requested human support."],
+        missing_fields: [],
+      },
+    });
+
+    expect(result.label).toBe(true);
+    expect(result.info.ticket_type).toBe("unknown");
+    expect(result.info.product).toBe("");
+    expect(result.info.llm).toEqual(emptyLlm());
   });
 
   it("requires a boolean label", () => {
@@ -259,6 +261,16 @@ describe("parseProductSupportResult", () => {
       },
     });
     expect(result.info.llm.region).toBe("domestic");
+  });
+
+  it.each([
+    { region: "domestic", aspect: "", model: "" },
+    { region: "", aspect: "network", model: "" },
+    { region: "", aspect: "", model: "example-model" },
+  ])("rejects LLM-specific fields in a final unknown handoff: %j", (llm) => {
+    const input = validResult();
+    input.info = { ...(input.info as Record<string, unknown>), ticket_type: "unknown", llm };
+    expect(() => parseProductSupportResult(input)).toThrow(/llm fields must be empty/);
   });
 
   it("mirrors the advertised schema: enum values are exact and length applies to the raw string", () => {

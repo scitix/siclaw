@@ -112,7 +112,7 @@ describe("product support result MCP", () => {
     });
   });
 
-  it("fails closed for an invalid handoff", async () => {
+  it("returns an unknown type for a final handoff after clarification is declined", async () => {
     await withClient(async (client) => {
       const response = await client.callTool(
         {
@@ -123,7 +123,7 @@ describe("product support result MCP", () => {
               ticket_type: "unknown",
               product: "",
               summary: "Needs support",
-              description: "User requested support.",
+              description: "User cannot describe the issue, declines further clarification, and requests human support.",
               evidence: [],
               missing_fields: [],
               llm: { region: "", aspect: "", model: "" },
@@ -133,8 +133,41 @@ describe("product support result MCP", () => {
         CallToolResultSchema,
       );
 
-      expect(response.isError).toBe(true);
-      expect(response.structuredContent).toBe(undefined);
+      expect(response.isError).toBeUndefined();
+      expect(response.structuredContent).toMatchObject({
+        label: true,
+        info: { ticket_type: "unknown", product: "", missing_fields: [] },
+      });
+    });
+  });
+
+  it("rejects final results with outstanding clarification or an empty description", async () => {
+    await withClient(async (client) => {
+      for (const patch of [
+        { missing_fields: ["issue_description"] }, { description: " " },
+        { llm: { region: "domestic", aspect: "", model: "" } },
+        { llm: { region: "", aspect: "network", model: "" } },
+        { llm: { region: "", aspect: "", model: "example-model" } },
+      ]) {
+        const response = await client.callTool({
+          name: TOOL_NAME,
+          arguments: {
+            label: true,
+            info: {
+              ticket_type: "unknown",
+              product: "",
+              summary: "User requests human support",
+              description: "User declined further clarification.",
+              evidence: [],
+              missing_fields: [],
+              ...patch,
+            },
+          },
+        }, CallToolResultSchema);
+
+        expect(response.isError).toBe(true);
+        expect(response.structuredContent).toBeUndefined();
+      }
     });
   });
 });
