@@ -9,7 +9,7 @@ import { privateWorkspaceRoots } from "../shared/private-workspace-paths.js";
 
 const dirs: string[] = [];
 function dir() { const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "private-workspace-"))); dirs.push(d); return d; }
-afterEach(() => { vi.useRealTimers(); for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
 
 class Store implements WorkspaceTransport {
   objects = new Map<string, { ref: WorkspaceObjectRef; data: Buffer }>();
@@ -191,10 +191,15 @@ it.each([undefined, {}, { ok: false }])("refuses an invalid renewal acknowledgem
 
 it("retries transient background renewals within the original window without bypassing tool validation", async () => {
   vi.useFakeTimers(); vi.setSystemTime(0);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const info = vi.spyOn(console, "info").mockImplementation(() => {});
   const store = new Store(), original = store.exchange.bind(store);
   let unavailable = true, renewals = 0;
   store.exchange = async request => {
-    if (request.action === "renew") { renewals++; if (unavailable) throw outage(); }
+    if (request.action === "renew") {
+      renewals++;
+      if (unavailable) { const error = outage(); error.message = "private provider response"; throw error; }
+    }
     return original(request);
   };
   const workspace = new PrivateWorkspace(store, "sid", "space");
@@ -204,16 +209,23 @@ it("retries transient background renewals within the original window without byp
     expect(renewals).toBe(2);
     expect(() => workspace.assertHealthy()).not.toThrow();
     await expect(workspace.validateExecution()).rejects.toBeInstanceOf(WorkspaceTransportError);
+    expect(warn.mock.calls).toEqual([["[private-workspace] lease renewal failed; retrying within existing validity window", { remainingValidityMs: 60_000 }]]);
     // A fresh validation can recover before the unchanged 90-second deadline.
     await vi.advanceTimersByTimeAsync(15_000); unavailable = false;
     await workspace.validateExecution();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(() => workspace.assertHealthy()).not.toThrow();
+    expect(info.mock.calls).toEqual([["[private-workspace] lease renewal recovered"]]);
+    unavailable = true;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private provider response");
   } finally { await workspace.close(); }
 });
 
 it("never refreshes local validity on transient failure and fences at the original deadline", async () => {
   vi.useFakeTimers(); vi.setSystemTime(0);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   const store = new Store(), original = store.exchange.bind(store);
   let renewals = 0;
   store.exchange = async request => {
@@ -229,6 +241,8 @@ it("never refreshes local validity on transient failure and fences at the origin
     await expect(workspace.acquire()).rejects.toThrow(/recovery/);
     await expect(workspace.checkpoint(new Map())).rejects.toThrow(/recovery/);
     expect(store.receipts.size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[1]).toEqual(["[private-workspace] lease validity expired; recovery required"]);
   } finally { await workspace.close(); }
 });
 
