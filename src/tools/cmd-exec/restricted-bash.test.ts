@@ -108,7 +108,7 @@ describe("extractPipeline", () => {
     const result = extractPipeline("kubectl get pods | grep Error");
     expect(result).toEqual([
       { command: "kubectl get pods", piped: false },
-      { command: "grep Error", piped: true },
+      { command: "grep Error", piped: true, sep: "|" },
     ]);
   });
 
@@ -116,7 +116,7 @@ describe("extractPipeline", () => {
     const result = extractPipeline("sleep 2 && grep pattern file");
     expect(result).toEqual([
       { command: "sleep 2", piped: false },
-      { command: "grep pattern file", piped: false },
+      { command: "grep pattern file", piped: false, sep: "&&" },
     ]);
   });
 
@@ -124,7 +124,7 @@ describe("extractPipeline", () => {
     const result = extractPipeline("cmd1 || grep fallback");
     expect(result).toEqual([
       { command: "cmd1", piped: false },
-      { command: "grep fallback", piped: false },
+      { command: "grep fallback", piped: false, sep: "||" },
     ]);
   });
 
@@ -132,7 +132,7 @@ describe("extractPipeline", () => {
     const result = extractPipeline("echo done; cut -f1 file");
     expect(result).toEqual([
       { command: "echo done", piped: false },
-      { command: "cut -f1 file", piped: false },
+      { command: "cut -f1 file", piped: false, sep: ";" },
     ]);
   });
 
@@ -140,9 +140,9 @@ describe("extractPipeline", () => {
     const result = extractPipeline("cmd1 | cmd2 && cmd3 | cmd4");
     expect(result).toEqual([
       { command: "cmd1", piped: false },
-      { command: "cmd2", piped: true },
-      { command: "cmd3", piped: false },
-      { command: "cmd4", piped: true },
+      { command: "cmd2", piped: true, sep: "|" },
+      { command: "cmd3", piped: false, sep: "&&" },
+      { command: "cmd4", piped: true, sep: "|" },
     ]);
   });
 
@@ -150,8 +150,8 @@ describe("extractPipeline", () => {
     const result = extractPipeline("kubectl get pods -A | grep error | wc -l");
     expect(result).toEqual([
       { command: "kubectl get pods -A", piped: false },
-      { command: "grep error", piped: true },
-      { command: "wc -l", piped: true },
+      { command: "grep error", piped: true, sep: "|" },
+      { command: "wc -l", piped: true, sep: "|" },
     ]);
   });
 
@@ -159,7 +159,7 @@ describe("extractPipeline", () => {
     const result = extractPipeline("echo error >&2 | grep error");
     expect(result).toEqual([
       { command: "echo error >&2", piped: false },
-      { command: "grep error", piped: true },
+      { command: "grep error", piped: true, sep: "|" },
     ]);
   });
 
@@ -169,8 +169,8 @@ describe("extractPipeline", () => {
     );
     expect(result).toEqual([
       { command: "find / -name foo -exec cat {} \\; 2>/dev/null", piped: false },
-      { command: "sort", piped: true },
-      { command: "head -5", piped: true },
+      { command: "sort", piped: true, sep: "|" },
+      { command: "head -5", piped: true, sep: "|" },
     ]);
   });
 });

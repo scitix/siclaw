@@ -271,6 +271,17 @@ export interface PipelineSegment {
   command: string;
   /** true if this command was preceded by a pipe operator | (not ||) */
   piped: boolean;
+  /**
+   * The operator that PRECEDED this command; absent for the first one.
+   *
+   * `piped` already answers "did a `|` come before me", which is all the validator needs. The
+   * separator itself is needed by exit classification, which has to decide WHICH pipeline bash's
+   * `PIPESTATUS` describes: `&&` and `||` short-circuit, so a command written after one may never
+   * have run, while `;` and `&` always execute what follows. Without that distinction a status
+   * array gets mapped onto the text of a pipeline that never ran — see
+   * `docs/design/2026-09-02-exec-classification-and-operand-quoting.md`.
+   */
+  sep?: "|" | "&&" | "||" | ";" | "&";
 }
 
 /**
@@ -285,6 +296,13 @@ export function extractPipeline(input: string): PipelineSegment[] {
   let ansiC = false;
   let parenDepth = 0;
   let nextIsPiped = false;
+  let nextSep: PipelineSegment["sep"] | undefined;
+  // Carries `sep` onto each pushed segment. The first segment has none: nothing preceded it.
+  const push = (cmd: string) => {
+    segments.push(nextSep === undefined
+      ? { command: cmd, piped: nextIsPiped }
+      : { command: cmd, piped: nextIsPiped, sep: nextSep });
+  };
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
@@ -322,9 +340,10 @@ export function extractPipeline(input: string): PipelineSegment[] {
         (ch === "&" && input[i + 1] === "&") ||
         (ch === "|" && input[i + 1] === "|")
       ) {
-        if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+        if (current.trim()) push(current.trim());
         current = "";
         nextIsPiped = false; // || and && are not pipes
+        nextSep = ch === "&" ? "&&" : "||";
         i++; // skip next char
         continue;
       }
@@ -335,16 +354,18 @@ export function extractPipeline(input: string): PipelineSegment[] {
       }
       // Single | — next command receives piped input
       if (ch === "|") {
-        if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+        if (current.trim()) push(current.trim());
         current = "";
         nextIsPiped = true;
+        nextSep = "|";
         continue;
       }
       // & or ; — not pipes
       if (ch === "&" || ch === ";") {
-        if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+        if (current.trim()) push(current.trim());
         current = "";
         nextIsPiped = false;
+        nextSep = ch === "&" ? "&" : ";";
         continue;
       }
     }
@@ -352,7 +373,7 @@ export function extractPipeline(input: string): PipelineSegment[] {
     current += ch;
   }
 
-  if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+  if (current.trim()) push(current.trim());
   return segments;
 }
 
