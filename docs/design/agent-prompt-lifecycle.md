@@ -81,7 +81,14 @@ legacy `run_scripts` group that also grants node, Pod and host script tools.
 Its `write_sandbox` tools write only to the Agent's user-data workspace. Skill
 scripts run as trusted code in the AgentBox using the existing resource bindings;
 QA is therefore a research role, not a blanket read-only execution boundary.
-Long-term memory remains disabled for this preset.
+Long-term memory remains disabled for this preset. Operational Safety follows
+execution capabilities for every type, including QA local scripts. Working-file
+instructions name the actual user-data directory; factory Write/Edit reject
+paths outside it and existing symbolic links within the write path.
+
+Agent-scoped Skill filtering is active before the first materialization for all
+types. Bundled and platform roots remain eligible without admitting ambient
+user-global Skills. Older read-only QA tool lists keep this same scope filter.
 
 QA planning is parent-owned. Spawned children inherit the QA tool/resource scope
 and Skill bindings, while child construction omits parent ledger and recursive

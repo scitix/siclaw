@@ -56,6 +56,12 @@ describe("resolveAgentHarness", () => {
     expect(harness.includeInfrastructureGuidance).toBe(false);
   });
 
+  it.each(["sre", "custom", "knowledge_qa"])("gives %s operational safety when local scripts are enabled", agentType => {
+    const context = compileAgentContext({ agentType, allowedTools: ["read", "local_script"], memoryConfigured: false });
+    expect(context.harness.includeOperationalSafety).toBe(true);
+    expect(context.systemPrompt).toContain("# Operational Safety");
+  });
+
   it("keeps Product Support read-only while exposing its configured result MCP", () => {
     const harness = resolveAgentHarness({
       agentType: "product_support",

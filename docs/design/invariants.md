@@ -119,8 +119,10 @@ harness: Portal/Gateway materialized bindings, repo-bundled operational skills
 for operational and Knowledge QA sessions, and platform skills for Knowledge QA
 or sessions with write/preview capabilities. Explicit Skill inheritance switches
 and per-name masks still apply. Unresolved harnesses cannot inherit ambient
-Skill context. Standalone,
-unscoped SRE headless CLI sessions retain the legacy repo/global skill fallback.
+Skill context. Filtering applies to every Agent-scoped session even before its
+first Skill sync creates `resolved/`; bundled discovery does not disable it.
+Standalone, unscoped SRE and Custom CLI sessions retain the legacy repo/global
+skill fallback.
 
 **Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-main.ts`, `src/cli-options.ts`
 

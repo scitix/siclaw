@@ -176,7 +176,7 @@ export function resolveAgentHarness(
       hasAnyTool(allowedTools, ["cluster_list", "host_list"]),
     includeOperationalSafety:
       resolution === "resolved" &&
-      (agentType === "sre" || (agentType === "custom" && canOperate)),
+      (agentType === "sre" || canOperate),
     legacyUnrestrictedCustom,
   };
 }

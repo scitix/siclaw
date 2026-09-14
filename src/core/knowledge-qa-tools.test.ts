@@ -80,7 +80,7 @@ describe("Knowledge QA tools", () => {
     expect(denied.details).toMatchObject({ error: true });
   });
 
-  it("can dispatch a research child while child tool resolution excludes recursion and parent planning", async () => {
+  it("dispatches through the parent bridge and gates child registry tools when parent executors are absent", async () => {
     const parent = fixture();
     const tool = parent.resolve().find(tool => tool.name === "spawn_subagent");
     expect(tool).toBeDefined();
