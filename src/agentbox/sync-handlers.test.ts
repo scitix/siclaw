@@ -1242,12 +1242,17 @@ describe("createKnowledgeHandler per-box client", () => {
 describe("knowledgeHandler multi-repo identity", () => {
   let knowledgeTmpDir: string;
 
-  function packageBase64(title: string): string {
+  function packageBase64(title: string, introduction?: unknown): string {
     const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-package-test-"));
     const archive = path.join(os.tmpdir(), `knowledge-package-${process.pid}-${Date.now()}-${Math.random()}.tar.gz`);
     try {
       fs.writeFileSync(path.join(sourceDir, "index.md"), `# ${title}\n`);
-      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "index.md"]);
+      const files = ["index.md"];
+      if (introduction) {
+        fs.writeFileSync(path.join(sourceDir, ".library-introduction.json"), JSON.stringify(introduction));
+        files.push(".library-introduction.json");
+      }
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, ...files]);
       return fs.readFileSync(archive).toString("base64");
     } finally {
       fs.rmSync(sourceDir, { recursive: true, force: true });
@@ -1262,6 +1267,27 @@ describe("knowledgeHandler multi-repo identity", () => {
 
   afterEach(() => {
     fs.rmSync(knowledgeTmpDir, { recursive: true, force: true });
+  });
+
+  it("keeps each published introduction intact and exposes its own reading entry", async () => {
+    const introduction = (summary: string) => ({ schema_version: 1, summary, overview: "Complete library overview.",
+      knowledge_structure: "Concepts connect to procedures.", typical_questions: ["Which procedure applies?"],
+      scope: "Preserve the documented exceptions.", reading_guide: [{ path: "index.md", reason: "Choose a topic." }] });
+    const repos = [
+      { id: "a", name: "Library A", version: 2, sizeBytes: 10, consumerDomain: "Old subtitle", dataBase64: packageBase64("A", introduction("Device X recovery")) },
+      { id: "b", name: "Library B", version: 4, sizeBytes: 10, dataBase64: packageBase64("B", introduction("Device Y configuration")) },
+    ];
+    await knowledgeHandler.materialize({ version: "intro-v1", repos });
+    const index = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
+    for (const [i, repo] of repos.entries()) {
+      const root = `repos/${knowledgeRepoDirName(repo.name, repo.id)}`;
+      expect(index).toContain(`${root}/.library-introduction.json`);
+      expect(JSON.parse(fs.readFileSync(path.join(knowledgeTmpDir, root, ".library-introduction.json"), "utf8")))
+        .toEqual(introduction(i === 0 ? "Device X recovery" : "Device Y configuration"));
+    }
+    expect(index).toContain("Device X recovery");
+    expect(index).not.toContain("Old subtitle");
+    expect(index).not.toContain("Preserve the documented exceptions.");
   });
 
   it("uses stable repo identity so two CJK-only names never collide and index links match", async () => {

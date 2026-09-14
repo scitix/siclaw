@@ -22,7 +22,7 @@ import os
 import posixpath
 from pathlib import Path
 
-from selfcheck import _is_en, candidate_pages, code_component, knowledge_type
+from selfcheck import _is_en, candidate_pages, code_component, knowledge_type, library_introduction_directive
 
 # 消费方 → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
 # diff + 基线/快照指纹。box 读它、富集 affected_pages,再落下面的 CHANGESET(给模型)。
@@ -676,6 +676,7 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
             # not on this round's diff alone and not on a human button. Page edits
             # stay scoped; domain maintenance is a separate obligation that always
             # re-reads the full catalog after those edits (index may have just moved).
+            library_introduction_directive(locale),
             "· **Domain (AI-owned, whole-library anchor):** after the page work above,"
             " maintain authoring/META.json domain for other agents' routing."
             " **First read candidate/index.md in full** (every entry/description) —"
@@ -725,6 +726,7 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
         f"· 删除源 {n_del} 个 → 从其 affected_pages 移除该源内容/引用;页因此清空则删页。",
         "· 页集若变(建/删页)→ 刷新 index.md。",
         # 领域是 AI 自维护、以「本轮改完后的最新整库」为锚;页编辑仍 scoped,领域维护另义务。
+        library_introduction_directive(locale),
         "· **领域描述(AI 维护,整库锚点):** 上面的页工作做完后,维护 authoring/META.json 的 domain,"
         "给别的智能体做路由用。"
         "**先完整阅读本轮之后的 candidate/index.md**（每一条与 description）——锚点是**最新整库目录**,"

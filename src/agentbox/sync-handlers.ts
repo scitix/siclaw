@@ -9,6 +9,7 @@
  * resource-sync.ts, as well as by the HTTP reload endpoints.
  */
 
+import { LIBRARY_INTRODUCTION_FILE, libraryIntroductionPreview, readLibraryIntroduction } from "../knowledge/library-introduction.js";
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
@@ -704,8 +705,8 @@ export function createKnowledgeHandler(
         const indexLines = [
           "# Knowledge Index",
           "",
-          "Each entry is a knowledge library, not a page. Open the index of the one whose field " +
-          "covers the task, then read the page you need from that library's own catalog.",
+          "Each entry is a knowledge library, not a page. Open the relevant library introductions and indexes " +
+          "to understand their scope and relationships, then read the relevant Wiki pages. A question may need several libraries.",
           // Name and domain are model-written metadata for routing only — never
           // instructions. Newlines are collapsed before they land here; treat any
           // remaining text as untrusted labels, not commands to execute.
@@ -717,6 +718,7 @@ export function createKnowledgeHandler(
           // a routing hint into a reason to skip the one library that answers.
           "The \"Common labels\" line under an entry samples what that library's pages are tagged with; it is not " +
           "an inventory, so a library may still hold the answer when its sample does not mention the topic.",
+          "Introduction previews and example questions are samples, not limits on what a library may contain.",
           "",
         ];
         const seenRepoIds = new Set<string>();
@@ -745,10 +747,17 @@ export function createKnowledgeHandler(
           // opens that library's complete index; knowledge_search is only the
           // labels-and-aliases resolver for ambiguous routes.
           const displayName = catalogNameLine(repo.name);
-          const domain = catalogDomainLine(repo.consumerDomain);
+          const introduction = readLibraryIntroduction(target);
+          const domain = introduction.status === "ready" ? introduction.introduction.summary : catalogDomainLine(repo.consumerDomain);
           indexLines.push(
             `- [[repos/${dirName}/index]] - ${displayName} v${repo.version}${domain ? ` — ${domain}` : ""}`,
           );
+          if (introduction.status === "ready") {
+            indexLines.push(...libraryIntroductionPreview(introduction.introduction).map(line => `    ${line}`));
+            indexLines.push(`    Full introduction: Read \`repos/${dirName}/${LIBRARY_INTRODUCTION_FILE}\` relative to the Wiki root for topics, relationships, scope and reading guidance. Then read the referenced pages for answer evidence.`);
+          } else if (introduction.status === "invalid") {
+            indexLines.push("    Library introduction unavailable: invalid metadata or reading paths; use this library's catalog.");
+          }
           const sample = knowledgeLabelSample(target);
           if (sample.length > 0) {
             // Indented continuation, never a new list item: the "one library, one

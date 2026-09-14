@@ -4,6 +4,7 @@ import path from "node:path";
 import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-path.js";
 import { maskMarkdownCode } from "../core/knowledge-citation-tool.js";
 import { rewriteCatalogLinkPaths } from "../knowledge/catalog-graph.js";
+import { LIBRARY_INTRODUCTION_FILE, libraryIntroductionPreview, readLibraryIntroduction } from "../knowledge/library-introduction.js";
 
 const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
 const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
@@ -119,6 +120,7 @@ export function buildKnowledgeWikiCatalog(
   const { wikiRoot, indexPath: modelIndexPath } = modelKnowledgeLocations(knowledgeDir);
   const { catalogIndex, verifiedRoutes } = collectVerifiedRoutes(knowledgeDir, index);
   const multiLibrary = readCitationManifestRepos(knowledgeDir).filter((repo) => (repo.root ?? "") !== "").length > 1;
+  const introduction = !multiLibrary ? readLibraryIntroduction(knowledgeDir) : { status: "missing" as const };
 
   return [
     "# Knowledge Wiki",
@@ -155,6 +157,13 @@ export function buildKnowledgeWikiCatalog(
         ]
       : []),
     "",
+    ...(introduction.status === "ready" ? [
+      `Library purpose: ${introduction.introduction.summary}`,
+      ...libraryIntroductionPreview(introduction.introduction),
+      `Read the complete library introduction at \`${modelKnowledgePath(knowledgeDir, LIBRARY_INTRODUCTION_FILE)}\` ` +
+      "to understand its topics, relationships, typical questions, scope and reading guide. Previews are not a coverage inventory. This is navigation metadata; read the referenced Wiki pages for answer evidence.",
+      "",
+    ] : introduction.status === "invalid" ? ["The library introduction is unavailable because its metadata or reading paths are invalid. Use the complete catalog below.", ""] : []),
     catalogIndex,
   ].join("\n");
 }

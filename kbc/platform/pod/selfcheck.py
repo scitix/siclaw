@@ -1635,6 +1635,61 @@ REPO_META_PATH = "authoring/META.json"
 # META.json, and a multi-line / over-cap domain then inflates every directive
 # that quotes it.
 DOMAIN_MAX_CHARS = 100
+LIBRARY_INTRODUCTION_PATH = ".library-introduction.json"
+LIBRARY_INTRODUCTION_MAX_BYTES = 48 * 1024
+
+
+def validate_library_introduction(value: dict, candidate: Path) -> dict:
+    """Validate navigation metadata against the finished Wiki, without clipping it."""
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 1:
+        raise ValueError("library introduction requires schema_version 1")
+    for key in ("summary", "overview", "knowledge_structure", "scope"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise ValueError(f"library introduction requires {key}")
+    if normalize_domain_line(value["summary"]) != value["summary"]:
+        raise ValueError("library introduction summary must be one complete sentence within 100 characters")
+    questions = value.get("typical_questions")
+    if not isinstance(questions, list) or not 1 <= len(questions) <= 12 or any(not isinstance(q, str) or not q.strip() for q in questions):
+        raise ValueError("typical_questions requires 1–12 nonempty questions")
+    guide = value.get("reading_guide")
+    if not isinstance(guide, list) or not 1 <= len(guide) <= 12:
+        raise ValueError("reading_guide requires 1–12 Wiki entry points")
+    for item in guide:
+        target = item.get("path") if isinstance(item, dict) else None
+        if (not isinstance(target, str) or not target.endswith(".md") or "\\" in target
+                or "#" in target or "?" in target or target.startswith("/")
+                or any(not part or part.startswith(".") for part in target.split("/"))
+                or not isinstance(item.get("reason"), str) or not item["reason"].strip()):
+            raise ValueError("reading_guide requires relative Markdown paths and reading reasons")
+        file = candidate / target
+        components = [candidate.joinpath(*target.split("/")[:i]) for i in range(1, len(target.split("/")) + 1)]
+        if not file.is_file() or any(p.is_symlink() for p in components):
+            raise ValueError(f"reading_guide target is unavailable: {target}")
+        try:
+            file.resolve().relative_to(candidate.resolve())
+        except ValueError as exc:
+            raise ValueError(f"reading_guide target escapes the Wiki: {target}") from exc
+    if len((json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")) > LIBRARY_INTRODUCTION_MAX_BYTES:
+        raise ValueError("library introduction exceeds 48 KiB; rewrite without truncating sections")
+    return value
+
+
+def library_introduction_directive(locale: str | None = None) -> str:
+    if _is_en(locale):
+        return ("Library introduction: after reviewing the COMPLETE finished catalog and relevant topic overviews, "
+                "call report_domain with both domain and introduction. Supply overview, knowledge_structure "
+                "(topics and relationships), typical_questions, scope (conditions, versions and known gaps), "
+                "and reading_guide (existing relative Markdown paths and reasons). Describe the whole Wiki, "
+                "including inherited topics, not only this batch or change set. Keep valid existing coverage "
+                "during incremental updates. The tool writes candidate/.library-introduction.json; do not "
+                "hand-edit that artifact. Its summary is the same domain sentence. This is navigation metadata, "
+                "so explain where to find evidence without claiming unsupported capabilities.")
+    return ("库介绍：通读编译完成后的完整目录和相关主题总览，再调用 report_domain，同时提供 domain 和 introduction。"
+            "introduction 包含 overview（整体介绍）、knowledge_structure（主题和关系）、typical_questions（典型问题）、"
+            "scope（条件、版本与已知局限）、reading_guide（实际存在的相对 Markdown 路径及阅读理由）。"
+            "介绍整个 Wiki，包括已有主题；不要只总结本批次或变更集。增量更新保留仍有效的既有覆盖。"
+            "工具生成 candidate/.library-introduction.json，不要手写该文件。摘要使用同一句 domain。"
+            "这是阅读导航，应指出证据位置，不得宣称语料没有支持的能力。")
 
 
 def normalize_domain_line(raw: str | None, *, max_chars: int = DOMAIN_MAX_CHARS) -> str:
@@ -1647,18 +1702,21 @@ def normalize_domain_line(raw: str | None, *, max_chars: int = DOMAIN_MAX_CHARS)
     return one
 
 
-def write_repo_meta(workdir: str, domain: str) -> None:
-    """Persist the library's domain line as a machine-owned artifact.
+def write_repo_meta(workdir: str, domain: str, introduction: dict | None = None) -> None:
+    """Validate complete introduction data, then atomically replace each artifact.
 
-    Same rule as the exclusion ledger: the model supplies natural language and
-    NOTHING else, the format is generated here. The 2026-07-24 mandate exists
-    because a hand-authored trailing comma once blanked a ledger and wedged a
-    145-batch train, and a field disclosed to every agent that can see this
-    library is not the place to relax it.
-
-    Rewritten whole, atomically. This is one value, not an append-only log — a
-    later compile that renames the domain is correcting it, not adding to it.
+    Both artifacts use the same summary and are synchronized with the completed
+    candidate tree. Publication validates their agreement against one attempt.
+    Domain-only calls preserve compatibility with existing metadata writers.
     """
+    candidate = Path(workdir) / "candidate"
+    if introduction is not None:
+        if not isinstance(introduction, dict):
+            raise ValueError("library introduction must be an object")
+        value = {**introduction, "schema_version": 1, "summary": domain}
+        validate_library_introduction(value, candidate)
+        _write_text_atomic(candidate / LIBRARY_INTRODUCTION_PATH,
+                           json.dumps(value, ensure_ascii=False, indent=2) + "\n")
     _write_text_atomic(
         Path(workdir) / REPO_META_PATH,
         json.dumps({"domain": domain}, ensure_ascii=False, indent=2) + "\n")
@@ -2977,6 +3035,18 @@ def run_layer1(workdir: str) -> dict:
     exclusions, exclusion_errors = load_exclusions(workdir)
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
+    introduction_path = Path(workdir) / "candidate" / LIBRARY_INTRODUCTION_PATH
+    if introduction_path.exists():
+        try:
+            if introduction_path.is_symlink():
+                raise ValueError("library introduction must be a regular file")
+            if introduction_path.stat().st_size > LIBRARY_INTRODUCTION_MAX_BYTES:
+                raise ValueError("library introduction exceeds 48 KiB")
+            intro = validate_library_introduction(json.loads(introduction_path.read_text("utf-8")), introduction_path.parent)
+            if intro["summary"] != read_repo_meta(workdir).get("domain"):
+                raise ValueError("introduction summary differs from the library domain; call report_domain with both")
+        except (OSError, ValueError) as exc:
+            lint["violations"].append({"page": LIBRARY_INTRODUCTION_PATH, "kind": "library_introduction", "detail": str(exc)})
     lint["violations"].extend(trusted_evidence_violations(workdir, pages))
     lint["ok"] = not lint["violations"]
     over_broad = detect_over_broad_exclusions(workdir, exclusions)

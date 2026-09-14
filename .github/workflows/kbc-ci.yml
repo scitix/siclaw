@@ -46,6 +46,10 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_incremental.py
         working-directory: kbc/platform/pod
+      - run: python -m pytest -q -p pytest_asyncio.plugin -o asyncio_mode=auto test_library_introduction.py
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        working-directory: kbc/platform/pod
       - run: python test_batching.py
         working-directory: kbc/platform/pod
       - run: python test_mediaverify.py

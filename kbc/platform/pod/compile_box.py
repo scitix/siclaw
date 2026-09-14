@@ -1943,24 +1943,12 @@ def _compile_engine_tools(
         return strings["deleted"].format(path=rel.as_posix())
 
     async def report_domain(args):
-        """Name the DOMAIN this library covers, for another agent's routing.
+        """Record a short routing summary and a complete versioned introduction.
 
-        Its only job is the coarse question — "should I open this library at
-        all?". Precise routing already has a grounded surface: index.md carries
-        a per-page description documented as the sentence that routes an agent
-        to a page. This is one layer above that, and answering the coarse
-        question with an inventory makes it worse, not better: an inventory goes
-        stale on every compile, and an inventory that omits a topic makes a
-        router SKIP the library that had the answer — a false negative nobody
-        ever learns about. A domain that is slightly too broad only costs one
-        extra open.
-
-        Length is admission control, not editing. A cap written only into a
-        prompt is a wish; several libraries disclose this text at once, so the
-        budget is a fact enforced HERE. Over the ceiling we refuse without
-        writing: a complete shorter sentence on retry beats a clipped one that
-        looks fine in the head and corrupted in the tail. Empty is also
-        refused — blank is worse than absent in a picker.
+        The summary remains bounded because every mounted library discloses it.
+        Detailed topics, relationships, applicability and reading paths live in
+        the introduction. Validation precedes writes; consumers read published
+        package metadata rather than the author's live draft.
         """
         rs = ts["report_domain"]
         domain = " ".join(str(args.get("domain", "")).split())
@@ -1970,7 +1958,12 @@ def _compile_engine_tools(
             return rs["too_long"].format(
                 limit=DOMAIN_MAX_CHARS, target=DOMAIN_TARGET_CHARS)
         try:
-            selfcheck.write_repo_meta(run.workdir, domain)
+            if args.get("introduction") is not None:
+                selfcheck.write_repo_meta(run.workdir, domain, args["introduction"])
+            else:
+                selfcheck.write_repo_meta(run.workdir, domain)
+        except ValueError as e:
+            return f"Library introduction not recorded: {e}. Correct it and call report_domain again."
         except Exception as e:
             _print_compile_lifecycle("meta.write_failed", run, extra=f"class={type(e).__name__}")
             # Distinct from need_args: the model already supplied a domain; a
@@ -2158,7 +2151,18 @@ def _compile_engine_tools(
         EngineTool(
             "report_domain",
             ts["report_domain"]["desc"],
-            {"type": "object", "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
+            {"type": "object", "properties": {
+                "domain": {"type": "string"},
+                "introduction": {"type": "object", "properties": {
+                    "overview": {"type": "string", "description": "Purpose, coverage and nature of the complete finished Wiki."},
+                    "knowledge_structure": {"type": "string", "description": "Main topics and their relationships, grounded in the finished Wiki."},
+                    "typical_questions": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 12},
+                    "scope": {"type": "string", "description": "Applicability, versions, prerequisites and known gaps; preserve uncertainty."},
+                    "reading_guide": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
+                        "type": "object", "properties": {"path": {"type": "string", "description": "Existing Markdown path relative to the Wiki root, without the candidate/ prefix."}, "reason": {"type": "string"}},
+                        "required": ["path", "reason"]}},
+                }, "required": ["overview", "knowledge_structure", "typical_questions", "scope", "reading_guide"]},
+            }, "required": ["domain", "introduction"]},
             report_domain,
         ),
         EngineTool(
@@ -3549,7 +3553,7 @@ def build_domain_refresh_directive(
         note = (owner_text or "").strip()
         if note:
             lines.append(f"· Owner message (keep in mind if relevant): {note}")
-        return "\n".join(lines)
+        return "\n".join(lines) + "\n" + selfcheck.library_introduction_directive(locale)
     lines = [
         "【领域维护】AI 自维护的整库领域句（report_domain），锚点是**当前最新完整目录**,"
         "不是变更集、不是给人填的表单。",
@@ -3576,7 +3580,7 @@ def build_domain_refresh_directive(
     note = (owner_text or "").strip()
     if note:
         lines.append(f"· 负责人原话（相关则参考）: {note}")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n" + selfcheck.library_introduction_directive(locale)
 
 
 async def _start_domain_refresh(run: "CompileRun", text: str = "") -> None:
@@ -4462,7 +4466,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                      "that are already fine or compile previously unowned sources. When done, report "
                      "briefly: total pages, which pages this close-out touched, which pairs were "
                      "merged/exempted and why, and anything worth the owner's attention.")
-        return "\n".join(lines) + notes
+        return "\n".join(lines) + notes + "\n" + selfcheck.library_introduction_directive(locale)
     lines = [f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口(以下清单是系统机械算出的,逐项处理、不许沉默跳过):"]
     step = 1
     if dups:
@@ -4491,7 +4495,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                  "用 source_inventory/source_search/source_read 查冻结 Raw 快照。不要重编已经完好的页,"
                  "也不要新编此前无人负责的源。"
                  "完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
-    return "\n".join(lines) + notes
+    return "\n".join(lines) + notes + "\n" + selfcheck.library_introduction_directive(locale)
 
 
 def _planner_role(locale: str | None) -> str:

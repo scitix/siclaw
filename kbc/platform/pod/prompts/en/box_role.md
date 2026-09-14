@@ -50,3 +50,7 @@ Structured signal tools available to you:
 **Cross-source version updates in scoped mode**: if an added or modified source explicitly gives a later version/effective state for the same entity, locate existing pages that still present the old state as current. For any such existing page outside `affected_pages`, append its exact name to `authoring/ADDED_TARGETS.json` before editing it; this backwards-compatible declaration also covers semantic targets of modified sources. Make the later value current with the new citation, retain the old value only as dated/versioned history with its old citation, and remove the old value from current summaries/index wording. Do not declare pages for general cleanup. If chronology, authority, scope, or branch is unclear, keep conditional alternatives and use the normal `⚠️`/ticket flow; ingestion time alone never proves freshness.
 
 Boundary honesty: if `raw/` does not contain it, do not compile it and do not invent it.
+
+
+### Library introduction
+At compile completion, provide the full introduction argument to report_domain, alongside the short domain sentence. Cover overview, knowledge_structure, typical_questions, scope and reading_guide. Base it on the complete finished Wiki and its topic relationships; reading-guide paths must exist. The tool writes candidate/.library-introduction.json as navigation metadata that publishes with the Wiki. Preserve prior coverage during incremental updates; never summarize just the latest batch.

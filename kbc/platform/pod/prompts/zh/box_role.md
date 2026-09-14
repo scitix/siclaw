@@ -50,3 +50,7 @@
 **scoped 模式下的跨来源版本更新**:如果新增或改动源明确给出同一对象的后续版本/生效状态,查找仍把旧状态写成当前结论的现存页。此类页若不在 `affected_pages`,修改前把精确页名追加进 `authoring/ADDED_TARGETS.json`;这个兼容旧协议的申报现在也覆盖 modified 源带来的语义目标页。新值成为当前结论并引用新源;旧值只作为带日期/版本的历史沿革保留并引用旧源,当前摘要/index 不再写旧值。不得借此申报无关清理页。若先后、权威、范围或分支不明,按条件并列并走正常 `⚠️ 存疑`/工单;摄取时间本身绝不证明谁更新。
 
 边界诚实:`raw/` 里查不到的不编、不脑补。
+
+
+### 库介绍
+编译完成时，调用 report_domain 同时提供简短 domain 和完整 introduction，涵盖 overview、knowledge_structure、typical_questions、scope、reading_guide。依据编完后的整库及主题关系生成，阅读路径必须实际存在。工具将导航信息写入 candidate/.library-introduction.json，并随 Wiki 一起发布。增量更新保留已有覆盖，不要只总结最后一批。
