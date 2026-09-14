@@ -9,7 +9,7 @@
  *                   sub-agent fan-out and the background-job read/stop pair its
  *                   own exec tools hand out task ids for).
  *   - knowledge_qa — researches bound knowledge bases and synthesizes sourced
- *                    answers. Read-only, with no skills by default.
+ *                    answers using Skills, local scripts and research sub-agents.
  *   - product_support — managed front-door customer support. Its persisted
  *                       prompt and bound MCP define the intake/result contract;
  *                       built-in filesystem access stays read-only.
@@ -204,9 +204,9 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   knowledge_qa: {
     label: "Knowledge Q&A Agent",
     description: "Researches bound knowledge bases and answers with synthesized, source-backed information.",
-    capabilities: ["read_files"],
+    capabilities: ["read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "spawn_subagents", "session_output"],
     defaultPrompt: KNOWLEDGE_QA_DEFAULT_PROMPT,
-    defaultNoSkills: true,
+    defaultNoSkills: false,
   },
   product_support: {
     label: "Product Support Agent",

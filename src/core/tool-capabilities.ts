@@ -38,6 +38,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // zero instead: everything the tool can read, `bash` can already read through the same read-only
   // kubectl policy, so it adds round-trip efficiency and no reach.
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec", "k8s_inspect"],
+  run_local_scripts: ["local_script"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
   run_sandbox:     ["run_script"],
   search_memory:   ["memory_search", "memory_get"],

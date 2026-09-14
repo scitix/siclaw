@@ -6,6 +6,9 @@ import { Type } from "@sinclair/typebox";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   createAgentSessionServices,
+  createReadTool,
+  createWriteTool,
+  createEditTool,
   ModelRuntime,
   SessionManager,
   SettingsManager,
@@ -16,6 +19,12 @@ import { createPiExecutionSession } from "./pi-execution.js";
 import { summarizeWithFallback } from "./compaction.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import { skillsHandler, knowledgeHandler } from "../agentbox/sync-handlers.js";
+import { compileAgentContext } from "./agent-context.js";
+import { resolveSkillDirectories } from "./skill-directories.js";
+import { filterHarnessSkills } from "./skill-overlay.js";
+import { ToolRegistry, type ToolRefs } from "./tool-registry.js";
+import { appendAllowedTools } from "./tool-append.js";
+import { allToolEntries } from "../tools/all-entries.js";
 import type { UsageObservation } from "../shared/model-usage.js";
 
 // Exercise installed Pi packages through the real HTTP serializer and agent loop.
@@ -59,6 +68,7 @@ function mockNetwork(respond: (request: Request, body: any) => Response | Promis
 async function createFixture(
   customTools: ToolDefinition[] = [],
   fixtureSettings: Parameters<typeof SettingsManager.inMemory>[0] = {},
+  prepareResources?: (cwd: string) => Promise<Parameters<typeof createAgentSessionServices>[0]["resourceLoaderOptions"]>,
 ) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-pi-contract-"));
   cleanups.push(() => fs.rm(cwd, { recursive: true, force: true }));
@@ -80,6 +90,7 @@ async function createFixture(
   await modelRuntime.setRuntimeApiKey("contract-provider", "contract-key");
   const model = modelRuntime.getModel("contract-provider", "contract-model")!;
   const sessionStarts = vi.fn();
+  const resources = await prepareResources?.(cwd);
   const services = await createAgentSessionServices({
     cwd, agentDir: cwd, modelRuntime,
     settingsManager: SettingsManager.inMemory({
@@ -91,6 +102,7 @@ async function createFixture(
       noExtensions: true, noSkills: true, noPromptTemplates: true,
       noThemes: true, noContextFiles: true, systemPrompt: "Exercise the supplied tools.",
       extensionFactories: [api => { api.on("session_start", sessionStarts); }],
+      ...resources,
     },
   });
   const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
@@ -115,6 +127,97 @@ function resultTool(execute = vi.fn(async () => ({
 }
 
 describe("installed Pi SDK contract", () => {
+  it("sends QA research tools to the provider and writes a working result", async () => {
+    let outputPath = "";
+    const requests = mockNetwork(() => requests.length === 1
+      ? completion({ tool_calls: [{ index: 0, id: "call-write", type: "function",
+        function: { name: "write", arguments: JSON.stringify({ path: outputPath, content: "# Research result\n" }) } }] }, "tool_calls")
+      : completion({ content: "Completed." }));
+    const tools: ToolDefinition[] = [];
+    const context = compileAgentContext({
+      agentType: "knowledge_qa", allowedTools: null, memoryConfigured: true, mode: "web",
+    });
+    const { brain } = await createFixture(tools, {}, async cwd => {
+      outputPath = path.join(cwd, "result.md");
+      const registry = new ToolRegistry();
+      registry.register(...allToolEntries);
+      tools.push(...registry.resolve({ mode: "web", allowedTools: context.harness.allowedTools, refs: {
+        sessionIdRef: { current: "qa-session" }, taskListId: "qa-plan", sessionEventEmitter: vi.fn(),
+        spawnSubagentExecutor: vi.fn(), taskOutputReader: vi.fn(), jobStopExecutor: vi.fn(), allowInputRequest: true,
+      } as unknown as ToolRefs }));
+      appendAllowedTools(tools, [createReadTool(cwd), createWriteTool(cwd), createEditTool(cwd)], context.harness.allowedTools);
+      return { systemPromptOverride: () => context.systemPrompt };
+    });
+    await brain.prompt("Save the research result to the working directory.");
+    const names = requests[0].body.tools.map((tool: any) => tool.function.name);
+    expect(names).toEqual(expect.arrayContaining([
+      "read", "write", "edit", "local_script", "task_create", "task_update", "task_list", "task_get",
+      "spawn_subagent", "task_output", "job_stop", "skill_preview", "request_input", "save_feedback",
+    ]));
+    for (const name of ["memory_search", "memory_get", "bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script"]) {
+      expect(names).not.toContain(name);
+    }
+    expect(await fs.readFile(outputPath, "utf8")).toBe("# Research result\n");
+  });
+
+  it.each(["bound", "scoped", "bundled"])("advertises a %s Knowledge QA skill on the first provider request", async source => {
+    let skillPath = "";
+    let inheritFile = "";
+    const requests = mockNetwork(() => requests.length === 1
+      ? completion({ tool_calls: [{ index: 0, id: "call-read", type: "function",
+        function: { name: "read", arguments: JSON.stringify({ path: skillPath }) } }] }, "tool_calls")
+      : completion({ content: "Completed." }));
+    const { brain, services, session } = await createFixture([createReadTool(process.cwd())], {}, async cwd => {
+      const skillsBase = path.join(cwd, ".siclaw", "skills");
+      const resolvedDir = source === "scoped"
+        ? path.join(skillsBase, "agents", "qa", "resolved")
+        : path.join(skillsBase, "resolved");
+      const skillRoot = source === "bundled" ? path.join(cwd, "skills", "core") : resolvedDir;
+      skillPath = path.join(skillRoot, "resource-catalog", "SKILL.md");
+      await fs.mkdir(path.dirname(skillPath), { recursive: true });
+      await fs.writeFile(skillPath, "---\nname: resource-catalog\ndescription: Query the resource catalog through the configured MCP.\n---\nRead the resource catalog.\n");
+      const platformRoot = path.join(cwd, "skills", "platform", "answer-format");
+      await fs.mkdir(platformRoot, { recursive: true });
+      await fs.writeFile(path.join(platformRoot, "SKILL.md"), "---\nname: answer-format\ndescription: Format evidence-backed answers.\n---\nInclude supporting sources.\n");
+      const context = compileAgentContext({
+        agentType: "knowledge_qa", allowedTools: null, memoryConfigured: false, mode: "web",
+      });
+      const skillsDirs = resolveSkillDirectories({
+        cwd, skillsBase,
+        scopedSkillsDir: source === "scoped" ? resolvedDir : undefined,
+        includeBundledSkills: context.harness.includeBundledSkills,
+        includePlatformSkills: context.harness.includePlatformSkills,
+      });
+      const policyDir = path.dirname(resolvedDir);
+      inheritFile = path.join(policyDir, ".inherit-builtins.json");
+      return {
+        additionalSkillPaths: skillsDirs,
+        systemPromptOverride: () => context.systemPrompt,
+        skillsOverride: base => ({ ...base, skills: filterHarnessSkills(base.skills, {
+          resolvedDir,
+          portalDir: source === "scoped" ? resolvedDir : undefined,
+          builtinDirs: [path.join(cwd, "skills", "core"), path.join(cwd, "skills", "platform")],
+          inheritFile, disabledFile: path.join(policyDir, ".disabled-builtins.json"),
+        }) }),
+      };
+    });
+    expect(services.resourceLoader.getSkills().skills.map(skill => skill.name).sort()).toEqual(["answer-format", "resource-catalog"]);
+    expect(session.systemPrompt).toContain(skillPath);
+    await brain.prompt("What skills are available?");
+    expect(JSON.stringify(requests[0].body.messages)).toContain("<name>resource-catalog</name>");
+    expect(JSON.stringify(requests[0].body.messages)).toContain("<name>answer-format</name>");
+    expect(requests[1].body.messages.some((message: any) =>
+      message.role === "tool" && message.content.includes("Read the resource catalog."))).toBe(true);
+    expect(session.getActiveToolNames()).toEqual(["read"]);
+
+    await fs.mkdir(path.dirname(inheritFile), { recursive: true });
+    await fs.writeFile(inheritFile, "false");
+    await brain.reload();
+    expect(services.resourceLoader.getSkills().skills.map(skill => skill.name))
+      .toEqual(source === "bundled" ? [] : ["resource-catalog"]);
+    expect(session.systemPrompt).not.toContain("<name>answer-format</name>");
+  });
+
   it("records provider evidence through the coding-agent's installed SDK dependency", async () => {
     mockNetwork(() => completion({ content: "Completed." }));
     const { brain, llmCallRecorder } = await createFixture();

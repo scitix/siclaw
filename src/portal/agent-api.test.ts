@@ -236,7 +236,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(400);
     });
 
-    it("creates agent and auto-binds builtin skills", async () => {
+    it.each(["custom", "sre", "knowledge_qa"])("creates %s agent and auto-binds builtin skills", async agentType => {
       query
         .mockResolvedValueOnce([undefined, []])                   // insert agent
         .mockResolvedValueOnce([[{ id: "s-builtin" }], []])       // select builtin skills
@@ -246,11 +246,12 @@ describe("registerAgentRoutes", () => {
       const { status, body } = await runRoute(router, fakeReq({
         url: "/api/v1/agents",
         method: "POST",
-        body: { name: "Test Agent" },
+        body: { name: "Test Agent", agent_type: agentType },
       }));
 
       expect(status).toBe(201);
       expect(body.id).toBe("a-new");
+      expect(query.mock.calls.some(([sql, args]) => sql.includes("INTO agent_skills") && args[1] === "s-builtin")).toBe(true);
     });
 
     it("stores normalized model_routing policy on create", async () => {
@@ -326,9 +327,9 @@ describe("registerAgentRoutes", () => {
     });
 
     it("does not materialize a built-in contract when create omits an addendum", async () => {
-      // Knowledge QA has defaultNoSkills → no auto-bind: INSERT then SELECT-back.
       query
         .mockResolvedValueOnce([undefined, []])                        // insert agent
+        .mockResolvedValueOnce([[], []])                              // builtin skills
         .mockResolvedValueOnce([[{ id: "a-new", name: "coord" }], []]); // select-back
 
       const { status } = await runRoute(router, fakeReq({
@@ -349,6 +350,7 @@ describe("registerAgentRoutes", () => {
     it("persists a maintainer-supplied prompt for a built-in type", async () => {
       query
         .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[], []])
         .mockResolvedValueOnce([[{ id: "a-new", name: "coord" }], []]);
 
       const { status } = await runRoute(router, fakeReq({

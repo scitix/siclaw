@@ -153,12 +153,14 @@ export function resolveAgentHarness(
       resolution === "resolved" &&
       input.memoryConfigured &&
       hasAnyTool(allowedTools, ["memory_search", "memory_get"]),
+    // QA consumes Skill instructions through Read or configured MCP tools.
+    // Skill discovery is independent of command execution and authoring rights.
     includeBundledSkills:
       resolution === "resolved" &&
-      canOperate,
+      (agentType === "knowledge_qa" || canOperate),
     includePlatformSkills:
       resolution === "resolved" &&
-      hasAnyTool(allowedTools, ["write", "edit", "skill_preview"]),
+      (agentType === "knowledge_qa" || hasAnyTool(allowedTools, ["write", "edit", "skill_preview"])),
     includePlanningGuidance:
       !input.isSubagent &&
       resolution === "resolved" &&
@@ -174,7 +176,7 @@ export function resolveAgentHarness(
       hasAnyTool(allowedTools, ["cluster_list", "host_list"]),
     includeOperationalSafety:
       resolution === "resolved" &&
-      (agentType === "sre" || (agentType === "custom" && canOperate)),
+      (agentType === "sre" || canOperate),
     legacyUnrestrictedCustom,
   };
 }

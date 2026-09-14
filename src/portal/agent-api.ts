@@ -206,7 +206,7 @@ export function registerAgentRoutes(
     );
 
     // Auto-bind builtin skills to new agent — skipped for types that default to
-    // no skills (for example Knowledge QA).
+    // no skills (for example Product Support).
     if (!AGENT_TYPES[agentType].defaultNoSkills) try {
       const [builtinSkills] = await db.query(
         "SELECT id FROM skills WHERE is_builtin = 1 AND status = 'installed' AND org_id = ?",

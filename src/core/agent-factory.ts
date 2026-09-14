@@ -344,6 +344,24 @@ function assertToolPathAllowed(
   blockedDirs: Array<{ dir: string; reason: string }>,
 ): void {
   assertPathAllowed(absolutePath, allowedDirs, operation);
+  if (operation === "write" || operation === "edit") {
+    // New files may not exist yet. Check each component beneath the allowed
+    // workspace before mkdir/read/write so a pre-existing link cannot redirect
+    // a file tool into another resource directory.
+    const root = allowedDirs.find(dir => isPathInsideDir(absolutePath, dir))!;
+    let current = path.resolve(root);
+    for (const part of ["", ...path.relative(current, path.resolve(absolutePath)).split(path.sep)]) {
+      current = path.join(current, part);
+      try {
+        if (fs.lstatSync(current).isSymbolicLink()) {
+          throw new Error(`${operation} blocked: symbolic links are not writable workspace paths`);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+    }
+  }
   if (isToolResultArtifactPath(absolutePath)) {
     throw new Error(`${operation} blocked: tool-result artifacts are internal; use tool_result_read or tool_result_search`);
   }
@@ -744,10 +762,10 @@ export async function createSiclawSession(
   // A scoped Agent must not inherit pi's ambient ~/.pi/agent/skills discovery.
   // Keep standalone SRE/CLI compatibility only when there is no Portal/Gateway
   // scope and the harness explicitly permits bundled operational skills.
-  const filterSkillsToHarness =
-    Boolean(opts?.portalSkillsDir) ||
-    fs.existsSync(resolvedSkillsDir) ||
-    !compiledContext.harness.includeBundledSkills;
+  const unscopedCli = mode === "cli" && !agentId && !opts?.userId && opts?.portalSkillsDir === undefined
+    && !fs.existsSync(resolvedSkillsDir)
+    && ["sre", "custom"].includes(compiledContext.harness.agentType);
+  const filterSkillsToHarness = !unscopedCli || !compiledContext.harness.includeBundledSkills;
   const allowedSkillRoots = [...new Set(skillsDirs.map((dir) => path.resolve(dir)))];
   // LocalSpawner materializes policy files beside its Agent-scoped resolved/
   // tree; K8s keeps them in the process-wide skills root because one pod owns
@@ -776,7 +794,9 @@ export async function createSiclawSession(
           knowledgeDir,
           Boolean(citationSupport),
           compiledContext.harness.includeOperationalSafety,
-        ),
+        ).concat(compiledContext.harness.agentType === "knowledge_qa" && allowedTools?.includes("write")
+          ? [`\n## Research Workspace\nSave working notes and generated results under \`${userDataDir}\`. Use available Skill helpers when computation or processing helps answer the question; reading a Skill does not authorize unrelated actions.`]
+          : []),
       // Extension registration order: compactionSafeguard handles session_before_compact.
       extensionFactories: [
         contextPruningExtension,

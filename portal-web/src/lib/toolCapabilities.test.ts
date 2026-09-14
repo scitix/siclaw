@@ -15,6 +15,7 @@ describe("CAPABILITY_GROUPS shape", () => {
       "plan_tasks",
       "read_files",
       "run_commands",
+      "run_local_scripts",
       "run_sandbox",
       "run_scripts",
       "scheduling",
@@ -40,9 +41,10 @@ describe("CAPABILITY_GROUPS shape", () => {
     }
   })
 
-  it("assigns each tool to exactly one group (no cross-group overlap)", () => {
+  it("shares local_script only between the local subset and the existing script group", () => {
     const all = CAPABILITY_GROUPS.flatMap((g) => g.tools)
-    expect(new Set(all).size).toBe(all.length)
+    expect(all.filter((tool, index) => all.indexOf(tool) !== index)).toEqual(["local_script"])
+    expect(countToolsForSelection(new Set(["run_local_scripts", "run_scripts"]))).toBe(4)
   })
 })
 
@@ -121,8 +123,8 @@ describe("countToolsForSelection", () => {
     const all = countToolsForSelection(new Set(KNOWN_KEYS))
     const distinct = new Set(CAPABILITY_GROUPS.flatMap((g) => g.tools)).size
     expect(all).toBe(distinct)
-    // Groups never share a tool, so the union equals the simple sum.
-    const sum = CAPABILITY_GROUPS.reduce((n, g) => n + g.tools.length, 0)
-    expect(all).toBe(sum)
+    // The local subset adds no tools when the full script group is selected.
+    const withoutSubset = new Set(KNOWN_KEYS.filter((key) => key !== "run_local_scripts"))
+    expect(all).toBe(countToolsForSelection(withoutSubset))
   })
 })

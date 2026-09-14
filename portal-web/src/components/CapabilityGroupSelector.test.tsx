@@ -30,11 +30,8 @@ const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
 // group turned this into a red test that said nothing about the component — the
 // arithmetic it pinned was the table's, not the renderer's.
 //
-// KNOWN LIMIT, stated rather than implied: this cannot exercise DEDUPLICATION,
-// because every group in the real table is disjoint, so a renderer that summed
-// group lengths would pass too. The same was true of the hardcoded version (9 is
-// both 5+4 and |union|). What the assertions do pin is the pluralisation and that
-// the count follows the SELECTED groups.
+// The local script subset overlaps the full script group; the renderer must
+// count their shared tool only once.
 const toolCount = (...keys: string[]) =>
   new Set(keys.flatMap((key) => CAPABILITY_GROUPS.find((g) => g.key === key)!.tools)).size
 
@@ -58,10 +55,10 @@ describe("CapabilityGroupSelector — render contract", () => {
     expect(countChecked(html)).toBe(1)
   })
 
-  it("pluralizes groups and sums the deduped tool count for a multi-group selection", () => {
-    const html = render(new Set(["read_files", "run_commands"]))
+  it.each([["read_files", "run_commands"], ["run_local_scripts", "run_scripts"]])("counts distinct tools for %s and %s", (first, second) => {
+    const html = render(new Set([first, second]))
     // Plural "groups", and the count covers both selections.
-    expect(html).toContain(`2 groups · ${toolCount("read_files", "run_commands")} tools`)
+    expect(html).toContain(`2 groups · ${toolCount(first, second)} tools`)
     expect(html).toContain(`Capability groups (2 / ${CAPABILITY_GROUPS.length})`)
     expect(countChecked(html)).toBe(2)
   })

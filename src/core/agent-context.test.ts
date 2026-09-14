@@ -7,9 +7,9 @@ import {
 } from "./agent-context.js";
 
 describe("resolveAgentHarness", () => {
-  it("fails closed when type/capability resolution did not complete", () => {
+  it.each(["sre", "knowledge_qa"])("fails closed for %s when type/capability resolution did not complete", agentType => {
     const harness = resolveAgentHarness({
-      agentType: "sre",
+      agentType,
       allowedTools: null,
       harnessResolved: false,
       memoryConfigured: true,
@@ -20,6 +20,7 @@ describe("resolveAgentHarness", () => {
     expect(harness.mcpExposure).toBe("none");
     expect(harness.memoryEnabled).toBe(false);
     expect(harness.includeBundledSkills).toBe(false);
+    expect(harness.includePlatformSkills).toBe(false);
     expect(harness.includeInfrastructureGuidance).toBe(false);
   });
 
@@ -44,10 +45,21 @@ describe("resolveAgentHarness", () => {
 
     expect(harness.allowedTools).toEqual([
       "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+      "local_script", "write", "edit", "skill_preview",
+      "task_create", "task_update", "task_list", "task_get",
+      "spawn_subagent", "task_output", "job_stop",
+      "task_report", "save_feedback", "channel_update", "request_input", "propose_execution",
     ]);
     expect(harness.legacyUnrestrictedCustom).toBe(false);
-    expect(harness.includeBundledSkills).toBe(false);
+    expect(harness.includeBundledSkills).toBe(true);
+    expect(harness.includePlatformSkills).toBe(true);
     expect(harness.includeInfrastructureGuidance).toBe(false);
+  });
+
+  it.each(["sre", "custom", "knowledge_qa"])("gives %s operational safety when local scripts are enabled", agentType => {
+    const context = compileAgentContext({ agentType, allowedTools: ["read", "local_script"], memoryConfigured: false });
+    expect(context.harness.includeOperationalSafety).toBe(true);
+    expect(context.systemPrompt).toContain("# Operational Safety");
   });
 
   it("keeps Product Support read-only while exposing its configured result MCP", () => {
@@ -77,13 +89,13 @@ describe("resolveAgentHarness", () => {
 
   it("adds the automated-task report tool without broadening interactive capabilities", () => {
     const task = resolveAgentHarness({
-      agentType: "knowledge_qa",
+      agentType: "product_support",
       allowedTools: null,
       memoryConfigured: false,
       mode: "task",
     });
     const web = resolveAgentHarness({
-      agentType: "knowledge_qa",
+      agentType: "product_support",
       allowedTools: null,
       memoryConfigured: false,
       mode: "web",
@@ -132,7 +144,8 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("complete mounted Wiki catalog as the primary navigation map");
     expect(context.systemPrompt).not.toContain("Use `knowledge_search` before answering");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
-    expect(context.harness.includeBundledSkills).toBe(false);
+    expect(context.harness.includeBundledSkills).toBe(true);
+    expect(context.harness.includePlatformSkills).toBe(true);
     expect(context.harness.mcpExposure).toBe("configured");
   });
 

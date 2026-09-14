@@ -38,6 +38,15 @@ function wikiRuntimeContext(): string {
   return `\n\n${buildKnowledgeWikiCatalog(dir, { operational: false })}`;
 }
 
+it("fails inspection when an execution-capable QA prompt loses operational safety", () => {
+  const context = compileAgentContext({ agentType: "knowledge_qa", allowedTools: null, memoryConfigured: false });
+  const inspection = createPromptInspection({ context, mode: "web",
+    effectivePrompt: context.systemPrompt.replace("# Operational Safety", "# Missing policy"),
+    stage: "session_ready", tools: visibleTools(context.harness.allowedTools ?? []), skillNames: [],
+  });
+  expect(inspection.design.checks.find(check => check.id === "operational_safety_guidance")?.status).toBe("fail");
+});
+
 describe("createPromptInspection", () => {
   for (const agentType of ["sre", "knowledge_qa", "knowledge_qa", "custom"] as const satisfies readonly AgentType[]) {
     it(`exposes the exact ${agentType} prompt, layers, actual tools, and design verdict`, () => {

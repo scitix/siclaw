@@ -189,10 +189,12 @@ describe("conversation handoff across Agent types", () => {
     expect(harness.includeOperationalSafety).toBe(false);
     expect(toolsFor("custom", { allowedTools, memoryConfigured: false })).toHaveLength(2);
   });
-  it("does not grant operations to a read-only knowledge agent", () => {
+  it("adds only the handoff tools to the Knowledge QA research profile", () => {
+    const baseline = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false });
     const harness = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false, handoffAvailable: true });
-    expect(harness.allowedTools).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "transfer_to_agent", "search_handoff_targets"]);
-    expect(harness.includeSubagentGuidance).toBe(false);
+    expect(harness.allowedTools).toEqual([...baseline.allowedTools!, "transfer_to_agent", "search_handoff_targets"]);
+    expect(harness.includeSubagentGuidance).toBe(true);
+    expect(harness.memoryEnabled).toBe(false);
   });
   it("keeps an unresolved harness closed even with a roster", () => {
     expect(toolsFor("custom", { allowedTools: null, memoryConfigured: false, harnessResolved: false })).toEqual([]);

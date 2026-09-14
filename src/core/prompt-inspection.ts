@@ -168,6 +168,15 @@ function designChecks(input: {
     irrelevantSre ? `${harness.agentType} received SRE infrastructure guidance.` : `No incompatible SRE guidance is present for ${harness.agentType}.`,
   );
 
+  const operationalSafetyMissing = harness.includeOperationalSafety &&
+    !prompt.includes("# Operational Safety");
+  add(
+    "operational_safety_guidance",
+    operationalSafetyMissing ? "fail" : "pass",
+    "Execution-capable harnesses retain operational safety guidance.",
+    operationalSafetyMissing ? "Operational safety guidance is missing." : "Operational safety matches the harness.",
+  );
+
   const toolNames = new Set(tools.map((item) => item.name));
   const missingMentionedTools = mentionedKnownTools(prompt).filter((name) => !toolNames.has(name));
   add(

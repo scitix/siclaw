@@ -205,6 +205,10 @@ credential protection — not a separate tool boundary.
 
 ### `local_script`
 
+The `run_local_scripts` capability grants this tool on its own. Knowledge QA
+uses this group for Skill helpers; the existing `run_scripts` group continues
+to grant local, node, Pod and host script execution.
+
 Executes skill helper scripts locally via `spawn()`. No command validation
 (scripts are from trusted `skills/` directory). Uses `resolveSkillScript()`
 in `infra/script-resolver.ts` for path resolution with traversal protection.
