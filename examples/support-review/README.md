@@ -44,7 +44,10 @@ and result tools. Model combinations remain governed by the platform.
 `run-client.ts` is a source example for a server-side integration. It reuses both
 MCP validators and accepts a result only after `result` followed by `done`. It
 rejects wrong ticket IDs, references absent from supplied records, malformed
-results and incomplete streams. Optional `onChatEvent` forwards assistant events
+results and incomplete streams. A ticket reference requires a nonempty ticket
+description or a supplied ticket record; its ID, title and status alone are not
+citable evidence. Invalid review input rejects the returned Promise before any
+request is sent. Optional `onChatEvent` forwards assistant events
 for customer-facing streaming. Keys stay on the backend; redirects are refused.
 
 ```ts
@@ -103,9 +106,12 @@ Run local contract checks from the repository root:
 
 ```sh
 npx vitest run examples/support-review mcp/ticket-review-result mcp/product-support-result
-npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 \
-  --esModuleInterop --skipLibCheck --resolveJsonModule examples/support-review/run-client.ts
+npx tsc -p examples/support-review/tsconfig.json
 ```
+
+CI type-checks the example and smoke script with the repository's strict settings
+and installs/builds both result MCP packages independently. Smoke failures print
+RunError codes without printing supplied material.
 
 The tests consume actual MCP-validated outputs through a controlled SSE response.
 They are not real-provider or deployed-control-plane acceptance. For live checks,

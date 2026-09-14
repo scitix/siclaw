@@ -72,7 +72,8 @@ function validateReview(value: unknown, context: ReviewContext): TicketReviewRes
     throw new RunError("REVIEW_INCOMPLETE_COVERAGE", false);
   }
   const references = new Set(context.records.map((record) => JSON.stringify([record.source, record.id])));
-  references.add(JSON.stringify(["ticket", context.ticket.id]));
+  // Identity and status locate a ticket; only supplied content is citable.
+  if (nonempty(context.ticket.description)) references.add(JSON.stringify(["ticket", context.ticket.id]));
   if (result.evidence.some((reference) => !references.has(JSON.stringify([reference.source, reference.id])))) {
     throw new RunError("REVIEW_EVIDENCE_NOT_SUPPLIED", false);
   }
@@ -191,7 +192,7 @@ export function runSupport(options: RunOptions, text: string): Promise<RunResult
   return run(options, text, parseProductSupportResult);
 }
 
-export function runTicketReview(options: RunOptions, context: ReviewContext): Promise<RunResult<TicketReviewResult>> {
+export async function runTicketReview(options: RunOptions, context: ReviewContext): Promise<RunResult<TicketReviewResult>> {
   const text = reviewText(context);
   return run(options, text, (value) => validateReview(value, context));
 }

@@ -59,6 +59,47 @@ describe("supplied ticket context", () => {
   });
 });
 
+describe("review evidence and rejection contract", () => {
+  it("returns rejected Promises for invalid input without sending a request", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const rejected = runTicketReview(options(), {} as ReviewContext).catch(error => error);
+    await expect(rejected).resolves.toMatchObject({ code: "INVALID_REVIEW_CONTEXT", retriable: false });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "", "   "])("does not treat ticket metadata as supplied evidence (description=%s)", async description => {
+    const context: ReviewContext = {
+      ticket: { id: drafts[0].ticket_id, status: "closed", revision: "r1", title: "Ticket title", description },
+      records: [], coverage: { complete: true, missing: [] },
+    };
+    const draft = { ...drafts[0], evidence: [{ source: "ticket", id: context.ticket.id }] };
+    serve(encode("session", session) + encode("result", draft) + encode("done", {}));
+    await expect(runTicketReview(options(), context)).rejects.toMatchObject({ code: "REVIEW_EVIDENCE_NOT_SUPPLIED", retriable: false });
+  });
+
+  it.each(["description", "record"])("accepts a ticket reference backed by supplied %s", async source => {
+    const context: ReviewContext = {
+      ticket: { id: drafts[0].ticket_id, status: "closed", revision: "r1",
+        ...(source === "description" ? { description: "Supplied handling evidence." } : {}) },
+      records: source === "record" ? [{ source: "ticket", id: drafts[0].ticket_id, time: "2026-01-01T00:00:00Z", text: "Supplied handling evidence." }] : [],
+      coverage: { complete: true, missing: [] },
+    };
+    const draft = { ...drafts[0], evidence: [{ source: "ticket", id: context.ticket.id }] };
+    serve(encode("session", session) + encode("result", draft) + encode("done", {}));
+    await expect(runTicketReview(options(), context)).resolves.toMatchObject({ result: draft });
+  });
+
+  it("accepts an honest incomplete draft without any supplied content", async () => {
+    const context: ReviewContext = {
+      ticket: { id: drafts[5].ticket_id, status: "closed", revision: "r1" },
+      records: [], coverage: { complete: false, missing: ["Ticket contents"] },
+    };
+    serve(encode("session", session) + encode("result", drafts[5]) + encode("done", {}));
+    await expect(runTicketReview(options(), context)).resolves.toMatchObject({ result: drafts[5] });
+  });
+});
+
 describe("strict API result consumer", () => {
   it.each([1, 2, 7, 10000])("accepts CRLF and Unicode across chunks of %i bytes", async (stride) => {
     const draft = { ...drafts[0], type: "Example Δ category" };

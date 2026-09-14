@@ -3,7 +3,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { reviewCases } from "../../examples/support-review/acceptance-cases.js";
-import { runSupport, runTicketReview } from "../../examples/support-review/run-client.js";
+import { RunError, runSupport, runTicketReview } from "../../examples/support-review/run-client.js";
 
 const baseUrl = process.env.SICLAW_BASE_URL;
 const reviewKey = process.env.SICLAW_REVIEW_API_KEY;
@@ -22,7 +22,7 @@ async function record(id: string, operation: () => Promise<unknown>) {
   } catch (error) {
     failures++;
     // Schema diagnostics and provider errors can contain supplied material.
-    console.log(JSON.stringify({ case: id, passed: false, error: error instanceof Error ? error.name : "Error" }));
+    console.log(JSON.stringify({ case: id, passed: false, error: error instanceof RunError ? error.code : error instanceof Error ? error.name : "Error" }));
     if (output) await writeFile(resolve(output, `${id}.error.txt`), error instanceof Error ? error.message : "Unknown error", { mode: 0o600 });
   }
 }

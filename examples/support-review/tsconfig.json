@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": "../..",
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["./*.ts", "../../scripts/smoke/support-review.ts"],
+  "exclude": ["**/*.test.ts", "../../node_modules"]
+}
