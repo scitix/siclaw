@@ -114,6 +114,12 @@ const MISSING_OWNER_NOTICE_BY_LOCALE = {
   "en-US": "❌ This group binding is missing a session owner. Generate a fresh PAIR code from the Agent page and pair this group again.",
 } as const;
 
+// reach=group_only: this bot answers in groups only.
+const GROUP_ONLY_DM_NOTICE_BY_LOCALE = {
+  "zh-CN": "这个助手只在群里使用，请到对应的群里 @ 我。",
+  "en-US": "This assistant is only available in group chats — @ me in the group instead.",
+} as const;
+
 // Gated group, sender's account not linked yet.
 const GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 你的账号还没完成关联，暂时无法在群里使用这个助手。",
@@ -317,7 +323,12 @@ export interface LarkChannelConfig {
     access_mode: "open" | "public" | "identified" | "granted" | "platform_authorized" | (string & {});
     owner_user_id?: string;
     authorize_url?: string;
-    group_auto_bind?: boolean;
+    // Where this bot may be used, independent of access_mode's WHO.
+    // `group_only` means DMs are closed — every DM entry point is refused by the
+    // frontend regardless, so this is a local shortcut that saves a round trip,
+    // never the authority. Absent / unrecognized means both, matching the
+    // frontend's NormalizeReach.
+    reach?: "both" | "group_only" | (string & {});
   };
 }
 
@@ -1199,6 +1210,19 @@ export async function handleLarkMessage(
       console.log(`[lark] Ignoring p2p message for non-personal channel=${channelId}`);
       return;
     }
+    // reach=group_only closes every DM entry point, commands included. The
+    // frontend refuses these independently (adapter/rpc.go's personalDM
+    // registrar is the authority); declining here just saves the round trip.
+    //
+    // One short reply rather than silence: unlike a group, a DM is a place the
+    // sender deliberately opened, and leaving it unanswered reads as the bot
+    // being broken. It carries no link — the only link this system mints is
+    // redeemed in a DM, which is exactly what is closed.
+    if (personalBot.reach === "group_only") {
+      console.log(`[lark] DM refused channel=${personalChannelId} sender=${senderOpenId} — reach=group_only`);
+      await replyToLark(larkClient, messageId, GROUP_ONLY_DM_NOTICE_BY_LOCALE[locale]);
+      return;
+    }
     if (!senderOpenId) {
       await replyToLark(larkClient, messageId, "❌ Missing Feishu sender open_id.");
       return;
@@ -1490,16 +1514,14 @@ export async function handleLarkMessage(
     return;
   }
 
-  // Check for PAIR command
-  const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
-  if (pairMatch) {
-    const code = pairMatch[1].toUpperCase();
-    // Seed the binding's display name with the group title (best-effort).
-    const chatName = await fetchLarkChatName(larkClient, chatId);
-    const result = await handlePairingCode(code, groupChannelId, chatId, "group", frontendClient!, chatName ?? undefined);
-
-    const replyText = formatPairReply(result, locale);
-    await replyToLark(larkClient, messageId, replyText);
+  // Group PAIR is retired: a group is served by the dedicated app that was added
+  // to it, and by nothing else. The command word is dropped here rather than
+  // forwarded, so a stale code typed into a group is simply ignored instead of
+  // producing a refusal the room did not ask for. (The PERSONAL pairing code, in
+  // a DM, is untouched — that one links a Feishu identity to a Sicore account.)
+  // See sicore docs/design/feishu-bot-reach-and-pair-retirement.md.
+  if (/^PAIR\s+[A-Z0-9]{6}$/i.test(text.trim())) {
+    console.log(`[lark] group PAIR ignored chat=${chatId} — group pairing is retired`);
     return;
   }
 
@@ -1553,7 +1575,7 @@ export async function handleLarkMessage(
     );
     if (isChannelAccessDenied(modeBinding)) {
       if (modeExistingOnly) return;
-      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot)));
+      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot, modeBinding)));
       return;
     }
     if (!modeBinding) {
@@ -1665,7 +1687,7 @@ export async function handleLarkMessage(
     if (unmentionedGroupMessage) return;
     // Gated group: this sender isn't allowed. The message is either an explicit @ or a follow-up
     // in a previously established bot topic, so a single short hint is appropriate.
-    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, dmCanResolveAccess(personalBot)));
+    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, dmCanResolveAccess(personalBot, binding)));
     return;
   }
   if (!binding) {
@@ -2240,7 +2262,16 @@ function minutesUntil(expiresAtMs: number | undefined, now = Date.now()): number
  * offers no authorization step, so "DM me" would be a dead end — and the console URL the group
  * reply would otherwise carry was the only path they had.
  */
-function dmCanResolveAccess(personalBot: LarkChannelConfig["personal_bot"]): boolean {
+function dmCanResolveAccess(
+  personalBot: LarkChannelConfig["personal_bot"],
+  denied?: ChannelAccessDenied,
+): boolean {
+  // `dmDisabled` wins over everything else here: on a group_only bot the private
+  // chat refuses this sender too, so "DM me to get authorized" is an instruction
+  // that cannot be followed. Read from the REFUSAL rather than from the local
+  // config so the answer comes from the same evaluation that produced it — a
+  // cached config could still say `both` moments after the owner closed DMs.
+  if (denied?.dmDisabled) return false;
   return Boolean(personalBot) && !isOpenAccessTier(personalBot!.access_mode);
 }
 
