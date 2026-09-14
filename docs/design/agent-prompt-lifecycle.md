@@ -65,7 +65,7 @@ The two availability axes remain independent:
 | Agent type | Built-in capability groups | Explicitly configured resources |
 |---|---|---|
 | SRE | infrastructure, commands, scripts, files, memory, planning, sub-agents, session output | Skills, knowledge, MCP |
-| Knowledge QA | `knowledge_search`, Grep/Find, Read, `knowledge_cite` | knowledge, explicitly bound Skills and query/visual MCP |
+| Knowledge QA | knowledge search/citations, files, local Skill scripts, planning, sub-agents, session output | knowledge, Skills, MCP |
 | Custom | Portal selection, or legacy unrestricted built-ins only when an explicit Custom type has no selection | Skills, knowledge, MCP |
 
 `allowedTools` controls built-in tools, not dynamically named MCP tools. In
@@ -75,6 +75,19 @@ read/write classification or binding-source provenance, so Siclaw must not
 guess safety from a server or tool name. Until the contract carries enforceable
 effect metadata, Agent-type-safe MCP binding remains a control-plane
 responsibility.
+
+Knowledge QA uses `run_local_scripts` for `local_script`, independently of the
+legacy `run_scripts` group that also grants node, Pod and host script tools.
+Its `write_sandbox` tools write only to the Agent's user-data workspace. Skill
+scripts run as trusted code in the AgentBox using the existing resource bindings;
+QA is therefore a research role, not a blanket read-only execution boundary.
+Long-term memory remains disabled for this preset.
+
+QA planning is parent-owned. Spawned children inherit the QA tool/resource scope
+and Skill bindings, while child construction omits parent ledger and recursive
+spawn tools. Background work retains result inspection and cancellation through
+`task_output` and `job_stop`. Existing channel foreground and session-mode delivery
+rules also apply to QA.
 
 For Knowledge QA, the complete root `index.md` is the primary navigation map.
 `knowledge_search` resolves typed page labels and aliases only when catalog

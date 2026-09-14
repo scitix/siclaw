@@ -23,6 +23,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "write_sandbox", name: "Write & author skills", description: "Write/edit scratch files and author skills (sandboxed to user-data)", tools: ["write", "edit", "skill_preview"] },
   { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only discovery of bound clusters and hosts", tools: ["cluster_list", "host_list"] },
   { key: "run_commands", name: "Run commands", description: "Execute whitelisted shell commands (kubectl read-only)", tools: ["bash", "node_exec", "pod_exec", "host_exec", "k8s_inspect"] },
+  { key: "run_local_scripts", name: "Run local Skill scripts", description: "Execute available Skill scripts locally", tools: ["local_script"] },
   { key: "run_scripts", name: "Run scripts", description: "Execute approved Skill scripts", tools: ["node_script", "pod_script", "local_script", "host_script"] },
   { key: "run_sandbox", name: "Run sandbox code", description: "Disposable Python/Bash with scoped, read-only tool access", tools: ["run_script"] },
   { key: "search_memory", name: "Search memory", description: "Semantic search over long-term memory", tools: ["memory_search", "memory_get"] },

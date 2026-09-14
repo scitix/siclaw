@@ -36,6 +36,12 @@ describe("resolveCapabilities", () => {
     expect(resolveCapabilities(["run_scripts"])).not.toContain("run_script");
   });
 
+  it("local Skill execution can be selected independently of remote scripts", () => {
+    expect(resolveCapabilities(["run_local_scripts"])).toEqual(["local_script"]);
+    expect(resolveCapabilities(["run_local_scripts", "run_scripts"])!.sort())
+      .toEqual([...CAPABILITY_GROUPS.run_scripts].sort());
+  });
+
   it("multiple groups resolve to the union of their tools", () => {
     const result = resolveCapabilities(["read_files", "search_memory"]);
     expect(new Set(result)).toEqual(
@@ -78,6 +84,7 @@ describe("resolveCapabilities", () => {
       "plan_tasks",
       "read_files",
       "run_commands",
+      "run_local_scripts",
       "run_sandbox",
       "run_scripts",
       "scheduling",

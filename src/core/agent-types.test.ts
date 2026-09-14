@@ -19,7 +19,9 @@ describe("agent-types", () => {
     expect(Object.keys(AGENT_TYPES).sort()).toEqual(["custom", "knowledge_qa", "product_support", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
-    expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual(["read_files"]);
+    expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual([
+      "read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "spawn_subagents", "session_output",
+    ]);
     expect(AGENT_TYPES.knowledge_qa.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(false);
     expect(AGENT_TYPES.product_support.capabilities).toEqual(["read_files"]);
@@ -45,6 +47,7 @@ describe("agent-types", () => {
       const block = mirror.split(`key: "${key}"`)[1]?.split("},")[0];
       expect(block, `no ${key} block in the Portal mirror`).toBeTruthy();
       expect(block).toContain(def.description);
+      expect(block).toContain(`defaultNoSkills: ${def.defaultNoSkills}`);
       const mirrored = [...(block!.match(/capabilities: \[([^\]]*)\]/)?.[1] ?? "")
         .matchAll(/"([^"]+)"/g)].map((m) => m[1]);
       expect(mirrored, `${key} capabilities drifted`).toEqual(def.capabilities ?? []);
@@ -78,7 +81,7 @@ describe("agent-types", () => {
 
   it("effectiveCapabilityKeys: built-in types override, custom uses own selection", () => {
     expect(effectiveCapabilityKeys("sre", null)).toEqual(AGENT_TYPES.sre.capabilities);
-    expect(effectiveCapabilityKeys("knowledge_qa", ["run_commands"])).toEqual(["read_files"]);
+    expect(effectiveCapabilityKeys("knowledge_qa", ["run_commands"])).toEqual(AGENT_TYPES.knowledge_qa.capabilities);
     expect(effectiveCapabilityKeys("product_support", ["run_commands"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", ["read_files"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", null)).toBeNull();

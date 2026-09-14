@@ -351,10 +351,15 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     // Locked, not unrestricted: a non-null, non-empty whitelist derived from the
-    // Knowledge QA type, with only its configured read capabilities.
+    // Knowledge QA type, including its research workflow capabilities.
     expect(Array.isArray(box.sessionManager.allowedToolsState)).toBe(true);
     expect(box.sessionManager.allowedToolsState.length).toBeGreaterThan(0);
     expect(box.sessionManager.allowedToolsState).toContain("read");
+    expect(box.sessionManager.allowedToolsState).toEqual(expect.arrayContaining([
+      "local_script", "write", "task_create", "spawn_subagent", "task_output", "job_stop",
+    ]));
+    expect(box.sessionManager.allowedToolsState).not.toContain("memory_search");
+    expect(box.sessionManager.allowedToolsState).not.toContain("host_exec");
     // Persona is driven by agentTypeState — must reflect the built-in type.
     expect(box.sessionManager.agentTypeState).toBe("knowledge_qa");
     expect(box.sessionManager.harnessResolvedState).toBe(true);

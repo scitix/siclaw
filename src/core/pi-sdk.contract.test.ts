@@ -7,6 +7,8 @@ import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   createAgentSessionServices,
   createReadTool,
+  createWriteTool,
+  createEditTool,
   ModelRuntime,
   SessionManager,
   SettingsManager,
@@ -20,6 +22,9 @@ import { skillsHandler, knowledgeHandler } from "../agentbox/sync-handlers.js";
 import { compileAgentContext } from "./agent-context.js";
 import { resolveSkillDirectories } from "./skill-directories.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
+import { ToolRegistry, type ToolRefs } from "./tool-registry.js";
+import { appendAllowedTools } from "./tool-append.js";
+import { allToolEntries } from "../tools/all-entries.js";
 import type { UsageObservation } from "../shared/model-usage.js";
 
 // Exercise installed Pi packages through the real HTTP serializer and agent loop.
@@ -122,6 +127,39 @@ function resultTool(execute = vi.fn(async () => ({
 }
 
 describe("installed Pi SDK contract", () => {
+  it("sends QA research tools to the provider and writes a working result", async () => {
+    let outputPath = "";
+    const requests = mockNetwork(() => requests.length === 1
+      ? completion({ tool_calls: [{ index: 0, id: "call-write", type: "function",
+        function: { name: "write", arguments: JSON.stringify({ path: outputPath, content: "# Research result\n" }) } }] }, "tool_calls")
+      : completion({ content: "Completed." }));
+    const tools: ToolDefinition[] = [];
+    const context = compileAgentContext({
+      agentType: "knowledge_qa", allowedTools: null, memoryConfigured: true, mode: "web",
+    });
+    const { brain } = await createFixture(tools, {}, async cwd => {
+      outputPath = path.join(cwd, "result.md");
+      const registry = new ToolRegistry();
+      registry.register(...allToolEntries);
+      tools.push(...registry.resolve({ mode: "web", allowedTools: context.harness.allowedTools, refs: {
+        sessionIdRef: { current: "qa-session" }, taskListId: "qa-plan", sessionEventEmitter: vi.fn(),
+        spawnSubagentExecutor: vi.fn(), taskOutputReader: vi.fn(), jobStopExecutor: vi.fn(), allowInputRequest: true,
+      } as unknown as ToolRefs }));
+      appendAllowedTools(tools, [createReadTool(cwd), createWriteTool(cwd), createEditTool(cwd)], context.harness.allowedTools);
+      return { systemPromptOverride: () => context.systemPrompt };
+    });
+    await brain.prompt("Save the research result to the working directory.");
+    const names = requests[0].body.tools.map((tool: any) => tool.function.name);
+    expect(names).toEqual(expect.arrayContaining([
+      "read", "write", "edit", "local_script", "task_create", "task_update", "task_list", "task_get",
+      "spawn_subagent", "task_output", "job_stop", "skill_preview", "request_input", "save_feedback",
+    ]));
+    for (const name of ["memory_search", "memory_get", "bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script"]) {
+      expect(names).not.toContain(name);
+    }
+    expect(await fs.readFile(outputPath, "utf8")).toBe("# Research result\n");
+  });
+
   it.each(["bound", "scoped", "bundled"])("advertises a %s Knowledge QA skill on the first provider request", async source => {
     let skillPath = "";
     let inheritFile = "";

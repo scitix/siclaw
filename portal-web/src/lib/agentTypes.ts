@@ -26,8 +26,8 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "knowledge_qa",
     label: "Knowledge Q&A Agent",
     description: "Researches bound knowledge bases and answers with synthesized, source-backed information.",
-    capabilities: ["read_files"],
-    defaultNoSkills: true,
+    capabilities: ["read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "spawn_subagents", "session_output"],
+    defaultNoSkills: false,
   },
   {
     key: "product_support",
