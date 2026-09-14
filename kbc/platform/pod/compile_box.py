@@ -548,6 +548,20 @@ class PlanIntegrityError(RuntimeError):
     deterministic = True
 
 
+class WorkerTeardownError(RuntimeError):
+    """The workspace must be discarded before another worker can run."""
+
+
+# Includes host-tool drain and SDK subprocess shutdown, not model execution.
+_WORKER_TEARDOWN_TIMEOUT_S = 30
+
+
+def _observe_task_exit(task):
+    """Retrieve a late cleanup result after its failure was already reported."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _batch_error_code(exc: BaseException) -> str:
     """A machine-routable code for a batch failure — the whitelist token that may
     reach pod stdout. NEVER embed the exception MESSAGE in a log line: a
@@ -556,6 +570,8 @@ def _batch_error_code(exc: BaseException) -> str:
     operator-visible, and the owner's KB content is theirs alone (it flows to the
     OWNER-facing SSE events instead). The class name + this code route the fault
     without leaking any of that."""
+    if isinstance(exc, WorkerTeardownError):
+        return "worker_teardown_failed"
     if isinstance(exc, ModelStallError):
         return "model_stall"
     if isinstance(exc, ModelResultError):
@@ -613,6 +629,7 @@ class CompileStep:
     text: list[str] = field(default_factory=list)
     reply: str = ""
     teardown_failed: bool = False
+    task: asyncio.Task | None = None
 
     def discard_reply(self):
         self.text.clear()
@@ -3989,7 +4006,11 @@ def _assert_exclusions_landed(run: "CompileRun", batch: dict) -> None:
 async def _execute_compile_step(run: "CompileRun", client: AgentClient, directive: str,
                                 *, preserve_page_baseline: bool = False) -> str:
     """Own a bounded worker through connection, result and teardown."""
-    with _own_compile_step(run, client) as step:
+    teardown_started = asyncio.get_running_loop().create_future()
+
+    async def execute(step):
+        # SDK connect and disconnect must stay in the SAME task: Claude's
+        # AnyIO scopes cannot be exited by a separate cleanup task.
         try:
             await client.connect()
             run._begin_turn(directive, preserve_page_baseline=preserve_page_baseline)
@@ -4001,13 +4022,47 @@ async def _execute_compile_step(run: "CompileRun", client: AgentClient, directiv
             # Stop the watchdog before teardown, retaining exclusive ownership
             # until the adapter has settled its tools and disconnected.
             run._turn_active = False
+            teardown_started.set_result(None)
             try:
                 await client.disconnect()
             except BaseException as exc:
                 step.teardown_failed = True
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                raise RuntimeError("compile worker teardown was not confirmed; recreate the session") from exc
+                raise WorkerTeardownError("compile worker teardown was not confirmed; recreate the session") from exc
+
+    with _own_compile_step(run, client) as step:
+        step.task = asyncio.create_task(execute(step))
+        cancelled = False
+        try:
+            try:
+                await asyncio.wait({step.task, teardown_started}, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                cancelled = True
+                step.task.cancel()
+            # asyncio.wait, unlike wait_for, does not await cancellation of a
+            # wedged SDK/tool. Keep this workspace quarantined and report the
+            # failure so Runtime can dispose the box and recovery can rehydrate
+            # the last committed checkpoint into a different workspace.
+            done, _ = await asyncio.wait({step.task}, timeout=_WORKER_TEARDOWN_TIMEOUT_S)
+            if not done:
+                step.teardown_failed = True
+                if cancelled:
+                    raise asyncio.CancelledError
+                raise WorkerTeardownError("compile worker teardown was not confirmed; recreate the session")
+            if cancelled:
+                raise asyncio.CancelledError
+            if step.task.cancelled() and run._turn_dead:
+                run._turn_dead = False
+                raise ModelStallError("model worker stopped by watchdog")
+            return step.task.result()
+        finally:
+            if not step.task.done():
+                step.teardown_failed = True
+                step.task.cancel()
+            # Retain the task with the quarantined step until box disposal, and
+            # retrieve any late exception without treating late exit as recovery.
+            step.task.add_done_callback(_observe_task_exit)
 
 
 @_observe_pi_sessions
@@ -4673,6 +4728,10 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
                 await run.emit({"type": "log", "text": _loc(run,
                     "Planner proposal failed validation, falling back to the code baseline: ",
                     "规划方案未过校验,改用代码基线分批:") + "; ".join(errors[:3])})
+    except WorkerTeardownError:
+        # A surviving planner may still write BATCH_PLAN.json. A code-plan
+        # fallback is valid only after that planner has relinquished ownership.
+        raise
     except Exception as e:
         await run.emit({"type": "log", "text": _loc(run,
             f"Planner session failed, falling back to the code baseline: {e!r}",
@@ -5511,6 +5570,22 @@ async def _consume_turn_stream(
 _STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
 
 
+async def _interrupt_with_deadline(client):
+    # The watchdog must keep working even if an SDK/tool never acknowledges
+    # cancellation. The caller reaps the worker on timeout; this is not stop
+    # confirmation and never releases workspace ownership.
+    task = asyncio.create_task(client.interrupt())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=_STALL_INTERRUPT_DEADLINE_S)
+        if not done:
+            raise AgentTransportError("worker interrupt deadline exceeded")
+        task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(_observe_task_exit)
+
+
 def _watchdog_idle_bound(tool_pending: bool, model_idle_timeout: float, destream_floor: float) -> float:
     """Idle bound for the stall watchdog.
 
@@ -5539,6 +5614,10 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
       behavior — error + a turn_done that promises the session is recreated on
       the next message (run_session has no reconnect loop; the platform
       find-or-starts a fresh run/box with workspace rehydration)."""
+    step = run._active_step
+    if (step.client if step is not None else run.client) is not client:
+        # interrupt() awaited the SDK; a successor may already own execution.
+        return
     run._stall_retrying = False
     run._turn_active = False
     if run._active_step is not None:
@@ -5568,6 +5647,11 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
             "The turn stalled and could not be recovered — nothing was applied. "
             "The compile session will be recreated automatically on your next message.",
             "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
+    if step is not None and step.task is not None:
+        # Let the SDK-owning task drain its tools and exit its own scopes. The
+        # step driver bounds this drain and prevents a rebuild if it times out.
+        step.task.cancel()
+        return
     try:
         await client.disconnect()
     except Exception:
@@ -5649,7 +5733,7 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         run._last_stall_diagnostic = diagnostic
         await run.emit({"type": "turn_stalled", "attempt": run._model_retries, **diagnostic})
         try:
-            await client.interrupt()
+            await _interrupt_with_deadline(client)
         except Exception as e:
             # interrupt() itself failed → no interrupted-result can EVER come, so
             # the receive loop stays blocked forever. Merely clearing the latch and

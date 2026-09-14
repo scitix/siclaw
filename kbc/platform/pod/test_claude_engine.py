@@ -129,6 +129,70 @@ async def test_claude_readonly_and_provider_failure(tmp_path, monkeypatch):
                 allowed_read_roots=[str(tmp_path)], timeout_secs=30)
 
 
+@pytest.mark.parametrize("engine", ["claude_agent_sdk", "pi_agent"])
+async def test_internal_step_owns_real_sdk_through_teardown(tmp_path, monkeypatch, engine):
+    tool_name = "mcp__kbc__Write" if engine == "claude_agent_sdk" else "Write"
+    async with provider(lambda _, n: response(tool=(tool_name, {
+        "file_path": "candidate/page.md", "content": "Synthetic retention: 19 days.",
+    })) if n == 1 else response(text="Draft written.")) as (config, requests):
+        config["model"]["cost"] = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        configure(monkeypatch, config)
+        monkeypatch.setenv("KBC_ENGINE", engine)
+        run = compile_box.CompileRun("step-fixture", str(tmp_path), 1)
+        run._batch_active = True
+        async with asyncio.timeout(30):
+            reply = await compile_box._drive_batch_session(run, "Write the candidate page.", "fixture")
+        assert reply == "Draft written."
+        assert (tmp_path / "candidate/page.md").read_text() == "Synthetic retention: 19 days."
+        assert len(requests) == 2
+        assert run._active_step is None and not run._turn_active
+
+
+@pytest.mark.parametrize("engine", ["claude_agent_sdk", "pi_agent"])
+async def test_cancel_internal_step_drains_real_sdk_tools(tmp_path, monkeypatch, engine):
+    from agent_protocol import EngineTool
+    from engine import create_agent_client
+
+    entered, stopped = asyncio.Event(), asyncio.Event()
+
+    async def hold(_):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            stopped.set()
+
+    tool_name = "mcp__kbc__hold" if engine == "claude_agent_sdk" else "hold"
+    async with provider(lambda *_: response(tool=(tool_name, {}))) as (config, _):
+        config["model"]["cost"] = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        configure(monkeypatch, config)
+        monkeypatch.setenv("KBC_ENGINE", engine)
+        client = create_agent_client(
+            cwd=str(tmp_path), system_prompt="Use the tool.", session_id=str(uuid.uuid4()),
+            model_config=config, tools=[EngineTool("hold", "Wait", {"type": "object", "properties": {}}, hold)])
+        run = compile_box.CompileRun("cancel-step-fixture", str(tmp_path), 1)
+        run._batch_active = True
+        task = asyncio.create_task(compile_box._execute_compile_step(run, client, "Wait."))
+        try:
+            await asyncio.wait_for(entered.wait(), 15)
+            process = client._client._transport._process if engine == "claude_agent_sdk" else client.process
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=15)
+            assert task in done
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert stopped.is_set()
+            assert run._active_step is None
+            assert process.returncode is not None
+            if engine == "claude_agent_sdk":
+                from anyio import ClosedResourceError
+                with pytest.raises(ClosedResourceError):
+                    await process.stdout.receive()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_claude_interrupt_settles_host_writes_before_next_turn(tmp_path):
     from agent_protocol import AgentTransportError, EngineTool
     entered, stopped = asyncio.Event(), asyncio.Event()

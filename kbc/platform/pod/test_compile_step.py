@@ -140,6 +140,35 @@ async def test_step_cancellation_retains_ownership_until_teardown(run):
     assert not run.client.disconnected
 
 
+async def test_cancel_during_hung_cleanup_stays_cancelled_and_quarantined(run, monkeypatch):
+    monkeypatch.setattr(compile_box, "_WORKER_TEARDOWN_TIMEOUT_S", 0.01)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class HungClose(Client):
+        async def disconnect(self):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    task = asyncio.create_task(compile_box._execute_compile_step(run, HungClose([result()]), "scope"))
+    try:
+        await asyncio.wait_for(entered.wait(), 0.5)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        assert task in done
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert run._active_step.teardown_failed
+        assert not any(event["type"] in {"error", "syncArtifacts"} for event in drain(run))
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if run._active_step and run._active_step.task:
+            await asyncio.gather(run._active_step.task, return_exceptions=True)
+
+
 async def test_watchdog_targets_step_worker_without_interrupting_owner(run, monkeypatch):
     entered = asyncio.Event()
     owner = run.client
@@ -147,6 +176,14 @@ async def test_watchdog_targets_step_worker_without_interrupting_owner(run, monk
 
     class ExitedClient(Client):
         returncode = 1
+
+        async def connect(self):
+            self.owner_task = asyncio.current_task()
+            await super().connect()
+
+        async def disconnect(self):
+            assert asyncio.current_task() is self.owner_task
+            await super().disconnect()
 
         async def receive_messages(self):
             entered.set()
@@ -169,6 +206,60 @@ async def test_watchdog_targets_step_worker_without_interrupting_owner(run, monk
     assert not owner.disconnected and owner.interrupts == 0
     assert run._turn_text == ["owner reply"]
     assert not any(e["type"] == "turn_done" for e in drain(run))
+
+
+async def test_watchdog_interrupt_call_cannot_hold_the_step_forever(run, monkeypatch):
+    monkeypatch.setattr(compile_box, "_MODEL_WATCHDOG_POLL_S", 0.001)
+    monkeypatch.setattr(compile_box, "_MODEL_IDLE_TIMEOUT_S", 0.001)
+    monkeypatch.setattr(compile_box, "_STALL_INTERRUPT_DEADLINE_S", 0.01)
+    monkeypatch.setattr(compile_box.destream, "model_idle_floor", lambda: 0)
+
+    class HungInterrupt(Client):
+        async def receive_messages(self):
+            await asyncio.Future()
+            yield result()
+
+        async def interrupt(self):
+            self.interrupts += 1
+            await asyncio.Future()
+
+    worker = HungInterrupt()
+    watchdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+    task = asyncio.create_task(compile_box._execute_compile_step(run, worker, "compile scope"))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        assert task in done, "watchdog must also bound the interrupt call itself"
+        with pytest.raises(compile_box.ModelStallError):
+            await task
+        assert worker.disconnected and worker.interrupts == 1
+        assert run._active_step is None
+    finally:
+        watchdog.cancel()
+        task.cancel()
+        await asyncio.gather(watchdog, task, return_exceptions=True)
+
+
+async def test_late_watchdog_failure_cannot_cancel_a_successor_step(run):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold():
+        entered.set()
+        await release.wait()
+
+    successor = Client([assistant("successor output"), result()], hold)
+    task = asyncio.create_task(compile_box._execute_compile_step(run, successor, "new step"))
+    try:
+        await asyncio.wait_for(entered.wait(), 0.5)
+        # The previous worker's interrupt awaited the SDK while this successor
+        # started. Its late failure must only refer to that previous client.
+        await compile_box._reap_unrecoverable_turn(run, Client(), "late interrupt failure")
+        assert run._turn_active
+        assert run._active_step.client is successor
+        assert not run._active_step.task.cancelling()
+    finally:
+        release.set()
+        outcome = await asyncio.gather(task, return_exceptions=True)
+    assert outcome == ["successor output"]
 
 
 async def test_planner_result_has_step_semantics(run, monkeypatch):
@@ -226,6 +317,66 @@ async def test_unconfirmed_teardown_blocks_rebuild_and_new_messages(run, monkeyp
     with pytest.raises(RuntimeError, match="already owns execution"):
         await compile_box._execute_compile_step(run, Client(), "new scope")
     assert not run.client.disconnected
+
+
+@pytest.mark.parametrize("ignore_cancel", [False, True])
+async def test_hung_teardown_fails_without_releasing_the_workspace(run, monkeypatch, ignore_cancel):
+    monkeypatch.setattr(compile_box, "_WORKER_TEARDOWN_TIMEOUT_S", 0.01, raising=False)
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class HungClose(Client):
+        async def disconnect(self):
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                if not ignore_cancel:
+                    raise
+                await release.wait()
+            await super().disconnect()
+
+    worker = HungClose([result()])
+    task = asyncio.create_task(compile_box._execute_compile_step(run, worker, "compile scope"))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        assert task in done, "SDK teardown must hand failure back within its deadline"
+        with pytest.raises(RuntimeError, match="teardown was not confirmed") as error:
+            await task
+        assert compile_box._batch_error_code(error.value) == "worker_teardown_failed"
+        await asyncio.wait_for(cancelled.wait(), 0.5)
+        assert run._active_step.client is worker and run._active_step.teardown_failed
+        with pytest.raises(RuntimeError, match="teardown was not confirmed"):
+            await compile_box._sync_workspace(run, {})
+        with pytest.raises(RuntimeError, match="already owns execution"):
+            await compile_box._execute_compile_step(run, Client(), "competing step")
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if run._active_step and run._active_step.task:
+            await asyncio.gather(run._active_step.task, return_exceptions=True)
+
+
+async def test_failed_planner_teardown_does_not_fall_back_or_publish_a_checkpoint(run, monkeypatch, tmp_path):
+    monkeypatch.setenv("KBC_BATCH_PLANNER", "model")
+    monkeypatch.setattr(compile_box.pi_config, "for_role", lambda *a, **kw: {})
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw/source.md").write_text("synthetic source")
+
+    class BrokenClose(Client):
+        async def disconnect(self):
+            raise AgentTransportError("fixture stop failed")
+
+    monkeypatch.setattr(compile_box, "create_agent_client", lambda **kw: BrokenClose([result()]))
+    await compile_box._run_batch_compile(run, "compile scope")
+    events = drain(run)
+    failures = [event for event in events if event["type"] == "error"]
+    assert len(failures) == 1
+    assert failures[0]["code"] == "worker_teardown_failed"
+    assert failures[0]["stage"] == "batch_compile"
+    assert run._active_step.teardown_failed and run._batch_active
+    assert not (tmp_path / compile_box.batching.BATCH_PLAN_PATH).exists()
+    assert not any(event["type"] == "syncArtifacts" for event in events)
 
 
 async def test_each_step_returns_its_own_reply(run, monkeypatch):

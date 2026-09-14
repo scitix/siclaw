@@ -288,7 +288,13 @@ class ClaudeAgentClient:
             await asyncio.gather(self._reader, return_exceptions=True)
         try:
             if self._client:
+                process = getattr(getattr(self._client, "_transport", None), "_process", None)
                 await self._client.disconnect()
+                # The pinned SDK waits for exit but can leave unread stdout
+                # open after an aborted tool turn. Close the AnyIO Process's
+                # pipes before releasing this session's resources.
+                if process is not None:
+                    await process.aclose()
         finally:
             if self._state:
                 self._state.cleanup()

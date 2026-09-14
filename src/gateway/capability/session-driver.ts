@@ -182,6 +182,10 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
             // same event without replaying its already-persisted side effects.
             await client.postJson(`/events/ack/${runId}`, { event_id: event.event_id }, 10_000);
           }
+          // A fatal worker may never emit end (e.g. SDK teardown is wedged).
+          // Once its failure is durable, end this relay so the server's existing
+          // finally stops the box. Never read/sync more files from that worker.
+          if (event.type === "error" && event.recoverable !== true) return;
         }
         if (replay && !acknowledgedStream) throw new Error("box cannot safely replay lifecycle events");
         if (acknowledgedStream && !sawEnd && !runSettled()) throw new Error("box stream ended before its end event");

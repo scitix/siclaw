@@ -28,6 +28,38 @@ function frontend() {
 }
 
 describe("acknowledged capability event delivery", () => {
+  it.each([false, true])("closes a failed worker relay after persistence even when ACK is lost: %s", async (loseAck) => {
+    const { fe, writes } = frontend();
+    const manager = new CapabilityRunManager(fe);
+    await manager.startRun({ runId: "r", profile: "kb-compile", orgId: "o" });
+    let closed = false;
+    let readAfterFailure = false;
+    const ack = vi.fn(async () => {
+      expect(writes.at(-1)).toMatchObject({ status: "failed", checkpoint: {
+        failure: { code: "worker_teardown_failed", stage: "batch_compile" }, relay_event_id: id(1),
+      } });
+      if (loseAck) throw new Error("ACK response lost");
+      return { ok: true };
+    });
+    const client = {
+      postJson: ack,
+      async *streamPath() {
+        try {
+          yield ready;
+          yield { type: "error", event_id: id(1), code: "worker_teardown_failed", stage: "batch_compile" };
+          readAfterFailure = true;
+          yield { type: "syncArtifacts", event_id: id(2), artifacts: [{ path: "candidate/late.md", content: "unsafe" }] };
+        } finally { closed = true; }
+      },
+    };
+    await driveCapabilitySession({ client: client as any, runId: "r", frontendClient: fe as any, manager, reconnect });
+    expect(closed).toBe(true);
+    expect(readAfterFailure).toBe(false);
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(manager.get("r")).toBeUndefined();
+    expect(fe.request.mock.calls.some(([method]) => method === CAPABILITY_PERSIST_ARTIFACTS)).toBe(false);
+  });
+
   it("replays a lost fatal error before end and persists failed rather than done", async () => {
     const { fe, writes } = frontend();
     const manager = new CapabilityRunManager(fe);
@@ -49,7 +81,7 @@ describe("acknowledged capability event delivery", () => {
     };
     await driveCapabilitySession({ client: client as any, runId: "r", frontendClient: fe as any, manager, reconnect });
     expect(writes.map(w => w.status)).toEqual(["running", "failed"]);
-    expect(ack).toHaveBeenCalledTimes(2);
+    expect(ack).toHaveBeenCalledTimes(1); // fatal receipt closes the relay before end
   });
 
   it("ACK loss replays a completed turn without persisting the reply twice", async () => {
@@ -128,7 +160,7 @@ describe("acknowledged capability event delivery", () => {
     };
     await driveCapabilitySession({ client: client as any, runId: "r", frontendClient: fe as any, manager, reconnect });
     expect(rejected).toBe(true);
-    expect(ack).toHaveBeenCalledTimes(2);
+    expect(ack).toHaveBeenCalledTimes(method === CAPABILITY_PERSIST_TURN ? 2 : 1);
     if (method === CAPABILITY_PERSIST_TURN) expect(turns).toHaveLength(1);
     else expect(writes.map(w => w.status)).toEqual(["running", "failed"]);
   });
