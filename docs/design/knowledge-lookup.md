@@ -68,6 +68,24 @@ node siclaw.mjs knowledge search "certificate expiry" --root ./wiki --repo libra
 node scripts/eval/knowledge-lookup.mjs
 ```
 
+For a private mounted snapshot, compare the original question with supplied
+alternate queries using the same public resolver API:
+
+```sh
+node scripts/eval/knowledge-lookup-corpus.mjs --root ./wiki --queries ./questions.json
+```
+
+Each question has `id`, `query`, `expectedFiles` (relative page paths, possibly
+multiple), and optional `alternates` (up to three focused queries). An empty
+`expectedFiles` array marks a no-answer case. Freeze alternates before examining
+retrieval results. The script reports label navigation, original body lookup,
+and equal-weight reciprocal-rank fusion of the original and alternate queries.
+It measures expected-page recall and complete-question coverage at six results;
+candidate presence for a no-answer query is not itself an incorrect answer.
+Keep the input and corpus-derived output private. Alternate queries are supplied
+by the evaluator, so this comparison does not establish automatic query planning
+or semantic retrieval. It does not change the runtime's default ranking.
+
 The CLI starts a fresh in-memory index per process and needs no model or Portal
 connection. Agent sessions amortize this cold start. CLI JSON includes elapsed
 time; the synthetic evaluation separates label sync, content cold start, warm
@@ -99,6 +117,13 @@ conditions, citation correctness, first-evidence time, tool calls, output tokens
 and end-to-end p50/p95. Include ambiguous library names, multi-library answers,
 long pages, exceptions, obsolete versions, no-answer questions and updates.
 The microbenchmark does not replace these agent-level trials.
+
+Include library-order permutations and large distractor libraries. Global
+top-K truncation can omit a useful library even when all libraries are searched.
+Blindly reserving slots for each library or retaining only technical terms can
+also displace useful evidence; evaluate these interventions against the same
+questions. Lexical OR matches do not establish that every identifier, version,
+or prerequisite in a question is supported by a returned page.
 
 Trace consumers that identify knowledge usage solely from `read` tool inputs
 must also recognize `knowledge_lookup` results with `readStatus=full`, matching

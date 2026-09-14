@@ -4,7 +4,6 @@ import type { createKnowledgeCitationSupport } from "../../core/knowledge-citati
 import type { ToolEntry } from "../../core/tool-registry.js";
 import type { KnowledgeResolver } from "../../knowledge/resolver.js";
 import type { LookupOptions } from "../../knowledge/lookup.js";
-import { renderTextResult } from "../infra/tool-render.js";
 
 export type KnowledgeReadSupport = Pick<ReturnType<typeof createKnowledgeCitationSupport>, "captureMount" | "noteRead">;
 
@@ -26,7 +25,6 @@ export function createKnowledgeLookupTool(resolver: KnowledgeResolver, reads?: K
       readCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 5, description: "Attempt to include this many top-ranked complete pages; default 2. Zero returns metadata only." })),
       repoIds: Type.Optional(Type.Array(Type.String(), { minItems: 1, description: "Optional library IDs from prior results. Omit to search all mounted libraries." })),
     }),
-    renderResult: renderTextResult,
     async execute(_id, params, signal) {
       const start = reads?.captureMount();
       const result = await resolver.lookup(params as LookupOptions, signal);
