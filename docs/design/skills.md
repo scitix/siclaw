@@ -501,7 +501,8 @@ This is a secondary path -- `local_script` is preferred.
 valid for this session. A Gateway-managed Agent loads the single `resolved/`
 directory built by materialization; a Portal-backed headless CLI loads its
 `portalSkillsDir`. Repo-bundled operational skills are a fallback only when the
-harness has execution capability.
+harness supports them, including Knowledge QA. Reading a Skill does not require
+command execution capability.
 
 ```typescript
 const resolvedSkillsDir = path.join(skillsBase, "resolved");
@@ -513,15 +514,18 @@ const resolvedSkillsDir = path.join(skillsBase, "resolved");
 The resolved directory is passed to `DefaultResourceLoader` via `additionalSkillPaths`.
 The loader auto-discovers skills by scanning for `SKILL.md` files, parsing frontmatter,
 and injecting descriptions into the system prompt. The agent then knows which skills are
-available and can invoke them via `local_script`.
+available, reads a matching `SKILL.md`, and follows it using the session's
+available tools. Script execution still requires the corresponding tool capability.
 
 ### Harness-scoped `skillsOverride` Filter
 
 For scoped Portal/Gateway Agents, the factory passes a `skillsOverride` that
 restricts the visible skill set to the roots selected above. This removes
 user-global skills that the loader would otherwise auto-discover from
-`~/.pi/agent/skills/` or similar. QA and
-unresolved sessions also disable the repo-bundled operational fallback.
+`~/.pi/agent/skills/` or similar. Knowledge QA enables the normal bundled and
+platform Skill sources; its read-only built-in tools do not disable discovery.
+Explicit inheritance switches and per-Skill masks remain authoritative.
+Unresolved sessions disable the repo-bundled fallback.
 
 Without the override, the prompt could advertise skills the Agent owner never
 bound and whose operational assumptions conflict with the Agent type. See

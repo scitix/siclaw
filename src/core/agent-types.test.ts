@@ -21,7 +21,7 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual(["read_files"]);
     expect(AGENT_TYPES.knowledge_qa.defaultPrompt).toBeTruthy();
-    expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(true);
+    expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(false);
     expect(AGENT_TYPES.product_support.capabilities).toEqual(["read_files"]);
     expect(AGENT_TYPES.product_support.defaultPrompt).toBe(PRODUCT_SUPPORT_DEFAULT_PROMPT);
     expect(AGENT_TYPES.product_support.defaultNoSkills).toBe(true);

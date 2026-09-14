@@ -7,9 +7,9 @@ import {
 } from "./agent-context.js";
 
 describe("resolveAgentHarness", () => {
-  it("fails closed when type/capability resolution did not complete", () => {
+  it.each(["sre", "knowledge_qa"])("fails closed for %s when type/capability resolution did not complete", agentType => {
     const harness = resolveAgentHarness({
-      agentType: "sre",
+      agentType,
       allowedTools: null,
       harnessResolved: false,
       memoryConfigured: true,
@@ -20,6 +20,7 @@ describe("resolveAgentHarness", () => {
     expect(harness.mcpExposure).toBe("none");
     expect(harness.memoryEnabled).toBe(false);
     expect(harness.includeBundledSkills).toBe(false);
+    expect(harness.includePlatformSkills).toBe(false);
     expect(harness.includeInfrastructureGuidance).toBe(false);
   });
 
@@ -46,7 +47,8 @@ describe("resolveAgentHarness", () => {
       "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
     ]);
     expect(harness.legacyUnrestrictedCustom).toBe(false);
-    expect(harness.includeBundledSkills).toBe(false);
+    expect(harness.includeBundledSkills).toBe(true);
+    expect(harness.includePlatformSkills).toBe(true);
     expect(harness.includeInfrastructureGuidance).toBe(false);
   });
 
@@ -132,7 +134,8 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).not.toContain("complete mounted Wiki catalog as the primary navigation map");
     expect(context.systemPrompt).not.toContain("Use `knowledge_search` before answering");
     expect(context.systemPrompt).toContain("# Channel Reply Format");
-    expect(context.harness.includeBundledSkills).toBe(false);
+    expect(context.harness.includeBundledSkills).toBe(true);
+    expect(context.harness.includePlatformSkills).toBe(true);
     expect(context.harness.mcpExposure).toBe("configured");
   });
 

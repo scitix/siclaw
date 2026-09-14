@@ -54,8 +54,9 @@ policy that selected prompt guidance:
 - Automated-task mode grants only its transport-owned `task_report` tool in
   addition to the type's ordinary capabilities, keeping the required terminal
   report aligned for every Agent Type.
-- QA Agents do not inherit repo-bundled or user-global operational Skills;
-  explicitly bound Skills, knowledge, and MCP remain available.
+- QA Agents use the normal Skill binding and discovery path, including bundled
+  and platform Skills. Skill instructions do not grant additional tool permissions.
+  Scoped sessions and explicit inheritance switches still determine membership.
 - An unresolved control-plane lookup exposes no tools, MCP, memory, or ambient
   Skills until a successful sync.
 

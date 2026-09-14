@@ -116,9 +116,10 @@ For any scoped Agent (Portal or Gateway materialization), pi-coding-agent's
 auto-discovered user-global skills (for example `~/.pi/agent/skills/`) are
 filtered out. `skillsOverride` keeps only roots selected by the compiled Agent
 harness: Portal/Gateway materialized bindings, repo-bundled operational skills
-when execution is permitted, and platform authoring skills when write/preview
-capabilities are permitted. QA, Coordinator, delegated read-only, and unresolved
-harnesses therefore cannot inherit ambient SRE skill context. Standalone,
+for operational and Knowledge QA sessions, and platform skills for Knowledge QA
+or sessions with write/preview capabilities. Explicit Skill inheritance switches
+and per-name masks still apply. Unresolved harnesses cannot inherit ambient
+Skill context. Standalone,
 unscoped SRE headless CLI sessions retain the legacy repo/global skill fallback.
 
 **Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-main.ts`, `src/cli-options.ts`
