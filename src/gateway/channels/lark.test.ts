@@ -338,121 +338,32 @@ describe("handleLarkMessage — payload shape guards", () => {
   });
 });
 
-describe("handleLarkMessage — PAIR command", () => {
-  it("matches /PAIR XXXXXX/ and routes to handlePairingCode; replies with success message", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
+describe("handleLarkMessage — retired group PAIR", () => {
+  // Group pairing is gone: a group is served by the dedicated app that was added
+  // to it, and by nothing else. The command word is swallowed here rather than
+  // forwarded, so a stale code typed into a group neither binds anything nor
+  // produces a refusal the room did not ask for.
+  it("ignores a group PAIR code without calling the frontend or replying", async () => {
     const larkClient = makeLarkClient();
     const data = makeTextEvent("PAIR ABC123");
 
     await handleLarkMessage(data, larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
 
-    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything(), undefined);
-    expect(larkClient.im.message.reply).toHaveBeenCalledWith(expect.objectContaining({
-      path: { message_id: "mid-1" },
-      data: expect.objectContaining({
-        content: expect.stringContaining("SRE Bot"),
-      }),
-    }));
+    expect(handlePairingCodeMock).not.toHaveBeenCalled();
+    expect(larkClient.im.message.reply).not.toHaveBeenCalled();
+    // And it is not forwarded to the agent either — the text is a command word,
+    // not a prompt.
     expect(resolveBindingMock).not.toHaveBeenCalled();
   });
 
-  it("replies with error when pairing fails", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: false, error: "Invalid or expired code" });
+  it("still ignores it case-insensitively, the way the old matcher accepted it", async () => {
     const larkClient = makeLarkClient();
-    const data = makeTextEvent("PAIR DEADBE");
+    const data = makeTextEvent("pair abc123");
 
     await handleLarkMessage(data, larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
 
-    const replyArg = larkClient.im.message.reply.mock.calls[0][0];
-    expect(replyArg.data.content).toContain("Invalid or expired code");
-  });
-
-  it("upper-cases the pair code before sending — case-insensitive regex", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "n" });
-    const data = makeTextEvent("pair abc123");
-    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, {} as any);
-    expect(handlePairingCodeMock.mock.calls[0][0]).toBe("ABC123");
-  });
-
-  it("uses group_channel_id for group PAIR when the same handler also has a personal bot", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
-    await handleLarkMessage(
-      makeTextEvent("PAIR ABC123"),
-      makeLarkClient(),
-      "lark-runtime",
-      makeAgentBoxManager() as any,
-      undefined,
-      {} as any,
-      "zh-CN",
-      {
-        app_id: "cli_shared",
-        app_secret: "secret",
-        group_channel_id: "lark",
-        personal_bot: {
-          channel_id: "pb-1",
-          agent_id: "a1",
-          access_mode: "open",
-          owner_user_id: "owner-1",
-        },
-      },
-    );
-
-    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything(), undefined);
-    expect(handlePersonalPairingCodeMock).not.toHaveBeenCalled();
-  });
-
-  it("seeds the binding display name from the fetched group title", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
-    const larkClient = makeLarkClient() as any;
-    larkClient.request = vi.fn().mockResolvedValue({ data: { name: " 运维告警群 " } });
-
-    await handleLarkMessage(makeTextEvent("PAIR ABC123"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
-
-    expect(larkClient.request).toHaveBeenCalledWith(expect.objectContaining({
-      url: expect.stringContaining("/open-apis/im/v1/chats/oc_abc123"),
-    }));
-    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything(), "运维告警群");
-  });
-
-  it("PAIR success reply is Chinese for zh-CN (feishu domain)", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
-    const lark = makeLarkClient();
-    await handleLarkMessage(
-      makeTextEvent("PAIR ABC123"),
-      lark,
-      "lark",
-      makeAgentBoxManager() as any,
-      undefined,
-      {} as any,
-      "zh-CN",
-    );
-    const replyArg = lark.im.message.reply.mock.calls[0][0];
-    expect(replyArg.data.content).toContain("绑定成功");
-    expect(replyArg.data.content).toContain("SRE Bot");
-  });
-
-  it("PAIR success reply is English for en-US (lark domain)", async () => {
-    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
-    const lark = makeLarkClient();
-    await handleLarkMessage(
-      makeTextEvent("PAIR ABC123"),
-      lark,
-      "lark",
-      makeAgentBoxManager() as any,
-      undefined,
-      {} as any,
-      "en-US",
-    );
-    const replyArg = lark.im.message.reply.mock.calls[0][0];
-    expect(replyArg.data.content).toContain("Paired!");
-  });
-
-  it("codes shorter or longer than 6 chars are not matched", async () => {
-    const data5 = makeTextEvent("PAIR AB12E");      // 5 chars
-    const data7 = makeTextEvent("PAIR AB12EF3");    // 7 chars
-    await handleLarkMessage(data5, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, {} as any);
-    await handleLarkMessage(data7, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, {} as any);
     expect(handlePairingCodeMock).not.toHaveBeenCalled();
+    expect(larkClient.im.message.reply).not.toHaveBeenCalled();
   });
 });
 

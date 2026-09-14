@@ -66,6 +66,14 @@ export interface ChannelAccessDenied {
   walled: true;
   reason?: string;
   authorizeUrl?: string;
+  /**
+   * The bot's reach is `group_only`, so the refused sender has no DM to be sent
+   * to. An EXTRA FIELD rather than a new `reason` on purpose: reason is the
+   * contract this runtime branches on and localizes, so a new value would drop
+   * an un-updated build into its generic fallback — whereas an unknown boolean
+   * is simply ignored and that build keeps behaving as before.
+   */
+  dmDisabled?: boolean;
 }
 
 export function isChannelAccessDenied(
