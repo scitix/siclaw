@@ -746,6 +746,18 @@ class PoolSpawner extends FakeSpawner {
   }
 }
 
+/**
+ * Mark a box draining the way the manager does.
+ *
+ * These fixtures reach into the private map, so the mark's shape had eight literal copies in
+ * this file and none of them changed when the manager started recording WHY a box was marked.
+ * Default reason is `stale`, which is the one kind that is never withdrawn — a test that pins
+ * removal must not depend on whether a withdrawal rule happens to fire.
+ */
+function markDraining(mgr: any, boxId: string, at: number = Date.now(), reason = "stale"): void {
+  mgr.draining.set(boxId, { at, reason });
+}
+
 function poolBox(boxId: string, instance: number, over: Partial<AgentBoxInfo> = {}): AgentBoxInfo {
   return {
     boxId, agentId: "agent-a", status: "running", endpoint: `http://10.0.0.${instance + 1}:3000`,
@@ -848,7 +860,7 @@ describe("AgentBoxManager — drain reaper", () => {
       if (probeThrows) throw new Error("unreachable");
       return statusByEndpoint[endpoint] ?? { sessionIds: [], turnsInFlight: 0, drained: false };
     });
-    (mgr as any).draining.set("old-box", Date.now());
+    markDraining(mgr as any, "old-box", Date.now());
     return { mgr, spawner };
   }
 
@@ -882,7 +894,7 @@ describe("AgentBoxManager — drain reaper", () => {
     (mgr as any).bindings.remember("agent-a", "s-live", "old-box");
     (mgr as any).bindings.remember("agent-a", "s-other", "other-box");
     // Past the grace period: the box is going regardless of what it still holds.
-    (mgr as any).draining.set("old-box", Date.now() - 10 * 60_000);
+    markDraining(mgr as any, "old-box", Date.now() - 10 * 60_000);
 
     await (mgr as any).reapDrainedBoxes();
 
@@ -897,7 +909,7 @@ describe("AgentBoxManager — drain reaper", () => {
     const reported: string[][] = [];
     mgr.setTurnTerminator((ids) => reported.push(ids));
     (mgr as any).bindings.remember("agent-a", "s-live", "old-box");
-    (mgr as any).draining.set("old-box", Date.now() - 10 * 60_000);
+    markDraining(mgr as any, "old-box", Date.now() - 10 * 60_000);
     spawner.stopThrows = true;
 
     await (mgr as any).reapDrainedBoxes();
@@ -923,7 +935,7 @@ describe("AgentBoxManager — drain reaper", () => {
     const { mgr, spawner } = drainingManager({}, true);
     const reported: string[][] = [];
     mgr.setTurnTerminator((ids) => reported.push(ids));
-    (mgr as any).draining.set("old-box", Date.now() - 10 * 60_000);
+    markDraining(mgr as any, "old-box", Date.now() - 10 * 60_000);
 
     await (mgr as any).reapDrainedBoxes();
 
@@ -943,7 +955,7 @@ describe("AgentBoxManager — drain reaper", () => {
     const { mgr, spawner } = drainingManager({
       "http://10.0.0.9:3000": { sessionIds: ["s1"], turnsInFlight: 1, drained: false },
     });
-    (mgr as any).draining.set("old-box", Date.now() - 6 * 60_000);
+    markDraining(mgr as any, "old-box", Date.now() - 6 * 60_000);
     await (mgr as any).reapDrainedBoxes();
     expect(spawner.stopCalls).toEqual(["old-box"]);
   });
@@ -952,7 +964,7 @@ describe("AgentBoxManager — drain reaper", () => {
     const spawner = new PoolSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
     mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
-    (mgr as any).draining.set("vanished", Date.now());
+    markDraining(mgr as any, "vanished", Date.now());
     await (mgr as any).reapDrainedBoxes();
     expect(spawner.stopCalls).toHaveLength(0);
     expect((mgr as any).draining.size).toBe(0);
@@ -1018,6 +1030,181 @@ describe("AgentBoxManager — regressions found in review", () => {
     mgr.setReplicasResolver(async () => 2);
     await (mgr as any).reconcilePoolSizes();
     expect((mgr as any).draining.size).toBe(0);
+  });
+});
+
+describe("AgentBoxManager — an unanswered replica count is not a replica count of one", () => {
+  // `replicas` arrives over RPC, and the old code read a failed lookup as 1 — so one dropped
+  // WS frame shrank a live pool to a single box. The reaper does not wait for the control
+  // plane and its first tick lands ten seconds after a Runtime restart, which makes a deploy
+  // the likeliest trigger.
+  const unanswerablePool = () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [
+      poolBox("agentbox-agent-a-0", 0),
+      poolBox("agentbox-agent-a-1", 1),
+      // The other reasons this loop would have found to act, so the test proves it skipped
+      // the whole body: a corpse to collect and replace, and a non-current image.
+      poolBox("agentbox-agent-a-2", 2, { status: "stopped", exitedUnexpectedly: true }),
+      poolBox("agentbox-agent-a-3", 3, { image: "agentbox:v1" }),
+    ];
+    spawner.pool = spawner.listReturns;
+    return spawner;
+  };
+
+  it("touches nothing in the loop body when the count cannot be established", async () => {
+    const spawner = unanswerablePool();
+    const mgr = new AgentBoxManager(spawner);
+    // What the WS client actually throws when the control plane is not connected — the case a
+    // Runtime restart produces, with no second Runtime involved.
+    mgr.setReplicasResolver(async () => { throw new Error("FrontendWsClient is not connected"); });
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+
+    await (mgr as any).reconcilePoolSizes();
+    await new Promise((r) => setTimeout(r, 10)); // a replacement would spawn in the background
+
+    expect((mgr as any).draining.size).toBe(0); // no shrink, no staleness marking
+    expect(spawner.stopCalls).toHaveLength(0);  // no corpse collection, no roll
+    expect(spawner.spawnCalls).toHaveLength(0); // and nothing respawned on a guess
+  });
+
+  it("stops re-asking the control plane about an agent it cannot resolve", async () => {
+    // Usually a standing condition, and the reaper ticks every ten seconds. The memo is the
+    // reconciler's alone — the lookup stays uncached so a turn is never held at one box on
+    // the strength of a remembered blip.
+    const spawner = unanswerablePool();
+    const mgr = new AgentBoxManager(spawner);
+    let lookups = 0;
+    mgr.setReplicasResolver(async () => { lookups++; throw new Error("agent does not belong to this runtime"); });
+
+    for (let i = 0; i < 4; i++) await (mgr as any).reconcilePoolSizes();
+    expect(lookups).toBe(1);
+
+    (mgr as any).unresolvedAgents.clear(); // as if the memo window had elapsed
+    await (mgr as any).reconcilePoolSizes();
+    expect(lookups).toBe(2); // and it does ask again — a reassigned agent must be picked up
+  });
+
+  it("acts on the very same pool once the count is known", async () => {
+    // The control against the test above: without it, a reconciler broken in some unrelated
+    // way would pass by doing nothing at all.
+    const spawner = unanswerablePool();
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+
+    await (mgr as any).reconcilePoolSizes();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(spawner.stopCalls).toContain("agentbox-agent-a-2"); // the corpse is collected
+    expect((mgr as any).draining.size).toBeGreaterThan(0);     // and the pool is shrunk
+  });
+
+  it("still serves a turn for an agent whose replica count is unavailable", async () => {
+    // Ownership gates DESTRUCTION only. A request naming the agent is itself the evidence
+    // that this runtime serves it, so an unresolvable count falls back to a single box
+    // rather than refusing the turn.
+    const spawner = new PoolSpawner("k8s");
+    const box = poolBox("agentbox-agent-a-0", 0);
+    spawner.pool = [box];
+    spawner.getReturns.set("agentbox-agent-a-0", box);
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => { throw new Error("control plane down"); });
+
+    const acquired = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(acquired.boxId).toBe("agentbox-agent-a-0");
+  });
+
+  it("withdraws a shrink it decided on a replica count it now knows better", async () => {
+    // The deploy case, and the one the skip-if-unknown rule alone does NOT cover: the control
+    // plane is unreachable for one tick, every box above instance 0 is marked surplus, and
+    // by the time the reaper acts the lookup works again. Nothing revisited the mark, so a
+    // live pool was shrunk permanently by a transient RPC failure.
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [0, 1, 2].map((i) => poolBox(`agentbox-agent-a-${i}`, i));
+    spawner.pool = spawner.listReturns;
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 3);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    // What the failed tick left behind.
+    markDraining(mgr as any, "agentbox-agent-a-1", Date.now(), "excess");
+    markDraining(mgr as any, "agentbox-agent-a-2", Date.now(), "excess");
+
+    await (mgr as any).reconcilePoolSizes();
+
+    expect([...(mgr as any).draining.keys()]).toEqual([]);
+  });
+
+  it("keeps a shrink that the replica count still justifies", async () => {
+    // The control against the test above. An operator really did lower replicas to 1, so the
+    // marks must survive being re-examined — a withdrawal rule that fires here would make
+    // scaling down impossible.
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [0, 1, 2].map((i) => poolBox(`agentbox-agent-a-${i}`, i));
+    spawner.pool = spawner.listReturns;
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    markDraining(mgr as any, "agentbox-agent-a-1", Date.now(), "excess");
+    markDraining(mgr as any, "agentbox-agent-a-2", Date.now(), "excess");
+
+    await (mgr as any).reconcilePoolSizes();
+
+    expect([...(mgr as any).draining.keys()].sort())
+      .toEqual(["agentbox-agent-a-1", "agentbox-agent-a-2"]);
+  });
+
+  it("does not withdraw a mark made for a reason re-examination would reach again", async () => {
+    // A stale image or a dead probe is judged from what the box itself presents, so a
+    // withdrawal would simply be re-decided on the next tick — churning the drain budget.
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [0, 1].map((i) => poolBox(`agentbox-agent-a-${i}`, i));
+    spawner.pool = spawner.listReturns;
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    markDraining(mgr as any, "agentbox-agent-a-1", Date.now(), "stale");
+
+    await (mgr as any).reconcilePoolSizes();
+
+    expect([...(mgr as any).draining.keys()]).toEqual(["agentbox-agent-a-1"]);
+  });
+
+  it("drops a queued drain when the agent can no longer be resolved", async () => {
+    // The reconciler skipping an agent stops NEW marks; it cannot recall one already queued
+    // in the reaper. Re-confirming at the point of destruction is what closes that.
+    const spawner = new PoolSpawner("k8s");
+    const box = poolBox("agentbox-agent-a-1", 1);
+    spawner.pool = [box];
+    spawner.listReturns = [];          // reconcile sees nothing, so only the reaper runs
+    spawner.getReturns.set("agentbox-agent-a-1", box);
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => { throw new Error("agent does not belong to this runtime"); });
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    markDraining(mgr as any, "agentbox-agent-a-1", Date.now() - 10 * 60_000); // already overdue
+
+    await (mgr as any).reapDrainedBoxes();
+
+    expect(spawner.stopCalls).toHaveLength(0);          // not removed
+    expect((mgr as any).draining.has("agentbox-agent-a-1")).toBe(false); // and not left queued
+  });
+
+  it("reports an unresolvable agent once a window, not once a tick", async () => {
+    // The reaper runs every few seconds against every sibling agent in the namespace. Said
+    // each time, this was the bulk of the runtime log — which is how the drain that mattered
+    // went unnoticed.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mgr = new AgentBoxManager(new PoolSpawner("k8s"));
+    let lookups = 0;
+    mgr.setReplicasResolver(async () => { lookups++; throw new Error("agent does not belong to this runtime"); });
+
+    for (let i = 0; i < 4; i++) {
+      expect(await (mgr as any).lookupReplicas("agent-a")).toBeUndefined();
+      (mgr as any).replicasCache.clear(); // as if the TTL had elapsed between ticks
+    }
+
+    expect(lookups).toBe(4); // the lookup itself is NOT throttled — a blip must recover
+    expect(warn.mock.calls.filter((c) => /replicas unknown/.test(String(c[0])))).toHaveLength(1);
   });
 });
 
@@ -1094,7 +1281,7 @@ describe("AgentBoxManager — PR review regressions", () => {
     // No box reports holding it → free.
     mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
     (mgr as any).bindings.remember("agent-a", "s-released", "agentbox-agent-a-0");
-    (mgr as any).draining.set("agentbox-agent-a", Date.now());
+    markDraining(mgr as any, "agentbox-agent-a", Date.now());
 
     const handle = await mgr.getOrCreate("agent-a", undefined, "s-released");
     expect(handle.boxId).toBe("agentbox-agent-a-1");
@@ -2243,7 +2430,7 @@ describe("AgentBoxManager — a single box being rolled must hand over", () => {
     const box = runningBox({ certExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
     spawner.getReturns.set("agentbox-agent-a-0", box);
     (spawner as any).listForAgent = async () => [box];
-    (mgr as any).draining.set(box.boxId, Date.now());
+    markDraining(mgr as any, box.boxId, Date.now());
 
     await mgr.getOrCreate("agent-a", undefined, "s1").catch(() => {});
 
