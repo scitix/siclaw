@@ -14,6 +14,7 @@ import path from "node:path";
 import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import { parseKnowledgeLabels } from "../knowledge/labels.js";
 import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
+import { AGENT_TYPES } from "../core/agent-types.js";
 import {
   extractKnowledgePackageToDir,
   knowledgeRepoDirName,
@@ -866,7 +867,17 @@ interface ToolsPayload {
   subagentTierMenu?: unknown;
 }
 
-const VALID_AGENT_TYPES = new Set(["sre", "knowledge_qa", "product_support", "custom"]);
+/**
+ * Accepted `agentType` values in a tool-capabilities payload.
+ *
+ * DERIVED from the registry rather than re-listed, because materialize() below
+ * THROWS on a value that is missing here — a hand-written copy that falls behind
+ * the registry does not weaken a new type, it makes every tools reload for that
+ * type fail, and a box whose tools never resolve is a box with no tool schema.
+ * agent-types.ts has no session or factory dependency, so importing it keeps this module
+ * one (the leaf rule this file documents is about session.ts / agent-factory).
+ */
+const VALID_AGENT_TYPES: ReadonlySet<string> = new Set(Object.keys(AGENT_TYPES));
 
 /**
  * Minimal structural target the tools handler writes to. Deliberately NOT the
