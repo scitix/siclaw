@@ -5500,13 +5500,13 @@ async def test_stall_interrupt_deadline_closes_turn():
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("wdl", td, 1)
-            run._suppress_turn_done = True
+            step = compile_box.CompileStep(fake)
             run.client = fake
             wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
             try:
                 await run.inject_user_message("批 1/10")
                 await asyncio.wait_for(
-                    compile_box._consume_turn_stream(run, fake, stop_on_result=True),
+                    compile_box._consume_turn_stream(run, fake, stop_on_result=True, step=step),
                     timeout=5)
             finally:
                 run.done = True
@@ -5729,12 +5729,12 @@ async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0,
     raised = None
     with tempfile.TemporaryDirectory() as td:
         run = compile_box.CompileRun("wd", td, 1)
-        run._suppress_turn_done = True          # isolate the watchdog from post-turn machinery
+        step = compile_box.CompileStep(fake)  # explicit internal-result routing
         run.client = fake
         wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
         try:
             await run.inject_user_message("批 1/10")
-            await compile_box._consume_turn_stream(run, fake, stop_on_result=True)
+            await compile_box._consume_turn_stream(run, fake, stop_on_result=True, step=step)
         except compile_box.ModelStallError as e:
             raised = e
         finally:
@@ -5766,7 +5766,7 @@ async def test_model_stall_retries_then_completes():
     assert fake.interrupts == 1, fake.interrupts
     assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
     assert "turn_stalled" in types, types
-    assert run._last_turn_reply == "批 1/10 完成", run._last_turn_reply
+    assert any(e.get("text") == "批 1/10 完成" for e in evs)
     print("✓ model stall: interrupt + retry recovers a black-holed request")
 
 
@@ -6221,13 +6221,13 @@ async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
             "at: '2026-08-04T00:00:00Z'}}\n---\nOld\n", "utf-8")
         run = compile_box.CompileRun("blocked-stamp", td, 1)
         sent = compile_box._workspace_sync_cursor(td)
-        run._suppress_turn_done = True
+        step = compile_box.CompileStep(_FakeAgentClient())
         run._begin_turn("batch")
         page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
 
         # result_event must finish normally instead of poisoning every batch
         # rebuild. The changed page is withheld from durability sync.
-        await compile_box._emit_message(run, result_event())
+        await compile_box._emit_message(run, result_event(), step=step)
         assert "topic.md" in run._provenance_stamp_failures
         assert await compile_box._sync_workspace(run, sent) == 0
         assert not _drain(run), "blocked page must emit neither stale bytes nor a tombstone"
@@ -6238,7 +6238,7 @@ async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
         page.write_text(
             "---\ntype: Topic\nverified:\n  by: human:r\n"
             "  at: '2026-08-04T00:00:00Z'\n---\nNew\n", "utf-8")
-        await compile_box._emit_message(run, result_event())
+        await compile_box._emit_message(run, result_event(), step=step)
         assert run._provenance_stamp_failures == {}
         assert await compile_box._sync_workspace(run, sent) == 1
         sync = next(event for event in _drain(run) if event["type"] == "syncArtifacts")
@@ -6392,7 +6392,7 @@ async def test_model_rate_limit_backoff_then_completes():
     assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
     assert "rate_limited" in types, types
     assert next(e for e in evs if e["type"] == "rate_limited")["status"] == 429
-    assert run._last_turn_reply == "compiled ok", run._last_turn_reply
+    assert any(e.get("text") == "compiled ok" for e in evs)
     print("✓ rate limit: 429 backs off + re-issues, then completes (C2)")
 
 

@@ -15,6 +15,7 @@ import tempfile
 import types
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import selfcheck
 
@@ -1007,7 +1008,7 @@ def test_charset_corruption_detection():
         # The lint catches it → not ok → compile_box cannot set state=passed.
         viols = [v for v in report["lint"]["violations"] if v["kind"] == "charset_corruption"]
         assert len(viols) == 1 and viols[0]["page"] == "p1.md", report["lint"]
-        assert "第6行" in viols[0]["detail"], viols[0]["detail"]
+        assert "第7行" in viols[0]["detail"], viols[0]["detail"]
         assert not report["lint"]["ok"]
         # It is surfaced to the model in the bounded repair turn.
         assert "charset_corruption" in selfcheck.build_repair_prompt(report)
@@ -1617,7 +1618,7 @@ async def test_wiring():
     from compile_box import _post_turn_selfcheck
     import incremental
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"KBC_L1_REPAIR_ROUNDS": "2"}):
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/b.md")
@@ -1642,8 +1643,11 @@ async def test_wiring():
         sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
         assert sc["state"] == "repairing" and sc["coverage"]["unaccounted"] == ["s/b.md"], sc
 
-        # same state again (idempotency key unchanged) → no re-check, no double-inject
-        assert await _post_turn_selfcheck(run) is None
+        # A repair that changed nothing must spend the bounded retry budget;
+        # deduplicating it would strand the persisted state in "repairing".
+        retry = await _post_turn_selfcheck(run)
+        assert retry and "s/b.md" in retry, retry
+        assert run._l1_repairs_used == 2
 
         # agent repairs by EXCLUSIONS ONLY (no candidate edit) → re-check fires → passed
         _mk(base, "authoring/EXCLUSIONS.json",
@@ -1653,7 +1657,7 @@ async def test_wiring():
         assert sc["state"] == "passed", sc
         assert run._l1_repairs_used == 0  # budget resets on close
 
-        # budget exhaustion: reopen the gap twice without fixing → unconverged, no injection
+        # Exhaust both repair rounds, then settle without another injection.
         _mk(base, "raw/s/c.md")
         _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
             "  - facet: topic\n    value: wiring test\nsources:\n"
@@ -1662,6 +1666,7 @@ async def test_wiring():
         _mk(base, "candidate/p.md", "---\ntype: Topic\nlabels:\n"
             "  - facet: topic\n    value: wiring test\nsources:\n"
             "  - resource: s/a.md\n---\nx3")  # agent "fixed" nothing
+        assert await _post_turn_selfcheck(run) is not None      # round 2 → repairing
         assert await _post_turn_selfcheck(run) is None          # budget spent → unconverged
         sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
         assert sc["state"] == "unconverged", sc
@@ -2064,7 +2069,6 @@ async def test_seam_settles_when_nothing_pending():
             _l1_repairs_used = 0
             _turn_text = ["编好了"]
             _sync_sent = None
-            _suppress_turn_done = False
             async def emit(self, ev):
                 pass
             async def inject_user_message(self, t):

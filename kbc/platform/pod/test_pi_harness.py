@@ -120,7 +120,7 @@ async def test_batch_failure_keeps_draft_without_marking_completion(tmp_path, mo
         assert any(event["kind"] == "assistant" and event["data"]["llm_call"]["round"] == 1 for event in observations)
         assert any(event["kind"] == "result" and event["data"]["outcome"] == "failed" for event in observations)
         assert all("content" not in event["data"] and "arguments" not in event["data"] for event in observations)
-        assert run._last_turn_reply == ""
+        assert run._active_step is None
 
 
 async def test_readonly_engine_uses_snapshot_tools_and_actual_sdk(tmp_path, monkeypatch):
