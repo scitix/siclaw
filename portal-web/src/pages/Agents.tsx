@@ -8,7 +8,7 @@ import { Tooltip } from "../components/tooltip"
 import { useConfirm } from "../components/confirm-dialog"
 import { buildChatPath, chatSessionForAgent } from "../lib/chatSelection"
 import { CapabilityGroupSelector } from "../components/CapabilityGroupSelector"
-import { AGENT_TYPES } from "../lib/agentTypes"
+import { PORTAL_AGENT_TYPES } from "../lib/agentTypes"
 
 interface Agent {
   id: string; name: string; description: string; status: string; agent_type?: string
@@ -120,7 +120,7 @@ export function Agents() {
           <div>
             <label className="block text-sm font-medium mb-1">Type</label>
             <div className="space-y-1.5">
-              {AGENT_TYPES.map((t) => (
+              {PORTAL_AGENT_TYPES.map((t) => (
                 <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">
                   <input type="radio" name="new-agent-type" className="mt-0.5" checked={form.agent_type === t.key} onChange={() => setForm({ ...form, agent_type: t.key })} />
                   <span className="flex-1 min-w-0">

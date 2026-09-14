@@ -2,7 +2,7 @@
 // capability set and provide an immutable type contract. The Portal edits only
 // an optional Agent Addendum; it never replaces that contract.
 
-export type AgentTypeKey = "sre" | "knowledge_qa" | "product_support" | "custom"
+export type AgentTypeKey = "sre" | "knowledge_qa" | "product_support" | "ticket" | "custom"
 
 export interface AgentTypeOption {
   key: AgentTypeKey
@@ -37,6 +37,13 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     defaultNoSkills: true,
   },
   {
+    key: "ticket",
+    label: "Ticket Agent",
+    description: "Runs tenant-defined ticket workflows with a required structured result tool.",
+    capabilities: null,
+    defaultNoSkills: true,
+  },
+  {
     key: "custom",
     label: "Custom Agent",
     description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
@@ -56,3 +63,6 @@ export function agentTypeOption(key: string | null | undefined): Omit<AgentTypeO
   }
   return AGENT_TYPES.find((t) => t.key === key) ?? AGENT_TYPES[AGENT_TYPES.length - 1] // default: custom
 }
+
+// Ticket result contracts are configured by the integrated host.
+export const PORTAL_AGENT_TYPES = AGENT_TYPES.filter(type => type.key !== "ticket")

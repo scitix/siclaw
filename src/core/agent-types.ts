@@ -24,7 +24,7 @@
 
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 
-export type AgentType = "sre" | "knowledge_qa" | "product_support" | "custom";
+export type AgentType = "sre" | "knowledge_qa" | "product_support" | "ticket" | "custom";
 
 export interface AgentTypeDef {
   label: string;
@@ -175,6 +175,7 @@ const MATERIALIZED_TYPE_PROMPTS: Record<Exclude<AgentType, "custom">, ReadonlySe
   sre: new Set([SRE_DEFAULT_PROMPT]),
   knowledge_qa: REPLACED_KNOWLEDGE_QA_DEFAULT_PROMPTS,
   product_support: new Set([PRODUCT_SUPPORT_DEFAULT_PROMPT]),
+  ticket: new Set(),
 };
 
 export interface AgentPromptLayers {
@@ -218,6 +219,13 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     defaultPrompt: PRODUCT_SUPPORT_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
+  ticket: {
+    label: "Ticket Agent",
+    description: "Runs tenant-defined ticket workflows with a required structured result tool.",
+    capabilities: null,
+    defaultPrompt: "Follow the instance business instructions using its bound resources. Submit a valid result through the configured result tool before completing. Never claim that a ticket was created, closed or updated unless a tool actually performed that action.",
+    defaultNoSkills: true,
+  },
   custom: {
     label: "Custom Agent",
     description: "Free-form built-in capabilities; explicitly resolved Custom agents with no selection retain legacy unrestricted compatibility.",
@@ -235,7 +243,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
  */
 export function normalizeAgentType(v: unknown): AgentType {
   if (v === "coordinator") throw new AgentRetiredError();
-  return v === "sre" || v === "knowledge_qa" || v === "product_support" ? v : "custom";
+  return v === "sre" || v === "knowledge_qa" || v === "product_support" || v === "ticket" ? v : "custom";
 }
 
 /**
@@ -247,7 +255,7 @@ export function normalizeAgentType(v: unknown): AgentType {
  */
 export function requireAgentType(v: unknown): AgentType {
   if (v === "coordinator") throw new AgentRetiredError();
-  if (v === "sre" || v === "knowledge_qa" || v === "product_support" || v === "custom") {
+  if (v === "sre" || v === "knowledge_qa" || v === "product_support" || v === "ticket" || v === "custom") {
     return v;
   }
   throw new Error(`Invalid or missing agent_type: ${String(v)}`);
@@ -260,6 +268,9 @@ export function requireAgentType(v: unknown): AgentType {
  */
 export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilities: string[] | null): string[] | null {
   const def = AGENT_TYPES[agentType];
+  if (agentType === "ticket" && (!ownToolCapabilities || ownToolCapabilities.length === 0)) {
+    throw new Error("Ticket Agent requires explicit tool capabilities from its host");
+  }
   return def.capabilities ?? ownToolCapabilities;
 }
 

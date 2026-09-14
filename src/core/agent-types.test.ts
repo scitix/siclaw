@@ -15,8 +15,8 @@ import {
 } from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the four designed types; built-ins lock capabilities and own their runtime contracts", () => {
-    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["custom", "knowledge_qa", "product_support", "sre"]);
+  it("has the supported types; built-ins lock capabilities and own their runtime contracts", () => {
+    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["custom", "knowledge_qa", "product_support", "sre", "ticket"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual([
@@ -125,5 +125,20 @@ describe("agent-types", () => {
     });
     expect(effectiveAgentPrompt("knowledge_qa", `${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`))
       .toBe(`${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`);
+  });
+});
+
+
+describe("Ticket Agent instance contract", () => {
+  it("requires explicit host capabilities and preserves the tenant business prompt", () => {
+    expect(requireAgentType("ticket")).toBe("ticket");
+    expect(normalizeAgentType("ticket")).toBe("ticket");
+    expect(() => effectiveCapabilityKeys("ticket", null)).toThrow("explicit tool capabilities");
+    expect(() => effectiveCapabilityKeys("ticket", [])).toThrow("explicit tool capabilities");
+    expect(effectiveCapabilityKeys("ticket", ["read_files"])).toEqual(["read_files"]);
+    const layers = resolveAgentPromptLayers("ticket", "Review supplied handling records.");
+    expect(layers.addendum).toBe("Review supplied handling records.");
+    expect(layers.typeContract).toContain("configured result tool");
+    expect(resolveAgentPromptLayers("ticket", "").typeContract).toBe(layers.typeContract);
   });
 });

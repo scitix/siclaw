@@ -1,15 +1,15 @@
 # Customer support and completed-ticket review
 
-Use two independent Custom Agent instances, each with its own prompt, bindings,
+Use two independent Ticket Agent instances, each with its own prompt, bindings,
 required result tool and API key. The same `POST /api/v1/run` transport serves both
 instances; the bearer key chooses the instance. Callers do not supply an Agent ID.
 
 ## Configure the two instances
 
-The control plane must support tenant-owned Custom harnesses and provide a usable
-published Custom model. Use the normal Agent creation and configuration pages:
+The control plane must support tenant-owned Ticket instances and provide a usable
+published Ticket model. Use the normal Agent creation and configuration pages:
 
-1. Create separate support and review instances. New Custom prompts are empty.
+1. Create separate support and review instances. Choose Ticket Agent for both instances; write each instance’s own business prompt.
 2. Apply `support-prompt.md` or `review-prompt.md` through the prompt editor
    (`PUT /api/v1/agents/:id/prompt`, body `{ "system_prompt": "..." }`).
 3. Bind each instance's resources. Support needs product knowledge and its result
@@ -27,6 +27,10 @@ The result servers are stdio MCPs packaged with AgentBox:
 | Support | `mcp-product-support-result` | `submit_product_support_result` |
 | Review | `mcp-ticket-review-result` | `submit_ticket_review_result` |
 
+The Ticket type is configured through the integrated host tenant UI. Its result
+tool is mandatory; the configuration page has no result opt-out checkbox.
+Deploy matching Runtime and AgentBox builds before enabling this type in the host.
+
 Both use an empty arguments array and environment object by default. Create and enable
 the MCP in the same tenant as its Agent, then bind it using the MCP resource tab.
 Installing the executable does not create that binding. A saved `pending` reload
@@ -35,9 +39,7 @@ Built-in `read_files` does not restrict the operations offered by an MCP: bind
 read-only readers, not general ticket-writing or remediation servers.
 
 Existing release-managed product-support instances retain their contract. They
-do not need to be migrated to deliver the new review instance. New managed Agent
-Types or changes to the shared Custom release are not needed for these prompts
-and result tools. Model combinations remain governed by the platform.
+do not need to be migrated to deliver the new review instance. Both instances use the same Ticket type with tenant-owned result tools. Model combinations remain governed by the platform.
 
 ## Call and consume
 

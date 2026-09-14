@@ -6,7 +6,7 @@ import { AgentTasks } from "./AgentTasks"
 import { AgentApiKeys } from "./AgentApiKeys"
 import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
 import { toCapabilitySet } from "../lib/toolCapabilities"
-import { AGENT_TYPES, agentTypeOption, isRetiredAgentType } from "../lib/agentTypes"
+import { PORTAL_AGENT_TYPES, agentTypeOption, isRetiredAgentType } from "../lib/agentTypes"
 import {
   diffAgentResourceBindings,
   requiresLoadedResourceBindings,
@@ -469,7 +469,7 @@ function EditableAgentSettings({ agent, onUpdate, initialTab }: AgentSettingsPro
                 The type supplies an immutable behavior contract and locks its built-in capabilities. Add agent-specific specialization in Basic without replacing that contract.
               </p>
               <div className="mt-2 space-y-1.5">
-                {AGENT_TYPES.map(t => (
+                {PORTAL_AGENT_TYPES.map(t => (
                   <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">
                     <input type="radio" name="agent-type" className="mt-0.5" checked={agentType === t.key} onChange={() => setAgentType(t.key)} />
                     <span className="flex-1 min-w-0">

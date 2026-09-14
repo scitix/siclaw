@@ -795,6 +795,22 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(seen).not.toContain("�");
   });
 
+  it("refuses Ticket prompts until the configured result tool is available", async () => {
+    sm.agentTypeState = "ticket";
+    const session = await sm.getOrCreate("ticket-result");
+    const missing = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result" });
+    expect(missing.status).toBe(400);
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+    const unavailable = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result", requiredResultToolName: "mcp__review__submit" });
+    expect(unavailable.status).toBe(400);
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+    session.toolNames.push("mcp__review__submit");
+    const ready = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result", requiredResultToolName: "mcp__review__submit" });
+    await flushAsync();
+    expect(ready.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith("review", undefined, { requiredResultToolName: "mcp__review__submit" });
+  });
+
   it("POST /api/prompt forwards a strict result-tool requirement only when supplied", async () => {
     const session = await sm.getOrCreate("strict-result");
     const r = await getJson(port, "/api/prompt", "POST", {

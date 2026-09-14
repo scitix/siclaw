@@ -979,6 +979,11 @@ export function createHttpServer(
     // holds its whole transcript. For a brand-new session the load is one cheap
     // empty round-trip.
     const resumed = await sessionManager.ensureSessionContext(body.sessionId);
+    if (sessionManager.agentTypeState === "ticket" && !requiredResultToolName) {
+      logPromptResponse(400, "rejected", "Ticket Agent requires a result tool");
+      sendJson(res, 400, { error: "Ticket Agent requires a host-configured result tool" });
+      return;
+    }
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
         code: SESSION_CONTEXT_UNAVAILABLE_CODE,
@@ -1000,6 +1005,11 @@ export function createHttpServer(
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
     );
+    if (sessionManager.agentTypeState === "ticket" && !managed.toolNames.includes(requiredResultToolName!)) {
+      logPromptResponse(400, "rejected", "Ticket result tool is unavailable", managed.id);
+      sendJson(res, 400, { error: "The configured Ticket result tool is unavailable; check the instance MCP binding" });
+      return;
+    }
     sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root");
     if (managed.mcpManager) {
       observedMcpServers = managed.mcpManager.getServerConnections();
