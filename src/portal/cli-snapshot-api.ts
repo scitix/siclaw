@@ -25,6 +25,7 @@
  * "local single-user only" trust boundary.
  */
 
+import { ticketHostRequiredDetail } from "../shared/ticket-configuration.js";
 import type http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
@@ -293,6 +294,11 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
         });
         return;
       }
+    }
+    if (activeAgent?.agent_type === "ticket") {
+      const detail = ticketHostRequiredDetail();
+      sendJson(res, detail.status, { error: detail });
+      return;
     }
     const activeAgentId = activeAgent?.id ?? null;
 

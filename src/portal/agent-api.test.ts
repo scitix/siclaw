@@ -436,6 +436,15 @@ describe("registerAgentRoutes", () => {
 
   // ── PUT /api/v1/agents/:id ───────────────────────────────
   describe("PUT /api/v1/agents/:id", () => {
+    it.each([{ agent_type: "custom" }, { name: "Renamed" }, { model_id: "other" }])("keeps stored Ticket settings owned by the host: %j", async body => {
+      query.mockResolvedValueOnce([[{ id: "ticket-1", agent_type: "ticket", name: "Ticket" }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "ticket-1", agent_type: "custom", name: "Ticket" }], []]);
+      const response = await runRoute(router, fakeReq({ url: "/api/v1/agents/ticket-1", method: "PUT", body }));
+      expect(response.status).toBe(400);
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
     it("rejects non-admin", async () => {
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1",

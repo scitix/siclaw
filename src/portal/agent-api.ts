@@ -298,6 +298,10 @@ export function registerAgentRoutes(
       sendJson(res, 404, { error: "Agent not found" });
       return;
     }
+    if (current.agent_type === "ticket" || body.agent_type === "ticket") {
+      sendJson(res, 400, { error: "Ticket Agents must be configured in the integrated host tenant UI" });
+      return;
+    }
     if (body.agent_type === "coordinator" || current.agent_type === "coordinator") {
       sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
       return;
@@ -332,10 +336,6 @@ export function registerAgentRoutes(
     const nextAgentType = "agent_type" in body
       ? normalizeAgentType(body.agent_type)
       : currentAgentType;
-    if (nextAgentType === "ticket") {
-      sendJson(res, 400, { error: "Ticket Agents require a host with instance result contracts" });
-      return;
-    }
     const agentTypeChanged = "agent_type" in body && nextAgentType !== currentAgentType;
 
     const promptSupplied = "system_prompt" in body;

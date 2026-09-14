@@ -21,3 +21,10 @@ The standalone Portal does not configure instance result contracts, so Ticket
 is recognized for host execution but excluded from standalone creation. Deploy
 Runtime and AgentBox before enabling the type in the host. Existing Custom and
 product_support instances retain their behavior.
+
+Tool synchronization derives its accepted type names from the shared Agent
+registry. The production path is host configuration → Gateway tool-capabilities
+payload → AgentBox materialization → prompt admission. Ticket capability absence
+remains a refusal with TICKET_CAPABILITIES_REQUIRED, never an empty group list
+that could resolve to the legacy unrestricted default. Standalone Portal edits
+and CLI snapshots of Ticket rows direct the user to the integrated host.

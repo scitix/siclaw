@@ -203,6 +203,15 @@ describe("handleMcpServers", () => {
 // ── handleToolCapabilities ────────────────────────────────
 
 describe("handleToolCapabilities", () => {
+  it.each([null, []])("returns an explicit configuration error for Ticket capabilities %j", async caps => {
+    frontend.responses.set("config.getAgent", { agent_type: "ticket", tool_capabilities: caps });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toMatchObject({ error: { code: "TICKET_CAPABILITIES_REQUIRED", retriable: false } });
+    expect(JSON.parse(res.body)).not.toHaveProperty("allowedTools");
+  });
+
   it("resolves product_support as a locked read-only built-in harness", async () => {
     frontend.responses.set("config.getAgent", { agent_type: "product_support", tool_capabilities: ["run_commands"] });
     const res = new FakeRes();

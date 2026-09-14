@@ -10,6 +10,7 @@
  */
 
 import fs from "node:fs";
+import { AGENT_TYPES } from "../core/agent-types.js";
 import path from "node:path";
 import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import { parseKnowledgeLabels } from "../knowledge/labels.js";
@@ -866,7 +867,7 @@ interface ToolsPayload {
   subagentTierMenu?: unknown;
 }
 
-const VALID_AGENT_TYPES = new Set(["sre", "knowledge_qa", "product_support", "custom"]);
+const VALID_AGENT_TYPES = new Set(Object.keys(AGENT_TYPES));
 
 /**
  * Minimal structural target the tools handler writes to. Deliberately NOT the

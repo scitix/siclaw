@@ -545,6 +545,15 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.activeAgent.allowedTools).toContain("read");
   });
 
+  it("refuses host-managed Ticket snapshots before returning credentials", async () => {
+    await getDb().query("INSERT INTO agents (id,name,status,agent_type,tool_capabilities,is_production,created_by) VALUES (?,?,?,?,?,?,?)",
+      ["ticket-snapshot", "Ticket snapshot", "active", "ticket", null, 1, "test-user"]);
+    const response = await runRoute(router, fakeReq({ url: "/api/v1/cli-snapshot?agent=Ticket%20snapshot", headers: authedHeaders() }));
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ error: { code: "TICKET_HOST_REQUIRED", retriable: false } });
+    expect(response.body).not.toHaveProperty("providers");
+  });
+
   it("locks Knowledge QA tools in Portal-backed CLI even when the row asks for command execution", async () => {
     const db = getDb();
     await db.query(

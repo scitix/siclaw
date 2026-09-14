@@ -22,6 +22,7 @@
  * is the built-in type contract; Custom has no built-in contract.
  */
 
+import { TicketCapabilitiesError } from "../shared/ticket-configuration.js";
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 
 export type AgentType = "sre" | "knowledge_qa" | "product_support" | "ticket" | "custom";
@@ -269,7 +270,7 @@ export function requireAgentType(v: unknown): AgentType {
 export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilities: string[] | null): string[] | null {
   const def = AGENT_TYPES[agentType];
   if (agentType === "ticket" && (!ownToolCapabilities || ownToolCapabilities.length === 0)) {
-    throw new Error("Ticket Agent requires explicit tool capabilities from its host");
+    throw new TicketCapabilitiesError();
   }
   return def.capabilities ?? ownToolCapabilities;
 }

@@ -1,13 +1,15 @@
 # Customer support and completed-ticket review
 
-Use two independent Ticket Agent instances, each with its own prompt, bindings,
+In the integrated host tenant UI, create two independent Ticket Agent instances, each with its own prompt, bindings,
 required result tool and API key. The same `POST /api/v1/run` transport serves both
 instances; the bearer key chooses the instance. Callers do not supply an Agent ID.
 
 ## Configure the two instances
 
 The control plane must support tenant-owned Ticket instances and provide a usable
-published Ticket model. Use the normal Agent creation and configuration pages:
+published Ticket model. The steps below use that host's Agent creation and
+configuration pages and APIs. The standalone Siclaw Portal does not provide
+these instance result-contract settings:
 
 1. Create separate support and review instances. Choose Ticket Agent for both instances; write each instance’s own business prompt.
 2. Apply `support-prompt.md` or `review-prompt.md` through the prompt editor

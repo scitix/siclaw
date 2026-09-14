@@ -59,3 +59,12 @@ describe("Agent retirement settings", () => {
     }
   })
 })
+
+
+it("shows host ownership for a Ticket row without editable settings", () => {
+  const html = renderToStaticMarkup(<AgentSettings agent={{ ...agent, agent_type: "ticket", status: "active" }} onUpdate={vi.fn()} initialTab="tools" />)
+  expect(html).toContain("Ticket Agent")
+  expect(html).toContain("integrated host")
+  expect(html).not.toContain('type="radio"')
+  expect(html).not.toContain(">Save<")
+})

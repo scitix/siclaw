@@ -796,7 +796,21 @@ describe("http-server — prompt + session lifecycle", () => {
   });
 
   it("refuses Ticket prompts until the configured result tool is available", async () => {
-    sm.agentTypeState = "ticket";
+    const { handleToolCapabilities } = await import("../gateway/internal-api.js");
+    const { createToolsHandler } = await vi.importActual<typeof import("./sync-handlers.js")>("./sync-handlers.js");
+    let status = 0;
+    let payload: any;
+    const response = {
+      writeHead(code: number) { status = code; return this; },
+      end(body: string) { payload = JSON.parse(body); },
+    };
+    await handleToolCapabilities({} as any, response as any, { agentId: "ticket-agent" } as any,
+      { request: async () => ({ agent_type: "ticket", tool_capabilities: ["read_files"] }) } as any);
+    expect(status).toBe(200);
+    const handler = createToolsHandler(sm, { request: async () => payload });
+    await handler.materialize(await handler.fetch(null));
+    expect(sm.agentTypeState).toBe("ticket");
+    expect(sm.allowedToolsState).toContain("read");
     const session = await sm.getOrCreate("ticket-result");
     const missing = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result" });
     expect(missing.status).toBe(400);

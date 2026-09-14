@@ -416,6 +416,17 @@ function EditableAgentSettings({ agent, onUpdate, initialTab }: AgentSettingsPro
     } finally { setSaving(false) }
   }
 
+  if (agent.agent_type === "ticket") {
+    return (
+      <div className="p-6 space-y-2">
+        <h3 className="text-sm font-medium">Ticket Agent</h3>
+        <p className="text-sm text-muted-foreground">
+          This instance is managed in the integrated host tenant UI. Configure its business prompt, resources and required result tool there.
+        </p>
+      </div>
+    )
+  }
+
   // Tabs that need the Save button
   const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "knowledge", "resources", "channels"]
   const showSave = saveTabs.includes(activeTab)

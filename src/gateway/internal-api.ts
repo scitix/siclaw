@@ -14,6 +14,7 @@
  *   DELETE /api/internal/agent-tasks/:id   — delete a task
  */
 
+import { TicketCapabilitiesError } from "../shared/ticket-configuration.js";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
@@ -406,6 +407,10 @@ export async function handleToolCapabilities(
     // agentType rides along for capabilities and legacy-row prompt fallback.
     sendJson(res, 200, { allowedTools, agentType, subagentTierMenu });
   } catch (err) {
+    if (err instanceof TicketCapabilitiesError) {
+      sendJson(res, err.status, { error: err.toJSON() });
+      return;
+    }
     console.error("[internal-api] tool-capabilities error:", err);
     sendJson(res, 500, { error: "Internal server error" });
   }
