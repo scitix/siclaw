@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import forge from "node-forge";
-import { CertificateManager } from "./cert-manager.js";
+import { CertificateManager, certificateHasInvalidPrintableString } from "./cert-manager.js";
 
 /**
  * Clean env of any SICLAW_CA_* vars between tests so create() picks the
@@ -296,4 +296,20 @@ describe("CertificateManager.getCACertificate", () => {
     expect(pem).toMatch(/^-----BEGIN CERTIFICATE-----/);
     expect(pem).toMatch(/-----END CERTIFICATE-----\s*$/);
   });
+});
+
+it("round-trips private user, space and session binding in a CA-signed certificate", () => {
+  const bundle = manager.issueAgentBoxCertificate("agent", "org", "box", { spaceId: "space", userId: "alice", sessionId: "session" });
+  expect(manager.verifyCertificate(bundle.cert)).toMatchObject({ agentId: "agent", orgId: "org", boxId: "box", privateSpaceId: "space", privateUserId: "alice", privateSessionId: "session" });
+  const cert = forge.pki.certificateFromPem(bundle.cert);
+  const ou = cert.subject.attributes.find(a => a.name === "organizationalUnitName")!;
+  expect(ou.valueTagClass).toBe(forge.asn1.Type.UTF8);
+  expect(certificateHasInvalidPrintableString(bundle.cert)).toBe(false);
+  // Simulate the previous signed encoding. Node/OpenSSL accepted it, but Go's
+  // strict X.509 parser rejects JSON characters tagged as PrintableString.
+  ou.valueTagClass = forge.asn1.Type.PRINTABLESTRING;
+  cert.setSubject(cert.subject.attributes);
+  cert.sign(forge.pki.privateKeyFromPem(bundle.key), forge.md.sha256.create());
+  expect(certificateHasInvalidPrintableString(forge.pki.certificateToPem(cert))).toBe(true);
+  expect(certificateHasInvalidPrintableString("unparseable")).toBe(false);
 });

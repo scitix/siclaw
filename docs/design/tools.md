@@ -36,7 +36,7 @@ src/tools/
 |-----------|-------------|------------|
 | `cmd-exec/` | Tool executes a **user-provided command** (remote or local) | Full security pipeline: `preExecSecurity` → execute → `postExecSecurity` |
 | `script-exec/` | Tool executes a **pre-approved script file** (remote or local) | No command validation needed (scripts are reviewed); uses `resolveScript()` |
-| `query/` | Tool performs **read-only data retrieval** (no process spawn, no K8s interaction) | Pure function over memory indexer, DB, or filesystem |
+| `query/` | Tool retrieves data or updates bounded personal-memory metadata (no process spawn, no K8s interaction) | Backend contracts over evidence, DB or filesystem |
 | `workflow/` | Tool orchestrates a **user-facing workflow** (investigation, skill management, scheduling) | Business logic, often stateful |
 | `infra/` | **Not a tool** — shared functions consumed by tools | Security pipeline, K8s execution helpers, output processing |
 
@@ -550,7 +550,7 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 |------|-------|-------|--------|
 | `manage_schedule` | `modes` | `["web", "channel"]` | Requires the Gateway schedule backend |
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
-| `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
+| `memory_search`, `memory_get`, `memory_catalog`, `memory_update`, `memory_feedback` | `available` | Memory enabled and the corresponding `refs.privateMemory` operation available | Same local/remote backend contract; capability filtering applies separately |
 | `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
 
 Skill draft previews enforce a shared ceiling of 1 MiB, measured as
@@ -616,11 +616,10 @@ are intentionally different:
 
 `read_files` is a retrieval capability group, not only filesystem access:
 
-1. `knowledge_search` queries an Agent-scoped `MemoryIndexer` over mounted
-   Markdown using hybrid semantic + FTS ranking. FTS-only remains functional
-   when embeddings are unavailable.
+1. `knowledge_search` resolves Agent-scoped page labels and frontmatter metadata.
+   It opens no embedding, FTS or vector index.
 2. `grep` / `find` provide exact-text and filename fallback for identifiers,
-   versions, aliases, and terms absent from embeddings.
+   versions, aliases, and terms absent from page labels.
 3. `read` loads the complete selected page before synthesis.
 4. `knowledge_cite` emits citations only for manifest-backed pages actually
    read during the current turn. A whole-page (`pages`) citation additionally

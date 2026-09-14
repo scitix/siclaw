@@ -6,6 +6,11 @@ import { resolveSandboxBuiltin } from "../script-sandbox/tool-dispatch.js";
 export class SandboxInvocations {
   private readonly active = new Map<string, { sessionId: string; scope: ScriptRequest; controller: AbortController; busy: number; calls: number; ids: Set<string> }>();
 
+  assertActive(token: string, sessionId: string): void {
+    const entry = this.active.get(token);
+    if (!entry || entry.sessionId !== sessionId || entry.controller.signal.aborted) throw new Error("Sandbox callback denied");
+  }
+
   open(sessionId: string, scope: ScriptRequest, signal?: AbortSignal) {
     const token = randomBytes(32).toString("hex");
     const controller = new AbortController();

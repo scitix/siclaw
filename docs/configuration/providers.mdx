@@ -95,32 +95,14 @@ See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/setting
 - **Headless CLI**: Prepare `.siclaw/config/settings.json`, or reuse a local Portal snapshot from the same workspace
 - **Local Server / Gateway**: Configure providers and models in the Web UI
 
-## Embedding Provider
+## Memory learning
 
-<Warning>
-Without an embedding provider, Investigation Memory semantic search is disabled. All other features work normally.
-</Warning>
+Memory uses the configured Agent model for bounded background extraction.
+Enable it with `SICLAW_MEMORY_ENABLED=true` (Helm: `runtime.memory.enabled`).
+No embedding provider or vector database is required. The retired `embedding`
+settings and `SICLAW_EMBEDDING_*` variables have no effect.
 
-Embedding is used for memory search — matching current symptoms against past investigation records. Any OpenAI-compatible embedding API works:
-
-```json
-{
-  "embedding": {
-    "baseUrl": "https://api.example.com/v1",
-    "apiKey": "sk-...",
-    "model": "bge-m3",
-    "dimensions": 1024
-  }
-}
-```
-
-If `embedding.apiKey` is omitted, Siclaw falls back to the default provider API key.
-
-| Provider | Model | Dimensions | Notes |
-|----------|-------|------------|-------|
-| **BGE-M3** (recommended) | `bge-m3` | 1024 | Multilingual, good for technical content |
-| **OpenAI** | `text-embedding-3-small` | 1536 | Easy setup if you already have an OpenAI key |
-| **Ollama** | `nomic-embed-text` | 768 | Local, free |
+See [Memory](/features/memory) for source selection, recall and privacy controls.
 
 ## Model Recommendations
 

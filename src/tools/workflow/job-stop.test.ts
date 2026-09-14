@@ -5,7 +5,7 @@ import type { ToolRefs } from "../../core/tool-registry.js";
 function makeRefs(executor: ToolRefs["jobStopExecutor"]): ToolRefs {
   return {
     kubeconfigRef: {} as any, userId: "u", agentId: "a", sessionIdRef: { current: "s" },
-    taskListId: "tl", memoryRef: {} as any, dpStateRef: {} as any,
+    taskListId: "tl", dpStateRef: {} as any,
     jobStopExecutor: executor,
   };
 }

@@ -100,7 +100,7 @@ vi.mock("../core/agent-factory.js", async () => {
         skillsDirs: ["skills/core"],
         mode: opts.mode ?? "web",
         mcpManager: { shutdown: async () => {} },
-        memoryIndexer: undefined,
+        localMemory: { clear: vi.fn(), close: vi.fn() },
         dpStateRef: { active: false },
       };
     },
@@ -109,21 +109,6 @@ vi.mock("../core/agent-factory.js", async () => {
 
 const lastCreateSiclawSession = { calls: (globalThis as any).__createSessionCalls ?? [] };
 if (!(globalThis as any).__createSessionCalls) (globalThis as any).__createSessionCalls = lastCreateSiclawSession.calls;
-
-// Avoid real memory indexer / embeddings
-vi.mock("../memory/index.js", () => ({
-  createMemoryIndexer: vi.fn(async () => ({
-    sync: vi.fn(async () => {}),
-    startWatching: vi.fn(),
-    purgeStaleInvestigations: vi.fn(async () => {}),
-    clearInvestigations: vi.fn(),
-    close: vi.fn(),
-  })),
-}));
-
-vi.mock("../memory/session-summarizer.js", () => ({
-  saveSessionKnowledge: vi.fn(async () => null),
-}));
 
 // Scoped config mock — points paths to the per-test temp dir.
 let _cfgUserDataDir = "";
@@ -140,15 +125,12 @@ vi.mock("../core/config.js", () => ({
     },
     providers: {},
   }),
-  getEmbeddingConfig: () => null,
   isMemoryEnabled: () => _memoryEnabled,
 }));
 
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
-import { createMemoryIndexer } from "../memory/index.js";
-import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import * as subagentRegistry from "../core/subagent-registry.js";
 import { getSubagentConcurrency } from "../core/subagent-registry.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
@@ -461,8 +443,6 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
 
     await mgr.getOrCreate("sess-1");
 
-    expect(createMemoryIndexer).not.toHaveBeenCalled();
-    expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
     expect(fs.existsSync(path.join(_cfgUserDataDir, "memory"))).toBe(false);
   });
 
@@ -508,7 +488,6 @@ describe("AgentBoxSessionManager — release", () => {
     await mgr.getOrCreate("sess-1");
     await mgr.release("sess-1");
 
-    expect(saveSessionKnowledge).not.toHaveBeenCalled();
   });
 
   it("release skips delete when a new getOrCreate has replaced the session mid-release", async () => {
@@ -774,29 +753,6 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
   });
 });
 
-describe("AgentBoxSessionManager — resetMemory", () => {
-  it("is a no-op when memory indexer was never initialized", async () => {
-    const mgr = new AgentBoxSessionManager();
-    await expect(mgr.resetMemory()).resolves.toBeUndefined();
-  });
-
-  it("closes and rebuilds the shared indexer after Gateway deletes the memory dir", async () => {
-    const mgr = new AgentBoxSessionManager();
-    // Trigger shared init via getOrCreate
-    await mgr.getOrCreate("sess-1");
-
-    const firstIndexer = await (createMemoryIndexer as any).mock.results[0].value;
-
-    await mgr.resetMemory();
-
-    expect(firstIndexer.close).toHaveBeenCalledTimes(1);
-    expect(createMemoryIndexer).toHaveBeenCalledTimes(2);
-    const secondIndexer = await (createMemoryIndexer as any).mock.results[1].value;
-    expect(secondIndexer.sync).toHaveBeenCalledTimes(1);
-    expect(secondIndexer.startWatching).toHaveBeenCalledTimes(1);
-    expect(mgr.activeCount()).toBe(1);
-  });
-});
 
 describe("AgentBoxSessionManager — list + get + activeCount", () => {
   it("list returns all managed sessions", async () => {
@@ -1949,7 +1905,7 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
 
     // cleanup: stop, let it settle, and cancel the coalesce timer so no stray synthetic turn.
     await mgr.createJobStopExecutor()("grpbg");
-    await new Promise((r) => setTimeout(r, 30));
+    await vi.waitFor(() => expect(managed._backgroundWorkCount).toBe(0));
     mgr.discardPendingNotifications("p1");
   });
 
@@ -1966,7 +1922,7 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
     expect(stop.stopped).toBe(true);
     expect(mgr.jobs.get(res.jobId).status).toBe("stopped");
 
-    await new Promise((r) => setTimeout(r, 30)); // let the group settle
+    await vi.waitFor(() => expect(mgr.sessions.get("p1")._backgroundWorkCount).toBe(0));
     expect(hooks.abortCount).toBe(3); // every in-flight child was aborted by the group controller
     mgr.discardPendingNotifications("p1");
   });
@@ -1996,7 +1952,7 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
 
     const res = mgr.startBackgroundSubagentGroup(bgReq());
     expect(res.status).toBe("launched");
-    await new Promise((r) => setTimeout(r, 120)); // let the group settle (before the 600ms coalesce)
+    await vi.waitFor(() => expect(mgr.sessions.get("p1")._backgroundWorkCount).toBe(0));
 
     // group_progress is LIVE-ONLY (emit_chat_event, never append_event) and carries the groupId
     // + per-item status/session array so the card animates and can open a running child's
@@ -2381,6 +2337,73 @@ describe("AgentBoxSessionManager — resumable child sessions", () => {
     expect(JSON.stringify(events)).toContain("spawn-followup");
     expect(restored.subagentRuns.size).toBe(0);
   });
+  async function privateChildFixture() {
+    const mgr = new AgentBoxSessionManager() as any;
+    success();
+    const first = await mgr.createSpawnSubagentExecutor()(request());
+    const native = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
+    const { capturePiSession } = await import("./pi-session-snapshot.js");
+    const directory = mgr.getSessionDir(first.childSessionId);
+    const transcript = native.SessionManager.create("/previous-runtime-cwd", directory);
+    transcript.appendMessage({ role: "user", content: "Inspect eth0", timestamp: 1 });
+    const leaf = transcript.appendMessage({ role: "assistant", content: [{ type: "text", text: "eth0 verified" }], api: "openai-responses", provider: "fixture", model: "fixture", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 2 });
+    transcript.appendMessage({ role: "user", content: "Unselected branch", timestamp: 3 });
+    transcript.branch(leaf);
+    const file = path.join(directory, ".pi-session.json");
+    fs.writeFileSync(file, JSON.stringify(capturePiSession(first.childSessionId, transcript)), { mode: 0o600 });
+    return { first, transcript, directory, file, leaf };
+  }
+
+  it("resumes the selected private child branch and checkpoints follow-ups through the same manager", async () => {
+    const { first, file, leaf } = await privateChildFixture();
+    const restored = new AgentBoxSessionManager() as any;
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    try {
+      success();
+      await restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, spawnId: "private-followup" }));
+      const resumed = (globalThis as any).__createSessionCalls.at(-1).sessionManager;
+      expect(resumed.getLeafId()).toBe(leaf);
+      expect(resumed.getCwd()).toBe(process.cwd());
+      expect(JSON.stringify(resumed.buildSessionContext())).toContain("eth0 verified");
+      expect(JSON.stringify(resumed.buildSessionContext())).not.toContain("Unselected branch");
+      expect(restored.piManagers.get(first.childSessionId)).toBe(resumed);
+      // A later continuation must use live state even before the next disk snapshot.
+      const followup = resumed.appendMessage({ role: "user", content: "Inspect eth1 next", timestamp: 4 });
+      success();
+      await restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle, spawnId: "private-followup-2" }));
+      expect((globalThis as any).__createSessionCalls.at(-1).sessionManager).toBe(resumed);
+      expect(resumed.getLeafId()).toBe(followup);
+      const checkpoint = vi.fn(async (_files: Map<string, Buffer>) => {});
+      restored.privateWorkspace = { sessionId: "parent", assertHealthy() {}, checkpoint };
+      await restored.checkpointPrivateWorkspace();
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+      expect(saved.entries).toEqual(resumed.getEntries());
+      expect(saved.activeLeafId).toBe(followup);
+      const files = checkpoint.mock.calls[0][0] as Map<string, Buffer>;
+      expect(JSON.parse(files.get(`sessions/${first.childSessionId}/.pi-session.json`)!.toString())).toEqual(saved);
+      expect(restored.subagentRuns.size).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(["missing", "corrupt", "oversized", "wrong-owner", "empty"])("rejects a %s private child snapshot without falling back to JSONL", async (kind) => {
+    const { first, file } = await privateChildFixture();
+    const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (kind === "missing") fs.rmSync(file);
+    if (kind === "corrupt") fs.writeFileSync(file, "{broken");
+    if (kind === "oversized") fs.truncateSync(file, 64 * 1024 * 1024 + 1);
+    if (kind === "wrong-owner") fs.writeFileSync(file, JSON.stringify({ ...snapshot, sessionId: "other-child" }));
+    if (kind === "empty") fs.writeFileSync(file, JSON.stringify({ ...snapshot, entries: [], activeLeafId: null }));
+    const restored = new AgentBoxSessionManager() as any;
+    const calls = (globalThis as any).__createSessionCalls.length;
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    try {
+      await expect(restored.createSpawnSubagentExecutor()(request({ resumeHandle: first.resumeHandle }))).rejects.toThrow(/private transcript/);
+      expect((globalThis as any).__createSessionCalls).toHaveLength(calls);
+      expect(restored.piManagers.size).toBe(0);
+      expect(restored.subagentRuns.size).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("queues a running child's guidance without starting another child or background job", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let finish!: () => void;

@@ -291,7 +291,7 @@ describe("LocalSpawner — tool-capabilities injection", () => {
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get", "memory_catalog"]),
     );
   });
 

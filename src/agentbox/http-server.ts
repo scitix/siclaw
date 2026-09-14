@@ -735,7 +735,7 @@ export function createHttpServer(
    * without a separate term.
    */
   function isDrained(): boolean {
-    return activeSseCount === 0 && sessionManager.activeCount() === 0;
+    return activeSseCount === 0 && sessionManager.activeCount() === 0 && !sessionManager.isPreparingPrivatePrompt;
   }
 
   function checkIdle(): void {
@@ -906,6 +906,19 @@ export function createHttpServer(
     let dispatched = false;
     try {
       const body = await parseJsonBody(req);
+      // The Runtime uses the same per-run grant to fence MCP calls and result
+      // reads which execute there, without dispatching a built-in callback.
+      if (record(body) && body.validation_only === true) {
+        if (Object.keys(body).some(k => !["session_id", "callback_token", "validation_only"].includes(k)) ||
+            typeof body.session_id !== "string" || typeof body.callback_token !== "string") throw new Error();
+        const managed = sessionManager.get(body.session_id);
+        const invocations = sessionManager.gatewayClient?.sandboxInvocations;
+        if (!managed || managed.mode !== "web" || !invocations) throw new Error();
+        invocations.assertActive(body.callback_token, body.session_id);
+        await sessionManager.validatePrivateExecution(body.session_id);
+        invocations.assertActive(body.callback_token, body.session_id);
+        sendJson(res, 200, { protocol: 1, ok: true, result: null }); return;
+      }
       if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approval"].includes(k)) ||
           !record(body.approval) || Buffer.byteLength(JSON.stringify(body.approval)) > 256 * 1024 ||
           typeof body.session_id !== "string" || typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token)) throw new Error();
@@ -918,7 +931,14 @@ export function createHttpServer(
       if (typeof approval.callId !== "string" || !approval.callId || approval.callId.length > 64) throw new Error();
       const result = await invocations.execute(body.callback_token, body.session_id,
         { id: approval.callId, tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
-        (request, signal) => { dispatched = true; return executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal); });
+        async (request, signal) => {
+          await sessionManager.validatePrivateExecution(body.session_id as string);
+          signal.throwIfAborted();
+          dispatched = true;
+          const result = await executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal);
+          await sessionManager.validatePrivateExecution(body.session_id as string);
+          return result;
+        });
       sendJson(res, 200, { protocol: 1, ok: true, result });
     } catch (error) {
       const failure = error instanceof SandboxToolError ? error : new SandboxToolError(
@@ -959,10 +979,26 @@ export function createHttpServer(
       return;
     }
 
-    const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
+    if (process.env.SICLAW_WORKSPACE_MODE === "remote" && (body.sessionId !== process.env.SICLAW_PRIVATE_SESSION_ID || body.userId !== process.env.SICLAW_PRIVATE_USER_ID)) {
+      sendJson(res, 403, { error: "Private session owner mismatch" }); return;
+    }
     if ((body as Record<string, unknown>).delegation || String(body.origin) === "delegation") {
       sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
       return;
+    }
+    const resumed = await sessionManager.ensureSessionContext(body.sessionId);
+    // DP/router sidecars arrive with the remote projection. Inspect them only
+    // after restore, including the first prompt in a replacement Pod.
+    const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
+    if (process.env.SICLAW_WORKSPACE_MODE === "remote" && sessionManager.hasUncertainPrivateTurn(body.sessionId!)) {
+      // A live turn also owns a pending marker until its final checkpoint commits.
+      // Let its retries reach the ledger/busy checks; a restored marker without
+      // an in-process prompt still requires recovery even if its ID is accepted.
+      const live = sessionManager.get(body.sessionId!);
+      if (!live || (live._promptDone && !live._promptInflight)) {
+        await sessionManager.releaseUncertainPrivateTurn();
+        sendJson(res, 409, { code: "PRIVATE_TURN_RECOVERY_REQUIRED", error: "A previous turn may already have executed. Automatic replay is blocked; inspect the saved recovery record." }); return;
+      }
     }
     // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
     // dispatch in process memory only, so after a Runtime restart the same turn
@@ -978,7 +1014,6 @@ export function createHttpServer(
     // a session this box has never seen — and refuse it — while the control plane
     // holds its whole transcript. For a brand-new session the load is one cheap
     // empty round-trip.
-    const resumed = await sessionManager.ensureSessionContext(body.sessionId);
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
         code: SESSION_CONTEXT_UNAVAILABLE_CODE,
@@ -1060,7 +1095,7 @@ export function createHttpServer(
     // BEFORE the ack, because a record that landed after it would leave open
     // exactly the window it exists to close. A 409/412 above returns earlier and
     // deliberately records nothing — that turn did not run.
-    if (body.turnId) sessionManager.recordAcceptedTurn(managed.id, body.turnId);
+    if (body.turnId && process.env.SICLAW_WORKSPACE_MODE !== "remote") sessionManager.recordAcceptedTurn(managed.id, body.turnId);
     if (sessionManager.consumePendingAbort(managed.id, body.turnId)) {
       managed._aborted = true;
       managed._backgroundWorkTurn?.cancel();
@@ -1126,6 +1161,7 @@ export function createHttpServer(
 
     let promptText: string;
     try {
+      if (process.env.SICLAW_WORKSPACE_MODE === "remote") await sessionManager.preparePrivateTurn(managed.id, { turnId: body.turnId, text: body.text, images: body.images, files: body.files });
       if (body.modelProvider || body.modelId || body.modelConfig) {
         sessionManager.setDelegationModel({
           provider: body.modelProvider,
@@ -1180,12 +1216,7 @@ export function createHttpServer(
     // Prepending would break marker detection in pi-agent extension input handlers
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     //
-    // The directive is injected UNCONDITIONALLY (not gated on memory): following the
-    // user's language is a baseline behaviour every agent needs, independent of whether
-    // it has long-term memory. Only the PROFILE.md persistence below is a memory concern.
-    // (Previously this was accidentally gated on isMemoryEnabled() as a side effect of
-    // "disable memory by default", which left memory-off agents — e.g. the GPU-cloud
-    // sales-guide — with no language enforcement, so they drifted to the model's bias.)
+    // Current response language is independent from durable memory.
     const detectedLang = detectLanguage(promptText);
     if (detectedLang !== "English") {
       // Only two DP markers remain after the refactor: activation and exit.
@@ -1198,32 +1229,6 @@ export function createHttpServer(
         promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
       }
     }
-
-    // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
-    // Only update on non-English detection to avoid flapping: English is the default,
-    // so we only persist when the user actively uses another language.
-    if (detectedLang !== "English") {
-      try {
-        const cfg = loadConfig();
-        const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
-        const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
-        if (fs.existsSync(profilePath)) {
-          const content = fs.readFileSync(profilePath, "utf-8");
-          const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
-          const currentLang = currentLangMatch?.[1]?.trim();
-          if (currentLang !== detectedLang) {
-            const updated = content.replace(
-              /(\*\*Language\*\*:\s*).+/i,
-              `$1${detectedLang}`,
-            );
-            fs.writeFileSync(profilePath, updated);
-          }
-        }
-      } catch { /* best-effort, don't block prompt */ }
-    }
-
-    // Execute prompt asynchronously; notify SSE to close on completion
-    console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
 
     // Metrics: snapshot stats before prompt for delta calculation
     const prevStats = managed.brain.getSessionStats();
@@ -1248,7 +1253,19 @@ export function createHttpServer(
         && assistantTextBlocks(event.message).some(block => block.text.trim() && block.phase !== "commentary");
     });
 
-    const actuallyFinish = () => {
+    let finishStarted = false;
+    const actuallyFinish = async () => {
+      if (finishStarted) return;
+      finishStarted = true;
+      if (process.env.SICLAW_WORKSPACE_MODE === "remote") {
+        try { await sessionManager.checkpointPrivateWorkspace(true); }
+        catch {
+          promptOutcome = "error";
+          const failure = { type: "stream_error", sessionId: managed.id, error: "The turn could not be durably saved. Its execution state requires recovery." };
+          managed._eventBuffer.push(failure);
+          for (const sub of managed._extraEventSubs) { try { sub(failure); } catch { /* transport already closed */ } }
+        }
+      }
       backgroundWorkTurn.cancel();
       reportUnsubscribe();
       managed._promptDone = true;
@@ -2102,20 +2119,6 @@ export function createHttpServer(
     sendJson(res, 200, { ok: true });
   });
 
-  /**
-   * DELETE /api/memory - reset memory indexer after Gateway clears PVC files
-   */
-  addRoute("DELETE", "/api/memory", async (_req, res) => {
-    console.log(`[agentbox-http] Resetting memory indexer`);
-    try {
-      await sessionManager.resetMemory();
-      sendJson(res, 200, { ok: true });
-    } catch (err: any) {
-      console.error(`[agentbox-http] Memory reset failed: ${err.message}`);
-      sendJson(res, 500, { error: `Memory reset failed: ${err.message}` });
-    }
-  });
-
   // ==================== Server ====================
 
   /** Main request handler shared by HTTP and HTTPS servers */
@@ -2143,6 +2146,11 @@ export function createHttpServer(
       }
     }
 
+    if (sessionManager.isShuttingDown && method !== "GET") {
+      sendJson(res, 503, { error: "AgentBox is shutting down" });
+      return;
+    }
+
     // Match route
     for (const route of routes) {
       if (route.method !== method) continue;
@@ -2156,7 +2164,15 @@ export function createHttpServer(
         params[name] = match[i + 1];
       });
 
+      let releaseSetup: (() => void) | undefined;
       try {
+        if (method === "POST" && pathname === "/api/prompt" && process.env.SICLAW_WORKSPACE_MODE === "remote") {
+          releaseSetup = sessionManager.beginPrivatePromptSetup();
+          if (!releaseSetup) {
+            sendJson(res, 409, { error: "A prompt is being prepared; retry after admission completes" });
+            return;
+          }
+        }
         await route.handler(req, res, params);
       } catch (err) {
         if (err instanceof HttpRequestError) {
@@ -2171,6 +2187,8 @@ export function createHttpServer(
         if (!res.headersSent) {
           sendJson(res, 500, { error: "Internal server error" });
         }
+      } finally {
+        if (releaseSetup) { releaseSetup(); checkIdle(); }
       }
       return;
     }

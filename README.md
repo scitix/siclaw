@@ -192,7 +192,7 @@ All configuration happens through the web UI:
 | Language | TypeScript 5.9 |
 | Agent | [pi-coding-agent](https://github.com/badlogic/pi-mono) |
 | Database (portal) | MySQL (prod) or SQLite (local, via [node:sqlite](https://nodejs.org/api/sqlite.html)) — single DDL, driver chosen by `DATABASE_URL` scheme |
-| Database (memory) | node:sqlite + FTS5 + bge-m3 embeddings |
+| Database (memory) | Host evidence service (remote); per-user node:sqlite transactions (local) |
 | Frontend | React + Vite + Tailwind CSS |
 | K8s Client | @kubernetes/client-node |
 | MCP | @modelcontextprotocol/sdk |

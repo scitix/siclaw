@@ -1,3 +1,4 @@
+import { stripMemoryCitations } from "../../../../src/shared/memory-citations"
 import { TraceHostContext } from "./TraceContext"
 import { createContext, useContext, useMemo } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
@@ -370,6 +371,7 @@ const MARKDOWN_COMPONENTS: Components = {
 }
 
 export function Markdown({ children, isStreaming = false }: MarkdownProps) {
+  children = stripMemoryCitations(children)
   return (
     <ChartStreamingContext.Provider value={isStreaming}>
       <ReactMarkdown

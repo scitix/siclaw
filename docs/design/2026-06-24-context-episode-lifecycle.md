@@ -75,7 +75,7 @@ explicit inverse of the compaction failure mode where summarized turns are lost.
 ### 2.1 The bridge
 
 On boundary close, summarize the closing episode into a **bounded** note
-(reuse the `compaction-safeguard` summarizer / `session-summarizer.ts`):
+(historical proposal; the session summarizer is now retired—see [current memory](memory-v2-alignment.md)):
 
 - It is small (target ≤ ~500 tokens) and capped.
 - The next episode starts with `{bridge, new user question}`.

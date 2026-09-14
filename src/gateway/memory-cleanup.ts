@@ -1,35 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { LocalMemoryStore } from "../memory/local-store.js";
 
-function sanitizeAgentId(agentId: string): string {
-  return agentId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 63);
-}
-
-function countFiles(dir: string): number {
-  let count = 0;
-  if (!fs.existsSync(dir)) return count;
-
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      count += countFiles(fullPath);
-    } else if (entry.isFile()) {
-      count++;
-    }
-  }
-
-  return count;
-}
-
-export function clearAgentMemory(agentId: string, userDataBase = "/app/.siclaw/user-data"): { memoryDir: string; deletedFiles: number } {
-  const base = path.resolve(userDataBase);
-  const memoryDir = path.resolve(base, "agents", sanitizeAgentId(agentId), "memory");
-
-  if (!memoryDir.startsWith(base + path.sep)) {
-    throw new Error(`Refusing to clear memory outside user data base: ${memoryDir}`);
-  }
-
-  const deletedFiles = countFiles(memoryDir);
-  fs.rmSync(memoryDir, { recursive: true, force: true });
-  return { memoryDir, deletedFiles };
+/** Local user privacy control. Bump the authority generation instead of deleting
+ * an open SQLite/WAL file; all resident sessions observe the same tombstone. */
+export function clearUserMemory(userId: string, userDataBase: string): void {
+  if (!userId) throw new Error("Memory owner is required");
+  const directory = path.join(path.resolve(userDataBase), "memory-v2", createHash("sha256").update(userId).digest("hex"));
+  if (!fs.existsSync(path.join(directory, "memory-v2.db"))) return;
+  const memory = new LocalMemoryStore(directory);
+  try { memory.clear(); } finally { memory.close(); }
 }

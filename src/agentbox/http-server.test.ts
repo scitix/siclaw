@@ -12,7 +12,7 @@ import https from "node:https";
 /**
  * Tests for createHttpServer.
  *
- * We mock heavy subsystems (metrics registries, memory indexer, config
+ * We mock heavy subsystems (metrics registries, configuration
  * loader) so we can exercise the routing table against a
  * lightweight fake session manager. The server itself is a real http.Server;
  * we send HTTP requests to it from the same process.
@@ -53,7 +53,7 @@ vi.mock("../shared/detect-language.js", () => ({
   detectLanguage: (s: string) => (s.includes("你") ? "Chinese" : "English"),
 }));
 
-// Config loader — point paths at /tmp (no PROFILE.md → no update)
+// Config loader uses the isolated test paths.
 vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
     paths: {
@@ -232,6 +232,7 @@ function makeFakeSession(id: string) {
 function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-ledger-"))) {
   const sessions = new Map<string, ReturnType<typeof makeFakeSession>>();
   const getOrCreateCalls: any[] = [];
+  let preparing = false;
   return {
     sessions,
     getOrCreateCalls,
@@ -239,6 +240,12 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     ledgerDir,
     userId: "u",
     agentId: "a",
+    get isPreparingPrivatePrompt() { return preparing; },
+    beginPrivatePromptSetup: () => {
+      if (preparing) return undefined;
+      preparing = true;
+      return () => { preparing = false; };
+    },
     // The REAL file-backed ledger, so these tests exercise the durability that
     // the cross-restart de-duplication depends on rather than a stub of it.
     hasAcceptedTurn: (sessionId: string, turnId: string) =>
@@ -280,7 +287,6 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     },
     close: async (id: string) => { sessions.delete(id); },
     closeAll: async () => { sessions.clear(); },
-    resetMemory: async () => {},
     scheduleRelease: (_id: string) => {},
     invalidate: (_id: string) => {},
     setDelegationModel: vi.fn(),
@@ -2146,11 +2152,9 @@ describe("http-server — session status (liveness)", () => {
 });
 
 describe("http-server — memory reset", () => {
-  it("DELETE /api/memory calls sessionManager.resetMemory", async () => {
-    const spy = vi.spyOn(sm, "resetMemory");
+  it("does not expose the retired unscoped memory reset endpoint", async () => {
     const r = await getJson(port, "/api/memory", "DELETE");
-    expect(r.status).toBe(200);
-    expect(spy).toHaveBeenCalled();
+    expect(r.status).toBe(404);
   });
 });
 
@@ -2283,6 +2287,15 @@ describe("http-server — idle self-destruct", () => {
     expect(onIdleShutdown).not.toHaveBeenCalled();
   });
 
+  it("does not treat a private restore without a resident brain as drained", () => {
+    const { onIdleShutdown, sm: sm2 } = arm({ idleTimeoutMs: 1000 });
+    const finish = sm2.beginPrivatePromptSetup()!;
+    expect(sm2.activeCount()).toBe(0);
+    vi.advanceTimersByTime(1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    finish();
+  });
+
   it("is resident (never fires) when the window is 0", () => {
     const { onIdleShutdown } = arm({ idleTimeoutMs: 0 });
     vi.advanceTimersByTime(60 * 60 * 1000);
@@ -2393,6 +2406,86 @@ describe("http-server — turn ledger (cross-restart dispatch idempotency)", () 
   });
 });
 
+describe("http-server — private turn retry and recovery", () => {
+  const sessionId = "private-retry-session";
+  const turnId = "private-retry-turn";
+  let marker: string;
+  let releaseUncertain: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    vi.stubEnv("SICLAW_PRIVATE_SESSION_ID", sessionId);
+    vi.stubEnv("SICLAW_PRIVATE_USER_ID", "u");
+    sm.recordAcceptedTurn(sessionId, turnId);
+    marker = path.join(sm.ledgerDir, sessionId, ".pending-turn.json");
+    fs.writeFileSync(marker, JSON.stringify({ turnId, state: "execution_uncertain" }));
+    releaseUncertain = vi.fn(async () => {});
+    Object.assign(sm, {
+      hasUncertainPrivateTurn: (id: string) => fs.existsSync(path.join(sm.ledgerDir, id, ".pending-turn.json")),
+      releaseUncertainPrivateTurn: releaseUncertain,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    fs.rmSync(sm.ledgerDir, { recursive: true, force: true });
+  });
+
+  it.each(["running", "settling"])("acknowledges the same turn while %s without replay or recovery", async (state) => {
+    const session = await sm.getOrCreate(sessionId);
+    Object.assign(session, {
+      _promptDone: state === "settling",
+      _promptInflight: state === "settling" ? new Promise<void>(() => {}) : null,
+    });
+
+    const response = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId, turnId, userId: "u" });
+
+    expect(response.status).toBe(200);
+    expect(response.data).toMatchObject({ ok: true, sessionId, turnId, duplicate: true });
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+    expect(releaseUncertain).not.toHaveBeenCalled();
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it("reports busy for a different turn while the original turn is running", async () => {
+    const session = await sm.getOrCreate(sessionId);
+    session._promptDone = false;
+
+    const response = await getJson(port, "/api/prompt", "POST", { text: "another request", sessionId, turnId: "new-turn", userId: "u" });
+
+    expect(response.status).toBe(409);
+    expect(response.data.error).toContain("Session is already running");
+    expect(response.data.code).toBeUndefined();
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+    expect(releaseUncertain).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("requires recovery for a saved unfinished turn even with an accepted ID (resident=%s)", async (resident) => {
+    if (resident) await sm.getOrCreate(sessionId);
+    const createsBefore = sm.getOrCreateCalls.length;
+
+    const response = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId, turnId, userId: "u" });
+
+    expect(response.status).toBe(409);
+    expect(response.data.code).toBe("PRIVATE_TURN_RECOVERY_REQUIRED");
+    expect(response.data.duplicate).toBeUndefined();
+    expect(sm.getOrCreateCalls).toHaveLength(createsBefore);
+    expect(releaseUncertain).toHaveBeenCalledOnce();
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it("acknowledges a completed saved turn without recreating a session", async () => {
+    fs.rmSync(marker);
+
+    const response = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId, turnId, userId: "u" });
+
+    expect(response.status).toBe(200);
+    expect(response.data.duplicate).toBe(true);
+    expect(sm.getOrCreateCalls).toHaveLength(0);
+    expect(releaseUncertain).not.toHaveBeenCalled();
+  });
+});
+
 describe("handoff prompt trace acknowledgement", () => {
   it("inherits the source trace per request and starts a fresh trace for the next user question", async () => {
     const traceId = "0123456789abcdef0123456789abcdef";
@@ -2412,6 +2505,38 @@ describe("handoff prompt trace acknowledgement", () => {
 
 
 describe("sandbox callback authentication", () => {
+  it("revalidates a private lease through an active invocation and denies revoked grants", async () => {
+    const { SandboxInvocations } = await import("./sandbox-invocations.js");
+    const invocations = new SandboxInvocations();
+    const grant = invocations.open("private-session", { language: "python", code: "pass" });
+    const validate = vi.fn(async () => {});
+    Object.assign(sm, { gatewayClient: { sandboxInvocations: invocations }, validatePrivateExecution: validate });
+    await sm.getOrCreate("private-session");
+    const body = { session_id: "private-session", callback_token: grant.token, validation_only: true };
+    try {
+      expect((await getJson(port, "/api/internal/sandbox-tool", "POST", body)).data).toMatchObject({ ok: true });
+      expect(validate).toHaveBeenCalledWith("private-session");
+      validate.mockRejectedValueOnce(new Error("lease lost"));
+      expect((await getJson(port, "/api/internal/sandbox-tool", "POST", body)).data).toMatchObject({ ok: false, execution: "NOT_DISPATCHED" });
+      grant.close();
+      validate.mockClear();
+      expect((await getJson(port, "/api/internal/sandbox-tool", "POST", body)).data).toMatchObject({ ok: false });
+      expect(validate).not.toHaveBeenCalled();
+    } finally { grant.close(); }
+  });
+
+  it("rechecks the invocation after a pending lease validation", async () => {
+    const { SandboxInvocations } = await import("./sandbox-invocations.js");
+    const invocations = new SandboxInvocations();
+    const grant = invocations.open("private-session", { language: "python", code: "pass" });
+    Object.assign(sm, { gatewayClient: { sandboxInvocations: invocations }, validatePrivateExecution: async () => { grant.close(); } });
+    await sm.getOrCreate("private-session");
+    const response = await getJson(port, "/api/internal/sandbox-tool", "POST", {
+      session_id: "private-session", callback_token: grant.token, validation_only: true,
+    });
+    expect(response.data).toMatchObject({ ok: false, execution: "NOT_DISPATCHED" });
+  });
+
   it("rejects an unauthenticated local callback even to an existing session", async () => {
     await sm.getOrCreate("sandbox-session");
     const r = await getJson(port, "/api/internal/sandbox-tool", "POST", {
@@ -2455,4 +2580,53 @@ describe("sandbox callback authentication", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+
+describe("http-server — remote admission and restored mode", () => {
+  beforeEach(() => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    vi.stubEnv("SICLAW_PRIVATE_SESSION_ID", "sid");
+    vi.stubEnv("SICLAW_PRIVATE_USER_ID", "u");
+    Object.assign(sm, { hasUncertainPrivateTurn: () => false, preparePrivateTurn: vi.fn(async () => {}), checkpointPrivateWorkspace: vi.fn(async () => {}) });
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it("rejects a competing admission while the first request is restoring", async () => {
+    let entered!: () => void, unblock!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { unblock = resolve; });
+    sm.ensureSessionContext = async () => { entered(); await gate; return false; };
+    const first = getJson(port, "/api/prompt", "POST", { sessionId: "sid", userId: "u", text: "hello" });
+    await started;
+    const second = await getJson(port, "/api/prompt", "POST", { sessionId: "sid", userId: "u", text: "second" });
+    expect(second.status).toBe(409);
+    expect(sm.getOrCreateCalls).toHaveLength(0);
+    unblock();
+    expect((await first).status).toBe(200);
+    expect(sm.getOrCreateCalls).toHaveLength(1);
+  });
+
+  it("reads DP state after the OSS projection has been restored", async () => {
+    sm.ensureSessionContext = async () => { sm.getPersistedDpState = () => ({ active: true }); return true; };
+    const response = await getJson(port, "/api/prompt", "POST", { sessionId: "sid", userId: "u", text: "continue" });
+    expect(response.status).toBe(200);
+    expect(sm.getOrCreateCalls.at(-1)?.activeMode).toBe("dp");
+  });
+
+  it("refuses new work on a keep-alive connection once shutdown starts", async () => {
+    Object.assign(sm, { isShuttingDown: true });
+    const response = await getJson(port, "/api/prompt", "POST", { sessionId: "sid", userId: "u", text: "hello" });
+    expect(response.status).toBe(503);
+    expect(sm.getOrCreateCalls).toHaveLength(0);
+  });
+
+  it("refuses a corrupt private turn ledger instead of replaying a turn", async () => {
+    const directory = path.join(sm.ledgerDir, "sid");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, ".turn-ledger.json"), "invalid");
+    const response = await getJson(port, "/api/prompt", "POST", { sessionId: "sid", userId: "u", turnId: "retry", text: "hello" });
+    expect(response.status).toBe(500);
+    expect(sm.getOrCreateCalls).toHaveLength(0);
+  });
 });

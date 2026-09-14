@@ -1,36 +1,78 @@
 ---
-title: "Investigation Memory"
+title: "Personal Memory"
 sidebarTitle: "Memory"
-description: "How Siclaw learns from past investigations to improve future diagnoses."
+description: "Learn useful preferences and task experience from attributed historical evidence."
 ---
 
-## Overview
+Memory is opt-in (`SICLAW_MEMORY_ENABLED=true`, or Helm
+`runtime.memory.enabled`). It uses the Agent's configured model and needs no
+embedding provider, vector database or FTS index.
 
-Every deep investigation helps Siclaw get better at future investigations.
+## Learning useful evidence
 
-Siclaw stores:
+After a completed turn is saved, AgentBox reviews unreviewed source records in the
+background. It can retain stable preferences, project conventions, corrections,
+and useful task experience. Exact quotes retain their roles and provenance;
+failed attempts, proposals and uncertain outcomes remain distinguishable.
+An assistant's success claim or a successful tool invocation does not prove that
+a repair worked. Trivial questions, routine inventory and temporary task requests
+should produce no memory.
 
-- a human-readable investigation report
-- a structured summary of the incident
-- searchable memory used to improve future hypothesis generation
+The host selects committed snapshots and checks source access, learning leases,
+quotes and generations before publishing. Transient failures retry while the box
+is resident. Restarted boxes resume eligible learning without another question.
+Learning never writes skills, executes scripts or restores historical permission.
+A separately leased second stage groups cross-session task evidence into a small
+source-backed outline. It can merge equivalent durable topics, retain aliases,
+and resolve later corrections without overwriting independent task attempts.
+Task records require a literal user goal; a request to verify success is not
+confirmation that verification succeeded.
 
-## How It Works
+## Recall without filling the context
 
-### Writing Memory
+Use `memory_search` for relevant prior decisions and `memory_get` for precise
+source windows. `memory_catalog` provides at most eight navigation entries when
+the topic is unclear. Historical evidence must be verified against current facts.
+A small relevant brief is available at the start of a task when the Agent has
+Memory Search capability. It permits zero entries and shares recall budgets.
+Memory is skipped for self-contained calculations and translations; duplicate
+briefs are suppressed until context compaction. Queries exceeding the metadata
+candidate budget explicitly request a narrower project/entity or scope.
 
-After an investigation finishes, Siclaw saves key facts such as:
+Search/read/catalog share response, turn and context budgets. Compaction clears
+only disposable recall bookkeeping. Only evidence actually returned and cited in the final response records usage automatically;
+internal attribution is hidden from chat presentation. Exposure and use are separate;
+`memory_feedback` flags incorrect or irrelevant evidence. Repeated use is a small
+ranking signal, not proof.
 
-- likely root cause
-- affected services or resources
-- important evidence
-- recommended next steps
+## Remember, correct and forget
 
-### Reading Memory
+An explicit user request can use `memory_update` with an exact quote from the
+current user message. Remember/correct requests are accepted for background
+review. Forget targets an existing returned memory path and takes effect
+immediately; a tombstone prevents stale learning from bringing it back. An
+explicit later remember request can replace that tombstone.
 
-When a new investigation starts, Siclaw can look up similar past incidents and use them to improve hypothesis quality.
+Reading memory uses the `search_memory` capability. Explicit updates and feedback
+use the separate `manage_memory` capability. An existing read-only custom Agent
+selection does not acquire update permission automatically.
 
-This makes repeated incident patterns easier to recognize over time.
+## Storage and retention
 
-<Warning>
-Memory search works best with an [embedding provider](/configuration/providers#embedding). Without one, Siclaw still saves investigation history, but semantic recall is reduced.
-</Warning>
+Remote deployments store source bodies and learning batches in versioned object
+storage, and ownership, topics, leases and receipts in the host's metadata store.
+All participating Runtimes must use the same bound backend for an existing
+personal space. Local/CLI uses per-user transactional SQLite under
+`memory-v2/<owner hash>/memory-v2.db`; local development is not a substitute for
+production operating-system isolation.
+
+Recall expires at most 90 days after the source event. Background model learning is capped at 64
+batches per user per UTC day, with separate reserves of 16 explicit batches and
+16 consolidation batches. Deterministically trivial batches do not consume model quota, with smaller batches after repeated failures and a
+one-day cooldown after eight failed attempts. Each batch has at most 24 primary source
+fragments and eight adjacent read-only context fragments, sharing 32 KiB of input. These limits bound memory cost independently of
+the foreground task.
+
+Deleting learned memory does not erase conversations, checkpoint files or
+retained object versions. Old `.memory.db` investigation rows remain exportable;
+the retired database is not opened as a recall backend or deleted as a cache.

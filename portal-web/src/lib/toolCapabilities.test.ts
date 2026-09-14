@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest"
+import { CAPABILITY_GROUPS as BACKEND_GROUPS } from "../../../src/core/tool-capabilities"
 import {
   CAPABILITY_GROUPS,
   countToolsForSelection,
@@ -8,9 +9,10 @@ import {
 const KNOWN_KEYS = CAPABILITY_GROUPS.map((g) => g.key)
 
 describe("CAPABILITY_GROUPS shape", () => {
-  it("declares the designed capability groups, including conversation handoff", () => {
+  it("declares the designed groups, including separate memory management", () => {
     expect([...KNOWN_KEYS].sort()).toEqual([
       "inspect_infra",
+      "manage_memory",
       "no_tools",
       "plan_tasks",
       "read_files",
@@ -24,6 +26,11 @@ describe("CAPABILITY_GROUPS shape", () => {
       "transfer_conversation",
       "write_sandbox",
     ])
+  })
+
+  it("shows the same capability grants as the backend resolver", () => {
+    expect(Object.fromEntries(CAPABILITY_GROUPS.map((g) => [g.key, g.tools])))
+      .toEqual(BACKEND_GROUPS)
   })
 
   it("has unique group keys", () => {
@@ -108,8 +115,8 @@ describe("countToolsForSelection", () => {
   })
 
   it("counts the deduped union across multiple groups", () => {
-    // read_files (6) + search_memory (2), no shared tools → 8 distinct.
-    expect(countToolsForSelection(new Set(["read_files", "search_memory"]))).toBe(8)
+    // read_files (6) + search_memory (3), no shared tools → 9 distinct.
+    expect(countToolsForSelection(new Set(["read_files", "search_memory"]))).toBe(9)
   })
 
   it("ignores unknown keys in the selection", () => {

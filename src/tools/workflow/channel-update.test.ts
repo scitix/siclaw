@@ -9,7 +9,6 @@ function makeRefs(executor: ToolRefs["channelMessageExecutor"]): ToolRefs {
     agentId: "agent-1",
     sessionIdRef: { current: "sess-1" },
     taskListId: "tl-1",
-    memoryRef: {} as any,
     dpStateRef: {} as any,
     channelMessageExecutor: executor,
   };

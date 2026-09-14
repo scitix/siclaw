@@ -132,7 +132,7 @@ SICLAW_CERT_PATH=/etc/siclaw/certs
 
 ### `/api/internal/settings` - GET
 
-Fetch Gateway configuration (providers, models, embedding config).
+Fetch Gateway configuration (providers and models).
 
 **Authentication:**
 - Requires valid client certificate

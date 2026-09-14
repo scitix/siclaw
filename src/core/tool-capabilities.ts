@@ -40,7 +40,8 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec", "k8s_inspect"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
   run_sandbox:     ["run_script"],
-  search_memory:   ["memory_search", "memory_get"],
+  search_memory:   ["memory_search", "memory_get", "memory_catalog"],
+  manage_memory:   ["memory_update", "memory_feedback"],
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
   spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
   // Handing the conversation to another agent is NOT delegation and does not

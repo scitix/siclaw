@@ -356,12 +356,10 @@ describe("AgentBoxManager — K8s mode", () => {
 
 // ── Per-agent persistence is anchored at cold spawn ────────────────────
 //
-// chat.send carries `persistence` per request, but the volume mode is fixed
-// when the pod is created (K8s cannot hot-change a running pod's mounts). A
-// warm pod is reused by agentId WITHOUT spawning, so a changed persistence
-// value must NOT recycle it or reach a new pod spec — it only applies on the
-// next cold spawn. These tests pin that contract. (Cold-spawn volume selection
-// from boxConfig.persistence is covered by k8s-spawner.test.ts.)
+// Legacy durability requests are resolved at cold spawn. Changing one must
+// not recycle a warm shared pod. These manager tests use a fake spawner;
+// k8s-spawner.test.ts verifies that the real spawner rejects a durability
+// request without a private workspace instead of mounting the former PVC.
 
 describe("AgentBoxManager — persistence anchored at cold spawn (warm reuse ignores it)", () => {
   it("K8s: a running pod is reused without re-spawning when persistence flips", async () => {
@@ -401,7 +399,7 @@ describe("AgentBoxManager — persistence anchored at cold spawn (warm reuse ign
 
 // ── Per-agent persistence resolved by agentId (entry-point independent) ─
 //
-// The injected persistenceResolver makes persistence a true agent property:
+// The injected persistenceResolver preserves legacy requests from every entry point:
 // any cold-spawn entry point (chat, channel, cron, abort) that passes NO
 // per-request value still gets the agent's resolved mode. An explicit config
 // value (e.g. task-coordinator's binding.persistence) wins; the resolver is
@@ -436,7 +434,7 @@ describe("AgentBoxManager — persistence resolved by agentId via resolver", () 
     expect(spawner.spawnCalls[0].persistence).toBe(true);
   });
 
-  it("no resolver and no config → persistence undefined (global fallback)", async () => {
+  it("no resolver and no config leaves the legacy durability request undefined", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
 
@@ -2373,3 +2371,46 @@ describe("AgentBoxManager — a wrong staleness judgement must not spin", () => 
   });
 });
 
+
+describe("AgentBoxManager — private workspace placement", () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  function privateBox(sessionId: string, spaceId: string): AgentBoxInfo {
+    return { boxId: `private-${sessionId}`, agentId: "agent-a", privateSessionId: sessionId, privateSpaceId: spaceId,
+      status: "running", endpoint: `https://${sessionId}`, createdAt: new Date(), lastActiveAt: new Date() };
+  }
+
+  it("routes two users of one agent only to their own session Pods while listing both for reload", async () => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    const spawner = new FakeSpawner("k8s");
+    spawner.listReturns = [privateBox("session-a", "space-a"), privateBox("session-b", "space-b")];
+    Object.assign(spawner, { listForAgent: async () => spawner.listReturns });
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPrivateSpaceResolver(async (agentId, sessionId) => ({ agentId, userId: sessionId === "session-a" ? "alice" : "bob", orgId: "org", spaceId: sessionId === "session-a" ? "space-a" : "space-b" }));
+    expect((await mgr.getOrCreate("agent-a", {}, "session-a")).boxId).toBe("private-session-a");
+    expect((await mgr.getForSession("agent-a", "session-b"))?.boxId).toBe("private-session-b");
+    expect((await mgr.list()).map(box => box.boxId)).toHaveLength(2);
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("coalesces concurrent private spawns instead of racing delete/recreate for one session", async () => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "remote");
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPrivateSpaceResolver(async agentId => ({ agentId, userId: "alice", orgId: "org", spaceId: "space" }));
+    const [a, b] = await Promise.all([mgr.getOrCreate("agent-a", {}, "session"), mgr.getOrCreate("agent-a", {}, "session")]);
+    expect(a).toBe(b);
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].privateSpace).toMatchObject({ sessionId: "session", spaceId: "space", userId: "alice" });
+  });
+
+  it("does not adopt private Pods after switching back to local persistence mode", async () => {
+    vi.stubEnv("SICLAW_WORKSPACE_MODE", "local");
+    const spawner = new FakeSpawner("k8s");
+    spawner.listReturns = [privateBox("session-a", "space-a")];
+    Object.assign(spawner, { listForAgent: async () => spawner.listReturns });
+    const mgr = new AgentBoxManager(spawner);
+    expect(await mgr.getForSession("agent-a", "other-session")).toBeUndefined();
+    expect(await mgr.getHolder("agent-a", "other-session")).toBeUndefined();
+    expect(await mgr.list()).toHaveLength(1);
+  });
+});

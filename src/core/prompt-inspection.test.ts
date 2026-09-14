@@ -8,7 +8,7 @@ import { compileAgentContext } from "./agent-context.js";
 import type { AgentType } from "./agent-types.js";
 import { createPromptInspection } from "./prompt-inspection.js";
 import { CAPABILITY_GROUPS } from "./tool-capabilities.js";
-import { buildKnowledgeWikiCatalog } from "../memory/overview-generator.js";
+import { buildKnowledgeWikiCatalog } from "../knowledge/overview-generator.js";
 import { createKnowledgeSearchTool } from "../tools/query/knowledge-search.js";
 
 const tempDirs: string[] = [];

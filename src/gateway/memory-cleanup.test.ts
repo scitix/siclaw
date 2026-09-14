@@ -1,42 +1,21 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { clearAgentMemory } from "./memory-cleanup.js";
-
-let tmpDir: string;
-
-beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-cleanup-test-"));
-});
-
-afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-});
-
-describe("clearAgentMemory", () => {
-  it("deletes the complete memory directory including profile, db, and nested files", () => {
-    const memoryDir = path.join(tmpDir, "agents", "a1", "memory");
-    fs.mkdirSync(path.join(memoryDir, "investigations"), { recursive: true });
-    fs.mkdirSync(path.join(memoryDir, "topics"), { recursive: true });
-    fs.writeFileSync(path.join(memoryDir, "PROFILE.md"), "profile");
-    fs.writeFileSync(path.join(memoryDir, ".memory.db"), "db");
-    fs.writeFileSync(path.join(memoryDir, "2026-05-26-0502.md"), "longmen");
-    fs.writeFileSync(path.join(memoryDir, "investigations", "case.md"), "case");
-    fs.writeFileSync(path.join(memoryDir, "topics", "cilium.md"), "topic");
-
-    const result = clearAgentMemory("a1", tmpDir);
-
-    expect(result.deletedFiles).toBe(5);
-    expect(result.memoryDir).toBe(memoryDir);
-    expect(fs.existsSync(memoryDir)).toBe(false);
-  });
-
-  it("is idempotent when the memory directory is already absent", () => {
-    const first = clearAgentMemory("missing", tmpDir);
-    const second = clearAgentMemory("missing", tmpDir);
-
-    expect(first.deletedFiles).toBe(0);
-    expect(second.deletedFiles).toBe(0);
-  });
+import { createHash } from "node:crypto";
+import { expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { LocalMemoryStore } from "../memory/local-store.js";
+import { clearUserMemory } from "./memory-cleanup.js";
+it("clears exactly one user generation while preserving legacy migration inputs",()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),"clear-memory-"));const stores:LocalMemoryStore[]=[];
+ try{
+  for(const user of ["alice","bob"])stores.push(new LocalMemoryStore(path.join(root,"memory-v2",createHash("sha256").update(user).digest("hex"))));
+  fs.mkdirSync(path.join(root,"memory"));fs.writeFileSync(path.join(root,"memory","legacy.md"),"migration evidence");
+  clearUserMemory("alice",root);
+  for(const [i,user] of ["alice","bob"].entries()){
+   const db=new DatabaseSync(path.join(root,"memory-v2",createHash("sha256").update(user).digest("hex"),"memory-v2.db"));
+   try{expect(db.prepare("SELECT generation FROM state").get()!.generation).toBe(i===0?1:0);}finally{db.close();}
+  }
+  expect(fs.readFileSync(path.join(root,"memory","legacy.md"),"utf8")).toBe("migration evidence");
+ }finally{stores.forEach(s=>s.close());fs.rmSync(root,{recursive:true,force:true});}
 });

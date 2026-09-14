@@ -1,4 +1,7 @@
+import { loadConfig } from "../core/config.js";
 import { AgentRetiredError } from "../shared/agent-retirement.js";
+import { PRIVATE_WORKSPACE_PATH } from "../shared/private-workspace.js";
+import { handlePrivateWorkspace } from "./private-workspace-api.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
@@ -89,7 +92,7 @@ import {
   type BoxSyncStatus,
 } from "../shared/agentbox-sync-status.js";
 import { McpClientManager, type McpConnectErrorKind, type McpServerConnection } from "../core/mcp-client.js";
-import { clearAgentMemory } from "./memory-cleanup.js";
+import { clearUserMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
   handleTracingConfig,
@@ -256,7 +259,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       session_id: principal.sessionId, callback_token: principal.callbackToken, arguments: args,
       approval,
     }, signal);
-  }, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId));
+  }, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId), async (principal, signal) => {
+    if (process.env.SICLAW_WORKSPACE_MODE !== "remote") return;
+    const handle = await agentBoxManager.getForSession(principal.agentId, principal.sessionId);
+    if (!handle || handle.agentId !== principal.agentId || !principal.callbackToken) throw new Error("Private sandbox placement changed");
+    await new AgentBoxClient(handle.endpoint, 95_000, agentBoxTlsOptions).sandboxTool({
+      session_id: principal.sessionId, callback_token: principal.callbackToken, validation_only: true,
+    }, signal);
+  });
 
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
@@ -2100,23 +2110,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     if (!agentId) throw new Error("agentId required");
 
-    const { memoryDir, deletedFiles } = clearAgentMemory(agentId);
-
-    console.log(`[rpc] agent.clearMemory: deleted ${deletedFiles} files in ${memoryDir}`);
-
-    // Notify AgentBox to reset indexer
-    try {
-      const handle = await agentBoxManager.getAsync(agentId);
-      if (handle) {
-        const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-        await client.resetMemory();
-        console.log("[rpc] agent.clearMemory: AgentBox notified to reset indexer");
-      }
-    } catch (err: any) {
-      console.warn(`[rpc] agent.clearMemory: AgentBox notify failed: ${err.message}`);
+    if (process.env.SICLAW_WORKSPACE_MODE === "remote") {
+      throw new Error("Remote memory must be cleared through the host's personal memory controls");
     }
-
-    return { ok: true, deletedFiles };
+    const userId = params.userId as string;
+    if (!userId) throw new Error("Memory owner is required");
+    clearUserMemory(userId, loadConfig().paths.userDataDir);
+    return { ok: true };
   });
 
   rpcMethods.set("agent.terminate", async (params) => {
@@ -2737,6 +2737,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // Session history — the checkpointer read. An agentbox that holds no
           // local JSONL for a session (another agent's box, a replica, a restart)
           // pulls the full transcript from the control plane before its turn.
+          if (url === PRIVATE_WORKSPACE_PATH && method === "POST") {
+            if (!identity) { res.writeHead(401); res.end(); return; }
+            void handlePrivateWorkspace(req, res, identity, frontendClient);
+            return;
+          }
           if (url.startsWith(SESSION_HISTORY_PATH) && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             void handleSessionHistory(req, res, identity);

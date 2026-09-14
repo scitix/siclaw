@@ -4,7 +4,7 @@ import { registration } from "./run-script.js";
 import { Value } from "@sinclair/typebox/value";
 
 function refs(overrides: Partial<ToolRefs> = {}): ToolRefs {
-  return { kubeconfigRef: {}, userId: "u", agentId: "a", sessionIdRef: { current: "s" }, memoryRef: {}, dpStateRef: { active: false }, ...overrides };
+  return { kubeconfigRef: {}, userId: "u", agentId: "a", sessionIdRef: { current: "s" }, dpStateRef: { active: false }, ...overrides };
 }
 function registry() { const r = new ToolRegistry(); r.register(registration); return r; }
 

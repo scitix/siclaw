@@ -1,3 +1,4 @@
+import { sessionRegistry } from "./session-registry.js";
 /**
  * GET /api/internal/session-history?sessionId=… — 把控制面里一段会话的**全部**记录
  * 拉回来给 agentbox,从旧到新。
@@ -82,7 +83,7 @@ export async function loadFullHistory(
 export async function handleSessionHistory(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  _identity: CertificateIdentity,
+  identity: CertificateIdentity,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://internal");
   const sessionId = url.searchParams.get("sessionId")?.trim() ?? "";
@@ -91,6 +92,11 @@ export async function handleSessionHistory(
     return;
   }
   try {
+    const owner = await sessionRegistry.refresh(sessionId);
+    if (!owner?.authoritative || owner.agentId !== identity.agentId ||
+      (identity.privateUserId && owner.userId !== identity.privateUserId)) {
+      sendJson(res, 403, { error: "Session is unavailable" }); return;
+    }
     const messages = await loadFullHistory(sessionId);
     sendJson(res, 200, { sessionId, messages } satisfies SessionHistoryResponse);
   } catch (err) {

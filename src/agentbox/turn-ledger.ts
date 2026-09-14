@@ -8,20 +8,20 @@
  * Runtime — so it records the turnIds it has accepted, and answers a repeat
  * without starting anything.
  *
- * Stored next to the session's JSONL history, on the same volume that already
- * carries session state (see the `.plan-ledger.json` / `.model-route-state.json`
- * precedents), so it survives a pod restart for exactly as long as the
- * conversation it belongs to does.
+ * Stored next to JSONL and the plan/router sidecars. Remote workspace checkpoints
+ * carry these files to replacement pods; local disk alone does not survive loss
+ * of a pod's emptyDir.
  *
- * NON-FATAL BY DESIGN. A missing file is the normal first-turn case; a corrupt
- * or unreadable one yields an EMPTY ledger. The failure mode of an empty ledger
- * is a duplicate turn — the pre-existing behaviour — whereas refusing the prompt
- * would turn an unreadable bookkeeping file into an outage.
+ * A missing file is the normal first-turn case. Local mode retains best-effort
+ * bookkeeping for compatibility. Remote mode rejects corrupt/unreadable ledgers
+ * and failed writes: treating them as empty could replay an external side effect
+ * after a Pod or Runtime restart.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { privateWorkspaceEnabled } from "../shared/private-workspace.js";
 
 export const TURN_LEDGER_FILE = ".turn-ledger.json";
 
@@ -36,14 +36,18 @@ function ledgerPath(sessionDir: string): string {
   return path.join(sessionDir, TURN_LEDGER_FILE);
 }
 
-/** Reads the ledger; any problem reading it yields an empty one. */
+/** Remote mode fails closed; local mode tolerates unreadable legacy ledgers. */
 export function readTurnLedger(sessionDir: string): string[] {
   try {
     const raw = JSON.parse(fs.readFileSync(ledgerPath(sessionDir), "utf8"));
+    if (privateWorkspaceEnabled() && (!Array.isArray(raw) || raw.some(id => typeof id !== "string" || !id))) {
+      throw new Error("Invalid private turn ledger");
+    }
     if (!Array.isArray(raw)) return [];
     return raw.filter((id): id is string => typeof id === "string" && id.length > 0);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      if (privateWorkspaceEnabled()) throw new Error("Private turn ledger is unreadable; refusing duplicate execution", { cause: err });
       console.warn(`[turn-ledger] ${ledgerPath(sessionDir)} unreadable, treating it as empty:`, err);
     }
     return [];
@@ -72,13 +76,14 @@ export function recordAcceptedTurn(sessionDir: string, turnId: string): void {
     const file = ledgerPath(sessionDir);
     const tmp = `${file}.${randomUUID()}.tmp`;
     try {
-      fs.writeFileSync(tmp, `${JSON.stringify(kept)}\n`, "utf8");
+      fs.writeFileSync(tmp, `${JSON.stringify(kept)}\n`, { encoding: "utf8", mode: 0o600 });
       fs.renameSync(tmp, file);
     } catch (err) {
       try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
       throw err;
     }
   } catch (err) {
+    if (privateWorkspaceEnabled()) throw new Error("Private turn could not be recorded", { cause: err });
     // Best-effort: failing to record costs cross-restart de-duplication for
     // this turn, which is strictly better than failing the turn itself.
     console.warn(`[turn-ledger] could not record turn ${turnId} in ${sessionDir}:`, err);

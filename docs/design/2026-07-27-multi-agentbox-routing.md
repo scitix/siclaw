@@ -111,17 +111,15 @@ Moving a session that is NOT held costs only warm state:
 | MCP connections | re-initialised, awaited |
 | Conversation history | none — the shared PVC subPath is per AGENT, so every box of it reads the same tree |
 
-### Losing a box loses in-flight work, not history
+### Persistence update
 
-`user-data` runs on the shared RWX PVC with its per-agent subPath `agents/{agentId}`
-(`k8s-spawner.ts:403-407`, `:533`), so every box of an agent mounts the same session tree and a
-replacement box restores the conversation from JSONL. The turn in progress, background jobs, and
-the SSE replay buffer are forfeit.
-
-**No volume split is needed because memory is off.** `isMemoryEnabled()` defaults to false
-(`src/core/config.ts:200-206`) and both the SQLite index and `PROFILE.md` are created only inside
-`if (memoryEnabled)` blocks (`src/core/agent-factory.ts:357`, `:377`), so the shared subPath holds
-nothing agent-scoped and nothing with concurrent writers.
+The shared-PVC and implicit-profile assumptions in the original July proposal
+are superseded by [private workspaces](private-workspaces.md) and
+[evidence-backed memory](memory-v2-alignment.md). Remote boxes restore committed
+per-session snapshots from versioned object storage. Memory is a per-user host
+authority with independent learning leases; it is never a shared writable local
+index. In-flight execution still requires explicit recovery after an uncertain
+interruption.
 
 ### Placement metric: fewest in-flight turns
 

@@ -252,7 +252,7 @@ Skill scripts (`skills/` directory) are **exempt from the binary allowlist** for
 
 ```
 Read allowed:  builtin skills, dynamic skills, userDataDir, traces (.siclaw/traces/)
-Write allowed: userDataDir ONLY (memory files, PROFILE.md, investigation notes)
+Write allowed: userDataDir only; memory-v2 state and legacy memory inputs are internal and blocked from file tools. Remote writes are restricted further to the personal files directory.
 Blocked:       credentials dir, config dir, system dirs (/etc, /var, etc.)
 ```
 
@@ -269,7 +269,7 @@ Siclaw maintains **two independent databases** with completely different schemas
 | Database | Purpose | Engine | Location |
 |----------|---------|--------|----------|
 | Portal DB | Users, sessions, skills, channels, tasks, MCP, chat history | **MySQL (prod) or node:sqlite (local)** via `DATABASE_URL` | Local default: `.siclaw/data/portal.db` |
-| Memory DB | Embeddings, chunks, investigation records, FTS index | node:sqlite (native) | `<memoryDir>/.memory.db` |
+| Memory | Evidence, learning leases/reviews, topics and feedback | Host service in remote mode; node:sqlite transactions locally | Per-user `memory-v2/<owner hash>/memory-v2.db` locally; host metadata + object storage remotely |
 
 These are never merged. Do not confuse them.
 
@@ -338,28 +338,33 @@ of the contract.
 
 ## 7. Memory System Invariants
 
-### 7.1 Hybrid Search Formula
+### 7.1 One evidence authority per mode
 
-```
-finalScore = (vectorWeight × cosineSimilarity) + (ftsWeight × bm25Score)
-```
+Remote tools call the host; local/CLI tools use a per-user SQLite store with the
+same bounded contracts. There is no vector extension, embedding client, FTS/BM25
+engine, file watcher or implicit PROFILE writer. Legacy investigation exports
+remain migration inputs and never override a committed remote head.
 
-Default weights: `vectorWeight = 0.70`, `ftsWeight = 0.30` (see `src/memory/indexer.ts:14-15`; configurable via `searchConfig`)
+### 7.2 Learning is separate from execution
 
-- Minimum score threshold: `0.35` (results below this are filtered)
-- Default top-K: `10` results
-- CJK queries use OR for bigrams; Latin queries use AND
+AgentBox classifies committed source batches without tools. The host owns source
+selection, independent learning leases, retry progress, exact quote checks,
+source visibility, generation fencing and atomic publication receipts. Startup
+resumes eligible learning without acquiring a foreground execution lease. A
+pending-turn snapshot cannot supply a completed learning batch. Model/network
+failure schedules a retry without another user prompt.
 
-### 7.2 Chunking Contract
+### 7.3 Bounded, revocable recall
 
-- Chunks are split on heading boundaries (H1 > H2 > H3 hierarchy)
-- Max chunk size: ~400 tokens (~1600 bytes)
-- Overlap: ~80 tokens between adjacent chunks
-- Each chunk tracks: file path, heading breadcrumb, start/end line
+Search, source windows and small topic catalogs share 8 KiB per response,
+16 KiB per turn and 64 KiB per context before compaction. Repeated content is
+suppressed only after authority checks. Usage is a small ranking signal, never
+proof. Scope/claim ordering prevents old publication from replacing newer
+claims. Explicit forgetting creates a tombstone, retained until a generation
+change or a later explicit remember request. Source evidence has a hard 90-day
+recall lifetime; object versions remain retained independently.
 
-### 7.3 Embedding Dependency
-
-Memory search (`memory_search` tool) is only available when an embedding provider is configured in `settings.json`. If no embedding is configured, the tool is not registered. Check `config.embedding` before assuming memory tools are available.
+See [the complete memory contract](memory-v2-alignment.md).
 
 ---
 

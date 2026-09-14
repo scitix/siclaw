@@ -25,7 +25,6 @@ vi.mock("./core/config.js", () => ({
   loadConfig: mocks.config, setPortalSnapshot: mocks.setSnapshot,
   isMemoryEnabled: () => false, validateLlmConfig: () => [],
 }));
-vi.mock("./memory/session-summarizer.js", () => ({ saveSessionKnowledge: vi.fn() }));
 vi.mock("./tools/infra/debug-pod.js", () => ({ debugPodCache: { evictAll: mocks.evict } }));
 vi.mock("./lib/portal-snapshot-client.js", () => ({
   loadPortalSnapshotDetailed: mocks.snapshot, tryLoadPortalSnapshot: vi.fn(),
@@ -67,7 +66,7 @@ describe("headless diagnostic lifecycle", () => {
     mocks.print.mockResolvedValue(0);
     mocks.purge.mockResolvedValue(undefined);
     mocks.create.mockResolvedValue({
-      session: { dispose: mocks.dispose }, services: {}, memoryIndexer: { close: mocks.closeMemory, purgeStaleInvestigations: mocks.purge },
+      session: { dispose: mocks.dispose }, services: {}, localMemory: { close: mocks.closeMemory },
       knowledgeIndexer: { close: mocks.closeKnowledge }, mcpManager: { shutdown: mocks.closeMcp },
     });
   });

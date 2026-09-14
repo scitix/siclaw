@@ -1,0 +1,15 @@
+{
+  "records": [
+    {"id":"a","scope":"harbor42","claim":"report-format","summary":"Harbor42 report format","keywords":"汇报格式 bullet concise","text":"Harbor42 reports use concise bullets.","source":{"createdAt":10}},
+    {"id":"b","scope":"harbor43","claim":"report-format","summary":"Harbor43 report format","keywords":"汇报格式 paragraph","text":"Harbor43 reports use a paragraph.","source":{"createdAt":20}},
+    {"id":"c","scope":"harbor42","claim":"database","summary":"Harbor42 database timeout investigation","keywords":"数据库 超时 排障","text":"The database probe failed; no repair was verified.","source":{"createdAt":30}},
+    {"id":"d","scope":"user","claim":"language","summary":"Response language","keywords":"语言 中文 Chinese","text":"For general responses I prefer Chinese.","source":{"createdAt":40}}
+  ],
+  "queries": [
+    {"query":"Harbor42 report format","ids":["a"]},
+    {"query":"Harbor44 report format","ids":[]},
+    {"query":"report format","ids":["b","a"]},
+    {"query":"Harbor42 数据库超时","ids":["c"]},
+    {"query":"Chinese language","ids":["d"]}
+  ]
+}

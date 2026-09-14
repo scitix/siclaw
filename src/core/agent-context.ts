@@ -152,7 +152,7 @@ export function resolveAgentHarness(
     memoryEnabled:
       resolution === "resolved" &&
       input.memoryConfigured &&
-      hasAnyTool(allowedTools, ["memory_search", "memory_get"]),
+      hasAnyTool(allowedTools, ["memory_search", "memory_get", "memory_catalog", "memory_update", "memory_feedback"]),
     includeBundledSkills:
       resolution === "resolved" &&
       canOperate,

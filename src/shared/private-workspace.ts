@@ -1,0 +1,186 @@
+/** Private persistence protocol. No credentials or caller-selected object paths. */
+export const PRIVATE_WORKSPACE_PATH = "/api/internal/private-workspace";
+export const WORKSPACE_OBJECT_BYTES = 4 * 1024 * 1024;
+export const WORKSPACE_MAX_OBJECTS = 4096;
+
+/** HTTP/transport classification only; never carry private upstream error bodies.
+ * Kept in shared because the isolated AgentBox image does not include lib.
+ */
+export class WorkspaceTransportError extends Error {
+  readonly retriable: boolean;
+  constructor(readonly status?: number) {
+    super(status == null ? "Private workspace transport is unavailable" : "Private workspace is unavailable or its execution changed");
+    this.name = "WorkspaceTransportError";
+    this.retriable = status == null || status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+}
+
+export interface WorkspaceObjectRef {
+  id: string;
+  spaceId: string;
+  storageBackendId: string;
+  key: string;
+  versionId: string;
+  sha256: string;
+  size: number;
+}
+
+export interface WorkspaceBinding {
+  spaceId: string;
+  workspaceId: string;
+  revision: number;
+  epoch: number;
+  placementEpoch: number;
+  generation: number;
+  leaseUntil: number;
+  manifest: WorkspaceObjectRef | null;
+}
+
+export interface PrivateSpaceIdentity {
+  spaceId: string;
+  userId: string;
+  orgId: string;
+  agentId: string;
+}
+
+export interface WorkspaceCommit extends WorkspaceBinding {
+  operationId: string;
+  manifestId: string;
+  objectIds: string[];
+}
+
+export type WorkspaceRequest = {
+  action: "memory_consolidate_prepare" | "memory_consolidate_publish" | "memory_consolidate_fail" | "memory_brief" | "acquire" | "renew" | "release" | "put" | "get" | "commit" | "memory_prepare" | "memory_publish" | "memory_fail" | "memory_search" | "memory_read" | "memory_catalog" | "memory_note" | "memory_feedback";
+  sessionId: string;
+  incarnation: string;
+  binding?: WorkspaceBinding;
+  commit?: WorkspaceCommit;
+  objectId?: string;
+  data?: string;
+  consolidation?: MemoryConsolidationSubmission;
+  brief?: MemoryBriefRequest;
+  catalog?: MemoryCatalogRequest;
+  note?: MemoryNoteRequest;
+  feedback?: MemoryFeedbackRequest;
+  token?: string;
+  submission?: MemoryLearningSubmission;
+  search?: MemorySearchRequest;
+  read?: MemoryReadRequest;
+};
+
+/** Virtual document paths never designate files, object keys, or skills. */
+export interface MemorySearchRequest {
+  queries: string[];
+  match_mode?: "any" | "all";
+  scope?: string;
+  cursor?: string;
+  context_lines?: number;
+  max_results?: number;
+}
+export interface MemorySearchMatch {
+  path: string;
+  kind: string;
+  status?: string;
+  task_id?: string;
+  scope?: string;
+  claim?: string;
+  content: string;
+  content_start_line_number: number;
+  truncated: boolean;
+  matched_queries: string[];
+  source_session_id: string;
+  source_entry_id: string;
+  created_at: number;
+  expires_at: number;
+}
+export interface MemorySearchPage {
+  refine_query?: boolean;
+  matches: MemorySearchMatch[];
+  next_cursor?: string;
+  truncated: boolean;
+  enabled: boolean;
+}
+export interface MemoryReadRequest {
+  path: string;
+  line_offset?: number;
+  max_lines?: number;
+  char_offset?: number;
+}
+export interface MemoryReadPage {
+  path: string;
+  found: boolean;
+  content: string;
+  start_line_number: number;
+  next_char_offset?: number;
+  truncated: boolean;
+  source_session_id?: string;
+  source_entry_id?: string;
+  created_at?: number;
+  expires_at?: number;
+}
+export interface PrivateMemorySource {
+  brief?(request: MemoryBriefRequest): Promise<MemoryBrief>;
+  catalog?(request: MemoryCatalogRequest): Promise<MemoryCatalogPage>;
+  note?(request: MemoryNoteRequest): Promise<{ status: "accepted" | "applied"; id: string }>;
+  feedback?(request: MemoryFeedbackRequest): Promise<{ ok: boolean }>;
+  validateExecution?(): Promise<void>;
+  search(request: MemorySearchRequest): Promise<MemorySearchPage>;
+  read(request: MemoryReadRequest): Promise<MemoryReadPage>;
+}
+
+export function privateWorkspaceEnabled(): boolean {
+  const mode = process.env.SICLAW_WORKSPACE_MODE;
+  if (mode && mode !== "local" && mode !== "remote") throw new Error("Invalid SICLAW_WORKSPACE_MODE");
+  return mode === "remote";
+}
+
+export function validPrivateId(id: unknown): id is string {
+  return typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(id);
+}
+
+export interface MemoryLearningSource {
+  id: string; text: string; role: string; sourceEntryId: string; sourceSessionId: string;
+  createdAt: number; expiresAt: number; sourceOrder?: number; taskId?: string; toolCallId?: string; tool?: string; isError?: boolean; target?: MemoryHint;
+}
+export interface MemoryHint { id: string; scope: string; claim: string; summary: string }
+export interface MemoryLearningBatch {
+  token: string; generation: number; revision: number; inputs: MemoryLearningSource[];
+  hints: MemoryHint[]; context?: MemoryLearningSource[]; skipModel?: boolean; more: boolean; retryAfterMs?: number;
+}
+export interface MemoryDecision {
+  entryId: string; kind: "ignore" | "preference" | "constraint" | "correction" | "experience" | "task" | "forget";
+  quote?: string; scope?: string; claim?: string; summary?: string; keywords?: string; replaces?: string[];
+  status?: "observed" | "failed" | "proposed" | "uncertain" | "user-confirmed";
+  evidence?: { entryId: string; quote: string }[];
+}
+export interface MemoryLearningSubmission { token: string; decisions: MemoryDecision[] }
+export interface MemoryLearningBackend {
+  prepareLearning(): Promise<MemoryLearningBatch>;
+  publishLearning(input: MemoryLearningSubmission): Promise<{ count: number; more: boolean }>;
+  failLearning(token: string): Promise<void>;
+  prepareConsolidation?(): Promise<MemoryConsolidationBatch>;
+  publishConsolidation?(input: MemoryConsolidationSubmission): Promise<{ ok: boolean }>;
+  failConsolidation?(token: string): Promise<void>;
+}
+
+/** Phase one records are grouped into chronological, source-backed task accounts.
+ * Phase two chooses routes and equivalent durable topics, never executable text. */
+export interface MemoryConsolidationRecord {
+  id: string; scope: string; claim: string; kind: string; status?: string;
+  text: string; summary: string; sourceSessionId: string; createdAt: number;
+  usageCount: number; negativeCount: number;
+}
+export interface MemoryTaskRollout { sessionId: string; ids: string[] }
+export interface MemoryOutline { topics: { scope: string; title: string; ids: string[] }[]; merges: string[][] }
+export interface MemoryConsolidationBatch {
+  token: string; generation: number; revision: number; records: MemoryConsolidationRecord[];
+  rollouts: MemoryTaskRollout[]; previous: MemoryOutline; retryAfterMs?: number;
+}
+export interface MemoryConsolidationSubmission { token: string; outline: MemoryOutline }
+export interface MemoryBriefRequest { query: string; scope?: string }
+export interface MemoryBrief { generation: number; items: MemorySearchMatch[] }
+
+export interface MemoryCatalogRequest { scope?: string; query?: string }
+export interface MemoryCatalogPage { refine_query?: boolean; entries: { path: string; scope: string; claim: string; label: string; created_at: number }[]; truncated: boolean; generation: number }
+export interface MemoryNoteRequest { action: "remember" | "correct" | "forget"; path?: string; quote: string; operation_id: string }
+export interface MemoryFeedbackRequest { path: string; outcome: "used" | "incorrect" | "irrelevant"; operation_id: string }

@@ -74,7 +74,7 @@ Key directories:
 - `src/gateway/` — Runtime server, channels, DB, skills bundle builder
 - `src/portal/` — Portal: auth, REST API, admin resources
 - `src/agentbox/` — AgentBox HTTP server, credential broker, resource sync
-- `src/memory/` — Vector + keyword investigation indexer
+- `src/memory/` — Evidence-backed learning, local transactions and context budgets
 - `src/cron/` — Task scheduling
 - `portal-web/` — React + Vite web UI
 - `skills/` — Diagnostic playbooks (SKILL.md + scripts)

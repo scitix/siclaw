@@ -10,7 +10,6 @@ import { createSiclawSession } from "./core/agent-factory.js";
 import { CliBackgroundHost } from "./core/cli-background-host.js";
 import { isMemoryEnabled, loadConfig, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
 import { parseCliOptions, type CliOptions } from "./cli-options.js";
-import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 import { debugPodCache } from "./tools/infra/debug-pod.js";
 import { type PortalSnapshot, loadPortalSnapshotDetailed } from "./lib/portal-snapshot-client.js";
 import { materializePortalSkills } from "./lib/portal-skill-materializer.js";
@@ -189,7 +188,7 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   taskOutputReader: cliBackgroundHost.createTaskOutputReader(),
 });
 
-const { session, services, modelFallbackMessage, memoryIndexer, knowledgeIndexer, mcpManager } =
+const { session, services, modelFallbackMessage, memoryLearner, localMemory, knowledgeIndexer, mcpManager } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
 cliBackgroundHost.setSession(session);
 disposeActiveSession = () => session.dispose();
@@ -216,12 +215,7 @@ const runtime = new AgentSessionRuntime(
   modelFallbackMessage,
 );
 
-// Startup maintenance: preserve the standalone investigation retention policy.
-if (memoryIndexer) {
-  const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
-  memoryIndexer.purgeStaleInvestigations(cliMemoryDir)
-    .catch(err => console.warn("[siclaw] Startup maintenance failed:", err));
-}
+
 
 // Debug: subscribe to all session events and write to log file
 if (debugMode) {
@@ -305,29 +299,14 @@ try {
   cliBackgroundHost.shutdown();
 
   // -- Cleanup on exit --
-  // Auto-save session memory (mirrors AgentBox release flow)
-  if (isMemoryEnabled() && session.sessionFile) {
-    const sessionDir = path.dirname(session.sessionFile);
-    const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
-    try {
-      const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
-      if (saved) {
-        console.log(`[siclaw] Session knowledge saved: ${saved.map(f => path.basename(f)).join(", ")}`);
-      }
-    } catch (err) {
-      console.warn(`[siclaw] Memory auto-save failed:`, err);
-    }
-  }
+  await memoryLearner?.close();
+  localMemory?.close();
 
   // Clean up cached debug pods
   try { await debugPodCache.evictAll(); } catch { /* ignore */ }
   // Shutdown MCP connections
   if (mcpManager) {
     try { await mcpManager.shutdown(); } catch { /* ignore */ }
-  }
-  // Close memory indexer
-  if (memoryIndexer) {
-    try { memoryIndexer.close(); } catch { /* ignore */ }
   }
   if (knowledgeIndexer) {
     try { knowledgeIndexer.close(); } catch { /* ignore */ }

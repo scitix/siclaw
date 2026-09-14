@@ -88,7 +88,6 @@ function countToolCallsSinceVisibleAssistant(messages: any[]): number {
 
 export default function deepInvestigationExtension(
   api: ExtensionAPI,
-  _memoryRef?: unknown,
   dpStateRef?: MutableDpStateRef,
 ): void {
   let dpActive = false;
