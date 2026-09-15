@@ -41,7 +41,7 @@ import {
   readBoxSyncStatus,
   type KnowledgeSyncHandler,
 } from "./sync-handlers.js";
-import type { ObservedMcpServer } from "../shared/agentbox-sync-status.js";
+import { knowledgeSessionRefresh, type ObservedMcpServer } from "../shared/agentbox-sync-status.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
@@ -833,6 +833,7 @@ export function createHttpServer(
     const servers = liveManager ? liveManager.getServerConnections() : observedMcpServers;
     sendJson(res, 200, {
       ...inventory,
+      knowledge: { ...inventory.knowledge, sessionRefresh: knowledgeSessionRefresh(sessionManager.list()) },
       mcp: { ...inventory.mcp, ...(servers ? { servers } : {}) },
       model: observedModel,
       harness: observedHarness,

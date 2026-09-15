@@ -8,7 +8,7 @@
  * ways of "saying nothing" mean opposite things.
  */
 import { describe, it, expect } from "vitest";
-import { AGENT_SYNC_STATUS_SCHEMA_VERSION, normalizeBoxSyncStatus } from "./agentbox-sync-status.js";
+import { AGENT_SYNC_STATUS_SCHEMA_VERSION, knowledgeSessionRefresh, normalizeBoxSyncStatus } from "./agentbox-sync-status.js";
 
 const REV_A = "a".repeat(64);
 const REV_B = "b".repeat(64);
@@ -163,5 +163,21 @@ describe("mcp.servers observation", () => {
       mcp: { names: ["x"], servers: [{ name: "x", state: "failed", error: { kind: "weird", message: "boom" } }] },
     }));
     expect(status.mcp.servers?.[0].error).toEqual({ kind: "unknown", message: "boom" });
+  });
+});
+
+
+describe("knowledge session refresh evidence", () => {
+  it("reports invalidated sessions separately from installed files", () => {
+    const refresh = knowledgeSessionRefresh([{ _invalidated: true }, { _invalidated: false }]);
+    expect(refresh).toEqual({ policy: "next_prompt", residentSessions: 2, pendingSessions: 1 });
+    const status = normalizeBoxSyncStatus(payload({ knowledge: { repos: [], sessionRefresh: refresh } }));
+    expect(status.knowledge.sessionRefresh).toEqual(refresh);
+  });
+  it("preserves missing legacy evidence and rejects inconsistent counts", () => {
+    expect(normalizeBoxSyncStatus(payload()).knowledge.sessionRefresh).toBeUndefined();
+    expect(normalizeBoxSyncStatus(payload({ knowledge: { repos: [], sessionRefresh: {
+      policy: "next_prompt", residentSessions: 1, pendingSessions: 2,
+    } } })).knowledge.sessionRefresh).toBeUndefined();
   });
 });

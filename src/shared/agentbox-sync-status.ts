@@ -30,7 +30,26 @@ export interface ObservedKnowledgeRepo {
  * session has initialized MCP; a v3 box cannot, so a consumer must not read an
  * absent `servers` as "all connected".
  */
-export const AGENT_SYNC_STATUS_SCHEMA_VERSION = 4;
+// 5 adds knowledge.sessionRefresh: materialized files and deferred warm-session
+// invalidation are distinct; older boxes leave this evidence absent.
+export const AGENT_SYNC_STATUS_SCHEMA_VERSION = 5;
+
+/** Installed files and warm-session refresh are separate observations. */
+export interface KnowledgeSessionRefresh {
+  policy: "next_prompt";
+  residentSessions: number;
+  pendingSessions: number;
+}
+
+export function knowledgeSessionRefresh(
+  sessions: ReadonlyArray<{ _invalidated: boolean }>,
+): KnowledgeSessionRefresh {
+  return {
+    policy: "next_prompt",
+    residentSessions: sessions.length,
+    pendingSessions: sessions.filter((session) => session._invalidated).length,
+  };
+}
 
 /** Closed vocabulary shared with core/mcp-client.ts; see McpConnectErrorKind. */
 export type ObservedMcpErrorKind =
@@ -64,6 +83,7 @@ export interface BoxSyncStatus {
   knowledge: {
     syncedAt: string | null;
     repos: ObservedKnowledgeRepo[];
+    sessionRefresh?: KnowledgeSessionRefresh;
   };
   skills: { names: string[] };
   mcp: {
@@ -193,6 +213,11 @@ export function normalizeBoxSyncStatus(value: unknown): BoxSyncStatus {
   if (!root) throw new Error("invalid AgentBox sync status");
 
   const knowledge = record(root.knowledge);
+  const refresh = record(knowledge?.sessionRefresh);
+  const validRefresh = refresh?.policy === "next_prompt"
+    && Number.isSafeInteger(refresh.residentSessions) && (refresh.residentSessions as number) >= 0
+    && Number.isSafeInteger(refresh.pendingSessions) && (refresh.pendingSessions as number) >= 0
+    && (refresh.pendingSessions as number) <= (refresh.residentSessions as number);
   const repos = Array.isArray(knowledge?.repos)
     ? knowledge.repos.flatMap((item): ObservedKnowledgeRepo[] => {
         const repo = record(item);
@@ -229,6 +254,11 @@ export function normalizeBoxSyncStatus(value: unknown): BoxSyncStatus {
     knowledge: {
       syncedAt: typeof knowledge?.syncedAt === "string" ? knowledge.syncedAt : null,
       repos,
+      ...(validRefresh ? { sessionRefresh: {
+        policy: "next_prompt" as const,
+        residentSessions: refresh!.residentSessions as number,
+        pendingSessions: refresh!.pendingSessions as number,
+      } } : {}),
     },
     skills: { names: strings(record(root.skills)?.names) },
     mcp: normalizeObservedMcp(record(root.mcp)),

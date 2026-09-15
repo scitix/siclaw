@@ -403,6 +403,7 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
         schemaVersion: AGENT_SYNC_STATUS_SCHEMA_VERSION,
         knowledge: {
           syncedAt: "2026-08-18T08:00:00.000Z",
+          sessionRefresh: { policy: "next_prompt", residentSessions: 0, pendingSessions: 0 },
           repos: [{ id: "kb-1", name: "hardware", version: 2, sha256: "abc", fileCount: 12 }],
         },
         skills: { names: ["k8s-debug"] },
