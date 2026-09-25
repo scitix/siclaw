@@ -381,7 +381,7 @@ describe("knowledge_search", () => {
     fs.writeFileSync(
       path.join(knowledgeDir, "labels.md"),
       "---\ntype: Topic\nlabels:\n  - facet: entity\n    value: B300\n    aliases: [GB300]\n" +
-      "  - facet: environment\n    value: siflow-test\n---\n# Labels\n",
+      "  - facet: environment\n    value: staging\n---\n# Labels\n",
     );
     await resolver.sync();
 
