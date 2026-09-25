@@ -19,6 +19,15 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
 
+  public-identifiers:
+    name: Public Identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: bash scripts/check-public-identifiers.sh
+
   agentbox-build-graph:
     name: AgentBox Build Graph
     runs-on: ubuntu-latest
