@@ -1,4 +1,4 @@
-claude-agent-sdk==0.2.110
+claude-agent-sdk==0.2.121
 aiohttp
 PyYAML==6.0.3
 python-pptx
